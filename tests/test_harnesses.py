@@ -1,6 +1,41 @@
 from aflow._test_support import *  # noqa: F401,F403
+from aflow.harnesses.reasonix import ReasonixAdapter
 
 class AdaptersTests(unittest.TestCase):
+
+    def test_reasonix_without_effort(self) -> None:
+        adapter = ReasonixAdapter()
+        invocation = adapter.build_invocation(
+            repo_root=Path('/repo'),
+            model='deepseek-pro',
+            system_prompt='SYSTEM',
+            user_prompt='USER',
+        )
+        assert invocation.argv == (
+            'reasonix',
+            'run',
+            '-dir',
+            '/repo',
+            '--model',
+            'deepseek-pro',
+            'SYSTEM\n\nUSER',
+        )
+        assert not adapter.supports_effort
+        assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
+        assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
+
+    def test_reasonix_without_model_and_with_effort_ignores_effort(self) -> None:
+        adapter = ReasonixAdapter()
+        invocation = adapter.build_invocation(
+            repo_root=Path('/repo'),
+            model=None,
+            system_prompt='SYSTEM',
+            user_prompt='USER',
+            effort='high',
+        )
+        assert invocation.argv == ('reasonix', 'run', '-dir', '/repo', 'SYSTEM\n\nUSER')
+        assert '--effort' not in invocation.argv
+        assert '--model' not in invocation.argv
 
     def test_codex_without_effort(self) -> None:
         adapter = CodexAdapter()

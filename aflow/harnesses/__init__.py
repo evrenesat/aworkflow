@@ -8,6 +8,7 @@ from .gemini import GeminiAdapter
 from .kiro import KiroAdapter
 from .opencode import OpencodeAdapter
 from .pi import PiAdapter
+from .reasonix import ReasonixAdapter
 
 
 ADAPTERS: dict[str, HarnessAdapter] = {
@@ -18,6 +19,7 @@ ADAPTERS: dict[str, HarnessAdapter] = {
     "kiro": KiroAdapter(),
     "opencode": OpencodeAdapter(),
     "pi": PiAdapter(),
+    "reasonix": ReasonixAdapter(),
 }
 
 __all__ = ["ADAPTERS", "HarnessAdapter", "HarnessInvocation", "get_adapter"]

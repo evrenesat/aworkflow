@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import resources
-from importlib.abc import Traversable
+try:
+    from importlib.resources.abc import Traversable
+except ImportError:
+    from importlib.abc import Traversable
 from pathlib import Path
 import shutil
 import sys

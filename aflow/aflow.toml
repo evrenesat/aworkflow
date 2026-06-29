@@ -67,6 +67,22 @@ model = "gpt-5.4-mini"
 model = "gpt-5.4-mini"
 effort = "none"
 
+[harness.reasonix.profiles.flash]
+# The harness model identifier for this profile.
+model = "deepseek-flash"
+
+[harness.reasonix.profiles.pro]
+# The harness model identifier for this profile.
+model = "deepseek-pro"
+
+[harness.reasonix.profiles.flash-max]
+# The harness model identifier for this profile.
+model = "deepseek-flash-max"
+
+[harness.reasonix.profiles.pro-max]
+# The harness model identifier for this profile.
+model = "deepseek-pro-max"
+
 
 #### Roles & Teams ####
 
