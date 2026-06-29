@@ -171,7 +171,7 @@ This file is not yet exist, if you are tasked to create a follow-up plan for pos
 NEW_PLAN_PATH: "{NEW_PLAN_PATH}"
 """
 
-cp_loop_implementation = "Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-checkpoint' skill. {WORK_ON_NEXT_CHECKPOINT_CMD}"
+cp_loop_implementation = "Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-checkpoint' skill. Do not create checkpoint commits; leave verified scoped changes uncommitted for review. {WORK_ON_NEXT_CHECKPOINT_CMD}"
 followup_implementation = "Implement {ACTIVE_PLAN_PATH} using 'aflow-execute-plan' skill. Treat {ACTIVE_PLAN_PATH} as the only plan file you should edit. Do not read, move, delete, or rewrite other plan files under plans/in-progress unless the active plan explicitly tells you to."
 
 review_squash = "Use 'aflow-review-squash' skill. Take into account both ORIGINAL_PLAN and ACTIVE_PLAN (if they differ)"

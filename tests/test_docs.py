@@ -100,12 +100,21 @@ class SkillDocsTests(unittest.TestCase):
         exec_cp_text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-execute-checkpoint' / 'SKILL.md').read_text(encoding='utf-8')
         exec_plan_text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-execute-plan' / 'SKILL.md').read_text(encoding='utf-8')
         plan_text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-plan' / 'SKILL.md').read_text(encoding='utf-8')
+        config_text = (repo_root / 'aflow' / 'aflow.toml').read_text(encoding='utf-8')
         assert 'workflow engine finalizes the original plan location after terminal success' in review_text
         assert 'move that original plan to `plans/done/`' not in review_text
         assert 'workflow engine owns the final move to `plans/done/`' in plan_text
+        assert '## Commit Ownership Rule' in plan_text
+        assert '**Implementation Done When:**' in plan_text
+        assert '**Review Acceptance Boundary:**' in plan_text
+        assert 'Dirty-worktree contract' in plan_text
+        assert 'the implementer has not created a checkpoint commit' in plan_text
         assert 'Reviewer workflows own all commit creation and approval-grade git bookkeeping' in exec_cp_text
         assert 'Reviewer workflows own all commit creation and approval-grade git bookkeeping' in exec_plan_text
+        assert 'git diff --name-only' in exec_cp_text
+        assert 'git diff --name-only' in exec_plan_text
         assert 'Create the checkpoint approval commit for the reviewed work in this review turn.' in review_cp_text
+        assert 'Do not create checkpoint commits; leave verified scoped changes uncommitted for review.' in config_text
         assert 'all approval-grade git/tracking chores were completed by the reviewer in the same turn' in review_final_text
         assert 'all approval-grade git/tracking chores were completed by the reviewer in the same turn' in review_text
 

@@ -70,7 +70,8 @@ Do not use this skill to invent a second execution spec. The plan should already
 
 ## Git Workflow
 
-- Before stopping, check `git status --short` and `git diff --stat` so the reviewer inherits an accurate dirty worktree.
+- Before stopping, check `git status --short`, `git diff --name-only`, and `git diff --stat` so the reviewer inherits an accurate dirty worktree.
+- The dirty worktree must contain only the target checkpoint's scoped changes plus allowed plan progress edits. If unrelated dirty files are present, stop and escalate instead of leaving an ambiguous handoff.
 - Leave commit creation, squash/rewrite decisions, fix-plan cleanup, and `Git Tracking` / `Review Log` approval bookkeeping to reviewer workflows.
 - Do not rewrite history unless the plan explicitly asks for it.
 

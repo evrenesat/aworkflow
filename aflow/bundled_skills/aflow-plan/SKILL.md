@@ -29,6 +29,18 @@ Use this skill only for aflow-style planning. It is designed to be installed as 
 
 The plan must be decision complete. The implementer should not need to choose behavior, precedence, fallback, validation policy, or verification strategy on their own.
 
+## Commit Ownership Rule
+
+Checkpoint plans must separate implementation handoff state from review acceptance boundaries.
+
+Requirements:
+
+- In checkpoint-review workflows, implementers verify the assigned checkpoint and leave scoped changes uncommitted for reviewer validation. They must not create checkpoint commits, final approval commits, squash commits, or review-bookkeeping commits.
+- Reviewer workflows own checkpoint approval commits and approval-grade git bookkeeping in checkpoint-review workflows.
+- Autonomous non-review workflows may create checkpoint boundary commits only when no later reviewer workflow owns that boundary.
+- Every checkpoint must spell out both the implementation handoff state and the review acceptance boundary so agents do not treat a reviewer-owned commit as an implementer task.
+- If the selected workflow's commit ownership is ambiguous, stop and ask rather than guessing.
+
 ## Execution Root Safety Rule
 
 For repository-local work, the plan must be safe under worktree-first execution.
@@ -75,8 +87,9 @@ Requirements:
 - List allowed files and forbidden files or systems per checkpoint.
 - Include anti-shortcut constraints and preserved behaviors.
 - Include scoped and non-regression verification commands per checkpoint.
-- Require a git commit boundary per checkpoint.
-- Define a commit message format per checkpoint that includes the checkpoint/version prefix, the branch name, and a meaningful summary on the first line. Every checkpoint commit, including the first commit for that checkpoint, must use an explicit version starting at `v01`. Example first line: `cp1 v01 feature-branch: implement parser cleanup`
+- Require a git boundary per checkpoint and explicitly state which workflow role owns that boundary.
+- Separate checkpoint implementation completion from checkpoint review acceptance. In checkpoint-review workflows, the implementation handoff state leaves verified scoped changes uncommitted; the reviewer acceptance boundary creates the `cpN vNN` commit.
+- Define a review acceptance commit message format per checkpoint that includes the checkpoint/version prefix, the branch name, and a meaningful summary on the first line. Every checkpoint commit, including the first commit for that checkpoint, must use an explicit version starting at `v01`. Example first line: `cp1 v01 feature-branch: implement parser cleanup`
 - Make checkpoint state durable enough for restart. Step checkboxes should reflect meaningful progress inside the checkpoint and help a later rerun or reviewer understand what is already done.
 - Do not encode whether plan checkboxes are updated by the executor or the reviewer. The consuming execution or review skill owns that policy.
 - Include explicit stop-and-escalate conditions.
@@ -107,6 +120,7 @@ Use this checkpoint skeleton:
 - May create/modify: [files]
 - Must not touch: [files/systems, including `plans/**` except read-only access to the assigned plan file and the minimal progress-tracking edits performed by the consuming execution or review workflow]
 - Constraints: [anti-shortcuts + preserved behavior]
+- Dirty-worktree contract: before handoff, `git diff --name-only` may list only files in `May create/modify` plus allowed plan progress edits; unrelated dirty files require `AFLOW_STOP`.
 
 **Steps:**
 
@@ -123,11 +137,18 @@ Use this checkpoint skeleton:
 - Run scoped tests: `<exact repo-relative or execution-root-safe command>`
 - Run non-regression tests: `<exact repo-relative or execution-root-safe command>`
 
-**Done When:**
+**Implementation Done When:**
 
 - Verification commands pass cleanly.
+- Every checkpoint step has been validated against code, tests, or observable behavior before being checked off.
 - <observable condition>
-- A checkpoint-scoped git commit boundary exists with first line:
+- Dirty worktree contains only scoped checkpoint changes and allowed plan progress edits.
+- Before stopping, the implementer has run `git status --short`, `git diff --name-only`, and `git diff --stat`.
+- In checkpoint-review workflows, the implementer has not created a checkpoint commit. Verified changes remain uncommitted for reviewer validation.
+
+**Review Acceptance Boundary:**
+
+- The reviewer accepts the implementation and creates a checkpoint-scoped git commit with first line:
   ```text
   cpN vNN <branch-name>: <meaningful summary>
   ```
@@ -136,6 +157,7 @@ Use this checkpoint skeleton:
 **Stop and Escalate If:**
 
 - <explicit failure mode — when this condition is irrecoverable, emit `AFLOW_STOP: <reason>` on its own line so the workflow engine fails immediately instead of looping>
+- `git status --short` or `git diff --name-only` shows files outside the checkpoint scope or user-owned dirty changes not caused by this checkpoint.
 ```
 
 Use this `Git Tracking` skeleton in the final plan:
