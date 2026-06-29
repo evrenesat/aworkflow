@@ -1,6 +1,6 @@
 # Architecture
 
-AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Gemini, Kiro, OpenCode, Pi). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
+AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Gemini, Kiro, OpenCode, Pi, and Reasonix). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
 
 ## High-Level Data Flow
 
@@ -141,7 +141,7 @@ The condition evaluator is a full recursive-descent parser supporting `&&`, `||`
 Prompt templates support `file://` references (absolute, config-relative, or cwd-relative).
 
 ### `harnesses/`
-Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Seven adapters:
+Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Eight adapters:
 
 | Harness    | CLI binary  | Prompt mode                    | Effort support |
 |------------|-------------|--------------------------------|----------------|
@@ -151,6 +151,7 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `gemini`   | `gemini`    | system prefixed into user prompt | No           |
 | `kiro`     | `kiro-cli`  | system prefixed into user prompt | No           |
 | `opencode` | `opencode`  | system prefixed into user prompt | No           |
+| `reasonix` | `reasonix`  | system prefixed into user prompt | No           |
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
 
 All harnesses run in non-interactive, auto-approve mode with full tool access.
@@ -301,10 +302,12 @@ aflow/
     base.py            # HarnessAdapter protocol, HarnessInvocation dataclass
     claude.py          # Claude Code adapter
     codex.py           # Codex adapter
+    copilot.py         # Copilot adapter
     gemini.py          # Gemini adapter
     kiro.py            # Kiro adapter
     opencode.py        # OpenCode adapter
     pi.py              # Pi adapter
+    reasonix.py        # Reasonix adapter
   bundled_skills/
     aflow-plan/              SKILL.md
     aflow-execute-plan/      SKILL.md

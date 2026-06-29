@@ -94,40 +94,50 @@ worker = 'claude.haiku'
 reviewer = 'claude.sonnet'
 
 # Team-specific role overrides live under [teams.<name>.roles]. Missing roles fall back
-# to the global [roles] map. backup_team names the next team to try for harness recovery.
-[teams.codex1]
-backup_team = '7teen'
-
-[teams.codex1.roles]
-architect = 'codex.high'
-senior_architect = 'codex.high'
-reviewer = 'codex.high'
-worker = 'codex.mini'
-
-[teams.7teen]
-
-[teams.7teen.roles]
-architect = 'codex.mini'
-reviewer = 'codex.mini'
-worker = 'codex.nano'
+# to the global [roles] map. backup_team names the next team to try for harness
+# recovery. backup_team values must be defined teams; self-links and cycles are
+# rejected at config validation.
+# [teams.codex1]
+# backup_team = '7teen'
+#
+# [teams.codex1.roles]
+# architect = 'codex.high'
+# senior_architect = 'codex.high'
+# reviewer = 'codex.high'
+# worker = 'codex.mini'
+#
+# [teams.7teen]
+#
+# [teams.7teen.roles]
+# architect = 'codex.mini'
+# reviewer = 'codex.mini'
+# worker = 'codex.nano'
 
 
 #### Harness Error Recovery ####
 
 # [error_handling.harness_error_recovery]
-# max_consecutive_recoveries = 3
+# max_consecutive_recoveries = 3  # Hard stop for repeated recovery attempts in one run.
+
+# Reserved for v1 compatibility; recovery handoff is currently executed through
+# the team-lead role resolved from [aflow].team_lead.
 # team_lead_skill = "aflow-harness-recovery-lead"
 #
+# Rules are evaluated in order. Match is an AND across every string in `match`,
+# checked case-insensitively against combined stdout+stderr for the failing turn.
 # [[error_handling.harness_error_recovery.rules]]
+# Same team retry: wait a little and rerun the same step on the same selector.
 # action = "retry_same_team_after_delay"
 # match = ["throttled", "rate limit"]
-# delay_seconds = 30
+# delay_seconds = 30  # Optional. 0 means no wait.
 #
 # [[error_handling.harness_error_recovery.rules]]
+# Backup switch: move to teams.<active_team>.backup_team for this retry.
 # action = "switch_to_backup_team_and_retry"
 # match = ["quota exceeded", "account exhausted"]
 #
 # [[error_handling.harness_error_recovery.rules]]
+# Immediate stop: fail the run without scheduling another recovery turn.
 # action = "fail_immediately"
 # match = ["invalid prompt payload"]
 

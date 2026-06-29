@@ -1,221 +1,55 @@
 # aflow Remote App
 
-A mobile-first remote management interface for aflow workflows.
+A mobile-first remote management interface for AFlow workflows.
 
-## Overview
+The remote app provides project discovery, Codex thread reuse for plan creation, plan draft save/load/promote workflows, execution monitoring via SSE, and optional audio transcription. It is a separate subproject from the main `aworkflow` package and is not included in the published wheel.
 
-This app provides a web-based interface for managing aflow workflows across multiple repositories. It consists of:
+Full documentation lives in [../../docs/remote-app.md](../../docs/remote-app.md).
 
-- **Server** (`server/`): A FastAPI-based backend that uses the `aflow` library for workflow execution
-- **Web** (`web/`): A mobile-first React frontend (coming in later checkpoints)
+## Running
 
-The remote app is a separate subproject from the main `aworkflow` package and is not included in the published wheel.
-
-## Architecture
-
-```
-apps/aflow_app/
-├── server/                    # Python FastAPI server
-│   ├── src/aflow_app_server/
-│   │   ├── __init__.py       # Package init
-│   │   ├── config.py         # Server configuration
-│   │   ├── models.py         # API models
-│   │   ├── repo_registry.py  # Repository management
-│   │   ├── aflow_service.py  # aflow library integration
-│   │   ├── codex_backend.py  # Codex gateway compatibility exports
-│   │   ├── codex_thread_gateway.py  # Codex thread gateway interface
-│   │   ├── codex_app_server_client.py  # Codex websocket JSON-RPC client
-│   │   ├── codex_routes.py   # Codex API routes
-│   │   ├── plan_store.py     # Plan draft management
-│   │   └── main.py           # FastAPI app and endpoints
-│   └── tests/                # Server tests
-└── web/                      # React web client
-    ├── src/
-    │   ├── components/       # React components
-    │   ├── api.ts            # API client
-    │   ├── types.ts          # TypeScript types
-    │   ├── App.tsx           # Main app component
-    │   └── main.tsx          # Entry point
-    └── tests/                # Frontend tests
-```
-
-## Server Configuration
-
-The server is configured via environment variables or a TOML config file.
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AFLOW_APP_CONFIG_DIR` | Config directory path | `~/.config/aflow` |
-| `AFLOW_APP_HOST` | Bind host | `127.0.0.1` |
-| `AFLOW_APP_PORT` | Bind port | `8765` |
-| `AFLOW_APP_TOKEN` | Auth token (required) | - |
-| `AFLOW_APP_REGISTRY_PATH` | Repo registry file path | `<config_dir>/repos.json` |
-| `AFLOW_CODEX_APP_SERVER_URL` | Codex app-server websocket URL | - |
-| `AFLOW_CODEX_APP_SERVER_TOKEN` | Codex app-server auth token | - |
-| `AFLOW_TRANSCRIPTION_URL` | Transcription service URL | - |
-| `AFLOW_TRANSCRIPTION_TOKEN` | Transcription service token | - |
-
-### Config File
-
-Create `~/.config/aflow/config.toml`:
-
-```toml
-[server]
-bind_host = "127.0.0.1"
-bind_port = 8765
-auth_token = "your-secret-token"
-
-[codex_app_server]
-server_url = "ws://localhost:8080"
-server_token = "codex-token"
-
-[transcription]
-server_url = "https://api.openai.com/v1"
-server_token = "openai-api-key"
-```
-
-## Running the Server
+Build the frontend:
 
 ```bash
-# Build the web app once
 cd apps/aflow_app/web
 npm install
 npm run build
+```
 
-# Then run the backend from the server directory
+Run the backend:
+
+```bash
 cd apps/aflow_app/server
 uv sync
 AFLOW_APP_TOKEN=secret uv run aflow-app-server
-
-# Open the UI from the backend
-open http://127.0.0.1:8765/
 ```
 
-The backend serves the built frontend from `apps/aflow_app/web/dist`, so you do not need a separate frontend server for normal use. The server project depends on the repo-root `aworkflow` package through a local uv source, so it should be started from this checkout without setting `PYTHONPATH`.
-
-## Running the Web Client
-
-```bash
-# Separate frontend dev server, only if you want hot reload
-cd apps/aflow_app/web
-npm install
-
-# Start development server (proxies API to localhost:8765)
-npm run dev
-
-# Build static assets for the backend to serve
-npm run build
-
-# Preview the built output directly
-npm run preview
-
-# Run tests
-npm test -- --run
-```
-
-`npm run dev` runs a separate Vite dev server on `http://localhost:3000` and proxies API requests to `http://127.0.0.1:8765`.
-
-`npm run preview` serves the already-built `dist/` output. Run `npm run build` first if you want to use preview.
-
-## API Endpoints
-
-All endpoints (except `/health`) require Bearer token authentication.
-
-### Repositories
-
-- `GET /api/repos` - List all registered repositories
-- `POST /api/repos` - Add a repository
-- `GET /api/repos/{repo_id}` - Get a specific repository
-- `PATCH /api/repos/{repo_id}` - Update repository metadata
-- `DELETE /api/repos/{repo_id}` - Remove a repository
-
-### Plans
-
-- `GET /api/repos/{repo_id}/plans` - List all plans (drafts and in-progress)
-
-### Codex
-
-- `GET /api/codex/threads` - List Codex threads
-- `GET /api/codex/threads/{thread_id}` - Read a thread
-- `POST /api/codex/threads` - Start a thread
-- `POST /api/codex/threads/{thread_id}/resume` - Resume a thread
-- `POST /api/codex/threads/{thread_id}/fork` - Fork a thread
-- `PATCH /api/codex/threads/{thread_id}/name` - Rename a thread
-- `POST /api/codex/threads/{thread_id}/turns` - Send a user turn
-- `GET /api/codex/repos/{repo_id}/plans/drafts` - List plan drafts
-- `POST /api/codex/repos/{repo_id}/plans/drafts` - Save a plan draft
-- `GET /api/codex/repos/{repo_id}/plans/drafts/{filename}` - Load a plan draft
-- `POST /api/codex/repos/{repo_id}/plans/drafts/{filename}/promote` - Promote draft to in-progress
-- `DELETE /api/codex/repos/{repo_id}/plans/drafts/{filename}` - Delete a plan draft
-
-### Executions
-
-- `POST /api/executions` - Start a workflow execution
-- `GET /api/executions/{run_id}` - Get execution status
-- `GET /api/executions/{run_id}/events` - Stream execution events (SSE)
-
-### Transcription
-
-- `POST /api/transcribe` - Transcribe an uploaded audio file
-
-### Health
-
-- `GET /health` - Health check (no auth required)
-
-## Audio Transcription
-
-The app supports browser-recorded audio clip transcription for voice input. This feature is optional and degrades gracefully when not configured.
-
-### Configuration
-
-Set the transcription service URL and token:
-
-```bash
-export AFLOW_TRANSCRIPTION_URL="https://api.openai.com/v1"
-export AFLOW_TRANSCRIPTION_TOKEN="your-openai-api-key"
-```
-
-Or in `config.toml`:
-
-```toml
-[transcription]
-server_url = "https://api.openai.com/v1"
-server_token = "your-openai-api-key"
-```
-
-### Behavior
-
-- When configured: Audio recording button appears in the composer
-- When not configured: Text-only input remains fully functional
-- Transcription errors are shown to the user without breaking the app
-- Uploaded audio files are automatically cleaned up after transcription
-
-The transcription client supports OpenAI-compatible APIs (Whisper format).
+Open `http://127.0.0.1:8765/`.
 
 ## Development
 
-### Running Tests
+```bash
+cd apps/aflow_app/web
+npm run dev
+npm test -- --run
+```
 
 ```bash
 cd apps/aflow_app/server
 uv run --extra dev pytest -q
 ```
 
-### Project Structure
+## Configuration
 
-The server is designed to:
+The app reads environment variables and `~/.config/aflow/config.toml`. Environment variables override file values.
 
-1. Use `aflow` as a library, not a CLI
-2. Stream execution events via SSE for real-time updates
-3. Support multiple repositories with a file-backed registry
-4. Require token authentication for all state-changing operations
-5. Be deployable for local/LAN use, not internet-facing
+Common variables:
 
-## Security Notes
+- `AFLOW_APP_TOKEN` - required API token.
+- `AFLOW_APP_HOST` - bind host, default `127.0.0.1`.
+- `AFLOW_APP_PORT` - bind port, default `8765`.
+- `AFLOW_APP_PROJECTS_HOME` - root scanned for local git projects, default `~/code`.
+- `AFLOW_CODEX_APP_SERVER_URL` - optional Codex app-server websocket URL.
+- `AFLOW_TRANSCRIPTION_URL` and `AFLOW_TRANSCRIPTION_TOKEN` - optional transcription endpoint.
 
-- The server requires a bearer token for all API operations
-- It is designed for authenticated desktop-hosted local/LAN use
-- Do not expose the server to the internet without additional security measures
-- The token is transmitted in the `Authorization` header on every request
+See [Remote App Configuration](../../docs/remote-app.md#configuration) for the full table and behavioral notes.
