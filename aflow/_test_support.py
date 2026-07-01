@@ -11,11 +11,11 @@ import tempfile
 import textwrap
 import time
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from importlib import resources
 from unittest.mock import patch
 from aflow.config import AflowSection, ConfigError, GoTransition, HarnessProfileConfig, TeamConfig, WorkflowConfig, WorkflowHarnessConfig, WorkflowStepConfig, WorkflowUserConfig, bootstrap_config, find_placeholders, load_workflow_config, validate_workflow_config
-from aflow.workflow import WorkflowError, _backup_original_plan, derive_readme_content, evaluate_condition, generate_new_plan_path, move_completed_plan_to_done, pick_transition, render_prompt, render_step_prompts, resolve_profile, resolve_role_selector, run_workflow
+from aflow.workflow import WorkflowError, _backup_original_plan, _run_process, derive_readme_content, evaluate_condition, generate_new_plan_path, move_completed_plan_to_done, pick_transition, render_prompt, render_step_prompts, resolve_profile, resolve_role_selector, run_workflow
 from aflow.cli import _confirm_startup_recovery, _maybe_move_completed_plan_to_done, _parse_run_args, _pick_workflow_step, _resolve_run_arguments, build_parser, main, RUN_HELP
 from aflow.harnesses.claude import ClaudeAdapter
 from aflow.harnesses.codex import CodexAdapter

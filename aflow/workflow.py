@@ -819,8 +819,6 @@ def _run_process(
     banner: BannerRenderer,
     state: ControllerState,
 ) -> subprocess.CompletedProcess[str]:
-    is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
-
     proc = subprocess.Popen(
         list(invocation.argv),
         cwd=str(repo_root),
@@ -830,34 +828,28 @@ def _run_process(
         text=True,
     )
 
-    if is_interactive:
-        banner.pause()
-    else:
-        banner.update(state)
+    banner.update(state)
 
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
 
-    def _drain(stream, chunks: list[str], tee_to=None) -> None:
+    def _drain(stream, chunks: list[str]) -> None:
         while True:
             chunk = stream.read(4096)
             if not chunk:
                 break
             chunks.append(chunk)
-            if tee_to is not None:
-                tee_to.write(chunk)
-                tee_to.flush()
 
     assert proc.stdout is not None
     assert proc.stderr is not None
     t_out = threading.Thread(
         target=_drain,
-        args=(proc.stdout, stdout_chunks, sys.stdout if is_interactive else None),
+        args=(proc.stdout, stdout_chunks),
         daemon=True,
     )
     t_err = threading.Thread(
         target=_drain,
-        args=(proc.stderr, stderr_chunks, sys.stderr if is_interactive else None),
+        args=(proc.stderr, stderr_chunks),
         daemon=True,
     )
     t_out.start()
@@ -872,9 +864,6 @@ def _run_process(
 
     t_out.join()
     t_err.join()
-
-    if is_interactive:
-        banner.resume(state)
 
     return subprocess.CompletedProcess(
         proc.args,

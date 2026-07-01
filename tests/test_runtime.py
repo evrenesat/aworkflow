@@ -3,6 +3,50 @@ from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, Harnes
 
 class WorkflowRuntimeTests(unittest.TestCase):
 
+    def test_run_process_captures_harness_output_without_echoing_to_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = root / 'emit_output.py'
+            script.write_text(
+                "import sys\n"
+                "print('visible stdout')\n"
+                "print('visible stderr', file=sys.stderr)\n",
+                encoding='utf-8',
+            )
+            invocation = HarnessInvocation(
+                label='test',
+                argv=(sys.executable, str(script)),
+                env={},
+                prompt_mode='stdin',
+                system_prompt='',
+                user_prompt='',
+                effective_prompt='',
+            )
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+
+            class FakeBanner:
+                def __init__(self) -> None:
+                    self.updated = False
+
+                def update(self, state: ControllerState) -> None:
+                    self.updated = True
+
+            banner = FakeBanner()
+            stdout_capture = io.StringIO()
+            stderr_capture = io.StringIO()
+
+            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture), \
+                 patch('sys.stdin.isatty', return_value=True), \
+                 patch('sys.stdout.isatty', return_value=True):
+                completed = _run_process(invocation, root, banner, state)  # type: ignore[arg-type]
+
+            assert completed.returncode == 0
+            assert completed.stdout == 'visible stdout\n'
+            assert completed.stderr == 'visible stderr\n'
+            assert stdout_capture.getvalue() == ''
+            assert stderr_capture.getvalue() == ''
+            assert banner.updated
+
     def test_prompt_rendering_supports_inline_and_file_uri_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
