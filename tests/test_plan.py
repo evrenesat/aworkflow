@@ -776,3 +776,206 @@ class ActivePlanLifecycleTests(unittest.TestCase):
             assert captured_active[1] == str(fix_plan)
             # Turn 3 (second_review): active must reset to original — not the stale fix plan
             assert captured_active[2] == str(plan_path)
+
+    def test_repair_plan_is_preserved_until_review_approves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            fix_v01 = repo_root / 'plan-cp01-v01.md'
+            fix_v02 = repo_root / 'plan-cp01-v02.md'
+            captured_active: list[str] = []
+            next_turn_run_state: dict[int, str] = {}
+            turn_counter = [0]
+
+            _write_plan(
+                plan_path,
+                '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n',
+            )
+
+            def capturing_runner(argv, **kwargs):
+                turn_counter[0] += 1
+                turn = turn_counter[0]
+                prompt = ' '.join(argv)
+                import re as _re
+                match = _re.search(r'Active: (\S+)', prompt)
+                assert match is not None
+                captured_active.append(match.group(1).rstrip('.'))
+
+                run_files = list((repo_root / '.aflow' / 'runs').glob('*/run.json'))
+                if turn > 1 and run_files:
+                    run_payload = json.loads(
+                        run_files[0].read_text(encoding='utf-8')
+                    )
+                    next_turn_run_state[turn] = run_payload['active_plan_path']
+
+                if turn == 1:
+                    fix_v01.write_text('# Repair v01\n', encoding='utf-8')
+                elif turn == 3:
+                    fix_v02.write_text('# Repair v02\n', encoding='utf-8')
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={
+                    'codex': WorkflowHarnessConfig(
+                        profiles={'default': HarnessProfileConfig(model='m')}
+                    )
+                },
+                workflows={
+                    'loop': WorkflowConfig(
+                        steps={
+                            'review': WorkflowStepConfig(
+                                role='architect',
+                                prompts=('p',),
+                                go=(
+                                    GoTransition(
+                                        to='rework', when='NEW_PLAN_EXISTS'
+                                    ),
+                                    GoTransition(to='implement'),
+                                ),
+                            ),
+                            'rework': WorkflowStepConfig(
+                                role='architect',
+                                prompts=('p',),
+                                go=(
+                                    GoTransition(
+                                        to='review',
+                                        preserve_active_plan=True,
+                                    ),
+                                ),
+                            ),
+                            'implement': WorkflowStepConfig(
+                                role='architect',
+                                prompts=('p',),
+                                go=(GoTransition(to='END'),),
+                            ),
+                        },
+                        first_step='review',
+                    )
+                },
+                prompts={'p': 'Active: {ACTIVE_PLAN_PATH}.'},
+            )
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=6,
+                ),
+                wf_config,
+                'loop',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=capturing_runner,
+            )
+
+            assert result.turns_completed == 6
+            assert captured_active == [
+                str(plan_path),
+                str(fix_v01),
+                str(fix_v01),
+                str(fix_v02),
+                str(fix_v02),
+                str(plan_path),
+            ]
+            assert next_turn_run_state[3] == str(fix_v01)
+            assert next_turn_run_state[5] == str(fix_v02)
+            assert next_turn_run_state[6] == str(plan_path)
+
+            run_dir = next((repo_root / '.aflow' / 'runs').iterdir())
+            expected = [
+                plan_path,
+                fix_v01,
+                fix_v01,
+                fix_v02,
+                fix_v02,
+                plan_path,
+            ]
+            for turn, expected_path in enumerate(expected, 1):
+                payload = json.loads(
+                    (
+                        run_dir
+                        / 'turns'
+                        / f'turn-{turn:03d}'
+                        / 'result.json'
+                    ).read_text(encoding='utf-8')
+                )
+                assert payload['active_plan_path'] == str(expected_path)
+            for turn in (2, 4):
+                payload = json.loads(
+                    (
+                        run_dir
+                        / 'turns'
+                        / f'turn-{turn:03d}'
+                        / 'result.json'
+                    ).read_text(encoding='utf-8')
+                )
+                assert payload['conditions']['NEW_PLAN_EXISTS'] is False
+
+    def test_preserving_transition_rejects_missing_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            fix_plan = repo_root / 'plan-cp01-v01.md'
+            calls = [0]
+            _write_plan(
+                plan_path,
+                '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n',
+            )
+
+            def runner(argv, **kwargs):
+                calls[0] += 1
+                if calls[0] == 1:
+                    fix_plan.write_text('# Repair\n', encoding='utf-8')
+                elif calls[0] == 2:
+                    fix_plan.unlink()
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={
+                    'codex': WorkflowHarnessConfig(
+                        profiles={'default': HarnessProfileConfig(model='m')}
+                    )
+                },
+                workflows={
+                    'loop': WorkflowConfig(
+                        steps={
+                            'review': WorkflowStepConfig(
+                                role='architect',
+                                prompts=('p',),
+                                go=(GoTransition(to='rework'),),
+                            ),
+                            'rework': WorkflowStepConfig(
+                                role='architect',
+                                prompts=('p',),
+                                go=(
+                                    GoTransition(
+                                        to='review',
+                                        preserve_active_plan=True,
+                                    ),
+                                ),
+                            ),
+                        },
+                        first_step='review',
+                    )
+                },
+                prompts={'p': 'Active: {ACTIVE_PLAN_PATH}.'},
+            )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=4,
+                    ),
+                    wf_config,
+                    'loop',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+            assert calls[0] == 2
+            assert 'cannot preserve active plan' in str(ctx.value)
+            assert str(fix_plan) in str(ctx.value)

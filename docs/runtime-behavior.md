@@ -40,11 +40,23 @@ Plan-path behavior is strict:
 - `DONE` is computed from `ORIGINAL_PLAN_PATH`, not from a generated follow-up plan.
 - `NEW_PLAN_PATH` is generated once per turn with the format `<stem>-cpNN-vNN.<suffix>`.
 - `ACTIVE_PLAN_PATH` starts as the original plan path.
-- `ACTIVE_PLAN_PATH` changes only when the current harness step writes `NEW_PLAN_PATH`.
+- After a successful turn, a newly written `NEW_PLAN_PATH` becomes active first.
+  Otherwise, a selected transition with `preserve_active_plan = true` retains
+  the current active path. All other transitions reset it to the original plan.
+- `NEW_PLAN_EXISTS` remains a current-turn event and can be false while an
+  earlier repair plan remains active.
+- A preserving transition fails before the next harness call if its active plan
+  is missing from the execution checkout.
+- Turn `result.json` records the plan used to render that turn. Run-level
+  `run.json` records the plan selected for the next turn.
 - Before the workflow starts, `aflow` copies the original plan into `<repo_root>/plans/backups/`.
 - If matching backup content already exists, `aflow` reuses it.
 - If the same backup name already exists with different content, `aflow` writes the next `_vNN` file.
 - For worktree workflows, the original plan can be untracked or gitignored under `plans/`; it is still copied into the linked worktree and synced back after each turn.
+- Worktree prompts and existence checks use the execution-checkout copy while
+  run metadata stores the corresponding primary-checkout logical path.
+- Resume restores the saved active logical path and verifies its worktree copy
+  before rendering the first resumed prompt.
 
 In normal checkouts, ignore `.aflow/`, `.aflow/runs/`, and `plans/backups/` in git. Those are engine artifacts.
 

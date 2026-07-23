@@ -1578,6 +1578,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "feature_branch": "feature/test-branch",
             "worktree_path": str(Path("/fake/repo/.git/worktrees/test")),
             "main_branch": "main",
+            "active_plan_path": str(Path("/fake/plan-cp01-v01.md")),
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
@@ -1602,6 +1603,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert result.resumed_from_run_id == "20260101T000000Z-abc123"
         assert result.feature_branch == "feature/test-branch"
         assert result.worktree_path == Path("/fake/repo/.git/worktrees/test")
+        assert result.active_plan_path == Path("/fake/plan-cp01-v01.md")
 
     def test_resume_prompt_declined_returns_none(self) -> None:
         import aflow.cli as cli_module

@@ -245,6 +245,65 @@ class WorkflowConfigTests(unittest.TestCase):
             assert len(step.go) == 1
             assert step.go[0].to == 'implement_plan'
             assert step.go[0].when is None
+            assert step.go[0].preserve_active_plan is False
+
+    def test_parse_accepts_preserve_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._write_workflow_config(
+                tmpdir,
+                '[workflow.simple.steps.s1]\n'
+                'role = "architect"\n'
+                'prompts = ["p"]\n'
+                'go = [{ to = "s1", preserve_active_plan = true }]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                '[roles]\narchitect = "opencode.default"\n\n'
+                '[prompts]\np = "do it"\n',
+            )
+            transition = load_workflow_config(
+                config_path
+            ).workflows['simple'].steps['s1'].go[0]
+            assert transition.preserve_active_plan is True
+
+    def test_parse_rejects_non_boolean_preserve_active_plan(self) -> None:
+        for invalid_value in ('"true"', '1', '[true]'):
+            with self.subTest(invalid_value=invalid_value):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    config_path = self._write_workflow_config(
+                        tmpdir,
+                        '[workflow.simple.steps.s1]\n'
+                        'role = "architect"\n'
+                        'prompts = ["p"]\n'
+                        f'go = [{{ to = "s1", preserve_active_plan = {invalid_value} }}]\n\n'
+                        '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                        '[roles]\narchitect = "opencode.default"\n\n'
+                        '[prompts]\np = "do it"\n',
+                    )
+                    with pytest.raises(ConfigError) as ctx:
+                        load_workflow_config(config_path)
+                    assert (
+                        'workflow.simple.steps.s1.go[0].preserve_active_plan'
+                        in str(ctx.value)
+                    )
+
+    def test_parse_rejects_preserve_active_plan_on_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._write_workflow_config(
+                tmpdir,
+                '[workflow.simple.steps.s1]\n'
+                'role = "architect"\n'
+                'prompts = ["p"]\n'
+                'go = [{ to = "END", preserve_active_plan = true }]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                '[roles]\narchitect = "opencode.default"\n\n'
+                '[prompts]\np = "do it"\n',
+            )
+            with pytest.raises(ConfigError) as ctx:
+                load_workflow_config(config_path)
+            assert (
+                'workflow.simple.steps.s1.go[0].preserve_active_plan'
+                in str(ctx.value)
+            )
+            assert "'END'" in str(ctx.value)
 
     def test_parse_accepts_complex_condition_expressions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -310,6 +369,23 @@ class WorkflowConfigTests(unittest.TestCase):
         assert 'hard' in config.workflows
         assert 'jr' in config.workflows
         assert validate_workflow_config(config) == []
+
+    def test_bundled_workflows_preserve_repair_plans_on_review_edges(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config = load_workflow_config(repo_root / 'aflow' / 'aflow.toml')
+        review_impl = config.workflows[
+            'review_implement_review'
+        ].steps['implement_plan'].go
+        assert review_impl[1].preserve_active_plan is True
+        assert review_impl[2].preserve_active_plan is True
+        checkpoint_impl = config.workflows[
+            'review_implement_cp_review'
+        ].steps['implement_plan'].go
+        assert checkpoint_impl[1].preserve_active_plan is True
+        followup = config.workflows[
+            'review_implement_cp_review'
+        ].steps['followup'].go
+        assert followup[1].preserve_active_plan is True
 
     def test_bundled_docs_and_configs_reflect_split_schema(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

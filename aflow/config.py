@@ -134,6 +134,7 @@ class ErrorHandlingConfig:
 class GoTransition:
     to: str
     when: str | None = None
+    preserve_active_plan: bool = False
 
 
 @dataclass(frozen=True)
@@ -471,7 +472,23 @@ def _parse_go_transitions(
         if when_value is not None:
             when_str = _require_text(when_value, path=f"{entry_path}.when")
             _validate_condition_symbols(when_str, path=entry_path)
-        transitions.append(GoTransition(to=to_value, when=when_str))
+        preserve_active_plan = entry.get("preserve_active_plan", False)
+        if not isinstance(preserve_active_plan, bool):
+            raise ConfigError(
+                f"expected {entry_path}.preserve_active_plan to be a boolean"
+            )
+        if to_value == "END" and preserve_active_plan:
+            raise ConfigError(
+                f"{entry_path}.preserve_active_plan cannot be true when "
+                f"{entry_path}.to is 'END'"
+            )
+        transitions.append(
+            GoTransition(
+                to=to_value,
+                when=when_str,
+                preserve_active_plan=preserve_active_plan,
+            )
+        )
     return tuple(transitions)
 
 

@@ -274,6 +274,7 @@ def _detect_resume_candidate(
     main_branch = prev_run.get("main_branch")
     lifecycle_setup = prev_run.get("lifecycle_setup")
     lifecycle_teardown = prev_run.get("lifecycle_teardown")
+    active_plan_path = prev_run.get("active_plan_path")
 
     if not isinstance(feature_branch, str) or not isinstance(worktree_path, str) or not isinstance(main_branch, str):
         if require_resume:
@@ -294,6 +295,9 @@ def _detect_resume_candidate(
         main_branch=main_branch,
         setup=tuple(lifecycle_setup),
         teardown=tuple(lifecycle_teardown),
+        active_plan_path=(
+            Path(active_plan_path) if isinstance(active_plan_path, str) else None
+        ),
     )
 
 

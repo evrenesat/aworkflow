@@ -86,6 +86,7 @@ class ResumeContext:
     main_branch: str
     setup: tuple[str, ...]
     teardown: tuple[str, ...]
+    active_plan_path: Path | None = None
 
 
 @dataclass

@@ -3986,6 +3986,255 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert run_json2['feature_branch'] == original_feature_branch
             assert run_json2['worktree_path'] == original_worktree_path
 
+    def test_resume_restores_active_plan_from_reused_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            wf_config = _make_worktree_wf_config(
+                worktree_root=str(worktree_root)
+            )
+
+            with pytest.raises(WorkflowError) as first_ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                        argv, 1, 'failed', 'first run failed'
+                    ),
+                )
+
+            first_run = json.loads(
+                (first_ctx.value.run_dir / 'run.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            worktree_path = Path(first_run['worktree_path'])
+            logical_repair = repo_root / 'plan-cp01-v01.md'
+            execution_repair = worktree_path / logical_repair.relative_to(
+                repo_root
+            )
+            execution_repair.write_text('# Repair\n', encoding='utf-8')
+            captured_prompt: list[str] = []
+
+            def resumed_runner(argv, **kwargs):
+                captured_prompt.append(' '.join(argv))
+                return subprocess.CompletedProcess(
+                    argv, 1, 'failed', 'resumed run failed'
+                )
+
+            resume_ctx = ResumeContext(
+                resumed_from_run_id=first_ctx.value.run_dir.name,
+                feature_branch=first_run['feature_branch'],
+                worktree_path=worktree_path,
+                main_branch='main',
+                setup=('worktree', 'branch'),
+                teardown=('merge', 'rm_worktree'),
+                active_plan_path=logical_repair,
+            )
+
+            with pytest.raises(WorkflowError):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=resumed_runner,
+                    resume=resume_ctx,
+                )
+
+            assert captured_prompt
+            assert str(execution_repair) in captured_prompt[0]
+
+    def test_preserved_active_plan_uses_worktree_execution_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            base = _make_worktree_wf_config(
+                worktree_root=str(worktree_root)
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    'review': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('p',),
+                        go=(GoTransition(to='rework'),),
+                    ),
+                    'rework': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('p',),
+                        go=(
+                            GoTransition(
+                                to='review',
+                                preserve_active_plan=True,
+                            ),
+                        ),
+                    ),
+                },
+                first_step='review',
+                setup=('worktree', 'branch'),
+                teardown=('merge', 'rm_worktree'),
+                main_branch='main',
+            )
+            wf_config = WorkflowUserConfig(
+                aflow=base.aflow,
+                roles=base.roles,
+                harnesses=base.harnesses,
+                workflows={'repair_loop': workflow},
+                prompts={'p': 'Active: {ACTIVE_PLAN_PATH}.'},
+            )
+            captured_active: list[str] = []
+            logical_repair = repo_root / 'plan-cp01-v01.md'
+
+            def runner(argv, **kwargs):
+                if len(captured_active) >= 3:
+                    return subprocess.CompletedProcess(
+                        argv, 1, 'recovery failed', ''
+                    )
+                prompt = ' '.join(argv)
+                import re as _re
+                match = _re.search(r'Active: (\S+)', prompt)
+                assert match is not None
+                captured_active.append(match.group(1).rstrip('.'))
+                if len(captured_active) == 1:
+                    execution_repair = (
+                        Path(kwargs['cwd'])
+                        / logical_repair.relative_to(repo_root)
+                    )
+                    execution_repair.write_text(
+                        '# Repair\n', encoding='utf-8'
+                    )
+                    return subprocess.CompletedProcess(argv, 0, 'ok', '')
+                if len(captured_active) == 2:
+                    return subprocess.CompletedProcess(argv, 0, 'ok', '')
+                return subprocess.CompletedProcess(
+                    argv, 1, 'stop after assertion', ''
+                )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=4,
+                    ),
+                    wf_config,
+                    'repair_loop',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_payload = json.loads(
+                (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            execution_root = Path(run_payload['worktree_path'])
+            execution_plan = execution_root / plan_path.relative_to(repo_root)
+            execution_repair = execution_root / logical_repair.relative_to(
+                repo_root
+            )
+            assert captured_active[:3] == [
+                str(execution_plan),
+                str(execution_repair),
+                str(execution_repair),
+            ]
+            assert run_payload['active_plan_path'] == str(logical_repair)
+
+    def test_resume_rejects_missing_saved_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            wf_config = _make_worktree_wf_config(
+                worktree_root=str(worktree_root)
+            )
+
+            with pytest.raises(WorkflowError) as first_ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                        argv, 1, 'failed', 'first run failed'
+                    ),
+                )
+
+            first_run = json.loads(
+                (first_ctx.value.run_dir / 'run.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            runner_called = [False]
+
+            def unexpected_runner(argv, **kwargs):
+                runner_called[0] = True
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            resume_ctx = ResumeContext(
+                resumed_from_run_id=first_ctx.value.run_dir.name,
+                feature_branch=first_run['feature_branch'],
+                worktree_path=Path(first_run['worktree_path']),
+                main_branch='main',
+                setup=('worktree', 'branch'),
+                teardown=('merge', 'rm_worktree'),
+                active_plan_path=repo_root / 'missing-repair.md',
+            )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=unexpected_runner,
+                    resume=resume_ctx,
+                )
+
+            assert runner_called[0] is False
+            assert 'cannot resume with the saved active plan' in str(ctx.value)
+
     def test_resume_does_not_create_second_worktree(self) -> None:
         """Test that accepted resume does not create a second linked worktree."""
         with tempfile.TemporaryDirectory() as tmpdir:
