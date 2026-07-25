@@ -1280,6 +1280,29 @@ def _primary_plan_path(path: Path, exec_ctx: ExecutionContext | None) -> Path:
         return path
 
 
+def _select_next_active_plan_path(
+    *,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    new_plan_path: Path,
+    new_plan_exists: bool,
+    selected_transition: GoTransition,
+    exec_ctx: ExecutionContext | None,
+) -> Path:
+    if new_plan_exists:
+        return new_plan_path
+    if selected_transition.preserve_active_plan:
+        execution_path = _exec_plan_path(active_plan_path, exec_ctx)
+        if not execution_path.is_file():
+            raise WorkflowError(
+                "cannot preserve active plan for transition to "
+                f"'{selected_transition.to}': active plan does not exist in the "
+                f"execution checkout: {execution_path}"
+            )
+        return active_plan_path
+    return original_plan_path
+
+
 def _list_followup_plan_candidates(original_plan_path: Path) -> set[Path]:
     parent = original_plan_path.parent
     suffix = original_plan_path.suffix
@@ -2438,6 +2461,15 @@ def run_workflow(
                     effective_startup_base_head_refresh_sha if should_refresh_pre_handoff_base_head else None
                 ),
             )
+            if resume.active_plan_path is not None:
+                active_plan_path = resume.active_plan_path
+                active_execution_path = _exec_plan_path(active_plan_path, exec_ctx)
+                if not active_execution_path.is_file():
+                    raise WorkflowError(
+                        "cannot resume with the saved active plan because it does "
+                        "not exist in the reused execution checkout: "
+                        f"{active_execution_path}"
+                    )
         except WorkflowError as exc:
             state.status_message = "failed"
             banner.stop(state)
@@ -4030,8 +4062,36 @@ def run_workflow(
 
         if transition_target != "END":
             state.current_team_override = None
-        if not new_plan_exists and active_plan_path != original_plan_path:
-            active_plan_path = original_plan_path
+        if selected_transition is None:
+            raise WorkflowError("internal error: transition selection produced no result")
+        try:
+            active_plan_path = _select_next_active_plan_path(
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                new_plan_exists=new_plan_exists,
+                selected_transition=selected_transition,
+                exec_ctx=exec_ctx,
+            )
+        except WorkflowError as exc:
+            state.status_message = "failed"
+            summary = _format_failure(
+                reason=exc.summary,
+                run_dir=run_paths.run_dir,
+                snapshot=state.last_snapshot,
+            )
+            write_run_metadata(
+                run_paths, config, state, status="failed", failure_reason=summary,
+                turns_completed=state.turns_completed,
+                last_snapshot=state.last_snapshot,
+                execution_context=exec_ctx,
+                workflow_name=workflow_name, original_plan_path=original_plan_path,
+                current_step_name=current_step_name, active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            banner.stop(state)
+            raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
         banner.set_context(
             active_plan_path=active_plan_path,

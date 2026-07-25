@@ -38,8 +38,8 @@ role = "worker"
 prompts = ["implementation_plans", "cp_loop_implementation"]
 go = [
   { to = "END", when = "MAX_TURNS_REACHED" },
-  { to = "review_implementation", when = "DONE" },
-  { to = "implement_plan" },
+  { to = "review_implementation", when = "DONE", preserve_active_plan = true },
+  { to = "implement_plan", preserve_active_plan = true },
 ]
 
 [workflow.review_implement_review.steps.review_implementation]
@@ -66,7 +66,7 @@ role = "worker"
 prompts = ["implementation_plans", "cp_loop_implementation"]
 go = [
   { to = "END", when = "MAX_TURNS_REACHED" },
-  { to = "review_cp_implementation" },
+  { to = "review_cp_implementation", preserve_active_plan = true },
 ]
 
 [workflow.review_implement_cp_review.steps.review_cp_implementation]
@@ -93,7 +93,7 @@ role = "senior_architect"
 prompts = ["implementation_plans", "followup_implementation"]
 go = [
   { to = "END", when = "MAX_TURNS_REACHED" },
-  { to = "final_review" },
+  { to = "final_review", preserve_active_plan = true },
 ]
 
 # Alias workflows
@@ -102,5 +102,4 @@ extends = "review_implement_cp_review"
 
 [workflow.medium]
 extends = "review_implement_review"
-
 

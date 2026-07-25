@@ -114,6 +114,19 @@ merge_prompt = ["simple_merge"]
 - `prompts` must be a non-empty array of prompt keys.
 - `go` transitions are checked in declaration order. First match wins.
 - A transition without `when` is an unconditional fallback.
+- `preserve_active_plan` is an optional transition boolean that defaults to
+  `false`. When `true`, a non-`END` transition keeps the current active plan if
+  the turn did not create a replacement. A newly created plan always takes
+  precedence. Preservation is invalid on transitions to `END`.
+
+Repair implementation can therefore return to review with the same overlay:
+
+```toml
+go = [
+  { to = "END", when = "MAX_TURNS_REACHED" },
+  { to = "review_checkpoint", preserve_active_plan = true },
+]
+```
 
 Accepted lifecycle combinations are:
 
@@ -128,7 +141,7 @@ When teardown includes `merge`, config validation requires `[aflow].team_lead` a
 Supported condition symbols:
 
 - `DONE` - true when the original user-supplied plan file is complete after the current step finishes.
-- `NEW_PLAN_EXISTS` - true when the current step created the generated candidate file at `NEW_PLAN_PATH`.
+- `NEW_PLAN_EXISTS` - true only when the current step created the generated candidate file at `NEW_PLAN_PATH`; it does not describe an earlier active repair plan.
 - `MAX_TURNS_REACHED` - true only on the last allowed turn.
 
 Boolean expressions support `&&`, `||`, `!`, and parentheses.

@@ -1,3 +1,22 @@
+## 2026-07-23 — Preserve active repair plans across review transitions
+
+### What changed
+
+- Added opt-in `preserve_active_plan` policy to non-`END` workflow transitions.
+- Active-plan selection now gives a newly created plan precedence, preserves an
+  existing repair plan only on opted-in transitions, and otherwise retains the
+  compatibility behavior of resetting to the original plan.
+- Added missing-file guards for preserving and resumed worktree paths and marked
+  the bundled implementation/follow-up-to-review edges that require retention.
+
+### Why
+
+- Review-created repair plans were being discarded after a successful rework
+  turn with `NEW_PLAN_EXISTS = false`, causing review/rework loops to alternate
+  against the wrong plan.
+- `NEW_PLAN_EXISTS` is a turn event; persistent active-plan state must be decided
+  explicitly by the selected transition.
+
 ## 2026-04-07 — Workflow show command and excluded-step documentation (Checkpoint 4)
 
 ### What changed
@@ -208,12 +227,18 @@
 
 - **Untracked plans under `plans/` are a natural workflow state** for checkpoint-based handoffs where each agent iteration produces a new plan variant. Requiring them to be git-tracked was an artificial barrier, especially when `plans/backups/` and `plans/done/` are engine artifacts.
 - **Plan-only dirtiness is safe to allow** because changes under `plans/` do not affect compiled code or normal workflows; they only affect `aflow` itself. Unrelated dirtiness (code changes, config, etc.) still blocks startup.
-- **Original-plan-only sync is the minimal contract** needed to support untracked plans. Follow-up plans created via `NEW_PLAN_EXISTS` remain transient/worktree-local, so syncing only the original plan is sufficient for restart and state consistency.
+- **Original-plan-only sync remains the minimal copy contract.** Follow-up plans
+  stay worktree-local, while their logical primary paths are retained in run
+  metadata so a reused worktree can resume them safely.
 
 ### Gotchas
 
-- **Original-plan-only sync:** This handoff syncs only the original plan file, not follow-up plans. If a worktree turn creates a new plan via `NEW_PLAN_EXISTS`, that plan stays in the worktree and does not affect the primary checkout. This is intentional — follow-up plans are not durable or restartable in this version.
-- **Transient follow-up plans:** Do not rely on follow-up-plan persistence across `aflow` invocations or restarts. They live only in the worktree for the duration of the run. If you need a follow-up plan to survive a restart or later invocation, implement that as part of the plan-update logic in your harness steps, not as worktree transience.
+- **Original-plan-only sync:** This handoff syncs only the original plan file, not
+  follow-up plans. A follow-up stays in its linked worktree; resume is supported
+  only while that same worktree and saved active path remain available.
+- **Transient follow-up plans:** Follow-up plans are not copied into the primary
+  checkout. Reusing the recorded worktree can restore one; a missing saved file
+  now fails clearly instead of silently resetting.
 - **Dirty-path prefix matching:** The `plans/` classification uses exact `startswith("plans/")` checks, not substring matching. Paths like `plans_backup/` or `my-plans/foo` are treated as unrelated dirtiness and will block startup. This strict rule prevents accidental allow-listing of unintended directories.
 - **Primary copy is the authority:** The original plan file in the primary checkout is the long-lived source of truth for plan state across runs. The worktree copy is a working copy that is synced back after each turn. If both the primary and worktree copies are edited externally between turns, the worktree copy wins (because it is synced after the harness returns).
 
