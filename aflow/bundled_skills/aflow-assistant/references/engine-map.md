@@ -35,6 +35,7 @@ Conceptually the flow is:
    - reload plan
    - decide transition
    - write turn-complete artifacts and update `run.json`
+   - optionally run the read-only manager gate before applying the proposed action
 8. Optional merge / teardown
 9. Final status write
 
@@ -71,6 +72,8 @@ The run-log subsystem persists:
 
 - one `run.json` per run
 - one `turns/turn-NNN/` directory per turn
+- one `manager/decision-NNN/` directory per manager call, with exact context, prompts, response streams, and result
+- `manager-report.md` when supervision stops a created run
 - prompt artifacts
 - stdout and stderr
 - structured turn result metadata
@@ -111,6 +114,16 @@ For a run rooted at `.aflow/runs/<run-id>/`:
   - prompt construction evidence
 
 ## Expected Meanings Of Common Fields
+
+### Manager supervision
+
+Manager calls are read-only control gates, not workflow turns. They run after
+a finalized turn and before its proposed next action, including END. The
+compact run summary may point to pending notes, a one-step team override,
+manager history, or a report. Start with the report when present, then run
+`aflow analyze <run-id> --manager-context lite`; use Full only when the active
+plan itself is needed. Raw trace paths in context are references, not an
+invitation to scan every stream.
 
 - `failure_reason`
   - top-level workflow failure before merge finalization

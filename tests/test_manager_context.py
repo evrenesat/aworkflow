@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from aflow.analyzer import extract_aflow_stop
+from aflow.manager_context import DIAGNOSTIC_LIMIT, build_manager_context, extract_semantic_result
+from aflow.stop_marker import detect_stop_marker
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _snapshot(*, unchecked_steps: int = 1) -> dict[str, object]:
+    return {
+        "current_checkpoint_index": 1,
+        "current_checkpoint_name": "Checkpoint 1: Context",
+        "current_checkpoint_unchecked_step_count": unchecked_steps,
+        "is_complete": False,
+        "total_checkpoint_count": 1,
+        "unchecked_checkpoint_count": 1,
+    }
+
+
+def _write_turn(run_dir: Path, number: int, *, step: str, role: str, stdout: str, before: dict[str, object] | None = None, after: dict[str, object] | None = None) -> None:
+    turn_dir = run_dir / "turns" / f"turn-{number:03d}"
+    turn_dir.mkdir(parents=True)
+    _write_json(turn_dir / "result.json", {
+        "turn_number": number,
+        "step_name": step,
+        "step_role": role,
+        "status": "completed",
+        "returncode": 0,
+        "selector": "codex.nano",
+        "snapshot_before": before or _snapshot(),
+        "snapshot_after": after or _snapshot(),
+        "chosen_transition": "next",
+    })
+    (turn_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
+    (turn_dir / "stderr.txt").write_text("diagnostic only", encoding="utf-8")
+
+
+def _run(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    plan = repo / "plans" / "in-progress" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Secret implementation plan\n\n### [ ] Checkpoint 1: Context\n- [ ] private instruction\n", encoding="utf-8")
+    run_dir = repo / ".aflow" / "runs" / "run-1"
+    _write_json(run_dir / "run.json", {"plan_path": str(plan), "active_plan_path": str(plan), "original_plan_path": str(plan), "team": "base", "turns_completed": 1, "max_turns": 5})
+    return run_dir, plan
+
+
+def test_lite_and_full_context_keep_plan_boundary(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="complete semantic answer")
+
+    lite = build_manager_context(run_dir, level="lite")
+    full = build_manager_context(run_dir, level="full")
+
+    assert lite["schema_version"] == 1
+    assert lite["active_plan_content"] is None
+    assert "Secret implementation plan" not in json.dumps(lite)
+    assert full["active_plan_content"] == plan.read_text(encoding="utf-8")
+    assert lite["finished_turn"]["semantic_result"]["result"] == "complete semantic answer"
+    assert lite["finished_turn"]["raw_artifacts"][0]["path"] == "turns/turn-001/stdout.txt"
+
+
+def test_structured_semantics_and_bounded_large_trace_reference(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    stream = '\n'.join((json.dumps({"role": "assistant", "content": "first"}), json.dumps({"type": "result", "result": "complete final answer"})))
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=stream)
+    turn_dir = run_dir / "turns" / "turn-001"
+    (turn_dir / "stderr.txt").write_text("x" * (DIAGNOSTIC_LIMIT + 100), encoding="utf-8")
+
+    context = build_manager_context(run_dir)
+
+    assert extract_semantic_result(stream).result == "complete final answer"
+    assert context["finished_turn"]["semantic_result"]["extraction"] == "structured_stream"
+    assert len(context["finished_turn"]["diagnostics"]["stderr_excerpt"]) < DIAGNOSTIC_LIMIT + 100
+    assert context["finished_turn"]["raw_artifacts"][1]["byte_size"] == DIAGNOSTIC_LIMIT + 100
+    assert extract_semantic_result('{"type": "unknown"}').fallback is True
+
+
+def test_progress_detects_alternating_reviewer_non_convergence(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="attempt")
+    _write_turn(run_dir, 2, step="review", role="reviewer", stdout="rejected", after=_snapshot(unchecked_steps=2))
+    _write_turn(run_dir, 3, step="implement", role="implementer", stdout="attempt", before=_snapshot(unchecked_steps=2))
+    _write_turn(run_dir, 4, step="review", role="reviewer", stdout="rejected")
+    _write_turn(run_dir, 5, step="implement", role="implementer", stdout="attempt")
+
+    context = build_manager_context(run_dir)
+
+    progress = context["controller_state"]["progress"]
+    assert progress["unchanged_snapshot_turns"] == 2
+    assert progress["reviewer_rejection_count"] == 2
+    assert progress["reviewer_non_convergence"] is True
+    assert len(context["run_extract"]) == 5
+
+    in_memory = build_manager_context(run_dir, turns=[json.loads((run_dir / "turns" / "turn-005" / "result.json").read_text(encoding="utf-8")) | {"_turn_dir": run_dir / "turns" / "turn-005"}], run_metadata={"plan_path": str(run_dir.parent.parent.parent / "plans" / "in-progress" / "plan.md")})
+    assert in_memory["finished_turn"]["turn_number"] == 5
+
+
+def test_progress_detects_long_unchanged_tail(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    for number in range(1, 5):
+        _write_turn(run_dir, number, step="implement", role="implementer", stdout="no semantic plan change")
+
+    context = build_manager_context(run_dir)
+
+    assert context["controller_state"]["progress"]["unchanged_snapshot_turns"] == 4
+
+
+def test_context_tolerates_invalid_plan_and_prior_manager_artifacts(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan.write_text("### [x] Checkpoint 1: Context\n- [ ] broken state\n", encoding="utf-8")
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="AFLOW_STOP: deliberate stop")
+    _write_json(run_dir / "manager" / "decision-001" / "result.json", {"decision_number": 1, "status": "accepted", "action": "retry_current_step", "reason": "synthetic"})
+
+    context = build_manager_context(run_dir)
+
+    assert "inconsistent checkpoint state" in context["plan_state"]["parse_error"]
+    assert context["finished_turn"]["detected_stop"] == ["deliberate stop"]
+    assert context["run_extract"][-1]["kind"] == "manager_decision"
+
+
+def test_stop_parser_ignores_fences_and_placeholder_examples() -> None:
+    text = "```text\nAFLOW_STOP: <reason>\n```\nAFLOW_STOP: <reason>\nAFLOW_STOP: actual blocker\n"
+    assert extract_aflow_stop(text) == ["actual blocker"]
+    assert detect_stop_marker(text, "AFLOW_STOP: stderr blocker") == "actual blocker"

@@ -99,9 +99,19 @@ aflow analyze --repo-root path/to/repo <RUN_ID>
 aflow analyze
 aflow analyze --repo-root path/to/repo
 aflow analyze --all
+aflow analyze <RUN_ID> --manager-context lite
+aflow analyze <RUN_ID> --manager-context full --turn 3
 ```
 
 Single-run resolution uses the same lookup order as resume: explicit `RUN_ID`, shell-local last run id, `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`. `--all` switches to corpus mode.
+
+`--manager-context lite|full` rebuilds the same read-only versioned context
+that manager supervision used for a finalized workflow turn. `--turn N` selects
+that turn and otherwise defaults to the latest finalized turn. These options
+require single-run mode and never invoke a manager or alter run artifacts. Lite
+excludes plan prose; Full includes the complete active-plan body. For a stopped
+run, read `.aflow/runs/<RUN_ID>/manager-report.md` first; it is designed to
+explain the incident without requiring raw logs.
 
 ## Show
 

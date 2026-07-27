@@ -10,9 +10,10 @@ At a high level:
 2. If the workflow has lifecycle setup, `aflow` inspects git state, optionally bootstraps an empty repo, runs lifecycle preflight, and creates the execution environment.
 3. The run starts at the workflow's first declared step unless startup selected another step.
 4. The engine renders prompts, resolves the step role through the selected team and global roles, and runs the harness CLI once.
-5. After the harness returns, it re-reads the original plan and handles recovery or normal transitions.
-6. The next matching `go` transition chooses the next step or stops at `END`.
-7. If teardown includes `merge`, `aflow` invokes a merge handoff through the configured `team_lead` role and verifies the result.
+5. After the harness returns, it re-reads the original plan, computes the proposed recovery or normal transition, and durably finalizes the turn artifacts.
+6. When manager supervision is enabled, the manager accepts or changes that proposed control action before it is applied, including a proposed `END`.
+7. The next matching `go` transition then chooses the next step or stops at `END`.
+8. If teardown includes `merge`, `aflow` invokes a merge handoff through the configured `team_lead` role and verifies the result.
 
 At run start, `aflow` prints the new run ID immediately. Resumed runs also show which prior run they came from.
 
@@ -98,6 +99,45 @@ On the last allowed turn:
 
 `max_same_step_turns` limits consecutive selection of the same step in multi-step workflows. The streak resets only after a different step actually executes. Single-step workflows are not affected.
 
+## Interstep Manager Supervision
+
+With `[manager].enabled = true`, AFlow runs a read-only manager after every
+finalized workflow turn and before applying the controller's proposed
+transition, recovery, retry, or `END`. A manager call is not a workflow turn:
+it does not increase `turns_completed`, consume `max_turns`, create a checkpoint
+commit, or trigger same-step caps.
+
+The manager receives a reproducible, versioned context built from durable
+artifacts. Lite receives semantic results, plan snapshots and structured state,
+controller/routing counters, compact history, and bounded diagnostics. It does
+not receive active-plan content, prompts, or raw trace bodies. Full adds the
+complete active-plan Markdown. Full is chosen directly for semantic stalls,
+second reviewer rejection/non-convergence, explicit stop markers, invalid
+plans, and ambiguous failures; Lite can escalate once to Full at the same
+boundary.
+
+The strict manager protocol permits only controller actions: accept the
+proposal, retry, select an eligible implementation upgrade, select an eligible
+backup retry, escalate Lite to Full, or stop. It cannot choose arbitrary nodes,
+roles, teams, selectors, or business logic. Invalid or unavailable Lite output
+gets one Full attempt. Invalid or unavailable Full output stops the run with a
+deterministic report instead of starting another manager loop. A manager that
+changes repository, plan, git, config, or run-control state is detected and
+also stops the run.
+
+`continue` with notes stores immutable notes for the selected next step. They
+are injected once and cleared only when that step durably starts. A manager
+selected `upgrade_to` override is likewise persisted, affects only the next
+eligible implementation invocation, and is consumed only when that invocation
+starts. Both pending states survive a resume before consumption and are not
+replayed after consumption. See [Configuration](configuration.md#team-upgrade-routes)
+for routing rules and the distinction from `backup_team`.
+
+When manager supervision is disabled, AFlow retains its legacy transition and
+deterministic recovery behavior. Deterministic harness-recovery matches remain
+cheap proposed actions for an enabled manager to accept; only unmatched
+ambiguous failures are routed to Full supervision.
+
 Other early stop causes:
 
 - the plan is already complete before any turn starts
@@ -147,6 +187,19 @@ Saved data includes:
 - turn directories under `turns/turn-NNN/`
 - system, user, and effective prompts
 - argv and environment metadata
+- manager decisions under `manager/decision-NNN/`, each with immutable
+  `boundary.json` inputs, exact context, system/user prompts, stdout, stderr,
+  and parsed result. Historical analysis rebuilds the context from the boundary
+  inputs and reports any stored-context drift.
+- `manager-report.md` for a manager stop, manager protocol/mutation failure,
+  explicit workflow stop, or another terminal incident after run creation
+
+Manager artifacts remain separate from `turns/` so turn accounting stays
+stable. `run.json` contains only compact manager history, pending one-hop state,
+and the latest report path; raw traces are referenced by stable run-relative
+paths and byte sizes rather than copied into manager prompts. On failure the
+CLI prints the same self-contained report that is persisted, including evidence,
+attempts, plan/workspace state, and suggested next actions.
 - stdout and stderr
 - plan snapshots before and after each step
 - evaluated conditions and chosen transitions

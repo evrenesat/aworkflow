@@ -32,7 +32,7 @@ from .git_status import probe_worktree, classify_dirtiness_by_prefix
 from .plan import PlanParseError, load_plan, load_plan_tolerant
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
-from .run_state import WorkflowEndReason, describe_end_reason, ResumeContext
+from .run_state import WorkflowEndReason, describe_end_reason, manager_resume_fields, ResumeContext
 from .workflow import (
     WorkflowError,
     move_completed_plan_to_done,
@@ -73,7 +73,7 @@ INSTALL_SKILLS_HELP = """\
 Auto mode: omit DESTINATION to install the default bundled skills into each supported harness skill
 directory for the harness CLIs found on PATH.
 
-Manual mode: provide DESTINATION to install the nine default bundled skills into that root, one
+Manual mode: provide DESTINATION to install the default bundled skills into that root, one
 subdirectory per skill.
 
 Selection flags:
@@ -298,6 +298,7 @@ def _detect_resume_candidate(
         active_plan_path=(
             Path(active_plan_path) if isinstance(active_plan_path, str) else None
         ),
+        **manager_resume_fields(prev_run),
     )
 
 
@@ -487,6 +488,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-noise",
         action="store_true",
         help="Include low-signal test noise runs instead of filtering them out.",
+    )
+    analyze_parser.add_argument(
+        "--manager-context",
+        choices=("lite", "full"),
+        help="Rebuild the read-only manager context for a finalized turn.",
+    )
+    analyze_parser.add_argument(
+        "--turn",
+        type=int,
+        help="Finalized workflow turn number to use with --manager-context (default: latest).",
     )
 
     show_parser = subparsers.add_parser(
@@ -883,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
             all=args.all,
             limit=args.limit,
             include_noise=args.include_noise,
+            manager_context=args.manager_context,
+            turn=args.turn,
         )
         try:
             payload = analyze_runs(request)

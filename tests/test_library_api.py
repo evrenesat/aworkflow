@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 import subprocess
 import sys
@@ -836,6 +837,25 @@ class LibraryRunnerTests(unittest.TestCase):
         self.assertIsInstance(collected[0], RunStartedEvent)
         self.assertEqual(collected[0].workflow_name, "test")
 
+    def test_manager_event_payload_contains_only_compact_artifact_metadata(self) -> None:
+        from aflow.api import ManagerDecidedEvent
+
+        event = ManagerDecidedEvent.create(
+            decision_number=3,
+            level="full",
+            trigger="lite_escalation",
+            action="upgrade_next_implementation",
+            target_step="implement",
+            target_team="strong",
+            report_path=None,
+            artifact_paths={"context": "manager/decision-003/context.json"},
+        )
+
+        payload = asdict(event)
+        self.assertEqual(payload["event_type"].value, "manager_decided")
+        self.assertEqual(payload["artifact_paths"]["context"], "manager/decision-003/context.json")
+        self.assertNotIn("active_plan_content", json.dumps(payload, default=str))
+
 
 class LibraryAnalyzeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1016,3 +1036,49 @@ class LibraryAnalyzeTests(unittest.TestCase):
         self.assertEqual(payload["runs"][0]["recovery_summary"]["suggested_keywords"], ["throttled", "quota"])
         self.assertIn("harness_recovery_team_lead", payload["signal_counts"])
         self.assertIn("harness_recovery_keyword_suggestions", payload["signal_counts"])
+
+    def test_analyze_runs_rebuilds_selected_manager_context_without_plan_leak(self) -> None:
+        run_dir = self.repo_root / ".aflow" / "runs" / "20260401T000500Z-manager"
+        plan_path = self.repo_root / "plans" / "in-progress" / "plan.md"
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text(
+            "# Confidential plan\n\n### [ ] Checkpoint 1: Context\n- [ ] private step\n",
+            encoding="utf-8",
+        )
+        _write_json(
+            run_dir / "run.json",
+            {
+                "status": "running", "workflow_name": "test", "turns_completed": 2,
+                "plan_path": str(plan_path), "active_plan_path": str(plan_path),
+                "original_plan_path": str(plan_path), "manager_decision_number": 1,
+                "manager_history": [{
+                    "decision_number": 1, "level": "lite", "trigger": "post_turn",
+                    "action": "continue", "reason": "first pass",
+                    "artifact_path": "manager/decision-001",
+                }],
+            },
+        )
+        _write_turn(
+            run_dir, 1,
+            result={"turn_number": 1, "step_name": "implement", "step_role": "implementer",
+                    "status": "completed", "returncode": 0,
+                    "snapshot_before": _snapshot(), "snapshot_after": _snapshot()},
+            stdout="first semantic result",
+        )
+        _write_turn(
+            run_dir, 2,
+            result={"turn_number": 2, "step_name": "review", "step_role": "reviewer",
+                    "status": "completed", "returncode": 0,
+                    "snapshot_before": _snapshot(), "snapshot_after": _snapshot()},
+            stdout="second semantic result",
+        )
+
+        context = analyze_runs(AnalyzeRequest(
+            repo_root=self.repo_root, run_id=run_dir.name, manager_context="lite", turn=1,
+        ))
+
+        self.assertEqual(context["level"], "lite")
+        self.assertEqual(context["finished_turn"]["turn_number"], 1)
+        self.assertEqual(len(context["run_extract"]), 1)
+        self.assertIsNone(context["active_plan_content"])
+        self.assertNotIn("Confidential plan", json.dumps(context))

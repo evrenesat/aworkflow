@@ -6,6 +6,13 @@ class WorkflowCliTests(unittest.TestCase):
         parser = build_parser()
         assert parser.prog == 'aflow'
 
+    def test_analyze_parser_accepts_manager_context_and_turn(self) -> None:
+        args = build_parser().parse_args([
+            'analyze', 'run-123', '--manager-context', 'full', '--turn', '4',
+        ])
+        assert args.manager_context == 'full'
+        assert args.turn == 4
+
     def test_run_args_workflow_and_plan(self) -> None:
         workflow, plan, extra = _parse_run_args(['ralph', 'plan.md'])
         assert workflow == 'ralph'

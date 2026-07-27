@@ -107,6 +107,16 @@ class WorkflowHarnessConfig:
 class TeamConfig:
     roles: dict[str, str] = field(default_factory=dict)
     backup_team: str | None = None
+    upgrade_to: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagerConfig:
+    enabled: bool = False
+    lite_role: str | None = None
+    full_role: str | None = None
+    full_after_stalled_turns: int = 2
+    skill: str = "aflow-manager"
 
 
 @dataclass(frozen=True)
@@ -168,6 +178,7 @@ class WorkflowUserConfig:
     harnesses: dict[str, WorkflowHarnessConfig] = field(default_factory=dict)
     roles: dict[str, str] = field(default_factory=dict)
     teams: dict[str, TeamConfig] = field(default_factory=dict)
+    manager: ManagerConfig = field(default_factory=ManagerConfig)
     error_handling: ErrorHandlingConfig = field(default_factory=ErrorHandlingConfig)
     workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
     prompts: dict[str, str] = field(default_factory=dict)
@@ -308,7 +319,7 @@ def _parse_workflow_harness(
 
 
 def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
-    reserved_keys = {"roles", "backup_team"}
+    reserved_keys = {"roles", "backup_team", "upgrade_to"}
     inline_role_keys = [key for key in raw if key not in reserved_keys]
     roles_value = raw.get("roles")
     if roles_value is not None and inline_role_keys:
@@ -328,6 +339,38 @@ def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
     return TeamConfig(
         roles=roles,
         backup_team=_optional_text(raw.get("backup_team"), path=f"{path}.backup_team"),
+        upgrade_to=_optional_text(raw.get("upgrade_to"), path=f"{path}.upgrade_to"),
+    )
+
+
+def _parse_manager_config(raw: Mapping[str, object], *, path: str) -> ManagerConfig:
+    allowed = {"enabled", "lite_role", "full_role", "full_after_stalled_turns", "skill"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ConfigError(f"unsupported keys in {path}: {', '.join(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{path}.enabled must be a boolean")
+    lite_role = _optional_text(raw.get("lite_role"), path=f"{path}.lite_role")
+    full_role = _optional_text(raw.get("full_role"), path=f"{path}.full_role")
+    if enabled and lite_role is None:
+        raise ConfigError(f"{path}.lite_role is required when {path}.enabled is true")
+    if enabled and full_role is None:
+        raise ConfigError(f"{path}.full_role is required when {path}.enabled is true")
+    full_after_stalled_turns = raw.get("full_after_stalled_turns", 2)
+    if (
+        not isinstance(full_after_stalled_turns, int)
+        or isinstance(full_after_stalled_turns, bool)
+        or full_after_stalled_turns < 1
+    ):
+        raise ConfigError(f"{path}.full_after_stalled_turns must be an integer at least 1")
+    skill = _optional_text(raw.get("skill"), path=f"{path}.skill") or "aflow-manager"
+    return ManagerConfig(
+        enabled=enabled,
+        lite_role=lite_role,
+        full_role=full_role,
+        full_after_stalled_turns=full_after_stalled_turns,
+        skill=skill,
     )
 
 
@@ -852,6 +895,10 @@ def _parse_workflow_user_config(
         error_handling = _parse_error_handling_config(
             error_handling_table, path=f"{path}.error_handling"
         )
+    manager = ManagerConfig()
+    if "manager" in raw:
+        manager_table = _require_table(raw["manager"], path=f"{path}.manager")
+        manager = _parse_manager_config(manager_table, path=f"{path}.manager")
     teams: dict[str, TeamConfig] = {}
     if "teams" in raw:
         teams_table = _require_table(raw["teams"], path=f"{path}.teams")
@@ -887,6 +934,7 @@ def _parse_workflow_user_config(
         harnesses=harnesses,
         roles=roles,
         teams=teams,
+        manager=manager,
         error_handling=error_handling,
         workflows=workflows,
         prompts=prompts,
@@ -907,7 +955,7 @@ def load_workflow_config(
     except OSError as exc:
         raise ConfigError(f"unable to read config file {path}: {exc}") from exc
     sibling_path = path.with_name("workflows.toml")
-    aflow_allowed_top_level_keys = {"aflow", "harness", "roles", "teams", "prompts", "error_handling"}
+    aflow_allowed_top_level_keys = {"aflow", "harness", "roles", "teams", "prompts", "error_handling", "manager"}
     if sibling_path.exists():
         config = _parse_workflow_user_config(
             raw, path=path, allowed_top_level_keys=aflow_allowed_top_level_keys
@@ -931,6 +979,7 @@ def load_workflow_config(
             harnesses=config.harnesses,
             roles=config.roles,
             teams=config.teams,
+            manager=config.manager,
             error_handling=config.error_handling,
             workflows={**config.workflows, **sibling_config.workflows},
             prompts={**config.prompts, **sibling_config.prompts},
@@ -943,6 +992,11 @@ def load_workflow_config(
     if errors:
         raise ConfigError("; ".join(errors))
     return merged
+
+
+def load_config(config_path: Path | str | None = None) -> WorkflowUserConfig:
+    """Load the AFlow configuration through the public concise alias."""
+    return load_workflow_config(Path(config_path) if isinstance(config_path, str) else config_path)
 
 
 def _bootstrap_config_files(config_path: Path | None = None) -> tuple[Path, tuple[Path, ...]]:
@@ -1032,42 +1086,67 @@ def validate_workflow_config(
                     f"teams.{team_name}.{role_key} references unknown profile '{profile_name}' "
                     f"for harness '{harness_name}'"
                 )
-    for team_name, team_config in config.teams.items():
-        backup_team = team_config.backup_team
-        if backup_team is not None and backup_team not in config.teams:
-            errors.append(
-                f"teams.{team_name}.backup_team references unknown team '{backup_team}'"
-            )
-    visited: set[str] = set()
-    visiting: set[str] = set()
+    def validate_team_graph(attribute: str) -> None:
+        for team_name, team_config in config.teams.items():
+            target = getattr(team_config, attribute)
+            if target is not None and target not in config.teams:
+                errors.append(
+                    f"teams.{team_name}.{attribute} references unknown team '{target}'"
+                )
+        visited: set[str] = set()
+        visiting: set[str] = set()
 
-    def walk_backup_chain(team_name: str, chain: list[str]) -> None:
-        if team_name in visiting:
-            cycle_start = chain.index(team_name)
-            cycle = chain[cycle_start:] + [team_name]
-            errors.append(
-                f"teams.{team_name}.backup_team forms a cycle: {' -> '.join(cycle)}"
-            )
-            return
-        if team_name in visited:
-            return
-        visiting.add(team_name)
-        chain.append(team_name)
-        backup_team = config.teams[team_name].backup_team
-        if backup_team is not None and backup_team in config.teams:
-            walk_backup_chain(backup_team, chain)
-        chain.pop()
-        visiting.remove(team_name)
-        visited.add(team_name)
+        def walk_team_chain(team_name: str, chain: list[str]) -> None:
+            if team_name in visiting:
+                cycle_start = chain.index(team_name)
+                cycle = chain[cycle_start:] + [team_name]
+                errors.append(
+                    f"teams.{team_name}.{attribute} forms a cycle: {' -> '.join(cycle)}"
+                )
+                return
+            if team_name in visited:
+                return
+            visiting.add(team_name)
+            chain.append(team_name)
+            target = getattr(config.teams[team_name], attribute)
+            if target is not None and target in config.teams:
+                walk_team_chain(target, chain)
+            chain.pop()
+            visiting.remove(team_name)
+            visited.add(team_name)
 
-    for team_name in config.teams:
-        walk_backup_chain(team_name, [])
+        for team_name in config.teams:
+            walk_team_chain(team_name, [])
+
+    validate_team_graph("backup_team")
+    validate_team_graph("upgrade_to")
+
+    if config.manager.enabled:
+        assert config.manager.lite_role is not None
+        assert config.manager.full_role is not None
+        manager_roles = (config.manager.lite_role, config.manager.full_role)
+        for role in manager_roles:
+            if role not in config.roles and not any(role in team.roles for team in config.teams.values()):
+                errors.append(
+                    f"manager role '{role}' cannot be resolved through global or team roles"
+                )
+
     for wf_name, wf_config in config.workflows.items():
         if wf_config.extends is not None:
             errors.append(
                 f"workflow.{wf_name}.extends should not be present after materialization"
             )
         known_roles = set(config.roles)
+        if config.manager.enabled:
+            assert config.manager.lite_role is not None
+            assert config.manager.full_role is not None
+            team_roles = config.teams.get(wf_config.team).roles if wf_config.team in config.teams else {}
+            for manager_role in (config.manager.lite_role, config.manager.full_role):
+                if manager_role not in team_roles and manager_role not in config.roles:
+                    errors.append(
+                        f"workflow.{wf_name} manager role '{manager_role}' cannot be resolved through "
+                        f"team '{wf_config.team}' or global roles"
+                    )
         for step_name, step_config in wf_config.steps.items():
             role_name = step_config.role
             if role_name not in known_roles:

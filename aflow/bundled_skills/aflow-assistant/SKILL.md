@@ -139,6 +139,17 @@ Use these bundled resources first. They are part of the shipped skill and remain
      - the previous successful turn's `snapshot_after`
    - In worktree mode, remember the durable source of truth is the primary-checkout plan path after sync-back.
 
+## Manager-Supervised Runs
+
+When a run has manager history or a manager report path, start with the
+self-contained manager report and the analyzer context before opening raw
+streams. Use `aflow analyze <run-id> --manager-context lite` for the safe
+compact reconstruction; use Full only when active-plan content is necessary
+and authorized. The manager decision directories contain exact contexts and
+responses, while public status and events intentionally contain only compact
+metadata. Open referenced stdout or stderr only when that extracted evidence
+is insufficient.
+
 ## Failure Classification
 
 - `run.json.failure_reason`

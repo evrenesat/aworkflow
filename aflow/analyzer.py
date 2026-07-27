@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .runlog import resolve_last_run_id
+from .stop_marker import extract_stop_markers
 
-
-AFLOW_STOP_RE = re.compile(r"^AFLOW_STOP:\s*(.+?)\s*$", re.MULTILINE)
 
 TEXT_SIGNAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("blocked_review_precondition", re.compile(r"Blocked on a required `aflow-review-checkpoint` precondition\.", re.IGNORECASE)),
@@ -49,7 +48,7 @@ def relpath(path: Path, base: Path | None) -> str:
 
 
 def extract_aflow_stop(text: str) -> list[str]:
-    return [match.group(1).strip() for match in AFLOW_STOP_RE.finditer(text)]
+    return extract_stop_markers(text)
 
 
 def extract_text_signals(text: str) -> list[str]:
@@ -218,6 +217,15 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
     step_names = [turn.get("step_name") for turn in unchanged_tail if turn.get("step_name")]
     turn_numbers = [turn.get("turn_number") for turn in unchanged_tail if turn.get("turn_number") is not None]
     alternating_two_step = len(set(step_names)) == 2 if step_names else False
+    reviewer_rejection_count = 0
+    for previous, current in zip(finalized_turns, finalized_turns[1:]):
+        same_checkpoint = snapshot_signature(previous.get("snapshot_after")) == snapshot_signature(current.get("snapshot_before"))
+        previous_role = str(previous.get("step_role", "")).lower()
+        current_role = str(current.get("step_role", "")).lower()
+        previous_name = str(previous.get("step_name", "")).lower()
+        current_name = str(current.get("step_name", "")).lower()
+        if same_checkpoint and ("review" in previous_role or "review" in previous_name) and ("implement" in current_role or "implement" in current_name):
+            reviewer_rejection_count += 1
     return {
         "unchanged_snapshot_turns": len(unchanged_tail),
         "alternating_two_step_tail": alternating_two_step,
@@ -225,6 +233,8 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
         "tail_turn_numbers": turn_numbers,
         "tail_start_turn": turn_numbers[0] if turn_numbers else None,
         "tail_end_turn": turn_numbers[-1] if turn_numbers else None,
+        "reviewer_rejection_count": reviewer_rejection_count,
+        "reviewer_non_convergence": reviewer_rejection_count >= 2,
     }
 
 
@@ -374,6 +384,33 @@ def compact_turn(turn: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _manager_summary(run_json: dict[str, Any]) -> dict[str, Any]:
+    """Return durable manager metadata without exposing prompts or contexts."""
+    history = run_json.get("manager_history")
+    normalized_history = [
+        {
+            "decision_number": item.get("decision_number"),
+            "level": item.get("level"),
+            "trigger": item.get("trigger"),
+            "action": item.get("action"),
+            "reason": item.get("reason"),
+            "artifact_path": item.get("artifact_path"),
+        }
+        for item in history
+        if isinstance(item, dict)
+    ] if isinstance(history, list) else []
+    return {
+        "decision_count": int(run_json.get("manager_decision_number", len(normalized_history)) or 0),
+        "history": normalized_history,
+        "last_level": normalized_history[-1]["level"] if normalized_history else None,
+        "last_trigger": normalized_history[-1]["trigger"] if normalized_history else None,
+        "last_action": normalized_history[-1]["action"] if normalized_history else None,
+        "pending_notes": run_json.get("pending_manager_notes"),
+        "pending_upgrade": run_json.get("pending_step_team_override"),
+        "report_path": run_json.get("last_manager_report_path"),
+    }
+
+
 def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str, Any]], base: Path | None) -> dict[str, Any]:
     signals: set[str] = set()
     notes: list[str] = []
@@ -494,6 +531,7 @@ def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str,
         },
         "recovery_history": recovery_history,
         "recovery_summary": recovery_summary,
+        "manager": _manager_summary(run_json),
         "run_id": run_dir.name,
         "selected_start_step": run_json.get("selected_start_step"),
         "signal_turns": signal_turns,
@@ -516,6 +554,7 @@ def summarize_run_compact(run_dir: Path, run_json: dict[str, Any], turns: list[d
         "outcome": detailed["outcome"],
         "recovery_history": detailed["recovery_history"],
         "recovery_summary": detailed["recovery_summary"],
+        "manager": detailed["manager"],
         "paths": {
             "run_dir": detailed["paths"]["run_dir"],
             "run_json": detailed["paths"]["run_json"],
@@ -565,6 +604,10 @@ def analyze_corpus(
     analyzed_runs: list[dict[str, Any]] = []
     skipped_noise = 0
     signal_counts: Counter[str] = Counter()
+    manager_action_counts: Counter[str] = Counter()
+    manager_full_escalations = 0
+    manager_upgrade_usage = 0
+    manager_stops = 0
     base = runs_root.parent.parent
 
     for run_dir in run_dirs:
@@ -579,6 +622,13 @@ def analyze_corpus(
         summary = summarize_run_compact(run_dir, run_json, turns, base)
         analyzed_runs.append(summary)
         signal_counts.update(summary["failure"]["signals"])
+        for decision in summary["manager"]["history"]:
+            action = decision.get("action")
+            if isinstance(action, str):
+                manager_action_counts[action] += 1
+                manager_upgrade_usage += action == "upgrade_next_implementation"
+                manager_stops += action == "stop"
+            manager_full_escalations += decision.get("level") == "full"
 
     payload = {
         "analysis_scope": {
@@ -591,6 +641,12 @@ def analyze_corpus(
         },
         "runs": analyzed_runs,
         "signal_counts": dict(sorted(signal_counts.items())),
+        "manager": {
+            "action_counts": dict(sorted(manager_action_counts.items())),
+            "full_escalations": manager_full_escalations,
+            "upgrade_usage": manager_upgrade_usage,
+            "stops": manager_stops,
+        },
         "version": 2,
     }
     return payload

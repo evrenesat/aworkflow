@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -25,11 +25,21 @@ from .config import (
     WorkflowStepConfig,
     WorkflowUserConfig,
 )
+from .manager import (
+    ManagerDecisionError,
+    ManagerDecisionV1,
+    build_manager_prompts,
+    eligible_implementation_upgrade,
+    parse_manager_decision,
+    render_manager_stop_report,
+    resolve_manager_role,
+    validate_manager_decision,
+)
+from .manager_context import build_manager_context
 from .git_status import classify_dirtiness_by_prefix, RepoState, probe_repo_state
 from .harnesses import get_adapter
 from .harnesses.base import HarnessAdapter, HarnessInvocation
 from .plan import (
-    FENCE_RE,
     ParsedPlan,
     PlanParseError,
     PlanSnapshot,
@@ -50,10 +60,13 @@ from .recovery import (
     resolve_backup_team,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, HarnessRecoveryAction, HarnessRecoveryContext, IssueRecord, RetryContext, ResumeContext, TurnRecord, WorkflowEndReason, format_harness_model_display
-from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_run_metadata, write_turn_artifacts_start
+from .run_state import ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, TurnRecord, WorkflowEndReason, format_harness_model_display
+from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_run_metadata, write_turn_artifacts_start
+from .stop_marker import detect_stop_marker
 from .status import BannerRenderer, WorkflowGraphSource
 from aflow.api.events import (
+    ManagerDecidedEvent,
+    ManagerStartedEvent,
     RunCompletedEvent,
     RunFailedEvent,
     RunStartedEvent,
@@ -929,43 +942,8 @@ def _build_retry_appendix(parse_error_str: str) -> str:
     return f"{_RETRY_APPENDIX_INTRO}{parse_error_str}"
 
 
-_STOP_SENTINEL_PREFIX = "AFLOW_STOP:"
-_STOP_SENTINEL_FALLBACK_REASON = "implementer requested stop without a reason"
-_STOP_SENTINEL_PLACEHOLDER_REASON = "<reason>"
-
-
-def _iter_non_fenced_lines(text: str):
-    in_fence = False
-    fence_char: str | None = None
-    fence_len = 0
-
-    for line in text.splitlines():
-        fence_match = FENCE_RE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if not in_fence:
-                in_fence = True
-                fence_char = marker[0]
-                fence_len = len(marker)
-            elif marker[0] == fence_char and len(marker) >= fence_len:
-                in_fence = False
-                fence_char = None
-                fence_len = 0
-            continue
-
-        if not in_fence:
-            yield line
-
-
 def _detect_stop_marker(stdout: str, stderr: str) -> str | None:
-    for text in (stdout, stderr):
-        for line in _iter_non_fenced_lines(text):
-            if line.startswith(_STOP_SENTINEL_PREFIX):
-                reason = line[len(_STOP_SENTINEL_PREFIX):].strip()
-                if reason == _STOP_SENTINEL_PLACEHOLDER_REASON:
-                    continue
-                return reason or _STOP_SENTINEL_FALLBACK_REASON
-    return None
+    return detect_stop_marker(stdout, stderr)
 
 
 _BRANCH_STEM_MAX_LEN = 50
@@ -2443,6 +2421,15 @@ def run_workflow(
     state.current_team_override = None
 
     if resume is not None:
+        state.manager_decision_number = resume.manager_decision_number
+        state.manager_history = list(resume.manager_history)
+        state.semantic_stall_count = resume.semantic_stall_count
+        state.reviewer_rejection_count = resume.reviewer_rejection_count
+        state.implementation_attempts = dict(resume.implementation_attempts)
+        state.pending_manager_notes = resume.pending_manager_notes
+        state.pending_step_team_override = resume.pending_step_team_override
+        state.pending_boundary_decision = resume.pending_boundary_decision
+        state.last_manager_report_path = resume.last_manager_report_path
         try:
             _validate_worktree_resume_context(config.repo_root, resume)
             exec_ctx = ExecutionContext(
@@ -2570,6 +2557,15 @@ def run_workflow(
                 effective_startup_base_head_refresh_sha if should_refresh_pre_handoff_base_head else None
             ),
         )
+
+    pending_boundary = state.pending_boundary_decision
+    if pending_boundary is not None and not pending_boundary.consumed:
+        if pending_boundary.resolved_next_step is not None:
+            current_step_name = pending_boundary.resolved_next_step
+        if pending_boundary.post_transition_active_plan_path is not None:
+            restored_active_plan = Path(pending_boundary.post_transition_active_plan_path)
+            if restored_active_plan.is_file():
+                active_plan_path = restored_active_plan
 
     execution_repo_root = exec_ctx.execution_repo_root if exec_ctx else config.repo_root
 
@@ -2825,6 +2821,29 @@ def run_workflow(
         recovery_config = workflow_config.error_handling.harness_error_recovery
         team_lead_role = workflow_config.aflow.team_lead
 
+        def _supervise_scheduled_recovery() -> None:
+            """Offer the already-finalized operational retry to the manager."""
+            if not workflow_config.manager.enabled:
+                return
+            backup_team, _ = resolve_backup_team(active_team_name, workflow_config.teams)
+            backup_selector: str | None = None
+            if backup_team is not None:
+                try:
+                    backup_selector, _ = _resolve_step_runtime(
+                        step, workflow_config, team_name=backup_team,
+                        step_path=step_path,
+                    )
+                except WorkflowError:
+                    backup_selector = None
+            _manager_gate(
+                proposed_transition=step_name, current_step=step_name,
+                current_role=step.role, active_team=active_team_name,
+                active_selector=selector, post_transition_active_path=active_plan_path,
+                trigger="harness_recovery", proposed_action="recovery",
+                safely_retryable=True, operational_failure=True,
+                backup_team=backup_team, backup_selector=backup_selector,
+            )
+
         def _finalize_team_lead_failure(
             *,
             action: HarnessRecoveryAction,
@@ -2957,6 +2976,7 @@ def run_workflow(
                 },
                 recovery=recovery,
             )
+            _supervise_scheduled_recovery()
             write_run_metadata(
                 run_paths,
                 config,
@@ -2985,6 +3005,11 @@ def run_workflow(
             return False
         if matched_rule is None:
             if returncode == 0:
+                return False
+            # Manager supervision owns unmatched operational incidents.  Do
+            # not invoke the older team-lead handoff first: the finalized turn
+            # below is routed as one Full, stop-only boundary instead.
+            if workflow_config.manager.enabled:
                 return False
             if team_lead_role is None:
                 return False
@@ -3348,6 +3373,7 @@ def run_workflow(
                 },
                 recovery=recovery,
             )
+            _supervise_scheduled_recovery()
             write_run_metadata(
                 run_paths,
                 config,
@@ -3480,6 +3506,7 @@ def run_workflow(
                 },
                 recovery=recovery,
             )
+            _supervise_scheduled_recovery()
             write_run_metadata(
                 run_paths,
                 config,
@@ -3564,6 +3591,387 @@ def run_workflow(
 
         return False
 
+    def _manager_repo_fingerprint() -> tuple[str, str, tuple[tuple[str, str], ...]]:
+        """Capture only repository state that a read-only manager may not alter."""
+        _, head, _ = _run_git(["rev-parse", "HEAD"], cwd=execution_repo_root)
+        _, status, _ = _run_git(
+            ["status", "--porcelain=v1", "--untracked-files=all"], cwd=execution_repo_root
+        )
+        plan_hashes: list[tuple[str, str]] = []
+        for plan_path in (original_plan_path, active_plan_path):
+            try:
+                plan_hashes.append((str(plan_path), hashlib.sha256(plan_path.read_bytes()).hexdigest()))
+            except OSError:
+                plan_hashes.append((str(plan_path), "<missing>"))
+        return head.strip(), status, tuple(plan_hashes)
+
+    def _checkpoint_identity(plan_path: Path, snapshot: PlanSnapshot | None = None) -> str:
+        """Keep manager routing local to one active plan and original checkpoint."""
+        resolved_snapshot = snapshot
+        if resolved_snapshot is None:
+            try:
+                resolved_snapshot = load_plan_tolerant(plan_path).parsed_plan.snapshot
+            except (OSError, PlanParseError, ValueError):
+                resolved_snapshot = None
+        index = resolved_snapshot.current_checkpoint_index if resolved_snapshot is not None else None
+        return f"{plan_path}::checkpoint-{index if index is not None else 'complete'}"
+
+    def _write_manager_report(
+        context: dict[str, object], *, reason: str, decision: ManagerDecisionV1 | None = None
+    ) -> str:
+        report = render_manager_stop_report(
+            context=context,
+            stop_report=decision.stop_report if decision is not None else None,
+            failure_reason=reason,
+        )
+        path = run_paths.run_dir / "manager-report.md"
+        path.write_text(report, encoding="utf-8")
+        state.last_manager_report_path = "manager-report.md"
+        return report
+
+    def _manager_level_for_boundary(context: dict[str, object]) -> str:
+        controller = context.get("controller_state")
+        if not isinstance(controller, dict):
+            return "lite"
+        stalled = int(controller.get("semantic_stall_count", 0) or 0)
+        reviewer_failures = int(controller.get("reviewer_rejection_count", 0) or 0)
+        trigger = context.get("trigger")
+        if (
+            stalled >= workflow_config.manager.full_after_stalled_turns
+            or reviewer_failures >= 2
+            or trigger in {"explicit_stop", "invalid_plan", "ambiguous_failure", "same_step_cap", "max_turns", "merge_failure", "illegal_transition"}
+        ):
+            return "full"
+        return "lite"
+
+    def _run_manager_call(
+        *,
+        level: str,
+        boundary: FinalizedTurnBoundary,
+    ) -> tuple[ManagerDecisionV1 | None, dict[str, object], str | None]:
+        """Run and durably record one manager attempt without altering turn accounting."""
+        decision_number = state.manager_decision_number + 1
+        metadata = {
+            "run_id": state.run_id,
+            "team": baseline_team_name,
+            "max_turns": config.max_turns,
+            "turns_completed": state.turns_completed,
+            "original_plan_path": str(original_plan_path),
+            "active_plan_path": str(active_plan_path),
+            "current_step_name": current_step_name,
+        }
+        captured_active_plan = None
+        try:
+            captured_active_plan = _exec_plan_path(active_plan_path, exec_ctx).read_text(encoding="utf-8")
+        except OSError:
+            pass
+        fingerprint_before = _manager_repo_fingerprint()
+        boundary_payload = {
+            **boundary.__dict__,
+            "active_plan_content": captured_active_plan,
+            "workspace_state": {
+                "branch": exec_ctx.feature_branch if exec_ctx is not None else None,
+                "head": fingerprint_before[0],
+                "dirty_worktree": fingerprint_before[1],
+                "merge_state": "managed" if exec_ctx is not None and "merge" in exec_ctx.teardown else "none",
+            },
+        }
+        context = build_manager_context(
+            run_paths.run_dir,
+            level=level,  # type: ignore[arg-type]
+            trigger=boundary.trigger,
+            decision_number=decision_number,
+            run_metadata=metadata,
+            boundary=boundary_payload,
+            active_plan_content=captured_active_plan,
+        )
+        eligible = set(boundary.__dict__.get("eligible_actions", ()))
+        if level == "lite":
+            eligible.add("escalate_to_full")
+
+        system_prompt, user_prompt = build_manager_prompts(context)
+        artifact_dir = run_paths.manager_dir / f"decision-{decision_number:03d}"
+        artifact_paths = {
+            name: str((artifact_dir / filename).relative_to(run_paths.run_dir))
+            for name, filename in {
+                "context": "context.json", "system_prompt": "system-prompt.txt",
+                "user_prompt": "user-prompt.txt", "stdout": "stdout.txt",
+                "stderr": "stderr.txt", "result": "result.json",
+            }.items()
+        }
+        target_team = boundary.implementation_upgrade.get("target_team") if boundary.implementation_upgrade else boundary.actual_team
+        _emit_event(observer, ManagerStartedEvent.create(
+            decision_number=decision_number, level=level, trigger=boundary.trigger,
+            target_step=boundary.proposed_transition, target_team=target_team, artifact_paths=artifact_paths,
+        ))
+        stdout = ""
+        stderr = ""
+        result_payload: dict[str, object] = {
+            "decision_number": decision_number, "finalized_turn_number": boundary.finalized_turn_number,
+            "level": level, "trigger": boundary.trigger, "status": "invalid",
+        }
+        parsed: ManagerDecisionV1 | None = None
+        error: str | None = None
+        try:
+            role_resolution = resolve_manager_role(
+                workflow_config, level=level, baseline_team=baseline_team_name  # type: ignore[arg-type]
+            )
+            manager_profile = resolve_profile(role_resolution.selector, workflow_config, step_path="manager")
+            manager_adapter = adapter or get_adapter(manager_profile.harness_name)
+            manager_invocation = manager_adapter.build_invocation(
+                repo_root=execution_repo_root,
+                model=manager_profile.model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                effort=manager_profile.effort,
+            )
+            if runner is None:
+                completed = _run_process(manager_invocation, execution_repo_root, banner, state)
+            else:
+                completed = runner(
+                    list(manager_invocation.argv), cwd=str(execution_repo_root),
+                    env={**os.environ, **manager_invocation.env}, capture_output=True, text=True, check=False,
+                )
+            stdout, stderr = completed.stdout, completed.stderr
+            if completed.returncode != 0:
+                raise ManagerDecisionError(f"manager harness exited with code {completed.returncode}")
+            parsed = validate_manager_decision(
+                parse_manager_decision(stdout),
+                level=level,  # type: ignore[arg-type]
+                eligible_actions=eligible,
+                proposed_transition=boundary.proposed_transition,
+            )
+            result_payload.update({"status": "accepted", **parsed.to_dict()})
+        except (ManagerDecisionError, ValueError, WorkflowError) as exc:
+            error = str(exc)
+            result_payload["error"] = error
+
+        fingerprint_after = _manager_repo_fingerprint()
+        if fingerprint_after != fingerprint_before:
+            parsed = None
+            error = "manager mutated repository or plan state"
+            result_payload.update({"status": "mutation-detected", "error": error})
+        artifacts = write_manager_artifacts(
+            run_paths, decision_number=decision_number, context=context,
+            system_prompt=system_prompt, user_prompt=user_prompt, stdout=stdout, stderr=stderr,
+            result=result_payload,
+            boundary={
+                "decision_number": decision_number,
+                "trigger": boundary.trigger,
+                "run_metadata": metadata,
+                "boundary": boundary_payload,
+                "active_plan_content": captured_active_plan,
+            },
+        )
+        state.manager_decision_number = decision_number
+        state.manager_history.append(ManagerDecisionSummary(
+            decision_number=decision_number, level=level, trigger=boundary.trigger,
+            action=parsed.action if parsed is not None else "invalid",
+            reason=parsed.reason if parsed is not None else (error or "invalid manager result"),
+            artifact_path=str(artifacts.directory.relative_to(run_paths.run_dir)),
+        ))
+        action = parsed.action if parsed is not None else "invalid"
+        _emit_event(observer, ManagerDecidedEvent.create(
+            decision_number=decision_number, level=level, trigger=boundary.trigger, action=action,
+            target_step=boundary.proposed_transition, target_team=target_team,
+            report_path="manager-report.md" if action == "stop" else None,
+            artifact_paths=artifact_paths,
+        ))
+        return parsed, context, error
+
+    def _manager_gate(
+        *,
+        proposed_transition: str,
+        current_step: str,
+        current_role: str,
+        active_team: str | None,
+        active_selector: str,
+        post_transition_active_path: Path,
+        trigger: str = "post_turn",
+        proposed_action: str = "transition",
+        safely_retryable: bool = False,
+        operational_failure: bool = False,
+        backup_team: str | None = None,
+        backup_selector: str | None = None,
+    ) -> str:
+        """Accept or replace the controller transition after a durable turn."""
+        if not workflow_config.manager.enabled:
+            return proposed_transition
+        next_step = None if proposed_transition == "END" else proposed_transition
+        candidate_step = wf.steps.get(next_step) if next_step is not None else None
+        identity = _checkpoint_identity(active_plan_path)
+        attempts = state.implementation_attempts.get(identity, [])
+        recent_team = attempts[-1].team if isinstance(attempts, list) and attempts else None
+        upgrade = eligible_implementation_upgrade(
+            workflow_config,
+            role=candidate_step.role if candidate_step is not None else current_role,
+            baseline_team=baseline_team_name,
+            most_recent_implementation_team=recent_team,
+            is_implementation_attempt=candidate_step is not None and candidate_step.role == "worker",
+        )
+        eligible: set[str] = {"continue", "stop"}
+        if safely_retryable:
+            eligible.add("retry_current_step")
+        if operational_failure and backup_team is not None and backup_team != active_team:
+            eligible.add("switch_to_backup_and_retry")
+        if upgrade.available:
+            eligible.add("upgrade_next_implementation")
+        boundary = FinalizedTurnBoundary(
+            finalized_turn_number=state.active_turn,
+            artifact_path=f"turns/turn-{state.active_turn:03d}", trigger=trigger, terminal=False,
+            proposed_action=proposed_action, proposed_transition=proposed_transition,
+            current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
+            actual_team=active_team, actual_selector=active_selector,
+            original_plan_path=str(original_plan_path), active_plan_path=str(active_plan_path),
+            checkpoint_identity=identity, safely_retryable=safely_retryable,
+            operational_failure=operational_failure, backup_team=backup_team,
+            backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
+            eligible_actions=sorted(eligible),
+        )
+        # Build once to select Lite or Full without exposing plan text to Lite.
+        selection_context = build_manager_context(
+            run_paths.run_dir, level="lite", trigger=trigger,
+            run_metadata={"team": baseline_team_name, "max_turns": config.max_turns, "turns_completed": state.turns_completed,
+                          "original_plan_path": str(original_plan_path), "active_plan_path": str(active_plan_path)},
+            boundary=boundary.__dict__,
+        )
+        signals = selection_context.get("controller_state")
+        if isinstance(signals, dict):
+            state.semantic_stall_count = int(signals.get("semantic_stall_count", 0) or 0)
+            state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
+        level = _manager_level_for_boundary(selection_context)
+        decision, context, error = _run_manager_call(
+            level=level, boundary=boundary,
+        )
+        if decision is None and level == "lite" and error != "manager mutated repository or plan state":
+            boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_invalid", "evidence": error})
+            decision, context, error = _run_manager_call(
+                level="full", boundary=boundary,
+            )
+        elif decision is not None and decision.action == "escalate_to_full":
+            boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_escalation", "evidence": decision.reason})
+            decision, context, error = _run_manager_call(
+                level="full", boundary=boundary,
+            )
+        if decision is None:
+            report = _write_manager_report(context, reason=error or "manager did not return a valid decision")
+            state.status_message = "failed"
+            write_run_metadata(run_paths, config, state, status="failed", failure_reason=report,
+                               last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
+                               workflow_name=workflow_name, original_plan_path=original_plan_path,
+                               current_step_name=current_step_name, active_plan_path=active_plan_path,
+                               new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
+            raise WorkflowError(report, run_dir=run_paths.run_dir)
+        if decision.action == "stop":
+            report = _write_manager_report(context, reason=decision.reason, decision=decision)
+            state.status_message = "failed"
+            write_run_metadata(run_paths, config, state, status="failed", failure_reason=report,
+                               last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
+                               workflow_name=workflow_name, original_plan_path=original_plan_path,
+                               current_step_name=current_step_name, active_plan_path=active_plan_path,
+                               new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
+            raise WorkflowError(report, run_dir=run_paths.run_dir)
+
+        target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
+        target_config = wf.steps.get(target_step) if target_step not in {None, "END"} else None
+        target_plan = active_plan_path if target_step == current_step else post_transition_active_path
+        target_identity = _checkpoint_identity(target_plan)
+        target_team = upgrade.target_team if decision.action == "upgrade_next_implementation" else None
+        target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
+        if target_config is not None and target_selector is None:
+            try:
+                target_selector, _ = _resolve_step_runtime(
+                    target_config, workflow_config,
+                    team_name=target_team or active_team,
+                    step_path=f"workflow.{workflow_name}.steps.{target_step}",
+                )
+            except WorkflowError:
+                target_selector = None
+        state.pending_boundary_decision = PendingBoundaryDecision(
+            finalized_turn_number=state.active_turn, decision_number=state.manager_decision_number,
+            action=decision.action, proposed_action=boundary.proposed_action,
+            proposed_transition=proposed_transition, resolved_next_step=target_step,
+            target_role=target_config.role if target_config is not None else None,
+            target_team=target_team,
+            target_selector=target_selector,
+            checkpoint_identity=target_identity,
+            post_transition_active_plan_path=str(target_plan),
+            post_transition_checkpoint_identity=target_identity,
+            notes_reference=(f"manager/decision-{state.manager_decision_number:03d}" if decision.next_step_notes else None),
+        )
+        if decision.next_step_notes and target_step != "END":
+            state.pending_manager_notes = PendingManagerNotes(
+                target_step, decision.next_step_notes, state.manager_decision_number,
+                target_role=target_config.role if target_config is not None else None,
+                target_selector=target_selector,
+                checkpoint_identity=target_identity,
+            )
+        # This is intentionally before changing any controller routing state.
+        write_run_metadata(run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
+                           workflow_name=workflow_name, original_plan_path=original_plan_path,
+                           current_step_name=current_step_name, active_plan_path=active_plan_path,
+                           new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
+        if decision.action == "retry_current_step":
+            return current_step
+        if decision.action == "switch_to_backup_and_retry":
+            backup_team, _ = resolve_backup_team(active_team, workflow_config.teams)
+            if backup_team is None:
+                raise WorkflowError("manager selected unavailable backup-team retry", run_dir=run_paths.run_dir)
+            state.current_team_override = backup_team
+            return current_step
+        if decision.action == "upgrade_next_implementation":
+            assert next_step is not None
+            if not upgrade.available or upgrade.target_team is None or upgrade.target_selector is None:
+                raise WorkflowError("manager selected unavailable implementation upgrade", run_dir=run_paths.run_dir)
+            state.pending_step_team_override = PendingTeamOverride(
+                target_step=next_step, role=wf.steps[next_step].role, source_team=upgrade.source_team,
+                target_team=upgrade.target_team, selector=upgrade.target_selector,
+                checkpoint_identity=target_identity, decision_number=state.manager_decision_number,
+            )
+        return proposed_transition
+
+    def _manager_terminal_incident(
+        *,
+        trigger: str,
+        reason: str,
+        current_step: str | None,
+        current_role: str | None,
+        active_team: str | None,
+        active_selector: str | None,
+    ) -> str | None:
+        """Enrich a finalized controller incident without permitting recovery.
+
+        Full receives a single closed protocol choice: ``stop``.  Any invalid
+        output therefore falls through to the same deterministic report rather
+        than accidentally opening a second manager loop.
+        """
+        if not workflow_config.manager.enabled:
+            return None
+        boundary = FinalizedTurnBoundary(
+            finalized_turn_number=state.active_turn,
+            artifact_path=f"turns/turn-{state.active_turn:03d}", trigger=trigger, terminal=True,
+            proposed_action="stop", proposed_transition=None, current_step=current_step,
+            current_role=current_role, baseline_team=baseline_team_name, actual_team=active_team,
+            actual_selector=active_selector, original_plan_path=str(original_plan_path),
+            active_plan_path=str(active_plan_path), checkpoint_identity=_checkpoint_identity(active_plan_path),
+            eligible_actions=["stop"], evidence=reason,
+        )
+        decision, context, error = _run_manager_call(level="full", boundary=boundary)
+        report = _write_manager_report(
+            context,
+            reason=reason if decision is not None else (error or reason),
+            decision=decision if decision is not None and decision.action == "stop" else None,
+        )
+        state.last_manager_report_path = "manager-report.md"
+        # Keep report state durable even though the caller owns the final
+        # failure metadata and exception.
+        write_run_metadata(run_paths, config, state, status="failed", failure_reason=report,
+                           last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
+                           workflow_name=workflow_name, original_plan_path=original_plan_path,
+                           current_step_name=current_step_name, active_plan_path=active_plan_path,
+                           new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
+        return report
+
     for turn_number in range(1, config.max_turns + 1):
         retry_ctx = state.pending_retry
         active_team_name = (
@@ -3572,6 +3980,8 @@ def run_workflow(
             else state.current_team
         )
         followup_candidates_before: set[Path] = set()
+        consume_manager_notes = False
+        consume_team_override = False
 
         if retry_ctx is not None:
             state.status_message = (
@@ -3592,6 +4002,16 @@ def run_workflow(
             )
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+            pending_override = state.pending_step_team_override
+            if (
+                pending_override is not None
+                and not pending_override.consumed
+                and pending_override.target_step == current_step_name
+                and pending_override.role == step.role
+                and pending_override.checkpoint_identity == _checkpoint_identity(active_plan_path, retry_ctx.snapshot_before)
+            ):
+                active_team_name = pending_override.target_team
+                consume_team_override = True
             selector, resolved = _resolve_step_runtime(
                 step,
                 workflow_config,
@@ -3602,6 +4022,14 @@ def run_workflow(
             snapshot_before = retry_ctx.snapshot_before
             try:
                 user_prompt = retry_ctx.base_user_prompt + "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
+                pending_notes = state.pending_manager_notes
+                if (pending_notes is not None and not pending_notes.consumed
+                        and pending_notes.target_step == current_step_name
+                        and (pending_notes.target_role is None or pending_notes.target_role == step.role)
+                        and (pending_notes.target_selector is None or pending_notes.target_selector == selector)
+                        and (pending_notes.checkpoint_identity is None or pending_notes.checkpoint_identity == _checkpoint_identity(active_plan_path, retry_ctx.snapshot_before))):
+                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
+                    consume_manager_notes = True
                 invocation = step_adapter.build_invocation(
                     repo_root=execution_repo_root,
                     model=resolved.model,
@@ -3655,6 +4083,16 @@ def run_workflow(
 
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+            pending_override = state.pending_step_team_override
+            if (
+                pending_override is not None
+                and not pending_override.consumed
+                and pending_override.target_step == current_step_name
+                and pending_override.role == step.role
+                and pending_override.checkpoint_identity == _checkpoint_identity(active_plan_path, state.last_snapshot)
+            ):
+                active_team_name = pending_override.target_team
+                consume_team_override = True
             selector, resolved = _resolve_step_runtime(
                 step,
                 workflow_config,
@@ -3685,6 +4123,15 @@ def run_workflow(
                     extra_text = " ".join(config.extra_instructions).strip()
                     user_prompt = "\n\n".join((user_prompt, extra_text))
 
+                pending_notes = state.pending_manager_notes
+                if (pending_notes is not None and not pending_notes.consumed
+                        and pending_notes.target_step == current_step_name
+                        and (pending_notes.target_role is None or pending_notes.target_role == step.role)
+                        and (pending_notes.target_selector is None or pending_notes.target_selector == selector)
+                        and (pending_notes.checkpoint_identity is None or pending_notes.checkpoint_identity == _checkpoint_identity(active_plan_path, state.last_snapshot))):
+                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
+                    consume_manager_notes = True
+
                 invocation = step_adapter.build_invocation(
                     repo_root=execution_repo_root,
                     model=resolved.model,
@@ -3712,6 +4159,29 @@ def run_workflow(
             invocation=invocation,
             snapshot_before=snapshot_before,
         )
+        if consume_manager_notes:
+            state.pending_manager_notes = None
+        if consume_team_override:
+            state.pending_step_team_override = None
+        boundary_target_started = (
+            state.pending_boundary_decision is not None
+            and not state.pending_boundary_decision.consumed
+            and state.pending_boundary_decision.resolved_next_step == current_step_name
+            and (state.pending_boundary_decision.target_role is None or state.pending_boundary_decision.target_role == step.role)
+            and (state.pending_boundary_decision.checkpoint_identity is None or state.pending_boundary_decision.checkpoint_identity == _checkpoint_identity(active_plan_path, snapshot_before))
+            and (state.pending_boundary_decision.target_selector is None or state.pending_boundary_decision.target_selector == selector)
+        )
+        if consume_manager_notes or consume_team_override or boundary_target_started:
+            if boundary_target_started:
+                state.pending_boundary_decision = replace(
+                    state.pending_boundary_decision, applied=True, consumed=True
+                )
+            write_run_metadata(
+                run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
+                workflow_name=workflow_name, original_plan_path=original_plan_path,
+                current_step_name=current_step_name, active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
+            )
 
         if use_popen:
             completed = _run_process(invocation, execution_repo_root, banner, state)
@@ -3747,10 +4217,14 @@ def run_workflow(
                 active_path=active_plan_path,
                 new_path=new_plan_path,
             )
-            summary = _format_failure(
+            report = _manager_terminal_incident(
+                trigger="explicit_stop", reason=f"AFLOW_STOP: {stop_reason}",
+                current_step=current_step_name, current_role=step.role,
+                active_team=active_team_name, active_selector=selector,
+            )
+            summary = report or _format_failure(
                 reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
-                run_dir=run_paths.run_dir,
-                snapshot=snapshot_before,
+                run_dir=run_paths.run_dir, snapshot=snapshot_before,
             )
             write_run_metadata(
                 run_paths, config, state, status="failed", failure_reason=summary,
@@ -3880,10 +4354,12 @@ def run_workflow(
                 new_path=new_plan_path,
                 conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= config.max_turns},
             )
-            summary = _format_failure(
-                reason=str(exc),
-                run_dir=run_paths.run_dir,
-                snapshot=snapshot_before,
+            report = _manager_terminal_incident(
+                trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
+                current_role=step.role, active_team=active_team_name, active_selector=selector,
+            )
+            summary = report or _format_failure(
+                reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
                 parse_error=exc if isinstance(exc, PlanParseError) else None,
             )
             write_run_metadata(
@@ -3945,10 +4421,15 @@ def run_workflow(
                 new_path=new_plan_path,
                 conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= config.max_turns},
             )
-            summary = _format_failure(
+            report = _manager_terminal_incident(
+                trigger="ambiguous_failure",
                 reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
-                run_dir=run_paths.run_dir,
-                snapshot=post_snapshot,
+                current_step=current_step_name, current_role=step.role,
+                active_team=active_team_name, active_selector=selector,
+            )
+            summary = report or _format_failure(
+                reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
+                run_dir=run_paths.run_dir, snapshot=post_snapshot,
             )
             write_run_metadata(
                 run_paths, config, state, status="failed", failure_reason=summary,
@@ -4011,10 +4492,12 @@ def run_workflow(
                 new_path=new_plan_path,
                 conditions=conditions,
             )
-            summary = _format_failure(
-                reason=exc.summary,
-                run_dir=run_paths.run_dir,
-                snapshot=state.last_snapshot,
+            report = _manager_terminal_incident(
+                trigger="illegal_transition", reason=exc.summary, current_step=current_step_name,
+                current_role=step.role, active_team=active_team_name, active_selector=selector,
+            )
+            summary = report or _format_failure(
+                reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
             )
             write_run_metadata(
                 run_paths, config, state, status="failed", failure_reason=summary,
@@ -4058,6 +4541,95 @@ def run_workflow(
             ),
             was_retry=True if retry_ctx is not None else None,
             retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
+        )
+
+        if step.role == "worker":
+            attempt_key = _checkpoint_identity(active_plan_path, snapshot_before)
+            state.implementation_attempts.setdefault(attempt_key, []).append(ImplementationAttempt(
+                turn_number=turn_number, step_name=current_step_name, role=step.role,
+                team=active_team_name, selector=selector,
+                outcome="accepted" if done else "progress",
+                manager_decision_number=(state.pending_boundary_decision.decision_number
+                    if state.pending_boundary_decision is not None else None),
+            ))
+
+        post_transition_active_path = _select_next_active_plan_path(
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            new_plan_exists=new_plan_exists,
+            selected_transition=selected_transition,
+            exec_ctx=exec_ctx,
+        )
+
+        # Preserve the legacy MAX_TURNS transition when supervision is off.
+        # With supervision enabled, exhaustion is itself the finalized
+        # terminal boundary and must go directly to Full rather than through a
+        # normal Lite transition gate.
+        if workflow_config.manager.enabled and max_turns_reached and not done:
+            reason = f"reached max turns limit of {config.max_turns} without completing the active plan"
+            state.status_message = "failed"
+            report = _manager_terminal_incident(
+                trigger="max_turns", reason=reason, current_step=current_step_name,
+                current_role=step.role, active_team=active_team_name, active_selector=selector,
+            )
+            summary = report or _format_failure(
+                reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
+            )
+            write_run_metadata(
+                run_paths, config, state, status="failed", failure_reason=summary,
+                turns_completed=state.turns_completed, last_snapshot=post_snapshot,
+                execution_context=exec_ctx, workflow_name=workflow_name,
+                original_plan_path=original_plan_path, current_step_name=current_step_name,
+                active_plan_path=active_plan_path, new_plan_path=new_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            banner.stop(state)
+            raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+        # A same-step cap is a terminal controller boundary, not a normal
+        # transition followed by a second manager call.  Decide it before the
+        # ordinary gate so Full is invoked exactly once when supervision is on.
+        if len(wf.steps) > 1 and transition_target == current_step_name:
+            max_cap = workflow_config.aflow.max_same_step_turns
+            new_streak = (
+                state.consec_step_count + 1
+                if state.consec_step_name == current_step_name
+                else 1
+            )
+            if max_cap > 0 and new_streak >= max_cap:
+                reason = (
+                    f"same-step cap reached: step '{current_step_name}' "
+                    f"selected {new_streak} consecutive times (limit: {max_cap})"
+                )
+                state.status_message = "failed"
+                report = _manager_terminal_incident(
+                    trigger="same_step_cap", reason=reason,
+                    current_step=current_step_name, current_role=step.role,
+                    active_team=active_team_name, active_selector=selector,
+                )
+                _record_issue("same-step-cap", reason, turn_dir=turn_dir)
+                summary = report or _format_failure(
+                    reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
+                )
+                write_run_metadata(
+                    run_paths, config, state, status="failed", failure_reason=summary,
+                    turns_completed=state.turns_completed, last_snapshot=post_snapshot,
+                    execution_context=exec_ctx, workflow_name=workflow_name,
+                    original_plan_path=original_plan_path, current_step_name=current_step_name,
+                    active_plan_path=active_plan_path, new_plan_path=new_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                banner.stop(state)
+                raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+        transition_target = _manager_gate(
+            proposed_transition=transition_target,
+            current_step=current_step_name,
+            current_role=step.role,
+            active_team=active_team_name,
+            active_selector=selector,
+            post_transition_active_path=post_transition_active_path,
         )
 
         if transition_target != "END":
@@ -4185,10 +4757,14 @@ def run_workflow(
 
             if merge_status == "failed":
                 state.status_message = "failed"
-                summary = _format_failure(
+                report = _manager_terminal_incident(
+                    trigger="merge_failure", reason=merge_failure_reason or "merge teardown failed",
+                    current_step=current_step_name, current_role=step.role,
+                    active_team=merge_team_name, active_selector=selector,
+                )
+                summary = report or _format_failure(
                     reason=merge_failure_reason or "merge teardown failed",
-                    run_dir=run_paths.run_dir,
-                    snapshot=post_snapshot,
+                    run_dir=run_paths.run_dir, snapshot=post_snapshot,
                 )
                 write_run_metadata(
                     run_paths, config, state, status="failed",
@@ -4270,6 +4846,13 @@ def run_workflow(
                 )
                 if max_cap > 0 and new_streak >= max_cap:
                     state.status_message = "failed"
+                    _manager_terminal_incident(
+                        trigger="same_step_cap",
+                        reason=(f"same-step cap reached: step '{current_step_name}' "
+                                f"selected {new_streak} consecutive times (limit: {max_cap})"),
+                        current_step=current_step_name, current_role=step.role,
+                        active_team=active_team_name, active_selector=selector,
+                    )
                     _record_issue(
                         "same-step-cap",
                         (
@@ -4307,10 +4890,14 @@ def run_workflow(
         current_step_name = transition_target
 
     state.status_message = "failed"
-    summary = _format_failure(
+    report = _manager_terminal_incident(
+        trigger="max_turns", reason=f"reached max turns limit of {config.max_turns} without a transition to END",
+        current_step=current_step_name, current_role=None, active_team=state.current_team,
+        active_selector=None,
+    )
+    summary = report or _format_failure(
         reason=f"reached max turns limit of {config.max_turns} without a transition to END",
-        run_dir=run_paths.run_dir,
-        snapshot=state.last_snapshot,
+        run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
     )
     write_run_metadata(
         run_paths, config, state, status="failed", failure_reason=summary,

@@ -67,6 +67,34 @@ payload = analyze_runs(AnalyzeRequest(repo_root=Path("."), run_id="20260407-1217
 
 `AnalyzeRequest` uses the same single-run and corpus behavior as the CLI. Set `all=True` for corpus mode.
 
+To reproduce the shared manager context for a finalized turn without starting a
+manager or changing the run, pass `manager_context="lite"` or
+`manager_context="full"`. `turn` is optional and defaults to the latest
+finalized workflow turn; it requires `manager_context`, and manager context
+requests require a single run rather than `all=True`.
+
+```python
+context = analyze_runs(AnalyzeRequest(
+    repo_root=Path("."),
+    run_id="20260407-121715",
+    manager_context="lite",
+    turn=3,
+))
+```
+
+Lite remains safe for broad diagnostics because it excludes active-plan bodies,
+prompt text, and raw trace bodies. Full intentionally includes the complete
+active-plan content, so callers should handle it as sensitive run data.
+
+## Manager Events
+
+`ExecutionObserver` can receive additive `manager_started` and
+`manager_decided` events. They provide a decision number, level, trigger,
+action when decided, selected target step/team, optional report path, and
+run-relative manager artifact paths. Events intentionally do not embed the
+active plan, manager context, prompts, or raw stdout/stderr; retrieve those
+from the run directory only when authorized and needed.
+
 ## Public Types
 
 The stable public API includes:
@@ -85,5 +113,7 @@ The stable public API includes:
 - `execute_workflow`
 - `AnalyzeRequest`
 - `analyze_runs`
+- `ManagerStartedEvent`
+- `ManagerDecidedEvent`
 
 See [Architecture](../ARCHITECTURE.md) for module-level notes and model details.

@@ -17,7 +17,8 @@ flowchart TD
     Adapter["harnesses/ — build CLI invocation"]
     Subprocess["workflow.py — _run_process() via subprocess.Popen"]
     PlanReload["plan.py — reload plan, compute post-snapshot"]
-    Transition["workflow.py — evaluate_condition() + pick_transition()"]
+    Transition["workflow.py — evaluate_condition() + proposed transition"]
+    Manager["workflow.py — optional manager gate"]
     RunLog["runlog.py — write run metadata & turn artifacts"]
     Banner["status.py — Rich live banner on stderr"]
 
@@ -36,11 +37,23 @@ flowchart TD
     Adapter --> Subprocess
     Subprocess --> PlanReload
     PlanReload --> Transition
-    Transition -->|"to = step_name"| WorkflowLoop
-    Transition -->|"to = END"| Done["Return result"]
+    Transition --> Manager
+    Manager -->|"accepted next step"| WorkflowLoop
+    Manager -->|"accepted END"| Done["Return result"]
+    Manager -->|"stop"| Stopped["Persist manager report"]
     WorkflowLoop --> RunLog
     WorkflowLoop --> Banner
 ```
+
+## Interstep Manager Boundary
+
+After a workflow turn has durable final artifacts, the controller computes its
+proposed recovery or transition and optionally invokes the interstep manager
+before applying it. This includes a proposed terminal transition: merge and
+teardown begin only after the manager accepts that terminal action. Lite gets
+compact semantic evidence and structured state, while Full additionally gets
+the complete active plan. Manager calls and their exact artifacts live outside
+the workflow turn sequence, so they never affect turn counts or checkpoints.
 
 ## Module Breakdown
 
@@ -52,14 +65,15 @@ Entry point. Exposes three subcommands:
   - `--start-step`/`-ss` accepts either a workflow step name or a 1-based numeric index into the declared workflow step order.
   - `--resume [RUN_ID]` forces resume mode. With no `RUN_ID`, the CLI must resolve a resumable previous run from shell-local state or fail. With `RUN_ID`, the CLI resumes that exact run or fails.
 - **`aflow install-skills [destination]`** -- copies bundled skills into harness skill directories.
-  - The default install set is the nine default bundled skills, including `aflow-harness-recovery-lead`.
+  - The default install set includes `aflow-harness-recovery-lead` and `aflow-manager`.
   - `--include-optional` adds optional bundled skills such as `aflow-assistant`.
   - `--only` installs exactly the named skill(s).
 - **`aflow show [workflow_name]`** -- renders workflow diagrams and the effective role/team relationships from the loaded config.
   - With no workflow name, it prints a shared roles/teams section followed by every workflow in config order.
   - With a workflow name, it prints only that workflow plus the roles and teams that apply to it.
-- **`aflow analyze [RUN_ID] [--all]`** -- analyzes run logs from `.aflow/runs/`.
+- **`aflow analyze [RUN_ID] [--all] [--manager-context lite|full] [--turn N]`** -- analyzes run logs from `.aflow/runs/`.
   - Single-run mode resolves the target run in `analyzer.py`, and the CLI delegates to `aflow.api.analyze.analyze_runs()` so library callers get the same behavior.
+  - Manager-context mode is read-only and uses the same shared context builder as runtime; Lite excludes plan content and Full includes the active plan.
 
 `main()` resolves `aflow run` startup in this order:
 
@@ -88,6 +102,7 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - **`[aflow]`** section: `default_workflow`, `keep_runs`, `max_turns`, `retry_inconsistent_checkpoint_state`, `banner_files_limit`, `max_same_step_turns`, `team_lead`, `branch_prefix`, `worktree_prefix`, `worktree_root`.
 - **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
 - **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining.
+- **`[manager]`**: optional interstep supervision with Lite and Full role names, a semantic-stall threshold, and the bundled read-only skill name. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
 - **`[error_handling.harness_error_recovery]`**: ordered recovery rules, `max_consecutive_recoveries`, and the bundled fallback skill name used when deterministic matching cannot decide safely.
 - **`[prompts]`** section: named prompt templates.
 - Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) inherited by all workflows that don't override them. Not a runnable workflow.
@@ -134,9 +149,10 @@ The core engine. `run_workflow()` executes the turn loop:
       execution path while persisted controller state uses the primary-checkout
       logical path.
    l. Update run metadata with the active plan selected for the next turn.
-   m. If transition target is `END`, return. For multi-step workflows, check the same-step cap: if the same step has been selected consecutively `max_same_step_turns` times, fail the run before starting the next turn. Otherwise, advance to the next step.
+   m. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout fingerprints detect mutation. Its own invocation does not count as a workflow turn.
+   n. Persist accepted one-hop notes, exact selector, post-transition active plan, checkpoint identity, and an eligible implementation-team override before the next step begins. Resume restores an unconsumed target before launching it, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
 
-   Harness error recovery is inserted after the harness returns and before normal transition handling. If the turn made no plan progress and a configured error-handling rule matches the harness output, the engine applies the first deterministic rule in order. Rules can keep the same team, switch to a configured `backup_team`, or fail immediately. When no deterministic rule matches, the engine escalates to the configured team lead through the bundled `aflow-harness-recovery-lead` skill and expects a strict machine-readable decision. Progress-gated turns skip recovery entirely and continue on the normal transition path.
+   Harness error recovery is inserted after the harness returns and before normal transition handling. If the turn made no plan progress and a configured error-handling rule matches the harness output, the engine produces that cheap deterministic action for manager acceptance. Rules can keep the same team, switch to a configured `backup_team`, or fail immediately. An unmatched ambiguous error goes directly to Full supervision when enabled; manager-disabled runs retain the team-lead recovery handoff. Progress-gated turns skip recovery entirely and continue on the normal transition path.
 5. After normal workflow completion, if `teardown` includes `merge`, execute the merge handoff: resolve `[aflow].team_lead` through the effective team, build a merge prompt (built-in `aflow-merge` instruction plus rendered `merge_prompt` entries), and run the `team_lead` agent from the primary checkout. After the agent returns, verify: no unmerged index entries, clean working tree, HEAD on `main_branch`, and feature branch is an ancestor of the target. Only after all checks pass does `rm_worktree` (if configured) remove the linked worktree. Any verification failure leaves the feature branch and worktree intact and fails the run with the specific failed check.
 6. If the workflow uses the worktree+branch lifecycle, `aflow` can resume an unfinished prior run. Resume candidate lookup resolves the previous run id through the current shell's `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID` supplied an explicit run id. A run is resumable only when `run.json` shows a worktree lifecycle with recorded feature branch and worktree path, status `failed` or `running`, `last_snapshot.is_complete != true`, no `merge_status`, and the resolved invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup. Plain `aflow run` treats that as an optional interactive prompt in TTY mode and otherwise falls back to the fresh-run path. `aflow run --resume` makes resume mandatory: with no run id it must resolve a prior run from that lookup order or fail; with a run id it must use that run or fail. Accepted resume builds a `ResumeContext` from the recorded branch, worktree, and active logical plan path, validates that worktree and active execution path before prompting, and starts `run_workflow()` directly in the reused execution context instead of provisioning a fresh one. The plan file on disk still remains the durable checkpoint state.
 

@@ -37,7 +37,11 @@ aflow run path/to/plan.md
 
 ## Install Bundled Skills
 
-`aflow install-skills` copies the default bundled skills, including `aflow-harness-recovery-lead`, into harness skill directories. The optional `aflow-assistant` skill is not installed unless you ask for it.
+`aflow install-skills` copies the default bundled skills, including
+`aflow-harness-recovery-lead` and the read-only `aflow-manager`, into harness
+skill directories. The optional `aflow-assistant` skill is not installed unless
+you ask for it. Keep the legacy recovery skill installed even when using manager
+supervision: manager-disabled configurations retain that recovery path.
 
 Auto mode:
 

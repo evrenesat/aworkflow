@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any, Mapping
 from uuid import uuid4
 
 from .plan import PlanSnapshot
@@ -20,6 +21,7 @@ from .run_state import (
     HarnessRecoveryContext,
     RetryContext,
     WorkflowEndReason,
+    manager_state_payload,
 )
 from .harnesses.base import HarnessInvocation
 
@@ -51,7 +53,20 @@ class RunPaths:
     runs_root: Path
     run_dir: Path
     turns_dir: Path
+    manager_dir: Path
     run_json: Path
+
+
+@dataclass(frozen=True)
+class ManagerDecisionPaths:
+    directory: Path
+    context: Path
+    system_prompt: Path
+    user_prompt: Path
+    stdout: Path
+    stderr: Path
+    result: Path
+    boundary: Path
 
 
 def _utc_run_id() -> str:
@@ -65,6 +80,48 @@ def _json_dump(payload: dict[str, object]) -> str:
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(_json_dump(payload), encoding="utf-8")
+
+
+def manager_decision_paths(paths: RunPaths, decision_number: int) -> ManagerDecisionPaths:
+    if decision_number < 1:
+        raise ValueError("manager decision numbers start at 1")
+    directory = paths.manager_dir / f"decision-{decision_number:03d}"
+    return ManagerDecisionPaths(
+        directory=directory,
+        context=directory / "context.json",
+        system_prompt=directory / "system-prompt.txt",
+        user_prompt=directory / "user-prompt.txt",
+        stdout=directory / "stdout.txt",
+        stderr=directory / "stderr.txt",
+        result=directory / "result.json",
+        boundary=directory / "boundary.json",
+    )
+
+
+def write_manager_artifacts(
+    paths: RunPaths,
+    *,
+    decision_number: int,
+    context: Mapping[str, Any],
+    system_prompt: str,
+    user_prompt: str,
+    stdout: str = "",
+    stderr: str = "",
+    result: Mapping[str, Any] | None = None,
+    boundary: Mapping[str, Any] | None = None,
+) -> ManagerDecisionPaths:
+    """Persist exact manager inputs and outputs outside workflow turn artifacts."""
+    artifact_paths = manager_decision_paths(paths, decision_number)
+    artifact_paths.directory.mkdir(parents=True, exist_ok=False)
+    _write_json(artifact_paths.context, dict(context))
+    artifact_paths.system_prompt.write_text(system_prompt, encoding="utf-8")
+    artifact_paths.user_prompt.write_text(user_prompt, encoding="utf-8")
+    artifact_paths.stdout.write_text(stdout, encoding="utf-8")
+    artifact_paths.stderr.write_text(stderr, encoding="utf-8")
+    _write_json(artifact_paths.result, dict(result or {}))
+    if boundary is not None:
+        _write_json(artifact_paths.boundary, dict(boundary))
+    return artifact_paths
 
 
 def _aflow_dir(repo_root: Path) -> Path:
@@ -204,12 +261,14 @@ def create_run_paths(config: ControllerConfig) -> RunPaths:
     run_dir = runs_root / _utc_run_id()
     turns_dir = run_dir / "turns"
     turns_dir.mkdir(parents=True, exist_ok=False)
+    manager_dir = run_dir / "manager"
     run_json = run_dir / "run.json"
     paths = RunPaths(
         repo_root=config.repo_root,
         runs_root=runs_root,
         run_dir=run_dir,
         turns_dir=turns_dir,
+        manager_dir=manager_dir,
         run_json=run_json,
     )
     prune_old_runs(runs_root, config.keep_runs)
@@ -428,6 +487,17 @@ def write_run_metadata(
     issues_summary_path: str | None = None,
     resumed_from_run_id: str | None = None,
 ) -> None:
+    # A terminal manager report is the authoritative failure summary.  Some
+    # callers add merge/recovery metadata in a later write without repeating
+    # that summary; retain it rather than replacing it with an empty field.
+    if failure_reason is None and status == "failed" and paths.run_json.is_file():
+        try:
+            previous = json.loads(paths.run_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        previous_reason = previous.get("failure_reason") if isinstance(previous, Mapping) else None
+        if isinstance(previous_reason, str) and previous_reason.startswith("# AFlow manager report"):
+            failure_reason = previous_reason
     payload: dict[str, object] = {
         "repo_root": str(paths.repo_root),
         "run_dir": str(paths.run_dir),
@@ -511,6 +581,8 @@ def write_run_metadata(
         payload["recovery_rejection_reason"] = recovery.rejection_reason
     if state is not None and state.harness_recovery_history:
         payload.update(build_recovery_payload(state.current_harness_recovery, state.harness_recovery_history))
+    if state is not None:
+        payload.update(manager_state_payload(state))
     _write_json(paths.run_json, payload)
 
 

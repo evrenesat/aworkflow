@@ -20,6 +20,8 @@ class ExecutionEventType(str, Enum):
     STATUS_CHANGED = "status_changed"
     TURN_STARTED = "turn_started"
     TURN_FINISHED = "turn_finished"
+    MANAGER_STARTED = "manager_started"
+    MANAGER_DECIDED = "manager_decided"
     QUESTION_REQUIRED = "question_required"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
@@ -168,6 +170,63 @@ class TurnFinishedEvent:
 
 
 @dataclass(frozen=True)
+class ManagerStartedEvent:
+    """Event emitted immediately before a manager decision is requested."""
+
+    event_type: Literal[ExecutionEventType.MANAGER_STARTED]
+    timestamp: datetime
+    decision_number: int
+    level: str
+    trigger: str
+    target_step: str | None
+    target_team: str | None
+    artifact_paths: dict[str, str]
+
+    @classmethod
+    def create(
+        cls, *, decision_number: int, level: str, trigger: str,
+        target_step: str | None, target_team: str | None,
+        artifact_paths: dict[str, str],
+    ) -> ManagerStartedEvent:
+        return cls(
+            event_type=ExecutionEventType.MANAGER_STARTED,
+            timestamp=datetime.now(timezone.utc), decision_number=decision_number,
+            level=level, trigger=trigger, target_step=target_step,
+            target_team=target_team, artifact_paths=dict(artifact_paths),
+        )
+
+
+@dataclass(frozen=True)
+class ManagerDecidedEvent:
+    """Event emitted after a manager attempt is durably recorded."""
+
+    event_type: Literal[ExecutionEventType.MANAGER_DECIDED]
+    timestamp: datetime
+    decision_number: int
+    level: str
+    trigger: str
+    action: str
+    target_step: str | None
+    target_team: str | None
+    report_path: str | None
+    artifact_paths: dict[str, str]
+
+    @classmethod
+    def create(
+        cls, *, decision_number: int, level: str, trigger: str, action: str,
+        target_step: str | None, target_team: str | None,
+        report_path: str | None, artifact_paths: dict[str, str],
+    ) -> ManagerDecidedEvent:
+        return cls(
+            event_type=ExecutionEventType.MANAGER_DECIDED,
+            timestamp=datetime.now(timezone.utc), decision_number=decision_number,
+            level=level, trigger=trigger, action=action, target_step=target_step,
+            target_team=target_team, report_path=report_path,
+            artifact_paths=dict(artifact_paths),
+        )
+
+
+@dataclass(frozen=True)
 class QuestionRequiredEvent:
     """Event emitted when a workflow requires a question to be answered."""
 
@@ -277,6 +336,8 @@ ExecutionEvent = (
     | StatusChangedEvent
     | TurnStartedEvent
     | TurnFinishedEvent
+    | ManagerStartedEvent
+    | ManagerDecidedEvent
     | QuestionRequiredEvent
     | RunCompletedEvent
     | RunFailedEvent

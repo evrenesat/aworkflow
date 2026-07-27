@@ -60,6 +60,8 @@ class AnalyzeRequest:
     all: bool = False
     limit: int = 20
     include_noise: bool = False
+    manager_context: Literal["lite", "full"] | None = None
+    turn: int | None = None
 
 
 @dataclass(frozen=True)

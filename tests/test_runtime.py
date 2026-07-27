@@ -1,5 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
-from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig
+from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
 
 class WorkflowRuntimeTests(unittest.TestCase):
 
@@ -4951,3 +4951,171 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             assert result.end_reason == 'already_complete'
             assert not (repo_root / '.git').exists(), 'no git repo should be initialized for non-lifecycle workflows'
+
+    def test_manager_gates_end_and_persists_its_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={'impl': WorkflowStepConfig(
+                    role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
+                )},
+                first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'architect': 'codex.default',
+                    'manager_lite': 'codex.nano',
+                    'manager_full': 'codex.high',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'),
+                    'nano': HarnessProfileConfig(model='nano'),
+                    'high': HarnessProfileConfig(model='high'),
+                })},
+                workflows={'managed': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(enabled=True, lite_role='manager_lite', full_role='manager_full'),
+            )
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, 'work complete', '')
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    'schema_version': 1,
+                    'action': 'continue',
+                    'reason': 'The completed plan permits END.',
+                    'next_step_notes': [],
+                    'stop_report': None,
+                }), '')
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config, 'managed', config_dir=repo_root,
+                adapter=CodexAdapter(), runner=runner,
+            )
+            assert result.turns_completed == 1
+            decision_dir = result.run_dir / 'manager' / 'decision-001'
+            assert (decision_dir / 'context.json').is_file()
+            assert (decision_dir / 'boundary.json').is_file()
+            result_payload = json.loads((decision_dir / 'result.json').read_text(encoding='utf-8'))
+            assert result_payload['action'] == 'continue'
+            assert result_payload['status'] == 'accepted'
+
+            from aflow.api import AnalyzeRequest, analyze_runs
+            rebuilt = analyze_runs(AnalyzeRequest(
+                repo_root=repo_root, run_id=result.run_dir.name,
+                manager_context='lite', turn=1,
+            ))
+            stored = json.loads((decision_dir / 'context.json').read_text(encoding='utf-8'))
+            assert rebuilt == stored
+
+    def test_invalid_lite_manager_response_escalates_once_to_full(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={'impl': WorkflowStepConfig(
+                    role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
+                )}, first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default', 'manager_lite': 'codex.nano', 'manager_full': 'codex.high'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'), 'nano': HarnessProfileConfig(model='nano'), 'high': HarnessProfileConfig(model='high'),
+                })},
+                workflows={'managed': workflow}, prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(enabled=True, lite_role='manager_lite', full_role='manager_full'),
+            )
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, 'work complete', '')
+                if calls == 2:
+                    return subprocess.CompletedProcess(argv, 0, 'not JSON', '')
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    'schema_version': 1, 'action': 'continue', 'reason': 'Full supervision accepts END.',
+                    'next_step_notes': [], 'stop_report': None,
+                }), '')
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config, 'managed', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+            )
+            assert (result.run_dir / 'manager' / 'decision-001' / 'result.json').is_file()
+            full_result = json.loads((result.run_dir / 'manager' / 'decision-002' / 'result.json').read_text(encoding='utf-8'))
+            assert full_result['level'] == 'full'
+            assert full_result['action'] == 'continue'
+
+    def test_same_step_cap_calls_full_once_without_a_lite_transition_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    'impl': WorkflowStepConfig(
+                        role='architect', prompts=('p',), go=(GoTransition(to='impl'),),
+                    ),
+                    'review': WorkflowStepConfig(
+                        role='architect', prompts=('p',), go=(GoTransition(to='END'),),
+                    ),
+                },
+                first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'architect': 'codex.default',
+                    'manager_lite': 'codex.nano',
+                    'manager_full': 'codex.high',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'),
+                    'nano': HarnessProfileConfig(model='nano'),
+                    'high': HarnessProfileConfig(model='high'),
+                })},
+                workflows={'managed': workflow}, prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                aflow=AflowSection(max_same_step_turns=1),
+                manager=ManagerConfig(enabled=True, lite_role='manager_lite', full_role='manager_full'),
+            )
+
+            def runner(argv, **kwargs):
+                if 'high' in ' '.join(argv):
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        'schema_version': 1, 'action': 'stop', 'reason': 'Cap reached.',
+                        'next_step_notes': [],
+                        'stop_report': {
+                            'summary': 'The same-step cap was reached.',
+                            'root_cause': 'No transition progressed the workflow.',
+                            'evidence': ['The controller selected impl again.'],
+                            'attempts': 'One implementation turn ran.',
+                            'workspace_state': 'The plan remains in progress.',
+                            'next_actions': ['Inspect the manager report.'],
+                        },
+                    }), '')
+                return subprocess.CompletedProcess(argv, 0, 'work complete', '')
+
+            with pytest.raises(WorkflowError) as error:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config, 'managed', config_dir=repo_root,
+                    adapter=CodexAdapter(), runner=runner,
+                )
+            assert '# AFlow manager report' in str(error.value)
+            run_dir = error.value.run_dir
+            assert run_dir is not None
+            decisions = sorted((run_dir / 'manager').iterdir())
+            assert len(decisions) == 1
+            result = json.loads((decisions[0] / 'result.json').read_text(encoding='utf-8'))
+            assert result['level'] == 'full'
+            assert result['trigger'] == 'same_step_cap'

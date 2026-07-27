@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from aflow.config import (
+    HarnessProfileConfig,
+    ManagerConfig,
+    TeamConfig,
+    WorkflowHarnessConfig,
+    WorkflowUserConfig,
+)
+from aflow.manager import (
+    ManagerDecisionError,
+    ManagerStopReport,
+    build_manager_prompts,
+    eligible_implementation_upgrade,
+    parse_manager_decision,
+    render_manager_stop_report,
+    resolve_manager_role,
+    validate_manager_decision,
+)
+from aflow.plan import PlanSnapshot
+from aflow.run_state import (
+    ControllerConfig,
+    ControllerState,
+    ManagerDecisionSummary,
+    PendingManagerNotes,
+    PendingTeamOverride,
+    manager_resume_fields,
+    manager_state_payload,
+    restore_manager_state,
+)
+from aflow.runlog import create_run_paths, write_manager_artifacts, write_run_metadata
+
+
+def _config(*, upgraded_selector: str = "codex.high") -> WorkflowUserConfig:
+    return WorkflowUserConfig(
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={
+                    "nano": HarnessProfileConfig(model="nano"),
+                    "mini": HarnessProfileConfig(model="mini"),
+                    "high": HarnessProfileConfig(model="high"),
+                }
+            )
+        },
+        roles={
+            "worker": "codex.mini",
+            "manager_lite": "codex.nano",
+            "manager_full": "codex.high",
+        },
+        teams={
+            "base": TeamConfig(roles={"worker": "codex.mini"}, upgrade_to="high"),
+            "high": TeamConfig(roles={"worker": upgraded_selector}),
+        },
+        manager=ManagerConfig(enabled=True, lite_role="manager_lite", full_role="manager_full"),
+    )
+
+
+def _decision(**overrides: object) -> str:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "action": "continue",
+        "reason": "The proposed transition has sufficient evidence.",
+        "next_step_notes": ["Keep the retry narrowly scoped."],
+        "stop_report": None,
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_decision_protocol_rejects_unknown_fields_and_illegal_combinations() -> None:
+    with pytest.raises(ManagerDecisionError, match="unknown fields"):
+        parse_manager_decision(_decision(extra=True))
+    with pytest.raises(ManagerDecisionError, match="stop requires stop_report"):
+        parse_manager_decision(_decision(action="stop", next_step_notes=[]))
+    with pytest.raises(ManagerDecisionError, match="accepted END"):
+        validate_manager_decision(
+            parse_manager_decision(_decision()), proposed_transition="END"
+        )
+    with pytest.raises(ManagerDecisionError, match="not eligible"):
+        validate_manager_decision(
+            parse_manager_decision(_decision()), eligible_actions={"stop"}
+        )
+
+
+def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
+    decision = parse_manager_decision(_decision(
+        action="stop",
+        next_step_notes=[],
+        stop_report={
+            "summary": "The workflow is stalled.",
+            "root_cause": "Two attempts produced the same invalid plan state.",
+            "evidence": ["turn 4 had no plan delta"],
+            "attempts": "Two worker attempts and one review attempt ran.",
+            "workspace_state": "Branch is clean; the active plan remains in progress.",
+            "next_actions": ["Inspect the manager artifact.", "Repair the active plan."],
+        },
+    ))
+    report = render_manager_stop_report(
+        context={"run_id": "run-1", "finished_turn": {"turn_number": 4}, "plan_state": {"active_plan_path": "plans/a.md"}},
+        stop_report=decision.stop_report,
+    )
+    assert "# AFlow manager report" in report
+    assert "Two attempts produced" in report
+    assert "plans/a.md" in report
+
+
+def test_manager_role_and_one_edge_upgrade_use_baseline_routing_only() -> None:
+    config = _config()
+    resolved = resolve_manager_role(config, level="lite", baseline_team="base")
+    upgrade = eligible_implementation_upgrade(
+        config, role="worker", baseline_team="base"
+    )
+    assert resolved.selector == "codex.nano"
+    assert upgrade.available is True
+    assert upgrade.source_team == "base"
+    assert upgrade.target_team == "high"
+    assert upgrade.target_selector == "codex.high"
+    assert config.teams["base"].upgrade_to == "high"
+
+
+def test_upgrade_is_unavailable_when_target_selector_does_not_change() -> None:
+    upgrade = eligible_implementation_upgrade(
+        _config(upgraded_selector="codex.mini"), role="worker", baseline_team="base"
+    )
+    assert upgrade.available is False
+    assert "same selector" in str(upgrade.reason)
+
+
+def test_prompts_preserve_only_the_supplied_context_level() -> None:
+    context = {"level": "lite", "active_plan_content": None, "run_id": "run-1"}
+    system, user = build_manager_prompts(context)
+    assert "LITE" in system
+    assert json.loads(user) == context
+
+
+def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
+    paths = create_run_paths(ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"))
+    artifact = write_manager_artifacts(
+        paths,
+        decision_number=1,
+        context={"schema_version": 1, "level": "lite"},
+        system_prompt="system",
+        user_prompt="user",
+        stdout="{}",
+        result={"action": "continue"},
+    )
+    assert artifact.context.relative_to(paths.run_dir).as_posix() == "manager/decision-001/context.json"
+    assert json.loads(artifact.result.read_text(encoding="utf-8"))["action"] == "continue"
+
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    state.manager_decision_number = 1
+    state.manager_history.append(ManagerDecisionSummary(1, "lite", "normal", "continue", "safe", "manager/decision-001"))
+    state.semantic_stall_count = 1
+    state.reviewer_rejection_count = 2
+    state.implementation_attempts["cp-2"] = 2
+    state.pending_manager_notes = PendingManagerNotes("implement", ("focus",), 1)
+    state.pending_step_team_override = PendingTeamOverride("implement", "worker", "base", "high", "codex.high", "cp-2", 1)
+    state.last_manager_report_path = "manager-report.md"
+    payload = manager_state_payload(state)
+    assert payload["manager_history"][0]["action"] == "continue"
+    assert payload["pending_step_team_override"]["target_team"] == "high"
+    restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    restore_manager_state(restored, payload)
+    assert restored.manager_history == state.manager_history
+    assert restored.pending_manager_notes == state.pending_manager_notes
+    assert restored.pending_step_team_override == state.pending_step_team_override
+    assert manager_resume_fields(payload)["pending_manager_notes"] == state.pending_manager_notes
+    write_run_metadata(
+        paths,
+        ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"),
+        state,
+        status="running",
+    )
+    run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert run_json["last_manager_report_path"] == "manager-report.md"
+    assert run_json["manager_history"][0]["artifact_path"] == "manager/decision-001"

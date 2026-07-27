@@ -568,6 +568,17 @@ def _build_summary_table(
     if state.issues_summary_path is not None:
         table.add_row("Issues", state.issues_summary_path)
 
+    if state.manager_history:
+        manager = state.manager_history[-1]
+        table.add_row("Manager", f"{manager.level} / {manager.trigger} / {manager.action}")
+    if state.pending_manager_notes is not None:
+        table.add_row("Manager Notes", f"pending for {state.pending_manager_notes.target_step}")
+    if state.pending_step_team_override is not None:
+        override = state.pending_step_team_override
+        table.add_row("Manager Upgrade", f"{override.target_step}: {override.target_team}")
+    if state.last_manager_report_path is not None:
+        table.add_row("Manager Report", state.last_manager_report_path)
+
     if git_summary is not None:
         table.add_row("Git", _git_row(git_summary))
         files_text = _files_row(git_summary.changed_paths, limit=banner_files_limit)

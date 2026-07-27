@@ -1,6 +1,6 @@
 ---
 name: aflow-harness-recovery-lead
-description: "Decide how aflow should recover from harness throttling, quota, and other repeatable runtime failures. Return one strict JSON object only."
+description: "Legacy manager-disabled recovery: decide how aflow should recover from harness throttling, quota, and other repeatable runtime failures. Return one strict JSON object only."
 ---
 
 # AFlow Harness Recovery Lead

@@ -1,5 +1,35 @@
 from aflow._test_support import *  # noqa: F401,F403
 
+
+def test_manager_config_is_optional_and_defaults_to_disabled() -> None:
+    config = WorkflowUserConfig()
+    assert config.manager.enabled is False
+    assert config.manager.full_after_stalled_turns == 2
+
+
+def test_manager_config_rejects_missing_role_and_upgrade_cycle() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = _write_config(
+            Path(tmpdir),
+            '[manager]\nenabled = true\nlite_role = "manager_lite"\nfull_role = "manager_full"\n\n'
+            '[harness.codex.profiles.nano]\nmodel = "nano"\n\n'
+            '[roles]\nmanager_lite = "codex.nano"\nmanager_full = "codex.nano"\n\n'
+            '[teams.a]\nupgrade_to = "b"\n\n'
+            '[teams.b]\nupgrade_to = "a"\n',
+        )
+        with pytest.raises(ConfigError) as ctx:
+            load_workflow_config(config_path)
+        assert "upgrade_to forms a cycle" in str(ctx.value)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = _write_config(
+            Path(tmpdir),
+            '[manager]\nenabled = true\nlite_role = "manager_lite"\n\n',
+        )
+        with pytest.raises(ConfigError) as ctx:
+            load_workflow_config(config_path)
+        assert "full_role is required" in str(ctx.value)
+
 class AflowSectionConfigTests(unittest.TestCase):
 
     def _write_workflow_config(self, tmpdir: str, text: str) -> Path:

@@ -100,8 +100,73 @@ merge_prompt = ["simple_merge"]
 - `harness.<name>.profiles.<profile>` tables set `model` and optional `effort`.
 - Global roles map to fully qualified `harness.profile` selectors.
 - Team tables override a subset of global roles. Missing roles fall back to `[roles]`.
-- Team tables can set `backup_team`, naming the next team to try when harness recovery switches away from the active team.
-- Backup chains are validated at config load: targets must exist, cannot point to themselves, and cannot form cycles.
+- Team tables can set `backup_team`, naming the next team to try when deterministic harness recovery switches away from the active team.
+- Team tables can also set `upgrade_to`, a separate quality/capability edge that the manager may select for exactly one next implementation attempt.
+- Backup and upgrade chains are each validated at config load: targets must exist, cannot point to themselves, and cannot form cycles.
+
+## Interstep Manager Supervision
+
+Manager supervision is an opt-in control gate for existing configurations. A
+freshly bootstrapped config enables it, while a config with no `[manager]`
+section preserves the prior workflow, recovery, turn-count, and merge behavior.
+Add the following roles and section to opt in safely:
+
+```toml
+[roles]
+# Existing roles remain here.
+manager_lite = "codex.nano"
+manager_full = "codex.high"
+
+[manager]
+enabled = true
+lite_role = "manager_lite"
+full_role = "manager_full"
+full_after_stalled_turns = 2
+skill = "aflow-manager"
+```
+
+`lite_role` and `full_role` are required when `enabled = true`, must be
+non-empty role names, and resolve through the run's baseline team before the
+global `[roles]` map. This means they use normal harness/profile selection;
+the manager is never routed through a temporary implementation upgrade.
+`full_after_stalled_turns` defaults to `2` and must be at least `1`.
+`skill` defaults to `aflow-manager`.
+
+Lite is the normal cost-aware supervisor. It receives the finished turn's
+complete semantic result, compact run history, structured plan state, routing
+state, and bounded diagnostic excerpts, but never plan prose or prompt bodies.
+Full receives the same context plus the complete current active-plan Markdown.
+The controller chooses Full directly after the configured semantic-stall
+threshold, after repeated reviewer-to-implementer non-convergence for a
+checkpoint, and for explicit stops, invalid plans, or ambiguous failures. Lite
+can also request one immediate Full decision at the same boundary.
+
+### Team upgrade routes
+
+Use `upgrade_to` only for a manager-selected quality escalation, not for
+operational recovery:
+
+```toml
+[teams.codex1]
+backup_team = "fallback"
+upgrade_to = "codexmax"
+
+[teams.codexmax.roles]
+worker = "codex.high"
+```
+
+For `upgrade_next_implementation`, the controller follows one `upgrade_to`
+edge from the team that made the most recent implementation attempt (or the
+baseline team), resolves the proposed implementation role on the target team,
+and requires a different selector. The override is persisted and consumed only
+when that exact next implementation step starts. Reviewers, managers, later
+steps, and normal routing immediately return to the baseline team. Explicit
+chains are allowed but advance only after another failed implementation attempt.
+
+`backup_team` remains the immediate operational fallback for a failed harness
+retry. It is selected by recovery rules or the manager's
+`switch_to_backup_and_retry` action; it is not an alias for `upgrade_to`
+and does not change quality-upgrade routing.
 
 ## Workflows
 
@@ -183,7 +248,7 @@ Rules:
 - `max_consecutive_recoveries` caps deterministic and team-lead-recommended recoveries together.
 - `team_lead_skill` is parsed for compatibility, but the recovery handoff currently runs through `[aflow].team_lead`.
 - Recovery only runs when the turn did not advance the plan snapshot.
-- If no rule matches and the process exit code is non-zero, `aflow` escalates to team-lead recovery when `[aflow].team_lead` is configured.
+- If no rule matches and the process exit code is non-zero, manager-enabled runs send the ambiguous boundary to Full supervision; manager-disabled runs retain the existing team-lead recovery behavior when `[aflow].team_lead` is configured.
 - If no rule matches and no team lead is configured, `aflow` skips recovery.
 - Backup-team switches use `teams.<team>.backup_team` only for the immediate retry path; later normal workflow steps return to normal team resolution.
 

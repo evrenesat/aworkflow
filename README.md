@@ -40,6 +40,17 @@ aflow run --plan path/to/plan.md --workflow review_implement_cp_review
 aflow analyze
 ```
 
+### Interstep supervision
+
+Freshly bootstrapped configuration enables a lightweight manager between
+workflow turns. It accepts or changes the controller's already-proposed next
+action, and can stop a looping or ambiguous run with a self-contained report.
+Existing configurations remain compatible: supervision stays off until you add
+a `[manager]` section and the corresponding manager roles. See
+[Configuration](docs/configuration.md#interstep-manager-supervision) for the
+safe opt-in example, and [Runtime Behavior](docs/runtime-behavior.md#interstep-manager-supervision)
+for lifecycle and artifact details.
+
 Minimal plan:
 
 ```md
@@ -57,9 +68,9 @@ Minimal plan:
 
 - [Installation and Skills](docs/installation.md) - package install, first-run config bootstrap, and bundled skill installation.
 - [CLI Usage](docs/cli-usage.md) - `run`, `analyze`, `show`, resume, startup prompts, plan format, and harness adapters.
-- [Configuration](docs/configuration.md) - TOML layout, workflow definitions, roles, teams, lifecycle settings, prompt placeholders, and recovery rules.
-- [Runtime Behavior](docs/runtime-behavior.md) - lifecycle setup/teardown, worktrees, retries, dirty-tree checks, run logs, live status, and success reporting.
-- [Library API](docs/library-api.md) - public Python startup, execution, observer, and analysis API.
+- [Configuration](docs/configuration.md) - TOML layout, workflows, manager supervision, roles, teams, lifecycle settings, prompts, and recovery rules.
+- [Runtime Behavior](docs/runtime-behavior.md) - lifecycle setup/teardown, manager gates, worktrees, retries, artifacts, live status, and success reporting.
+- [Library API](docs/library-api.md) - public Python startup, execution, events, and analysis API.
 - [Remote App](docs/remote-app.md) - FastAPI/React app for projects, Codex threads, plan drafts, executions, transcription, and API endpoints.
 - [Architecture](ARCHITECTURE.md) - module-level implementation notes and data flow.
 

@@ -65,13 +65,13 @@ def test_detect_auto_targets_selects_installed_executables(tmp_path: Path, monke
     assert targets[4].destination == Path("~/.agents/skills").expanduser()
 
 
-def test_manual_destination_installs_nine_child_directories(tmp_path: Path) -> None:
+def test_manual_destination_installs_default_child_directories(tmp_path: Path) -> None:
     destination = tmp_path / "skills"
     stdout = io.StringIO()
 
     copied = install_skills(destination=destination, yes=True, stdin=_FakeStdin(True), stdout=stdout)
 
-    assert copied == 9
+    assert copied == 10
     for skill_name in DEFAULT_BUNDLED_SKILL_NAMES:
         skill_dir = destination / skill_name
         assert skill_dir.is_dir()
@@ -80,7 +80,7 @@ def test_manual_destination_installs_nine_child_directories(tmp_path: Path) -> N
         skill_dir = destination / skill_name
         assert not skill_dir.exists()
     assert "Manual install mode" in stdout.getvalue()
-    assert "Total copy operations: 9" in stdout.getvalue()
+    assert "Total copy operations: 10" in stdout.getvalue()
 
 
 def test_yes_skips_prompt(tmp_path: Path) -> None:
@@ -180,7 +180,7 @@ def test_auto_install_codex_copilot_gemini_and_pi_grouped_preview(tmp_path: Path
 
     expanded_dest = str(Path("~/.agents/skills").expanduser())
     assert "codex, copilot, gemini, pi" in preview
-    assert "Total copy operations: 9" in preview
+    assert "Total copy operations: 10" in preview
     assert preview.count(expanded_dest) == 1
 
 
@@ -195,7 +195,7 @@ def test_auto_install_codex_copilot_gemini_and_pi_copies_only_once(tmp_path: Pat
 
     copied = install_skills(yes=True, stdin=_FakeStdin(True), stdout=__import__('io').StringIO())
 
-    assert copied == 9
+    assert copied == 10
     shared_dest = Path("~/.agents/skills").expanduser()
     for skill_name in DEFAULT_BUNDLED_SKILL_NAMES:
         assert (shared_dest / skill_name).is_dir()
@@ -210,7 +210,7 @@ def test_default_install_excludes_optional_skills(tmp_path: Path) -> None:
 
     copied = install_skills(destination=destination, yes=True, stdin=_FakeStdin(True), stdout=stdout)
 
-    assert copied == 9
+    assert copied == 10
     for skill_name in DEFAULT_BUNDLED_SKILL_NAMES:
         skill_dir = destination / skill_name
         assert skill_dir.is_dir()
@@ -232,7 +232,7 @@ def test_include_optional_includes_optional_skills(tmp_path: Path) -> None:
         stdout=stdout,
     )
 
-    assert copied == 10
+    assert copied == 11
     for skill_name in BUNDLED_SKILL_NAMES:
         skill_dir = destination / skill_name
         assert skill_dir.is_dir()
@@ -349,11 +349,11 @@ def test_discover_bundled_skills_respects_selection(tmp_path: Path) -> None:
 
 def test_build_install_plan_respects_selection(tmp_path: Path) -> None:
     default_plan = build_install_plan(tmp_path / "dest")
-    assert len(default_plan.skills) == 9
+    assert len(default_plan.skills) == 10
     assert tuple(skill.name for skill in default_plan.skills) == DEFAULT_BUNDLED_SKILL_NAMES
 
     optional_plan = build_install_plan(tmp_path / "dest2", include_optional=True)
-    assert len(optional_plan.skills) == 10
+    assert len(optional_plan.skills) == 11
     assert tuple(skill.name for skill in optional_plan.skills) == BUNDLED_SKILL_NAMES
 
     only_plan = build_install_plan(tmp_path / "dest3", only_skills=("aflow-merge",))
@@ -395,7 +395,7 @@ def test_include_optional_copies_aflow_assistant_bundled_resources(tmp_path: Pat
         stdout=stdout,
     )
 
-    assert copied == 10
+    assert copied == 11
     assistant_dir = destination / "aflow-assistant"
     assert assistant_dir.is_dir()
     assert (assistant_dir / "SKILL.md").is_file()

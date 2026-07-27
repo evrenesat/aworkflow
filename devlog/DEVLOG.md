@@ -1,3 +1,35 @@
+## 2026-07-27 — Interstep manager supervision
+
+### What changed
+
+- Documented the opt-in manager configuration, Lite and Full evidence boundary,
+  role resolution, escalation, and the strict post-turn gate.
+- Documented step-scoped quality upgrades separately from operational backup
+  recovery, including resume-safe note and override consumption.
+- Added artifact, report, CLI/API, default skill-installation, architecture,
+  and assistant-diagnostics guidance for manager-supervised runs.
+- Added immutable manager-boundary artifacts and rebuilt CLI/API manager
+  analysis from those durable inputs, failing loudly when stored context
+  drifts.
+- Restored accepted one-hop routing before resume, routed operational recovery
+  through legal manager actions, and send same-step caps directly to one Full
+  terminal decision.
+
+### Why
+
+- Operators need a self-contained route from a stopped run to its report and
+  reproducible context without scanning large raw streams.
+- Keeping Lite free of plan prose and upgrades limited to one implementation
+  attempt makes the cost and routing boundaries auditable.
+
+### Verification
+
+- Focused manager, recovery, resume, same-step, stop, merge, CLI, and API suites
+  pass.
+- The remote-app server suite passes in its project environment. The root
+  affected suite retains pre-existing configuration, pre-handoff refresh, and
+  bootstrap lifecycle failures.
+
 ## 2026-07-23 — Preserve active repair plans across review transitions
 
 ### What changed
