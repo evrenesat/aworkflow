@@ -148,6 +148,7 @@ def _close_implementation_scope(state: ControllerState) -> None:
     state.pending_manager_notes = None
     state.pending_step_team_override = None
     state.pending_boundary_decision = None
+    state.reviewer_rejection_count = 0
 
 
 def _pending_matches_scope_and_plan(
@@ -2862,6 +2863,13 @@ def run_workflow(
         recovery: HarnessRecoveryContext | None = None,
     ) -> None:
         record = state.turn_history[-1]
+        normalized_status = (
+            "completed"
+            if status in {"running", "completed"} and returncode == 0
+            else status
+        )
+        finished_at = datetime.now(timezone.utc)
+        duration_seconds = (finished_at - started_at).total_seconds()
         if record.active_plan_path is None and active_path is not None:
             record.active_plan_path = str(active_path)
         if chosen_transition is not None:
@@ -2877,8 +2885,10 @@ def run_workflow(
             returncode=returncode,
             snapshot_before=snapshot_before,
             snapshot_after=snapshot_after,
-            status=status,
+            status=normalized_status,
             started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration_seconds,
             error=error,
             step_name=step_name,
             step_role=step_role,
@@ -2901,9 +2911,9 @@ def run_workflow(
         record.turn_dir = turn_dir
         record.stdout_artifact_path = _turn_artifact_display_path(run_paths.repo_root, turn_dir, "stdout.txt")
         record.stderr_artifact_path = _turn_artifact_display_path(run_paths.repo_root, turn_dir, "stderr.txt")
-        record.outcome = "completed" if status in {"running", "completed"} else status
-        record.finished_at = datetime.now(timezone.utc)
-        record.duration_seconds = (record.finished_at - record.started_at).total_seconds()
+        record.outcome = normalized_status
+        record.finished_at = finished_at
+        record.duration_seconds = duration_seconds
 
         _emit_event(observer, TurnFinishedEvent.create(
             turn_number=state.active_turn,
@@ -3735,6 +3745,33 @@ def run_workflow(
         state.last_manager_report_path = "manager-report.md"
         return report
 
+    def _fail_manager_gate(
+        context: dict[str, object],
+        *,
+        reason: str,
+        decision: ManagerDecisionV1 | None = None,
+    ) -> None:
+        report = _write_manager_report(context, reason=reason, decision=decision)
+        state.status_message = "failed"
+        write_run_metadata(
+            run_paths, config, state, status="failed", failure_reason=report,
+            last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
+            workflow_name=workflow_name, original_plan_path=original_plan_path,
+            current_step_name=current_step_name, active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
+        )
+        _emit_event(observer, RunFailedEvent.create(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            failure_reason=report,
+            final_snapshot=state.last_snapshot,
+            issues_accumulated=state.issues_accumulated,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        ))
+        banner.stop(state)
+        raise WorkflowError(report, run_dir=run_paths.run_dir)
+
     def _manager_level_for_boundary(context: dict[str, object]) -> str:
         controller = context.get("controller_state")
         if not isinstance(controller, dict):
@@ -3833,7 +3870,11 @@ def run_workflow(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 effort=manager_profile.effort,
-            )
+            ).for_final_output()
+            result_payload["invocation"] = {
+                "label": manager_invocation.label,
+                "argv": list(manager_invocation.argv),
+            }
             if runner is None:
                 completed = _run_process(manager_invocation, execution_repo_root, banner, state)
             else:
@@ -3924,6 +3965,7 @@ def run_workflow(
             )
             scope_context = {
                 "scope_id": scope.scope_id,
+                "opened_turn_number": scope.opened_turn_number,
                 "checkpoint_index": scope.checkpoint_index,
                 "checkpoint_name": scope.checkpoint_name,
                 "awaiting_review": scope.awaiting_review,
@@ -4001,23 +4043,12 @@ def run_workflow(
                 level="full", boundary=boundary,
             )
         if decision is None:
-            report = _write_manager_report(context, reason=error or "manager did not return a valid decision")
-            state.status_message = "failed"
-            write_run_metadata(run_paths, config, state, status="failed", failure_reason=report,
-                               last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
-                               workflow_name=workflow_name, original_plan_path=original_plan_path,
-                               current_step_name=current_step_name, active_plan_path=active_plan_path,
-                               new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
-            raise WorkflowError(report, run_dir=run_paths.run_dir)
+            _fail_manager_gate(
+                context,
+                reason=error or "manager did not return a valid decision",
+            )
         if decision.action == "stop":
-            report = _write_manager_report(context, reason=decision.reason, decision=decision)
-            state.status_message = "failed"
-            write_run_metadata(run_paths, config, state, status="failed", failure_reason=report,
-                               last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
-                               workflow_name=workflow_name, original_plan_path=original_plan_path,
-                               current_step_name=current_step_name, active_plan_path=active_plan_path,
-                               new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
-            raise WorkflowError(report, run_dir=run_paths.run_dir)
+            _fail_manager_gate(context, reason=decision.reason, decision=decision)
 
         target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
         target_config = wf.steps.get(target_step) if target_step not in {None, "END"} else None

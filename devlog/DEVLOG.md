@@ -1,3 +1,26 @@
+## 2026-07-28 — Manager runtime regression repair
+
+### What changed
+
+- Added Reasonix final-response-only argv for manager calls while preserving
+  ordinary workflow transcripts and strict JSON parsing.
+- Separated whole-run checkpoint stability from same-step stalls, and scoped
+  reviewer rejection counters to the durable original-checkpoint opening turn.
+- Finalized successful turn artifacts as `completed` with one shared finish
+  timestamp and duration across artifacts, in-memory records, events, and
+  manager context.
+- Persisted and emitted manager-gate failures, stopped the live banner, then
+  raised for the CLI to print the report once.
+- Added focused transport, parser, analysis, scope, duration, and runtime
+  regression coverage.
+
+### Why
+
+- Live workflow validation exposed noisy Reasonix stdout, false Full selection
+  during normal step alternation, rejection history leaking into the next
+  checkpoint, stale `running` turn results, and manager reports erased during
+  terminal renderer teardown.
+
 ## 2026-07-28 — Reasonix and terminal manager hardening
 
 ### What changed

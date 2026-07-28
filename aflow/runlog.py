@@ -375,6 +375,7 @@ def _turn_result_payload(
     status: str,
     started_at: datetime,
     finished_at: datetime | None = None,
+    duration_seconds: float | None = None,
     stdout: str | None = None,
     stderr: str | None = None,
     returncode: int | None = None,
@@ -413,6 +414,8 @@ def _turn_result_payload(
         payload["returncode"] = returncode
     if finished_at is not None:
         payload["finished_at"] = finished_at.isoformat()
+    if duration_seconds is not None:
+        payload["duration_seconds"] = duration_seconds
     if step_name is not None:
         payload["step_name"] = step_name
     if step_role is not None:
@@ -640,6 +643,8 @@ def finalize_turn_artifacts(
     snapshot_after: PlanSnapshot | None,
     status: str,
     started_at: datetime,
+    finished_at: datetime,
+    duration_seconds: float,
     error: str | None = None,
     step_name: str | None = None,
     step_role: str | None = None,
@@ -659,7 +664,6 @@ def finalize_turn_artifacts(
     was_retry: bool | None = None,
     recovery: HarnessRecoveryContext | None = None,
 ) -> Path:
-    finished_at = datetime.now(timezone.utc)
     (turn_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
     (turn_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
     result_payload = _turn_result_payload(
@@ -670,6 +674,7 @@ def finalize_turn_artifacts(
         status=status,
         started_at=started_at,
         finished_at=finished_at,
+        duration_seconds=duration_seconds,
         stdout=stdout,
         stderr=stderr,
         returncode=returncode,

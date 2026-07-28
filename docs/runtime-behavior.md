@@ -111,10 +111,12 @@ The manager receives a reproducible, versioned context built from durable
 artifacts. Lite receives semantic results, plan snapshots and structured state,
 controller/routing counters, compact history, and bounded diagnostics. It does
 not receive active-plan content, prompts, or raw trace bodies. Full adds the
-complete active-plan Markdown. Full is chosen directly for semantic stalls,
-second reviewer rejection/non-convergence, explicit stop markers, invalid
-plans, and ambiguous failures; Lite can escalate once to Full at the same
-boundary.
+complete active-plan Markdown. Full is chosen directly after consecutive
+unchanged executions of the same workflow step, the second reviewer rejection
+within one open original-checkpoint scope, explicit stop markers, invalid plans,
+and ambiguous failures. Alternating implementation and review steps do not
+select Full merely because their plan snapshots are unchanged. Lite can
+escalate once to Full at the same boundary.
 
 The strict manager protocol permits only controller actions: accept the
 proposal, retry, select an eligible implementation upgrade, select an eligible
@@ -128,6 +130,11 @@ schema are included in every manager prompt. If a terminal workflow incident is
 followed by an invalid manager response, the deterministic report retains the
 workflow incident as its summary and records the manager protocol error
 separately instead of masking the original failure.
+
+Reasonix manager invocations request its native final-response mode with
+`--print`, so strict manager JSON is not mixed with progress and metrics output.
+Ordinary Reasonix worker and reviewer turns omit `--print` and retain their
+diagnostic transcripts. The JSON parser itself remains strict.
 
 `continue` with notes stores immutable notes for the selected next step. They
 are injected once and cleared only when that step durably starts. A manager
@@ -145,6 +152,15 @@ the most recently reviewed worker. Reviewer approval, original-checkpoint
 advance without a pending review, or plan completion closes the scope and clears
 its unconsumed one-hop state. Historical attempts remain in run metadata, but
 the next checkpoint opens a new scope and begins with the baseline worker.
+Rejection counters are computed only from turns at or after that scope's durable
+opening turn, so prior-checkpoint repairs cannot stop a new checkpoint before
+its first review.
+
+Every successful finalized turn is written with `status: "completed"`, a single
+authoritative finish timestamp, and its duration even while the overall
+`run.json` status remains `running`. Manager stop reports are persisted, emitted
+to observers, and raised only after the live banner is stopped; the CLI then
+prints the complete report exactly once.
 
 When manager supervision is disabled, AFlow retains its legacy transition and
 deterministic recovery behavior. Deterministic harness-recovery matches remain

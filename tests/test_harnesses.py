@@ -24,6 +24,19 @@ class AdaptersTests(unittest.TestCase):
         assert not adapter.supports_effort
         assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
         assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
+        final_invocation = invocation.for_final_output()
+        assert '--print' not in invocation.argv
+        assert final_invocation.argv == (
+            'reasonix',
+            'run',
+            '--dir',
+            '/repo',
+            '--model',
+            'deepseek-pro',
+            '--print',
+            'SYSTEM\n\nUSER',
+        )
+        assert final_invocation.argv.index('--print') < final_invocation.argv.index('SYSTEM\n\nUSER')
 
     def test_reasonix_without_model_and_with_effort_ignores_effort(self) -> None:
         adapter = ReasonixAdapter()
@@ -38,6 +51,9 @@ class AdaptersTests(unittest.TestCase):
         assert '-dir' not in invocation.argv
         assert '--effort' not in invocation.argv
         assert '--model' not in invocation.argv
+        assert invocation.for_final_output().argv == (
+            'reasonix', 'run', '--dir', '/repo', '--print', 'SYSTEM\n\nUSER'
+        )
 
     def test_codex_without_effort(self) -> None:
         adapter = CodexAdapter()

@@ -92,6 +92,19 @@ def test_decision_protocol_rejects_unknown_fields_and_illegal_combinations() -> 
         )
 
 
+@pytest.mark.parametrize(
+    "noisy",
+    [
+        "\x1b[2mthinking\x1b[0m\n" + _decision(),
+        "```json\n" + _decision() + "\n```",
+        _decision() + "\n" + _decision(),
+    ],
+)
+def test_decision_protocol_rejects_transport_noise(noisy: str) -> None:
+    with pytest.raises(ManagerDecisionError, match="not valid JSON|single JSON object"):
+        parse_manager_decision(noisy)
+
+
 def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
     decision = parse_manager_decision(_decision(
         action="stop",

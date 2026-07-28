@@ -1,5 +1,6 @@
 from aflow._test_support import *  # noqa: F401,F403
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
+from aflow.api.events import ExecutionEventType
 from aflow.run_state import (
     ActiveImplementationScope,
     ImplementationAttempt,
@@ -782,7 +783,8 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert run_json['end_reason'] == 'transition_end'
             turn_result = json.loads((result.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['end_reason'] == 'transition_end'
-            assert turn_result['status'] == 'running'
+            assert turn_result['status'] == 'completed'
+            assert turn_result['duration_seconds'] >= 0
 
     def test_workflow_end_reason_prefers_done_when_plan_completes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1565,7 +1567,8 @@ class WorkflowArtifactTests(unittest.TestCase):
             assert run_json['status'] == 'completed'
             assert 'recovery_summary' not in run_json
             turn1_result = json.loads((result.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
-            assert turn1_result['status'] == 'running'
+            assert turn1_result['status'] == 'completed'
+            assert turn1_result['duration_seconds'] >= 0
             assert 'recovery_source' not in turn1_result
             turn2_result = json.loads((result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
             assert turn2_result['status'] == 'completed'
@@ -2378,7 +2381,8 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert result.stdout.strip() == "Workflow 'simple' completed after 3 turns because MAX_TURNS_REACHED matched."
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-003' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['end_reason'] == 'max_turns_reached'
-            assert turn_result['status'] == 'running'
+            assert turn_result['status'] == 'completed'
+            assert turn_result['duration_seconds'] >= 0
 
     def test_team_override_takes_precedence_and_falls_back_to_global_roles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5243,6 +5247,171 @@ class LifecycleBootstrapTests(unittest.TestCase):
             full_result = json.loads((result.run_dir / 'manager' / 'decision-002' / 'result.json').read_text(encoding='utf-8'))
             assert full_result['level'] == 'full'
             assert full_result['action'] == 'continue'
+
+    def test_reasonix_lite_manager_uses_final_output_without_full_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={"impl": WorkflowStepConfig(
+                    role="architect",
+                    prompts=("p",),
+                    go=(GoTransition(to="END", when="DONE"),),
+                )},
+                first_step="impl",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "architect": "codex.worker",
+                    "manager_lite": "reasonix.lite",
+                    "manager_full": "codex.full",
+                },
+                harnesses={
+                    "codex": WorkflowHarnessConfig(profiles={
+                        "worker": HarnessProfileConfig(model="worker"),
+                        "full": HarnessProfileConfig(model="full"),
+                    }),
+                    "reasonix": WorkflowHarnessConfig(profiles={
+                        "lite": HarnessProfileConfig(model="deepseek-flash"),
+                    }),
+                },
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+            calls: list[list[str]] = []
+
+            def runner(argv, **kwargs):
+                calls.append(argv)
+                if argv[0] == "reasonix":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "Lite accepts the completed turn.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "work complete", "")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config,
+                "managed",
+                config_dir=repo_root,
+                runner=runner,
+            )
+
+            assert [argv[0] for argv in calls] == ["codex", "reasonix"]
+            manager_argv = calls[1]
+            assert "--dir" in manager_argv
+            assert "--print" in manager_argv
+            assert manager_argv.index("--print") < len(manager_argv) - 1
+            decision = json.loads(
+                (result.run_dir / "manager" / "decision-001" / "result.json").read_text()
+            )
+            assert decision["level"] == "lite"
+            assert decision["status"] == "accepted"
+            assert decision["invocation"]["argv"] == manager_argv
+
+    def test_manager_stop_emits_report_then_stops_banner_before_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={"impl": WorkflowStepConfig(
+                    role="architect",
+                    prompts=("p",),
+                    go=(GoTransition(to="END", when="DONE"),),
+                )},
+                first_step="impl",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "architect": "codex.worker",
+                    "manager_lite": "codex.lite",
+                    "manager_full": "codex.full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "lite": HarnessProfileConfig(model="lite"),
+                    "full": HarnessProfileConfig(model="full"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+            order: list[str] = []
+            failed_events: list[object] = []
+
+            class RecordingBanner:
+                def start(self, state):
+                    pass
+
+                def update(self, state):
+                    pass
+
+                def set_context(self, **kwargs):
+                    pass
+
+                def stop(self, state):
+                    order.append("banner_stopped")
+
+            class RecordingObserver:
+                def on_event(self, event):
+                    if event.event_type == ExecutionEventType.RUN_FAILED:
+                        order.append("failure_emitted")
+                        failed_events.append(event)
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                if model == "worker":
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, "work complete", "")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "stop",
+                    "reason": "Stop after the completed turn.",
+                    "next_step_notes": [],
+                    "stop_report": {
+                        "summary": "The manager stopped the run.",
+                        "root_cause": "Synthetic terminal decision.",
+                        "evidence": ["The manager selected stop."],
+                        "attempts": "One worker turn ran.",
+                        "workspace_state": "The plan is complete.",
+                        "next_actions": ["Inspect the manager artifacts."],
+                    },
+                }), "")
+
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config,
+                    "managed",
+                    config_dir=repo_root,
+                    runner=runner,
+                    banner=RecordingBanner(),  # type: ignore[arg-type]
+                    observer=RecordingObserver(),  # type: ignore[arg-type]
+                )
+
+            assert order[-2:] == ["failure_emitted", "banner_stopped"]
+            assert len(failed_events) == 1
+            report = str(raised.value)
+            assert failed_events[0].failure_reason == report  # type: ignore[attr-defined]
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            assert (run_dir / "manager-report.md").read_text(encoding="utf-8") == report
+            assert json.loads((run_dir / "run.json").read_text())["failure_reason"] == report
 
     def test_invalid_terminal_manager_response_preserves_harness_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -214,6 +214,20 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
             break
         unchanged_tail.append(turn)
     unchanged_tail.reverse()
+    same_step_stall_tail: list[dict[str, Any]] = []
+    latest_step = finalized_turns[-1].get("step_name") if finalized_turns else None
+    if isinstance(latest_step, str) and latest_step:
+        for turn in reversed(finalized_turns):
+            before_sig = snapshot_signature(turn.get("snapshot_before"))
+            after_sig = snapshot_signature(turn.get("snapshot_after"))
+            if (
+                turn.get("step_name") != latest_step
+                or before_sig is None
+                or after_sig is None
+                or before_sig != after_sig
+            ):
+                break
+            same_step_stall_tail.append(turn)
     step_names = [turn.get("step_name") for turn in unchanged_tail if turn.get("step_name")]
     turn_numbers = [turn.get("turn_number") for turn in unchanged_tail if turn.get("turn_number") is not None]
     alternating_two_step = len(set(step_names)) == 2 if step_names else False
@@ -228,6 +242,7 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
             reviewer_rejection_count += 1
     return {
         "unchanged_snapshot_turns": len(unchanged_tail),
+        "same_step_stall_turns": len(same_step_stall_tail),
         "alternating_two_step_tail": alternating_two_step,
         "tail_step_names": step_names,
         "tail_turn_numbers": turn_numbers,
@@ -527,6 +542,7 @@ def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str,
             "tail_start_turn": progress["tail_start_turn"],
             "tail_step_names": progress["tail_step_names"],
             "tail_turn_numbers": progress["tail_turn_numbers"],
+            "same_step_stall_turns": progress["same_step_stall_turns"],
             "unchanged_snapshot_turns": progress["unchanged_snapshot_turns"],
         },
         "recovery_history": recovery_history,
@@ -561,6 +577,7 @@ def summarize_run_compact(run_dir: Path, run_json: dict[str, Any], turns: list[d
         },
         "progress": {
             "alternating_two_step_tail": detailed["progress"]["alternating_two_step_tail"],
+            "same_step_stall_turns": detailed["progress"]["same_step_stall_turns"],
             "tail_start_turn": detailed["progress"]["tail_start_turn"],
             "unchanged_snapshot_turns": detailed["progress"]["unchanged_snapshot_turns"],
         },

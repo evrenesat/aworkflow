@@ -48,7 +48,9 @@ action, and can stop a looping or ambiguous run with a self-contained report.
 For a rejected implementation, configured team `upgrade_to` edges can raise
 only the next worker invocation one level at a time; repeated rejection can
 advance farther along the chain, while the next checkpoint starts again from
-the baseline team.
+the baseline team. Full supervision is selected for repeated unchanged
+executions of one workflow step or two reviewer rejections within the same
+checkpoint scope; ordinary implement/review alternation stays on Lite.
 Existing configurations remain compatible: supervision stays off until you add
 a `[manager]` section and the corresponding manager roles. See
 [Configuration](docs/configuration.md#interstep-manager-supervision) for the

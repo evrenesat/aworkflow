@@ -40,7 +40,7 @@ flowchart TD
     Transition --> Manager
     Manager -->|"accepted next step"| WorkflowLoop
     Manager -->|"accepted END"| Done["Return result"]
-    Manager -->|"stop"| Stopped["Persist manager report"]
+    Manager -->|"stop"| Stopped["Persist report, emit failure, stop banner"]
     WorkflowLoop --> RunLog
     WorkflowLoop --> Banner
 ```
@@ -58,6 +58,13 @@ Every manager prompt names the configured manager skill and embeds the complete
 closed JSON protocol, including the structured stop-report shape. Invalid
 manager output at a terminal incident cannot replace the original controller
 failure as the report's primary cause.
+
+Manager transport may select an adapter-native final-response argv without
+changing ordinary workflow invocations. Progress analysis keeps whole-run
+checkpoint stability separate from scope-aware same-step stalls and reviewer
+rejections. Active-scope boundaries persist their opening turn so runtime and
+historical analysis use the same controller window. Successful turn artifacts,
+in-memory records, and finish events share one finish timestamp and duration.
 Implementation upgrades use a stable original-checkpoint review scope rather
 than the mutable active repair-plan identity. Attempts retain their actual team
 and selector; each rejection can expose one further configured edge. Approval

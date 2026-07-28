@@ -128,6 +128,8 @@ def test_progress_detects_alternating_reviewer_non_convergence(tmp_path: Path) -
 
     progress = context["controller_state"]["progress"]
     assert progress["unchanged_snapshot_turns"] == 2
+    assert progress["same_step_stall_turns"] == 1
+    assert context["controller_state"]["semantic_stall_count"] == 1
     assert progress["reviewer_rejection_count"] == 2
     assert progress["reviewer_non_convergence"] is True
     assert len(context["run_extract"]) == 5
@@ -144,6 +146,51 @@ def test_progress_detects_long_unchanged_tail(tmp_path: Path) -> None:
     context = build_manager_context(run_dir)
 
     assert context["controller_state"]["progress"]["unchanged_snapshot_turns"] == 4
+    assert context["controller_state"]["progress"]["same_step_stall_turns"] == 4
+
+
+def test_progress_is_scoped_to_open_implementation_scope(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="CP1 rejected")
+    _write_turn(run_dir, 2, step="implement", role="implementer", stdout="CP1 repair")
+    _write_turn(run_dir, 3, step="review", role="reviewer", stdout="CP1 rejected again")
+    _write_turn(run_dir, 4, step="implement", role="implementer", stdout="CP1 repair")
+    _write_turn(run_dir, 5, step="implement", role="implementer", stdout="CP2 first attempt")
+
+    context = build_manager_context(
+        run_dir,
+        boundary={
+            "active_implementation_scope": {
+                "scope_id": "plan.md::checkpoint-2::second",
+                "opened_turn_number": 5,
+            }
+        },
+    )
+
+    progress = context["controller_state"]["progress"]
+    assert progress["reviewer_rejection_count"] == 0
+    assert progress["reviewer_non_convergence"] is False
+    assert context["controller_state"]["progress_scope"] == {
+        "scope_id": "plan.md::checkpoint-2::second",
+        "opened_turn_number": 5,
+    }
+    assert len(context["run_extract"]) == 5
+
+
+def test_legacy_scope_boundary_preserves_legacy_progress_shape(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="attempt")
+    _write_turn(run_dir, 2, step="review", role="reviewer", stdout="review")
+
+    context = build_manager_context(
+        run_dir,
+        boundary={"active_implementation_scope": {"scope_id": "legacy-scope"}},
+    )
+
+    controller = context["controller_state"]
+    assert controller["semantic_stall_count"] == 2
+    assert "same_step_stall_turns" not in controller["progress"]
+    assert "progress_scope" not in controller
 
 
 def test_context_tolerates_invalid_plan_and_prior_manager_artifacts(tmp_path: Path) -> None:
@@ -157,6 +204,20 @@ def test_context_tolerates_invalid_plan_and_prior_manager_artifacts(tmp_path: Pa
     assert "inconsistent checkpoint state" in context["plan_state"]["parse_error"]
     assert context["finished_turn"]["detected_stop"] == ["deliberate stop"]
     assert context["run_extract"][-1]["kind"] == "manager_decision"
+
+
+def test_context_derives_duration_for_legacy_turn_artifact(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    result_path = run_dir / "turns" / "turn-001" / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["started_at"] = "2026-07-28T10:00:00+00:00"
+    result["finished_at"] = "2026-07-28T10:00:12.500000+00:00"
+    _write_json(result_path, result)
+
+    context = build_manager_context(run_dir)
+
+    assert context["finished_turn"]["duration_seconds"] == 12.5
 
 
 def test_stop_parser_ignores_fences_and_placeholder_examples() -> None:

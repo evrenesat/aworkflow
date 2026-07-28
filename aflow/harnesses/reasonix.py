@@ -37,6 +37,7 @@ class ReasonixAdapter:
         if model is not None:
             argv.extend(["--model", model])
         argv.append(effective_prompt)
+        final_output_argv = [*argv[:-1], "--print", effective_prompt]
         return HarnessInvocation(
             label=self.name,
             argv=tuple(argv),
@@ -45,4 +46,5 @@ class ReasonixAdapter:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             effective_prompt=effective_prompt,
+            final_output_argv=tuple(final_output_argv),
         )

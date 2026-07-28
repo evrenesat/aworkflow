@@ -7,6 +7,7 @@ contexts never read prompt artifacts or active-plan contents.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -38,6 +39,7 @@ class SemanticTurnOutcome:
 @dataclass(frozen=True)
 class ProgressSignals:
     unchanged_snapshot_turns: int
+    same_step_stall_turns: int
     alternating_two_step_tail: bool
     reviewer_rejection_count: int
     reviewer_non_convergence: bool
@@ -233,10 +235,25 @@ def analyze_manager_progress(turns: list[dict[str, Any]]) -> ProgressSignals:
     progress = analyze_progress_tail(turns)
     return ProgressSignals(
         unchanged_snapshot_turns=progress["unchanged_snapshot_turns"],
+        same_step_stall_turns=progress["same_step_stall_turns"],
         alternating_two_step_tail=progress["alternating_two_step_tail"],
         reviewer_rejection_count=progress["reviewer_rejection_count"],
         reviewer_non_convergence=progress["reviewer_non_convergence"],
     )
+
+
+def _duration_seconds(turn: dict[str, Any]) -> float | None:
+    explicit = turn.get("duration_seconds")
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        return float(explicit)
+    started = turn.get("started_at")
+    finished = turn.get("finished_at")
+    if not isinstance(started, str) or not isinstance(finished, str):
+        return None
+    try:
+        return (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
+    except ValueError:
+        return None
 
 
 def _compact_turn(run_dir: Path, turn: dict[str, Any]) -> CompactRunRecord:
@@ -333,13 +350,61 @@ def build_manager_context(
         plan_state_payload = captured_plan_state
     else:
         plan_state_payload = asdict(plan_state)
-    progress = analyze_manager_progress(turns)
+    whole_run_progress = analyze_manager_progress(turns)
+    scope_was_explicit = "active_implementation_scope" in boundary
+    scope = (
+        boundary.get("active_implementation_scope")
+        if scope_was_explicit
+        else run_json.get("active_implementation_scope")
+    )
+    legacy_scoped_boundary = (
+        scope_was_explicit
+        and isinstance(scope, dict)
+        and "opened_turn_number" not in scope
+    )
+    progress_scope = None
+    scoped_progress = whole_run_progress
+    if isinstance(scope, dict):
+        opened_turn_number = scope.get("opened_turn_number")
+        if isinstance(opened_turn_number, int):
+            scoped_turns = [
+                turn for turn in turns
+                if int(turn.get("turn_number", 0) or 0) >= opened_turn_number
+            ]
+            scoped_progress = analyze_manager_progress(scoped_turns)
+            progress_scope = {
+                "scope_id": scope.get("scope_id"),
+                "opened_turn_number": opened_turn_number,
+            }
+    elif scope_was_explicit:
+        scoped_progress = ProgressSignals(
+            unchanged_snapshot_turns=whole_run_progress.unchanged_snapshot_turns,
+            same_step_stall_turns=whole_run_progress.same_step_stall_turns,
+            alternating_two_step_tail=whole_run_progress.alternating_two_step_tail,
+            reviewer_rejection_count=0,
+            reviewer_non_convergence=False,
+        )
+    progress = ProgressSignals(
+        unchanged_snapshot_turns=whole_run_progress.unchanged_snapshot_turns,
+        same_step_stall_turns=scoped_progress.same_step_stall_turns,
+        alternating_two_step_tail=whole_run_progress.alternating_two_step_tail,
+        reviewer_rejection_count=scoped_progress.reviewer_rejection_count,
+        reviewer_non_convergence=scoped_progress.reviewer_non_convergence,
+    )
+    progress_payload = asdict(progress)
+    if legacy_scoped_boundary:
+        progress_payload.pop("same_step_stall_turns", None)
     raw_artifacts = [asdict(_artifact_ref(run_dir, finished_dir / name)) for name in ("stdout.txt", "stderr.txt")]
     finished_turn = {
         "turn_number": finished.get("turn_number"), "step_name": finished.get("step_name"),
         "role": finished.get("step_role"), "team": finished.get("team") or run_json.get("team"),
         "selector": finished.get("selector"), "status": finished.get("status"),
-        "returncode": finished.get("returncode"), "duration_seconds": finished.get("duration_seconds"),
+        "returncode": finished.get("returncode"),
+        "duration_seconds": (
+            finished.get("duration_seconds")
+            if legacy_scoped_boundary
+            else _duration_seconds(finished)
+        ),
         "semantic_result": asdict(semantic), "error": finished.get("error"),
         "snapshot_before": finished.get("snapshot_before"), "snapshot_after": finished.get("snapshot_after"),
         "snapshot_changed": snapshot_signature(finished.get("snapshot_before")) != snapshot_signature(finished.get("snapshot_after")),
@@ -367,9 +432,16 @@ def build_manager_context(
             "actual_team": boundary.get("actual_team"),
             "actual_selector": boundary.get("actual_selector"),
             "turn_budget": {"completed": run_json.get("turns_completed"), "maximum": run_json.get("max_turns")},
-            "same_node_counter": progress.unchanged_snapshot_turns, "semantic_stall_count": progress.unchanged_snapshot_turns,
+            "same_node_counter": (
+                progress.unchanged_snapshot_turns
+                if legacy_scoped_boundary else progress.same_step_stall_turns
+            ),
+            "semantic_stall_count": (
+                progress.unchanged_snapshot_turns
+                if legacy_scoped_boundary else progress.same_step_stall_turns
+            ),
             "reviewer_rejection_count": progress.reviewer_rejection_count, "reviewer_non_convergence": progress.reviewer_non_convergence,
-            "progress": asdict(progress),
+            "progress": progress_payload,
             "proposed_action": boundary.get("proposed_action", "transition"),
             "proposed_next_step": boundary.get("proposed_transition", finished.get("chosen_transition")),
             "terminal": bool(boundary.get("terminal", False)),
@@ -391,6 +463,8 @@ def build_manager_context(
             _read_text(active_plan_path) if level == "full" and active_plan_path is not None else None
         ),
     )
+    if not legacy_scoped_boundary:
+        context.controller_state["progress_scope"] = progress_scope
     # Runtime prompts, artifacts, and later API analysis all use JSON.  Return
     # that canonical shape here too, so tuple/list representation cannot cause
     # a false drift report after a context has been persisted and rebuilt.

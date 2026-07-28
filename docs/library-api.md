@@ -85,6 +85,12 @@ context = analyze_runs(AnalyzeRequest(
 Lite remains safe for broad diagnostics because it excludes active-plan bodies,
 prompt text, and raw trace bodies. Full intentionally includes the complete
 active-plan content, so callers should handle it as sensitive run data.
+Manager context exposes both whole-run `unchanged_snapshot_turns` diagnostics
+and the scope-aware `same_step_stall_turns` controller signal. Its progress
+scope contains the stable scope id and opening turn when an implementation
+scope is active. Finalized-turn status and duration come from the durable turn
+artifact; legacy artifacts without an explicit duration derive it from their
+timestamps when possible.
 
 ## Manager Events
 

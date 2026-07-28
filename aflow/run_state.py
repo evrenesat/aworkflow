@@ -210,6 +210,7 @@ class ResumeContext:
     active_plan_path: Path | None = None
     manager_decision_number: int = 0
     manager_history: tuple[ManagerDecisionSummary, ...] = ()
+    # Consecutive unchanged finalized turns in the latest workflow step.
     semantic_stall_count: int = 0
     reviewer_rejection_count: int = 0
     implementation_attempts: dict[str, tuple[ImplementationAttempt, ...]] = field(default_factory=dict)

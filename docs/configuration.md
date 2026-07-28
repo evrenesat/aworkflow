@@ -136,7 +136,11 @@ skill = "aflow-manager"
 non-empty role names, and resolve through the run's baseline team before the
 global `[roles]` map. This means they use normal harness/profile selection;
 the manager is never routed through a temporary implementation upgrade.
-`full_after_stalled_turns` defaults to `2` and must be at least `1`.
+`full_after_stalled_turns` defaults to `2` and must be at least `1`. It counts
+consecutive finalized executions of the same workflow step whose plan snapshot
+did not change. An unchanged `implement → review` sequence is progress, not a
+two-turn stall. Two reviewer-to-implementation rejection cycles still select
+Full, but only within the currently open original-checkpoint scope.
 `skill` defaults to `aflow-manager`. Each manager prompt requests that configured
 skill when the harness supports skills and also carries the complete strict JSON
 contract inline, so protocol correctness does not depend on skill installation.
@@ -145,9 +149,10 @@ Lite is the normal cost-aware supervisor. It receives the finished turn's
 complete semantic result, compact run history, structured plan state, routing
 state, and bounded diagnostic excerpts, but never plan prose or prompt bodies.
 Full receives the same context plus the complete current active-plan Markdown.
-The controller chooses Full directly after the configured semantic-stall
-threshold, after repeated reviewer-to-implementer non-convergence for a
-checkpoint, and for explicit stops, invalid plans, or ambiguous failures. Lite
+The controller chooses Full directly after the configured same-step stall
+threshold, after repeated reviewer-to-implementer non-convergence within one
+open checkpoint scope, and for explicit stops, invalid plans, or ambiguous
+failures. Lite
 can also request one immediate Full decision at the same boundary.
 
 ### Team upgrade routes
