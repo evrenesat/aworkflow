@@ -42,6 +42,13 @@ worktree_root = "~/code/worktrees"
 model = "gpt-5.4"
 effort = "high"
 
+[harness.codex.profiles.mini]
+model = "gpt-5.4-mini"
+
+[harness.codex.profiles.nano]
+model = "gpt-5.4-mini"
+effort = "none"
+
 [roles]
 architect = "codex.high"
 worker = "codex.high"
@@ -151,8 +158,20 @@ operational recovery:
 backup_team = "fallback"
 upgrade_to = "codexmax"
 
+[teams.codex1.roles]
+worker = "codex.nano"
+
+[teams.codexmax]
+upgrade_to = "codexultra"
+
 [teams.codexmax.roles]
+worker = "codex.mini"
+
+[teams.codexultra.roles]
 worker = "codex.high"
+
+[teams.fallback.roles]
+worker = "codex.nano"
 ```
 
 For `upgrade_next_implementation`, the controller follows one `upgrade_to`
@@ -161,7 +180,16 @@ baseline team), resolves the proposed implementation role on the target team,
 and requires a different selector. The override is persisted and consumed only
 when that exact next implementation step starts. Reviewers, managers, later
 steps, and normal routing immediately return to the baseline team. Explicit
-chains are allowed but advance only after another failed implementation attempt.
+chains are allowed, but each manager decision advances only one edge. Repeated
+rejection preserves the original checkpoint's review scope, so the next edge is
+resolved from the actual upgraded worker that was just reviewed. Approval closes
+that scope; the next checkpoint starts from baseline routing while prior attempt
+history remains available for analysis.
+
+In this example, successive manager decisions can route one rejected checkpoint
+through `codex1 → codexmax → codexultra`. They cannot skip directly from
+`codex1` to `codexultra`, and `fallback` remains an independent operational
+recovery route.
 
 `backup_team` remains the immediate operational fallback for a failed harness
 retry. It is selected by recovery rules or the manager's

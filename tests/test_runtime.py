@@ -1,5 +1,11 @@
 from aflow._test_support import *  # noqa: F401,F403
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
+from aflow.run_state import (
+    ActiveImplementationScope,
+    ImplementationAttempt,
+    PendingBoundaryDecision,
+    PendingTeamOverride,
+)
 
 class WorkflowRuntimeTests(unittest.TestCase):
 
@@ -5015,6 +5021,187 @@ class LifecycleBootstrapTests(unittest.TestCase):
             stored = json.loads((decision_dir / 'context.json').read_text(encoding='utf-8'))
             assert rebuilt == stored
 
+    def test_manager_chains_worker_upgrades_within_one_review_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(
+                plan_path,
+                "# Plan\n\n"
+                "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
+                "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review", preserve_active_plan=True),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="implement"),
+                        ),
+                    ),
+                },
+                first_step="implement",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker-default",
+                    "reviewer": "codex.reviewer-default",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker-default": HarnessProfileConfig(model="worker-default"),
+                    "worker-high": HarnessProfileConfig(model="worker-high"),
+                    "worker-max": HarnessProfileConfig(model="worker-max"),
+                    "reviewer-default": HarnessProfileConfig(model="reviewer-default"),
+                    "reviewer-high": HarnessProfileConfig(model="reviewer-high"),
+                    "reviewer-max": HarnessProfileConfig(model="reviewer-max"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                teams={
+                    "default": TeamConfig(
+                        roles={"worker": "codex.worker-default"},
+                        upgrade_to="high",
+                    ),
+                    "high": TeamConfig(
+                        roles={
+                            "worker": "codex.worker-high",
+                            "reviewer": "codex.reviewer-high",
+                        },
+                        upgrade_to="max",
+                    ),
+                    "max": TeamConfig(roles={
+                        "worker": "codex.worker-max",
+                        "reviewer": "codex.reviewer-max",
+                    }),
+                },
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                    full_after_stalled_turns=99,
+                ),
+            )
+            workflow_models: list[str] = []
+            manager_calls = 0
+            reviewer_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal manager_calls, reviewer_calls
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    manager_calls += 1
+                    action = (
+                        "upgrade_next_implementation"
+                        if manager_calls in {2, 4}
+                        else "continue"
+                    )
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": action,
+                        "reason": "Synthetic manager decision.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+
+                workflow_models.append(model)
+                if model == "worker-default":
+                    if workflow_models.count("worker-default") == 1:
+                        _write_plan(
+                            plan_path,
+                            "# Plan\n\n"
+                            "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                            "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+                        )
+                    else:
+                        _write_plan(
+                            plan_path,
+                            "# Plan\n\n"
+                            "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                            "### [x] Checkpoint 2: Second\n- [x] step two\n",
+                        )
+                elif model == "reviewer-default":
+                    reviewer_calls += 1
+                    if reviewer_calls <= 2:
+                        repair = repo_root / f"plan-repair-{reviewer_calls}.md"
+                        _write_plan(
+                            repair,
+                            "# Repair\n\n"
+                            f"### [ ] Checkpoint 1: Repair {reviewer_calls}\n"
+                            "- [ ] repair step\n",
+                        )
+                return subprocess.CompletedProcess(argv, 0, "synthetic workflow result", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=7,
+                    team="default",
+                ),
+                wf_config,
+                "managed",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert workflow_models == [
+                "worker-default",
+                "reviewer-default",
+                "worker-high",
+                "reviewer-default",
+                "worker-max",
+                "reviewer-default",
+                "worker-default",
+            ]
+            second = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "context.json").read_text()
+            )
+            fourth = json.loads(
+                (result.run_dir / "manager" / "decision-004" / "context.json").read_text()
+            )
+            sixth = json.loads(
+                (result.run_dir / "manager" / "decision-006" / "context.json").read_text()
+            )
+            assert second["controller_state"]["eligible_upgrade"]["source_team"] == "default"
+            assert second["controller_state"]["eligible_upgrade"]["target_team"] == "high"
+            assert fourth["controller_state"]["eligible_upgrade"]["source_team"] == "high"
+            assert fourth["controller_state"]["eligible_upgrade"]["target_team"] == "max"
+            assert fourth["controller_state"]["active_implementation_scope"]["attempt_teams"] == [
+                "default",
+                "high",
+            ]
+            assert fourth["controller_state"]["active_implementation_scope"]["upgrade_depth"] == 1
+            assert "upgrade_next_implementation" not in sixth["controller_state"]["eligible_actions"]
+            assert sixth["controller_state"]["eligible_upgrade"]["available"] is False
+            assert "no prior attempt" in sixth["controller_state"]["eligible_upgrade"]["reason"]
+
+            run_json = json.loads((result.run_dir / "run.json").read_text())
+            histories = list(run_json["implementation_attempts"].values())
+            assert [attempt["team"] for attempt in histories[0]] == [
+                "default",
+                "high",
+                "max",
+            ]
+            assert run_json["active_implementation_scope"] is None
+            assert run_json["pending_manager_notes"] is None
+            assert run_json["pending_step_team_override"] is None
+            assert run_json["pending_boundary_decision"]["scope_id"] is None
+
     def test_invalid_lite_manager_response_escalates_once_to_full(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -5119,3 +5306,271 @@ class LifecycleBootstrapTests(unittest.TestCase):
             result = json.loads((decisions[0] / 'result.json').read_text(encoding='utf-8'))
             assert result['level'] == 'full'
             assert result['trigger'] == 'same_step_cap'
+
+
+def _run_upgrade_resume_scenario(
+    tmp_path: Path,
+    *,
+    interruption: str,
+) -> tuple[list[str], list[int], dict[str, object], Path]:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _make_lifecycle_git_repo(repo_root, branch="main")
+    plan_path = repo_root / "plan.md"
+    _write_plan(
+        plan_path,
+        "# Plan\n\n"
+        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+        "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+    )
+    _git_commit_file(repo_root, plan_path)
+    worktree_path = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "resume-feature", str(worktree_path), "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    repair_path = repo_root / "repair.md"
+    repair_text = "# Repair\n\n### [ ] Checkpoint 1: Repair\n- [ ] repair step\n"
+    _write_plan(repair_path, repair_text)
+    _write_plan(worktree_path / "repair.md", repair_text)
+
+    workflow = WorkflowConfig(
+        steps={
+            "implement": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(
+                    GoTransition(to="END", when="DONE"),
+                    GoTransition(to="review", preserve_active_plan=True),
+                ),
+            ),
+            "review": WorkflowStepConfig(
+                role="reviewer",
+                prompts=("p",),
+                go=(GoTransition(to="implement"),),
+            ),
+        },
+        first_step="implement",
+        setup=("worktree", "branch"),
+        teardown=(),
+        main_branch="main",
+    )
+    wf_config = WorkflowUserConfig(
+        aflow=AflowSection(worktree_root=str(tmp_path)),
+        roles={
+            "worker": "codex.worker-default",
+            "reviewer": "codex.reviewer-default",
+            "manager_lite": "codex.manager-lite",
+            "manager_full": "codex.manager-full",
+        },
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "worker-default": HarnessProfileConfig(model="worker-default"),
+            "worker-high": HarnessProfileConfig(model="worker-high"),
+            "worker-max": HarnessProfileConfig(model="worker-max"),
+            "reviewer-default": HarnessProfileConfig(model="reviewer-default"),
+            "manager-lite": HarnessProfileConfig(model="manager-lite"),
+            "manager-full": HarnessProfileConfig(model="manager-full"),
+        })},
+        teams={
+            "default": TeamConfig(
+                roles={"worker": "codex.worker-default"},
+                upgrade_to="high",
+            ),
+            "high": TeamConfig(
+                roles={"worker": "codex.worker-high"},
+                upgrade_to="max",
+            ),
+            "max": TeamConfig(roles={"worker": "codex.worker-max"}),
+        },
+        workflows={"managed": workflow},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+        manager=ManagerConfig(
+            enabled=True,
+            lite_role="manager_lite",
+            full_role="manager_full",
+            full_after_stalled_turns=99,
+        ),
+    )
+    scope = ActiveImplementationScope(
+        f"{plan_path}::checkpoint-1::first",
+        str(plan_path),
+        1,
+        "First",
+        1,
+        awaiting_review=interruption != "before_worker",
+    )
+    attempts = [
+        ImplementationAttempt(
+            1, "implement", "worker", "default", "codex.worker-default", "progress"
+        ),
+        ImplementationAttempt(
+            3, "implement", "worker", "high", "codex.worker-high", "progress", 2
+        ),
+    ]
+    if interruption == "after_consumption":
+        attempts.append(ImplementationAttempt(
+            5, "implement", "worker", "max", "codex.worker-max", "progress", 3
+        ))
+
+    target_identity = f"{repair_path}::checkpoint-1"
+    pending_override = None
+    pending_boundary = None
+    decision_number = 2 if interruption == "before_review" else 3
+    if interruption == "before_worker":
+        pending_override = PendingTeamOverride(
+            "implement",
+            "worker",
+            "high",
+            "max",
+            "codex.worker-max",
+            target_identity,
+            3,
+            scope_id=scope.scope_id,
+            target_plan_identity=target_identity,
+        )
+        pending_boundary = PendingBoundaryDecision(
+            finalized_turn_number=4,
+            decision_number=3,
+            action="upgrade_next_implementation",
+            proposed_action="transition",
+            proposed_transition="implement",
+            resolved_next_step="implement",
+            target_role="worker",
+            target_team="max",
+            target_selector="codex.worker-max",
+            checkpoint_identity=target_identity,
+            scope_id=scope.scope_id,
+            target_plan_identity=target_identity,
+        )
+    elif interruption == "after_consumption":
+        pending_boundary = PendingBoundaryDecision(
+            finalized_turn_number=4,
+            decision_number=3,
+            action="upgrade_next_implementation",
+            proposed_action="transition",
+            proposed_transition="implement",
+            resolved_next_step="implement",
+            target_role="worker",
+            target_team="max",
+            target_selector="codex.worker-max",
+            checkpoint_identity=target_identity,
+            applied=True,
+            consumed=True,
+            scope_id=scope.scope_id,
+            target_plan_identity=target_identity,
+        )
+
+    resume = ResumeContext(
+        resumed_from_run_id=f"prior-{interruption}",
+        feature_branch="resume-feature",
+        worktree_path=worktree_path,
+        main_branch="main",
+        setup=("worktree", "branch"),
+        teardown=(),
+        active_plan_path=repair_path,
+        manager_decision_number=decision_number,
+        implementation_attempts={scope.scope_id: tuple(attempts)},
+        active_implementation_scope=scope,
+        pending_step_team_override=pending_override,
+        pending_boundary_decision=pending_boundary,
+    )
+    workflow_models: list[str] = []
+    manager_numbers: list[int] = []
+    reviewer_calls = 0
+
+    def runner(argv, **kwargs):
+        nonlocal reviewer_calls
+        model = argv[argv.index("--model") + 1]
+        if model.startswith("manager-"):
+            prompt = argv[-1]
+            context = json.loads(prompt[prompt.index("{"):])
+            manager_numbers.append(context["decision_number"])
+            action = (
+                "upgrade_next_implementation"
+                if interruption == "before_review" and len(manager_numbers) == 1
+                else "continue"
+            )
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "schema_version": 1,
+                "action": action,
+                "reason": "Synthetic resumed manager decision.",
+                "next_step_notes": [],
+                "stop_report": None,
+            }), "")
+
+        workflow_models.append(model)
+        if model == "reviewer-default":
+            reviewer_calls += 1
+            replacement = Path(kwargs["cwd"]) / f"plan-resume-{interruption}-{reviewer_calls}.md"
+            _write_plan(
+                replacement,
+                "# Repair\n\n### [ ] Checkpoint 1: Replacement\n- [ ] repair step\n",
+            )
+        else:
+            _write_plan(
+                Path(kwargs["cwd"]) / "plan.md",
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                "### [x] Checkpoint 2: Second\n- [x] step two\n",
+            )
+        return subprocess.CompletedProcess(argv, 0, "resumed workflow result", "")
+
+    result = run_workflow(
+        ControllerConfig(
+            repo_root=repo_root,
+            plan_path=plan_path,
+            max_turns=2,
+            team="default",
+            start_step=(
+                "implement" if interruption == "before_worker" else "review"
+            ),
+        ),
+        wf_config,
+        "managed",
+        config_dir=repo_root,
+        adapter=CodexAdapter(),
+        runner=runner,
+        resume=resume,
+    )
+    run_json = json.loads((result.run_dir / "run.json").read_text())
+    return workflow_models, manager_numbers, run_json, result.run_dir
+
+
+def test_manager_resume_after_upgraded_worker_uses_it_as_next_upgrade_source(
+    tmp_path: Path,
+) -> None:
+    models, decisions, _, run_dir = _run_upgrade_resume_scenario(
+        tmp_path, interruption="before_review"
+    )
+    assert models == ["reviewer-default", "worker-max"]
+    assert decisions == [3, 4]
+    context = json.loads(
+        (run_dir / "manager" / "decision-003" / "context.json").read_text()
+    )
+    assert context["controller_state"]["eligible_upgrade"]["source_team"] == "high"
+    assert context["controller_state"]["eligible_upgrade"]["target_team"] == "max"
+
+
+def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: Path) -> None:
+    models, decisions, run_json, _ = _run_upgrade_resume_scenario(
+        tmp_path, interruption="before_worker"
+    )
+    assert models == ["worker-max"]
+    assert decisions == [4]
+    assert run_json["pending_step_team_override"] is None
+
+
+def test_manager_resume_after_override_consumption_does_not_replay_it(tmp_path: Path) -> None:
+    models, decisions, _, run_dir = _run_upgrade_resume_scenario(
+        tmp_path, interruption="after_consumption"
+    )
+    assert models == ["reviewer-default", "worker-default"]
+    assert decisions == [4, 5]
+    context = json.loads(
+        (run_dir / "manager" / "decision-004" / "context.json").read_text()
+    )
+    assert context["controller_state"]["eligible_upgrade"]["source_team"] == "max"
+    assert context["controller_state"]["eligible_upgrade"]["available"] is False

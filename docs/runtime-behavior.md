@@ -133,6 +133,15 @@ starts. Both pending states survive a resume before consumption and are not
 replayed after consumption. See [Configuration](configuration.md#team-upgrade-routes)
 for routing rules and the distinction from `backup_team`.
 
+Worker attempts are grouped under a stable original-checkpoint review scope.
+That scope survives worker completion, repair-plan creation or replacement,
+repeated reviewer rejection, and resume. Manager context shows the actual teams
+and selectors used in the scope and resolves at most one next upgrade edge from
+the most recently reviewed worker. Reviewer approval, original-checkpoint
+advance without a pending review, or plan completion closes the scope and clears
+its unconsumed one-hop state. Historical attempts remain in run metadata, but
+the next checkpoint opens a new scope and begins with the baseline worker.
+
 When manager supervision is disabled, AFlow retains its legacy transition and
 deterministic recovery behavior. Deterministic harness-recovery matches remain
 cheap proposed actions for an enabled manager to accept; only unmatched

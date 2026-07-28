@@ -379,6 +379,7 @@ def build_manager_context(
                 "team": boundary.get("backup_team"), "selector": boundary.get("backup_selector"),
             },
             "eligible_upgrade": boundary.get("implementation_upgrade"),
+            "active_implementation_scope": boundary.get("active_implementation_scope"),
             "eligible_actions": list(boundary.get("eligible_actions", [])),
             "lite_evidence": boundary.get("evidence"),
             "workspace_state": boundary.get("workspace_state", {}),

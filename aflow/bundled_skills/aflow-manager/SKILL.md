@@ -51,3 +51,9 @@ Allowed actions are `continue`, `retry_current_step`,
 - For every other action, set `stop_report` to `null`.
 - Never invent a workflow step, role, team, selector, transition, or upgrade
   route. The controller validates all routing and decides the concrete target.
+- An eligible implementation upgrade advances exactly one configured edge from
+  the worker attempt the reviewer just assessed. After another rejection, use
+  the newly exposed edge only when the scope history and eligible action support
+  it. Reviewers and managers remain on baseline routing.
+- Checkpoint approval closes the implementation scope. Do not use attempts from
+  a closed scope to justify upgrading the next checkpoint's initial worker.

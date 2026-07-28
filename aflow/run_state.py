@@ -89,6 +89,18 @@ class ManagerDecisionSummary:
 
 
 @dataclass(frozen=True)
+class ActiveImplementationScope:
+    """Stable lineage for all worker/reviewer attempts on one original checkpoint."""
+
+    scope_id: str
+    original_plan_path: str
+    checkpoint_index: int | None
+    checkpoint_name: str | None
+    opened_turn_number: int
+    awaiting_review: bool = False
+
+
+@dataclass(frozen=True)
 class PendingManagerNotes:
     target_step: str
     notes: tuple[str, ...]
@@ -97,6 +109,8 @@ class PendingManagerNotes:
     target_selector: str | None = None
     checkpoint_identity: str | None = None
     consumed: bool = False
+    scope_id: str | None = None
+    target_plan_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +123,8 @@ class PendingTeamOverride:
     checkpoint_identity: str | None
     decision_number: int
     consumed: bool = False
+    scope_id: str | None = None
+    target_plan_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +163,8 @@ class PendingBoundaryDecision:
     notes_reference: str | None = None
     applied: bool = False
     consumed: bool = False
+    scope_id: str | None = None
+    target_plan_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +194,7 @@ class FinalizedTurnBoundary:
     backup_team: str | None = None
     backup_selector: str | None = None
     implementation_upgrade: dict[str, Any] | None = None
+    active_implementation_scope: dict[str, Any] | None = None
     eligible_actions: list[str] = field(default_factory=list)
     evidence: str | None = None
 
@@ -194,6 +213,7 @@ class ResumeContext:
     semantic_stall_count: int = 0
     reviewer_rejection_count: int = 0
     implementation_attempts: dict[str, tuple[ImplementationAttempt, ...]] = field(default_factory=dict)
+    active_implementation_scope: ActiveImplementationScope | None = None
     pending_manager_notes: PendingManagerNotes | None = None
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
@@ -276,6 +296,7 @@ class ControllerState:
     semantic_stall_count: int = 0
     reviewer_rejection_count: int = 0
     implementation_attempts: dict[str, list[ImplementationAttempt]] = field(default_factory=dict)
+    active_implementation_scope: ActiveImplementationScope | None = None
     pending_manager_notes: PendingManagerNotes | None = None
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
@@ -297,6 +318,11 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
             key: (attempts if isinstance(attempts, int) else [asdict(attempt) for attempt in attempts])
             for key, attempts in state.implementation_attempts.items()
         },
+        "active_implementation_scope": (
+            asdict(state.active_implementation_scope)
+            if state.active_implementation_scope is not None
+            else None
+        ),
         "pending_manager_notes": (
             asdict(state.pending_manager_notes)
             if state.pending_manager_notes is not None
@@ -361,6 +387,24 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                         if item.get("manager_decision_number") is not None else None),
                 ))
             state.implementation_attempts[str(key)] = restored_attempts
+    scope = payload.get("active_implementation_scope")
+    if isinstance(scope, Mapping) and {
+        "scope_id", "original_plan_path", "opened_turn_number"
+    } <= set(scope):
+        state.active_implementation_scope = ActiveImplementationScope(
+            scope_id=str(scope["scope_id"]),
+            original_plan_path=str(scope["original_plan_path"]),
+            checkpoint_index=(
+                int(scope["checkpoint_index"])
+                if scope.get("checkpoint_index") is not None else None
+            ),
+            checkpoint_name=(
+                str(scope["checkpoint_name"])
+                if scope.get("checkpoint_name") is not None else None
+            ),
+            opened_turn_number=int(scope["opened_turn_number"]),
+            awaiting_review=bool(scope.get("awaiting_review", False)),
+        )
     notes = payload.get("pending_manager_notes")
     if isinstance(notes, Mapping) and isinstance(notes.get("notes"), (list, tuple)):
         state.pending_manager_notes = PendingManagerNotes(
@@ -371,6 +415,12 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             notes=tuple(str(note) for note in notes["notes"]),
             decision_number=int(notes.get("decision_number", 0) or 0),
             consumed=bool(notes.get("consumed", False)),
+            scope_id=str(notes["scope_id"]) if notes.get("scope_id") is not None else None,
+            target_plan_identity=(
+                str(notes["target_plan_identity"])
+                if notes.get("target_plan_identity") is not None
+                else None
+            ),
         )
     override = payload.get("pending_step_team_override")
     if isinstance(override, Mapping):
@@ -385,6 +435,12 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 checkpoint_identity=str(override["checkpoint_identity"]) if override.get("checkpoint_identity") is not None else None,
                 decision_number=int(override["decision_number"]),
                 consumed=bool(override.get("consumed", False)),
+                scope_id=str(override["scope_id"]) if override.get("scope_id") is not None else None,
+                target_plan_identity=(
+                    str(override["target_plan_identity"])
+                    if override.get("target_plan_identity") is not None
+                    else None
+                ),
             )
     boundary = payload.get("pending_boundary_decision")
     if isinstance(boundary, Mapping):
@@ -406,6 +462,12 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                     if boundary.get("post_transition_checkpoint_identity") is not None else None),
                 notes_reference=str(boundary["notes_reference"]) if boundary.get("notes_reference") is not None else None,
                 applied=bool(boundary.get("applied", False)), consumed=bool(boundary.get("consumed", False)),
+                scope_id=str(boundary["scope_id"]) if boundary.get("scope_id") is not None else None,
+                target_plan_identity=(
+                    str(boundary["target_plan_identity"])
+                    if boundary.get("target_plan_identity") is not None
+                    else None
+                ),
             )
     report_path = payload.get("last_manager_report_path")
     state.last_manager_report_path = str(report_path) if report_path is not None else None
@@ -421,9 +483,10 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
         "semantic_stall_count": restored.semantic_stall_count,
         "reviewer_rejection_count": restored.reviewer_rejection_count,
         "implementation_attempts": {
-            key: (attempts if isinstance(attempts, int) else tuple(attempts))
+            key: (() if isinstance(attempts, int) else tuple(attempts))
             for key, attempts in restored.implementation_attempts.items()
         },
+        "active_implementation_scope": restored.active_implementation_scope,
         "pending_manager_notes": restored.pending_manager_notes,
         "pending_step_team_override": restored.pending_step_team_override,
         "pending_boundary_decision": restored.pending_boundary_decision,

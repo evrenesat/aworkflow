@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Mapping
 
 if TYPE_CHECKING:
     from aflow.api.events import ExecutionEvent, ExecutionObserver
@@ -60,7 +60,7 @@ from .recovery import (
     resolve_backup_team,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, TurnRecord, WorkflowEndReason, format_harness_model_display
+from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, TurnRecord, WorkflowEndReason, format_harness_model_display
 from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .status import BannerRenderer, WorkflowGraphSource
@@ -85,6 +85,120 @@ _REVIEW_SKILL_NAMES = frozenset({
     "aflow-review-final",
 })
 _PLAN_BRANCH_LINE_RE = re.compile(r"^(\s*-\s+Plan Branch:\s+`)([^`]*)(`.*)$", re.MULTILINE)
+
+
+def _target_plan_identity(plan_path: Path, snapshot: PlanSnapshot | None = None) -> str:
+    """Identify the exact active-plan checkpoint targeted by one-hop state."""
+    resolved_snapshot = snapshot
+    if resolved_snapshot is None:
+        try:
+            resolved_snapshot = load_plan_tolerant(plan_path).parsed_plan.snapshot
+        except (OSError, PlanParseError, ValueError):
+            resolved_snapshot = None
+    index = resolved_snapshot.current_checkpoint_index if resolved_snapshot is not None else None
+    suffix = f"checkpoint-{index}" if index is not None else "checkpoint-complete"
+    return f"{plan_path}::{suffix}"
+
+
+def _normalized_checkpoint_name(name: str | None) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", (name or "unnamed").casefold()).strip("-")
+    return normalized or "unnamed"
+
+
+def _open_implementation_scope(
+    state: ControllerState,
+    *,
+    original_plan_path: Path,
+    original_snapshot: PlanSnapshot,
+    turn_number: int,
+) -> ActiveImplementationScope:
+    """Open once for an original checkpoint and reuse across repair plans."""
+    if state.active_implementation_scope is not None:
+        return state.active_implementation_scope
+    index = original_snapshot.current_checkpoint_index
+    name = original_snapshot.current_checkpoint_name
+    scope = ActiveImplementationScope(
+        scope_id=(
+            f"{original_plan_path}::checkpoint-{index}::"
+            f"{_normalized_checkpoint_name(name)}"
+        ),
+        original_plan_path=str(original_plan_path),
+        checkpoint_index=index,
+        checkpoint_name=name,
+        opened_turn_number=turn_number,
+    )
+    state.active_implementation_scope = scope
+    return scope
+
+
+def _original_checkpoint_advanced(
+    scope: ActiveImplementationScope,
+    snapshot: PlanSnapshot,
+) -> bool:
+    if snapshot.is_complete:
+        return True
+    if scope.checkpoint_index is None or snapshot.current_checkpoint_index is None:
+        return False
+    return snapshot.current_checkpoint_index > scope.checkpoint_index
+
+
+def _close_implementation_scope(state: ControllerState) -> None:
+    """Close routing state while retaining historical attempt records."""
+    state.active_implementation_scope = None
+    state.pending_manager_notes = None
+    state.pending_step_team_override = None
+    state.pending_boundary_decision = None
+
+
+def _pending_matches_scope_and_plan(
+    pending: object,
+    state: ControllerState,
+    target_plan_identity: str,
+) -> bool:
+    pending_scope_id = getattr(pending, "scope_id", None)
+    active_scope_id = (
+        state.active_implementation_scope.scope_id
+        if state.active_implementation_scope is not None else None
+    )
+    pending_target = (
+        getattr(pending, "target_plan_identity", None)
+        or getattr(pending, "checkpoint_identity", None)
+    )
+    return (
+        (pending_scope_id is None or pending_scope_id == active_scope_id)
+        and (pending_target is None or pending_target == target_plan_identity)
+    )
+
+
+def _mutable_implementation_attempts(
+    attempts: Mapping[str, tuple[ImplementationAttempt, ...] | list[ImplementationAttempt]],
+) -> dict[str, list[ImplementationAttempt]]:
+    """Normalize durable resume histories before any live append."""
+    return {key: list(history) for key, history in attempts.items()}
+
+
+def _implementation_upgrade_depth(
+    config: WorkflowUserConfig,
+    *,
+    baseline_team: str | None,
+    most_recent_team: str | None,
+) -> int | None:
+    """Count configured upgrade edges, independent of retry attempt count."""
+    if baseline_team is None or most_recent_team is None:
+        return 0 if baseline_team == most_recent_team else None
+    current = baseline_team
+    depth = 0
+    seen: set[str] = set()
+    while current != most_recent_team:
+        if current in seen:
+            return None
+        seen.add(current)
+        team = config.teams.get(current)
+        if team is None or team.upgrade_to is None:
+            return None
+        current = team.upgrade_to
+        depth += 1
+    return depth
 
 
 class StartupBaseHeadRefreshStatus(str, Enum):
@@ -2425,7 +2539,10 @@ def run_workflow(
         state.manager_history = list(resume.manager_history)
         state.semantic_stall_count = resume.semantic_stall_count
         state.reviewer_rejection_count = resume.reviewer_rejection_count
-        state.implementation_attempts = dict(resume.implementation_attempts)
+        state.implementation_attempts = _mutable_implementation_attempts(
+            resume.implementation_attempts
+        )
+        state.active_implementation_scope = resume.active_implementation_scope
         state.pending_manager_notes = resume.pending_manager_notes
         state.pending_step_team_override = resume.pending_step_team_override
         state.pending_boundary_decision = resume.pending_boundary_decision
@@ -3605,17 +3722,6 @@ def run_workflow(
                 plan_hashes.append((str(plan_path), "<missing>"))
         return head.strip(), status, tuple(plan_hashes)
 
-    def _checkpoint_identity(plan_path: Path, snapshot: PlanSnapshot | None = None) -> str:
-        """Keep manager routing local to one active plan and original checkpoint."""
-        resolved_snapshot = snapshot
-        if resolved_snapshot is None:
-            try:
-                resolved_snapshot = load_plan_tolerant(plan_path).parsed_plan.snapshot
-            except (OSError, PlanParseError, ValueError):
-                resolved_snapshot = None
-        index = resolved_snapshot.current_checkpoint_index if resolved_snapshot is not None else None
-        return f"{plan_path}::checkpoint-{index if index is not None else 'complete'}"
-
     def _write_manager_report(
         context: dict[str, object], *, reason: str, decision: ManagerDecisionV1 | None = None
     ) -> str:
@@ -3799,16 +3905,53 @@ def run_workflow(
             return proposed_transition
         next_step = None if proposed_transition == "END" else proposed_transition
         candidate_step = wf.steps.get(next_step) if next_step is not None else None
-        identity = _checkpoint_identity(active_plan_path)
-        attempts = state.implementation_attempts.get(identity, [])
-        recent_team = attempts[-1].team if isinstance(attempts, list) and attempts else None
+        target_plan_identity = _target_plan_identity(active_plan_path)
+        scope = state.active_implementation_scope
+        attempts = (
+            state.implementation_attempts.get(scope.scope_id, [])
+            if scope is not None else []
+        )
+        recent_team = attempts[-1].team if attempts else None
+        scope_context = None
+        if scope is not None:
+            upgrade_depth = _implementation_upgrade_depth(
+                workflow_config,
+                baseline_team=baseline_team_name,
+                most_recent_team=recent_team,
+            )
+            scope_context = {
+                "scope_id": scope.scope_id,
+                "checkpoint_index": scope.checkpoint_index,
+                "checkpoint_name": scope.checkpoint_name,
+                "awaiting_review": scope.awaiting_review,
+                "attempt_count": len(attempts),
+                "attempt_teams": [attempt.team for attempt in attempts],
+                "attempt_selectors": [attempt.selector for attempt in attempts],
+                "most_recent_team": recent_team,
+                "upgrade_depth": upgrade_depth,
+            }
+        retrying_scoped_implementation = (
+            scope is not None
+            and bool(attempts)
+            and candidate_step is not None
+            and candidate_step.role == "worker"
+        )
         upgrade = eligible_implementation_upgrade(
             workflow_config,
             role=candidate_step.role if candidate_step is not None else current_role,
             baseline_team=baseline_team_name,
             most_recent_implementation_team=recent_team,
-            is_implementation_attempt=candidate_step is not None and candidate_step.role == "worker",
+            is_implementation_attempt=retrying_scoped_implementation,
         )
+        if (
+            candidate_step is not None
+            and candidate_step.role == "worker"
+            and not retrying_scoped_implementation
+        ):
+            upgrade = replace(
+                upgrade,
+                reason="next worker has no prior attempt in an active implementation scope",
+            )
         eligible: set[str] = {"continue", "stop"}
         if safely_retryable:
             eligible.add("retry_current_step")
@@ -3823,9 +3966,10 @@ def run_workflow(
             current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
             actual_team=active_team, actual_selector=active_selector,
             original_plan_path=str(original_plan_path), active_plan_path=str(active_plan_path),
-            checkpoint_identity=identity, safely_retryable=safely_retryable,
+            checkpoint_identity=target_plan_identity, safely_retryable=safely_retryable,
             operational_failure=operational_failure, backup_team=backup_team,
             backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
+            active_implementation_scope=scope_context,
             eligible_actions=sorted(eligible),
         )
         # Build once to select Lite or Full without exposing plan text to Lite.
@@ -3875,14 +4019,25 @@ def run_workflow(
         target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
         target_config = wf.steps.get(target_step) if target_step not in {None, "END"} else None
         target_plan = active_plan_path if target_step == current_step else post_transition_active_path
-        target_identity = _checkpoint_identity(target_plan)
+        target_identity = _target_plan_identity(target_plan)
+        scope_id = (
+            state.active_implementation_scope.scope_id
+            if state.active_implementation_scope is not None else None
+        )
         target_team = upgrade.target_team if decision.action == "upgrade_next_implementation" else None
         target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
         if target_config is not None and target_selector is None:
+            resolution_team = (
+                backup_team
+                if decision.action == "switch_to_backup_and_retry"
+                else active_team
+                if decision.action == "retry_current_step"
+                else baseline_team_name
+            )
             try:
                 target_selector, _ = _resolve_step_runtime(
                     target_config, workflow_config,
-                    team_name=target_team or active_team,
+                    team_name=resolution_team,
                     step_path=f"workflow.{workflow_name}.steps.{target_step}",
                 )
             except WorkflowError:
@@ -3895,6 +4050,8 @@ def run_workflow(
             target_team=target_team,
             target_selector=target_selector,
             checkpoint_identity=target_identity,
+            scope_id=scope_id,
+            target_plan_identity=target_identity,
             post_transition_active_plan_path=str(target_plan),
             post_transition_checkpoint_identity=target_identity,
             notes_reference=(f"manager/decision-{state.manager_decision_number:03d}" if decision.next_step_notes else None),
@@ -3905,6 +4062,8 @@ def run_workflow(
                 target_role=target_config.role if target_config is not None else None,
                 target_selector=target_selector,
                 checkpoint_identity=target_identity,
+                scope_id=scope_id,
+                target_plan_identity=target_identity,
             )
         # This is intentionally before changing any controller routing state.
         write_run_metadata(run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
@@ -3927,6 +4086,7 @@ def run_workflow(
                 target_step=next_step, role=wf.steps[next_step].role, source_team=upgrade.source_team,
                 target_team=upgrade.target_team, selector=upgrade.target_selector,
                 checkpoint_identity=target_identity, decision_number=state.manager_decision_number,
+                scope_id=scope_id, target_plan_identity=target_identity,
             )
         return proposed_transition
 
@@ -3953,7 +4113,7 @@ def run_workflow(
             proposed_action="stop", proposed_transition=None, current_step=current_step,
             current_role=current_role, baseline_team=baseline_team_name, actual_team=active_team,
             actual_selector=active_selector, original_plan_path=str(original_plan_path),
-            active_plan_path=str(active_plan_path), checkpoint_identity=_checkpoint_identity(active_plan_path),
+            active_plan_path=str(active_plan_path), checkpoint_identity=_target_plan_identity(active_plan_path),
             eligible_actions=["stop"], evidence=reason,
         )
         decision, context, error = _run_manager_call(level="full", boundary=boundary)
@@ -4002,13 +4162,24 @@ def run_workflow(
             )
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+            if step.role == "worker":
+                _open_implementation_scope(
+                    state,
+                    original_plan_path=original_plan_path,
+                    original_snapshot=state.last_snapshot,
+                    turn_number=turn_number,
+                )
             pending_override = state.pending_step_team_override
             if (
                 pending_override is not None
                 and not pending_override.consumed
                 and pending_override.target_step == current_step_name
                 and pending_override.role == step.role
-                and pending_override.checkpoint_identity == _checkpoint_identity(active_plan_path, retry_ctx.snapshot_before)
+                and _pending_matches_scope_and_plan(
+                    pending_override,
+                    state,
+                    _target_plan_identity(active_plan_path),
+                )
             ):
                 active_team_name = pending_override.target_team
                 consume_team_override = True
@@ -4027,7 +4198,11 @@ def run_workflow(
                         and pending_notes.target_step == current_step_name
                         and (pending_notes.target_role is None or pending_notes.target_role == step.role)
                         and (pending_notes.target_selector is None or pending_notes.target_selector == selector)
-                        and (pending_notes.checkpoint_identity is None or pending_notes.checkpoint_identity == _checkpoint_identity(active_plan_path, retry_ctx.snapshot_before))):
+                        and _pending_matches_scope_and_plan(
+                            pending_notes,
+                            state,
+                            _target_plan_identity(active_plan_path),
+                        )):
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
                     consume_manager_notes = True
                 invocation = step_adapter.build_invocation(
@@ -4083,13 +4258,24 @@ def run_workflow(
 
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
+            if step.role == "worker":
+                _open_implementation_scope(
+                    state,
+                    original_plan_path=original_plan_path,
+                    original_snapshot=current_plan.snapshot,
+                    turn_number=turn_number,
+                )
             pending_override = state.pending_step_team_override
             if (
                 pending_override is not None
                 and not pending_override.consumed
                 and pending_override.target_step == current_step_name
                 and pending_override.role == step.role
-                and pending_override.checkpoint_identity == _checkpoint_identity(active_plan_path, state.last_snapshot)
+                and _pending_matches_scope_and_plan(
+                    pending_override,
+                    state,
+                    _target_plan_identity(active_plan_path),
+                )
             ):
                 active_team_name = pending_override.target_team
                 consume_team_override = True
@@ -4128,7 +4314,11 @@ def run_workflow(
                         and pending_notes.target_step == current_step_name
                         and (pending_notes.target_role is None or pending_notes.target_role == step.role)
                         and (pending_notes.target_selector is None or pending_notes.target_selector == selector)
-                        and (pending_notes.checkpoint_identity is None or pending_notes.checkpoint_identity == _checkpoint_identity(active_plan_path, state.last_snapshot))):
+                        and _pending_matches_scope_and_plan(
+                            pending_notes,
+                            state,
+                            _target_plan_identity(active_plan_path),
+                        )):
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
                     consume_manager_notes = True
 
@@ -4146,6 +4336,15 @@ def run_workflow(
                     active_path=active_plan_path,
                     new_path=new_plan_path,
                 )
+
+        if step.role == "worker":
+            write_run_metadata(
+                run_paths, config, state, status="running",
+                last_snapshot=state.last_snapshot, workflow_name=workflow_name,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name, active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
+            )
 
         turn_dir, turn_started_at = _start_turn(
             turn_number=turn_number,
@@ -4168,7 +4367,11 @@ def run_workflow(
             and not state.pending_boundary_decision.consumed
             and state.pending_boundary_decision.resolved_next_step == current_step_name
             and (state.pending_boundary_decision.target_role is None or state.pending_boundary_decision.target_role == step.role)
-            and (state.pending_boundary_decision.checkpoint_identity is None or state.pending_boundary_decision.checkpoint_identity == _checkpoint_identity(active_plan_path, snapshot_before))
+            and _pending_matches_scope_and_plan(
+                state.pending_boundary_decision,
+                state,
+                _target_plan_identity(active_plan_path),
+            )
             and (state.pending_boundary_decision.target_selector is None or state.pending_boundary_decision.target_selector == selector)
         )
         if consume_manager_notes or consume_team_override or boundary_target_started:
@@ -4544,14 +4747,29 @@ def run_workflow(
         )
 
         if step.role == "worker":
-            attempt_key = _checkpoint_identity(active_plan_path, snapshot_before)
-            state.implementation_attempts.setdefault(attempt_key, []).append(ImplementationAttempt(
+            scope = state.active_implementation_scope
+            if scope is None:
+                raise WorkflowError(
+                    "internal error: worker turn finalized without an implementation scope",
+                    run_dir=run_paths.run_dir,
+                )
+            state.implementation_attempts.setdefault(scope.scope_id, []).append(ImplementationAttempt(
                 turn_number=turn_number, step_name=current_step_name, role=step.role,
                 team=active_team_name, selector=selector,
                 outcome="accepted" if done else "progress",
                 manager_decision_number=(state.pending_boundary_decision.decision_number
                     if state.pending_boundary_decision is not None else None),
             ))
+            next_config = (
+                wf.steps.get(transition_target)
+                if transition_target != "END" else None
+            )
+            state.active_implementation_scope = replace(
+                scope,
+                awaiting_review=(
+                    next_config is not None and next_config.role != "worker"
+                ),
+            )
 
         post_transition_active_path = _select_next_active_plan_path(
             original_plan_path=original_plan_path,
@@ -4561,6 +4779,26 @@ def run_workflow(
             selected_transition=selected_transition,
             exec_ctx=exec_ctx,
         )
+
+        scope = state.active_implementation_scope
+        next_config = (
+            wf.steps.get(transition_target)
+            if transition_target != "END" else None
+        )
+        if scope is not None and step.role != "worker" and scope.awaiting_review:
+            scope = replace(scope, awaiting_review=False)
+            state.active_implementation_scope = scope
+        if (
+            scope is not None
+            and not new_plan_exists
+            and _original_checkpoint_advanced(scope, post_snapshot)
+            and (
+                step.role != "worker"
+                or next_config is None
+                or next_config.role == "worker"
+            )
+        ):
+            _close_implementation_scope(state)
 
         # Preserve the legacy MAX_TURNS transition when supervision is off.
         # With supervision enabled, exhaustion is itself the finalized

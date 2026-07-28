@@ -45,6 +45,10 @@ aflow analyze
 Freshly bootstrapped configuration enables a lightweight manager between
 workflow turns. It accepts or changes the controller's already-proposed next
 action, and can stop a looping or ambiguous run with a self-contained report.
+For a rejected implementation, configured team `upgrade_to` edges can raise
+only the next worker invocation one level at a time; repeated rejection can
+advance farther along the chain, while the next checkpoint starts again from
+the baseline team.
 Existing configurations remain compatible: supervision stays off until you add
 a `[manager]` section and the corresponding manager roles. See
 [Configuration](docs/configuration.md#interstep-manager-supervision) for the

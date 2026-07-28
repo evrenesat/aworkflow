@@ -1,3 +1,26 @@
+## 2026-07-28 — Chained worker upgrades within one checkpoint
+
+### What changed
+
+- Added a durable original-checkpoint implementation scope that survives repair
+  plan changes, repeated review cycles, and resume.
+- Keyed actual worker attempt history by that scope, separated one-hop target
+  plan validation from upgrade lineage, and normalized resumed histories to
+  mutable lists.
+- Exposed compact scope depth, teams, selectors, and the most recent reviewed
+  worker in manager context.
+- Added resolver, state/resume-boundary, context, and end-to-end runtime
+  coverage for `default → strong → stronger`, followed by a baseline worker on
+  the next checkpoint.
+- Updated the README, configuration guide, runtime guide, architecture notes,
+  manager skill, and bundled TOML example to describe the same chained,
+  checkpoint-scoped behavior.
+
+### Why
+
+- Mutable repair-plan/checkpoint identities could lose the upgraded worker
+  attempt and incorrectly offer the first upgrade edge again.
+
 ## 2026-07-27 — Interstep manager supervision
 
 ### What changed

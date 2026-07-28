@@ -67,6 +67,39 @@ def test_lite_and_full_context_keep_plan_boundary(tmp_path: Path) -> None:
     assert lite["finished_turn"]["raw_artifacts"][0]["path"] == "turns/turn-001/stdout.txt"
 
 
+def test_context_exposes_compact_active_implementation_scope(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="rejected")
+    scope = {
+        "scope_id": "plan.md::checkpoint-1::context",
+        "checkpoint_index": 1,
+        "checkpoint_name": "Context",
+        "awaiting_review": True,
+        "attempt_count": 2,
+        "attempt_teams": ["base", "high"],
+        "attempt_selectors": ["codex.mini", "codex.high"],
+        "most_recent_team": "high",
+        "upgrade_depth": 1,
+    }
+
+    context = build_manager_context(
+        run_dir,
+        boundary={
+            "active_implementation_scope": scope,
+            "implementation_upgrade": {
+                "available": True,
+                "source_team": "high",
+                "target_team": "max",
+            },
+        },
+    )
+
+    controller = context["controller_state"]
+    assert controller["active_implementation_scope"] == scope
+    assert controller["eligible_upgrade"]["source_team"] == "high"
+    assert controller["eligible_upgrade"]["target_team"] == "max"
+
+
 def test_structured_semantics_and_bounded_large_trace_reference(tmp_path: Path) -> None:
     run_dir, _ = _run(tmp_path)
     stream = '\n'.join((json.dumps({"role": "assistant", "content": "first"}), json.dumps({"type": "result", "result": "complete final answer"})))

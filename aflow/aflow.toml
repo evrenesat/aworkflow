@@ -107,9 +107,12 @@ skill = 'aflow-manager'
 
 # Team-specific role overrides live under [teams.<name>.roles]. Missing roles fall back
 # to the global [roles] map. backup_team names the next team to try for harness
-# recovery. upgrade_to is a separate, one-edge quality escalation route for a
-# manager-selected implementation retry. Both targets must be defined teams;
-# self-links and cycles are rejected independently at config validation.
+# recovery. upgrade_to is a separate quality escalation route for a
+# manager-selected implementation retry. Each decision advances one edge for
+# one worker invocation; repeated rejection can expose the next edge in the
+# chain. Checkpoint approval resets worker routing to the baseline team. Both
+# graph targets must be defined teams; self-links and cycles are rejected
+# independently at config validation.
 # [teams.codex1]
 # backup_team = '7teen'
 # upgrade_to = 'codexmax'
@@ -118,7 +121,18 @@ skill = 'aflow-manager'
 # architect = 'codex.high'
 # senior_architect = 'codex.high'
 # reviewer = 'codex.high'
+# worker = 'codex.nano'
+#
+# [teams.codexmax]
+# upgrade_to = 'codexultra'
+#
+# [teams.codexmax.roles]
 # worker = 'codex.mini'
+#
+# [teams.codexultra]
+#
+# [teams.codexultra.roles]
+# worker = 'codex.high'
 #
 # [teams.7teen]
 #

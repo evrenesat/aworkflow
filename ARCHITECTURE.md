@@ -54,6 +54,11 @@ teardown begin only after the manager accepts that terminal action. Lite gets
 compact semantic evidence and structured state, while Full additionally gets
 the complete active plan. Manager calls and their exact artifacts live outside
 the workflow turn sequence, so they never affect turn counts or checkpoints.
+Implementation upgrades use a stable original-checkpoint review scope rather
+than the mutable active repair-plan identity. Attempts retain their actual team
+and selector; each rejection can expose one further configured edge. Approval
+closes the scope before the next checkpoint and clears scoped pending actions
+without deleting historical attempt evidence.
 
 ## Module Breakdown
 
@@ -150,7 +155,7 @@ The core engine. `run_workflow()` executes the turn loop:
       logical path.
    l. Update run metadata with the active plan selected for the next turn.
    m. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout fingerprints detect mutation. Its own invocation does not count as a workflow turn.
-   n. Persist accepted one-hop notes, exact selector, post-transition active plan, checkpoint identity, and an eligible implementation-team override before the next step begins. Resume restores an unconsumed target before launching it, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
+   n. Persist accepted one-hop notes, exact selector, target active-plan identity, stable implementation-scope identity, and an eligible implementation-team override before the next step begins. Resume restores the scope and an unconsumed target before launching it, normalizes attempt histories to mutable live lists, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
 
    Harness error recovery is inserted after the harness returns and before normal transition handling. If the turn made no plan progress and a configured error-handling rule matches the harness output, the engine produces that cheap deterministic action for manager acceptance. Rules can keep the same team, switch to a configured `backup_team`, or fail immediately. An unmatched ambiguous error goes directly to Full supervision when enabled; manager-disabled runs retain the team-lead recovery handoff. Progress-gated turns skip recovery entirely and continue on the normal transition path.
 5. After normal workflow completion, if `teardown` includes `merge`, execute the merge handoff: resolve `[aflow].team_lead` through the effective team, build a merge prompt (built-in `aflow-merge` instruction plus rendered `merge_prompt` entries), and run the `team_lead` agent from the primary checkout. After the agent returns, verify: no unmerged index entries, clean working tree, HEAD on `main_branch`, and feature branch is an ancestor of the target. Only after all checks pass does `rm_worktree` (if configured) remove the linked worktree. Any verification failure leaves the feature branch and worktree intact and fails the run with the specific failed check.

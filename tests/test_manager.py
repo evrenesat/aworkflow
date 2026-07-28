@@ -24,8 +24,10 @@ from aflow.manager import (
 )
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
+    ActiveImplementationScope,
     ControllerConfig,
     ControllerState,
+    ImplementationAttempt,
     ManagerDecisionSummary,
     PendingManagerNotes,
     PendingTeamOverride,
@@ -34,6 +36,7 @@ from aflow.run_state import (
     restore_manager_state,
 )
 from aflow.runlog import create_run_paths, write_manager_artifacts, write_run_metadata
+from aflow.workflow import _implementation_upgrade_depth, _mutable_implementation_attempts
 
 
 def _config(*, upgraded_selector: str = "codex.high") -> WorkflowUserConfig:
@@ -44,6 +47,7 @@ def _config(*, upgraded_selector: str = "codex.high") -> WorkflowUserConfig:
                     "nano": HarnessProfileConfig(model="nano"),
                     "mini": HarnessProfileConfig(model="mini"),
                     "high": HarnessProfileConfig(model="high"),
+                    "max": HarnessProfileConfig(model="max"),
                 }
             )
         },
@@ -54,7 +58,8 @@ def _config(*, upgraded_selector: str = "codex.high") -> WorkflowUserConfig:
         },
         teams={
             "base": TeamConfig(roles={"worker": "codex.mini"}, upgrade_to="high"),
-            "high": TeamConfig(roles={"worker": upgraded_selector}),
+            "high": TeamConfig(roles={"worker": upgraded_selector}, upgrade_to="max"),
+            "max": TeamConfig(roles={"worker": "codex.max"}),
         },
         manager=ManagerConfig(enabled=True, lite_role="manager_lite", full_role="manager_full"),
     )
@@ -131,6 +136,43 @@ def test_upgrade_is_unavailable_when_target_selector_does_not_change() -> None:
     assert "same selector" in str(upgrade.reason)
 
 
+def test_upgrade_advances_from_most_recent_team_and_stops_at_chain_end() -> None:
+    config = _config()
+    second = eligible_implementation_upgrade(
+        config,
+        role="worker",
+        baseline_team="base",
+        most_recent_implementation_team="high",
+    )
+    assert second.available is True
+    assert second.source_team == "high"
+    assert second.target_team == "max"
+    assert second.target_selector == "codex.max"
+
+    exhausted = eligible_implementation_upgrade(
+        config,
+        role="worker",
+        baseline_team="base",
+        most_recent_implementation_team="max",
+    )
+    assert exhausted.available is False
+    assert exhausted.source_team == "max"
+    assert "does not configure upgrade_to" in str(exhausted.reason)
+
+
+def test_upgrade_depth_counts_edges_not_same_team_retries() -> None:
+    config = _config()
+    assert _implementation_upgrade_depth(
+        config, baseline_team="base", most_recent_team="base"
+    ) == 0
+    assert _implementation_upgrade_depth(
+        config, baseline_team="base", most_recent_team="high"
+    ) == 1
+    assert _implementation_upgrade_depth(
+        config, baseline_team="base", most_recent_team="max"
+    ) == 2
+
+
 def test_prompts_preserve_only_the_supplied_context_level() -> None:
     context = {"level": "lite", "active_plan_content": None, "run_id": "run-1"}
     system, user = build_manager_prompts(context)
@@ -158,6 +200,14 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     state.semantic_stall_count = 1
     state.reviewer_rejection_count = 2
     state.implementation_attempts["cp-2"] = 2
+    state.active_implementation_scope = ActiveImplementationScope(
+        "plan.md::checkpoint-2::second",
+        "plan.md",
+        2,
+        "Second",
+        3,
+        awaiting_review=True,
+    )
     state.pending_manager_notes = PendingManagerNotes("implement", ("focus",), 1)
     state.pending_step_team_override = PendingTeamOverride("implement", "worker", "base", "high", "codex.high", "cp-2", 1)
     state.last_manager_report_path = "manager-report.md"
@@ -167,6 +217,7 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
     restore_manager_state(restored, payload)
     assert restored.manager_history == state.manager_history
+    assert restored.active_implementation_scope == state.active_implementation_scope
     assert restored.pending_manager_notes == state.pending_manager_notes
     assert restored.pending_step_team_override == state.pending_step_team_override
     assert manager_resume_fields(payload)["pending_manager_notes"] == state.pending_manager_notes
@@ -179,3 +230,34 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
     assert run_json["last_manager_report_path"] == "manager-report.md"
     assert run_json["manager_history"][0]["artifact_path"] == "manager/decision-001"
+
+
+def test_resume_attempt_history_is_tolerant_and_live_conversion_is_mutable() -> None:
+    payload = {
+        "implementation_attempts": {
+            "scope-1": [{
+                "turn_number": 1,
+                "step_name": "implement",
+                "role": "worker",
+                "team": "base",
+                "selector": "codex.mini",
+                "outcome": "progress",
+            }],
+        },
+    }
+    fields = manager_resume_fields(payload)
+    attempts = fields["implementation_attempts"]["scope-1"]
+    assert isinstance(attempts, tuple)
+    assert attempts == (
+        ImplementationAttempt(1, "implement", "worker", "base", "codex.mini", "progress"),
+    )
+    live_attempts = _mutable_implementation_attempts(fields["implementation_attempts"])
+    assert isinstance(live_attempts["scope-1"], list)
+    live_attempts["scope-1"].append(
+        ImplementationAttempt(2, "implement", "worker", "high", "codex.high", "progress")
+    )
+    assert len(live_attempts["scope-1"]) == 2
+
+    legacy = manager_resume_fields({"implementation_attempts": {"checkpoint-1": 2}})
+    assert legacy["active_implementation_scope"] is None
+    assert legacy["implementation_attempts"]["checkpoint-1"] == ()
