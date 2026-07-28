@@ -54,6 +54,10 @@ teardown begin only after the manager accepts that terminal action. Lite gets
 compact semantic evidence and structured state, while Full additionally gets
 the complete active plan. Manager calls and their exact artifacts live outside
 the workflow turn sequence, so they never affect turn counts or checkpoints.
+Every manager prompt names the configured manager skill and embeds the complete
+closed JSON protocol, including the structured stop-report shape. Invalid
+manager output at a terminal incident cannot replace the original controller
+failure as the report's primary cause.
 Implementation upgrades use a stable original-checkpoint review scope rather
 than the mutable active repair-plan identity. Attempts retain their actual team
 and selector; each rejection can expose one further configured edge. Approval

@@ -242,20 +242,72 @@ def eligible_implementation_upgrade(
     return EligibleImplementationUpgrade(True, source_team, target_team, role, source_selector, target_selector)
 
 
-def build_manager_prompts(context: Mapping[str, Any]) -> tuple[str, str]:
+def build_manager_prompts(
+    context: Mapping[str, Any],
+    *,
+    skill_name: str = "aflow-manager",
+) -> tuple[str, str]:
     level = context.get("level")
     if level not in {"lite", "full"}:
         raise ValueError("manager context must declare level 'lite' or 'full'")
+    controller = (
+        context.get("controller_state")
+        if isinstance(context.get("controller_state"), Mapping)
+        else {}
+    )
+    eligible_actions = {
+        str(action)
+        for action in controller.get("eligible_actions", ())
+        if isinstance(action, str) and action
+    }
+    if level == "lite":
+        eligible_actions.add("escalate_to_full")
+    eligible_text = ", ".join(sorted(eligible_actions)) or "none"
+    normal_shape = json.dumps({
+        "schema_version": 1,
+        "action": "continue",
+        "reason": "Concise non-empty evidence-based reason.",
+        "next_step_notes": [],
+        "stop_report": None,
+    }, separators=(",", ":"))
+    stop_shape = json.dumps({
+        "schema_version": 1,
+        "action": "stop",
+        "reason": "Concise non-empty evidence-based reason.",
+        "next_step_notes": [],
+        "stop_report": {
+            "summary": "Non-empty summary.",
+            "root_cause": "Non-empty root cause.",
+            "evidence": ["At least one non-empty evidence string."],
+            "attempts": "Non-empty attempts summary.",
+            "workspace_state": "Non-empty workspace and plan summary.",
+            "next_actions": ["At least one non-empty next action."],
+        },
+    }, separators=(",", ":"))
     system_prompt = "\n".join((
         "You are the AFlow interstep manager.",
         f"Supervision level: {level.upper()}.",
+        f"Use the configured manager skill '{skill_name}' when it is available.",
+        "The inline protocol below is authoritative even when that skill is unavailable.",
         "You are read-only: do not edit source, plans, git state, configuration, or run files.",
         "Accept or alter only the controller action exposed as eligible in the supplied context.",
         "Do not choose workflow nodes, teams, selectors, or business logic.",
+        f"Eligible actions at this boundary: {eligible_text}.",
         "Return exactly one JSON object with schema_version, action, reason, next_step_notes, and stop_report.",
+        "schema_version must be the number 1. reason must be a non-empty string.",
+        "next_step_notes must always be an array of non-empty strings, never a string or null.",
+        "For stop, escalate_to_full, and accepted END, next_step_notes must be [].",
+        "For every non-stop action, stop_report must be null.",
+        "For stop, stop_report must be an object with exactly summary, root_cause, evidence, attempts, workspace_state, and next_actions; evidence and next_actions must be non-empty arrays of non-empty strings and the other fields must be non-empty strings.",
+        f"Non-stop response shape: {normal_shape}",
+        f"Stop response shape: {stop_shape}",
         "No Markdown fences or explanatory text.",
     ))
-    user_prompt = json.dumps(dict(context), indent=2, sort_keys=True) + "\n"
+    user_prompt = (
+        "MANAGER_CONTEXT_JSON:\n"
+        + json.dumps(dict(context), indent=2, sort_keys=True)
+        + "\n"
+    )
     return system_prompt, user_prompt
 
 
@@ -270,10 +322,44 @@ def render_manager_stop_report(
     controller = context.get("controller_state") if isinstance(context.get("controller_state"), Mapping) else {}
     plan_state = context.get("plan_state") if isinstance(context.get("plan_state"), Mapping) else {}
     if stop_report is None:
+        terminal_incident = bool(controller.get("terminal"))
+        incident_reason = next((
+            str(value)
+            for value in (
+                controller.get("lite_evidence"),
+                finished_turn.get("error"),
+            )
+            if isinstance(value, str) and value.strip()
+        ), None)
+        protocol_failure = (
+            failure_reason
+            or "Manager supervision could not continue the workflow safely."
+        )
+        summary = (
+            incident_reason
+            if terminal_incident and incident_reason is not None
+            else protocol_failure
+        )
+        root_cause = (
+            f"The controller reached a terminal workflow incident. "
+            f"The manager response was also unavailable, invalid, or illegal: "
+            f"{protocol_failure}"
+            if terminal_incident and incident_reason is not None
+            else "Manager output was unavailable, invalid, or illegal for the current controller boundary."
+        )
+        evidence_items = (
+            finished_turn.get("error"),
+            finished_turn.get("status"),
+            context.get("trigger"),
+            incident_reason,
+            f"Manager decision error: {protocol_failure}",
+        )
         report = ManagerStopReport(
-            summary=failure_reason or "Manager supervision could not continue the workflow safely.",
-            root_cause="Manager output was unavailable, invalid, or illegal for the current controller boundary.",
-            evidence=tuple(str(item) for item in (finished_turn.get("error"), finished_turn.get("status"), context.get("trigger")) if item),
+            summary=summary,
+            root_cause=root_cause,
+            evidence=tuple(dict.fromkeys(
+                str(item) for item in evidence_items if item
+            )),
             attempts=f"Manager decision {context.get('decision_number', 'unknown')} at {context.get('level', 'unknown')} level.",
             workspace_state=f"Baseline team: {controller.get('baseline_team')}; active plan: {plan_state.get('active_plan_path')}; turn: {finished_turn.get('turn_number')}.",
             next_actions=("Inspect the stored manager context and result artifacts.", "Correct the configuration or controller condition, then resume from the durable run state."),

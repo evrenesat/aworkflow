@@ -5244,6 +5244,82 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert full_result['level'] == 'full'
             assert full_result['action'] == 'continue'
 
+    def test_invalid_terminal_manager_response_preserves_harness_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    ),
+                },
+                first_step="implement",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "worker": "reasonix.ds4lite",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses={
+                    "reasonix": WorkflowHarnessConfig(profiles={
+                        "ds4lite": HarnessProfileConfig(model="deepseek-flash"),
+                    }),
+                    "codex": WorkflowHarnessConfig(profiles={
+                        "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                        "manager-full": HarnessProfileConfig(model="manager-full"),
+                    }),
+                },
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+            calls: list[str] = []
+
+            def runner(argv, **kwargs):
+                calls.append(argv[0])
+                if argv[0] == "reasonix":
+                    assert "--dir" in argv
+                    assert "-dir" not in argv
+                    return subprocess.CompletedProcess(argv, 2, "", "")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "stop",
+                    "reason": "The harness failed before implementation.",
+                    "next_step_notes": "Investigate the harness failure.",
+                    "stop_report": "AFLOW_STOP: harness failed.",
+                }), "")
+
+            with pytest.raises(WorkflowError) as error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    wf_config,
+                    "managed",
+                    config_dir=repo_root,
+                    runner=runner,
+                )
+
+            report = str(error.value)
+            assert calls == ["reasonix", "codex"]
+            assert "## Summary\nharness 'reasonix' exited with code 2" in report
+            assert "Manager decision error: next_step_notes must be an array" in report
+            run_dir = error.value.run_dir
+            assert run_dir is not None
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            assert run_json["failure_reason"] == report
+
     def test_same_step_cap_calls_full_once_without_a_lite_transition_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -5486,7 +5562,7 @@ def _run_upgrade_resume_scenario(
         model = argv[argv.index("--model") + 1]
         if model.startswith("manager-"):
             prompt = argv[-1]
-            context = json.loads(prompt[prompt.index("{"):])
+            context = json.loads(prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1])
             manager_numbers.append(context["decision_number"])
             action = (
                 "upgrade_next_implementation"

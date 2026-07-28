@@ -137,7 +137,9 @@ non-empty role names, and resolve through the run's baseline team before the
 global `[roles]` map. This means they use normal harness/profile selection;
 the manager is never routed through a temporary implementation upgrade.
 `full_after_stalled_turns` defaults to `2` and must be at least `1`.
-`skill` defaults to `aflow-manager`.
+`skill` defaults to `aflow-manager`. Each manager prompt requests that configured
+skill when the harness supports skills and also carries the complete strict JSON
+contract inline, so protocol correctness does not depend on skill installation.
 
 Lite is the normal cost-aware supervisor. It receives the finished turn's
 complete semantic result, compact run history, structured plan state, routing

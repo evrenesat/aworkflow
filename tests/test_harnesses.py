@@ -14,12 +14,13 @@ class AdaptersTests(unittest.TestCase):
         assert invocation.argv == (
             'reasonix',
             'run',
-            '-dir',
+            '--dir',
             '/repo',
             '--model',
             'deepseek-pro',
             'SYSTEM\n\nUSER',
         )
+        assert '-dir' not in invocation.argv
         assert not adapter.supports_effort
         assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
         assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
@@ -33,7 +34,8 @@ class AdaptersTests(unittest.TestCase):
             user_prompt='USER',
             effort='high',
         )
-        assert invocation.argv == ('reasonix', 'run', '-dir', '/repo', 'SYSTEM\n\nUSER')
+        assert invocation.argv == ('reasonix', 'run', '--dir', '/repo', 'SYSTEM\n\nUSER')
+        assert '-dir' not in invocation.argv
         assert '--effort' not in invocation.argv
         assert '--model' not in invocation.argv
 

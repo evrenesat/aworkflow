@@ -3795,7 +3795,10 @@ def run_workflow(
         if level == "lite":
             eligible.add("escalate_to_full")
 
-        system_prompt, user_prompt = build_manager_prompts(context)
+        system_prompt, user_prompt = build_manager_prompts(
+            context,
+            skill_name=workflow_config.manager.skill,
+        )
         artifact_dir = run_paths.manager_dir / f"decision-{decision_number:03d}"
         artifact_paths = {
             name: str((artifact_dir / filename).relative_to(run_paths.run_dir))

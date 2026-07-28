@@ -123,7 +123,11 @@ roles, teams, selectors, or business logic. Invalid or unavailable Lite output
 gets one Full attempt. Invalid or unavailable Full output stops the run with a
 deterministic report instead of starting another manager loop. A manager that
 changes repository, plan, git, config, or run-control state is detected and
-also stops the run.
+also stops the run. The configured manager skill name and complete response
+schema are included in every manager prompt. If a terminal workflow incident is
+followed by an invalid manager response, the deterministic report retains the
+workflow incident as its summary and records the manager protocol error
+separately instead of masking the original failure.
 
 `continue` with notes stores immutable notes for the selected next step. They
 are injected once and cleared only when that step durably starts. A manager

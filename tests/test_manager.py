@@ -114,6 +114,32 @@ def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
     assert "plans/a.md" in report
 
 
+def test_terminal_fallback_report_preserves_incident_before_protocol_error() -> None:
+    report = render_manager_stop_report(
+        context={
+            "run_id": "run-1",
+            "decision_number": 1,
+            "level": "full",
+            "trigger": "ambiguous_failure",
+            "finished_turn": {
+                "turn_number": 1,
+                "status": "harness-failed",
+                "error": None,
+            },
+            "controller_state": {
+                "terminal": True,
+                "baseline_team": "ds4_lite",
+                "lite_evidence": "harness 'reasonix' exited with code 2",
+            },
+            "plan_state": {"active_plan_path": "plans/a.md"},
+        },
+        failure_reason="next_step_notes must be an array of non-empty strings",
+    )
+    assert "## Summary\nharness 'reasonix' exited with code 2" in report
+    assert "The controller reached a terminal workflow incident." in report
+    assert "Manager decision error: next_step_notes must be an array" in report
+
+
 def test_manager_role_and_one_edge_upgrade_use_baseline_routing_only() -> None:
     config = _config()
     resolved = resolve_manager_role(config, level="lite", baseline_team="base")
@@ -174,10 +200,20 @@ def test_upgrade_depth_counts_edges_not_same_team_retries() -> None:
 
 
 def test_prompts_preserve_only_the_supplied_context_level() -> None:
-    context = {"level": "lite", "active_plan_content": None, "run_id": "run-1"}
-    system, user = build_manager_prompts(context)
+    context = {
+        "level": "lite",
+        "active_plan_content": None,
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue", "stop"]},
+    }
+    system, user = build_manager_prompts(context, skill_name="custom-manager")
     assert "LITE" in system
-    assert json.loads(user) == context
+    assert "configured manager skill 'custom-manager'" in system
+    assert "Eligible actions at this boundary: continue, escalate_to_full, stop." in system
+    assert "next_step_notes must always be an array" in system
+    assert '"stop_report":{"summary":' in system
+    assert user.startswith("MANAGER_CONTEXT_JSON:\n")
+    assert json.loads(user.removeprefix("MANAGER_CONTEXT_JSON:\n")) == context
 
 
 def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:

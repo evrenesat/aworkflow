@@ -30,12 +30,10 @@ class ReasonixAdapter:
         effort: str | None = None,
     ) -> HarnessInvocation:
         effective_prompt = "\n\n".join((system_prompt, user_prompt))
-        argv: list[str] = [
-            "reasonix",
-            "run",
-            "-dir",
-            str(repo_root),
-        ]
+        # Current Reasonix releases expose the directory option only as
+        # ``--dir``.  The old single-dash spelling exits during argument
+        # parsing before the agent can produce diagnostics.
+        argv: list[str] = ["reasonix", "run", "--dir", str(repo_root)]
         if model is not None:
             argv.extend(["--model", model])
         argv.append(effective_prompt)

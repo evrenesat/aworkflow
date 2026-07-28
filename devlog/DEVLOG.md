@@ -1,3 +1,24 @@
+## 2026-07-28 — Reasonix and terminal manager hardening
+
+### What changed
+
+- Replaced the obsolete Reasonix `-dir` argument with the supported `--dir`
+  spelling so the CLI reaches agent execution instead of failing argument
+  parsing.
+- Made `[manager].skill` effective in manager prompts and embedded exact normal
+  and stop JSON shapes so strict protocol validation does not depend on an
+  installed skill.
+- Kept the original terminal workflow incident primary in deterministic manager
+  reports while recording any secondary manager protocol error separately.
+- Added adapter, prompt-contract, and terminal-report regression coverage for
+  the observed zero-output Reasonix and malformed-stop response.
+
+### Why
+
+- Reasonix v1.17.15 rejects `-dir` before agent execution, and the prior terse
+  manager prompt allowed a semantically correct stop decision to serialize
+  `next_step_notes` and `stop_report` with invalid types.
+
 ## 2026-07-28 — Chained worker upgrades within one checkpoint
 
 ### What changed
