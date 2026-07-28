@@ -157,7 +157,9 @@ opening turn, so prior-checkpoint repairs cannot stop a new checkpoint before
 its first review. A rejected review is counted from its own unchanged finalized
 outcome, so the second rejection selects Full before another worker starts.
 When a run resumes into a fresh run directory, the scope opening turn is rebased
-to the new run and its prior rejection count is carried separately.
+to the new run and its prior rejection count is carried separately. Legacy
+scopes written before that carried counter existed discard the old top-level
+run-wide count rather than treating earlier-checkpoint rejections as current.
 
 Every successful finalized turn is written with `status: "completed"`, a single
 authoritative finish timestamp, and its duration even while the overall

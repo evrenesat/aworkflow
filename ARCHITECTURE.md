@@ -67,7 +67,9 @@ historical analysis use the same controller window. Successful turn artifacts,
 in-memory records, and finish events share one finish timestamp and duration.
 Boundary schema versioning preserves the legacy shape for old artifacts while
 new boundaries snapshot structured plan state. Resume rebases run-local scope
-turn numbering and carries prior rejection progress explicitly.
+turn numbering and carries prior rejection progress explicitly. Legacy scopes
+without that explicit carried field resume with zero scoped rejections instead
+of importing the old run-wide counter.
 Implementation upgrades use a stable original-checkpoint review scope rather
 than the mutable active repair-plan identity. Attempts retain their actual team
 and selector; each rejection can expose one further configured edge. Approval

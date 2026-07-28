@@ -6,6 +6,7 @@ from aflow.run_state import (
     ImplementationAttempt,
     PendingBoundaryDecision,
     PendingTeamOverride,
+    manager_resume_fields,
 )
 
 class WorkflowRuntimeTests(unittest.TestCase):
@@ -5575,6 +5576,7 @@ def _run_upgrade_resume_scenario(
     *,
     interruption: str,
     prior_reviewer_rejections: int = 0,
+    legacy_scope: bool = False,
 ) -> tuple[list[str], list[int], dict[str, object], Path]:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -5726,6 +5728,43 @@ def _run_upgrade_resume_scenario(
             target_plan_identity=target_identity,
         )
 
+    resume_manager_fields: dict[str, object] = {
+        "manager_decision_number": decision_number,
+        "reviewer_rejection_count": prior_reviewer_rejections,
+        "implementation_attempts": {scope.scope_id: tuple(attempts)},
+        "active_implementation_scope": scope,
+        "pending_step_team_override": pending_override,
+        "pending_boundary_decision": pending_boundary,
+    }
+    if legacy_scope:
+        assert pending_override is None
+        assert pending_boundary is None
+        resume_manager_fields = manager_resume_fields({
+            "manager_decision_number": decision_number,
+            "reviewer_rejection_count": prior_reviewer_rejections,
+            "implementation_attempts": {
+                scope.scope_id: [
+                    {
+                        "turn_number": attempt.turn_number,
+                        "step_name": attempt.step_name,
+                        "role": attempt.role,
+                        "team": attempt.team,
+                        "selector": attempt.selector,
+                        "outcome": attempt.outcome,
+                        "manager_decision_number": attempt.manager_decision_number,
+                    }
+                    for attempt in attempts
+                ],
+            },
+            "active_implementation_scope": {
+                "scope_id": scope.scope_id,
+                "original_plan_path": scope.original_plan_path,
+                "checkpoint_index": scope.checkpoint_index,
+                "checkpoint_name": scope.checkpoint_name,
+                "opened_turn_number": 5,
+                "awaiting_review": scope.awaiting_review,
+            },
+        })
     resume = ResumeContext(
         resumed_from_run_id=f"prior-{interruption}",
         feature_branch="resume-feature",
@@ -5734,12 +5773,7 @@ def _run_upgrade_resume_scenario(
         setup=("worktree", "branch"),
         teardown=(),
         active_plan_path=repair_path,
-        manager_decision_number=decision_number,
-        reviewer_rejection_count=prior_reviewer_rejections,
-        implementation_attempts={scope.scope_id: tuple(attempts)},
-        active_implementation_scope=scope,
-        pending_step_team_override=pending_override,
-        pending_boundary_decision=pending_boundary,
+        **resume_manager_fields,
     )
     workflow_models: list[str] = []
     manager_numbers: list[int] = []
@@ -5837,6 +5871,28 @@ def test_manager_resume_carries_scope_rejections_into_first_boundary(
     assert context["controller_state"]["reviewer_rejection_count"] == 3
     assert scope["opened_turn_number"] == 1
     assert scope["carried_reviewer_rejection_count"] == 2
+
+
+def test_manager_legacy_resume_discards_prior_checkpoint_rejections(
+    tmp_path: Path,
+) -> None:
+    _, _, _, run_dir = _run_upgrade_resume_scenario(
+        tmp_path,
+        interruption="before_review",
+        prior_reviewer_rejections=2,
+        legacy_scope=True,
+    )
+    result = json.loads(
+        (run_dir / "manager" / "decision-003" / "result.json").read_text()
+    )
+    context = json.loads(
+        (run_dir / "manager" / "decision-003" / "context.json").read_text()
+    )
+    scope = context["controller_state"]["active_implementation_scope"]
+    assert result["level"] == "lite"
+    assert context["controller_state"]["reviewer_rejection_count"] == 1
+    assert scope["opened_turn_number"] == 1
+    assert scope["carried_reviewer_rejection_count"] == 0
 
 
 def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: Path) -> None:

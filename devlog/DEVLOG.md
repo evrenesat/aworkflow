@@ -1,3 +1,17 @@
+## 2026-07-28 — Legacy scoped-rejection resume correction
+
+### What changed
+
+- Recognized active implementation scopes without the durable carried-rejection
+  field as legacy and discarded their potentially run-wide top-level count.
+- Added state restoration and end-to-end resume coverage proving an earlier
+  checkpoint's two rejections do not force Full for the current checkpoint.
+
+### Why
+
+- Pre-scoped run metadata could otherwise poison a resumed checkpoint and make
+  Full stop it before that checkpoint accumulated its own rejection evidence.
+
 ## 2026-07-28 — Manager runtime review follow-up
 
 ### What changed

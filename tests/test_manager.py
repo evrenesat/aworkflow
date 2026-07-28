@@ -315,3 +315,28 @@ def test_resume_attempt_history_is_tolerant_and_live_conversion_is_mutable() -> 
     legacy = manager_resume_fields({"implementation_attempts": {"checkpoint-1": 2}})
     assert legacy["active_implementation_scope"] is None
     assert legacy["implementation_attempts"]["checkpoint-1"] == ()
+
+
+def test_legacy_scope_does_not_restore_run_wide_reviewer_rejections() -> None:
+    payload = {
+        "reviewer_rejection_count": 2,
+        "active_implementation_scope": {
+            "scope_id": "plan.md::checkpoint-2::second",
+            "original_plan_path": "plan.md",
+            "checkpoint_index": 2,
+            "checkpoint_name": "Second",
+            "opened_turn_number": 5,
+            "awaiting_review": False,
+        },
+    }
+
+    restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    restore_manager_state(restored, payload)
+    fields = manager_resume_fields(payload)
+
+    assert restored.reviewer_rejection_count == 0
+    assert fields["reviewer_rejection_count"] == 0
+    scope = fields["active_implementation_scope"]
+    assert isinstance(scope, ActiveImplementationScope)
+    assert scope.opened_turn_number == 5
+    assert scope.carried_reviewer_rejection_count == 0

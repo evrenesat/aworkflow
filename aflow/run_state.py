@@ -394,6 +394,9 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
     if isinstance(scope, Mapping) and {
         "scope_id", "original_plan_path", "opened_turn_number"
     } <= set(scope):
+        has_scoped_rejection_count = (
+            "carried_reviewer_rejection_count" in scope
+        )
         state.active_implementation_scope = ActiveImplementationScope(
             scope_id=str(scope["scope_id"]),
             original_plan_path=str(scope["original_plan_path"]),
@@ -411,6 +414,11 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 scope.get("carried_reviewer_rejection_count", 0) or 0
             ),
         )
+        if not has_scoped_rejection_count:
+            # Pre-scoped run metadata may contain a poisoned whole-run total.
+            # The compact run payload has no finalized-turn history from which
+            # to reconstruct this scope, so resume it conservatively at zero.
+            state.reviewer_rejection_count = 0
     notes = payload.get("pending_manager_notes")
     if isinstance(notes, Mapping) and isinstance(notes.get("notes"), (list, tuple)):
         state.pending_manager_notes = PendingManagerNotes(
