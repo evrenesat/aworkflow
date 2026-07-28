@@ -231,14 +231,23 @@ def _plan_state(run_dir: Path, run_json: dict[str, Any], finished_turn: dict[str
     ), active_path
 
 
-def analyze_manager_progress(turns: list[dict[str, Any]]) -> ProgressSignals:
+def analyze_manager_progress(
+    turns: list[dict[str, Any]],
+    *,
+    legacy_reviewer_logic: bool = False,
+) -> ProgressSignals:
     progress = analyze_progress_tail(turns)
+    reviewer_rejection_count = (
+        progress["legacy_reviewer_rejection_count"]
+        if legacy_reviewer_logic
+        else progress["reviewer_rejection_count"]
+    )
     return ProgressSignals(
         unchanged_snapshot_turns=progress["unchanged_snapshot_turns"],
         same_step_stall_turns=progress["same_step_stall_turns"],
         alternating_two_step_tail=progress["alternating_two_step_tail"],
-        reviewer_rejection_count=progress["reviewer_rejection_count"],
-        reviewer_non_convergence=progress["reviewer_non_convergence"],
+        reviewer_rejection_count=reviewer_rejection_count,
+        reviewer_non_convergence=reviewer_rejection_count >= 2,
     )
 
 
@@ -333,7 +342,12 @@ def build_manager_context(
     stdout = _read_text(finished_dir / "stdout.txt") or str(finished.get("stdout", ""))
     stderr = _read_text(finished_dir / "stderr.txt") or str(finished.get("stderr", ""))
     semantic = extract_semantic_result(stdout)
+    boundary_was_supplied = boundary is not None
     boundary = dict(boundary or {})
+    legacy_boundary = (
+        boundary_was_supplied
+        and "context_schema_version" not in boundary
+    )
     # Boundary inputs are finalized before manager invocation.  They take
     # precedence over mutable run metadata so the same durable inputs rebuild
     # the exact runtime context later.
@@ -350,18 +364,22 @@ def build_manager_context(
         plan_state_payload = captured_plan_state
     else:
         plan_state_payload = asdict(plan_state)
-    whole_run_progress = analyze_manager_progress(turns)
-    scope_was_explicit = "active_implementation_scope" in boundary
-    scope = (
-        boundary.get("active_implementation_scope")
-        if scope_was_explicit
-        else run_json.get("active_implementation_scope")
+    whole_run_progress = analyze_manager_progress(
+        turns,
+        legacy_reviewer_logic=legacy_boundary,
     )
-    legacy_scoped_boundary = (
-        scope_was_explicit
-        and isinstance(scope, dict)
-        and "opened_turn_number" not in scope
-    )
+    if "active_implementation_scope" in boundary:
+        scope_was_explicit = True
+        scope = boundary.get("active_implementation_scope")
+    elif not boundary_was_supplied and "active_implementation_scope" in run_json:
+        scope_was_explicit = True
+        scope = run_json.get("active_implementation_scope")
+    else:
+        scope_was_explicit = False
+        scope = None
+    if legacy_boundary:
+        scope_was_explicit = False
+        scope = None
     progress_scope = None
     scoped_progress = whole_run_progress
     if isinstance(scope, dict):
@@ -372,6 +390,23 @@ def build_manager_context(
                 if int(turn.get("turn_number", 0) or 0) >= opened_turn_number
             ]
             scoped_progress = analyze_manager_progress(scoped_turns)
+            carried_rejections = int(
+                scope.get("carried_reviewer_rejection_count", 0) or 0
+            )
+            if carried_rejections:
+                scoped_progress = ProgressSignals(
+                    unchanged_snapshot_turns=scoped_progress.unchanged_snapshot_turns,
+                    same_step_stall_turns=scoped_progress.same_step_stall_turns,
+                    alternating_two_step_tail=scoped_progress.alternating_two_step_tail,
+                    reviewer_rejection_count=(
+                        carried_rejections
+                        + scoped_progress.reviewer_rejection_count
+                    ),
+                    reviewer_non_convergence=(
+                        carried_rejections
+                        + scoped_progress.reviewer_rejection_count
+                    ) >= 2,
+                )
             progress_scope = {
                 "scope_id": scope.get("scope_id"),
                 "opened_turn_number": opened_turn_number,
@@ -392,7 +427,7 @@ def build_manager_context(
         reviewer_non_convergence=scoped_progress.reviewer_non_convergence,
     )
     progress_payload = asdict(progress)
-    if legacy_scoped_boundary:
+    if legacy_boundary:
         progress_payload.pop("same_step_stall_turns", None)
     raw_artifacts = [asdict(_artifact_ref(run_dir, finished_dir / name)) for name in ("stdout.txt", "stderr.txt")]
     finished_turn = {
@@ -402,7 +437,7 @@ def build_manager_context(
         "returncode": finished.get("returncode"),
         "duration_seconds": (
             finished.get("duration_seconds")
-            if legacy_scoped_boundary
+            if legacy_boundary
             else _duration_seconds(finished)
         ),
         "semantic_result": asdict(semantic), "error": finished.get("error"),
@@ -434,11 +469,11 @@ def build_manager_context(
             "turn_budget": {"completed": run_json.get("turns_completed"), "maximum": run_json.get("max_turns")},
             "same_node_counter": (
                 progress.unchanged_snapshot_turns
-                if legacy_scoped_boundary else progress.same_step_stall_turns
+                if legacy_boundary else progress.same_step_stall_turns
             ),
             "semantic_stall_count": (
                 progress.unchanged_snapshot_turns
-                if legacy_scoped_boundary else progress.same_step_stall_turns
+                if legacy_boundary else progress.same_step_stall_turns
             ),
             "reviewer_rejection_count": progress.reviewer_rejection_count, "reviewer_non_convergence": progress.reviewer_non_convergence,
             "progress": progress_payload,
@@ -463,7 +498,7 @@ def build_manager_context(
             _read_text(active_plan_path) if level == "full" and active_plan_path is not None else None
         ),
     )
-    if not legacy_scoped_boundary:
+    if not legacy_boundary:
         context.controller_state["progress_scope"] = progress_scope
     # Runtime prompts, artifacts, and later API analysis all use JSON.  Return
     # that canonical shape here too, so tuple/list representation cannot cause

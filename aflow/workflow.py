@@ -2543,7 +2543,15 @@ def run_workflow(
         state.implementation_attempts = _mutable_implementation_attempts(
             resume.implementation_attempts
         )
-        state.active_implementation_scope = resume.active_implementation_scope
+        state.active_implementation_scope = (
+            replace(
+                resume.active_implementation_scope,
+                opened_turn_number=1,
+                carried_reviewer_rejection_count=resume.reviewer_rejection_count,
+            )
+            if resume.active_implementation_scope is not None
+            else None
+        )
         state.pending_manager_notes = resume.pending_manager_notes
         state.pending_step_team_override = resume.pending_step_team_override
         state.pending_boundary_decision = resume.pending_boundary_decision
@@ -3828,6 +3836,7 @@ def run_workflow(
             boundary=boundary_payload,
             active_plan_content=captured_active_plan,
         )
+        boundary_payload["captured_plan_state"] = context["plan_state"]
         eligible = set(boundary.__dict__.get("eligible_actions", ()))
         if level == "lite":
             eligible.add("escalate_to_full")
@@ -3966,6 +3975,9 @@ def run_workflow(
             scope_context = {
                 "scope_id": scope.scope_id,
                 "opened_turn_number": scope.opened_turn_number,
+                "carried_reviewer_rejection_count": (
+                    scope.carried_reviewer_rejection_count
+                ),
                 "checkpoint_index": scope.checkpoint_index,
                 "checkpoint_name": scope.checkpoint_name,
                 "awaiting_review": scope.awaiting_review,

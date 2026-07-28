@@ -91,6 +91,9 @@ scope contains the stable scope id and opening turn when an implementation
 scope is active. Finalized-turn status and duration come from the durable turn
 artifact; legacy artifacts without an explicit duration derive it from their
 timestamps when possible.
+Versioned boundaries also preserve the structured plan state and distinguish a
+closed scope from absent legacy scope data. Resume rebases the run-local scope
+window and carries its accumulated reviewer-rejection count.
 
 ## Manager Events
 

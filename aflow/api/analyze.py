@@ -75,6 +75,23 @@ def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
                             durable = json.loads(boundary_path.read_text(encoding="utf-8"))
                             if not isinstance(durable, dict):
                                 raise ValueError("manager boundary artifact is not an object")
+                            boundary = dict(durable["boundary"])
+                            if "context_schema_version" not in boundary:
+                                stored_progress = (
+                                    stored.get("controller_state", {}).get("progress", {})
+                                    if isinstance(stored.get("controller_state"), dict)
+                                    else {}
+                                )
+                                if (
+                                    isinstance(stored_progress, dict)
+                                    and "same_step_stall_turns" in stored_progress
+                                ):
+                                    boundary["context_schema_version"] = 2
+                                if (
+                                    "captured_plan_state" not in boundary
+                                    and isinstance(stored.get("plan_state"), dict)
+                                ):
+                                    boundary["captured_plan_state"] = stored["plan_state"]
                             turns = [
                                 turn for turn in load_turns(run_dir)
                                 if isinstance(turn.get("turn_number"), int)
@@ -86,7 +103,7 @@ def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
                                 trigger=str(durable["trigger"]),
                                 decision_number=int(durable["decision_number"]),
                                 run_metadata=dict(durable["run_metadata"]),
-                                boundary=dict(durable["boundary"]),
+                                boundary=boundary,
                                 turns=turns,
                                 active_plan_content=(str(durable["active_plan_content"])
                                     if durable.get("active_plan_content") is not None else None),

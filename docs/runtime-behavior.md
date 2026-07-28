@@ -154,13 +154,21 @@ its unconsumed one-hop state. Historical attempts remain in run metadata, but
 the next checkpoint opens a new scope and begins with the baseline worker.
 Rejection counters are computed only from turns at or after that scope's durable
 opening turn, so prior-checkpoint repairs cannot stop a new checkpoint before
-its first review.
+its first review. A rejected review is counted from its own unchanged finalized
+outcome, so the second rejection selects Full before another worker starts.
+When a run resumes into a fresh run directory, the scope opening turn is rebased
+to the new run and its prior rejection count is carried separately.
 
 Every successful finalized turn is written with `status: "completed"`, a single
 authoritative finish timestamp, and its duration even while the overall
 `run.json` status remains `running`. Manager stop reports are persisted, emitted
 to observers, and raised only after the live banner is stopped; the CLI then
 prints the complete report exactly once.
+
+New manager boundaries carry an explicit context schema version and the
+structured plan state captured at invocation time. Historical analysis therefore
+does not depend on mutable plan files. Unversioned boundaries retain their
+legacy context shape, including an explicit null implementation scope.
 
 When manager supervision is disabled, AFlow retains its legacy transition and
 deterministic recovery behavior. Deterministic harness-recovery matches remain

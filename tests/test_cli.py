@@ -1,4 +1,153 @@
 from aflow._test_support import *  # noqa: F401,F403
+from aflow.api.models import PreparedRun
+from aflow.config import ManagerConfig
+from aflow.status import BannerRenderer as RealBannerRenderer
+
+
+def _run_manager_report_cli_case(
+    tmp_path: Path,
+    *,
+    invalid_managers: bool,
+) -> tuple[int, str, Path]:
+    from rich.console import Console
+
+    import aflow.cli as cli_module
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    config_path = repo_root / "aflow.toml"
+    config_path.write_text("", encoding="utf-8")
+    workflow = WorkflowConfig(
+        steps={"impl": WorkflowStepConfig(
+            role="architect",
+            prompts=("p",),
+            go=(GoTransition(to="END", when="DONE"),),
+        )},
+        first_step="impl",
+    )
+    workflow_config = WorkflowUserConfig(
+        roles={
+            "architect": "codex.worker",
+            "manager_lite": "codex.lite",
+            "manager_full": "codex.full",
+        },
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "worker": HarnessProfileConfig(model="worker"),
+            "lite": HarnessProfileConfig(model="lite"),
+            "full": HarnessProfileConfig(model="full"),
+        })},
+        workflows={"managed": workflow},
+        prompts={"p": "Work."},
+        manager=ManagerConfig(
+            enabled=True,
+            lite_role="manager_lite",
+            full_role="manager_full",
+        ),
+    )
+    prepared = PreparedRun(
+        workflow_name="managed",
+        repo_root=repo_root,
+        plan_path=plan_path,
+        config_path=config_path,
+        max_turns=2,
+        team=None,
+        extra_instructions=(),
+        start_step="impl",
+    )
+    stderr = io.StringIO()
+
+    def runner(argv, **kwargs):
+        model = argv[argv.index("--model") + 1]
+        if model == "worker":
+            _write_plan(plan_path, _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "work complete", "")
+        if invalid_managers:
+            return subprocess.CompletedProcess(argv, 0, "not valid JSON", "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({
+            "schema_version": 1,
+            "action": "stop",
+            "reason": "The manager stopped the run.",
+            "next_step_notes": [],
+            "stop_report": {
+                "summary": "The manager stopped the run.",
+                "root_cause": "Synthetic manager stop.",
+                "evidence": ["The manager selected stop."],
+                "attempts": "One workflow turn ran.",
+                "workspace_state": "The plan is complete.",
+                "next_actions": ["Inspect the manager report."],
+            },
+        }), "")
+
+    def execute(prepared_run, *, banner, resume, observer):
+        return run_workflow(
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=plan_path,
+                max_turns=prepared_run.max_turns,
+            ),
+            workflow_config,
+            "managed",
+            config_dir=repo_root,
+            runner=runner,
+            banner=banner,
+            observer=observer,
+        )
+
+    def banner_factory(**kwargs):
+        return RealBannerRenderer(
+            **kwargs,
+            console=Console(
+                file=stderr,
+                force_terminal=True,
+                color_system=None,
+                width=120,
+            ),
+            refresh_interval_seconds=0.01,
+        )
+
+    with redirect_stderr(stderr), \
+         patch.object(cli_module, "_bootstrap_config_files", return_value=(config_path, ())), \
+         patch.object(cli_module, "load_workflow_config", return_value=workflow_config), \
+         patch.object(cli_module, "validate_workflow_config", return_value=[]), \
+         patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), \
+         patch.object(cli_module, "_resolve_run_arguments", return_value=("managed", str(plan_path), ())), \
+         patch.object(cli_module, "_handle_startup_questions", return_value=prepared), \
+         patch.object(cli_module, "_detect_resume_candidate", return_value=None), \
+         patch.object(cli_module, "BannerRenderer", side_effect=banner_factory), \
+         patch.object(cli_module, "execute_workflow", side_effect=execute):
+        status = cli_module.main(["run", str(plan_path)])
+        print("Aflow exited with status 1. This Screen shell will remain available.", file=sys.stderr)
+
+    run_dirs = sorted((repo_root / ".aflow" / "runs").iterdir())
+    return status, stderr.getvalue(), run_dirs[-1]
+
+
+@pytest.mark.parametrize("invalid_managers", [False, True])
+def test_manager_report_remains_visible_once_after_real_banner_and_cli(
+    tmp_path: Path,
+    invalid_managers: bool,
+) -> None:
+    status, stderr, run_dir = _run_manager_report_cli_case(
+        tmp_path,
+        invalid_managers=invalid_managers,
+    )
+    report = (run_dir / "manager-report.md").read_text(encoding="utf-8")
+    run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+    assert status == 1
+    assert stderr.count("# AFlow manager report") == 1
+    assert report in stderr
+    assert "## Likely root cause" in stderr
+    assert "## Evidence" in stderr
+    assert "## Next actions" in stderr
+    assert "## Artifact references" in stderr
+    assert stderr.index(report) < stderr.index("Aflow exited with status 1.")
+    assert run_json["failure_reason"] == report
+    assert run_json["last_manager_report_path"] == "manager-report.md"
+    decisions = sorted((run_dir / "manager").iterdir())
+    assert len(decisions) == (2 if invalid_managers else 1)
 
 class WorkflowCliTests(unittest.TestCase):
 

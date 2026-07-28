@@ -1,3 +1,22 @@
+## 2026-07-28 — Manager runtime review follow-up
+
+### What changed
+
+- Counted unchanged reviewer outcomes directly so the second rejection reaches
+  Full before a third worker starts.
+- Rebased active-scope turn numbering on resume and carried accumulated
+  rejection progress without double-counting new-run reviews.
+- Versioned new manager boundaries, captured immutable structured plan state,
+  and restored exact legacy behavior for unversioned null-scope artifacts.
+- Added real Rich-banner plus CLI regressions for accepted stop and invalid
+  Lite-to-Full fallback, including the wrapper's later status line.
+
+### Why
+
+- Review found delayed non-convergence selection, lost resume progress, context
+  drift for legacy null scopes and advanced plans, and insufficient terminal
+  rendering coverage.
+
 ## 2026-07-28 — Manager runtime regression repair
 
 ### What changed

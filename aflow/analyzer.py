@@ -231,7 +231,7 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
     step_names = [turn.get("step_name") for turn in unchanged_tail if turn.get("step_name")]
     turn_numbers = [turn.get("turn_number") for turn in unchanged_tail if turn.get("turn_number") is not None]
     alternating_two_step = len(set(step_names)) == 2 if step_names else False
-    reviewer_rejection_count = 0
+    legacy_reviewer_rejection_count = 0
     for previous, current in zip(finalized_turns, finalized_turns[1:]):
         same_checkpoint = snapshot_signature(previous.get("snapshot_after")) == snapshot_signature(current.get("snapshot_before"))
         previous_role = str(previous.get("step_role", "")).lower()
@@ -239,6 +239,18 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
         previous_name = str(previous.get("step_name", "")).lower()
         current_name = str(current.get("step_name", "")).lower()
         if same_checkpoint and ("review" in previous_role or "review" in previous_name) and ("implement" in current_role or "implement" in current_name):
+            legacy_reviewer_rejection_count += 1
+    reviewer_rejection_count = 0
+    for turn in finalized_turns:
+        role = str(turn.get("step_role", "")).lower()
+        name = str(turn.get("step_name", "")).lower()
+        before_sig = snapshot_signature(turn.get("snapshot_before"))
+        after_sig = snapshot_signature(turn.get("snapshot_after"))
+        if (
+            ("review" in role or "review" in name)
+            and before_sig is not None
+            and before_sig == after_sig
+        ):
             reviewer_rejection_count += 1
     return {
         "unchanged_snapshot_turns": len(unchanged_tail),
@@ -250,6 +262,7 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
         "tail_end_turn": turn_numbers[-1] if turn_numbers else None,
         "reviewer_rejection_count": reviewer_rejection_count,
         "reviewer_non_convergence": reviewer_rejection_count >= 2,
+        "legacy_reviewer_rejection_count": legacy_reviewer_rejection_count,
     }
 
 

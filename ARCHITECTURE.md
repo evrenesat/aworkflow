@@ -65,6 +65,9 @@ checkpoint stability separate from scope-aware same-step stalls and reviewer
 rejections. Active-scope boundaries persist their opening turn so runtime and
 historical analysis use the same controller window. Successful turn artifacts,
 in-memory records, and finish events share one finish timestamp and duration.
+Boundary schema versioning preserves the legacy shape for old artifacts while
+new boundaries snapshot structured plan state. Resume rebases run-local scope
+turn numbering and carries prior rejection progress explicitly.
 Implementation upgrades use a stable original-checkpoint review scope rather
 than the mutable active repair-plan identity. Attempts retain their actual team
 and selector; each rejection can expose one further configured edge. Approval

@@ -98,6 +98,7 @@ class ActiveImplementationScope:
     checkpoint_name: str | None
     opened_turn_number: int
     awaiting_review: bool = False
+    carried_reviewer_rejection_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,7 @@ class FinalizedTurnBoundary:
     original_plan_path: str | None
     active_plan_path: str | None
     checkpoint_identity: str | None
+    context_schema_version: int = 2
     safely_retryable: bool = False
     operational_failure: bool = False
     backup_team: str | None = None
@@ -405,6 +407,9 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             ),
             opened_turn_number=int(scope["opened_turn_number"]),
             awaiting_review=bool(scope.get("awaiting_review", False)),
+            carried_reviewer_rejection_count=int(
+                scope.get("carried_reviewer_rejection_count", 0) or 0
+            ),
         )
     notes = payload.get("pending_manager_notes")
     if isinstance(notes, Mapping) and isinstance(notes.get("notes"), (list, tuple)):

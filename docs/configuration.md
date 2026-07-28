@@ -139,8 +139,9 @@ the manager is never routed through a temporary implementation upgrade.
 `full_after_stalled_turns` defaults to `2` and must be at least `1`. It counts
 consecutive finalized executions of the same workflow step whose plan snapshot
 did not change. An unchanged `implement → review` sequence is progress, not a
-two-turn stall. Two reviewer-to-implementation rejection cycles still select
-Full, but only within the currently open original-checkpoint scope.
+two-turn stall. Two unchanged reviewer outcomes select Full immediately after
+the second rejection, but only within the currently open original-checkpoint
+scope.
 `skill` defaults to `aflow-manager`. Each manager prompt requests that configured
 skill when the harness supports skills and also carries the complete strict JSON
 contract inline, so protocol correctness does not depend on skill installation.

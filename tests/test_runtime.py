@@ -5013,11 +5013,23 @@ class LifecycleBootstrapTests(unittest.TestCase):
             decision_dir = result.run_dir / 'manager' / 'decision-001'
             assert (decision_dir / 'context.json').is_file()
             assert (decision_dir / 'boundary.json').is_file()
+            boundary_payload = json.loads(
+                (decision_dir / 'boundary.json').read_text(encoding='utf-8')
+            )
+            assert boundary_payload['boundary']['context_schema_version'] == 2
+            assert boundary_payload['boundary']['captured_plan_state'] == json.loads(
+                (decision_dir / 'context.json').read_text(encoding='utf-8')
+            )['plan_state']
             result_payload = json.loads((decision_dir / 'result.json').read_text(encoding='utf-8'))
             assert result_payload['action'] == 'continue'
             assert result_payload['status'] == 'accepted'
 
             from aflow.api import AnalyzeRequest, analyze_runs
+            _write_plan(
+                plan_path,
+                "# Mutated after decision\n\n"
+                "### [ ] Checkpoint 1: Later state\n- [ ] changed\n",
+            )
             rebuilt = analyze_runs(AnalyzeRequest(
                 repo_root=repo_root, run_id=result.run_dir.name,
                 manager_context='lite', turn=1,
@@ -5185,6 +5197,11 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert second["controller_state"]["eligible_upgrade"]["target_team"] == "high"
             assert fourth["controller_state"]["eligible_upgrade"]["source_team"] == "high"
             assert fourth["controller_state"]["eligible_upgrade"]["target_team"] == "max"
+            fourth_result = json.loads(
+                (result.run_dir / "manager" / "decision-004" / "result.json").read_text()
+            )
+            assert fourth_result["level"] == "full"
+            assert fourth["controller_state"]["reviewer_rejection_count"] == 2
             assert fourth["controller_state"]["active_implementation_scope"]["attempt_teams"] == [
                 "default",
                 "high",
@@ -5557,6 +5574,7 @@ def _run_upgrade_resume_scenario(
     tmp_path: Path,
     *,
     interruption: str,
+    prior_reviewer_rejections: int = 0,
 ) -> tuple[list[str], list[int], dict[str, object], Path]:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -5717,6 +5735,7 @@ def _run_upgrade_resume_scenario(
         teardown=(),
         active_plan_path=repair_path,
         manager_decision_number=decision_number,
+        reviewer_rejection_count=prior_reviewer_rejections,
         implementation_attempts={scope.scope_id: tuple(attempts)},
         active_implementation_scope=scope,
         pending_step_team_override=pending_override,
@@ -5797,6 +5816,27 @@ def test_manager_resume_after_upgraded_worker_uses_it_as_next_upgrade_source(
     )
     assert context["controller_state"]["eligible_upgrade"]["source_team"] == "high"
     assert context["controller_state"]["eligible_upgrade"]["target_team"] == "max"
+
+
+def test_manager_resume_carries_scope_rejections_into_first_boundary(
+    tmp_path: Path,
+) -> None:
+    _, _, _, run_dir = _run_upgrade_resume_scenario(
+        tmp_path,
+        interruption="before_review",
+        prior_reviewer_rejections=2,
+    )
+    result = json.loads(
+        (run_dir / "manager" / "decision-003" / "result.json").read_text()
+    )
+    context = json.loads(
+        (run_dir / "manager" / "decision-003" / "context.json").read_text()
+    )
+    scope = context["controller_state"]["active_implementation_scope"]
+    assert result["level"] == "full"
+    assert context["controller_state"]["reviewer_rejection_count"] == 3
+    assert scope["opened_turn_number"] == 1
+    assert scope["carried_reviewer_rejection_count"] == 2
 
 
 def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: Path) -> None:

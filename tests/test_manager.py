@@ -256,6 +256,7 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
         "Second",
         3,
         awaiting_review=True,
+        carried_reviewer_rejection_count=1,
     )
     state.pending_manager_notes = PendingManagerNotes("implement", ("focus",), 1)
     state.pending_step_team_override = PendingTeamOverride("implement", "worker", "base", "high", "codex.high", "cp-2", 1)
@@ -267,6 +268,10 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     restore_manager_state(restored, payload)
     assert restored.manager_history == state.manager_history
     assert restored.active_implementation_scope == state.active_implementation_scope
+    assert (
+        restored.active_implementation_scope.carried_reviewer_rejection_count
+        == 1
+    )
     assert restored.pending_manager_notes == state.pending_manager_notes
     assert restored.pending_step_team_override == state.pending_step_team_override
     assert manager_resume_fields(payload)["pending_manager_notes"] == state.pending_manager_notes
