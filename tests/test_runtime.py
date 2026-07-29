@@ -5785,11 +5785,16 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         if manager_calls in {2, 4}
                         else "continue"
                     )
+                    notes = (
+                        [f"CP repair note {index}." for index in range(9)]
+                        if manager_calls == 2
+                        else []
+                    )
                     return subprocess.CompletedProcess(argv, 0, json.dumps({
                         "schema_version": 1,
                         "action": action,
                         "reason": "Synthetic manager decision.",
-                        "next_step_notes": [],
+                        "next_step_notes": notes,
                         "stop_report": None,
                     }), "")
 
@@ -5811,7 +5816,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         )
                 elif model == "reviewer-default":
                     reviewer_calls += 1
-                    if reviewer_calls <= 2:
+                    if reviewer_calls <= 3:
                         repair = repo_root / f"plan-repair-{reviewer_calls}.md"
                         _write_plan(
                             repair,
@@ -5819,13 +5824,21 @@ class LifecycleBootstrapTests(unittest.TestCase):
                             f"### [ ] Checkpoint 1: Repair {reviewer_calls}\n"
                             "- [ ] repair step\n",
                         )
+                elif (
+                    model == "worker-max"
+                    and workflow_models.count("worker-max") == 2
+                ):
+                    _write_plan(
+                        repo_root / "plan-repair-3.md",
+                        "# Repair\n\n### [x] Checkpoint 1: Repair 3\n- [x] repair step\n",
+                    )
                 return subprocess.CompletedProcess(argv, 0, "synthetic workflow result", "")
 
             result = run_workflow(
                 ControllerConfig(
                     repo_root=repo_root,
                     plan_path=plan_path,
-                    max_turns=7,
+                    max_turns=9,
                     team="default",
                 ),
                 wf_config,
@@ -5842,6 +5855,8 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 "reviewer-default",
                 "worker-max",
                 "reviewer-default",
+                "worker-max",
+                "reviewer-default",
                 "worker-default",
             ]
             second = json.loads(
@@ -5853,6 +5868,9 @@ class LifecycleBootstrapTests(unittest.TestCase):
             sixth = json.loads(
                 (result.run_dir / "manager" / "decision-006" / "context.json").read_text()
             )
+            eighth = json.loads(
+                (result.run_dir / "manager" / "decision-008" / "context.json").read_text()
+            )
             assert second["controller_state"]["eligible_upgrade"]["source_team"] == "default"
             assert second["controller_state"]["eligible_upgrade"]["target_team"] == "high"
             assert fourth["controller_state"]["eligible_upgrade"]["source_team"] == "high"
@@ -5860,6 +5878,13 @@ class LifecycleBootstrapTests(unittest.TestCase):
             fourth_result = json.loads(
                 (result.run_dir / "manager" / "decision-004" / "result.json").read_text()
             )
+            second_result = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "result.json").read_text()
+            )
+            assert manager_calls == 9
+            assert second_result["level"] == "lite"
+            assert second_result["status"] == "accepted"
+            assert len(second_result["next_step_notes"]) == 8
             assert fourth_result["level"] == "full"
             first_rejection = json.loads(
                 (result.run_dir / "turns" / "turn-002" / "result.json").read_text()
@@ -5883,13 +5908,21 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert fourth["controller_state"]["active_implementation_scope"]["upgrade_depth"] == 1
             assert "upgrade_next_implementation" not in sixth["controller_state"]["eligible_actions"]
             assert sixth["controller_state"]["eligible_upgrade"]["available"] is False
-            assert "no prior attempt" in sixth["controller_state"]["eligible_upgrade"]["reason"]
+            assert (
+                sixth["controller_state"]["eligible_upgrade"]["reason"]
+                == "source team does not configure upgrade_to"
+            )
+            assert (
+                eighth["controller_state"]["eligible_upgrade"]["reason"]
+                == "next worker has no prior attempt in an active implementation scope"
+            )
 
             run_json = json.loads((result.run_dir / "run.json").read_text())
             histories = list(run_json["implementation_attempts"].values())
             assert [attempt["team"] for attempt in histories[0]] == [
                 "default",
                 "high",
+                "max",
                 "max",
             ]
             assert run_json["active_implementation_scope"] is None
@@ -6582,11 +6615,13 @@ def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: 
     assert run_json["pending_step_team_override"] is None
 
 
-def test_manager_resume_after_override_consumption_does_not_replay_it(tmp_path: Path) -> None:
+def test_manager_resume_after_consumption_retains_scope_team_without_replaying_boundary(
+    tmp_path: Path,
+) -> None:
     models, decisions, _, run_dir = _run_upgrade_resume_scenario(
         tmp_path, interruption="after_consumption"
     )
-    assert models == ["reviewer-default", "worker-default"]
+    assert models == ["reviewer-default", "worker-max"]
     assert decisions == [4, 5]
     context = json.loads(
         (run_dir / "manager" / "decision-004" / "context.json").read_text()

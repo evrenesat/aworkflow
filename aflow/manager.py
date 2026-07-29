@@ -149,8 +149,12 @@ def parse_manager_decision(text: str) -> ManagerDecisionV1:
     if action not in _ACTIONS:
         raise ManagerDecisionError(f"action must be one of: {', '.join(sorted(_ACTIONS))}")
     notes = _text_list(value["next_step_notes"], field="next_step_notes")
-    if len(notes) > MAX_MANAGER_NOTES or any(len(note) > MAX_MANAGER_NOTE_LENGTH for note in notes):
+    if any(len(note) > MAX_MANAGER_NOTE_LENGTH for note in notes):
         raise ManagerDecisionError("next_step_notes exceeds protocol bounds")
+    # Advisory notes must never spend a Full-manager call by themselves. Keep
+    # the bounded prefix; action-specific validation below still rejects notes
+    # for stop, Lite escalation, and accepted END.
+    notes = notes[:MAX_MANAGER_NOTES]
     stop_report = None if value["stop_report"] is None else _parse_stop_report(value["stop_report"])
     decision = ManagerDecisionV1(
         schema_version=1,
@@ -323,7 +327,11 @@ def build_manager_prompts(
         ),
         "Return exactly one JSON object with schema_version, action, reason, next_step_notes, and stop_report.",
         "schema_version must be the number 1. reason must be a non-empty string.",
-        "next_step_notes must always be an array of non-empty strings, never a string or null.",
+        (
+            "next_step_notes must always be an array of non-empty strings, never a string or null; "
+            f"use at most {MAX_MANAGER_NOTES} notes and at most "
+            f"{MAX_MANAGER_NOTE_LENGTH} characters per note."
+        ),
         "For stop, escalate_to_full, and accepted END, next_step_notes must be [].",
         "For every non-stop action, stop_report must be null.",
         "For stop, stop_report must be an object with exactly summary, root_cause, evidence, attempts, workspace_state, and next_actions; evidence and next_actions must be non-empty arrays of non-empty strings and the other fields must be non-empty strings.",

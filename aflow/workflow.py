@@ -4149,7 +4149,18 @@ def run_workflow(
             state.active_implementation_scope.scope_id
             if state.active_implementation_scope is not None else None
         )
-        target_team = upgrade.target_team if decision.action == "upgrade_next_implementation" else None
+        retain_scoped_team = (
+            decision.action == "continue"
+            and retrying_scoped_implementation
+            and recent_team is not None
+        )
+        target_team = (
+            upgrade.target_team
+            if decision.action == "upgrade_next_implementation"
+            else recent_team
+            if retain_scoped_team
+            else None
+        )
         target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
         if target_config is not None and target_selector is None:
             resolution_team = (
@@ -4157,6 +4168,8 @@ def run_workflow(
                 if decision.action == "switch_to_backup_and_retry"
                 else active_team
                 if decision.action == "retry_current_step"
+                else target_team
+                if target_team is not None
                 else baseline_team_name
             )
             try:
@@ -4213,6 +4226,27 @@ def run_workflow(
                 target_team=upgrade.target_team, selector=upgrade.target_selector,
                 checkpoint_identity=target_identity, decision_number=state.manager_decision_number,
                 scope_id=scope_id, target_plan_identity=target_identity,
+            )
+        elif (
+            retain_scoped_team
+            and next_step is not None
+            and target_team is not None
+            and target_selector is not None
+        ):
+            # A plain Full/Lite continuation inside the same rejected scope
+            # retains the most recently reviewed worker. Baseline is restored
+            # only when review closes the scope and checkpoint progress opens
+            # a fresh one.
+            state.pending_step_team_override = PendingTeamOverride(
+                target_step=next_step,
+                role=wf.steps[next_step].role,
+                source_team=target_team,
+                target_team=target_team,
+                selector=target_selector,
+                checkpoint_identity=target_identity,
+                decision_number=state.manager_decision_number,
+                scope_id=scope_id,
+                target_plan_identity=target_identity,
             )
         return proposed_transition
 

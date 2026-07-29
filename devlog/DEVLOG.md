@@ -1,3 +1,38 @@
+## 2026-07-29 — Retain upgraded worker through checkpoint repair
+
+### What changed
+
+- Made manager `continue` retain the most recently reviewed worker team when
+  routing another implementation inside the same open checkpoint scope.
+- Kept the baseline reset tied to reviewer approval and the opening of a new
+  checkpoint scope.
+- Extended chained-upgrade runtime coverage through an exhausted chain, a
+  same-team repair retry, approval, and the following baseline checkpoint.
+
+### Why
+
+- A live third CP12 rejection exhausted the configured upgrade chain. Full
+  authorized one bounded repair, but plain `continue` silently launched the
+  baseline DS4-pro worker instead of retaining Sol Medium.
+
+## 2026-07-29 — Bounded manager advice without Full fallback
+
+### What changed
+
+- Exposed the exact eight-note and 1,000-character bounds in manager prompts
+  and the bundled manager skill.
+- Retained the first eight valid advisory notes when an otherwise legal
+  non-terminal decision supplies more, while preserving strict action, type,
+  empty-note, and per-note length validation.
+- Added parser and chained-upgrade runtime coverage proving a nine-note Lite
+  upgrade remains Lite and launches the configured stronger worker.
+
+### Why
+
+- A live first-rejection Lite manager correctly selected the required Terra
+  upgrade but returned nine useful notes. The undisclosed eight-note validator
+  rejected it and spent an unnecessary Full call on the same action.
+
 ## 2026-07-29 — Durable live review-rejection history
 
 - Added controller-owned, resume-safe rejection records to turn artifacts and

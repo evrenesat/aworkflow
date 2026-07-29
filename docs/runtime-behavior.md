@@ -130,12 +130,21 @@ schema are included in every manager prompt. If a terminal workflow incident is
 followed by an invalid manager response, the deterministic report retains the
 workflow incident as its summary and records the manager protocol error
 separately instead of masking the original failure.
+The prompt exposes the advisory-note bounds: at most eight notes and 1,000
+characters per note. If an otherwise valid non-terminal decision returns more
+notes, the controller retains the first eight instead of spending a Full call
+solely on surplus advice. Invalid note types, empty notes, overlong notes, and
+notes forbidden for the selected action remain protocol errors.
 
 At the first reviewer rejection in an open implementation scope, Lite is
 instructed to select the available one-edge worker upgrade before spending
 another attempt on the same worker or escalating to Full. If that upgraded
 attempt is also rejected, the second rejection selects Full with the next
 configured upgrade edge, if any, exposed in context.
+After the configured chain is exhausted, a manager `continue` into another
+repair attempt retains the most recently reviewed worker team. It cannot fall
+back to the baseline team while the original-checkpoint scope remains open.
+Approval closes that scope, and only the next checkpoint starts on baseline.
 
 Reasonix manager invocations request its native final-response mode with
 `--print`, so strict manager JSON is not mixed with progress and metrics output.

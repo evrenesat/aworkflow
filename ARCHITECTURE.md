@@ -84,6 +84,9 @@ historical analysis use the same controller window. Successful turn artifacts,
 in-memory records, and finish events share one finish timestamp and duration.
 The decision parser normalizes one exact `json`-tagged Markdown fence around a
 single object, while continuing to reject all other transport prose/noise.
+It also bounds advisory notes to the first eight after validating their types
+and per-note size, avoiding a Full fallback caused only by surplus useful
+advice.
 Boundary schema versioning preserves the legacy shape for old artifacts while
 new boundaries snapshot structured plan state. Resume rebases run-local scope
 turn numbering and carries prior rejection progress explicitly. Legacy scopes
@@ -97,6 +100,9 @@ without deleting historical attempt evidence.
 Lite policy selects the first available upgrade edge immediately after the
 scope's first reviewer rejection, so a second rejection is evaluated by Full
 only after the stronger worker has received one attempt.
+If Full continues after the upgrade chain is exhausted, the controller
+persists a one-turn override for the most recently reviewed worker; closing the
+scope on approval is the sole path back to baseline.
 Each controller-confirmed rejection is persisted as a bounded
 `ReviewRejectionRecord` in `run.json` and in the reviewer turn artifact. The
 record identifies the reviewed worker and source run, while the raw reviewer

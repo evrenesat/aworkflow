@@ -13,6 +13,7 @@ from aflow.config import (
     WorkflowUserConfig,
 )
 from aflow.manager import (
+    MAX_MANAGER_NOTES,
     ManagerDecisionError,
     ManagerStopReport,
     build_manager_prompts,
@@ -113,6 +114,18 @@ def test_decision_protocol_accepts_one_exact_json_fence() -> None:
 
     assert decision.action == "continue"
     assert decision.reason == "The proposed transition has sufficient evidence."
+
+
+def test_decision_protocol_bounds_surplus_advisory_notes_without_escalation() -> None:
+    notes = [f"Repair note {index}." for index in range(MAX_MANAGER_NOTES + 1)]
+
+    decision = parse_manager_decision(_decision(
+        action="upgrade_next_implementation",
+        next_step_notes=notes,
+    ))
+
+    assert decision.action == "upgrade_next_implementation"
+    assert decision.next_step_notes == tuple(notes[:MAX_MANAGER_NOTES])
 
 
 def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
@@ -234,6 +247,7 @@ def test_prompts_preserve_only_the_supplied_context_level() -> None:
     assert "configured manager skill 'custom-manager'" in system
     assert "Eligible actions at this boundary: continue, escalate_to_full, stop." in system
     assert "next_step_notes must always be an array" in system
+    assert f"use at most {MAX_MANAGER_NOTES} notes" in system
     assert '"stop_report":{"summary":' in system
     assert user.startswith("MANAGER_CONTEXT_JSON:\n")
     assert json.loads(user.removeprefix("MANAGER_CONTEXT_JSON:\n")) == context
