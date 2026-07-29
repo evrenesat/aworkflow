@@ -1,4 +1,28 @@
 from aflow._test_support import *  # noqa: F401,F403
+from aflow.run_state import load_override_request
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("protected_state = true\n", "unsupported override keys"),
+        ("max_turns = 0\n", "positive integer"),
+        ('notes = [""]\n', "non-empty string"),
+        ('next_step = ""\n', "non-empty string"),
+        ("next_step = [\n", "malformed TOML"),
+    ],
+)
+def test_override_loader_rejects_unsafe_or_invalid_schema(
+    tmp_path: Path,
+    source: str,
+    message: str,
+) -> None:
+    path = tmp_path / "overrides.toml"
+    path.write_text(source, encoding="utf-8")
+    result = load_override_request(path)
+    assert result.status == "invalid"
+    assert result.message is not None
+    assert message in result.message
 
 
 def test_manager_config_is_optional_and_defaults_to_disabled() -> None:

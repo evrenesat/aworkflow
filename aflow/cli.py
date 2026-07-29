@@ -35,6 +35,8 @@ from .plan import PlanParseError, PlanSnapshot, load_plan, load_plan_tolerant
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
+    FrozenRunIdentity,
+    OverrideResult,
     PendingFinalizedTurn,
     ResumeContext,
     WorkflowEndReason,
@@ -158,8 +160,11 @@ def _resume_candidate_mismatch_reason(
         return "it has no recorded worktree path"
 
     status = prev_run.get("status")
-    if status not in ("failed", "running"):
-        return f"its status is '{status}', not 'failed' or 'running'"
+    if status not in ("failed", "running", "waiting_for_valid_override"):
+        return (
+            f"its status is '{status}', not 'failed', 'running', or "
+            "'waiting_for_valid_override'"
+        )
 
     last_snapshot = prev_run.get("last_snapshot")
     if isinstance(last_snapshot, dict) and last_snapshot.get("is_complete") is True:
@@ -494,6 +499,83 @@ def _detect_resume_candidate(
     ):
         recovered_active_plan = str(pending_finalized_turn.new_plan_path)
 
+    frozen_run_identity = None
+    frozen_value = prev_run.get("frozen_config")
+    if isinstance(frozen_value, Mapping):
+        workflow_value = frozen_value.get("workflow_name")
+        config_path_value = frozen_value.get("config_path")
+        fingerprint_value = frozen_value.get("config_fingerprint")
+        if all(
+            isinstance(value, str)
+            for value in (
+                workflow_value,
+                config_path_value,
+                fingerprint_value,
+            )
+        ):
+            frozen_run_identity = FrozenRunIdentity(
+                workflow_name=workflow_value,
+                config_path=config_path_value,
+                config_fingerprint=fingerprint_value,
+            )
+
+    override_result = None
+    override_value = prev_run.get("override_result")
+    if isinstance(override_value, Mapping):
+        override_status = override_value.get("status")
+        digest = override_value.get("digest")
+        message = override_value.get("message")
+        if (
+            override_status in {"accepted", "rejected"}
+            and isinstance(digest, str)
+            and isinstance(message, str)
+        ):
+            override_result = OverrideResult(
+                status=override_status,
+                digest=digest,
+                message=message,
+                source_text=(
+                    str(override_value["source_text"])
+                    if isinstance(override_value.get("source_text"), str)
+                    else None
+                ),
+                next_step=(
+                    str(override_value["next_step"])
+                    if override_value.get("next_step") is not None
+                    else None
+                ),
+                team=(
+                    str(override_value["team"])
+                    if override_value.get("team") is not None
+                    else None
+                ),
+                max_turns=(
+                    int(override_value["max_turns"])
+                    if isinstance(override_value.get("max_turns"), int)
+                    else None
+                ),
+                has_notes=bool(override_value.get("has_notes", False)),
+                applied=bool(override_value.get("applied", False)),
+                recorded_at=str(override_value.get("recorded_at", "")),
+            )
+    pending_override_notes = prev_run.get("pending_override_notes")
+    if not isinstance(pending_override_notes, list) or not all(
+        isinstance(note, str) for note in pending_override_notes
+    ):
+        pending_override_notes = []
+    effective_max_turns = prev_run.get("effective_max_turns")
+    if not isinstance(effective_max_turns, int) or effective_max_turns < 1:
+        effective_max_turns = None
+    override_source_run_dir = (
+        run_dir
+        if override_result is not None
+        and (
+            override_result.status == "rejected"
+            or not override_result.applied
+        )
+        else None
+    )
+
     return ResumeContext(
         resumed_from_run_id=resolved_run_id.name,
         feature_branch=feature_branch,
@@ -512,6 +594,12 @@ def _detect_resume_candidate(
             None if reset_scope else _interrupted_resume_step(run_dir, prev_run)
         ),
         pending_finalized_turn=pending_finalized_turn,
+        frozen_run_identity=frozen_run_identity,
+        override_result=override_result,
+        effective_max_turns=effective_max_turns,
+        pending_override_notes=tuple(pending_override_notes),
+        override_source_run_dir=override_source_run_dir,
+        override_file_present=bool(prev_run.get("override_file_present", False)),
         **manager_fields,
     )
 
@@ -1064,6 +1152,56 @@ def _print_renderable(renderable: object) -> None:
     Console(file=sys.stdout).print(renderable)
 
 
+def _add_controller_state_to_analysis(
+    payload: object,
+    *,
+    repo_root: Path,
+) -> None:
+    """Add safe run-state diagnostics to CLI analysis without exposing notes."""
+    if isinstance(payload, list):
+        for item in payload:
+            _add_controller_state_to_analysis(item, repo_root=repo_root)
+        return
+    if not isinstance(payload, dict):
+        return
+    run_id = payload.get("run_id")
+    if isinstance(run_id, str) and "controller_state" not in payload:
+        run_json = load_run_json(repo_root / ".aflow" / "runs" / run_id)
+        if run_json is not None:
+            override_result = run_json.get("override_result")
+            safe_override_result = None
+            if isinstance(override_result, Mapping):
+                safe_override_result = {
+                    key: override_result.get(key)
+                    for key in (
+                        "status",
+                        "digest",
+                        "message",
+                        "next_step",
+                        "team",
+                        "max_turns",
+                        "has_notes",
+                        "applied",
+                        "recorded_at",
+                    )
+                    if key in override_result
+                }
+            payload["controller_state"] = {
+                "schema_version": run_json.get("schema_version"),
+                "frozen_config": run_json.get("frozen_config"),
+                "override_file_present": bool(
+                    run_json.get("override_file_present", False)
+                ),
+                "last_override_result": safe_override_result,
+                "corrected_override_required": (
+                    isinstance(override_result, Mapping)
+                    and override_result.get("status") == "rejected"
+                ),
+            }
+    for value in tuple(payload.values()):
+        _add_controller_state_to_analysis(value, repo_root=repo_root)
+
+
 class TerminalObserver(ExecutionObserver):
     """Observer that formats execution events for terminal rendering."""
 
@@ -1125,6 +1263,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+        _add_controller_state_to_analysis(
+            payload,
+            repo_root=request.repo_root,
+        )
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0

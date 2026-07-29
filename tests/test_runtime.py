@@ -3,14 +3,429 @@ from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, Harnes
 from aflow.api.events import ExecutionEventType
 from aflow.run_state import (
     ActiveImplementationScope,
+    FrozenRunIdentity,
     ImplementationAttempt,
     PendingBoundaryDecision,
     PendingFinalizedTurn,
     PendingTeamOverride,
+    load_override_request,
     manager_resume_fields,
 )
+from aflow.runlog import create_run_paths, write_run_metadata
 
 class WorkflowRuntimeTests(unittest.TestCase):
+
+    def test_override_loader_accepts_exact_grammar_and_digest_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "overrides.toml"
+            path.write_text(
+                'next_step = "review"\nteam = "strong"\nmax_turns = 7\n'
+                'notes = ["focus on the failing test"]\n',
+                encoding="utf-8",
+            )
+            loaded = load_override_request(path)
+            assert loaded.status == "valid"
+            assert loaded.request is not None
+            assert loaded.request.next_step == "review"
+            assert loaded.request.team == "strong"
+            assert loaded.request.max_turns == 7
+            assert loaded.request.notes == ("focus on the failing test",)
+
+            consumed = load_override_request(
+                path,
+                consumed_digest=loaded.request.digest,
+            )
+            assert consumed.status == "already_consumed"
+            path.write_text('max_turns = 8\n', encoding="utf-8")
+            changed = load_override_request(
+                path,
+                consumed_digest=loaded.request.digest,
+            )
+            assert changed.status == "valid"
+            assert changed.request is not None
+            assert changed.request.digest != loaded.request.digest
+
+    def test_atomic_run_metadata_failure_preserves_previous_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            config = ControllerConfig(repo_root=repo_root, plan_path=plan_path)
+            paths = create_run_paths(config)
+            state = ControllerState(
+                last_snapshot=PlanSnapshot("Checkpoint 1: First", 1, 0, False)
+            )
+            state.frozen_run_identity = FrozenRunIdentity(
+                workflow_name="simple",
+                config_path=str(repo_root),
+                config_fingerprint="abc123",
+            )
+            write_run_metadata(paths, config, state, status="running")
+            previous = paths.run_json.read_text(encoding="utf-8")
+
+            state.status_message = "new state"
+            with patch("aflow.runlog.os.replace", side_effect=OSError("interrupted")):
+                with pytest.raises(OSError, match="interrupted"):
+                    write_run_metadata(paths, config, state, status="running")
+
+            assert paths.run_json.read_text(encoding="utf-8") == previous
+            payload = json.loads(previous)
+            assert payload["schema_version"] == 1
+            assert payload["frozen_config"]["config_fingerprint"] == "abc123"
+
+    def test_valid_boundary_override_routes_once_and_appends_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    ),
+                },
+                first_step="implement",
+                team="base",
+            )
+            workflow_config = WorkflowUserConfig(
+                harnesses={
+                    "codex": WorkflowHarnessConfig(
+                        profiles={
+                            "base": HarnessProfileConfig(model="base"),
+                            "strong": HarnessProfileConfig(model="strong"),
+                        }
+                    )
+                },
+                roles={"worker": "codex.base"},
+                teams={
+                    "base": TeamConfig(roles={"worker": "codex.base"}),
+                    "strong": TeamConfig(roles={"worker": "codex.strong"}),
+                },
+                workflows={"test": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+            actual_create = create_run_paths
+            created_paths = []
+
+            def create_with_override(config):
+                paths = actual_create(config)
+                created_paths.append(paths)
+                (paths.run_dir / "overrides.toml").write_text(
+                    'next_step = "review"\nteam = "strong"\nmax_turns = 3\n'
+                    'notes = ["focus on boundary behavior"]\n',
+                    encoding="utf-8",
+                )
+                return paths
+
+            invocations: list[tuple[str, ...]] = []
+
+            def runner(argv, **kwargs):
+                invocations.append(tuple(argv))
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    "test",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert result.turns_completed == 1
+            assert len(invocations) == 1
+            invocation_text = " ".join(invocations[0])
+            assert "strong" in invocation_text
+            assert "focus on boundary behavior" in invocation_text
+            payload = json.loads(
+                created_paths[0].run_json.read_text(encoding="utf-8")
+            )
+            assert payload["current_step_name"] == "review"
+            assert payload["team"] == "strong"
+            assert payload["effective_max_turns"] == 3
+            assert payload["override_result"]["status"] == "accepted"
+            assert payload["override_result"]["applied"] is True
+            assert (
+                'notes = ["focus on boundary behavior"]'
+                in payload["override_result"]["source_text"]
+            )
+
+    def test_invalid_boundary_override_waits_without_launching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _make_simple_wf_config()
+            actual_create = create_run_paths
+            created_paths = []
+
+            def create_with_override(config):
+                paths = actual_create(config)
+                created_paths.append(paths)
+                (paths.run_dir / "overrides.toml").write_text(
+                    'next_step = "missing"\n',
+                    encoding="utf-8",
+                )
+                return paths
+
+            runner = unittest.mock.Mock()
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ):
+                with pytest.raises(
+                    WorkflowError,
+                    match="waiting_for_valid_override",
+                ):
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=2,
+                        ),
+                        workflow_config,
+                        "simple",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+            runner.assert_not_called()
+            payload = json.loads(
+                created_paths[0].run_json.read_text(encoding="utf-8")
+            )
+            assert payload["status"] == "waiting_for_valid_override"
+            assert payload["override_result"]["status"] == "rejected"
+            assert "not an executable step" in payload["status_message"]
+
+    def test_boundary_override_rejects_unknown_team_without_launching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _make_simple_wf_config()
+            actual_create = create_run_paths
+
+            def create_with_override(config):
+                paths = actual_create(config)
+                (paths.run_dir / "overrides.toml").write_text(
+                    'team = "missing"\n',
+                    encoding="utf-8",
+                )
+                return paths
+
+            runner = unittest.mock.Mock()
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ):
+                with pytest.raises(WorkflowError, match="not configured"):
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=2,
+                        ),
+                        workflow_config,
+                        "simple",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+            runner.assert_not_called()
+
+    def test_override_written_during_turn_applies_only_to_following_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="implement"),
+                        ),
+                    )
+                },
+                first_step="implement",
+                team="base",
+            )
+            workflow_config = WorkflowUserConfig(
+                harnesses={
+                    "codex": WorkflowHarnessConfig(
+                        profiles={
+                            "base": HarnessProfileConfig(model="base"),
+                            "strong": HarnessProfileConfig(model="strong"),
+                        }
+                    )
+                },
+                roles={"worker": "codex.base"},
+                teams={
+                    "base": TeamConfig(roles={"worker": "codex.base"}),
+                    "strong": TeamConfig(roles={"worker": "codex.strong"}),
+                },
+                workflows={"test": workflow},
+                prompts={"p": "Work."},
+            )
+            actual_create = create_run_paths
+            created_paths = []
+
+            def capture_paths(config):
+                paths = actual_create(config)
+                created_paths.append(paths)
+                return paths
+
+            invocations: list[tuple[str, ...]] = []
+
+            def runner(argv, **kwargs):
+                invocations.append(tuple(argv))
+                if len(invocations) == 1:
+                    (created_paths[0].run_dir / "overrides.toml").write_text(
+                        'team = "strong"\nnotes = ["second turn only"]\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=capture_paths,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    workflow_config,
+                    "test",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert result.turns_completed == 2
+            first = " ".join(invocations[0])
+            second = " ".join(invocations[1])
+            assert "second turn only" not in first
+            assert "strong" not in first
+            assert "second turn only" in second
+            assert "strong" in second
+
+    def test_boundary_override_can_raise_initial_turn_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _make_simple_wf_config()
+            actual_create = create_run_paths
+
+            def create_with_override(config):
+                paths = actual_create(config)
+                (paths.run_dir / "overrides.toml").write_text(
+                    "max_turns = 2\n",
+                    encoding="utf-8",
+                )
+                return paths
+
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                    ),
+                    workflow_config,
+                    "simple",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert calls == 2
+            assert result.turns_completed == 2
+            assert result.end_reason == "done"
+
+    def test_boundary_override_rejects_limit_below_completed_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _make_simple_wf_config()
+            actual_create = create_run_paths
+            created_paths = []
+            calls = 0
+
+            def capture_paths(config):
+                paths = actual_create(config)
+                created_paths.append(paths)
+                return paths
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    (created_paths[0].run_dir / "overrides.toml").write_text(
+                        "max_turns = 1\n",
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=capture_paths,
+            ):
+                with pytest.raises(WorkflowError, match="below completed turns"):
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=3,
+                        ),
+                        workflow_config,
+                        "simple",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+            assert calls == 2
+            payload = json.loads(
+                created_paths[0].run_json.read_text(encoding="utf-8")
+            )
+            assert payload["status"] == "waiting_for_valid_override"
 
     def test_run_process_captures_harness_output_without_echoing_to_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

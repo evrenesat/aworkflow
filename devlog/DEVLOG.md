@@ -1,3 +1,22 @@
+## 2026-07-29 — Atomic run snapshots and safe boundary overrides
+
+### What changed
+
+- Versioned and atomically replaced `run.json`, including a frozen fingerprint
+  of the already-resolved workflow configuration while preserving legacy reads.
+- Added the exact `.aflow/runs/<run-id>/overrides.toml` surface for validated
+  next-step, team, turn-limit, and one-turn note requests.
+- Persisted accepted or rejected content digests before routing or launch;
+  invalid requests now wait for corrected content without starting a harness.
+- Added resume restoration, compact status diagnostics, boundary-timing tests,
+  strict grammar coverage, and interrupted-write coverage.
+
+### Why
+
+- Durable controller state should survive interruption without exposing partial
+  JSON, while users need one low-complexity way to adjust a future turn without
+  live config reload or mutation of protected history and lifecycle state.
+
 ## 2026-07-29 — Retain upgraded worker through checkpoint repair
 
 ### What changed

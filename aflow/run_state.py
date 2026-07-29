@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Any, Literal, Mapping
+import tomllib
 
 from .plan import PlanSnapshot
 
@@ -14,6 +16,151 @@ WorkflowEndReason = Literal[
     "max_turns_reached",
     "transition_end",
 ]
+RUN_STATE_SCHEMA_VERSION = 1
+OverrideLoadStatus = Literal[
+    "absent",
+    "valid",
+    "invalid",
+    "already_consumed",
+]
+
+
+@dataclass(frozen=True)
+class FrozenRunIdentity:
+    workflow_name: str
+    config_path: str
+    config_fingerprint: str
+
+
+@dataclass(frozen=True)
+class OverrideRequest:
+    digest: str
+    source_text: str
+    next_step: str | None = None
+    team: str | None = None
+    max_turns: int | None = None
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OverrideLoadResult:
+    status: OverrideLoadStatus
+    request: OverrideRequest | None = None
+    digest: str | None = None
+    source_text: str | None = None
+    message: str | None = None
+
+
+@dataclass(frozen=True)
+class OverrideResult:
+    status: Literal["accepted", "rejected"]
+    digest: str
+    message: str
+    source_text: str | None = None
+    next_step: str | None = None
+    team: str | None = None
+    max_turns: int | None = None
+    has_notes: bool = False
+    applied: bool = False
+    recorded_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+def load_override_request(
+    path: Path,
+    *,
+    consumed_digest: str | None = None,
+) -> OverrideLoadResult:
+    """Load the narrow user override grammar without mutating the file."""
+    if not path.is_file():
+        return OverrideLoadResult(status="absent")
+    try:
+        source_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return OverrideLoadResult(
+            status="invalid",
+            message=f"cannot read override file: {exc}",
+        )
+    digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    if digest == consumed_digest:
+        return OverrideLoadResult(
+            status="already_consumed",
+            digest=digest,
+            source_text=source_text,
+        )
+    try:
+        raw = tomllib.loads(source_text)
+    except tomllib.TOMLDecodeError as exc:
+        return OverrideLoadResult(
+            status="invalid",
+            digest=digest,
+            source_text=source_text,
+            message=f"malformed TOML: {exc}",
+        )
+    allowed = {"next_step", "team", "max_turns", "notes"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        return OverrideLoadResult(
+            status="invalid",
+            digest=digest,
+            source_text=source_text,
+            message=f"unsupported override keys: {', '.join(unknown)}",
+        )
+
+    def optional_text(key: str) -> str | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{key} must be a non-empty string")
+        return value.strip()
+
+    try:
+        next_step = optional_text("next_step")
+        team = optional_text("team")
+        max_turns = raw.get("max_turns")
+        if max_turns is not None and (
+            not isinstance(max_turns, int)
+            or isinstance(max_turns, bool)
+            or max_turns < 1
+        ):
+            raise ValueError("max_turns must be a positive integer")
+        notes_value = raw.get("notes", [])
+        if not isinstance(notes_value, list):
+            raise ValueError("notes must be an array of non-empty strings")
+        notes: list[str] = []
+        for index, note in enumerate(notes_value):
+            if not isinstance(note, str) or not note.strip():
+                raise ValueError(f"notes[{index}] must be a non-empty string")
+            notes.append(note.strip())
+    except ValueError as exc:
+        return OverrideLoadResult(
+            status="invalid",
+            digest=digest,
+            source_text=source_text,
+            message=str(exc),
+        )
+    if not raw:
+        return OverrideLoadResult(
+            status="invalid",
+            digest=digest,
+            source_text=source_text,
+            message="override file must contain at least one supported key",
+        )
+    return OverrideLoadResult(
+        status="valid",
+        digest=digest,
+        source_text=source_text,
+        request=OverrideRequest(
+            digest=digest,
+            source_text=source_text,
+            next_step=next_step,
+            team=team,
+            max_turns=max_turns,
+            notes=tuple(notes),
+        ),
+    )
 
 HarnessRecoverySource = Literal["deterministic", "team_lead"]
 HarnessRecoveryAction = Literal[
@@ -262,6 +409,12 @@ class ResumeContext:
     pending_boundary_decision: PendingBoundaryDecision | None = None
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
+    frozen_run_identity: FrozenRunIdentity | None = None
+    override_result: OverrideResult | None = None
+    effective_max_turns: int | None = None
+    pending_override_notes: tuple[str, ...] = ()
+    override_source_run_dir: Path | None = None
+    override_file_present: bool = False
 
 
 @dataclass
@@ -347,6 +500,12 @@ class ControllerState:
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
     last_manager_report_path: str | None = None
+    frozen_run_identity: FrozenRunIdentity | None = None
+    override_result: OverrideResult | None = None
+    effective_max_turns: int | None = None
+    pending_override_notes: tuple[str, ...] = ()
+    override_source_run_dir: Path | None = None
+    override_file_present: bool = False
 
 
 def manager_state_payload(state: ControllerState) -> dict[str, object]:

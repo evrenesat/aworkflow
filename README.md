@@ -40,6 +40,17 @@ aflow run --plan path/to/plan.md --workflow review_implement_cp_review
 aflow analyze
 ```
 
+### Safe next-turn overrides
+
+Each run writes an atomic, versioned controller snapshot to
+`.aflow/runs/<run-id>/run.json`. Treat that file as read-only. To change only a
+future turn, create `.aflow/runs/<run-id>/overrides.toml` with one or more of
+`next_step`, `team`, `max_turns`, or `notes`. AFlow validates and records the
+request immediately before the next launch; it never reloads workflow
+configuration or changes an active harness. See
+[Runtime Behavior](docs/runtime-behavior.md#disk-backed-run-state-and-boundary-overrides)
+for the exact grammar, examples, rejection recovery, and non-goals.
+
 ### Interstep supervision
 
 Freshly bootstrapped configuration enables a lightweight manager between

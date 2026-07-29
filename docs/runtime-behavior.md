@@ -87,9 +87,65 @@ If no plan progress occurred:
 
 The run fails if recovery exceeds `max_consecutive_recoveries` or a backup-team chain is invalid.
 
+## Disk-backed run state and boundary overrides
+
+Every new `.aflow/runs/<run-id>/run.json` is a schema-versioned controller
+snapshot. It records the selected workflow, the resolved configuration
+directory, and a stable fingerprint of the already-resolved workflow, roles,
+teams, harness profiles, manager, and recovery configuration. AFlow writes this
+file through a flushed same-directory temporary file and atomic replacement, so
+an interrupted update cannot expose partial JSON. Existing unversioned run
+metadata remains readable by the legacy-tolerant resume path.
+
+`run.json` is controller-owned output. To request a safe future-turn change,
+create or edit exactly:
+
+```text
+.aflow/runs/<run-id>/overrides.toml
+```
+
+The complete supported grammar is:
+
+```toml
+next_step = "implement_plan"
+team = "strong"
+max_turns = 20
+notes = ["Re-run the focused regression before broader tests."]
+```
+
+All keys are optional, but the file must contain at least one. `next_step` must
+name an executable step in the frozen workflow. `team` must be configured and
+able to resolve the target step's role. `max_turns` must be positive and cannot
+be below the number of completed turns. `notes` is an array of non-empty
+strings and is appended only to the next worker prompt.
+
+AFlow reads this file once at the pre-turn boundary, never while a harness is
+running. It retains the exact source and its hash in the controller record,
+records acceptance or rejection atomically before routing or launch, and never
+deletes or rewrites the file. Broad status and analysis output redact the source
+and note contents. An unchanged
+accepted digest is not applied twice; editing the file creates a new request.
+Invalid TOML, unknown keys, incompatible routing, and invalid limits leave the
+run in `waiting_for_valid_override` without launching another harness. Correct
+the same file and resume the recorded run id.
+
+Protected state has no override syntax. For example, this is rejected because
+`active_turn` is not a supported key:
+
+```toml
+active_turn = 0
+```
+
+Active/completed turn history, plan lineage, lifecycle/worktree ownership,
+manager decisions, the workflow graph, and configuration files cannot be
+changed through this surface. There is no live config reload, file watcher,
+daemon, database, or supported direct-edit workflow for `run.json`.
+
 ## Loop Limits
 
-`max_turns` is the hard turn cap. The runner executes a fixed `1..max_turns` loop, so a workflow cannot exceed that number of turns even if transitions keep routing back.
+`max_turns` is the hard turn cap. The runner checks the effective limit before
+each launch, allowing a validated boundary override to raise or reduce a future
+limit without changing an in-flight turn.
 
 On the last allowed turn:
 
@@ -231,6 +287,7 @@ Fields include:
 
 - elapsed time
 - run id and resumed-from run id when present
+- run-state schema, frozen-config fingerprint, and safe override status
 - workflow and current step
 - harness, model, and effort
 - checkpoint progress and turn count

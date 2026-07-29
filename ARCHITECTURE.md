@@ -234,8 +234,10 @@ All harnesses run in non-interactive, auto-approve mode with full tool access.
 ### `run_state.py`
 Data classes for runtime state:
 - `ControllerConfig` -- immutable run parameters (repo root, plan path, max turns, keep runs, extra instructions).
-- `ControllerState` -- mutable per-run state (snapshot, turn count, issues, timing, status, pending retry context, consecutive same-step streak tracking).
+- `ControllerState` -- mutable per-run state (snapshot, turn count, issues, timing, status, pending retry context, consecutive same-step streak tracking, frozen configuration identity, effective turn limit, and safe override result).
   - Also carries the current run id and, for resumed runs, the source run id so the banner and startup output can surface both immediately.
+- `FrozenRunIdentity` -- selected workflow name, resolved configuration path, and a canonical SHA-256 fingerprint computed once from the resolved in-memory execution configuration.
+- `OverrideRequest` / `OverrideResult` -- the strict user request and durable controller decision for one `overrides.toml` content digest. Raw notes stay out of broad status output.
 - `RetryContext` -- frozen dataclass holding everything needed to rerun the same step on the next turn without re-parsing the broken plan (step name, role, resolved selector, pre-failure snapshot, saved plan paths, base prompt, parse error string, attempt counter, retry limit).
 - `ExecutionContext` -- frozen dataclass holding lifecycle execution state: `primary_repo_root`, `execution_repo_root` (worktree path for worktree flows, same as primary for branch-only), `main_branch`, `feature_branch`, `worktree_path` (or `None` for branch-only), `setup`, `teardown`.
 - `ControllerConfig` also carries the selected startup step, if any, so the workflow loop can start from a non-default step without re-parsing CLI arguments.
@@ -244,9 +246,18 @@ Data classes for runtime state:
 
 ### `runlog.py`
 Persists run data under `.aflow/runs/<timestamp>-<uuid>/`:
-- `run.json` -- run-level metadata, updated after each turn.
+- `run.json` -- schema-versioned controller metadata, atomically replaced before externally visible launches and after finalized boundaries.
+- `overrides.toml` -- optional user-owned request surface read exactly once at a pre-turn boundary. Its only keys are `next_step`, `team`, `max_turns`, and `notes`; AFlow records but never rewrites or deletes it.
 - `turns/turn-NNN/` -- per-turn artifacts: `system-prompt.txt`, `user-prompt.txt`, `effective-prompt.txt`, `argv.json`, `env.json`, `stdout.txt`, `stderr.txt`, `result.json`.
 - `create_run_paths()` also writes `.aflow/last_run_id` immediately after the run directory is created, and writes `.aflow/last_run_ids/<shell-id>` when a stable shell/session id is available, so later `aflow analyze` invocations can prefer shell-local state without losing the repo-wide fallback if the workflow fails mid-run.
+
+`run.json` is written through a sibling temporary file, flushed and fsynced,
+then replaced in the same directory. The resolved workflow/config fingerprint
+is frozen at startup; runtime never reloads global TOML. Accepted override
+digests are durable before routing changes, rejected digests produce
+`waiting_for_valid_override`, and corrected content can be retried on resume.
+Direct `run.json` editing, graph mutation, active-harness mutation, and
+lifecycle/manager/plan-lineage overrides are intentionally unsupported.
 
 Prunes old run directories to respect `keep_runs`.
 
@@ -259,7 +270,7 @@ Git snapshot helpers used by the banner and CLI. Provides three public data clas
 All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
 
 ### `status.py`
-Rich-based live banner rendered to stderr during a run. Shows elapsed time, run id, resumed-from run id when present, workflow/step name, harness, model, checkpoint progress, turn count, issues, plan paths, git summary (if available), and status.
+Rich-based live banner rendered to stderr during a run. Shows elapsed time, run id, resumed-from run id when present, workflow/step name, harness, model, checkpoint progress, turn count, issues, plan paths, git summary (if available), schema/frozen-config identity, safe override diagnostics, and status.
 When the active implementation scope has rejected reviews, it also shows every
 current-scope rejection before the chronological turn cards and labels the next
 worker as a re-implementation with its compact rejection reason.

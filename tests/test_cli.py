@@ -4,6 +4,48 @@ from aflow.config import ManagerConfig
 from aflow.status import BannerRenderer as RealBannerRenderer
 
 
+def test_cli_analysis_adds_safe_controller_state_without_notes(
+    tmp_path: Path,
+) -> None:
+    import aflow.cli as cli_module
+
+    run_dir = tmp_path / ".aflow" / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "frozen_config": {
+                    "workflow_name": "test",
+                    "config_path": "/config",
+                    "config_fingerprint": "abc",
+                },
+                "override_file_present": True,
+                "override_result": {
+                    "status": "rejected",
+                    "digest": "digest",
+                    "message": "unknown team",
+                    "source_text": 'notes = ["private prompt note"]',
+                },
+                "pending_override_notes": ["private prompt note"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {"run": {"run_id": "run-1"}}
+
+    cli_module._add_controller_state_to_analysis(
+        payload,
+        repo_root=tmp_path,
+    )
+
+    controller = payload["run"]["controller_state"]
+    assert controller["schema_version"] == 1
+    assert controller["corrected_override_required"] is True
+    assert "pending_override_notes" not in controller
+    assert "private prompt note" not in json.dumps(controller)
+
+
 def _run_manager_report_cli_case(
     tmp_path: Path,
     *,
@@ -1789,6 +1831,74 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert result.feature_branch == "feature/test-branch"
         assert result.worktree_path == Path("/fake/repo/.git/worktrees/test")
         assert result.active_plan_path == Path("/fake/plan-cp01-v01.md")
+
+    def test_resume_restores_waiting_override_state(self) -> None:
+        import aflow.cli as cli_module
+
+        run_id = "20260101T000000Z-abc123"
+        repo_root = Path("/fake/repo").resolve()
+        prev_run = {
+            "repo_root": str(repo_root),
+            "workflow_name": "test_workflow",
+            "plan_path": str(Path("/fake/plan.md").resolve()),
+            "team": None,
+            "selected_start_step": None,
+            "max_turns": 15,
+            "effective_max_turns": 9,
+            "extra_instructions": [],
+            "lifecycle_setup": ["worktree", "branch"],
+            "lifecycle_teardown": ["merge", "rm_worktree"],
+            "feature_branch": "feature/test-branch",
+            "worktree_path": str(Path("/fake/worktree")),
+            "main_branch": "main",
+            "status": "waiting_for_valid_override",
+            "last_snapshot": {"is_complete": False},
+            "override_file_present": True,
+            "override_result": {
+                "status": "rejected",
+                "digest": "abc",
+                "message": "unknown team",
+                "applied": False,
+            },
+        }
+
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_id), "explicit_run_id"),
+        ), patch(
+            "aflow.cli.load_run_json",
+            return_value=prev_run,
+        ), patch(
+            "sys.stdin.isatty",
+            return_value=True,
+        ), patch(
+            "sys.stdout.isatty",
+            return_value=True,
+        ), patch(
+            "builtins.input",
+            return_value="y",
+        ):
+            result = cli_module._detect_resume_candidate(
+                repo_root=repo_root,
+                workflow_config=type(
+                    "obj",
+                    (object,),
+                    {"setup": ("worktree", "branch")},
+                )(),
+                workflow_name="test_workflow",
+                plan_path=Path("/fake/plan.md").resolve(),
+                team=None,
+                selected_start_step=None,
+                max_turns=15,
+                extra_instructions=(),
+            )
+
+        assert result is not None
+        assert result.override_result is not None
+        assert result.override_result.status == "rejected"
+        assert result.effective_max_turns == 9
+        assert result.override_file_present is True
+        assert result.override_source_run_dir == repo_root / ".aflow" / "runs" / run_id
 
     def test_resume_restores_step_from_unfinished_active_turn(self) -> None:
         import aflow.cli as cli_module

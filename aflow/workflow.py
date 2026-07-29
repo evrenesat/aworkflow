@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -61,7 +62,7 @@ from .recovery import (
     resolve_backup_team,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display
+from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
 from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .status import BannerRenderer, WorkflowGraphSource
@@ -86,6 +87,36 @@ _REVIEW_SKILL_NAMES = frozenset({
     "aflow-review-final",
 })
 _PLAN_BRANCH_LINE_RE = re.compile(r"^(\s*-\s+Plan Branch:\s+`)([^`]*)(`.*)$", re.MULTILINE)
+
+
+def _freeze_run_identity(
+    workflow_name: str,
+    workflow_config: WorkflowUserConfig,
+    *,
+    config_dir: Path,
+) -> FrozenRunIdentity:
+    """Fingerprint the resolved in-memory inputs used to execute one workflow."""
+    selected = {
+        "workflow_name": workflow_name,
+        "workflow": asdict(workflow_config.workflows[workflow_name]),
+        "roles": workflow_config.roles,
+        "teams": {
+            name: asdict(team)
+            for name, team in workflow_config.teams.items()
+        },
+        "harnesses": {
+            name: asdict(harness)
+            for name, harness in workflow_config.harnesses.items()
+        },
+        "manager": asdict(workflow_config.manager),
+        "error_handling": asdict(workflow_config.error_handling),
+    }
+    canonical = json.dumps(selected, sort_keys=True, separators=(",", ":"))
+    return FrozenRunIdentity(
+        workflow_name=workflow_name,
+        config_path=str(config_dir.resolve()),
+        config_fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
 
 
 def _target_plan_identity(plan_path: Path, snapshot: PlanSnapshot | None = None) -> str:
@@ -2305,6 +2336,21 @@ def run_workflow(
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
+    state.frozen_run_identity = _freeze_run_identity(
+        workflow_name,
+        workflow_config,
+        config_dir=config_dir,
+    )
+    state.effective_max_turns = (
+        resume.effective_max_turns
+        if resume is not None and resume.effective_max_turns is not None
+        else config.max_turns
+    )
+    if resume is not None:
+        state.override_result = resume.override_result
+        state.pending_override_notes = resume.pending_override_notes
+        state.override_source_run_dir = resume.override_source_run_dir
+        state.override_file_present = resume.override_file_present
     state.status_message = "initializing"
     state.selected_start_step = config.start_step
     state.startup_recovery_used = startup_retry is not None
@@ -4413,7 +4459,157 @@ def run_workflow(
             resumed_from_run_id=resumed_from_run_id,
         )
 
-    for turn_number in range(1, config.max_turns + 1):
+    def _write_override_boundary(*, status: str) -> None:
+        write_run_metadata(
+            run_paths,
+            config,
+            state,
+            status=status,
+            execution_context=exec_ctx,
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+
+    def _apply_boundary_override() -> tuple[str, str | None]:
+        nonlocal current_step_name, baseline_team_name
+        source_run_dir = state.override_source_run_dir or run_paths.run_dir
+        override_path = source_run_dir / "overrides.toml"
+        prior = state.override_result
+        if (
+            prior is not None
+            and prior.status == "accepted"
+            and not prior.applied
+        ):
+            if prior.next_step is not None:
+                current_step_name = prior.next_step
+            if prior.team is not None:
+                state.current_team = prior.team
+                state.current_team_override = None
+                baseline_team_name = prior.team
+            if prior.max_turns is not None:
+                state.effective_max_turns = prior.max_turns
+            state.override_result = replace(prior, applied=True)
+            state.override_source_run_dir = None
+            _write_override_boundary(status="running")
+            return current_step_name, baseline_team_name
+        consumed_digest = (
+            prior.digest
+            if prior is not None and prior.status == "accepted"
+            else None
+        )
+        loaded = load_override_request(
+            override_path,
+            consumed_digest=consumed_digest,
+        )
+        state.override_file_present = loaded.status != "absent"
+        if loaded.status == "absent":
+            return current_step_name, baseline_team_name
+        if (
+            loaded.status == "already_consumed"
+            and prior is not None
+            and prior.status == "accepted"
+            and prior.applied
+        ):
+            return current_step_name, baseline_team_name
+        request = loaded.request
+        validation_error = loaded.message
+        if loaded.status == "valid" and request is not None:
+            target_step = request.next_step or current_step_name
+            if target_step not in wf.steps:
+                validation_error = (
+                    f"next_step '{target_step}' is not an executable step in "
+                    f"workflow '{workflow_name}'"
+                )
+            target_team = request.team or state.current_team
+            if validation_error is None and request.team is not None:
+                if request.team not in workflow_config.teams:
+                    validation_error = f"team '{request.team}' is not configured"
+                else:
+                    try:
+                        _resolve_step_runtime(
+                            wf.steps[target_step],
+                            workflow_config,
+                            team_name=target_team,
+                            step_path=(
+                                f"workflow.{workflow_name}.steps.{target_step}"
+                            ),
+                        )
+                    except Exception as exc:
+                        validation_error = (
+                            f"team '{request.team}' is incompatible with step "
+                            f"'{target_step}': {exc}"
+                        )
+            if (
+                validation_error is None
+                and request.max_turns is not None
+                and request.max_turns < state.turns_completed
+            ):
+                validation_error = (
+                    f"max_turns ({request.max_turns}) cannot be below completed "
+                    f"turns ({state.turns_completed})"
+                )
+
+        if validation_error is not None or request is None:
+            digest = loaded.digest or hashlib.sha256(
+                (validation_error or "invalid override").encode("utf-8")
+            ).hexdigest()
+            state.override_result = OverrideResult(
+                status="rejected",
+                digest=digest,
+                message=validation_error or "invalid override request",
+                source_text=loaded.source_text,
+            )
+            state.status_message = (
+                "waiting_for_valid_override: "
+                f"{state.override_result.message}"
+            )
+            state.override_source_run_dir = source_run_dir
+            _write_override_boundary(status="waiting_for_valid_override")
+            banner.stop(state)
+            raise WorkflowError(
+                state.status_message,
+                run_dir=run_paths.run_dir,
+            )
+
+        state.pending_override_notes = request.notes
+        state.override_result = OverrideResult(
+            status="accepted",
+            digest=request.digest,
+            message="override accepted at pre-turn boundary",
+            source_text=request.source_text,
+            next_step=request.next_step,
+            team=request.team,
+            max_turns=request.max_turns,
+            has_notes=bool(request.notes),
+            applied=False,
+        )
+        _write_override_boundary(status="running")
+
+        if request.next_step is not None:
+            current_step_name = request.next_step
+        if request.team is not None:
+            state.current_team = request.team
+            state.current_team_override = None
+            baseline_team_name = request.team
+        if request.max_turns is not None:
+            state.effective_max_turns = request.max_turns
+        state.override_result = replace(state.override_result, applied=True)
+        state.override_source_run_dir = None
+        _write_override_boundary(status="running")
+        return current_step_name, baseline_team_name
+
+    turn_number = 1
+    while turn_number <= (state.effective_max_turns or config.max_turns):
+        current_step_name, baseline_team_name = _apply_boundary_override()
+        effective_max_turns = state.effective_max_turns or config.max_turns
+        if turn_number > effective_max_turns:
+            break
         retry_ctx = state.pending_retry
         active_team_name = (
             state.current_team_override
@@ -4486,6 +4682,13 @@ def run_workflow(
                         )):
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
                     consume_manager_notes = True
+                if step.role == "worker" and state.pending_override_notes:
+                    user_prompt += (
+                        "\n\n## User override notes for this turn\n"
+                        + "\n".join(
+                            f"- {note}" for note in state.pending_override_notes
+                        )
+                    )
                 invocation = step_adapter.build_invocation(
                     repo_root=execution_repo_root,
                     model=resolved.model,
@@ -4610,6 +4813,13 @@ def run_workflow(
                         )):
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
                     consume_manager_notes = True
+                if step.role == "worker" and state.pending_override_notes:
+                    user_prompt += (
+                        "\n\n## User override notes for this turn\n"
+                        + "\n".join(
+                            f"- {note}" for note in state.pending_override_notes
+                        )
+                    )
 
                 invocation = step_adapter.build_invocation(
                     repo_root=execution_repo_root,
@@ -4626,6 +4836,8 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
 
+        if step.role == "worker":
+            state.pending_override_notes = ()
         if step.role == "worker":
             write_run_metadata(
                 run_paths, config, state, status="running",
@@ -4772,7 +4984,7 @@ def run_workflow(
             current_attempt = (retry_ctx.attempt if retry_ctx is not None else 0) + 1
             base_prompt = retry_ctx.base_user_prompt if retry_ctx is not None else user_prompt
 
-            if is_retryable and current_attempt <= retry_limit and turn_number < config.max_turns:
+            if is_retryable and current_attempt <= retry_limit and turn_number < effective_max_turns:
                 _record_issue("retry-scheduled", str(exc), turn_dir=turn_dir)
                 state.turns_completed += 1
                 new_retry_ctx = RetryContext(
@@ -4807,7 +5019,7 @@ def run_workflow(
                     selector=selector,
                     active_path=active_plan_path,
                     new_path=new_plan_path,
-                    conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= config.max_turns},
+                    conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
                     retry_attempt=current_attempt,
                     retry_limit_value=retry_limit,
                     retry_reason="inconsistent_checkpoint_state",
@@ -4823,6 +5035,7 @@ def run_workflow(
                     resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.update(state)
+                turn_number += 1
                 continue
 
             state.pending_retry = None
@@ -4844,7 +5057,7 @@ def run_workflow(
                 selector=selector,
                 active_path=active_plan_path,
                 new_path=new_plan_path,
-                conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= config.max_turns},
+                conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
             )
             report = _manager_terminal_incident(
                 trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
@@ -4885,6 +5098,7 @@ def run_workflow(
             stderr=completed.stderr,
             returncode=completed.returncode,
         ):
+            turn_number += 1
             continue
 
         state.consecutive_harness_recoveries = 0
@@ -4911,7 +5125,7 @@ def run_workflow(
                 selector=selector,
                 active_path=active_plan_path,
                 new_path=new_plan_path,
-                conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= config.max_turns},
+                conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
             )
             report = _manager_terminal_incident(
                 trigger="ambiguous_failure",
@@ -4945,7 +5159,7 @@ def run_workflow(
         if new_plan_exists:
             active_plan_path = new_plan_path
 
-        max_turns_reached = turn_number >= config.max_turns
+        max_turns_reached = turn_number >= effective_max_turns
 
         conditions = {
             "DONE": done,
@@ -5149,7 +5363,7 @@ def run_workflow(
         # terminal boundary and must go directly to Full rather than through a
         # normal Lite transition gate.
         if workflow_config.manager.enabled and max_turns_reached and not done:
-            reason = f"reached max turns limit of {config.max_turns} without completing the active plan"
+            reason = f"reached max turns limit of {effective_max_turns} without completing the active plan"
             state.status_message = "failed"
             report = _manager_terminal_incident(
                 trigger="max_turns", reason=reason, current_step=current_step_name,
@@ -5470,15 +5684,17 @@ def run_workflow(
                 state.consec_step_count = 0
 
         current_step_name = transition_target
+        turn_number += 1
 
     state.status_message = "failed"
+    effective_max_turns = state.effective_max_turns or config.max_turns
     report = _manager_terminal_incident(
-        trigger="max_turns", reason=f"reached max turns limit of {config.max_turns} without a transition to END",
+        trigger="max_turns", reason=f"reached max turns limit of {effective_max_turns} without a transition to END",
         current_step=current_step_name, current_role=None, active_team=state.current_team,
         active_selector=None,
     )
     summary = report or _format_failure(
-        reason=f"reached max turns limit of {config.max_turns} without a transition to END",
+        reason=f"reached max turns limit of {effective_max_turns} without a transition to END",
         run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
     )
     write_run_metadata(

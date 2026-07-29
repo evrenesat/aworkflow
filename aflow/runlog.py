@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -20,6 +20,7 @@ from .run_state import (
     ExecutionContext,
     HarnessRecoveryContext,
     RetryContext,
+    RUN_STATE_SCHEMA_VERSION,
     WorkflowEndReason,
     manager_state_payload,
 )
@@ -80,6 +81,31 @@ def _json_dump(payload: dict[str, object]) -> str:
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(_json_dump(payload), encoding="utf-8")
+
+
+def _write_atomic_json(path: Path, payload: dict[str, object]) -> None:
+    """Durably replace one JSON file without exposing a partial write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(_json_dump(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def manager_decision_paths(paths: RunPaths, decision_number: int) -> ManagerDecisionPaths:
@@ -508,6 +534,7 @@ def write_run_metadata(
         if isinstance(previous_reason, str) and previous_reason.startswith("# AFlow manager report"):
             failure_reason = previous_reason
     payload: dict[str, object] = {
+        "schema_version": RUN_STATE_SCHEMA_VERSION,
         "repo_root": str(paths.repo_root),
         "run_dir": str(paths.run_dir),
         "status": status,
@@ -568,6 +595,20 @@ def write_run_metadata(
         payload["selected_start_step"] = state.selected_start_step
         payload["startup_recovery_used"] = state.startup_recovery_used
         payload["startup_recovery_reason"] = state.startup_recovery_reason
+        payload["effective_max_turns"] = (
+            state.effective_max_turns
+            if state.effective_max_turns is not None
+            else config.max_turns
+        )
+        payload["override_file_present"] = state.override_file_present
+        if state.frozen_run_identity is not None:
+            payload["frozen_config"] = asdict(state.frozen_run_identity)
+        if state.override_result is not None:
+            payload["override_result"] = asdict(state.override_result)
+        if state.pending_override_notes:
+            payload["pending_override_notes"] = list(state.pending_override_notes)
+        if state.override_source_run_dir is not None:
+            payload["override_source_run_dir"] = str(state.override_source_run_dir)
         if end_reason is None:
             end_reason = state.end_reason
     else:
@@ -607,7 +648,7 @@ def write_run_metadata(
         payload.update(build_recovery_payload(state.current_harness_recovery, state.harness_recovery_history))
     if state is not None:
         payload.update(manager_state_payload(state))
-    _write_json(paths.run_json, payload)
+    _write_atomic_json(paths.run_json, payload)
 
 
 def write_turn_artifacts_start(

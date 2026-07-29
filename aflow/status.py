@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from .plan import PlanSnapshot
-from .run_state import ControllerState, ReviewRejectionRecord, TurnRecord
+from .run_state import (
+    RUN_STATE_SCHEMA_VERSION,
+    ControllerState,
+    ReviewRejectionRecord,
+    TurnRecord,
+)
 from .config import WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig, load_workflow_config
 
 if TYPE_CHECKING:
@@ -603,11 +608,29 @@ def _build_summary_table(
 
     if workflow_name is not None:
         table.add_row("Workflow", workflow_name)
+    if state.frozen_run_identity is not None:
+        table.add_row("State Schema", str(RUN_STATE_SCHEMA_VERSION))
+        table.add_row(
+            "Frozen Config",
+            state.frozen_run_identity.config_fingerprint[:12],
+        )
+    table.add_row(
+        "Override File",
+        "present" if state.override_file_present else "absent",
+    )
+    if state.override_result is not None:
+        result = state.override_result
+        table.add_row("Last Override", f"{result.status}: {result.message}")
+        if result.status == "rejected":
+            table.add_row("Override Action", "correct overrides.toml and resume")
 
     table.add_row("Checkpoint", _checkpoint_display(state.last_snapshot))
     name = state.last_snapshot.current_checkpoint_name or "-"
     table.add_row("Name", name)
-    table.add_row("Turn", f"{state.active_turn}/{config_max_turns}")
+    table.add_row(
+        "Turn",
+        f"{state.active_turn}/{state.effective_max_turns or config_max_turns}",
+    )
 
     if original_plan_path is not None:
         table.add_row("Original Plan", original_plan_path.name)
