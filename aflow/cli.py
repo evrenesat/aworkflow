@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 from .api import (
     AnalyzeRequest,
@@ -29,10 +30,17 @@ from .config import (
     WorkflowStepConfig,
 )
 from .git_status import probe_worktree, classify_dirtiness_by_prefix
-from .plan import PlanParseError, load_plan, load_plan_tolerant
+from .manager_context import scoped_reviewer_rejection_count
+from .plan import PlanParseError, PlanSnapshot, load_plan, load_plan_tolerant
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
-from .run_state import WorkflowEndReason, describe_end_reason, manager_resume_fields, ResumeContext
+from .run_state import (
+    PendingFinalizedTurn,
+    ResumeContext,
+    WorkflowEndReason,
+    describe_end_reason,
+    manager_resume_fields,
+)
 from .workflow import (
     WorkflowError,
     move_completed_plan_to_done,
@@ -220,6 +228,180 @@ def _prompt_resume(prev_run_id: str, feature_branch: str, worktree_path: str) ->
     return response in ("", "y", "yes")
 
 
+def _interrupted_resume_step(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+) -> str | None:
+    """Return the workflow step whose durable turn never finalized."""
+    if prev_run.get("status") != "running":
+        return None
+    active_turn = prev_run.get("active_turn")
+    current_step_name = prev_run.get("current_step_name")
+    if (
+        not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn < 1
+        or not isinstance(current_step_name, str)
+        or not current_step_name.strip()
+    ):
+        return None
+    result_path = run_dir / "turns" / f"turn-{active_turn:03d}" / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(result, Mapping) or result.get("status") != "starting":
+        return None
+    result_step_name = result.get("step_name")
+    if (
+        isinstance(result_step_name, str)
+        and result_step_name.strip()
+        and result_step_name != current_step_name
+    ):
+        return None
+    return current_step_name
+
+
+def _pending_finalized_resume_turn(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+) -> PendingFinalizedTurn | None:
+    """Recover a completed harness turn whose manager boundary never ran."""
+    if prev_run.get("status") != "running":
+        return None
+    active_turn = prev_run.get("active_turn")
+    turns_completed = prev_run.get("turns_completed")
+    if (
+        not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn < 1
+        or not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or active_turn <= turns_completed
+    ):
+        return None
+    boundary = prev_run.get("pending_boundary_decision")
+    if (
+        isinstance(boundary, Mapping)
+        and boundary.get("finalized_turn_number") == active_turn
+    ):
+        return None
+    result_path = run_dir / "turns" / f"turn-{active_turn:03d}" / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("turn_number") != active_turn
+        or not isinstance(result.get("returncode"), int)
+        or isinstance(result.get("returncode"), bool)
+        or result.get("snapshot_after") is None
+    ):
+        return None
+    step_name = result.get("step_name")
+    step_role = result.get("step_role")
+    selector = result.get("selector")
+    active_plan_path = result.get("active_plan_path")
+    new_plan_path = result.get("new_plan_path")
+    chosen_transition = result.get("chosen_transition")
+    chosen_condition = result.get("chosen_transition_condition")
+    conditions = result.get("conditions")
+    snapshot = result.get("snapshot_after")
+    if (
+        not all(
+            isinstance(value, str) and value
+            for value in (
+                step_name,
+                step_role,
+                selector,
+                active_plan_path,
+                new_plan_path,
+                chosen_transition,
+            )
+        )
+        or (chosen_condition is not None and not isinstance(chosen_condition, str))
+        or not isinstance(conditions, Mapping)
+        or not isinstance(snapshot, Mapping)
+    ):
+        return None
+    condition_values = {
+        key: conditions.get(key)
+        for key in ("DONE", "NEW_PLAN_EXISTS", "MAX_TURNS_REACHED")
+    }
+    if not all(isinstance(value, bool) for value in condition_values.values()):
+        return None
+    checkpoint_name = snapshot.get("current_checkpoint_name")
+    checkpoint_index = snapshot.get("current_checkpoint_index")
+    snapshot_values = (
+        snapshot.get("unchecked_checkpoint_count"),
+        snapshot.get("current_checkpoint_unchecked_step_count"),
+        snapshot.get("total_checkpoint_count", 0),
+    )
+    if (
+        checkpoint_name is not None
+        and not isinstance(checkpoint_name, str)
+    ) or (
+        checkpoint_index is not None
+        and (
+            not isinstance(checkpoint_index, int)
+            or isinstance(checkpoint_index, bool)
+        )
+    ) or not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in snapshot_values
+    ) or not isinstance(snapshot.get("is_complete"), bool):
+        return None
+    return PendingFinalizedTurn(
+        source_run_dir=run_dir,
+        turn_number=active_turn,
+        step_name=step_name,
+        step_role=step_role,
+        selector=selector,
+        active_plan_path=Path(active_plan_path),
+        new_plan_path=Path(new_plan_path),
+        snapshot_after=PlanSnapshot(
+            current_checkpoint_name=checkpoint_name,
+            unchecked_checkpoint_count=snapshot_values[0],
+            current_checkpoint_unchecked_step_count=snapshot_values[1],
+            is_complete=snapshot["is_complete"],
+            total_checkpoint_count=snapshot_values[2],
+            current_checkpoint_index=checkpoint_index,
+        ),
+        conditions={key: bool(value) for key, value in condition_values.items()},
+        chosen_transition=chosen_transition,
+        chosen_transition_condition=chosen_condition,
+    )
+
+
+def _manager_resume_fields_for_scope(
+    prev_run: Mapping[str, object],
+    *,
+    reset_scope: bool,
+    run_dir: Path | None = None,
+) -> dict[str, object]:
+    """Restore manager history while optionally discarding one checkpoint scope."""
+    fields = manager_resume_fields(prev_run)
+    if reset_scope:
+        fields.update({
+            "semantic_stall_count": 0,
+            "reviewer_rejection_count": 0,
+            "implementation_attempts": {},
+            "active_implementation_scope": None,
+            "pending_manager_notes": None,
+            "pending_step_team_override": None,
+            "pending_boundary_decision": None,
+            "last_manager_report_path": None,
+        })
+        return fields
+    scope = prev_run.get("active_implementation_scope")
+    if run_dir is not None and isinstance(scope, Mapping):
+        recomputed = scoped_reviewer_rejection_count(run_dir, scope)
+        if recomputed is not None:
+            fields["reviewer_rejection_count"] = recomputed
+    return fields
+
+
 def _detect_resume_candidate(
     repo_root: Path,
     workflow_config: Any,
@@ -231,6 +413,7 @@ def _detect_resume_candidate(
     extra_instructions: tuple[str, ...],
     requested_run_id: str | None = None,
     require_resume: bool = False,
+    reset_scope: bool = False,
 ) -> ResumeContext | None:
     """Detect if there's a valid resume candidate and prompt the user.
 
@@ -288,6 +471,29 @@ def _detect_resume_candidate(
     if not require_resume and not _prompt_resume(resolved_run_id.name, feature_branch, worktree_path):
         return None
 
+    pending_finalized_turn = (
+        None
+        if reset_scope
+        else _pending_finalized_resume_turn(run_dir, prev_run)
+    )
+    manager_fields = _manager_resume_fields_for_scope(
+        prev_run,
+        reset_scope=reset_scope,
+        run_dir=run_dir,
+    )
+    if pending_finalized_turn is not None:
+        # Any prior boundary belongs to an earlier finalized turn. The
+        # recovered turn must receive a fresh manager decision before routing.
+        manager_fields["pending_manager_notes"] = None
+        manager_fields["pending_step_team_override"] = None
+        manager_fields["pending_boundary_decision"] = None
+    recovered_active_plan = active_plan_path
+    if (
+        pending_finalized_turn is not None
+        and pending_finalized_turn.conditions["NEW_PLAN_EXISTS"]
+    ):
+        recovered_active_plan = str(pending_finalized_turn.new_plan_path)
+
     return ResumeContext(
         resumed_from_run_id=resolved_run_id.name,
         feature_branch=feature_branch,
@@ -296,9 +502,17 @@ def _detect_resume_candidate(
         setup=tuple(lifecycle_setup),
         teardown=tuple(lifecycle_teardown),
         active_plan_path=(
-            Path(active_plan_path) if isinstance(active_plan_path, str) else None
+            None
+            if reset_scope
+            else Path(recovered_active_plan)
+            if isinstance(recovered_active_plan, str)
+            else None
         ),
-        **manager_resume_fields(prev_run),
+        interrupted_step_name=(
+            None if reset_scope else _interrupted_resume_step(run_dir, prev_run)
+        ),
+        pending_finalized_turn=pending_finalized_turn,
+        **manager_fields,
     )
 
 
@@ -425,6 +639,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Resume a previous unfinished worktree run. With no RUN_ID, requires a resumable last run "
             "from the current shell context. With RUN_ID, resumes that exact run."
+        ),
+    )
+    run_parser.add_argument(
+        "--resume-reset-scope",
+        action="store_true",
+        help=(
+            "With an explicit --resume RUN_ID, reuse its worktree and manager history "
+            "but restart from the invocation's original plan and fresh checkpoint scope."
         ),
     )
     run_parser.add_argument("run_args", nargs=argparse.REMAINDER)
@@ -907,6 +1129,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 0
 
+    if (
+        args.command == "run"
+        and args.resume_reset_scope
+        and args.resume in (None, "AUTO")
+    ):
+        print(
+            "error: --resume-reset-scope requires an explicit --resume RUN_ID",
+            file=sys.stderr,
+        )
+        return 1
+
     config_path: Path | None = None
     if args.command in (None, "run", "show"):
         config_path, created_paths = _bootstrap_config_files()
@@ -1035,6 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
             extra_instructions=prepared_run.extra_instructions,
             requested_run_id=requested_resume_run_id,
             require_resume=require_resume,
+            reset_scope=args.resume_reset_scope,
         )
     except ValueError as exc:
         print(exc, file=sys.stderr)

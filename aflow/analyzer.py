@@ -246,10 +246,15 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
         name = str(turn.get("step_name", "")).lower()
         before_sig = snapshot_signature(turn.get("snapshot_before"))
         after_sig = snapshot_signature(turn.get("snapshot_after"))
+        conditions = turn.get("conditions")
+        created_followup = (
+            isinstance(conditions, dict)
+            and conditions.get("NEW_PLAN_EXISTS") is True
+        )
         if (
             ("review" in role or "review" in name)
             and before_sig is not None
-            and before_sig == after_sig
+            and (before_sig == after_sig or created_followup)
         ):
             reviewer_rejection_count += 1
     return {

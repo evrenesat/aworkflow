@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import re
 from typing import Any, Literal, Mapping
 
 from .config import WorkflowUserConfig
@@ -35,6 +36,10 @@ _DECISION_KEYS = frozenset({"schema_version", "action", "reason", "next_step_not
 _STOP_REPORT_KEYS = frozenset({"summary", "root_cause", "evidence", "attempts", "workspace_state", "next_actions"})
 MAX_MANAGER_NOTES = 8
 MAX_MANAGER_NOTE_LENGTH = 1_000
+_SINGLE_JSON_FENCE = re.compile(
+    r"\A\s*```json[ \t]*\r?\n(?P<body>.*?)\r?\n```[ \t]*\s*\Z",
+    re.DOTALL,
+)
 
 
 class ManagerDecisionError(ValueError):
@@ -120,9 +125,11 @@ def _parse_stop_report(value: object) -> ManagerStopReport:
 
 
 def parse_manager_decision(text: str) -> ManagerDecisionV1:
-    """Parse one exact JSON object; markdown and free-form prose are rejected."""
+    """Parse one JSON object, tolerating only one exact ``json`` fence."""
+    fenced = _SINGLE_JSON_FENCE.fullmatch(text)
+    payload = fenced.group("body") if fenced is not None else text
     try:
-        value = json.loads(text)
+        value = json.loads(payload)
     except json.JSONDecodeError as exc:
         raise ManagerDecisionError(f"manager response is not valid JSON: {exc.msg}") from exc
     if not isinstance(value, Mapping):
@@ -263,6 +270,18 @@ def build_manager_prompts(
     if level == "lite":
         eligible_actions.add("escalate_to_full")
     eligible_text = ", ".join(sorted(eligible_actions)) or "none"
+    reviewer_rejections = int(controller.get("reviewer_rejection_count", 0) or 0)
+    eligible_upgrade = (
+        controller.get("eligible_upgrade")
+        if isinstance(controller.get("eligible_upgrade"), Mapping)
+        else {}
+    )
+    require_first_rejection_upgrade = (
+        level == "lite"
+        and reviewer_rejections == 1
+        and bool(eligible_upgrade.get("available"))
+        and "upgrade_next_implementation" in eligible_actions
+    )
     normal_shape = json.dumps({
         "schema_version": 1,
         "action": "continue",
@@ -293,6 +312,15 @@ def build_manager_prompts(
         "Accept or alter only the controller action exposed as eligible in the supplied context.",
         "Do not choose workflow nodes, teams, selectors, or business logic.",
         f"Eligible actions at this boundary: {eligible_text}.",
+        *(
+            (
+                "This is the first reviewer rejection in the active implementation scope and "
+                "a worker upgrade is eligible. Choose upgrade_next_implementation now; do not "
+                "continue with the same worker or escalate to Full before applying this upgrade.",
+            )
+            if require_first_rejection_upgrade
+            else ()
+        ),
         "Return exactly one JSON object with schema_version, action, reason, next_step_notes, and stop_report.",
         "schema_version must be the number 1. reason must be a non-empty string.",
         "next_step_notes must always be an array of non-empty strings, never a string or null.",

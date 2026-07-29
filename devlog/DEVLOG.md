@@ -1,3 +1,125 @@
+## 2026-07-29 — Finalized-turn manager-boundary resume
+
+### What changed
+
+- Detected a completed active turn that is newer than the controller boundary
+  persisted in `run.json`.
+- Restored its snapshot, repair plan, and transition on resume, then ran the
+  missing manager gate against the immutable source-run artifacts before any
+  new harness turn.
+- Cleared stale one-hop state from the earlier boundary and avoided
+  double-counting the recovered review rejection.
+
+### Why
+
+- A live controller was interrupted after a rejected CP11 review finalized but
+  before its manager gate persisted. Resume used the older accepted CP10
+  boundary and incorrectly launched the next checkpoint's baseline worker,
+  skipping the CP11 repair upgrade.
+
+## 2026-07-29 — Follow-up review rejection and reset-scope correction
+
+### What changed
+
+- Counted a reviewer-created follow-up plan as a rejection even when review
+  reopens the original checkpoint instead of leaving its snapshot unchanged.
+- Recomputed active-scope rejection counts from durable source-turn artifacts
+  on resume, repairing runs written before the classifier correction.
+- Cleared the live implementation-attempt index during owner-authorized scope
+  reset so restarting the same checkpoint cannot collide with its old scope ID.
+
+### Why
+
+- A live CP9 rejection moved the original plan from CP10 back to CP9 and created
+  a focused overlay. The unchanged-snapshot-only classifier reported zero
+  rejections, so Lite incorrectly retained DS4-pro despite an eligible Terra
+  upgrade.
+
+## 2026-07-29 — Fenced Lite manager decision normalization
+
+### What changed
+
+- Accepted one exact `json`-tagged Markdown fence around an otherwise valid
+  manager decision object.
+- Continued rejecting prose, untagged or multiple fences, multiple objects,
+  malformed JSON, and protocol-invalid decisions.
+- Added parser and Reasonix Lite runtime coverage proving a fenced final
+  response does not spend an unnecessary Full-manager call.
+
+### Why
+
+- A live Lite manager returned the correct closed-protocol decision inside a
+  `json` fence despite the no-fence instruction. Strict transport parsing
+  escalated healthy CP9 progress to Full unnecessarily.
+
+## 2026-07-29 — Owner-authorized checkpoint repartition resume
+
+### What changed
+
+- Added `--resume-reset-scope`, valid only with an explicit `--resume RUN_ID`.
+- Preserved worktree lifecycle identity, manager decision history, and
+  historical implementation attempts while clearing obsolete checkpoint scope,
+  pending routing, active repair overlay, interrupted step, and report pointer.
+- Added CLI parsing and state-boundary regression coverage.
+
+### Why
+
+- A legitimate Full-manager stop can ask the owner to repartition an oversized
+  checkpoint. Reusing the durable worktree must not also revive the rejected
+  repair overlay and exhausted rejection state, and operators should not need
+  to edit `run.json` manually.
+
+## 2026-07-28 — Repair approval active-plan restoration
+
+### What changed
+
+- Generated follow-up paths against the execution worktree's existing overlays.
+- Excluded pre-existing repair overlays from `NEW_PLAN_EXISTS` after review.
+- Added a resumed-worktree regression proving an approved repair returns the
+  next checkpoint worker to the original plan.
+- Normalized already-affected durable runs on resume when a completed repair
+  overlay remained active after its original checkpoint advanced, including
+  the non-checkpoint checklist format used by focused repair plans.
+
+### Why
+
+- A resumed CP3 approval reused the existing `cp03-v01` overlay as its proposed
+  follow-up path, misclassified it as newly created, and launched CP4 with the
+  completed CP3 repair plan.
+
+## 2026-07-28 — Durable lifecycle metadata preservation
+
+### What changed
+
+- Preserved existing worktree lifecycle identity when manager or status
+  boundaries rewrite `run.json` without repeating the execution context.
+- Added a regression covering the exact manager-style follow-up write.
+- Persisted lifecycle identity immediately after setup and restored an
+  interrupted `starting` step on resume instead of resetting to the CLI start
+  step.
+
+### Why
+
+- A real interrupted run lost its worktree, branch, setup, and teardown fields
+  after a manager boundary and was incorrectly rejected as non-resumable. Once
+  repaired, resume also skipped the unfinished reviewer and restarted the
+  implementor.
+
+## 2026-07-28 — First-rejection worker upgrade policy
+
+### What changed
+
+- Tightened the inline and bundled interstep-manager policy so Lite selects an
+  eligible one-edge worker upgrade immediately after the first reviewer
+  rejection, before Full-manager escalation.
+- Added prompt coverage for the DS4-pro to Terra-style upgrade boundary.
+
+### Why
+
+- A real run spent its first repair attempt on the baseline Lite worker even
+  though the controller exposed a valid upgrade, leaving Full to upgrade only
+  after the second rejection.
+
 ## 2026-07-28 — Legacy scoped-rejection resume correction
 
 ### What changed

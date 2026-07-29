@@ -5,6 +5,7 @@ from aflow.run_state import (
     ActiveImplementationScope,
     ImplementationAttempt,
     PendingBoundaryDecision,
+    PendingFinalizedTurn,
     PendingTeamOverride,
     manager_resume_fields,
 )
@@ -3673,6 +3674,14 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 call_count[0] += 1
                 cwd = Path(kwargs['cwd'])
                 if call_count[0] == 1:
+                    live_run_dirs = list((repo_root / '.aflow' / 'runs').iterdir())
+                    assert len(live_run_dirs) == 1
+                    live_run = json.loads(
+                        (live_run_dirs[0] / 'run.json').read_text(encoding='utf-8')
+                    )
+                    assert live_run['worktree_path'] == str(cwd)
+                    assert live_run['feature_branch']
+                    assert live_run['lifecycle_setup'] == ['worktree', 'branch']
                     exec_plan = cwd / plan_path.relative_to(repo_root)
                     _write_plan(exec_plan, _COMPLETE_PLAN)
                     _run_git_in_test(['add', str(exec_plan)], cwd=cwd)
@@ -3997,6 +4006,101 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert run_json2['feature_branch'] == original_feature_branch
             assert run_json2['worktree_path'] == original_worktree_path
 
+    def test_resume_retries_unfinished_step_instead_of_cli_start_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            base = _make_worktree_wf_config(worktree_root=str(worktree_root))
+            workflow = WorkflowConfig(
+                steps={
+                    'implement': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('p',),
+                        go=(GoTransition(to='review'),),
+                    ),
+                    'review': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('p',),
+                        go=(GoTransition(to='END'),),
+                    ),
+                },
+                first_step='implement',
+                setup=('worktree', 'branch'),
+                teardown=('merge', 'rm_worktree'),
+                main_branch='main',
+            )
+            wf_config = WorkflowUserConfig(
+                aflow=base.aflow,
+                roles=base.roles,
+                harnesses=base.harnesses,
+                workflows={'wt_wf': workflow},
+                prompts=base.prompts,
+            )
+
+            def failing_runner(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 1, 'failed', 'failed')
+
+            with pytest.raises(WorkflowError) as first_ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                        start_step='implement',
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=failing_runner,
+                )
+
+            first_run = json.loads(
+                (first_ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            resume_ctx = ResumeContext(
+                resumed_from_run_id=first_ctx.value.run_dir.name,
+                feature_branch=first_run['feature_branch'],
+                worktree_path=Path(first_run['worktree_path']),
+                main_branch='main',
+                setup=('worktree', 'branch'),
+                teardown=('merge', 'rm_worktree'),
+                interrupted_step_name='review',
+            )
+
+            with pytest.raises(WorkflowError) as resumed_ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                        start_step='implement',
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=failing_runner,
+                    resume=resume_ctx,
+                )
+
+            turn = json.loads(
+                (
+                    resumed_ctx.value.run_dir
+                    / 'turns'
+                    / 'turn-001'
+                    / 'result.json'
+                ).read_text(encoding='utf-8')
+            )
+            assert turn['step_name'] == 'review'
+
     def test_resume_restores_active_plan_from_reused_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -4074,6 +4178,561 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
             assert captured_prompt
             assert str(execution_repair) in captured_prompt[0]
+
+    def test_resumed_repair_approval_returns_next_worker_to_original_plan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_path = root / 'worktree'
+            plan_path = repo_root / 'plan.md'
+            _write_plan(
+                plan_path,
+                '# Plan\n\n'
+                '### [ ] Checkpoint 1: First\n'
+                '- [ ] step one\n\n'
+                '### [ ] Checkpoint 2: Second\n'
+                '- [ ] step two\n',
+            )
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                [
+                    'git',
+                    'worktree',
+                    'add',
+                    '-b',
+                    'resume-feature',
+                    str(worktree_path),
+                    'main',
+                ],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logical_repair = repo_root / 'plan-cp01-v01.md'
+            execution_repair = (
+                worktree_path / logical_repair.relative_to(repo_root)
+            )
+            _write_plan(
+                execution_repair,
+                '# Repair\n\n'
+                '## Required Repair Steps\n'
+                '- [x] repair step\n\n'
+                '## Done When\n'
+                '- [x] verified\n',
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    'review': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('review_prompt',),
+                        go=(
+                            GoTransition(
+                                to='implement',
+                                when='NEW_PLAN_EXISTS || !DONE',
+                            ),
+                        ),
+                    ),
+                    'implement': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('implement_prompt',),
+                        go=(GoTransition(to='END'),),
+                    ),
+                },
+                first_step='review',
+                setup=('worktree', 'branch'),
+                teardown=(),
+                main_branch='main',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='gpt-5.4'),
+                })},
+                workflows={'repair_loop': workflow},
+                prompts={
+                    'review_prompt': (
+                        'Review active {ACTIVE_PLAN_PATH}; '
+                        'write findings to {NEW_PLAN_PATH}.'
+                    ),
+                    'implement_prompt': 'Implement {ACTIVE_PLAN_PATH}.',
+                },
+            )
+            prompts: list[str] = []
+
+            def runner(argv, **kwargs):
+                prompt = ' '.join(argv)
+                prompts.append(prompt)
+                if len(prompts) == 1:
+                    execution_plan = (
+                        Path(kwargs['cwd'])
+                        / plan_path.relative_to(repo_root)
+                    )
+                    _write_plan(
+                        execution_plan,
+                        '# Plan\n\n'
+                        '### [x] Checkpoint 1: First\n'
+                        '- [x] step one\n\n'
+                        '### [ ] Checkpoint 2: Second\n'
+                        '- [ ] step two\n',
+                    )
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=2,
+                    start_step='review',
+                ),
+                wf_config,
+                'repair_loop',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='prior-run',
+                    feature_branch='resume-feature',
+                    worktree_path=worktree_path,
+                    main_branch='main',
+                    setup=('worktree', 'branch'),
+                    teardown=(),
+                    active_plan_path=logical_repair,
+                    interrupted_step_name='review',
+                ),
+            )
+
+            assert len(prompts) == 2
+            execution_plan = worktree_path / plan_path.relative_to(repo_root)
+            expected_v2 = worktree_path / 'plan-cp01-v02.md'
+            assert str(execution_repair) in prompts[0]
+            assert str(expected_v2) in prompts[0]
+            assert str(execution_plan) in prompts[1]
+            assert str(execution_repair) not in prompts[1]
+            turn_one = json.loads(
+                (
+                    result.run_dir
+                    / 'turns'
+                    / 'turn-001'
+                    / 'result.json'
+                ).read_text(encoding='utf-8')
+            )
+            assert turn_one['conditions']['NEW_PLAN_EXISTS'] is False
+            assert turn_one['new_plan_path'] == str(repo_root / 'plan-cp01-v02.md')
+
+    def test_resume_repairs_legacy_approved_overlay_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_path = root / 'worktree'
+            plan_path = repo_root / 'plan.md'
+            _write_plan(
+                plan_path,
+                '# Plan\n\n'
+                '### [x] Checkpoint 1: First\n'
+                '- [x] step one\n\n'
+                '### [ ] Checkpoint 2: Second\n'
+                '- [ ] step two\n',
+            )
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                [
+                    'git',
+                    'worktree',
+                    'add',
+                    '-b',
+                    'resume-feature',
+                    str(worktree_path),
+                    'main',
+                ],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logical_repair = repo_root / 'plan-cp01-v01.md'
+            execution_repair = (
+                worktree_path / logical_repair.relative_to(repo_root)
+            )
+            _write_plan(
+                execution_repair,
+                '# Repair\n\n'
+                '## Required Repair Steps\n'
+                '- [x] repair step\n\n'
+                '## Done When\n'
+                '- [x] verified\n',
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    'implement': WorkflowStepConfig(
+                        role='worker',
+                        prompts=('p',),
+                        go=(GoTransition(to='END'),),
+                    ),
+                },
+                first_step='implement',
+                setup=('worktree', 'branch'),
+                teardown=(),
+                main_branch='main',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={'worker': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='gpt-5.4'),
+                })},
+                workflows={'repair_loop': workflow},
+                prompts={'p': 'Implement {ACTIVE_PLAN_PATH}.'},
+            )
+            scope = ActiveImplementationScope(
+                scope_id=f'{plan_path}::checkpoint-1::first',
+                original_plan_path=str(plan_path),
+                checkpoint_index=1,
+                checkpoint_name='First',
+                opened_turn_number=1,
+                awaiting_review=False,
+            )
+            captured_prompt: list[str] = []
+
+            def runner(argv, **kwargs):
+                captured_prompt.append(' '.join(argv))
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=2,
+                    start_step='implement',
+                ),
+                wf_config,
+                'repair_loop',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='prior-run',
+                    feature_branch='resume-feature',
+                    worktree_path=worktree_path,
+                    main_branch='main',
+                    setup=('worktree', 'branch'),
+                    teardown=(),
+                    active_plan_path=logical_repair,
+                    interrupted_step_name='implement',
+                    active_implementation_scope=scope,
+                    pending_boundary_decision=PendingBoundaryDecision(
+                        finalized_turn_number=3,
+                        decision_number=9,
+                        action='continue',
+                        proposed_action='transition',
+                        proposed_transition='implement',
+                        resolved_next_step='implement',
+                        target_role='worker',
+                        target_selector='codex.default',
+                        checkpoint_identity=(
+                            f'{logical_repair}::checkpoint-complete'
+                        ),
+                        post_transition_active_plan_path=str(logical_repair),
+                        post_transition_checkpoint_identity=(
+                            f'{logical_repair}::checkpoint-complete'
+                        ),
+                        applied=True,
+                        consumed=True,
+                        scope_id=scope.scope_id,
+                        target_plan_identity=(
+                            f'{logical_repair}::checkpoint-complete'
+                        ),
+                    ),
+                ),
+            )
+
+            assert len(captured_prompt) == 1
+            execution_plan = worktree_path / plan_path.relative_to(repo_root)
+            assert str(execution_plan) in captured_prompt[0]
+            assert str(execution_repair) not in captured_prompt[0]
+            run_payload = json.loads(
+                (result.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert run_payload['active_plan_path'] == str(plan_path)
+            assert run_payload['active_implementation_scope'] is not None
+            assert run_payload['active_implementation_scope']['checkpoint_index'] == 2
+
+    def test_resume_replays_completed_reviewer_boundary_before_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_path = root / 'worktree'
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                [
+                    'git',
+                    'worktree',
+                    'add',
+                    '-b',
+                    'resume-feature',
+                    str(worktree_path),
+                    'main',
+                ],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            repair_path = repo_root / 'plan-cp01-v01.md'
+            execution_repair = (
+                worktree_path / repair_path.relative_to(repo_root)
+            )
+            _write_plan(
+                execution_repair,
+                '# Repair\n\n'
+                '### [ ] Checkpoint 1: Repair\n'
+                '- [ ] fix reviewer finding\n',
+            )
+            source_run = repo_root / '.aflow' / 'runs' / 'prior-run'
+            prior_turn = source_run / 'turns' / 'turn-001'
+            prior_turn.mkdir(parents=True)
+            (prior_turn / 'result.json').write_text(
+                json.dumps({
+                    'turn_number': 1,
+                    'status': 'completed',
+                    'step_name': 'review',
+                    'step_role': 'reviewer',
+                    'selector': 'codex.reviewer',
+                    'returncode': 0,
+                    'snapshot_before': PlanSnapshot(
+                        'Earlier', 2, 1, False, 2, 1
+                    ).to_dict(),
+                    'snapshot_after': PlanSnapshot(
+                        'Earlier', 2, 1, False, 2, 1
+                    ).to_dict(),
+                    'conditions': {
+                        'DONE': False,
+                        'NEW_PLAN_EXISTS': True,
+                        'MAX_TURNS_REACHED': False,
+                    },
+                    'chosen_transition': 'implement',
+                }),
+                encoding='utf-8',
+            )
+            (prior_turn / 'stdout.txt').write_text(
+                'Earlier checkpoint rejection.',
+                encoding='utf-8',
+            )
+            (prior_turn / 'stderr.txt').write_text('', encoding='utf-8')
+            source_turn = source_run / 'turns' / 'turn-004'
+            source_turn.mkdir(parents=True)
+            snapshot = PlanSnapshot('First', 1, 1, False, 1, 1)
+            source_result = {
+                'turn_number': 4,
+                'status': 'completed',
+                'step_name': 'review',
+                'step_role': 'reviewer',
+                'selector': 'codex.reviewer',
+                'returncode': 0,
+                'active_plan_path': str(plan_path),
+                'new_plan_path': str(repair_path),
+                'snapshot_before': snapshot.to_dict(),
+                'snapshot_after': snapshot.to_dict(),
+                'conditions': {
+                    'DONE': False,
+                    'NEW_PLAN_EXISTS': True,
+                    'MAX_TURNS_REACHED': False,
+                },
+                'chosen_transition': 'implement',
+                'chosen_transition_condition': 'NEW_PLAN_EXISTS || !DONE',
+            }
+            (source_turn / 'result.json').write_text(
+                json.dumps(source_result),
+                encoding='utf-8',
+            )
+            (source_turn / 'stdout.txt').write_text(
+                'Reviewer rejected and created a repair plan.',
+                encoding='utf-8',
+            )
+            (source_turn / 'stderr.txt').write_text('', encoding='utf-8')
+
+            workflow = WorkflowConfig(
+                steps={
+                    'review': WorkflowStepConfig(
+                        role='reviewer',
+                        prompts=('p',),
+                        go=(
+                            GoTransition(
+                                to='implement',
+                                when='NEW_PLAN_EXISTS || !DONE',
+                            ),
+                            GoTransition(to='END'),
+                        ),
+                    ),
+                    'implement': WorkflowStepConfig(
+                        role='worker',
+                        prompts=('p',),
+                        go=(GoTransition(to='END'),),
+                    ),
+                },
+                first_step='review',
+                setup=('worktree', 'branch'),
+                teardown=(),
+                main_branch='main',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'manager_lite': 'codex.manager-lite',
+                    'manager_full': 'codex.manager-full',
+                    'reviewer': 'codex.reviewer',
+                    'worker': 'codex.worker-low',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'reviewer': HarnessProfileConfig(model='reviewer'),
+                    'worker-low': HarnessProfileConfig(model='worker-low'),
+                    'worker-high': HarnessProfileConfig(model='worker-high'),
+                    'manager-lite': HarnessProfileConfig(model='manager-lite'),
+                    'manager-full': HarnessProfileConfig(model='manager-full'),
+                })},
+                teams={
+                    'default': TeamConfig(
+                        roles={
+                            'reviewer': 'codex.reviewer',
+                            'worker': 'codex.worker-low',
+                        },
+                        upgrade_to='high',
+                    ),
+                    'high': TeamConfig(roles={
+                        'reviewer': 'codex.reviewer',
+                        'worker': 'codex.worker-high',
+                    }),
+                },
+                workflows={'managed': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role='manager_lite',
+                    full_role='manager_full',
+                    full_after_stalled_turns=99,
+                ),
+            )
+            scope = ActiveImplementationScope(
+                scope_id=f'{plan_path}::checkpoint-1::first',
+                original_plan_path=str(plan_path),
+                checkpoint_index=1,
+                checkpoint_name='First',
+                opened_turn_number=3,
+                awaiting_review=True,
+            )
+            calls: list[str] = []
+            prompts: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index('--model') + 1]
+                calls.append(model)
+                prompts.append(argv[-1])
+                if model.startswith('manager-'):
+                    action = (
+                        'upgrade_next_implementation'
+                        if calls.count('manager-lite') == 1
+                        else 'continue'
+                    )
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        json.dumps({
+                            'schema_version': 1,
+                            'action': action,
+                            'reason': 'Synthetic resume boundary decision.',
+                            'next_step_notes': [],
+                            'stop_report': None,
+                        }),
+                        '',
+                    )
+                assert model == 'worker-high', calls
+                _write_plan(
+                    execution_repair,
+                    '# Repair\n\n'
+                    '### [x] Checkpoint 1: Repair\n'
+                    '- [x] fix reviewer finding\n',
+                )
+                _write_plan(
+                    worktree_path / plan_path.relative_to(repo_root),
+                    _VALID_PLAN.replace('[ ]', '[x]'),
+                )
+                return subprocess.CompletedProcess(argv, 0, 'repaired', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=1,
+                    start_step='implement',
+                    team='default',
+                ),
+                wf_config,
+                'managed',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='prior-run',
+                    feature_branch='resume-feature',
+                    worktree_path=worktree_path,
+                    main_branch='main',
+                    setup=('worktree', 'branch'),
+                    teardown=(),
+                    active_plan_path=repair_path,
+                    reviewer_rejection_count=1,
+                    implementation_attempts={
+                        scope.scope_id: (
+                            ImplementationAttempt(
+                                3,
+                                'implement',
+                                'worker',
+                                'default',
+                                'codex.worker-low',
+                                'progress',
+                            ),
+                        ),
+                    },
+                    active_implementation_scope=scope,
+                    pending_finalized_turn=PendingFinalizedTurn(
+                        source_run_dir=source_run,
+                        turn_number=4,
+                        step_name='review',
+                        step_role='reviewer',
+                        selector='codex.reviewer',
+                        active_plan_path=plan_path,
+                        new_plan_path=repair_path,
+                        snapshot_after=snapshot,
+                        conditions=source_result['conditions'],
+                        chosen_transition='implement',
+                        chosen_transition_condition=(
+                            'NEW_PLAN_EXISTS || !DONE'
+                        ),
+                    ),
+                ),
+            )
+
+            assert calls[:2] == ['manager-lite', 'worker-high']
+            assert str(execution_repair) in prompts[1]
+            boundary = json.loads(
+                (
+                    result.run_dir
+                    / 'manager'
+                    / 'decision-001'
+                    / 'boundary.json'
+                ).read_text(encoding='utf-8')
+            )
+            assert (
+                boundary['boundary']['artifact_path']
+                == 'resumed-from/prior-run/turns/turn-004'
+            )
 
     def test_preserved_active_plan_uses_worktree_execution_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5266,7 +5925,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert full_result['level'] == 'full'
             assert full_result['action'] == 'continue'
 
-    def test_reasonix_lite_manager_uses_final_output_without_full_fallback(self) -> None:
+    def test_reasonix_lite_manager_accepts_fenced_final_output_without_full_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
@@ -5307,13 +5966,18 @@ class LifecycleBootstrapTests(unittest.TestCase):
             def runner(argv, **kwargs):
                 calls.append(argv)
                 if argv[0] == "reasonix":
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({
-                        "schema_version": 1,
-                        "action": "continue",
-                        "reason": "Lite accepts the completed turn.",
-                        "next_step_notes": [],
-                        "stop_report": None,
-                    }), "")
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        "```json\n" + json.dumps({
+                            "schema_version": 1,
+                            "action": "continue",
+                            "reason": "Lite accepts the completed turn.",
+                            "next_step_notes": [],
+                            "stop_report": None,
+                        }) + "\n```\n",
+                        "",
+                    )
                 _write_plan(plan_path, _COMPLETE_PLAN)
                 return subprocess.CompletedProcess(argv, 0, "work complete", "")
 

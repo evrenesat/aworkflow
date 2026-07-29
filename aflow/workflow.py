@@ -48,6 +48,7 @@ from .plan import (
     load_plan_tolerant,
     parse_git_tracking_metadata,
     plan_has_git_tracking,
+    plan_step_checklist_is_complete,
     rewrite_git_tracking_field,
 )
 from .recovery import (
@@ -1421,7 +1422,10 @@ def _resolve_post_turn_new_plan_path(
     expected_new_plan_path: Path,
     candidates_before: set[Path],
 ) -> Path | None:
-    if expected_new_plan_path.is_file():
+    if (
+        expected_new_plan_path.is_file()
+        and expected_new_plan_path.resolve() not in candidates_before
+    ):
         return expected_new_plan_path
 
     candidates_after = _list_followup_plan_candidates(original_plan_path)
@@ -2290,7 +2294,11 @@ def run_workflow(
 
     original_plan_path = config.plan_path
     active_plan_path = original_plan_path
-    current_step_name = config.start_step or wf.first_step
+    current_step_name = (
+        resume.interrupted_step_name
+        if resume is not None and resume.interrupted_step_name is not None
+        else config.start_step or wf.first_step
+    )
     working_dir = working_dir or Path.cwd()
 
     run_paths = create_run_paths(config)
@@ -2583,6 +2591,32 @@ def run_workflow(
                         "not exist in the reused execution checkout: "
                         f"{active_execution_path}"
                     )
+                resumed_scope = state.active_implementation_scope
+                if (
+                    active_plan_path != original_plan_path
+                    and resumed_scope is not None
+                    and not resumed_scope.awaiting_review
+                    and _original_checkpoint_advanced(
+                        resumed_scope,
+                        original_snapshot,
+                    )
+                ):
+                    try:
+                        resumed_active_snapshot = load_plan_tolerant(
+                            active_execution_path
+                        ).parsed_plan.snapshot
+                    except (OSError, PlanParseError, ValueError):
+                        resumed_active_snapshot = None
+                    resumed_active_complete = (
+                        resumed_active_snapshot.is_complete
+                        if resumed_active_snapshot is not None
+                        else plan_step_checklist_is_complete(
+                            active_execution_path
+                        )
+                    )
+                    if resumed_active_complete:
+                        active_plan_path = original_plan_path
+                        _close_implementation_scope(state)
         except WorkflowError as exc:
             state.status_message = "failed"
             banner.stop(state)
@@ -2694,6 +2728,20 @@ def run_workflow(
                 active_plan_path = restored_active_plan
 
     execution_repo_root = exec_ctx.execution_repo_root if exec_ctx else config.repo_root
+    write_run_metadata(
+        run_paths,
+        config,
+        state,
+        status="running",
+        execution_context=exec_ctx,
+        last_snapshot=state.last_snapshot,
+        workflow_name=workflow_name,
+        original_plan_path=original_plan_path,
+        current_step_name=current_step_name,
+        active_plan_path=active_plan_path,
+        new_plan_path=new_plan_path,
+        resumed_from_run_id=resumed_from_run_id,
+    )
 
     def _record_issue(
         kind: str,
@@ -3799,6 +3847,7 @@ def run_workflow(
         *,
         level: str,
         boundary: FinalizedTurnBoundary,
+        context_run_dir: Path | None = None,
     ) -> tuple[ManagerDecisionV1 | None, dict[str, object], str | None]:
         """Run and durably record one manager attempt without altering turn accounting."""
         decision_number = state.manager_decision_number + 1
@@ -3828,7 +3877,7 @@ def run_workflow(
             },
         }
         context = build_manager_context(
-            run_paths.run_dir,
+            context_run_dir or run_paths.run_dir,
             level=level,  # type: ignore[arg-type]
             trigger=boundary.trigger,
             decision_number=decision_number,
@@ -3952,6 +4001,9 @@ def run_workflow(
         operational_failure: bool = False,
         backup_team: str | None = None,
         backup_selector: str | None = None,
+        context_run_dir: Path | None = None,
+        finalized_turn_number: int | None = None,
+        artifact_path: str | None = None,
     ) -> str:
         """Accept or replace the controller transition after a durable turn."""
         if not workflow_config.manager.enabled:
@@ -4017,8 +4069,17 @@ def run_workflow(
         if upgrade.available:
             eligible.add("upgrade_next_implementation")
         boundary = FinalizedTurnBoundary(
-            finalized_turn_number=state.active_turn,
-            artifact_path=f"turns/turn-{state.active_turn:03d}", trigger=trigger, terminal=False,
+            finalized_turn_number=(
+                state.active_turn
+                if finalized_turn_number is None
+                else finalized_turn_number
+            ),
+            artifact_path=(
+                f"turns/turn-{state.active_turn:03d}"
+                if artifact_path is None
+                else artifact_path
+            ),
+            trigger=trigger, terminal=False,
             proposed_action=proposed_action, proposed_transition=proposed_transition,
             current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
             actual_team=active_team, actual_selector=active_selector,
@@ -4031,7 +4092,8 @@ def run_workflow(
         )
         # Build once to select Lite or Full without exposing plan text to Lite.
         selection_context = build_manager_context(
-            run_paths.run_dir, level="lite", trigger=trigger,
+            context_run_dir or run_paths.run_dir,
+            level="lite", trigger=trigger,
             run_metadata={"team": baseline_team_name, "max_turns": config.max_turns, "turns_completed": state.turns_completed,
                           "original_plan_path": str(original_plan_path), "active_plan_path": str(active_plan_path)},
             boundary=boundary.__dict__,
@@ -4042,17 +4104,19 @@ def run_workflow(
             state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
         level = _manager_level_for_boundary(selection_context)
         decision, context, error = _run_manager_call(
-            level=level, boundary=boundary,
+            level=level, boundary=boundary, context_run_dir=context_run_dir,
         )
         if decision is None and level == "lite" and error != "manager mutated repository or plan state":
             boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_invalid", "evidence": error})
             decision, context, error = _run_manager_call(
                 level="full", boundary=boundary,
+                context_run_dir=context_run_dir,
             )
         elif decision is not None and decision.action == "escalate_to_full":
             boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_escalation", "evidence": decision.reason})
             decision, context, error = _run_manager_call(
                 level="full", boundary=boundary,
+                context_run_dir=context_run_dir,
             )
         if decision is None:
             _fail_manager_gate(
@@ -4089,7 +4153,8 @@ def run_workflow(
             except WorkflowError:
                 target_selector = None
         state.pending_boundary_decision = PendingBoundaryDecision(
-            finalized_turn_number=state.active_turn, decision_number=state.manager_decision_number,
+            finalized_turn_number=boundary.finalized_turn_number,
+            decision_number=state.manager_decision_number,
             action=decision.action, proposed_action=boundary.proposed_action,
             proposed_transition=proposed_transition, resolved_next_step=target_step,
             target_role=target_config.role if target_config is not None else None,
@@ -4177,6 +4242,127 @@ def run_workflow(
                            current_step_name=current_step_name, active_plan_path=active_plan_path,
                            new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
         return report
+
+    replayed_boundary = (
+        resume.pending_finalized_turn
+        if resume is not None
+        else None
+    )
+    if replayed_boundary is not None:
+        replayed_step = wf.steps.get(replayed_boundary.step_name)
+        if replayed_step is None or replayed_step.role != replayed_boundary.step_role:
+            raise WorkflowError(
+                "cannot resume finalized turn boundary because its workflow "
+                "step or role no longer matches configuration",
+                run_dir=run_paths.run_dir,
+            )
+        matching_transitions = [
+            transition
+            for transition in replayed_step.go
+            if (
+                transition.to == replayed_boundary.chosen_transition
+                and transition.when
+                == replayed_boundary.chosen_transition_condition
+            )
+        ]
+        if len(matching_transitions) != 1:
+            raise WorkflowError(
+                "cannot resume finalized turn boundary because its selected "
+                "transition no longer matches configuration",
+                run_dir=run_paths.run_dir,
+            )
+        if replayed_boundary.chosen_transition == "END":
+            raise WorkflowError(
+                "cannot yet resume a finalized terminal turn before its "
+                "manager boundary",
+                run_dir=run_paths.run_dir,
+            )
+
+        state.last_snapshot = replayed_boundary.snapshot_after
+        state.turns_completed = 0
+        active_plan_path = (
+            replayed_boundary.new_plan_path
+            if replayed_boundary.conditions["NEW_PLAN_EXISTS"]
+            else replayed_boundary.active_plan_path
+        )
+        new_plan_path = replayed_boundary.new_plan_path
+        scope = state.active_implementation_scope
+        source_scope = (
+            resume.active_implementation_scope
+            if resume is not None
+            else None
+        )
+        if scope is not None and source_scope is not None:
+            state.active_implementation_scope = replace(
+                scope,
+                awaiting_review=(
+                    False
+                    if replayed_boundary.step_role != "worker"
+                    else scope.awaiting_review
+                ),
+                # Evaluate the missing boundary against the source run's own
+                # scope window and carry, not the rebased new-run values.
+                opened_turn_number=source_scope.opened_turn_number,
+                carried_reviewer_rejection_count=(
+                    source_scope.carried_reviewer_rejection_count
+                ),
+            )
+        post_transition_active_path = _select_next_active_plan_path(
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            new_plan_exists=replayed_boundary.conditions["NEW_PLAN_EXISTS"],
+            selected_transition=matching_transitions[0],
+            exec_ctx=exec_ctx,
+        )
+        current_step_name = _manager_gate(
+            proposed_transition=replayed_boundary.chosen_transition,
+            current_step=replayed_boundary.step_name,
+            current_role=replayed_boundary.step_role,
+            active_team=baseline_team_name,
+            active_selector=replayed_boundary.selector,
+            post_transition_active_path=post_transition_active_path,
+            context_run_dir=replayed_boundary.source_run_dir,
+            finalized_turn_number=replayed_boundary.turn_number,
+            artifact_path=(
+                f"resumed-from/{replayed_boundary.source_run_dir.name}/"
+                f"turns/turn-{replayed_boundary.turn_number:03d}"
+            ),
+        )
+        scope = state.active_implementation_scope
+        if scope is not None:
+            state.active_implementation_scope = replace(
+                scope,
+                opened_turn_number=1,
+                carried_reviewer_rejection_count=(
+                    state.reviewer_rejection_count
+                ),
+            )
+        state.current_team_override = None
+        active_plan_path = post_transition_active_path
+        banner.set_context(
+            active_plan_path=active_plan_path,
+            new_plan_path=(
+                new_plan_path
+                if replayed_boundary.conditions["NEW_PLAN_EXISTS"]
+                else None
+            ),
+        )
+        write_run_metadata(
+            run_paths,
+            config,
+            state,
+            status="running",
+            execution_context=exec_ctx,
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
 
     for turn_number in range(1, config.max_turns + 1):
         retry_ctx = state.pending_retry
@@ -4297,9 +4483,17 @@ def run_workflow(
             done = current_plan.snapshot.is_complete
             checkpoint_index = current_plan.snapshot.current_checkpoint_index
 
-            new_plan_path = generate_new_plan_path(
+            execution_original_plan_path = _exec_plan_path(
                 original_plan_path,
+                exec_ctx,
+            )
+            execution_new_plan_path = generate_new_plan_path(
+                execution_original_plan_path,
                 checkpoint_index=checkpoint_index,
+            )
+            new_plan_path = _primary_plan_path(
+                execution_new_plan_path,
+                exec_ctx,
             )
 
             step = wf.steps[current_step_name]

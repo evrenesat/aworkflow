@@ -202,6 +202,23 @@ class FinalizedTurnBoundary:
 
 
 @dataclass(frozen=True)
+class PendingFinalizedTurn:
+    """A completed harness turn whose interstep boundary was not persisted."""
+
+    source_run_dir: Path
+    turn_number: int
+    step_name: str
+    step_role: str
+    selector: str
+    active_plan_path: Path
+    new_plan_path: Path
+    snapshot_after: PlanSnapshot
+    conditions: Mapping[str, bool]
+    chosen_transition: str
+    chosen_transition_condition: str | None = None
+
+
+@dataclass(frozen=True)
 class ResumeContext:
     resumed_from_run_id: str
     feature_branch: str
@@ -210,6 +227,7 @@ class ResumeContext:
     setup: tuple[str, ...]
     teardown: tuple[str, ...]
     active_plan_path: Path | None = None
+    interrupted_step_name: str | None = None
     manager_decision_number: int = 0
     manager_history: tuple[ManagerDecisionSummary, ...] = ()
     # Consecutive unchanged finalized turns in the latest workflow step.
@@ -221,6 +239,7 @@ class ResumeContext:
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
     last_manager_report_path: str | None = None
+    pending_finalized_turn: PendingFinalizedTurn | None = None
 
 
 @dataclass

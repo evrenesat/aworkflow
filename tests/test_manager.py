@@ -27,6 +27,7 @@ from aflow.run_state import (
     ActiveImplementationScope,
     ControllerConfig,
     ControllerState,
+    ExecutionContext,
     ImplementationAttempt,
     ManagerDecisionSummary,
     PendingManagerNotes,
@@ -96,13 +97,21 @@ def test_decision_protocol_rejects_unknown_fields_and_illegal_combinations() -> 
     "noisy",
     [
         "\x1b[2mthinking\x1b[0m\n" + _decision(),
-        "```json\n" + _decision() + "\n```",
+        "Manager decision:\n```json\n" + _decision() + "\n```",
+        "```\n" + _decision() + "\n```",
         _decision() + "\n" + _decision(),
     ],
 )
 def test_decision_protocol_rejects_transport_noise(noisy: str) -> None:
     with pytest.raises(ManagerDecisionError, match="not valid JSON|single JSON object"):
         parse_manager_decision(noisy)
+
+
+def test_decision_protocol_accepts_one_exact_json_fence() -> None:
+    decision = parse_manager_decision("```json\n" + _decision() + "\n```\n")
+
+    assert decision.action == "continue"
+    assert decision.reason == "The proposed transition has sufficient evidence."
 
 
 def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
@@ -229,6 +238,32 @@ def test_prompts_preserve_only_the_supplied_context_level() -> None:
     assert json.loads(user.removeprefix("MANAGER_CONTEXT_JSON:\n")) == context
 
 
+def test_lite_prompt_requires_eligible_upgrade_after_first_reviewer_rejection() -> None:
+    context = {
+        "level": "lite",
+        "active_plan_content": None,
+        "run_id": "run-1",
+        "controller_state": {
+            "reviewer_rejection_count": 1,
+            "eligible_actions": [
+                "continue",
+                "stop",
+                "upgrade_next_implementation",
+            ],
+            "eligible_upgrade": {
+                "available": True,
+                "source_team": "ds4_pro",
+                "target_team": "terra_xhigh",
+            },
+        },
+    }
+
+    system, _ = build_manager_prompts(context)
+
+    assert "Choose upgrade_next_implementation now" in system
+    assert "or escalate to Full before applying this upgrade" in system
+
+
 def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     paths = create_run_paths(ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"))
     artifact = write_manager_artifacts(
@@ -284,6 +319,39 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
     assert run_json["last_manager_report_path"] == "manager-report.md"
     assert run_json["manager_history"][0]["artifact_path"] == "manager/decision-001"
+
+
+def test_manager_style_metadata_write_preserves_worktree_lifecycle(tmp_path: Path) -> None:
+    config = ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md")
+    paths = create_run_paths(config)
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    worktree = tmp_path / "worktrees" / "feature"
+    execution_context = ExecutionContext(
+        primary_repo_root=tmp_path,
+        execution_repo_root=worktree,
+        main_branch="main",
+        feature_branch="feature/test",
+        worktree_path=worktree,
+        setup=("worktree", "branch"),
+        teardown=("merge", "rm_worktree"),
+    )
+    write_run_metadata(
+        paths,
+        config,
+        state,
+        status="running",
+        execution_context=execution_context,
+    )
+
+    write_run_metadata(paths, config, state, status="running")
+
+    run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert run_json["execution_repo_root"] == str(worktree)
+    assert run_json["feature_branch"] == "feature/test"
+    assert run_json["main_branch"] == "main"
+    assert run_json["worktree_path"] == str(worktree)
+    assert run_json["lifecycle_setup"] == ["worktree", "branch"]
+    assert run_json["lifecycle_teardown"] == ["merge", "rm_worktree"]
 
 
 def test_resume_attempt_history_is_tolerant_and_live_conversion_is_mutable() -> None:

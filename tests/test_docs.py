@@ -83,6 +83,19 @@ class SkillDocsTests(unittest.TestCase):
         # The selection rule about searching plans/in-progress/ must be present
         assert 'plans/in-progress/' in text
 
+    def test_plan_skill_requires_compact_checkpoint_sizing_gate(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-plan' / 'SKILL.md').read_text(encoding='utf-8')
+        section = text.split('## Checkpoint Sizing Gate', 1)[1].split('\n## ', 1)[0]
+
+        assert len(section.splitlines()) <= 8
+        assert 'at most two tightly coupled production layers' in section
+        assert '25 changed files or 3,000 changed lines' in section
+        assert 'including tests and generated artifacts' in section
+        assert 'explicit user approval' in section
+        assert 'AFLOW_STOP' in section
+        assert 'Projected or actual scope exceeds the checkpoint budget' in text
+
     def test_bundled_config_review_implement_review_max_turns_transitions(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         config = load_workflow_config(repo_root / 'aflow' / 'aflow.toml')

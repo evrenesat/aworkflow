@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from .analyzer import analyze_progress_tail, extract_text_signals, snapshot_signature
 from .plan import PlanParseError, load_plan_tolerant
@@ -249,6 +249,26 @@ def analyze_manager_progress(
         reviewer_rejection_count=reviewer_rejection_count,
         reviewer_non_convergence=reviewer_rejection_count >= 2,
     )
+
+
+def scoped_reviewer_rejection_count(
+    run_dir: Path,
+    scope: Mapping[str, Any],
+) -> int | None:
+    """Recompute one active scope's rejection count from durable turn artifacts."""
+    opened_turn_number = scope.get("opened_turn_number")
+    if not isinstance(opened_turn_number, int):
+        return None
+    scoped_turns = [
+        turn
+        for turn in _load_turns(Path(run_dir))
+        if int(turn.get("turn_number", 0) or 0) >= opened_turn_number
+    ]
+    progress = analyze_manager_progress(scoped_turns)
+    carried_rejections = int(
+        scope.get("carried_reviewer_rejection_count", 0) or 0
+    )
+    return carried_rejections + progress.reviewer_rejection_count
 
 
 def _duration_seconds(turn: dict[str, Any]) -> float | None:

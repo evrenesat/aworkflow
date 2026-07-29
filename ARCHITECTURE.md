@@ -58,6 +58,23 @@ Every manager prompt names the configured manager skill and embeds the complete
 closed JSON protocol, including the structured stop-report shape. Invalid
 manager output at a terminal incident cannot replace the original controller
 failure as the report's primary cause.
+Manager/status metadata updates preserve the existing lifecycle identity when
+they do not carry an execution context, preventing worktree resume fields from
+being erased at a later boundary.
+Resume detects an unfinished durable turn from its `starting` result artifact
+and retries that workflow step instead of resetting to the original CLI start
+step.
+Resume also detects a finalized active turn that is newer than the boundary in
+`run.json`. It carries that immutable turn into the new controller, rebuilds
+the active repair-plan transition, and executes the missing manager gate
+against the source run before starting another harness.
+Follow-up plan version discovery runs in the execution checkout. An already
+active repair overlay is not reported as newly created, so approval returns the
+next checkpoint worker to the original plan while a newly written next-version
+overlay remains routable.
+Resume also normalizes legacy durable state that captured a completed
+checkpoint or checklist-style repair overlay after its original checkpoint
+advanced, closing that stale scope before the next worker starts.
 
 Manager transport may select an adapter-native final-response argv without
 changing ordinary workflow invocations. Progress analysis keeps whole-run
@@ -65,6 +82,8 @@ checkpoint stability separate from scope-aware same-step stalls and reviewer
 rejections. Active-scope boundaries persist their opening turn so runtime and
 historical analysis use the same controller window. Successful turn artifacts,
 in-memory records, and finish events share one finish timestamp and duration.
+The decision parser normalizes one exact `json`-tagged Markdown fence around a
+single object, while continuing to reject all other transport prose/noise.
 Boundary schema versioning preserves the legacy shape for old artifacts while
 new boundaries snapshot structured plan state. Resume rebases run-local scope
 turn numbering and carries prior rejection progress explicitly. Legacy scopes
@@ -75,6 +94,9 @@ than the mutable active repair-plan identity. Attempts retain their actual team
 and selector; each rejection can expose one further configured edge. Approval
 closes the scope before the next checkpoint and clears scoped pending actions
 without deleting historical attempt evidence.
+Lite policy selects the first available upgrade edge immediately after the
+scope's first reviewer rejection, so a second rejection is evaluated by Full
+only after the stronger worker has received one attempt.
 
 ## Module Breakdown
 
@@ -175,7 +197,7 @@ The core engine. `run_workflow()` executes the turn loop:
 
    Harness error recovery is inserted after the harness returns and before normal transition handling. If the turn made no plan progress and a configured error-handling rule matches the harness output, the engine produces that cheap deterministic action for manager acceptance. Rules can keep the same team, switch to a configured `backup_team`, or fail immediately. An unmatched ambiguous error goes directly to Full supervision when enabled; manager-disabled runs retain the team-lead recovery handoff. Progress-gated turns skip recovery entirely and continue on the normal transition path.
 5. After normal workflow completion, if `teardown` includes `merge`, execute the merge handoff: resolve `[aflow].team_lead` through the effective team, build a merge prompt (built-in `aflow-merge` instruction plus rendered `merge_prompt` entries), and run the `team_lead` agent from the primary checkout. After the agent returns, verify: no unmerged index entries, clean working tree, HEAD on `main_branch`, and feature branch is an ancestor of the target. Only after all checks pass does `rm_worktree` (if configured) remove the linked worktree. Any verification failure leaves the feature branch and worktree intact and fails the run with the specific failed check.
-6. If the workflow uses the worktree+branch lifecycle, `aflow` can resume an unfinished prior run. Resume candidate lookup resolves the previous run id through the current shell's `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID` supplied an explicit run id. A run is resumable only when `run.json` shows a worktree lifecycle with recorded feature branch and worktree path, status `failed` or `running`, `last_snapshot.is_complete != true`, no `merge_status`, and the resolved invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup. Plain `aflow run` treats that as an optional interactive prompt in TTY mode and otherwise falls back to the fresh-run path. `aflow run --resume` makes resume mandatory: with no run id it must resolve a prior run from that lookup order or fail; with a run id it must use that run or fail. Accepted resume builds a `ResumeContext` from the recorded branch, worktree, and active logical plan path, validates that worktree and active execution path before prompting, and starts `run_workflow()` directly in the reused execution context instead of provisioning a fresh one. The plan file on disk still remains the durable checkpoint state.
+6. If the workflow uses the worktree+branch lifecycle, `aflow` can resume an unfinished prior run. Resume candidate lookup resolves the previous run id through the current shell's `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID` supplied an explicit run id. A run is resumable only when `run.json` shows a worktree lifecycle with recorded feature branch and worktree path, status `failed` or `running`, `last_snapshot.is_complete != true`, no `merge_status`, and the resolved invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup. Plain `aflow run` treats that as an optional interactive prompt in TTY mode and otherwise falls back to the fresh-run path. `aflow run --resume` makes resume mandatory: with no run id it must resolve a prior run from that lookup order or fail; with a run id it must use that run or fail. Accepted resume builds a `ResumeContext` from the recorded branch, worktree, and active logical plan path, validates that worktree and active execution path before prompting, and starts `run_workflow()` directly in the reused execution context instead of provisioning a fresh one. The plan file on disk still remains the durable checkpoint state. Resume recomputes the active scope's rejection count from durable review artifacts so corrected classifiers repair older metadata. If a completed active turn is newer than `run.json.turns_completed`, its finalized result becomes a pending replay boundary: the new run uses the source artifacts for one manager decision before routing another harness. An explicit `--resume RUN_ID --resume-reset-scope` owner-repartition boundary preserves lifecycle identity and manager history while omitting the saved active overlay and clearing the live scope/attempt index; the linked source run retains the immutable attempt audit.
 
 A scheduled retry skips the pre-turn plan reload and reuses the last valid snapshot and saved prompt context. The same `ACTIVE_PLAN_PATH`, `NEW_PLAN_PATH`, and resolved step selector are reused; the retry appendix (containing the exact parse error) is added to the prompt. Startup recovery seeds that same retry machinery by passing a `RetryContext` into `run_workflow()`, which stores the step name, role, resolved selector, and prompt context in `state.pending_retry` before turn 1. Retry turns still count toward `max_turns`.
 

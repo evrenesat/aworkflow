@@ -44,6 +44,8 @@ Important flags:
 - `--team` / `-t` selects a team and overrides any team set in the workflow config.
 - `--max-turns` / `-mt` overrides `[aflow].max_turns` for that invocation.
 - `--resume [RUN_ID]` forces resume mode.
+- `--resume-reset-scope` requires an explicit `--resume RUN_ID` and starts the
+  reused worktree from a fresh checkpoint scope on the invocation's plan.
 - `--start-step` / `-ss` starts from a workflow step name or 1-based step index.
 
 When two bare positional arguments are given, `aflow` resolves them by checking which token is an existing plan file and which token is a configured workflow name. If both tokens could match both categories, or neither can be resolved safely, the command exits with a clear ambiguity error. A single bare positional is always treated as the plan path for backward compatibility.
@@ -88,6 +90,19 @@ A prior run is resumable only when all of these are true:
 - the invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup
 
 If resume is accepted, `aflow` reuses the recorded feature branch and worktree path. The plan file on disk remains the source of truth for checkpoint progress.
+If the source run has a durable `starting` turn, resume retries that unfinished
+workflow step rather than returning to the invocation's original
+`--start-step`.
+
+After an owner intentionally repartitions or replaces the active checkpoint,
+use `--resume RUN_ID --resume-reset-scope`. This keeps the source run's
+worktree, branch, lifecycle commands, and manager decision history, while the
+source run retains its historical implementation-attempt audit. The new run
+returns to the invocation's original plan and clears its live attempt index,
+interrupted-step pointer, active implementation scope, scoped stall/rejection
+counters, pending notes/upgrades/boundary decisions, and stale manager-report
+pointer. The explicit run id prevents an accidental reset of an implicitly
+selected run.
 
 ## Analyze
 

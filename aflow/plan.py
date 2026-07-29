@@ -106,6 +106,39 @@ def plan_has_git_tracking(text: str) -> bool:
     return False
 
 
+def plan_step_checklist_is_complete(path: Path) -> bool:
+    """Return whether a non-checkpoint plan has only checked live step items."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    states: list[str] = []
+    in_fence = False
+    fence_char: str | None = None
+    fence_len = 0
+    for line in text.splitlines():
+        fence_match = FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
+                in_fence = False
+                fence_char = None
+                fence_len = 0
+            continue
+        if in_fence:
+            continue
+        step_match = STEP_RE.match(line)
+        if step_match:
+            states.append(step_match.group(1))
+
+    return bool(states) and all(state.casefold() == "x" for state in states)
+
+
 def _live_git_tracking_heading_line_numbers(text: str) -> tuple[int, ...]:
     line_numbers: list[int] = []
     in_fence = False

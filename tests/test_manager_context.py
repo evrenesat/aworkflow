@@ -5,7 +5,12 @@ from pathlib import Path
 
 from aflow.analyzer import extract_aflow_stop
 from aflow.api import AnalyzeRequest, analyze_runs
-from aflow.manager_context import DIAGNOSTIC_LIMIT, build_manager_context, extract_semantic_result
+from aflow.manager_context import (
+    DIAGNOSTIC_LIMIT,
+    build_manager_context,
+    extract_semantic_result,
+    scoped_reviewer_rejection_count,
+)
 from aflow.stop_marker import detect_stop_marker
 
 
@@ -137,6 +142,43 @@ def test_progress_detects_alternating_reviewer_non_convergence(tmp_path: Path) -
 
     in_memory = build_manager_context(run_dir, turns=[json.loads((run_dir / "turns" / "turn-004" / "result.json").read_text(encoding="utf-8")) | {"_turn_dir": run_dir / "turns" / "turn-004"}], run_metadata={"plan_path": str(run_dir.parent.parent.parent / "plans" / "in-progress" / "plan.md")})
     assert in_memory["finished_turn"]["turn_number"] == 4
+
+
+def test_followup_plan_reopening_checkpoint_counts_as_rejection(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    before = _snapshot()
+    before["current_checkpoint_index"] = 2
+    before["current_checkpoint_name"] = "Checkpoint 2: Next"
+    after = _snapshot()
+    _write_turn(
+        run_dir,
+        1,
+        step="review",
+        role="reviewer",
+        stdout="rejected with a focused repair plan",
+        before=before,
+        after=after,
+    )
+    result_path = run_dir / "turns" / "turn-001" / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["conditions"] = {"NEW_PLAN_EXISTS": True}
+    _write_json(result_path, result)
+    scope = {
+        "scope_id": "plan.md::checkpoint-1::context",
+        "opened_turn_number": 1,
+        "carried_reviewer_rejection_count": 0,
+    }
+
+    context = build_manager_context(
+        run_dir,
+        boundary={
+            "context_schema_version": 2,
+            "active_implementation_scope": scope,
+        },
+    )
+
+    assert context["controller_state"]["reviewer_rejection_count"] == 1
+    assert scoped_reviewer_rejection_count(run_dir, scope) == 1
 
 
 def test_progress_detects_long_unchanged_tail(tmp_path: Path) -> None:

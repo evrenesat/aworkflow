@@ -490,15 +490,19 @@ def write_run_metadata(
     issues_summary_path: str | None = None,
     resumed_from_run_id: str | None = None,
 ) -> None:
+    previous: Mapping[str, object] = {}
+    if paths.run_json.is_file():
+        try:
+            loaded = json.loads(paths.run_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, Mapping):
+            previous = loaded
     # A terminal manager report is the authoritative failure summary.  Some
     # callers add merge/recovery metadata in a later write without repeating
     # that summary; retain it rather than replacing it with an empty field.
-    if failure_reason is None and status == "failed" and paths.run_json.is_file():
-        try:
-            previous = json.loads(paths.run_json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            previous = {}
-        previous_reason = previous.get("failure_reason") if isinstance(previous, Mapping) else None
+    if failure_reason is None and status == "failed":
+        previous_reason = previous.get("failure_reason")
         if isinstance(previous_reason, str) and previous_reason.startswith("# AFlow manager report"):
             failure_reason = previous_reason
     payload: dict[str, object] = {
@@ -520,6 +524,21 @@ def write_run_metadata(
         payload["lifecycle_teardown"] = list(execution_context.teardown)
         if execution_context.worktree_path is not None:
             payload["worktree_path"] = str(execution_context.worktree_path)
+    else:
+        # Manager and status boundaries often update run metadata without
+        # carrying the execution context again. Lifecycle identity is durable
+        # resume state, so omission must not erase an already-recorded worktree
+        # or branch.
+        for key in (
+            "execution_repo_root",
+            "feature_branch",
+            "main_branch",
+            "lifecycle_setup",
+            "lifecycle_teardown",
+            "worktree_path",
+        ):
+            if key in previous:
+                payload[key] = previous[key]
     if workflow_name is not None:
         payload["workflow_name"] = workflow_name
     if current_step_name is not None:

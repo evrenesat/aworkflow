@@ -55,5 +55,9 @@ Allowed actions are `continue`, `retry_current_step`,
   the worker attempt the reviewer just assessed. After another rejection, use
   the newly exposed edge only when the scope history and eligible action support
   it. Reviewers and managers remain on baseline routing.
+- On the first reviewer rejection in an active implementation scope, when the
+  controller exposes `upgrade_next_implementation`, choose that upgrade at Lite
+  level. Do not spend another attempt on the same worker and do not escalate to
+  Full before applying the eligible one-edge upgrade.
 - Checkpoint approval closes the implementation scope. Do not use attempts from
   a closed scope to justify upgrading the next checkpoint's initial worker.

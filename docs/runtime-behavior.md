@@ -131,10 +131,20 @@ followed by an invalid manager response, the deterministic report retains the
 workflow incident as its summary and records the manager protocol error
 separately instead of masking the original failure.
 
+At the first reviewer rejection in an open implementation scope, Lite is
+instructed to select the available one-edge worker upgrade before spending
+another attempt on the same worker or escalating to Full. If that upgraded
+attempt is also rejected, the second rejection selects Full with the next
+configured upgrade edge, if any, exposed in context.
+
 Reasonix manager invocations request its native final-response mode with
 `--print`, so strict manager JSON is not mixed with progress and metrics output.
 Ordinary Reasonix worker and reviewer turns omit `--print` and retain their
-diagnostic transcripts. The JSON parser itself remains strict.
+diagnostic transcripts. The manager parser accepts either the bare JSON object
+or one exact `json`-tagged Markdown fence containing that object because some
+affordable models fence an otherwise valid final response. Prose, untagged or
+multiple fences, multiple objects, malformed JSON, and protocol-invalid objects
+remain errors.
 
 `continue` with notes stores immutable notes for the selected next step. They
 are injected once and cleared only when that step durably starts. A manager
@@ -155,7 +165,10 @@ the next checkpoint opens a new scope and begins with the baseline worker.
 Rejection counters are computed only from turns at or after that scope's durable
 opening turn, so prior-checkpoint repairs cannot stop a new checkpoint before
 its first review. A rejected review is counted from its own unchanged finalized
-outcome, so the second rejection selects Full before another worker starts.
+outcome or from its creation of a new focused follow-up plan. The latter also
+counts when the reviewer reopens the original checkpoint, so the first
+rejection exposes the required Lite worker upgrade and the second rejection
+selects Full before another worker starts.
 When a run resumes into a fresh run directory, the scope opening turn is rebased
 to the new run and its prior rejection count is carried separately. Legacy
 scopes written before that carried counter existed discard the old top-level
@@ -239,6 +252,38 @@ and the latest report path; raw traces are referenced by stable run-relative
 paths and byte sizes rather than copied into manager prompts. On failure the
 CLI prints the same self-contained report that is persisted, including evidence,
 attempts, plan/workspace state, and suggested next actions.
+
+Lifecycle identity in `run.json` is durable across manager and status metadata
+writes. A boundary that does not repeat the execution context preserves the
+recorded worktree path, feature branch, main branch, setup, and teardown so an
+interrupted managed run remains resumable.
+When the source run has an active turn whose result is still `starting`, the
+resume context restores that exact step. The original CLI start step remains
+invocation metadata and is not used to skip an interrupted review or worker.
+If the active turn is already finalized but `run.json` still points at the
+previous manager boundary, resume restores that turn's snapshot, new repair
+plan, and selected transition. It runs the missing manager boundary against
+the source-run artifacts before launching any new harness turn, so a first
+rejection still upgrades the repair worker and cannot skip to the next
+checkpoint.
+For worktree runs, follow-up plan version selection and post-turn creation
+detection use the execution checkout. A repair plan that existed before the
+review is not treated as a new review result: approval restores the original
+plan for the next checkpoint, while a newly created higher-version repair plan
+becomes active.
+Resume repairs older affected run state when the original checkpoint has
+advanced, the saved checkpoint or checklist-style repair overlay is complete,
+and the scope is no longer awaiting review. The stale scope and one-hop routing
+state are cleared before the next worker invocation.
+For an owner-authorized checkpoint repartition, CLI
+`--resume RUN_ID --resume-reset-scope` preserves the reused worktree and
+historical manager/attempt audit trail while explicitly discarding the saved
+repair overlay, interrupted step, active implementation scope, scoped counters,
+live attempt index, pending one-hop actions, and prior terminal report pointer.
+The source run remains the immutable attempt audit record. The next worker
+therefore opens a new scope from the invocation's original plan and baseline
+team.
+
 - stdout and stderr
 - plan snapshots before and after each step
 - evaluated conditions and chosen transitions

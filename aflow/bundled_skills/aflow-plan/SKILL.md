@@ -29,6 +29,13 @@ Use this skill only for aflow-style planning. It is designed to be installed as 
 
 The plan must be decision complete. The implementer should not need to choose behavior, precedence, fallback, validation policy, or verification strategy on their own.
 
+## Checkpoint Sizing Gate
+
+- Size checkpoints by reviewable change surface, not feature theme, bullet count, or total checkpoint count.
+- Keep each checkpoint to at most two tightly coupled production layers; split independently reviewable persistence/migrations, domain logic, HTTP/API contracts, frontend/UI, and build/deployment work.
+- Treat 25 changed files or 3,000 changed lines, including tests and generated artifacts, as a hard ceiling rather than a target. Split earlier when the scope is uncertain.
+- Exceed a ceiling only with explicit user approval recorded in the checkpoint. Otherwise require `AFLOW_STOP` and repartition before implementation or further repair.
+
 ## Commit Ownership Rule
 
 Checkpoint plans must separate implementation handoff state from review acceptance boundaries.
@@ -120,6 +127,7 @@ Use this checkpoint skeleton:
 - May create/modify: [files]
 - Must not touch: [files/systems, including `plans/**` except read-only access to the assigned plan file and the minimal progress-tracking edits performed by the consuming execution or review workflow]
 - Constraints: [anti-shortcuts + preserved behavior]
+- Budget: [at most two tightly coupled production layers; hard ceiling of 25 changed files and 3,000 changed lines unless the user explicitly approves an exception]
 - Dirty-worktree contract: before handoff, `git diff --name-only` may list only files in `May create/modify` plus allowed plan progress edits; unrelated dirty files require `AFLOW_STOP`.
 
 **Steps:**
@@ -157,6 +165,7 @@ Use this checkpoint skeleton:
 **Stop and Escalate If:**
 
 - <explicit failure mode — when this condition is irrecoverable, emit `AFLOW_STOP: <reason>` on its own line so the workflow engine fails immediately instead of looping>
+- Projected or actual scope exceeds the checkpoint budget without an explicit user-approved exception; emit `AFLOW_STOP` and repartition before continuing.
 - `git status --short` or `git diff --name-only` shows files outside the checkpoint scope or user-owned dirty changes not caused by this checkpoint.
 ```
 

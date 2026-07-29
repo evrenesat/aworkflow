@@ -232,6 +232,35 @@ class WorkflowCliTests(unittest.TestCase):
         args = build_parser().parse_args(['run', '-ss', 'implement_plan', 'plan.md'])
         assert args.start_step == 'implement_plan'
 
+    def test_run_parser_accepts_resume_reset_scope(self) -> None:
+        args = build_parser().parse_args([
+            'run',
+            '--resume',
+            '20260101T000000Z-abc123',
+            '--resume-reset-scope',
+            'plan.md',
+        ])
+        assert args.resume == '20260101T000000Z-abc123'
+        assert args.resume_reset_scope is True
+
+    def test_resume_reset_scope_requires_explicit_run_id(self) -> None:
+        stderr = io.StringIO()
+        with patch(
+            'aflow.cli._bootstrap_config_files',
+            side_effect=AssertionError('validation should run before bootstrap'),
+        ), redirect_stderr(stderr):
+            result = main([
+                'run',
+                '--resume-reset-scope',
+                'plan.md',
+            ])
+
+        assert result == 1
+        assert (
+            '--resume-reset-scope requires an explicit --resume RUN_ID'
+            in stderr.getvalue()
+        )
+
     def test_show_parser_accepts_optional_workflow_name(self) -> None:
         args = build_parser().parse_args(['show', 'alpha'])
         assert args.command == 'show'
@@ -1760,6 +1789,384 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert result.feature_branch == "feature/test-branch"
         assert result.worktree_path == Path("/fake/repo/.git/worktrees/test")
         assert result.active_plan_path == Path("/fake/plan-cp01-v01.md")
+
+    def test_resume_restores_step_from_unfinished_active_turn(self) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            run_dir = repo_root / ".aflow" / "runs" / "20260101T000000Z-abc123"
+            turn_dir = run_dir / "turns" / "turn-006"
+            turn_dir.mkdir(parents=True)
+            (turn_dir / "result.json").write_text(
+                json.dumps({
+                    "status": "starting",
+                    "step_name": "review_cp_implementation",
+                }),
+                encoding="utf-8",
+            )
+            prev_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": "ds4_pro",
+                "selected_start_step": "implement_plan",
+                "max_turns": 60,
+                "extra_instructions": [],
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": ["merge", "rm_worktree"],
+                "feature_branch": "feature/test-branch",
+                "worktree_path": str(repo_root / "worktree"),
+                "main_branch": "main",
+                "status": "running",
+                "active_turn": 6,
+                "current_step_name": "review_cp_implementation",
+                "last_snapshot": {"is_complete": False},
+            }
+
+            with patch(
+                "aflow.cli.resolve_run_id",
+                return_value=(run_dir, "explicit_run_id"),
+            ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                result = cli_module._detect_resume_candidate(
+                    repo_root=repo_root,
+                    workflow_config=type(
+                        "obj",
+                        (object,),
+                        {"setup": ("worktree", "branch")},
+                    )(),
+                    workflow_name="test_workflow",
+                    plan_path=plan_path,
+                    team="ds4_pro",
+                    selected_start_step="implement_plan",
+                    max_turns=60,
+                    extra_instructions=(),
+                    requested_run_id=run_dir.name,
+                    require_resume=True,
+                )
+
+        assert result is not None
+        assert result.interrupted_step_name == "review_cp_implementation"
+
+    def test_resume_reset_scope_preserves_history_and_lifecycle_only(self) -> None:
+        import aflow.cli as cli_module
+
+        repo_root = Path("/fake/repo").resolve()
+        plan_path = Path("/fake/plan.md").resolve()
+        previous_attempt = {
+            "turn_number": 25,
+            "step_name": "implement_plan",
+            "role": "worker",
+            "team": "terra_xhigh",
+            "selector": "codex.terraxhigh",
+            "outcome": "review_rejected",
+            "manager_decision_number": 37,
+        }
+        prev_run = {
+            "repo_root": str(repo_root),
+            "workflow_name": "test_workflow",
+            "plan_path": str(plan_path),
+            "team": "ds4_pro",
+            "selected_start_step": "implement_plan",
+            "max_turns": 60,
+            "extra_instructions": [],
+            "lifecycle_setup": ["worktree", "branch"],
+            "lifecycle_teardown": ["merge", "rm_worktree"],
+            "feature_branch": "feature/test-branch",
+            "worktree_path": str(repo_root / "worktree"),
+            "main_branch": "main",
+            "active_plan_path": str(Path("/fake/plan-cp09-v02.md")),
+            "status": "failed",
+            "last_snapshot": {"is_complete": False},
+            "manager_decision_number": 38,
+            "manager_history": [{
+                "decision_number": 38,
+                "level": "full",
+                "trigger": "reviewer_rejection",
+                "action": "stop",
+                "reason": "Owner repartition is required.",
+                "artifact_path": "manager/decision-038",
+            }],
+            "semantic_stall_count": 3,
+            "reviewer_rejection_count": 3,
+            "implementation_attempts": {"old-scope": [previous_attempt]},
+            "active_implementation_scope": {
+                "scope_id": "old-scope",
+                "original_plan_path": str(plan_path),
+                "checkpoint_index": 9,
+                "checkpoint_name": "Oversized checkpoint",
+                "opened_turn_number": 1,
+                "awaiting_review": True,
+                "carried_reviewer_rejection_count": 3,
+            },
+            "pending_manager_notes": {
+                "target_step": "implement_plan",
+                "notes": ["Split the checkpoint."],
+                "decision_number": 38,
+            },
+            "pending_step_team_override": {
+                "target_step": "implement_plan",
+                "role": "worker",
+                "source_team": "terra_xhigh",
+                "target_team": "sol_medium",
+                "selector": "codex.sol56medium",
+                "decision_number": 38,
+            },
+            "pending_boundary_decision": {
+                "finalized_turn_number": 28,
+                "decision_number": 38,
+                "action": "stop",
+                "proposed_action": "implement_plan",
+            },
+            "last_manager_report_path": "manager-report.md",
+        }
+
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path("20260101T000000Z-abc123"), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            result = cli_module._detect_resume_candidate(
+                repo_root=repo_root,
+                workflow_config=type(
+                    "obj",
+                    (object,),
+                    {"setup": ("worktree", "branch")},
+                )(),
+                workflow_name="test_workflow",
+                plan_path=plan_path,
+                team="ds4_pro",
+                selected_start_step="implement_plan",
+                max_turns=60,
+                extra_instructions=(),
+                requested_run_id="20260101T000000Z-abc123",
+                require_resume=True,
+                reset_scope=True,
+            )
+
+        assert result is not None
+        assert result.feature_branch == "feature/test-branch"
+        assert result.worktree_path == repo_root / "worktree"
+        assert result.setup == ("worktree", "branch")
+        assert result.teardown == ("merge", "rm_worktree")
+        assert result.manager_decision_number == 38
+        assert len(result.manager_history) == 1
+        assert result.implementation_attempts == {}
+        assert result.active_plan_path is None
+        assert result.interrupted_step_name is None
+        assert result.semantic_stall_count == 0
+        assert result.reviewer_rejection_count == 0
+        assert result.active_implementation_scope is None
+        assert result.pending_manager_notes is None
+        assert result.pending_step_team_override is None
+        assert result.pending_boundary_decision is None
+        assert result.last_manager_report_path is None
+
+    def test_resume_recomputes_active_scope_rejections_from_turn_artifacts(self) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            run_dir = repo_root / ".aflow" / "runs" / "20260101T000000Z-abc123"
+            turn_dir = run_dir / "turns" / "turn-002"
+            turn_dir.mkdir(parents=True)
+            snapshot_before = {
+                "current_checkpoint_index": 2,
+                "current_checkpoint_name": "Checkpoint 2: Next",
+                "current_checkpoint_unchecked_step_count": 4,
+                "is_complete": False,
+                "total_checkpoint_count": 2,
+                "unchecked_checkpoint_count": 1,
+            }
+            snapshot_after = {
+                "current_checkpoint_index": 1,
+                "current_checkpoint_name": "Checkpoint 1: Reopened",
+                "current_checkpoint_unchecked_step_count": 3,
+                "is_complete": False,
+                "total_checkpoint_count": 2,
+                "unchecked_checkpoint_count": 2,
+            }
+            (turn_dir / "result.json").write_text(json.dumps({
+                "turn_number": 2,
+                "status": "completed",
+                "step_name": "review_cp_implementation",
+                "step_role": "reviewer",
+                "snapshot_before": snapshot_before,
+                "snapshot_after": snapshot_after,
+                "conditions": {"NEW_PLAN_EXISTS": True},
+            }), encoding="utf-8")
+            (turn_dir / "stdout.txt").write_text("rejected", encoding="utf-8")
+            (turn_dir / "stderr.txt").write_text("", encoding="utf-8")
+            prev_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": "ds4_pro",
+                "selected_start_step": "implement_plan",
+                "max_turns": 60,
+                "extra_instructions": [],
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": ["merge", "rm_worktree"],
+                "feature_branch": "feature/test-branch",
+                "worktree_path": str(repo_root / "worktree"),
+                "main_branch": "main",
+                "status": "failed",
+                "last_snapshot": {"is_complete": False},
+                "reviewer_rejection_count": 0,
+                "active_implementation_scope": {
+                    "scope_id": "scope-1",
+                    "original_plan_path": str(plan_path),
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "Checkpoint 1: Reopened",
+                    "opened_turn_number": 1,
+                    "awaiting_review": False,
+                    "carried_reviewer_rejection_count": 0,
+                },
+            }
+
+            with patch(
+                "aflow.cli.resolve_run_id",
+                return_value=(run_dir, "explicit_run_id"),
+            ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                result = cli_module._detect_resume_candidate(
+                    repo_root=repo_root,
+                    workflow_config=type(
+                        "obj",
+                        (object,),
+                        {"setup": ("worktree", "branch")},
+                    )(),
+                    workflow_name="test_workflow",
+                    plan_path=plan_path,
+                    team="ds4_pro",
+                    selected_start_step="implement_plan",
+                    max_turns=60,
+                    extra_instructions=(),
+                    requested_run_id=run_dir.name,
+                    require_resume=True,
+                )
+
+        assert result is not None
+        assert result.reviewer_rejection_count == 1
+
+    def test_resume_recovers_completed_turn_before_manager_boundary(self) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            repair_path = repo_root / "plan-cp02-v01.md"
+            run_dir = (
+                repo_root
+                / ".aflow"
+                / "runs"
+                / "20260101T000000Z-abc123"
+            )
+            turn_dir = run_dir / "turns" / "turn-002"
+            turn_dir.mkdir(parents=True)
+            snapshot = {
+                "current_checkpoint_index": 2,
+                "current_checkpoint_name": "Checkpoint 2: Next",
+                "current_checkpoint_unchecked_step_count": 4,
+                "is_complete": False,
+                "total_checkpoint_count": 2,
+                "unchecked_checkpoint_count": 1,
+            }
+            (turn_dir / "result.json").write_text(
+                json.dumps({
+                    "turn_number": 2,
+                    "status": "completed",
+                    "step_name": "review_cp_implementation",
+                    "step_role": "reviewer",
+                    "selector": "codex.reviewer",
+                    "returncode": 0,
+                    "active_plan_path": str(plan_path),
+                    "new_plan_path": str(repair_path),
+                    "snapshot_before": snapshot,
+                    "snapshot_after": snapshot,
+                    "conditions": {
+                        "DONE": False,
+                        "NEW_PLAN_EXISTS": True,
+                        "MAX_TURNS_REACHED": False,
+                    },
+                    "chosen_transition": "implement_plan",
+                    "chosen_transition_condition": "NEW_PLAN_EXISTS || !DONE",
+                }),
+                encoding="utf-8",
+            )
+            (turn_dir / "stdout.txt").write_text("rejected", encoding="utf-8")
+            (turn_dir / "stderr.txt").write_text("", encoding="utf-8")
+            prev_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": "ds4_pro",
+                "selected_start_step": "implement_plan",
+                "max_turns": 60,
+                "extra_instructions": [],
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": ["merge", "rm_worktree"],
+                "feature_branch": "feature/test-branch",
+                "worktree_path": str(repo_root / "worktree"),
+                "main_branch": "main",
+                "status": "running",
+                "active_turn": 2,
+                "turns_completed": 1,
+                "current_step_name": "review_cp_implementation",
+                "active_plan_path": str(plan_path),
+                "last_snapshot": snapshot,
+                "reviewer_rejection_count": 0,
+                "active_implementation_scope": {
+                    "scope_id": "scope-1",
+                    "original_plan_path": str(plan_path),
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "Checkpoint 1: Reopened",
+                    "opened_turn_number": 1,
+                    "awaiting_review": True,
+                    "carried_reviewer_rejection_count": 0,
+                },
+                "pending_boundary_decision": {
+                    "finalized_turn_number": 1,
+                    "decision_number": 7,
+                    "action": "continue",
+                    "proposed_action": "transition",
+                    "proposed_transition": "review_cp_implementation",
+                    "resolved_next_step": "review_cp_implementation",
+                    "consumed": True,
+                },
+            }
+
+            with patch(
+                "aflow.cli.resolve_run_id",
+                return_value=(run_dir, "explicit_run_id"),
+            ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                result = cli_module._detect_resume_candidate(
+                    repo_root=repo_root,
+                    workflow_config=type(
+                        "obj",
+                        (object,),
+                        {"setup": ("worktree", "branch")},
+                    )(),
+                    workflow_name="test_workflow",
+                    plan_path=plan_path,
+                    team="ds4_pro",
+                    selected_start_step="implement_plan",
+                    max_turns=60,
+                    extra_instructions=(),
+                    requested_run_id=run_dir.name,
+                    require_resume=True,
+                )
+
+        assert result is not None
+        assert result.active_plan_path == repair_path
+        assert result.interrupted_step_name is None
+        assert result.pending_boundary_decision is None
+        assert result.reviewer_rejection_count == 1
+        assert result.pending_finalized_turn is not None
+        assert result.pending_finalized_turn.turn_number == 2
+        assert result.pending_finalized_turn.step_name == "review_cp_implementation"
+        assert result.pending_finalized_turn.chosen_transition == "implement_plan"
+        assert result.pending_finalized_turn.new_plan_path == repair_path
 
     def test_resume_prompt_declined_returns_none(self) -> None:
         import aflow.cli as cli_module
