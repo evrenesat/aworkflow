@@ -9,6 +9,8 @@ from aflow.manager_context import (
     DIAGNOSTIC_LIMIT,
     build_manager_context,
     extract_semantic_result,
+    summarize_repair_plan,
+    summarize_review_rejection,
     scoped_reviewer_rejection_count,
 )
 from aflow.stop_marker import detect_stop_marker
@@ -376,3 +378,16 @@ def test_stop_parser_ignores_fences_and_placeholder_examples() -> None:
     text = "```text\nAFLOW_STOP: <reason>\n```\nAFLOW_STOP: <reason>\nAFLOW_STOP: actual blocker\n"
     assert extract_aflow_stop(text) == ["actual blocker"]
     assert detect_stop_marker(text, "AFLOW_STOP: stderr blocker") == "actual blocker"
+
+
+def test_rejection_summaries_normalize_bound_and_extract_summary(tmp_path: Path) -> None:
+    assert summarize_review_rejection("  first\n\n second  ") == "first second"
+    assert summarize_review_rejection("x" * 481) == "x" * 479 + "…"
+    assert summarize_review_rejection("é" * 481) == "é" * 479 + "…"
+    assert summarize_review_rejection("") == (
+        "Reviewer rejected this implementation; see the review stdout artifact for details."
+    )
+    repair = tmp_path / "repair.md"
+    repair.write_text("# Repair\n\n## Summary\n  Fix   [red] output.\n\n## Steps\n- ignored\n", encoding="utf-8")
+    assert summarize_repair_plan(repair) == "Fix [red] output."
+    assert summarize_repair_plan(tmp_path / "missing.md") is None

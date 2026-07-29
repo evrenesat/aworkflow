@@ -146,6 +146,27 @@ class ImplementationAttempt:
 
 
 @dataclass(frozen=True)
+class ReviewRejectionRecord:
+    """Durable, controller-derived evidence of one rejected implementation."""
+
+    scope_id: str
+    rejection_number: int
+    source_run_id: str
+    review_turn_number: int
+    review_step_name: str
+    reviewer_selector: str | None
+    checkpoint_index: int | None
+    checkpoint_name: str | None
+    reviewed_implementation_turn_number: int
+    reviewed_worker_team: str | None
+    reviewed_worker_selector: str | None
+    review_summary: str
+    repair_plan_summary: str | None
+    review_stdout_artifact_path: str
+    repair_plan_path: str | None
+
+
+@dataclass(frozen=True)
 class PendingBoundaryDecision:
     """Accepted manager decision persisted before controller side effects."""
 
@@ -235,6 +256,7 @@ class ResumeContext:
     reviewer_rejection_count: int = 0
     implementation_attempts: dict[str, tuple[ImplementationAttempt, ...]] = field(default_factory=dict)
     active_implementation_scope: ActiveImplementationScope | None = None
+    review_rejection_history: tuple[ReviewRejectionRecord, ...] = ()
     pending_manager_notes: PendingManagerNotes | None = None
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
@@ -261,6 +283,7 @@ class TurnRecord:
     duration_seconds: float | None = None
     stdout_artifact_path: str | None = None
     stderr_artifact_path: str | None = None
+    triggering_rejection_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +342,7 @@ class ControllerState:
     reviewer_rejection_count: int = 0
     implementation_attempts: dict[str, list[ImplementationAttempt]] = field(default_factory=dict)
     active_implementation_scope: ActiveImplementationScope | None = None
+    review_rejection_history: list[ReviewRejectionRecord] = field(default_factory=list)
     pending_manager_notes: PendingManagerNotes | None = None
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
@@ -345,6 +369,7 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
             if state.active_implementation_scope is not None
             else None
         ),
+        "review_rejection_history": [asdict(item) for item in state.review_rejection_history],
         "pending_manager_notes": (
             asdict(state.pending_manager_notes)
             if state.pending_manager_notes is not None
@@ -384,6 +409,35 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
         ]
     state.semantic_stall_count = int(payload.get("semantic_stall_count", 0) or 0)
     state.reviewer_rejection_count = int(payload.get("reviewer_rejection_count", 0) or 0)
+    state.review_rejection_history = []
+    rejection_history = payload.get("review_rejection_history")
+    if isinstance(rejection_history, list):
+        required = {
+            "scope_id", "rejection_number", "source_run_id", "review_turn_number",
+            "review_step_name", "reviewed_implementation_turn_number", "review_summary",
+            "review_stdout_artifact_path",
+        }
+        for item in rejection_history:
+            if not isinstance(item, Mapping) or not required <= set(item):
+                continue
+            try:
+                state.review_rejection_history.append(ReviewRejectionRecord(
+                    scope_id=str(item["scope_id"]), rejection_number=int(item["rejection_number"]),
+                    source_run_id=str(item["source_run_id"]), review_turn_number=int(item["review_turn_number"]),
+                    review_step_name=str(item["review_step_name"]),
+                    reviewer_selector=str(item["reviewer_selector"]) if item.get("reviewer_selector") is not None else None,
+                    checkpoint_index=int(item["checkpoint_index"]) if item.get("checkpoint_index") is not None else None,
+                    checkpoint_name=str(item["checkpoint_name"]) if item.get("checkpoint_name") is not None else None,
+                    reviewed_implementation_turn_number=int(item["reviewed_implementation_turn_number"]),
+                    reviewed_worker_team=str(item["reviewed_worker_team"]) if item.get("reviewed_worker_team") is not None else None,
+                    reviewed_worker_selector=str(item["reviewed_worker_selector"]) if item.get("reviewed_worker_selector") is not None else None,
+                    review_summary=str(item["review_summary"]),
+                    repair_plan_summary=str(item["repair_plan_summary"]) if item.get("repair_plan_summary") is not None else None,
+                    review_stdout_artifact_path=str(item["review_stdout_artifact_path"]),
+                    repair_plan_path=str(item["repair_plan_path"]) if item.get("repair_plan_path") is not None else None,
+                ))
+            except (TypeError, ValueError):
+                continue
     attempts = payload.get("implementation_attempts")
     state.implementation_attempts = {}
     if isinstance(attempts, Mapping):
@@ -520,6 +574,7 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
             for key, attempts in restored.implementation_attempts.items()
         },
         "active_implementation_scope": restored.active_implementation_scope,
+        "review_rejection_history": tuple(restored.review_rejection_history),
         "pending_manager_notes": restored.pending_manager_notes,
         "pending_step_team_override": restored.pending_step_team_override,
         "pending_boundary_decision": restored.pending_boundary_decision,

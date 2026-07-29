@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from .plan import PlanSnapshot
-from .run_state import ControllerState, TurnRecord
+from .run_state import ControllerState, ReviewRejectionRecord, TurnRecord
 from .config import WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig, load_workflow_config
 
 if TYPE_CHECKING:
@@ -252,6 +252,43 @@ def _turn_outcome_style(outcome: str, *, current: bool = False) -> str:
     return "cyan"
 
 
+def _active_scope_rejections(state: ControllerState) -> tuple[ReviewRejectionRecord, ...]:
+    scope = state.active_implementation_scope
+    if scope is None:
+        return ()
+    return tuple(sorted(
+        (item for item in state.review_rejection_history if item.scope_id == scope.scope_id),
+        key=lambda item: item.rejection_number,
+    ))
+
+
+def _render_review_rejection_history(state: ControllerState) -> Panel | None:
+    records = _active_scope_rejections(state)
+    if not records:
+        return None
+    body = Table.grid(padding=(0, 1))
+    body.add_column()
+    current_run_id = state.run_id
+    for record in records:
+        label = f"Rejection {record.rejection_number} · review turn {record.review_turn_number}"
+        if current_run_id is not None and record.source_run_id != current_run_id:
+            label += f" · run {record.source_run_id}"
+        body.add_row(Text(label, style="bold yellow"))
+        worker = f"turn {record.reviewed_implementation_turn_number}"
+        if record.reviewed_worker_team:
+            worker += f" · {record.reviewed_worker_team}"
+        if record.reviewed_worker_selector:
+            worker += f" · {record.reviewed_worker_selector}"
+        body.add_row(Text(f"Reviewed worker: {worker}"))
+        body.add_row(Text("Review: ") + Text(record.review_summary))
+        if record.repair_plan_summary:
+            body.add_row(Text("Required fixes: ") + Text(record.repair_plan_summary))
+        body.add_row(Text(f"Details: {record.review_stdout_artifact_path}"))
+        if record.repair_plan_path:
+            body.add_row(Text(f"Fix plan: {record.repair_plan_path}"))
+    return Panel(body, title="Current checkpoint review history", border_style="yellow", padding=(0, 1))
+
+
 def _render_turn_history(state: ControllerState) -> Group | Text | None:
     if not state.turn_history:
         return None
@@ -278,6 +315,21 @@ def _render_turn_history(state: ControllerState) -> Group | Text | None:
             body.add_row("Active Plan", record.active_plan_path)
         body.add_row("Duration", _duration_display(record.started_at, record.finished_at))
         body.add_row("Outcome", record.outcome)
+        if record.triggering_rejection_number is not None:
+            active_scope = state.active_implementation_scope
+            rejection = next((
+                item for item in _active_scope_rejections(state)
+                if item.rejection_number == record.triggering_rejection_number
+            ), None)
+            if active_scope is not None and rejection is not None:
+                body.add_row(
+                    "Re-implementation",
+                    Text(f"after rejection {record.triggering_rejection_number}"),
+                )
+                body.add_row(
+                    "Why rejected",
+                    Text(rejection.repair_plan_summary or rejection.review_summary),
+                )
         transition_text = _turn_transition_text(record)
         if transition_text is not None:
             body.add_row("Transition", transition_text)
@@ -628,6 +680,7 @@ def build_banner(
         banner_files_limit=config_banner_files_limit,
     )
     turn_history = _render_turn_history(state)
+    rejection_history = _render_review_rejection_history(state)
     workflow_graph = _render_workflow_graph(
         workflow_name=workflow_name,
         workflow_steps=workflow_steps,
@@ -636,6 +689,8 @@ def build_banner(
         source=source,
     )
     left_items: list[object] = []
+    if rejection_history is not None:
+        left_items.append(rejection_history)
     if turn_history is not None:
         left_items.append(turn_history)
     left_items.append(summary)

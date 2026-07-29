@@ -242,6 +242,10 @@ def analyze_progress_tail(turns: list[dict[str, Any]]) -> dict[str, Any]:
             legacy_reviewer_rejection_count += 1
     reviewer_rejection_count = 0
     for turn in finalized_turns:
+        if "review_rejection" in turn:
+            if isinstance(turn.get("review_rejection"), dict):
+                reviewer_rejection_count += 1
+            continue
         role = str(turn.get("step_role", "")).lower()
         name = str(turn.get("step_name", "")).lower()
         before_sig = snapshot_signature(turn.get("snapshot_before"))

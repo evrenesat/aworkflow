@@ -97,6 +97,10 @@ without deleting historical attempt evidence.
 Lite policy selects the first available upgrade edge immediately after the
 scope's first reviewer rejection, so a second rejection is evaluated by Full
 only after the stronger worker has received one attempt.
+Each controller-confirmed rejection is persisted as a bounded
+`ReviewRejectionRecord` in `run.json` and in the reviewer turn artifact. The
+record identifies the reviewed worker and source run, while the raw reviewer
+stdout remains the durable detailed evidence.
 
 ## Module Breakdown
 
@@ -250,6 +254,9 @@ All three functions return `None` when git is unavailable or fails, so the workf
 
 ### `status.py`
 Rich-based live banner rendered to stderr during a run. Shows elapsed time, run id, resumed-from run id when present, workflow/step name, harness, model, checkpoint progress, turn count, issues, plan paths, git summary (if available), and status.
+When the active implementation scope has rejected reviews, it also shows every
+current-scope rejection before the chronological turn cards and labels the next
+worker as a re-implementation with its compact rejection reason.
 The module also owns the shared workflow-graph and role/team render helpers used by both the live banner and `aflow show`, so classification rules stay identical across the two views.
 
 `BannerRenderer` owns a background daemon thread that rebuilds and pushes the panel every `refresh_interval_seconds` (default 1 s) and polls for a new `GitSummary` every `git_poll_interval_seconds` (default 10 s). This keeps the elapsed timer alive between step transitions without requiring external pushes. `set_context(...)` is used to update mutable banner fields instead of directly writing private attributes.

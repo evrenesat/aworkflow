@@ -32,6 +32,7 @@ from aflow.run_state import (
     ManagerDecisionSummary,
     PendingManagerNotes,
     PendingTeamOverride,
+    ReviewRejectionRecord,
     manager_resume_fields,
     manager_state_payload,
     restore_manager_state,
@@ -293,6 +294,11 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
         awaiting_review=True,
         carried_reviewer_rejection_count=1,
     )
+    state.review_rejection_history.append(ReviewRejectionRecord(
+        "plan.md::checkpoint-2::second", 1, "source-run", 4, "review", "codex.review",
+        2, "Second", 3, "base", "codex.worker", "Needs fixes", None,
+        "turns/turn-004/stdout.txt", None,
+    ))
     state.pending_manager_notes = PendingManagerNotes("implement", ("focus",), 1)
     state.pending_step_team_override = PendingTeamOverride("implement", "worker", "base", "high", "codex.high", "cp-2", 1)
     state.last_manager_report_path = "manager-report.md"
@@ -309,6 +315,12 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     )
     assert restored.pending_manager_notes == state.pending_manager_notes
     assert restored.pending_step_team_override == state.pending_step_team_override
+    assert restored.review_rejection_history == state.review_rejection_history
+    assert manager_resume_fields(payload)["review_rejection_history"] == tuple(state.review_rejection_history)
+    payload["review_rejection_history"].append({"scope_id": "malformed"})
+    malformed_restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    restore_manager_state(malformed_restored, payload)
+    assert malformed_restored.review_rejection_history == state.review_rejection_history
     assert manager_resume_fields(payload)["pending_manager_notes"] == state.pending_manager_notes
     write_run_metadata(
         paths,
@@ -319,6 +331,7 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
     assert run_json["last_manager_report_path"] == "manager-report.md"
     assert run_json["manager_history"][0]["artifact_path"] == "manager/decision-001"
+    assert run_json["review_rejection_history"][0]["source_run_id"] == "source-run"
 
 
 def test_manager_style_metadata_write_preserves_worktree_lifecycle(tmp_path: Path) -> None:

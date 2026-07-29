@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping
@@ -35,7 +35,7 @@ from .manager import (
     resolve_manager_role,
     validate_manager_decision,
 )
-from .manager_context import build_manager_context
+from .manager_context import build_manager_context, summarize_repair_plan, summarize_review_rejection
 from .git_status import classify_dirtiness_by_prefix, RepoState, probe_repo_state
 from .harnesses import get_adapter
 from .harnesses.base import HarnessAdapter, HarnessInvocation
@@ -61,7 +61,7 @@ from .recovery import (
     resolve_backup_team,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, TurnRecord, WorkflowEndReason, format_harness_model_display
+from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display
 from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .status import BannerRenderer, WorkflowGraphSource
@@ -2551,6 +2551,7 @@ def run_workflow(
         state.implementation_attempts = _mutable_implementation_attempts(
             resume.implementation_attempts
         )
+        state.review_rejection_history = list(resume.review_rejection_history)
         state.active_implementation_scope = (
             replace(
                 resume.active_implementation_scope,
@@ -2829,6 +2830,17 @@ def run_workflow(
         started_at = datetime.now(timezone.utc)
         state.active_turn = turn_number
         state.current_turn_started_at = started_at
+        scope = state.active_implementation_scope
+        triggering_rejection_number = None
+        if step_role == "worker" and scope is not None:
+            matching_rejections = [
+                item for item in state.review_rejection_history
+                if item.scope_id == scope.scope_id
+            ]
+            if matching_rejections:
+                triggering_rejection_number = max(
+                    item.rejection_number for item in matching_rejections
+                )
         state.turn_history.append(
             TurnRecord(
                 turn_number=turn_number,
@@ -2842,6 +2854,7 @@ def run_workflow(
                     resolved.effort,
                 ),
                 active_plan_path=str(active_path),
+                triggering_rejection_number=triggering_rejection_number,
                 started_at=started_at,
             )
         )
@@ -2917,6 +2930,7 @@ def run_workflow(
         retry_next_turn: bool | None = None,
         was_retry: bool | None = None,
         recovery: HarnessRecoveryContext | None = None,
+        review_rejection: ReviewRejectionRecord | None = None,
     ) -> None:
         record = state.turn_history[-1]
         normalized_status = (
@@ -2963,6 +2977,7 @@ def run_workflow(
             retry_next_turn=retry_next_turn,
             was_retry=was_retry,
             recovery=recovery,
+            review_rejection=(asdict(review_rejection) if review_rejection is not None else None),
         )
         record.turn_dir = turn_dir
         record.stdout_artifact_path = _turn_artifact_display_path(run_paths.repo_root, turn_dir, "stdout.txt")
@@ -4955,6 +4970,58 @@ def run_workflow(
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
+        review_rejection: ReviewRejectionRecord | None = None
+        scope_before_finalize = state.active_implementation_scope
+        controller_next_step = (
+            wf.steps.get(transition_target)
+            if transition_target != "END" else None
+        )
+        is_scoped_rejection = (
+            scope_before_finalize is not None
+            and scope_before_finalize.awaiting_review
+            and step.role != "worker"
+            and not done
+            and snapshot_before == post_snapshot
+            and controller_next_step is not None
+            and controller_next_step.role == "worker"
+        )
+        if is_scoped_rejection:
+            attempts = state.implementation_attempts.get(scope_before_finalize.scope_id, [])
+            if not attempts:
+                raise WorkflowError(
+                    "internal error: review rejection has no implementation attempt",
+                    run_dir=run_paths.run_dir,
+                )
+            reviewed_attempt = attempts[-1]
+            repair_path = new_plan_path if new_plan_exists else None
+            try:
+                repair_path_text = str(repair_path.relative_to(run_paths.repo_root)) if repair_path else None
+            except ValueError:
+                repair_path_text = str(repair_path) if repair_path else None
+            matching = [
+                item.rejection_number for item in state.review_rejection_history
+                if item.scope_id == scope_before_finalize.scope_id
+            ]
+            review_rejection = ReviewRejectionRecord(
+                scope_id=scope_before_finalize.scope_id,
+                rejection_number=max(matching, default=0) + 1,
+                source_run_id=state.run_id or run_paths.run_dir.name,
+                review_turn_number=turn_number,
+                review_step_name=current_step_name,
+                reviewer_selector=selector,
+                checkpoint_index=scope_before_finalize.checkpoint_index,
+                checkpoint_name=scope_before_finalize.checkpoint_name,
+                reviewed_implementation_turn_number=reviewed_attempt.turn_number,
+                reviewed_worker_team=reviewed_attempt.team,
+                reviewed_worker_selector=reviewed_attempt.selector,
+                review_summary=summarize_review_rejection(completed.stdout),
+                repair_plan_summary=summarize_repair_plan(repair_path),
+                review_stdout_artifact_path=_turn_artifact_display_path(
+                    run_paths.repo_root, turn_dir, "stdout.txt"
+                ),
+                repair_plan_path=repair_path_text,
+            )
+
         _finalize_turn_record(
             status="completed" if done else "running",
             started_at=turn_started_at,
@@ -4984,7 +5051,10 @@ def run_workflow(
             ),
             was_retry=True if retry_ctx is not None else None,
             retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
+            review_rejection=review_rejection,
         )
+        if review_rejection is not None:
+            state.review_rejection_history.append(review_rejection)
 
         if step.role == "worker":
             scope = state.active_implementation_scope

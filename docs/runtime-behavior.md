@@ -169,6 +169,11 @@ outcome or from its creation of a new focused follow-up plan. The latter also
 counts when the reviewer reopens the original checkpoint, so the first
 rejection exposes the required Lite worker upgrade and the second rejection
 selects Full before another worker starts.
+For newly finalized reviewer turns, the controller stores an explicit
+`review_rejection` object (or JSON `null`) in `result.json` and retains the
+scope history in `run.json`. It records bounded plain-text reviewer and repair
+summaries plus artifact paths; legacy artifacts without that key retain the
+older compatibility inference.
 When a run resumes into a fresh run directory, the scope opening turn is rebased
 to the new run and its prior rejection count is carried separately. Legacy
 scopes written before that carried counter existed discard the old top-level
@@ -226,6 +231,12 @@ Fields include:
 - git summary since workflow start
 - issues link when issues exist
 - current run status
+
+For an active scope with rejected reviews, the banner displays the complete
+chronological rejection history before turn cards. A re-implementation card
+names its exact rejection ordinal and shows the repair summary when available,
+otherwise the reviewer summary. Full reviewer stdout remains linked from the
+record; text is rendered literally rather than as Rich markup.
 
 The git summary is based on a baseline captured at workflow start, so pre-existing dirty state is excluded. If git is unavailable, git rows are omitted and the workflow still runs.
 

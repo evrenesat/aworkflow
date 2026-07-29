@@ -397,6 +397,7 @@ def _turn_result_payload(
     retry_next_turn: bool | None = None,
     was_retry: bool | None = None,
     recovery: HarnessRecoveryContext | None = None,
+    review_rejection: object | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "turn_number": turn_number,
@@ -405,6 +406,7 @@ def _turn_result_payload(
         "snapshot_before": snapshot_before.to_dict(),
         "snapshot_after": _snapshot_payload(snapshot_after),
         "started_at": started_at.isoformat(),
+        "review_rejection": review_rejection,
     }
     if stdout is not None:
         payload["stdout"] = stdout
@@ -623,6 +625,7 @@ def write_turn_artifacts_start(
     active_plan_path: Path | None = None,
     new_plan_path: Path | None = None,
     recovery: HarnessRecoveryContext | None = None,
+    review_rejection: object | None = None,
 ) -> Path:
     turn_dir = paths.turns_dir / f"turn-{turn_number:03d}"
     turn_dir.mkdir(parents=False, exist_ok=False)
@@ -645,6 +648,7 @@ def write_turn_artifacts_start(
         active_plan_path=active_plan_path,
         new_plan_path=new_plan_path,
         recovery=recovery,
+        review_rejection=review_rejection,
     )
     _write_json(turn_dir / "result.json", result_payload)
     return turn_dir
@@ -682,6 +686,7 @@ def finalize_turn_artifacts(
     retry_next_turn: bool | None = None,
     was_retry: bool | None = None,
     recovery: HarnessRecoveryContext | None = None,
+    review_rejection: object | None = None,
 ) -> Path:
     (turn_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
     (turn_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
@@ -715,6 +720,7 @@ def finalize_turn_artifacts(
         retry_next_turn=retry_next_turn,
         was_retry=was_retry,
         recovery=recovery,
+        review_rejection=review_rejection,
     )
     _write_json(turn_dir / "result.json", result_payload)
     return turn_dir

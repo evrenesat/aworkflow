@@ -810,6 +810,44 @@ class GitBannerTests(unittest.TestCase):
         assert "[NEW_PLAN_EXISTS || !DONE]" in text
         assert ".aflow/runs/20260407T120000Z-00000001/issues.md" in text
 
+    def test_banner_renders_scoped_rejection_history_as_plain_text(self) -> None:
+        from rich.console import Console
+        from aflow.run_state import ActiveImplementationScope, ReviewRejectionRecord
+
+        scope = ActiveImplementationScope("scope-1", "/fake/plan.md", 1, "Context", 1)
+        rejection = ReviewRejectionRecord(
+            scope_id="scope-1", rejection_number=1, source_run_id="previous-run",
+            review_turn_number=2, review_step_name="review", reviewer_selector="codex.review",
+            checkpoint_index=1, checkpoint_name="Context", reviewed_implementation_turn_number=1,
+            reviewed_worker_team="base", reviewed_worker_selector="codex.worker",
+            review_summary="Use [red] literally", repair_plan_summary="Repair `this` first",
+            review_stdout_artifact_path=".aflow/runs/old/turns/turn-002/stdout.txt",
+            repair_plan_path="plans/repair.md",
+        )
+        worker = TurnRecord(
+            turn_number=3, step_name="implement", step_role="worker",
+            resolved_harness_name="codex", resolved_model_display="codex / worker",
+            outcome="running", started_at=datetime.now(timezone.utc),
+            triggering_rejection_number=1,
+        )
+        state = ControllerState(
+            last_snapshot=PlanSnapshot(
+                "Context", 1, 1, False, current_checkpoint_index=1
+            ), run_id="new-run",
+            active_turn=3, current_turn_started_at=datetime.now(timezone.utc),
+            active_implementation_scope=scope, review_rejection_history=[rejection], turn_history=[worker],
+        )
+        panel = build_banner(config_max_turns=5, config_plan_path=Path("/fake/plan.md"), state=state)
+        assert panel is not None
+        console = Console(record=True, width=120)
+        console.print(panel)
+        text = console.export_text()
+        assert "Current checkpoint review history" in text
+        assert "Rejection 1 · review turn 2 · run previous-run" in text
+        assert "Use [red] literally" in text
+        assert "after rejection 1" in text
+        assert "Repair `this` first" in text
+
     def test_shared_step_classification_distinguishes_active_inactive_excluded_and_skipped(self) -> None:
         import aflow.status as status_mod
 

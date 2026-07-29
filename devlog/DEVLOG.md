@@ -1,3 +1,12 @@
+## 2026-07-29 — Durable live review-rejection history
+
+- Added controller-owned, resume-safe rejection records to turn artifacts and
+  `run.json`, preserving legacy artifact analysis and manager upgrade timing.
+- The Rich banner now lists every current-scope rejection and explains the
+  latest re-implementation without parsing raw output during refresh.
+- Added summary and rendering regression coverage; the root suite retains its
+  existing app-server dependency collection baseline.
+
 ## 2026-07-29 — Finalized-turn manager-boundary resume
 
 ### What changed

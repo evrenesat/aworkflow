@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -164,6 +165,46 @@ def extract_semantic_result(stdout: str) -> SemanticTurnOutcome:
     if candidates:
         return SemanticTurnOutcome("unrecognized_structured_stream", stdout, True)
     return SemanticTurnOutcome("plain_text", stdout, False)
+
+
+_REJECTION_FALLBACK = (
+    "Reviewer rejected this implementation; see the review stdout artifact for details."
+)
+
+
+def _bounded_normalized_text(text: str) -> str:
+    normalized = " ".join(" ".join(line.split()) for line in text.splitlines() if line.split()).strip()
+    return normalized[:479] + "…" if len(normalized) > 480 else normalized
+
+
+def summarize_review_rejection(stdout: str) -> str:
+    """Return a deterministic, Rich-safe compact reviewer summary."""
+    summary = _bounded_normalized_text(extract_semantic_result(stdout).result)
+    return summary or _REJECTION_FALLBACK
+
+
+def summarize_repair_plan(path: Path | None) -> str | None:
+    """Extract only the first Summary section without treating plan text as markup."""
+    if path is None:
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    heading: tuple[int, int] | None = None
+    body: list[str] = []
+    for line in lines:
+        match = re.match(r"^(#{1,3})\s+Summary\s*$", line, re.IGNORECASE)
+        if heading is None:
+            if match:
+                heading = (len(match.group(1)), 0)
+            continue
+        next_heading = re.match(r"^(#{1,3})\s+", line)
+        if next_heading and len(next_heading.group(1)) <= heading[0]:
+            break
+        body.append(line)
+    summary = _bounded_normalized_text("\n".join(body))
+    return summary or None
 
 
 def _load_turns(run_dir: Path) -> list[dict[str, Any]]:

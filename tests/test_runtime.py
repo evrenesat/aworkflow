@@ -5861,6 +5861,20 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 (result.run_dir / "manager" / "decision-004" / "result.json").read_text()
             )
             assert fourth_result["level"] == "full"
+            first_rejection = json.loads(
+                (result.run_dir / "turns" / "turn-002" / "result.json").read_text()
+            )["review_rejection"]
+            second_rejection = json.loads(
+                (result.run_dir / "turns" / "turn-004" / "result.json").read_text()
+            )["review_rejection"]
+            assert first_rejection["rejection_number"] == 1
+            assert second_rejection["rejection_number"] == 2
+            assert second_rejection["reviewed_worker_team"] == "high"
+            third_rejection = json.loads(
+                (result.run_dir / "turns" / "turn-006" / "result.json").read_text()
+            )["review_rejection"]
+            assert third_rejection["rejection_number"] == 3
+            assert third_rejection["reviewed_worker_team"] == "max"
             assert fourth["controller_state"]["reviewer_rejection_count"] == 2
             assert fourth["controller_state"]["active_implementation_scope"]["attempt_teams"] == [
                 "default",
