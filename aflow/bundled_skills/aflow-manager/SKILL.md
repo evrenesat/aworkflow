@@ -60,5 +60,9 @@ Allowed actions are `continue`, `retry_current_step`,
   controller exposes `upgrade_next_implementation`, choose that upgrade at Lite
   level. Do not spend another attempt on the same worker and do not escalate to
   Full before applying the eligible one-edge upgrade.
+- If the upgraded attempt is rejected, the boundary selector invokes Full
+  directly for the second rejection in that same scope. At Full, select the
+  next exposed one-edge upgrade only when it is eligible; otherwise choose
+  among the other controller-exposed actions from the supplied evidence.
 - Checkpoint approval closes the implementation scope. Do not use attempts from
   a closed scope to justify upgrading the next checkpoint's initial worker.

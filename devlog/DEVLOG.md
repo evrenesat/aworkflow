@@ -1,3 +1,32 @@
+## 2026-07-29 — Manager worker-upgrade documentation
+
+### What changed
+
+- Made the first-rejection Lite upgrade and second-rejection direct Full
+  selection explicit in the README and bundled manager skill.
+- Clarified that managers choose an abstract eligible action while the
+  controller resolves and persists the concrete worker team and selector.
+- Added a documentation regression test for the complete scoped sequence,
+  including the baseline reset at the next checkpoint.
+
+## 2026-07-29 — Semantic checkpoint shaping
+
+### What changed
+
+- Refocused `aflow-plan` on concise, generic, decision-complete worker
+  checkpoints rather than workflow-manager or reviewer protocol.
+- Replaced the rigid file/line stop threshold with semantic cohesion,
+  independent verification, risk-boundary, and whole-plan re-audit guidance.
+- Kept generated, test, documentation, and maintained-code estimates separate
+  so volume remains a planning signal rather than an automatic breakpoint.
+
+### Why
+
+- A large checkpoint passed an earlier repartition because total plan shape and
+  raw diff estimates hid several independently reviewable implementation
+  boundaries. The planner should split those boundaries before handoff without
+  turning checkpoint size into an owner approval gate.
+
 ## 2026-07-29 — Atomic run snapshots and safe boundary overrides
 
 ### What changed

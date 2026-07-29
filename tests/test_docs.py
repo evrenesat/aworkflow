@@ -83,18 +83,37 @@ class SkillDocsTests(unittest.TestCase):
         # The selection rule about searching plans/in-progress/ must be present
         assert 'plans/in-progress/' in text
 
-    def test_plan_skill_requires_compact_checkpoint_sizing_gate(self) -> None:
+    def test_plan_skill_uses_semantic_checkpoint_shaping_without_hard_stop(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-plan' / 'SKILL.md').read_text(encoding='utf-8')
-        section = text.split('## Checkpoint Sizing Gate', 1)[1].split('\n## ', 1)[0]
+        section = text.split('## Checkpoint Shaping', 1)[1].split('\n## ', 1)[0]
 
-        assert len(section.splitlines()) <= 8
-        assert 'at most two tightly coupled production layers' in section
-        assert '25 changed files or 3,000 changed lines' in section
-        assert 'including tests and generated artifacts' in section
-        assert 'explicit user approval' in section
-        assert 'AFLOW_STOP' in section
-        assert 'Projected or actual scope exceeds the checkpoint budget' in text
+        assert len(text.splitlines()) <= 190
+        assert 'reviewable change surface' in section
+        assert 'no more than two tightly coupled production layers' in section
+        assert 'heuristic, not a quota' in section
+        assert 'secondary scope-pressure signals' in section
+        assert 'generated volume alone must not force a split' in section
+        assert 'Re-audit the entire remaining plan' in text
+        assert 'Confirm risky assumptions and record safe defaults explicitly' in text
+        assert 'do not rely on another skill or workflow role' in text
+        assert 'external artifacts explicitly supplied by the user or environment' in text
+        assert '`git rev-parse --show-toplevel`' in text
+        assert '`git diff --name-only`' in text
+        assert 'unrelated dirty files make change ownership ambiguous' in text
+        assert '25 changed files or 3,000 changed lines' not in text
+        assert 'AFLOW_STOP' not in text
+
+    def test_manager_skill_documents_lite_then_full_worker_upgrade_sequence(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-manager' / 'SKILL.md').read_text(encoding='utf-8')
+        normalized = ' '.join(text.split())
+
+        assert 'first reviewer rejection' in normalized
+        assert 'choose that upgrade at Lite level' in normalized
+        assert 'invokes Full directly for the second rejection' in normalized
+        assert 'controller validates all routing and decides the concrete target' in normalized
+        assert "next checkpoint's initial worker" in normalized
 
     def test_bundled_config_review_implement_review_max_turns_transitions(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -105,7 +124,7 @@ class SkillDocsTests(unittest.TestCase):
             assert step.go[0].when == 'MAX_TURNS_REACHED', f"step {step_name} first transition must be MAX_TURNS_REACHED"
         assert wf.steps['implement_plan'].prompts == ('implementation_plans', 'cp_loop_implementation')
 
-    def test_bundled_skills_shift_finalization_and_commit_ownership_to_reviewers(self) -> None:
+    def test_bundled_skills_keep_plan_worker_facing_and_commit_ownership_in_execution_roles(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         review_text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-review-squash' / 'SKILL.md').read_text(encoding='utf-8')
         review_cp_text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-review-checkpoint' / 'SKILL.md').read_text(encoding='utf-8')
@@ -117,11 +136,10 @@ class SkillDocsTests(unittest.TestCase):
         assert 'workflow engine finalizes the original plan location after terminal success' in review_text
         assert 'move that original plan to `plans/done/`' not in review_text
         assert 'workflow engine owns the final move to `plans/done/`' in plan_text
-        assert '## Commit Ownership Rule' in plan_text
-        assert '**Implementation Done When:**' in plan_text
-        assert '**Review Acceptance Boundary:**' in plan_text
-        assert 'Dirty-worktree contract' in plan_text
-        assert 'the implementer has not created a checkpoint commit' in plan_text
+        assert '**Done When:**' in plan_text
+        assert '**Review Acceptance Boundary:**' not in plan_text
+        assert 'AFLOW_STOP' not in plan_text
+        assert 'Do not add manager selection, retry or upgrade routing' in plan_text
         assert 'Reviewer workflows own all commit creation and approval-grade git bookkeeping' in exec_cp_text
         assert 'Reviewer workflows own all commit creation and approval-grade git bookkeeping' in exec_plan_text
         assert 'git diff --name-only' in exec_cp_text
