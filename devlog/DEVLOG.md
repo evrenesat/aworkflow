@@ -1,3 +1,21 @@
+## 2026-07-30 — Resume after completed repair-overlay removal
+
+### What changed
+
+- Allowed finalized-turn replay to normalize a deleted completed repair overlay
+  back to the advanced original plan before the saved-plan existence fence.
+- Restricted recovery to a durable nonterminal worker boundary with no new
+  plan and an active scope whose original checkpoint demonstrably advanced.
+- Added runtime coverage proving review is replayed without rerunning the
+  worker, while unrelated missing saved plans remain fatal.
+
+### Why
+
+- A successful repair worker removed its finished overlay and advanced the
+  original plan, then the controller exited before persisting the boundary.
+  Standard resume rejected the intentionally removed overlay before it could
+  replay the already finalized transition into review.
+
 ## 2026-07-29 — Manager worker-upgrade documentation
 
 ### What changed

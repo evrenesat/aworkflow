@@ -68,6 +68,12 @@ Resume also detects a finalized active turn that is newer than the boundary in
 `run.json`. It carries that immutable turn into the new controller, rebuilds
 the active repair-plan transition, and executes the missing manager gate
 against the source run before starting another harness.
+When that finalized worker advanced the original checkpoint and intentionally
+removed its completed repair overlay, standard resume may normalize the active
+plan back to the original plan before replay. This recovery is permitted only
+when the durable turn records a nonterminal worker transition with no new plan
+and the saved implementation scope proves that the original checkpoint
+advanced; an otherwise missing saved active plan remains a hard failure.
 Follow-up plan version discovery runs in the execution checkout. An already
 active repair overlay is not reported as newly created, so approval returns the
 next checkpoint worker to the original plan while a newly written next-version

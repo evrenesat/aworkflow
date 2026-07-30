@@ -174,6 +174,35 @@ def _original_checkpoint_advanced(
     return snapshot.current_checkpoint_index > scope.checkpoint_index
 
 
+def _resume_completed_worker_can_use_original_plan(
+    *,
+    pending_turn: PendingFinalizedTurn | None,
+    active_plan_path: Path,
+    original_plan_path: Path,
+    active_scope: ActiveImplementationScope | None,
+    exec_ctx: ExecutionContext | None,
+) -> bool:
+    """Recognize a completed repair whose worker removed its finished overlay."""
+    if (
+        pending_turn is None
+        or pending_turn.step_role != "worker"
+        or pending_turn.active_plan_path != active_plan_path
+        or active_plan_path == original_plan_path
+        or active_scope is None
+        or active_scope.awaiting_review
+        or pending_turn.conditions.get("DONE", False)
+        or pending_turn.conditions.get("NEW_PLAN_EXISTS", False)
+        or pending_turn.conditions.get("MAX_TURNS_REACHED", False)
+        or pending_turn.chosen_transition == "END"
+        or not _original_checkpoint_advanced(
+            active_scope,
+            pending_turn.snapshot_after,
+        )
+    ):
+        return False
+    return _exec_plan_path(original_plan_path, exec_ctx).is_file()
+
+
 def _close_implementation_scope(state: ControllerState) -> None:
     """Close routing state while retaining historical attempt records."""
     state.active_implementation_scope = None
@@ -2633,14 +2662,24 @@ def run_workflow(
                 active_plan_path = resume.active_plan_path
                 active_execution_path = _exec_plan_path(active_plan_path, exec_ctx)
                 if not active_execution_path.is_file():
-                    raise WorkflowError(
-                        "cannot resume with the saved active plan because it does "
-                        "not exist in the reused execution checkout: "
-                        f"{active_execution_path}"
-                    )
+                    if _resume_completed_worker_can_use_original_plan(
+                        pending_turn=resume.pending_finalized_turn,
+                        active_plan_path=active_plan_path,
+                        original_plan_path=original_plan_path,
+                        active_scope=state.active_implementation_scope,
+                        exec_ctx=exec_ctx,
+                    ):
+                        active_plan_path = original_plan_path
+                    else:
+                        raise WorkflowError(
+                            "cannot resume with the saved active plan because it does "
+                            "not exist in the reused execution checkout: "
+                            f"{active_execution_path}"
+                        )
                 resumed_scope = state.active_implementation_scope
                 if (
-                    active_plan_path != original_plan_path
+                    active_execution_path.is_file()
+                    and active_plan_path != original_plan_path
                     and resumed_scope is not None
                     and not resumed_scope.awaiting_review
                     and _original_checkpoint_advanced(
@@ -4375,10 +4414,22 @@ def run_workflow(
 
         state.last_snapshot = replayed_boundary.snapshot_after
         state.turns_completed = 0
+        replayed_active_plan_path = replayed_boundary.active_plan_path
+        if (
+            not _exec_plan_path(replayed_active_plan_path, exec_ctx).is_file()
+            and _resume_completed_worker_can_use_original_plan(
+                pending_turn=replayed_boundary,
+                active_plan_path=replayed_active_plan_path,
+                original_plan_path=original_plan_path,
+                active_scope=state.active_implementation_scope,
+                exec_ctx=exec_ctx,
+            )
+        ):
+            replayed_active_plan_path = original_plan_path
         active_plan_path = (
             replayed_boundary.new_plan_path
             if replayed_boundary.conditions["NEW_PLAN_EXISTS"]
-            else replayed_boundary.active_plan_path
+            else replayed_active_plan_path
         )
         new_plan_path = replayed_boundary.new_plan_path
         scope = state.active_implementation_scope

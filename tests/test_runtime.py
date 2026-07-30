@@ -5320,6 +5320,170 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert runner_called[0] is False
             assert 'cannot resume with the saved active plan' in str(ctx.value)
 
+    def test_resume_replays_completed_worker_after_removed_active_plan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_path = root / 'worktree'
+            plan_path = repo_root / 'plan.md'
+            advanced_plan = (
+                '# Plan\n\n'
+                '### [x] Checkpoint 1: First\n'
+                '- [x] step one\n\n'
+                '### [ ] Checkpoint 2: Second\n'
+                '- [ ] step two\n'
+            )
+            _write_plan(plan_path, advanced_plan)
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                [
+                    'git',
+                    'worktree',
+                    'add',
+                    '-b',
+                    'resume-feature',
+                    str(worktree_path),
+                    'main',
+                ],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logical_repair = repo_root / 'plan-cp01-v01.md'
+            execution_plan = worktree_path / plan_path.relative_to(repo_root)
+            workflow = WorkflowConfig(
+                steps={
+                    'implement': WorkflowStepConfig(
+                        role='worker',
+                        prompts=('implement_prompt',),
+                        go=(
+                            GoTransition(
+                                to='review',
+                                preserve_active_plan=True,
+                            ),
+                        ),
+                    ),
+                    'review': WorkflowStepConfig(
+                        role='reviewer',
+                        prompts=('review_prompt',),
+                        go=(GoTransition(to='END'),),
+                    ),
+                },
+                first_step='implement',
+                setup=('worktree', 'branch'),
+                teardown=(),
+                main_branch='main',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'worker': 'codex.low',
+                    'reviewer': 'codex.review',
+                },
+                teams={
+                    'sol_medium': TeamConfig(
+                        roles={'worker': 'codex.sol'},
+                    ),
+                },
+                harnesses={
+                    'codex': WorkflowHarnessConfig(
+                        profiles={
+                            'low': HarnessProfileConfig(model='low'),
+                            'sol': HarnessProfileConfig(model='sol'),
+                            'review': HarnessProfileConfig(model='review'),
+                        },
+                    ),
+                },
+                workflows={'repair_loop': workflow},
+                prompts={
+                    'implement_prompt': 'Implement {ACTIVE_PLAN_PATH}.',
+                    'review_prompt': 'Review {ACTIVE_PLAN_PATH}.',
+                },
+            )
+            scope = ActiveImplementationScope(
+                scope_id=f'{plan_path}::checkpoint-1::first',
+                original_plan_path=str(plan_path),
+                checkpoint_index=1,
+                checkpoint_name='First',
+                opened_turn_number=1,
+                awaiting_review=False,
+            )
+            calls: list[tuple[str, str]] = []
+
+            def runner(argv, **kwargs):
+                calls.append((argv[argv.index('--model') + 1], ' '.join(argv)))
+                return subprocess.CompletedProcess(argv, 0, 'reviewed', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=1,
+                    start_step='implement',
+                    team='sol_medium',
+                ),
+                wf_config,
+                'repair_loop',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='prior-run',
+                    feature_branch='resume-feature',
+                    worktree_path=worktree_path,
+                    main_branch='main',
+                    setup=('worktree', 'branch'),
+                    teardown=(),
+                    active_plan_path=logical_repair,
+                    active_implementation_scope=scope,
+                    pending_finalized_turn=PendingFinalizedTurn(
+                        source_run_dir=repo_root / '.aflow' / 'runs' / 'prior-run',
+                        turn_number=7,
+                        step_name='implement',
+                        step_role='worker',
+                        selector='codex.sol',
+                        active_plan_path=logical_repair,
+                        new_plan_path=repo_root / 'plan-cp01-v02.md',
+                        snapshot_after=PlanSnapshot(
+                            current_checkpoint_name='Checkpoint 2: Second',
+                            unchecked_checkpoint_count=1,
+                            current_checkpoint_unchecked_step_count=1,
+                            is_complete=False,
+                            total_checkpoint_count=2,
+                            current_checkpoint_index=2,
+                        ),
+                        conditions={
+                            'DONE': False,
+                            'NEW_PLAN_EXISTS': False,
+                            'MAX_TURNS_REACHED': False,
+                        },
+                        chosen_transition='review',
+                    ),
+                ),
+            )
+
+            assert [model for model, _ in calls] == ['review']
+            assert str(execution_plan) in calls[0][1]
+            assert str(logical_repair) not in calls[0][1]
+            turn = json.loads(
+                (
+                    result.run_dir
+                    / 'turns'
+                    / 'turn-001'
+                    / 'result.json'
+                ).read_text(encoding='utf-8')
+            )
+            assert turn['step_name'] == 'review'
+            payload = json.loads(
+                (result.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert payload['team'] == 'sol_medium'
+            assert payload['active_plan_path'] == str(plan_path)
+
     def test_resume_does_not_create_second_worktree(self) -> None:
         """Test that accepted resume does not create a second linked worktree."""
         with tempfile.TemporaryDirectory() as tmpdir:
