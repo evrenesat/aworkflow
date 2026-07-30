@@ -332,9 +332,12 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
     effective_team = _resolve_effective_team(request, workflow_name)
 
     if is_complete:
-        if resolved_start_step is not None:
+        if resolved_start_step is not None and not request.resume_requested:
             raise StartupError("plan is already complete, --start-step has no effect")
-        selected_start_step = request.workflow_config.workflows[workflow_name].first_step
+        selected_start_step = (
+            resolved_start_step
+            or request.workflow_config.workflows[workflow_name].first_step
+        )
     else:
         if resolved_start_step is not None:
             selected_start_step = resolved_start_step

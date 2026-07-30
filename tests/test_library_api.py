@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 import subprocess
 import sys
@@ -219,6 +219,13 @@ class LibraryStartupTests(unittest.TestCase):
         with self.assertRaises(StartupError) as ctx:
             prepare_startup(request)
         self.assertIn("already complete", str(ctx.exception))
+
+        resumed = prepare_startup(
+            replace(request, resume_requested=True)
+        )
+        self.assertIsInstance(resumed, PreparedRun)
+        assert isinstance(resumed, PreparedRun)
+        self.assertEqual(resumed.start_step, "step1")
 
     def test_prepare_startup_multi_step_plan_asks_for_selection(self) -> None:
         config_text = (

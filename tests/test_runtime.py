@@ -5721,6 +5721,101 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             rc, _, _ = _run_git_in_test(['merge-base', '--is-ancestor', feature_branch, 'main'], cwd=repo_root)
             assert rc == 0, 'main should contain the fast-forward merged feature branch'
 
+    def test_resume_failed_terminal_merge_retries_integration_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            worktree_path = worktree_root / 'feature'
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _COMPLETE_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                [
+                    'git',
+                    'worktree',
+                    'add',
+                    '-b',
+                    'feature/terminal-integration',
+                    str(worktree_path),
+                    'main',
+                ],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            feature_file = worktree_path / 'feature.txt'
+            feature_file.write_text('approved\n', encoding='utf-8')
+            _run_git_in_test(['add', 'feature.txt'], cwd=worktree_path)
+            _run_git_in_test(
+                ['commit', '-m', 'approved feature'],
+                cwd=worktree_path,
+            )
+            feature_head = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            wf_config = _make_worktree_wf_config(
+                worktree_root=str(worktree_root),
+            )
+
+            def runner(argv, **kwargs):
+                raise AssertionError(
+                    'terminal integration retry must not launch a workflow harness'
+                )
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=3,
+                    start_step='impl',
+                ),
+                wf_config,
+                'wt_wf',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='failed-merge-run',
+                    feature_branch='feature/terminal-integration',
+                    worktree_path=worktree_path,
+                    main_branch='main',
+                    setup=('worktree', 'branch'),
+                    teardown=('merge', 'rm_worktree'),
+                    active_plan_path=plan_path,
+                    interrupted_step_name='impl',
+                    terminal_integration_only=True,
+                ),
+            )
+
+            assert result.turns_completed == 0
+            assert not worktree_path.exists()
+            payload = json.loads(
+                (result.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert payload['status'] == 'completed'
+            assert payload['merge_status'] == 'success'
+            assert payload['resumed_from_run_id'] == 'failed-merge-run'
+            assert not list((result.run_dir / 'turns').iterdir())
+            assert (
+                subprocess.run(
+                    ['git', 'rev-parse', 'HEAD'],
+                    cwd=repo_root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                == feature_head
+            )
+
     def test_resume_rejects_worktree_with_in_progress_merge(self) -> None:
         """Test that validation rejects a worktree with an in-progress git operation."""
         with tempfile.TemporaryDirectory() as tmpdir:

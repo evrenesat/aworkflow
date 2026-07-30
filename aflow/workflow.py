@@ -2303,6 +2303,84 @@ def _execute_merge_handoff(
     )
 
 
+def _perform_merge_teardown(
+    exec_ctx: ExecutionContext,
+    wf: WorkflowConfig,
+    workflow_config: WorkflowUserConfig,
+    *,
+    repo_root: Path,
+    team_name: str | None,
+    adapter: HarnessAdapter | None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None,
+    config_dir: Path,
+    working_dir: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    new_plan_path: Path | None,
+    banner: BannerRenderer,
+    state: ControllerState,
+) -> tuple[str, str | None]:
+    prepared_primary_plan: _PreparedPrimaryPlanForMerge | None = None
+    try:
+        prepared_primary_plan = _prepare_primary_plan_for_merge(
+            repo_root,
+            original_plan_path,
+        )
+        _ensure_merge_handoff_clean(
+            exec_ctx,
+            original_plan_path=original_plan_path,
+        )
+        merge_completed = _execute_merge_handoff(
+            exec_ctx,
+            wf,
+            workflow_config,
+            team_name=team_name,
+            adapter=adapter,
+            runner=runner,
+            config_dir=config_dir,
+            working_dir=working_dir,
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path or original_plan_path,
+            banner=banner,
+            state=state,
+        )
+    except WorkflowError as exc:
+        _restore_primary_plan_after_merge(prepared_primary_plan)
+        return "failed", exc.summary
+
+    stop_reason = _detect_stop_marker(
+        merge_completed.stdout,
+        merge_completed.stderr,
+    )
+    if stop_reason is not None:
+        _restore_primary_plan_after_merge(prepared_primary_plan)
+        return "failed", f"AFLOW_STOP: {stop_reason}"
+    if merge_completed.returncode != 0:
+        _restore_primary_plan_after_merge(prepared_primary_plan)
+        return (
+            "failed",
+            f"merge agent exited with code {merge_completed.returncode}",
+        )
+
+    _restore_primary_plan_after_merge(prepared_primary_plan)
+    check_failure = _verify_merge_success(
+        repo_root,
+        exec_ctx.main_branch,
+        exec_ctx.feature_branch,
+        original_plan_path=original_plan_path,
+    )
+    if check_failure is not None:
+        return "failed", f"merge verification failed: {check_failure}"
+
+    if "rm_worktree" in exec_ctx.teardown and exec_ctx.worktree_path is not None:
+        try:
+            _rm_worktree_safe(repo_root, exec_ctx.worktree_path)
+        except WorkflowError as exc:
+            return "failed", exc.summary
+    return "success", None
+
+
 def _emit_event(observer: ExecutionObserver | None, event: ExecutionEvent) -> None:
     """Emit an event to the observer if one is provided."""
     if observer is not None:
@@ -2562,7 +2640,10 @@ def run_workflow(
     banner.update(state)
 
     done = original_snapshot.is_complete
-    if done:
+    terminal_integration_only = bool(
+        resume is not None and resume.terminal_integration_only
+    )
+    if done and not terminal_integration_only:
         prior_original_plan_path = original_plan_path
         finalized_original_plan_path = _finalize_original_plan_if_complete(
             config.repo_root,
@@ -4377,6 +4458,136 @@ def run_workflow(
                            new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
         return report
 
+    if terminal_integration_only:
+        if not done:
+            raise WorkflowError(
+                "terminal integration resume requires a complete saved plan",
+                run_dir=run_paths.run_dir,
+            )
+        if exec_ctx is None or "merge" not in exec_ctx.teardown:
+            raise WorkflowError(
+                "terminal integration resume requires recorded merge teardown",
+                run_dir=run_paths.run_dir,
+            )
+
+        merge_status, merge_failure_reason = _perform_merge_teardown(
+            exec_ctx,
+            wf,
+            workflow_config,
+            repo_root=config.repo_root,
+            team_name=baseline_team_name,
+            adapter=adapter,
+            runner=runner,
+            config_dir=config_dir,
+            working_dir=working_dir,
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            banner=banner,
+            state=state,
+        )
+        if merge_status == "failed":
+            state.status_message = "failed"
+            current_step = wf.steps.get(current_step_name)
+            report = _manager_terminal_incident(
+                trigger="merge_failure",
+                reason=merge_failure_reason or "merge teardown failed",
+                current_step=current_step_name,
+                current_role=current_step.role if current_step is not None else None,
+                active_team=baseline_team_name,
+                active_selector=None,
+            )
+            summary = report or _format_failure(
+                reason=merge_failure_reason or "merge teardown failed",
+                run_dir=run_paths.run_dir,
+                snapshot=original_snapshot,
+            )
+            write_run_metadata(
+                run_paths,
+                config,
+                state,
+                status="failed",
+                merge_status=merge_status,
+                merge_failure_reason=merge_failure_reason,
+                execution_context=exec_ctx,
+                last_snapshot=original_snapshot,
+                turns_completed=0,
+                workflow_name=workflow_name,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            banner.stop(state)
+            raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+        prior_original_plan_path = original_plan_path
+        finalized_original_plan_path = _finalize_original_plan_if_complete(
+            config.repo_root,
+            original_plan_path,
+            snapshot=original_snapshot,
+        )
+        if finalized_original_plan_path != prior_original_plan_path:
+            original_plan_path = finalized_original_plan_path
+            if active_plan_path == prior_original_plan_path:
+                active_plan_path = original_plan_path
+
+        end_reason: WorkflowEndReason = "transition_end"
+        state.end_reason = end_reason
+        state.status_message = "completed"
+        _emit_event(
+            observer,
+            StatusChangedEvent.create(
+                status_message="completed",
+                turns_completed=0,
+                active_turn=None,
+                current_step_name=current_step_name,
+            ),
+        )
+        result = ControllerRunResult(
+            run_dir=run_paths.run_dir,
+            turns_completed=0,
+            final_snapshot=original_snapshot,
+            issues_accumulated=state.issues_accumulated,
+            end_reason=end_reason,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        )
+        write_run_metadata(
+            run_paths,
+            config,
+            state,
+            status="completed",
+            merge_status=merge_status,
+            execution_context=exec_ctx,
+            last_snapshot=original_snapshot,
+            turns_completed=0,
+            end_reason=end_reason,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+        prune_old_runs(run_paths.runs_root, config.keep_runs)
+        banner.stop(state)
+        _emit_event(
+            observer,
+            RunCompletedEvent.create(
+                run_dir=run_paths.run_dir,
+                turns_completed=0,
+                final_snapshot=original_snapshot,
+                end_reason=end_reason,
+                issues_accumulated=state.issues_accumulated,
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            ),
+        )
+        return result
+
     replayed_boundary = (
         resume.pending_finalized_turn
         if resume is not None
@@ -5545,62 +5756,22 @@ def run_workflow(
             merge_failure_reason: str | None = None
 
             if exec_ctx is not None and "merge" in exec_ctx.teardown:
-                prepared_primary_plan: _PreparedPrimaryPlanForMerge | None = None
-                try:
-                    prepared_primary_plan = _prepare_primary_plan_for_merge(
-                        config.repo_root,
-                        original_plan_path,
-                    )
-                    _ensure_merge_handoff_clean(
-                        exec_ctx,
-                        original_plan_path=original_plan_path,
-                    )
-                    merge_completed = _execute_merge_handoff(
-                        exec_ctx, wf, workflow_config,
-                        team_name=merge_team_name,
-                        adapter=adapter,
-                        runner=runner,
-                        config_dir=config_dir,
-                        working_dir=working_dir,
-                        original_plan_path=original_plan_path,
-                        active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path,
-                        banner=banner,
-                        state=state,
-                    )
-                except WorkflowError as exc:
-                    _restore_primary_plan_after_merge(prepared_primary_plan)
-                    merge_status = "failed"
-                    merge_failure_reason = exc.summary
-                else:
-                    stop_reason = _detect_stop_marker(merge_completed.stdout, merge_completed.stderr)
-                    if stop_reason is not None:
-                        _restore_primary_plan_after_merge(prepared_primary_plan)
-                        merge_status = "failed"
-                        merge_failure_reason = f"AFLOW_STOP: {stop_reason}"
-                    elif merge_completed.returncode != 0:
-                        _restore_primary_plan_after_merge(prepared_primary_plan)
-                        merge_status = "failed"
-                        merge_failure_reason = f"merge agent exited with code {merge_completed.returncode}"
-                    else:
-                        _restore_primary_plan_after_merge(prepared_primary_plan)
-                        check_failure = _verify_merge_success(
-                            config.repo_root,
-                            exec_ctx.main_branch,
-                            exec_ctx.feature_branch,
-                            original_plan_path=original_plan_path,
-                        )
-                        if check_failure is not None:
-                            merge_status = "failed"
-                            merge_failure_reason = f"merge verification failed: {check_failure}"
-                        else:
-                            merge_status = "success"
-                            if "rm_worktree" in exec_ctx.teardown and exec_ctx.worktree_path is not None:
-                                try:
-                                    _rm_worktree_safe(config.repo_root, exec_ctx.worktree_path)
-                                except WorkflowError as exc:
-                                    merge_status = "failed"
-                                    merge_failure_reason = exc.summary
+                merge_status, merge_failure_reason = _perform_merge_teardown(
+                    exec_ctx,
+                    wf,
+                    workflow_config,
+                    repo_root=config.repo_root,
+                    team_name=merge_team_name,
+                    adapter=adapter,
+                    runner=runner,
+                    config_dir=config_dir,
+                    working_dir=working_dir,
+                    original_plan_path=original_plan_path,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    banner=banner,
+                    state=state,
+                )
 
             if merge_status == "failed":
                 state.status_message = "failed"

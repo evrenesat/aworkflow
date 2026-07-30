@@ -2502,6 +2502,81 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert isinstance(result, ResumeContext)
         assert result.resumed_from_run_id == "20260101T000000Z-abc123"
 
+    def test_resume_accepts_failed_terminal_merge_without_rerun_scope(self) -> None:
+        import aflow.cli as cli_module
+
+        repo_root = Path("/fake/repo").resolve()
+        plan_path = repo_root / "plan.md"
+        run_id = "20260101T000000Z-abc123"
+        prev_run = {
+            "repo_root": str(repo_root),
+            "workflow_name": "test_workflow",
+            "plan_path": str(plan_path),
+            "team": "sol_medium",
+            "selected_start_step": "implement_plan",
+            "max_turns": 60,
+            "extra_instructions": [],
+            "lifecycle_setup": ["worktree", "branch"],
+            "lifecycle_teardown": ["merge", "rm_worktree"],
+            "feature_branch": "feature/test-branch",
+            "worktree_path": str(repo_root / "worktree"),
+            "main_branch": "main",
+            "active_plan_path": str(repo_root / "missing-repair.md"),
+            "current_step_name": "final_review",
+            "status": "failed",
+            "end_reason": "transition_end",
+            "last_snapshot": {"is_complete": True},
+            "merge_status": "failed",
+            "merge_failure_reason": "feature branch is checked out elsewhere",
+        }
+        workflow = type(
+            "obj",
+            (object,),
+            {
+                "setup": ("worktree", "branch"),
+                "teardown": ("merge", "rm_worktree"),
+            },
+        )()
+
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_id), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            result = cli_module._detect_resume_candidate(
+                repo_root=repo_root,
+                workflow_config=workflow,
+                workflow_name="test_workflow",
+                plan_path=plan_path,
+                team="sol_medium",
+                selected_start_step="implement_plan",
+                max_turns=60,
+                extra_instructions=(),
+                requested_run_id=run_id,
+                require_resume=True,
+            )
+
+        assert result is not None
+        assert result.terminal_integration_only is True
+        assert result.active_plan_path == plan_path
+        assert result.interrupted_step_name == "final_review"
+
+        invalid = dict(prev_run)
+        invalid.pop("merge_failure_reason")
+        assert (
+            cli_module._resume_candidate_mismatch_reason(
+                invalid,
+                workflow,
+                repo_root,
+                "test_workflow",
+                plan_path,
+                "sol_medium",
+                "implement_plan",
+                60,
+                (),
+            )
+            == "its last saved plan snapshot was already complete"
+        )
+
     def test_resume_flag_without_id_errors_when_no_prior_run_can_be_resolved(self) -> None:
         import aflow.cli as cli_module
 

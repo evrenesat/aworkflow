@@ -78,6 +78,10 @@ An explicit resume also bypasses the fresh-run Pre-Handoff Base HEAD refresh
 gate during startup preparation. Resume candidate validation and the reused
 worktree checks remain authoritative, and runtime does not rewrite the started
 plan's recorded base merely because the primary checkout advanced meanwhile.
+A failed terminal merge is the sole complete-snapshot resume case. It requires
+durable `transition_end`, failed merge metadata, and matching merge teardown;
+the continuation normalizes to the original plan and retries only terminal
+integration, creating no workflow turn or checkpoint harness.
 Follow-up plan version discovery runs in the execution checkout. An already
 active repair overlay is not reported as newly created, so approval returns the
 next checkpoint worker to the original plan while a newly written next-version

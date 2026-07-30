@@ -6,14 +6,20 @@
   feature branch and perform the required rebase there.
 - Kept the primary checkout responsible for the final fast-forward merge and
   required the owning feature worktree to be clean and on the exact branch.
+- Added an integration-only resume path for a complete plan whose terminal
+  merge failed, without rerunning checkpoints or final review.
+- Allowed explicit resume startup to retain its resolved start-step identity
+  for this complete-plan recovery while fresh complete plans remain closed.
 - Added a documentation regression preventing the invalid primary-checkout
-  rebase form from returning.
+  rebase form from returning, plus CLI and runtime lifecycle regressions.
 
 ### Why
 
 - A fully approved seven-checkpoint run reached terminal integration with a
   clean managed feature worktree, but Git refused to rebase that branch from
-  the primary checkout because the branch was checked out elsewhere.
+  the primary checkout because the branch was checked out elsewhere. After the
+  merge contract was repaired, standard resume still rejected the complete
+  snapshot before terminal integration could be retried.
 
 ## 2026-07-30 — Resume after completed repair-overlay removal
 

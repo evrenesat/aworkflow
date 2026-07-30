@@ -126,6 +126,25 @@ def _is_valid_resume_candidate(
     ) is None
 
 
+def _is_terminal_integration_resume(
+    prev_run: Mapping[str, object],
+) -> bool:
+    last_snapshot = prev_run.get("last_snapshot")
+    lifecycle_teardown = prev_run.get("lifecycle_teardown")
+    merge_failure_reason = prev_run.get("merge_failure_reason")
+    return (
+        prev_run.get("status") == "failed"
+        and isinstance(last_snapshot, Mapping)
+        and last_snapshot.get("is_complete") is True
+        and prev_run.get("end_reason") == "transition_end"
+        and prev_run.get("merge_status") == "failed"
+        and isinstance(merge_failure_reason, str)
+        and bool(merge_failure_reason.strip())
+        and isinstance(lifecycle_teardown, list)
+        and "merge" in lifecycle_teardown
+    )
+
+
 def _resume_candidate_mismatch_reason(
     prev_run: dict[str, object],
     current_workflow_config: Any,
@@ -143,8 +162,8 @@ def _resume_candidate_mismatch_reason(
     - Have lifecycle_setup that includes "worktree"
     - Have non-empty feature_branch and worktree_path
     - Have status of "failed" or "running" (not "completed")
-    - Have last_snapshot.is_complete == false
-    - Not have merge_status (merge-failed-after-complete runs are not resumable)
+    - Have last_snapshot.is_complete == false, unless terminal merge failed
+    - Not have merge_status, unless it records a failed terminal merge
     - Have lifecycle_setup that matches the current workflow's effective setup tuple
     - Match on all resolved invocation fields
     """
@@ -167,10 +186,16 @@ def _resume_candidate_mismatch_reason(
         )
 
     last_snapshot = prev_run.get("last_snapshot")
-    if isinstance(last_snapshot, dict) and last_snapshot.get("is_complete") is True:
+    lifecycle_teardown = prev_run.get("lifecycle_teardown")
+    terminal_integration_only = _is_terminal_integration_resume(prev_run)
+    if (
+        isinstance(last_snapshot, dict)
+        and last_snapshot.get("is_complete") is True
+        and not terminal_integration_only
+    ):
         return "its last saved plan snapshot was already complete"
 
-    if "merge_status" in prev_run:
+    if "merge_status" in prev_run and not terminal_integration_only:
         return "it already entered merge teardown"
 
     prev_repo_root = prev_run.get("repo_root")
@@ -209,6 +234,10 @@ def _resume_candidate_mismatch_reason(
     current_setup = current_workflow_config.setup or ()
     if tuple(lifecycle_setup) != current_setup:
         return "its lifecycle setup does not match this invocation"
+    if terminal_integration_only:
+        current_teardown = getattr(current_workflow_config, "teardown", ()) or ()
+        if tuple(lifecycle_teardown) != current_teardown:
+            return "its lifecycle teardown does not match this invocation"
 
     return None
 
@@ -463,6 +492,7 @@ def _detect_resume_candidate(
     lifecycle_setup = prev_run.get("lifecycle_setup")
     lifecycle_teardown = prev_run.get("lifecycle_teardown")
     active_plan_path = prev_run.get("active_plan_path")
+    terminal_integration_only = _is_terminal_integration_resume(prev_run)
 
     if not isinstance(feature_branch, str) or not isinstance(worktree_path, str) or not isinstance(main_branch, str):
         if require_resume:
@@ -492,7 +522,11 @@ def _detect_resume_candidate(
         manager_fields["pending_manager_notes"] = None
         manager_fields["pending_step_team_override"] = None
         manager_fields["pending_boundary_decision"] = None
-    recovered_active_plan = active_plan_path
+    recovered_active_plan = (
+        str(plan_path)
+        if terminal_integration_only
+        else active_plan_path
+    )
     if (
         pending_finalized_turn is not None
         and pending_finalized_turn.conditions["NEW_PLAN_EXISTS"]
@@ -591,7 +625,14 @@ def _detect_resume_candidate(
             else None
         ),
         interrupted_step_name=(
-            None if reset_scope else _interrupted_resume_step(run_dir, prev_run)
+            None
+            if reset_scope
+            else (
+                str(prev_run["current_step_name"])
+                if terminal_integration_only
+                and isinstance(prev_run.get("current_step_name"), str)
+                else _interrupted_resume_step(run_dir, prev_run)
+            )
         ),
         pending_finalized_turn=pending_finalized_turn,
         frozen_run_identity=frozen_run_identity,
@@ -600,6 +641,7 @@ def _detect_resume_candidate(
         pending_override_notes=tuple(pending_override_notes),
         override_source_run_dir=override_source_run_dir,
         override_file_present=bool(prev_run.get("override_file_present", False)),
+        terminal_integration_only=terminal_integration_only,
         **manager_fields,
     )
 

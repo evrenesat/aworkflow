@@ -415,6 +415,7 @@ class ResumeContext:
     pending_override_notes: tuple[str, ...] = ()
     override_source_run_dir: Path | None = None
     override_file_present: bool = False
+    terminal_integration_only: bool = False
 
 
 @dataclass
