@@ -111,9 +111,11 @@ than the mutable active repair-plan identity. Attempts retain their actual team
 and selector; each rejection can expose one further configured edge. Approval
 closes the scope before the next checkpoint and clears scoped pending actions
 without deleting historical attempt evidence.
-Lite policy selects the first available upgrade edge immediately after the
-scope's first reviewer rejection, so a second rejection is evaluated by Full
-only after the stronger worker has received one attempt.
+On the first rejection in an open original-checkpoint scope, Lite decides by
+cause: it may keep the same worker for a bounded repair, choose the exposed
+one-edge upgrade for a capability or convergence failure, or escalate
+structural ambiguity or scope pressure to Full. The second rejection in that
+same scope invokes Full directly with retrospective evidence.
 If Full continues after the upgrade chain is exhausted, the controller
 persists a one-turn override for the most recently reviewed worker; closing the
 scope on approval is the sole path back to baseline.
