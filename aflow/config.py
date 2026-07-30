@@ -117,6 +117,7 @@ class ManagerConfig:
     full_role: str | None = None
     full_after_stalled_turns: int = 2
     skill: str = "aflow-manager"
+    repartition_skill: str = "aflow-repartition-checkpoint"
 
 
 @dataclass(frozen=True)
@@ -344,7 +345,7 @@ def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
 
 
 def _parse_manager_config(raw: Mapping[str, object], *, path: str) -> ManagerConfig:
-    allowed = {"enabled", "lite_role", "full_role", "full_after_stalled_turns", "skill"}
+    allowed = {"enabled", "lite_role", "full_role", "full_after_stalled_turns", "skill", "repartition_skill"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ConfigError(f"unsupported keys in {path}: {', '.join(unknown)}")
@@ -365,12 +366,14 @@ def _parse_manager_config(raw: Mapping[str, object], *, path: str) -> ManagerCon
     ):
         raise ConfigError(f"{path}.full_after_stalled_turns must be an integer at least 1")
     skill = _optional_text(raw.get("skill"), path=f"{path}.skill") or "aflow-manager"
+    repartition_skill = _optional_text(raw.get("repartition_skill"), path=f"{path}.repartition_skill") or "aflow-repartition-checkpoint"
     return ManagerConfig(
         enabled=enabled,
         lite_role=lite_role,
         full_role=full_role,
         full_after_stalled_turns=full_after_stalled_turns,
         skill=skill,
+        repartition_skill=repartition_skill,
     )
 
 

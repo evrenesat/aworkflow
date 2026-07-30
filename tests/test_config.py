@@ -29,6 +29,8 @@ def test_manager_config_is_optional_and_defaults_to_disabled() -> None:
     config = WorkflowUserConfig()
     assert config.manager.enabled is False
     assert config.manager.full_after_stalled_turns == 2
+    assert config.manager.skill == "aflow-manager"
+    assert config.manager.repartition_skill == "aflow-repartition-checkpoint"
 
 
 def test_manager_config_rejects_missing_role_and_upgrade_cycle() -> None:

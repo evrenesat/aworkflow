@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -15,10 +16,13 @@ from typing import Any, Literal, Mapping
 
 from .analyzer import analyze_progress_tail, extract_text_signals, snapshot_signature
 from .plan import PlanParseError, load_plan_tolerant
+from .repartition import parse_envelope_bytes
+from .scope_pressure import has_scope_pressure
 from .stop_marker import extract_stop_markers
 
 
 MANAGER_CONTEXT_SCHEMA_VERSION = 1
+MANAGER_CONTEXT_SCHEMA_VERSION_V2 = 2
 DIAGNOSTIC_LIMIT = 2_000
 ManagerLevel = Literal["lite", "full"]
 
@@ -83,6 +87,30 @@ class ManagerContextV1:
     plan_state: dict[str, Any]
     controller_state: dict[str, Any]
     active_plan_content: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ManagerContextV2:
+    schema_version: int
+    run_id: str
+    decision_number: int
+    level: ManagerLevel
+    trigger: str
+    finished_turn: dict[str, Any]
+    run_extract: tuple[dict[str, Any], ...]
+    plan_state: dict[str, Any]
+    controller_state: dict[str, Any]
+    active_plan_content: str | None = None
+    original_plan_content: str | None = None
+    envelope: dict[str, Any] | None = None
+    active_scope_rejection_ledger: tuple[dict[str, Any], ...] = ()
+    implementation_attempts: dict[str, Any] | None = None
+    manager_decisions: tuple[dict[str, Any], ...] = ()
+    change_surface_evidence: dict[str, Any] | None = None
+    scope_pressure_detected: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -233,6 +261,103 @@ def _path_from_metadata(run_dir: Path, value: Any) -> Path | None:
         return candidate
     relative = run_dir.parent.parent.parent / candidate
     return relative if relative.is_file() else None
+
+
+def _resolve_run_artifact(run_dir: Path, artifact_path: str) -> Path | None:
+    """Resolve a controller artifact path inside this run, rejecting escapes.
+
+    Turn records historically use repository-relative display paths while
+    scope artifacts use run-relative paths.  Accept both representations only
+    when they resolve underneath the selected run directory.
+    """
+    run_root = run_dir.resolve()
+    for candidate in (
+        run_dir / artifact_path,
+        run_dir.parent.parent.parent / artifact_path,
+    ):
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(run_root)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _resolve_validated_envelope(
+    run_dir: Path,
+    artifact_path: str,
+    expected_artifact_sha256: str,
+    expected_canonical_sha256: str,
+    active_scope: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Resolve, read, hash-check, and parse a validated envelope.
+
+    Returns the envelope payload dict on success, or ``None`` when the
+    artifact is missing, malformed, path-escaping, or hash-invalid.  The
+    caller must treat ``None`` as ineligible envelope evidence rather than
+    promoting invalid data as validated context.
+    """
+    scope_id = active_scope.get("scope_id") if active_scope is not None else None
+    checkpoint_index = (
+        active_scope.get("checkpoint_index") if active_scope is not None else None
+    )
+    checkpoint_name = (
+        active_scope.get("checkpoint_name") if active_scope is not None else None
+    )
+    if (
+        not isinstance(scope_id, str)
+        or not scope_id
+        or not isinstance(checkpoint_index, int)
+        or isinstance(checkpoint_index, bool)
+        or not isinstance(checkpoint_name, str)
+    ):
+        return None
+    expected_scope_digest = hashlib.sha256(scope_id.encode("utf-8")).hexdigest()
+    if artifact_path != f"scopes/{expected_scope_digest}/envelope.json":
+        return None
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_artifact_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_canonical_sha256) is None
+    ):
+        return None
+    resolved = _resolve_run_artifact(run_dir, artifact_path)
+    if resolved is None:
+        return None
+    try:
+        raw = resolved.read_bytes()
+    except OSError:
+        return None
+    actual_artifact_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_artifact_sha256 != expected_artifact_sha256:
+        return None
+    try:
+        parsed = parse_envelope_bytes(raw)
+    except ValueError:
+        return None
+    if (
+        parsed.scope_id != scope_id
+        or parsed.scope_digest != expected_scope_digest
+        or parsed.checkpoint_index != checkpoint_index
+        or parsed.checkpoint_name != checkpoint_name
+        or parsed.canonical_envelope_sha256 != expected_canonical_sha256
+    ):
+        return None
+    payload = parsed.to_dict()
+    payload.update({
+        "artifact_path": artifact_path,
+        "artifact_sha256": expected_artifact_sha256,
+        "canonical_envelope_sha256": expected_canonical_sha256,
+        "available": True,
+        "validated": True,
+    })
+    return payload
+
+
+def _unavailable_envelope(reason: str) -> dict[str, Any]:
+    """Return an explicit non-authoritative verdict for missing evidence."""
+    return {"available": False, "validated": False, "reason": reason}
 
 
 def _plan_state(run_dir: Path, run_json: dict[str, Any], finished_turn: dict[str, Any]) -> tuple[StructuredPlanState, Path | None]:
@@ -561,7 +686,223 @@ def build_manager_context(
     )
     if not legacy_boundary:
         context.controller_state["progress_scope"] = progress_scope
-    # Runtime prompts, artifacts, and later API analysis all use JSON.  Return
-    # that canonical shape here too, so tuple/list representation cannot cause
-    # a false drift report after a context has been persisted and rebuilt.
-    return json.loads(json.dumps(context.to_dict(), sort_keys=True))
+    # Determine whether to produce schema v2 (boundary selector >= 3).
+    boundary_schema_version = boundary.get("context_schema_version")
+    use_v2 = (
+        isinstance(boundary_schema_version, int)
+        and boundary_schema_version >= 3
+    )
+    if not use_v2:
+        # Exact schema-v1 output preserved for selector-2 and selector-absent.
+        return json.loads(json.dumps(context.to_dict(), sort_keys=True))
+    # --- Schema v2 additions ---
+    if level == "lite":
+        # Lite retains compact routing evidence, never verbatim reviewer output.
+        reviewer_turn_numbers = {
+            turn.get("turn_number")
+            for turn in turns
+            if turn.get("step_role") == "reviewer"
+        }
+        for record in context.run_extract:
+            if record.get("number") in reviewer_turn_numbers:
+                record["semantic_summary"] = (
+                    "Reviewer output withheld from Lite; see the review stdout artifact."
+                )
+        if finished.get("step_role") == "reviewer":
+            semantic_result = context.finished_turn.get("semantic_result")
+            if isinstance(semantic_result, dict):
+                semantic_result["result"] = (
+                    "Reviewer output withheld from Lite; see the review stdout artifact."
+                )
+            diagnostics = context.finished_turn.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                diagnostics["stdout_excerpt"] = (
+                    "Reviewer output withheld from Lite; see the review stdout artifact."
+                )
+    scope_pressure = has_scope_pressure(stdout, stderr)
+    # Expose scope pressure in controller_state so level selection can force Full.
+    context.controller_state["scope_pressure_detected"] = scope_pressure
+    # Also carry the exact scope-pressure reason from the boundary when present.
+    boundary_pressure_reason = boundary.get("scope_pressure_reason")
+    if isinstance(boundary_pressure_reason, str) and boundary_pressure_reason:
+        context.controller_state["scope_pressure_reason"] = boundary_pressure_reason
+
+    active_scope = boundary.get("active_implementation_scope")
+    active_scope_mapping = active_scope if isinstance(active_scope, Mapping) else None
+    active_scope_id = (
+        active_scope_mapping.get("scope_id")
+        if active_scope_mapping is not None
+        else None
+    )
+
+    # --- Envelope: resolve, read, hash-check, parse, and include validated payload ---
+    validated_envelope: dict[str, Any] | None = None
+    envelope_artifact_path = boundary.get("envelope_artifact_path")
+    envelope_artifact_sha256 = boundary.get("envelope_artifact_sha256")
+    envelope_canonical_sha256 = boundary.get("envelope_canonical_sha256")
+    complete_envelope_reference = (
+        isinstance(envelope_artifact_path, str) and envelope_artifact_path
+        and isinstance(envelope_artifact_sha256, str) and envelope_artifact_sha256
+        and isinstance(envelope_canonical_sha256, str) and envelope_canonical_sha256
+    )
+    if complete_envelope_reference:
+        validated_envelope = _resolve_validated_envelope(
+            run_dir, envelope_artifact_path,
+            envelope_artifact_sha256, envelope_canonical_sha256,
+            active_scope_mapping,
+        )
+    if validated_envelope is not None:
+        context.controller_state["repartition_evidence"] = {"status": "validated"}
+        envelope = (
+            validated_envelope
+            if level == "full"
+            else {
+                "available": True,
+                "validated": True,
+                "content_included": False,
+                "artifact_path": envelope_artifact_path,
+                "artifact_sha256": envelope_artifact_sha256,
+                "canonical_envelope_sha256": envelope_canonical_sha256,
+            }
+        )
+    else:
+        if active_scope_mapping is None:
+            envelope_reason = "no active implementation scope was captured at this boundary"
+        elif not complete_envelope_reference:
+            envelope_reason = "the active implementation scope has incomplete immutable envelope references"
+        else:
+            envelope_reason = "the captured immutable envelope is unavailable or failed validation"
+        context.controller_state["repartition_evidence"] = {
+            "status": "unavailable",
+            "reason": envelope_reason,
+        }
+        envelope = _unavailable_envelope(envelope_reason)
+
+    # --- Active-scope rejection ledger: ordered, complete rejection records ---
+    rejection_history = boundary.get("review_rejection_history")
+    active_rejections: list[dict[str, Any]] = []
+    if isinstance(rejection_history, list) and active_scope_id:
+        for item in rejection_history:
+            if isinstance(item, dict) and item.get("scope_id") == active_scope_id:
+                active_rejections.append({
+                    "rejection_number": item.get("rejection_number"),
+                    "source_run_id": item.get("source_run_id"),
+                    "review_turn_number": item.get("review_turn_number"),
+                    "review_step_name": item.get("review_step_name"),
+                    "reviewer_selector": item.get("reviewer_selector"),
+                    "checkpoint_index": item.get("checkpoint_index"),
+                    "checkpoint_name": item.get("checkpoint_name"),
+                    "reviewed_implementation_turn_number": item.get("reviewed_implementation_turn_number"),
+                    "reviewed_worker_team": item.get("reviewed_worker_team"),
+                    "reviewed_worker_selector": item.get("reviewed_worker_selector"),
+                    "review_summary": item.get("review_summary"),
+                    "repair_plan_summary": item.get("repair_plan_summary"),
+                    "review_stdout_artifact_path": item.get("review_stdout_artifact_path"),
+                    "repair_plan_path": item.get("repair_plan_path"),
+                })
+
+    # --- Latest full-rejection detail (for Full level only) ---
+    latest_full_rejection: dict[str, Any] | None = None
+    if level == "full" and active_rejections:
+        latest = active_rejections[-1]
+        artifact_path = latest.get("review_stdout_artifact_path")
+        latest_full_rejection = dict(latest)
+        if isinstance(artifact_path, str) and artifact_path:
+            resolved = _resolve_run_artifact(run_dir, artifact_path)
+            if resolved is not None:
+                latest_full_rejection["exact_reviewer_output"] = _read_text(resolved) or None
+            else:
+                latest_full_rejection["exact_reviewer_output"] = None
+        else:
+            latest_full_rejection["exact_reviewer_output"] = None
+
+    # --- Implementation attempts for the active scope ---
+    boundary_attempts = boundary.get("implementation_attempts")
+    scoped_attempts: dict[str, Any] | None = None
+    if isinstance(boundary_attempts, dict) and active_scope_id:
+        raw_attempts = boundary_attempts.get(active_scope_id)
+        if isinstance(raw_attempts, list):
+            scoped_attempts = {
+                "scope_id": active_scope_id,
+                "attempts": [
+                    {
+                        "turn_number": a.get("turn_number"),
+                        "step_name": a.get("step_name"),
+                        "role": a.get("role"),
+                        "team": a.get("team"),
+                        "selector": a.get("selector"),
+                        "outcome": a.get("outcome"),
+                        "manager_decision_number": a.get("manager_decision_number"),
+                    }
+                    for a in raw_attempts if isinstance(a, dict)
+                ],
+            }
+
+    # --- Manager decisions: only those strictly before the decision being built ---
+    manager_decisions = [
+        {
+            "decision_number": item.get("decision_number") or item.get("number"),
+            "action": item.get("action") or (item.get("routing", {}).get("action") if isinstance(item.get("routing"), dict) else None),
+            "reason": item.get("reason") or item.get("semantic_summary"),
+            "level": item.get("level"),
+        }
+        for item in _manager_records(run_dir, before_decision_number=decision_number)
+    ]
+
+    # --- Change-surface evidence from progress signals ---
+    change_surface = {
+        "unchanged_snapshot_turns": progress.unchanged_snapshot_turns,
+        "same_step_stall_turns": progress.same_step_stall_turns,
+        "alternating_two_step_tail": progress.alternating_two_step_tail,
+        "reviewer_rejection_count": progress.reviewer_rejection_count,
+        "reviewer_non_convergence": progress.reviewer_non_convergence,
+    }
+
+    # --- Original plan content (Full only) ---
+    original_plan_content: str | None = None
+    if level == "full":
+        immutable_plan_text = (
+            validated_envelope.get("plan_text")
+            if validated_envelope is not None
+            else None
+        )
+        if isinstance(immutable_plan_text, str):
+            original_plan_content = immutable_plan_text
+        else:
+            original_value = (
+                boundary.get("original_plan_path")
+                or run_json.get("original_plan_path")
+                or run_json.get("plan_path")
+            )
+            original_path = _path_from_metadata(run_dir, original_value)
+            if original_path is not None:
+                original_plan_content = _read_text(original_path) or None
+
+    v2_context = ManagerContextV2(
+        schema_version=MANAGER_CONTEXT_SCHEMA_VERSION_V2,
+        run_id=context.run_id,
+        decision_number=context.decision_number,
+        level=context.level,
+        trigger=context.trigger,
+        finished_turn=context.finished_turn,
+        run_extract=context.run_extract,
+        plan_state=context.plan_state,
+        controller_state=context.controller_state,
+        active_plan_content=context.active_plan_content,
+        original_plan_content=original_plan_content,
+        envelope=envelope,
+        active_scope_rejection_ledger=tuple(active_rejections),
+        implementation_attempts=scoped_attempts,
+        manager_decisions=tuple(manager_decisions),
+        change_surface_evidence=change_surface,
+        scope_pressure_detected=scope_pressure,
+    )
+    # Attach latest-full-rejection to controller_state for Full only.
+    if level == "full" and latest_full_rejection is not None:
+        context.controller_state["latest_full_rejection"] = latest_full_rejection
+    v2_context_dict = v2_context.to_dict()
+    context_dict = json.loads(json.dumps(v2_context_dict, sort_keys=True))
+    # Carry the controller_state additions through the round-trip.
+    if level == "full" and latest_full_rejection is not None:
+        context_dict["controller_state"]["latest_full_rejection"] = latest_full_rejection
+    return context_dict

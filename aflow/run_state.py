@@ -381,7 +381,7 @@ class FinalizedTurnBoundary:
     original_plan_path: str | None
     active_plan_path: str | None
     checkpoint_identity: str | None
-    context_schema_version: int = 2
+    context_schema_version: int = 3
     safely_retryable: bool = False
     operational_failure: bool = False
     backup_team: str | None = None
@@ -390,6 +390,18 @@ class FinalizedTurnBoundary:
     active_implementation_scope: dict[str, Any] | None = None
     eligible_actions: list[str] = field(default_factory=list)
     evidence: str | None = None
+    scope_pressure_reason: str | None = None
+    # Immutable controller-owned copies for deterministic schema-v2 reconstruction.
+    # Captured at the boundary so historical analysis never depends on later
+    # mutable run.json state.
+    review_rejection_history: list[dict[str, Any]] = field(default_factory=list)
+    implementation_attempts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Envelope references from ActiveImplementationScope, carried separately
+    # so the boundary can resolve, read, hash-check, and validate the envelope
+    # artifact without trusting later run.json state.
+    envelope_artifact_path: str | None = None
+    envelope_artifact_sha256: str | None = None
+    envelope_canonical_sha256: str | None = None
 
 
 @dataclass(frozen=True)

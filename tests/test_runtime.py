@@ -1,5 +1,6 @@
 from aflow._test_support import *  # noqa: F401,F403
 import hashlib
+from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
 from aflow.api.events import ExecutionEventType
 from aflow.run_state import (
@@ -41,6 +42,42 @@ def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
         scope["checkpoint_index"],
         scope["checkpoint_name"],
         len(artifacts),
+    )
+
+
+def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
+    """Build a minimal supervised workflow for pressure-boundary regressions."""
+    workflow = WorkflowConfig(
+        steps={
+            "step": WorkflowStepConfig(
+                role=role,
+                prompts=("p",),
+                go=(
+                    GoTransition(to="END", when="DONE"),
+                    GoTransition(to="step"),
+                ),
+            ),
+        },
+        first_step="step",
+    )
+    return WorkflowUserConfig(
+        roles={
+            role: "codex.default",
+            "manager_lite": "codex.manager-lite",
+            "manager_full": "codex.manager-full",
+        },
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "default": HarnessProfileConfig(model="default"),
+            "manager-lite": HarnessProfileConfig(model="manager-lite"),
+            "manager-full": HarnessProfileConfig(model="manager-full"),
+        })},
+        workflows={"managed": workflow},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+        manager=ManagerConfig(
+            enabled=True,
+            lite_role="manager_lite",
+            full_role="manager_full",
+        ),
     )
 
 
@@ -6250,6 +6287,31 @@ class StopMarkerTests(unittest.TestCase):
             assert 'dirty worktree blocks verification' in str(ctx.value)
             assert 'AFLOW_STOP' in str(ctx.value)
 
+    def test_stop_marker_precedes_scope_pressure_without_a_valid_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    stdout=(
+                        'AFLOW_SCOPE_PRESSURE: oversized checkpoint\n'
+                        'AFLOW_STOP: terminal owner boundary\n'
+                    ),
+                    stderr='',
+                )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                    self._make_wf_config(), 'simple', config_dir=repo_root,
+                    adapter=CodexAdapter(), runner=runner,
+                )
+            assert 'terminal owner boundary' in str(ctx.value)
+            assert 'validated immutable envelope' not in str(ctx.value)
+
     def test_stop_marker_in_stderr_fails_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -6810,7 +6872,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             boundary_payload = json.loads(
                 (decision_dir / 'boundary.json').read_text(encoding='utf-8')
             )
-            assert boundary_payload['boundary']['context_schema_version'] == 2
+            assert boundary_payload['boundary']['context_schema_version'] == 3
             assert boundary_payload['boundary']['captured_plan_state'] == json.loads(
                 (decision_dir / 'context.json').read_text(encoding='utf-8')
             )['plan_state']
@@ -6835,12 +6897,12 @@ class LifecycleBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
-            _write_plan(
-                plan_path,
+            original_plan_text = (
                 "# Plan\n\n"
                 "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
-                "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+                "### [ ] Checkpoint 2: Second\n- [ ] step two\n"
             )
+            _write_plan(plan_path, original_plan_text)
             workflow = WorkflowConfig(
                 steps={
                     "implement": WorkflowStepConfig(
@@ -7035,6 +7097,23 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert second_result["status"] == "accepted"
             assert len(second_result["next_step_notes"]) == 8
             assert fourth_result["level"] == "full"
+            assert fourth["schema_version"] == 2
+            envelope = fourth["envelope"]
+            assert envelope["validated"] is True
+            assert envelope["available"] is True
+            assert envelope["plan_text"] == original_plan_text
+            assert envelope["plan_sha256"] == hashlib.sha256(
+                original_plan_text.encode("utf-8")
+            ).hexdigest()
+            assert envelope["checkpoint_text"] == (
+                "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
+            )
+            assert envelope["checkpoint_line_start"] == 3
+            assert envelope["checkpoint_line_end"] == 6
+            assert envelope["checkpoint_byte_start"] < envelope["checkpoint_byte_end"]
+            assert envelope["heading_prefix"] == "### [ ] Checkpoint 1: First\n"
+            assert envelope["source_blocks"]
+            assert fourth["original_plan_content"] == original_plan_text
             first_rejection = json.loads(
                 (result.run_dir / "turns" / "turn-002" / "result.json").read_text()
             )["review_rejection"]
@@ -7055,6 +7134,21 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 "high",
             ]
             assert fourth["controller_state"]["active_implementation_scope"]["upgrade_depth"] == 1
+            assert [
+                rejection["rejection_number"]
+                for rejection in fourth["active_scope_rejection_ledger"]
+            ] == [1, 2]
+            latest_rejection = fourth["controller_state"]["latest_full_rejection"]
+            assert latest_rejection["rejection_number"] == 2
+            assert latest_rejection["exact_reviewer_output"] == "synthetic workflow result"
+            assert [
+                attempt["turn_number"]
+                for attempt in fourth["implementation_attempts"]["attempts"]
+            ] == [1, 3]
+            assert [
+                decision["decision_number"]
+                for decision in fourth["manager_decisions"]
+            ] == [1, 2, 3]
             assert "upgrade_next_implementation" not in sixth["controller_state"]["eligible_actions"]
             assert sixth["controller_state"]["eligible_upgrade"]["available"] is False
             assert (
@@ -7078,6 +7172,172 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert run_json["pending_manager_notes"] is None
             assert run_json["pending_step_team_override"] is None
             assert run_json["pending_boundary_decision"]["scope_id"] is None
+
+            fourth_context_path = result.run_dir / "manager" / "decision-004" / "context.json"
+            stored_fourth_context = fourth_context_path.read_text(encoding="utf-8")
+            _write_plan(
+                plan_path,
+                "# Mutated after selector-3 capture\n\n"
+                "### [ ] Checkpoint 1: Later\n- [ ] changed\n",
+            )
+            run_json["review_rejection_history"] = []
+            run_json["implementation_attempts"] = {}
+            run_json["manager_history"] = []
+            (result.run_dir / "run.json").write_text(
+                json.dumps(run_json, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            later_result_path = result.run_dir / "manager" / "decision-009" / "result.json"
+            later_result = json.loads(later_result_path.read_text(encoding="utf-8"))
+            later_result["reason"] = "mutated later manager history"
+            later_result_path.write_text(
+                json.dumps(later_result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            rebuilt = analyze_runs(AnalyzeRequest(
+                repo_root=repo_root,
+                run_id=result.run_dir.name,
+                manager_context="full",
+                turn=4,
+            ))
+            assert json.dumps(rebuilt, indent=2, sort_keys=True) + "\n" == stored_fourth_context
+
+    def test_scope_pressure_without_active_scope_fails_before_manager_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            manager_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal manager_calls
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    manager_calls += 1
+                return subprocess.CompletedProcess(
+                    argv, 0, "AFLOW_SCOPE_PRESSURE: no active scope", ""
+                )
+
+            with pytest.raises(WorkflowError, match="no active implementation scope is open"):
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _pressure_workflow_config(role="reviewer"),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+            assert manager_calls == 0
+            assert not list((run_dir / "manager").glob("decision-*"))
+
+    def test_scope_pressure_with_disabled_manager_fails_before_rerouting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv, 0, "AFLOW_SCOPE_PRESSURE: manager required", ""
+                )
+
+            with pytest.raises(WorkflowError, match="manager supervision is disabled"):
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _make_simple_wf_config(),
+                    "simple",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+            assert not list((run_dir / "manager").glob("decision-*"))
+
+    def test_scope_pressure_with_valid_envelope_forces_full_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            worker_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal worker_calls
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "Pressure requires a Full decision.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+                worker_calls += 1
+                if worker_calls == 1:
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_SCOPE_PRESSURE: scope needs Full review", ""
+                    )
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "completed", "")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                _pressure_workflow_config(role="worker"),
+                "managed",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            first_result = json.loads(
+                (result.run_dir / "manager" / "decision-001" / "result.json").read_text()
+            )
+            first_context = json.loads(
+                (result.run_dir / "manager" / "decision-001" / "context.json").read_text()
+            )
+            assert first_result["level"] == "full"
+            assert first_context["controller_state"]["scope_pressure_reason"] == (
+                "scope needs Full review"
+            )
+            assert first_context["envelope"]["validated"] is True
+
+    def test_scope_pressure_with_tampered_envelope_fails_before_manager_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            manager_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal manager_calls
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    manager_calls += 1
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+                scope = payload["active_implementation_scope"]
+                assert scope is not None
+                (run_dir / scope["envelope_artifact_path"]).write_bytes(b"tampered")
+                return subprocess.CompletedProcess(
+                    argv, 0, "AFLOW_SCOPE_PRESSURE: envelope changed", ""
+                )
+
+            with pytest.raises(WorkflowError, match="artifact bytes hash mismatch"):
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _pressure_workflow_config(role="worker"),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+            assert manager_calls == 0
+            assert not list((run_dir / "manager").glob("decision-*"))
 
     def test_invalid_lite_manager_response_escalates_once_to_full(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7437,6 +7697,7 @@ def _run_upgrade_resume_scenario(
     interruption: str,
     prior_reviewer_rejections: int = 0,
     legacy_scope: bool = False,
+    pressure_on_first_reviewer: bool = False,
 ) -> tuple[list[str], list[int], dict[str, object], Path]:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -7667,6 +7928,10 @@ def _run_upgrade_resume_scenario(
                 replacement,
                 "# Repair\n\n### [ ] Checkpoint 1: Replacement\n- [ ] repair step\n",
             )
+            if pressure_on_first_reviewer and reviewer_calls == 1:
+                return subprocess.CompletedProcess(
+                    argv, 0, "AFLOW_SCOPE_PRESSURE: legacy scope", ""
+                )
         else:
             _write_plan(
                 Path(kwargs["cwd"]) / "plan.md",
@@ -7753,6 +8018,21 @@ def test_manager_legacy_resume_discards_prior_checkpoint_rejections(
     assert context["controller_state"]["reviewer_rejection_count"] == 1
     assert scope["opened_turn_number"] == 1
     assert scope["carried_reviewer_rejection_count"] == 0
+
+
+def test_scope_pressure_with_legacy_resume_scope_fails_before_manager_decision(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(WorkflowError, match="legacy scope has no artifact"):
+        _run_upgrade_resume_scenario(
+            tmp_path,
+            interruption="before_review",
+            legacy_scope=True,
+            pressure_on_first_reviewer=True,
+        )
+
+    run_dir = next((tmp_path / "repo" / ".aflow" / "runs").iterdir())
+    assert not list((run_dir / "manager").glob("decision-*"))
 
 
 def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: Path) -> None:

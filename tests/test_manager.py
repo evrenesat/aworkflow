@@ -95,6 +95,24 @@ def test_decision_protocol_rejects_unknown_fields_and_illegal_combinations() -> 
         )
 
 
+def test_repartition_only_legal_for_full() -> None:
+    decision = parse_manager_decision(_decision(action="repartition_current_checkpoint", next_step_notes=[]))
+    validate_manager_decision(decision, level="full")
+    with pytest.raises(ManagerDecisionError, match="only legal for Full"):
+        validate_manager_decision(decision, level="lite")
+
+
+def test_repartition_rejects_notes_and_stop_report() -> None:
+    with pytest.raises(ManagerDecisionError, match="must not include next_step_notes"):
+        parse_manager_decision(_decision(action="repartition_current_checkpoint"))
+    with pytest.raises(ManagerDecisionError, match="stop_report is only allowed for stop"):
+        parse_manager_decision(_decision(
+            action="repartition_current_checkpoint",
+            next_step_notes=[],
+            stop_report={"summary": "x", "root_cause": "x", "evidence": ["x"], "attempts": "x", "workspace_state": "x", "next_actions": ["x"]},
+        ))
+
+
 @pytest.mark.parametrize(
     "noisy",
     [
@@ -253,7 +271,7 @@ def test_prompts_preserve_only_the_supplied_context_level() -> None:
     assert json.loads(user.removeprefix("MANAGER_CONTEXT_JSON:\n")) == context
 
 
-def test_lite_prompt_requires_eligible_upgrade_after_first_reviewer_rejection() -> None:
+def test_lite_prompt_cause_based_first_rejection_does_not_force_upgrade() -> None:
     context = {
         "level": "lite",
         "active_plan_content": None,
@@ -275,8 +293,34 @@ def test_lite_prompt_requires_eligible_upgrade_after_first_reviewer_rejection() 
 
     system, _ = build_manager_prompts(context)
 
-    assert "Choose upgrade_next_implementation now" in system
-    assert "or escalate to Full before applying this upgrade" in system
+    # Cause-based policy: both continue and upgrade are legal.
+    assert "neither is forced" in system
+    assert "continue with the same worker" in system
+    assert "upgrade_next_implementation" in system
+    # The old forced-upgrade language must NOT appear.
+    assert "Choose upgrade_next_implementation now" not in system
+
+
+def test_full_prompt_includes_repartition_guidance() -> None:
+    context = {
+        "level": "full",
+        "active_plan_content": None,
+        "run_id": "run-1",
+        "controller_state": {
+            "reviewer_rejection_count": 2,
+            "eligible_actions": [
+                "continue",
+                "repartition_current_checkpoint",
+                "stop",
+            ],
+        },
+    }
+
+    system, _ = build_manager_prompts(context)
+
+    assert "repartition_current_checkpoint splits the current" in system
+    assert "Do not name workflow steps, teams, or business logic" in system
+    assert "next_step_notes must be []" in system
 
 
 def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:

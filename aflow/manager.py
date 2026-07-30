@@ -22,6 +22,7 @@ ManagerAction = Literal[
     "upgrade_next_implementation",
     "switch_to_backup_and_retry",
     "escalate_to_full",
+    "repartition_current_checkpoint",
     "stop",
 ]
 _ACTIONS = frozenset({
@@ -30,6 +31,7 @@ _ACTIONS = frozenset({
     "upgrade_next_implementation",
     "switch_to_backup_and_retry",
     "escalate_to_full",
+    "repartition_current_checkpoint",
     "stop",
 })
 _DECISION_KEYS = frozenset({"schema_version", "action", "reason", "next_step_notes", "stop_report"})
@@ -186,6 +188,11 @@ def validate_manager_decision(
             raise ManagerDecisionError("escalate_to_full is only legal for Lite")
         if decision.next_step_notes:
             raise ManagerDecisionError("escalate_to_full must not include next_step_notes")
+    if decision.action == "repartition_current_checkpoint":
+        if level is not None and level != "full":
+            raise ManagerDecisionError("repartition_current_checkpoint is only legal for Full")
+        if decision.next_step_notes:
+            raise ManagerDecisionError("repartition_current_checkpoint must not include next_step_notes")
     if decision.action == "continue" and proposed_transition == "END" and decision.next_step_notes:
         raise ManagerDecisionError("accepted END must not include next_step_notes")
     if eligible_actions is not None and decision.action not in eligible_actions:
@@ -280,12 +287,6 @@ def build_manager_prompts(
         if isinstance(controller.get("eligible_upgrade"), Mapping)
         else {}
     )
-    require_first_rejection_upgrade = (
-        level == "lite"
-        and reviewer_rejections == 1
-        and bool(eligible_upgrade.get("available"))
-        and "upgrade_next_implementation" in eligible_actions
-    )
     normal_shape = json.dumps({
         "schema_version": 1,
         "action": "continue",
@@ -315,14 +316,26 @@ def build_manager_prompts(
         "You are read-only: do not edit source, plans, git state, configuration, or run files.",
         "Accept or alter only the controller action exposed as eligible in the supplied context.",
         "Do not choose workflow nodes, teams, selectors, or business logic.",
+        *(
+            (
+                "When Lite, evaluate the rejection cause before choosing an action:",
+                "- For a bounded omission with a valid repair overlay, continue with the same worker.",
+                "- For broad misunderstanding or capability gaps, upgrade_next_implementation.",
+                "- For structural ambiguity or scope pressure, escalate_to_full.",
+                "Continue and upgrade are both legal first-rejection actions; neither is forced.",
+            )
+            if level == "lite"
+            else ()
+        ),
         f"Eligible actions at this boundary: {eligible_text}.",
         *(
             (
-                "This is the first reviewer rejection in the active implementation scope and "
-                "a worker upgrade is eligible. Choose upgrade_next_implementation now; do not "
-                "continue with the same worker or escalate to Full before applying this upgrade.",
+                "When Full, repartition_current_checkpoint splits the current "
+                "checkpoint into smaller children. Use it only for structural "
+                "oversize/indivisibility that stalls the scope. Do not name "
+                "workflow steps, teams, or business logic. next_step_notes must be [].",
             )
-            if require_first_rejection_upgrade
+            if level == "full" and "repartition_current_checkpoint" in eligible_actions
             else ()
         ),
         "Return exactly one JSON object with schema_version, action, reason, next_step_notes, and stop_report.",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 from aflow.analyzer import extract_aflow_stop
@@ -14,6 +15,7 @@ from aflow.manager_context import (
     scoped_reviewer_rejection_count,
 )
 from aflow.stop_marker import detect_stop_marker
+from aflow.repartition import create_envelope, write_envelope_atomic
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -58,6 +60,36 @@ def _run(tmp_path: Path) -> tuple[Path, Path]:
     run_dir = repo / ".aflow" / "runs" / "run-1"
     _write_json(run_dir / "run.json", {"plan_path": str(plan), "active_plan_path": str(plan), "original_plan_path": str(plan), "team": "base", "turns_completed": 1, "max_turns": 5})
     return run_dir, plan
+
+
+def _enveloped_boundary(run_dir: Path, plan: Path) -> dict[str, object]:
+    """Create one controller-shaped selector-3 boundary with immutable scope evidence."""
+    scope_id = "plans/in-progress/plan.md::checkpoint-1::context"
+    envelope = create_envelope(
+        scope_id=scope_id,
+        original_plan_path="plans/in-progress/plan.md",
+        plan_text=plan.read_text(encoding="utf-8"),
+        checkpoint_index=1,
+    )
+    artifact = write_envelope_atomic(
+        envelope,
+        run_dir / "scopes" / envelope.scope_digest,
+    )
+    artifact_bytes = artifact.read_bytes()
+    return {
+        "context_schema_version": 3,
+        "active_implementation_scope": {
+            "scope_id": scope_id,
+            "checkpoint_index": 1,
+            "checkpoint_name": "Checkpoint 1: Context",
+            "opened_turn_number": 1,
+        },
+        "envelope_artifact_path": (
+            f"scopes/{envelope.scope_digest}/envelope.json"
+        ),
+        "envelope_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "envelope_canonical_sha256": envelope.canonical_envelope_sha256,
+    }
 
 
 def test_lite_and_full_context_keep_plan_boundary(tmp_path: Path) -> None:
@@ -391,3 +423,429 @@ def test_rejection_summaries_normalize_bound_and_extract_summary(tmp_path: Path)
     repair.write_text("# Repair\n\n## Summary\n  Fix   [red] output.\n\n## Steps\n- ignored\n", encoding="utf-8")
     assert summarize_repair_plan(repair) == "Fix [red] output."
     assert summarize_repair_plan(tmp_path / "missing.md") is None
+
+
+# --- Schema v2 context tests ---
+
+
+def test_schema_v1_preserved_for_selector_2_boundary(tmp_path: Path) -> None:
+    """Selector-2 boundaries must produce byte-for-byte identical schema-v1."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context_v1 = build_manager_context(run_dir)
+    context_v2_boundary = build_manager_context(
+        run_dir,
+        boundary={"context_schema_version": 2},
+    )
+
+    assert context_v1["schema_version"] == 1
+    assert context_v2_boundary["schema_version"] == 1
+    # Same output (ignoring run_extract ordering which is already sort_keys=True)
+    assert context_v1 == context_v2_boundary
+
+
+def test_schema_v2_produced_for_selector_3_boundary(tmp_path: Path) -> None:
+    """Selector-3 boundaries produce schema v2 with new evidence fields."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        boundary={"context_schema_version": 3},
+    )
+
+    assert context["schema_version"] == 2
+    assert "scope_pressure_detected" in context
+    assert "change_surface_evidence" in context
+    assert "active_scope_rejection_ledger" in context
+    assert "manager_decisions" in context
+    assert context["scope_pressure_detected"] is False
+
+
+def test_schema_v2_detects_scope_pressure(tmp_path: Path) -> None:
+    """Schema v2 context detects AFLOW_SCOPE_PRESSURE in turn output."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(
+        run_dir, 1, step="implement", role="implementer",
+        stdout="AFLOW_SCOPE_PRESSURE: checkpoint too large\nsome output",
+    )
+
+    context = build_manager_context(
+        run_dir,
+        boundary={"context_schema_version": 3},
+    )
+
+    assert context["schema_version"] == 2
+    assert context["scope_pressure_detected"] is True
+
+
+def test_schema_v2_includes_change_surface_evidence(tmp_path: Path) -> None:
+    """Schema v2 includes change-surface progress evidence."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+    _write_turn(run_dir, 2, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        boundary={"context_schema_version": 3},
+    )
+
+    evidence = context["change_surface_evidence"]
+    assert evidence["unchanged_snapshot_turns"] == 2
+    assert "reviewer_rejection_count" in evidence
+    assert "reviewer_non_convergence" in evidence
+
+
+def test_schema_v2_lite_context_omits_plan_content(tmp_path: Path) -> None:
+    """Lite context in schema v2 must not include active/original plan content."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={"context_schema_version": 3},
+    )
+
+    assert context["active_plan_content"] is None
+    assert context["original_plan_content"] is None
+
+
+def test_schema_v2_full_includes_active_plan_content(tmp_path: Path) -> None:
+    """Full context in schema v2 includes active plan content."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary={"context_schema_version": 3},
+    )
+
+    assert context["active_plan_content"] is not None
+    assert "Secret implementation plan" in context["active_plan_content"]
+
+
+def test_schema_v2_full_uses_validated_immutable_envelope_payload(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=_enveloped_boundary(run_dir, plan),
+    )
+
+    envelope = context["envelope"]
+    assert envelope is not None
+    assert envelope["validated"] is True
+    assert envelope["available"] is True
+    assert envelope["plan_text"] == plan.read_text(encoding="utf-8")
+    assert envelope["checkpoint_text"] == (
+        "### [ ] Checkpoint 1: Context\n- [ ] private instruction\n"
+    )
+    assert envelope["plan_sha256"] == hashlib.sha256(
+        plan.read_bytes()
+    ).hexdigest()
+    assert envelope["checkpoint_byte_start"] < envelope["checkpoint_byte_end"]
+    assert envelope["checkpoint_line_start"] == 3
+    assert envelope["heading_prefix"] == "### [ ] Checkpoint 1: Context\n"
+    assert envelope["source_blocks"]
+    assert context["original_plan_content"] == plan.read_text(encoding="utf-8")
+    assert context["controller_state"]["repartition_evidence"] == {
+        "status": "validated"
+    }
+
+
+def test_schema_v2_lite_redacts_validated_envelope_content(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary=_enveloped_boundary(run_dir, plan),
+    )
+
+    envelope = context["envelope"]
+    assert set(envelope) == {
+        "available",
+        "validated",
+        "content_included",
+        "artifact_path",
+        "artifact_sha256",
+        "canonical_envelope_sha256",
+    }
+    assert envelope["available"] is True
+    assert envelope["validated"] is True
+    assert envelope["content_included"] is False
+    assert "Secret implementation plan" not in json.dumps(context)
+    assert "private instruction" not in json.dumps(context)
+
+
+def test_schema_v2_lite_redacts_exact_reviewer_output(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    exact_reviewer_output = "REJECTED: secret reviewer evidence"
+    _write_turn(
+        run_dir,
+        1,
+        step="review",
+        role="reviewer",
+        stdout=exact_reviewer_output,
+    )
+
+    context = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={"context_schema_version": 3},
+    )
+
+    serialized = json.dumps(context)
+    assert exact_reviewer_output not in serialized
+    assert context["finished_turn"]["semantic_result"]["result"].startswith(
+        "Reviewer output withheld"
+    )
+    assert context["finished_turn"]["diagnostics"]["stdout_excerpt"].startswith(
+        "Reviewer output withheld"
+    )
+    assert context["run_extract"][0]["semantic_summary"].startswith(
+        "Reviewer output withheld"
+    )
+
+
+def test_schema_v2_marks_incomplete_envelope_evidence_unavailable(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary={
+            "context_schema_version": 3,
+            "active_implementation_scope": {
+                "scope_id": "plans/in-progress/plan.md::checkpoint-1::context",
+                "checkpoint_index": 1,
+                "checkpoint_name": "Checkpoint 1: Context",
+            },
+            "envelope_artifact_path": "scopes/missing/envelope.json",
+        },
+    )
+
+    assert context["envelope"] == {
+        "available": False,
+        "validated": False,
+        "reason": (
+            "the active implementation scope has incomplete immutable envelope "
+            "references"
+        ),
+    }
+    assert context["controller_state"]["repartition_evidence"]["status"] == "unavailable"
+
+
+# --- Schema v2 with captured boundary inputs ---
+
+
+def test_schema_v2_rejection_ledger_from_boundary(tmp_path: Path) -> None:
+    """Active-scope rejection ledger populated from boundary rejection history."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="rejected")
+
+    context = build_manager_context(
+        run_dir,
+        boundary={
+            "context_schema_version": 3,
+            "active_implementation_scope": {
+                "scope_id": "plan.md::checkpoint-1::context",
+                "opened_turn_number": 1,
+            },
+            "review_rejection_history": [
+                {
+                    "scope_id": "plan.md::checkpoint-1::context",
+                    "rejection_number": 1,
+                    "source_run_id": "run-1",
+                    "review_turn_number": 1,
+                    "review_step_name": "review",
+                    "reviewer_selector": "codex.nano",
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "Context",
+                    "reviewed_implementation_turn_number": 0,
+                    "reviewed_worker_team": "base",
+                    "reviewed_worker_selector": "codex.default",
+                    "review_summary": "incomplete",
+                    "repair_plan_summary": None,
+                    "review_stdout_artifact_path": "turns/turn-001/stdout.txt",
+                    "repair_plan_path": None,
+                },
+                {
+                    "scope_id": "plan.md::checkpoint-1::context",
+                    "rejection_number": 2,
+                    "source_run_id": "run-1",
+                    "review_turn_number": 2,
+                    "review_step_name": "review",
+                    "reviewer_selector": "codex.high",
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "Context",
+                    "reviewed_implementation_turn_number": 1,
+                    "reviewed_worker_team": "high",
+                    "reviewed_worker_selector": "codex.worker-high",
+                    "review_summary": "still incomplete",
+                    "repair_plan_summary": "fix x",
+                    "review_stdout_artifact_path": "turns/turn-002/stdout.txt",
+                    "repair_plan_path": "plans/repair.md",
+                },
+            ],
+        },
+    )
+
+    assert context["schema_version"] == 2
+    ledger = context["active_scope_rejection_ledger"]
+    assert len(ledger) == 2
+    assert ledger[0]["rejection_number"] == 1
+    assert ledger[0]["reviewer_selector"] == "codex.nano"
+    assert ledger[1]["rejection_number"] == 2
+    assert ledger[1]["reviewed_worker_team"] == "high"
+
+
+def test_schema_v2_implementation_attempts_from_boundary(tmp_path: Path) -> None:
+    """Implementation attempts filtered to active scope from boundary."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="worker", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        boundary={
+            "context_schema_version": 3,
+            "active_implementation_scope": {
+                "scope_id": "plan.md::checkpoint-1::context",
+                "opened_turn_number": 1,
+            },
+            "implementation_attempts": {
+                "plan.md::checkpoint-1::context": [
+                    {
+                        "turn_number": 1,
+                        "step_name": "implement",
+                        "role": "worker",
+                        "team": "base",
+                        "selector": "codex.default",
+                        "outcome": "progress",
+                        "manager_decision_number": None,
+                    },
+                    {
+                        "turn_number": 3,
+                        "step_name": "implement",
+                        "role": "worker",
+                        "team": "high",
+                        "selector": "codex.worker-high",
+                        "outcome": "progress",
+                        "manager_decision_number": 2,
+                    },
+                ],
+                "other-scope": [
+                    {"turn_number": 5, "step_name": "other", "role": "worker", "team": "base", "selector": "x", "outcome": "progress"},
+                ],
+            },
+        },
+    )
+
+    assert context["schema_version"] == 2
+    attempts = context["implementation_attempts"]
+    assert attempts is not None
+    assert attempts["scope_id"] == "plan.md::checkpoint-1::context"
+    assert len(attempts["attempts"]) == 2
+    assert attempts["attempts"][0]["team"] == "base"
+    assert attempts["attempts"][1]["team"] == "high"
+
+
+def test_schema_v2_bounded_manager_decisions_excludes_current(tmp_path: Path) -> None:
+    """Manager decisions only include those strictly before the current decision."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+    _write_json(
+        run_dir / "manager" / "decision-001" / "result.json",
+        {"decision_number": 1, "status": "accepted", "action": "continue", "reason": "first"},
+    )
+    _write_json(
+        run_dir / "manager" / "decision-002" / "result.json",
+        {"decision_number": 2, "status": "accepted", "action": "continue", "reason": "second"},
+    )
+
+    context = build_manager_context(
+        run_dir,
+        boundary={"context_schema_version": 3},
+        decision_number=2,
+    )
+
+    assert context["schema_version"] == 2
+    decisions = context["manager_decisions"]
+    assert len(decisions) == 1
+    assert decisions[0]["decision_number"] == 1
+    assert decisions[0]["reason"] == "first"
+
+
+def test_schema_v2_full_includes_latest_rejection_detail(tmp_path: Path) -> None:
+    """Full context includes exact reviewer output from latest rejection artifact."""
+    run_dir, _ = _run(tmp_path)
+    review_stdout = "REJECTED: missing edge case handling in the implementation"
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout=review_stdout)
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary={
+            "context_schema_version": 3,
+            "active_implementation_scope": {
+                "scope_id": "plan.md::checkpoint-1::context",
+                "opened_turn_number": 1,
+            },
+            "review_rejection_history": [
+                {
+                    "scope_id": "plan.md::checkpoint-1::context",
+                    "rejection_number": 1,
+                    "source_run_id": "run-1",
+                    "review_turn_number": 1,
+                    "review_step_name": "review",
+                    "reviewer_selector": "codex.nano",
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "Context",
+                    "reviewed_implementation_turn_number": 0,
+                    "reviewed_worker_team": "base",
+                    "reviewed_worker_selector": "codex.default",
+                    "review_summary": "incomplete",
+                    "repair_plan_summary": None,
+                    "review_stdout_artifact_path": "turns/turn-001/stdout.txt",
+                    "repair_plan_path": None,
+                },
+            ],
+        },
+    )
+
+    assert context["schema_version"] == 2
+    latest = context["controller_state"].get("latest_full_rejection")
+    assert latest is not None
+    assert latest["rejection_number"] == 1
+    assert latest["exact_reviewer_output"] is not None
+    assert "missing edge case" in latest["exact_reviewer_output"]
+
+
+def test_schema_v2_scope_pressure_reason_in_controller_state(tmp_path: Path) -> None:
+    """Scope pressure reason from boundary propagated to controller_state."""
+    run_dir, _ = _run(tmp_path)
+    _write_turn(
+        run_dir, 1, step="implement", role="implementer",
+        stdout="AFLOW_SCOPE_PRESSURE: checkpoint too large\noutput",
+    )
+
+    context = build_manager_context(
+        run_dir,
+        boundary={
+            "context_schema_version": 3,
+            "scope_pressure_reason": "checkpoint too large",
+        },
+    )
+
+    assert context["schema_version"] == 2
+    assert context["scope_pressure_detected"] is True
+    cs = context["controller_state"]
+    assert cs["scope_pressure_detected"] is True
+    assert cs["scope_pressure_reason"] == "checkpoint too large"

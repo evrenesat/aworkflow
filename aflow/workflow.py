@@ -65,6 +65,7 @@ from .recovery import (
 from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
 from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
+from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
 from aflow.api.events import (
     ManagerDecidedEvent,
@@ -390,6 +391,36 @@ def _validate_existing_scope_envelope(
         load_scope_envelope_for_resume(run_dir, scope)
 
 
+def _require_valid_pressure_scope(
+    run_dir: Path,
+    scope: ActiveImplementationScope | None,
+) -> None:
+    """Require immutable scope authority before pressure may reach a manager.
+
+    ``AFLOW_SCOPE_PRESSURE`` is meaningful only for an actively supervised
+    original-checkpoint scope.  Reuse the resume validator here so a pressure
+    boundary gets the same path, hash, parser, and scope-identity checks as
+    capture and resume instead of a weaker parallel interpretation.
+    """
+    if scope is None:
+        raise WorkflowError(
+            "AFLOW_SCOPE_PRESSURE requires an active implementation scope with "
+            "a validated immutable envelope; no active implementation scope is open"
+        )
+    try:
+        reference = _scope_envelope_reference(scope)
+        if reference is None:
+            raise WorkflowError(
+                "invalid scope envelope reference: legacy scope has no artifact"
+            )
+        load_scope_envelope_for_resume(run_dir, scope)
+    except WorkflowError as exc:
+        raise WorkflowError(
+            "AFLOW_SCOPE_PRESSURE requires an active implementation scope with "
+            f"a validated immutable envelope: {exc.summary}"
+        ) from exc
+
+
 def _validate_plan_copies_agree(
     *,
     primary_plan_path: Path,
@@ -521,11 +552,17 @@ class _PreparedPrimaryPlanForMerge:
     original_text: str | None
 
 
-def _turn_artifact_display_path(repo_root: Path, turn_dir: Path, filename: str) -> str | None:
+def _turn_artifact_display_path(
+    repo_root: Path,
+    turn_dir: Path,
+    filename: str,
+    *,
+    content: str | None = None,
+) -> str | None:
     artifact_path = turn_dir / filename
-    if not artifact_path.is_file():
-        return None
-    if not artifact_path.read_text(encoding="utf-8").strip():
+    if content is not None:
+        return str(artifact_path.relative_to(repo_root)) if content.strip() else None
+    if not artifact_path.is_file() or not artifact_path.read_text(encoding="utf-8").strip():
         return None
     return str(artifact_path.relative_to(repo_root))
 
@@ -4300,9 +4337,11 @@ def run_workflow(
         stalled = int(controller.get("semantic_stall_count", 0) or 0)
         reviewer_failures = int(controller.get("reviewer_rejection_count", 0) or 0)
         trigger = context.get("trigger")
+        scope_pressure = bool(controller.get("scope_pressure_detected"))
         if (
             stalled >= workflow_config.manager.full_after_stalled_turns
             or reviewer_failures >= 2
+            or scope_pressure
             or trigger in {"explicit_stop", "invalid_plan", "ambiguous_failure", "same_step_cap", "max_turns", "merge_failure", "illegal_transition"}
         ):
             return "full"
@@ -4469,10 +4508,22 @@ def run_workflow(
         context_run_dir: Path | None = None,
         finalized_turn_number: int | None = None,
         artifact_path: str | None = None,
+        scope_pressure_reason: str | None = None,
     ) -> str:
         """Accept or replace the controller transition after a durable turn."""
+        if scope_pressure_reason is not None and not workflow_config.manager.enabled:
+            raise WorkflowError(
+                f"AFLOW_SCOPE_PRESSURE detected ('{scope_pressure_reason}') but manager supervision is disabled; "
+                f"scope-pressure rerouting requires an enabled manager",
+                run_dir=run_paths.run_dir,
+            )
         if not workflow_config.manager.enabled:
             return proposed_transition
+        if scope_pressure_reason is not None:
+            _require_valid_pressure_scope(
+                run_paths.run_dir,
+                state.active_implementation_scope,
+            )
         next_step = None if proposed_transition == "END" else proposed_transition
         candidate_step = wf.steps.get(next_step) if next_step is not None else None
         target_plan_identity = _target_plan_identity(active_plan_path)
@@ -4554,6 +4605,28 @@ def run_workflow(
             backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
             active_implementation_scope=scope_context,
             eligible_actions=sorted(eligible),
+            scope_pressure_reason=scope_pressure_reason,
+            # Immutable controller-owned copies for deterministic v2 reconstruction.
+            review_rejection_history=[asdict(r) for r in state.review_rejection_history],
+            implementation_attempts={
+                sid: [asdict(a) for a in atts]
+                for sid, atts in state.implementation_attempts.items()
+            },
+            envelope_artifact_path=(
+                str(scope.envelope_artifact_path)
+                if scope is not None and scope.envelope_artifact_path is not None
+                else None
+            ),
+            envelope_artifact_sha256=(
+                str(scope.envelope_artifact_sha256)
+                if scope is not None and scope.envelope_artifact_sha256 is not None
+                else None
+            ),
+            envelope_canonical_sha256=(
+                str(scope.envelope_canonical_sha256)
+                if scope is not None and scope.envelope_canonical_sha256 is not None
+                else None
+            ),
         )
         # Build once to select Lite or Full without exposing plan text to Lite.
         selection_context = build_manager_context(
@@ -5879,7 +5952,8 @@ def run_workflow(
                 review_summary=summarize_review_rejection(completed.stdout),
                 repair_plan_summary=summarize_repair_plan(repair_path),
                 review_stdout_artifact_path=_turn_artifact_display_path(
-                    run_paths.repo_root, turn_dir, "stdout.txt"
+                    run_paths.repo_root, turn_dir, "stdout.txt",
+                    content=completed.stdout,
                 ),
                 repair_plan_path=repair_path_text,
             )
@@ -6033,6 +6107,19 @@ def run_workflow(
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
+        # Detect scope pressure from the finalized turn before the manager gate.
+        # Stop already won at this point (checked at line 5257).  When pressure
+        # is present, _manager_gate forces Full or fails clearly for disabled
+        # supervision; it must not reach the stop path with a simultaneous
+        # real AFLOW_STOP marker.
+        scope_pressure = parse_scope_pressure(
+            (turn_dir / "stdout.txt").read_text(encoding="utf-8")
+            if (turn_dir / "stdout.txt").is_file() else "",
+            (turn_dir / "stderr.txt").read_text(encoding="utf-8")
+            if (turn_dir / "stderr.txt").is_file() else "",
+        )
+        scope_pressure_reason = scope_pressure.reason if scope_pressure.detected else None
+
         transition_target = _manager_gate(
             proposed_transition=transition_target,
             current_step=current_step_name,
@@ -6040,6 +6127,7 @@ def run_workflow(
             active_team=active_team_name,
             active_selector=selector,
             post_transition_active_path=post_transition_active_path,
+            scope_pressure_reason=scope_pressure_reason,
         )
 
         if transition_target != "END":
