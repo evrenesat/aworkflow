@@ -6,15 +6,20 @@
   back to the advanced original plan before the saved-plan existence fence.
 - Restricted recovery to a durable nonterminal worker boundary with no new
   plan and an active scope whose original checkpoint demonstrably advanced.
+- Skipped the fresh-run Pre-Handoff Base HEAD refresh gate for explicit resume
+  requests, leaving resume-candidate and reused-worktree validation unchanged.
 - Added runtime coverage proving review is replayed without rerunning the
-  worker, while unrelated missing saved plans remain fatal.
+  worker, startup coverage for an advanced primary checkout, and the existing
+  fatal behavior for unrelated missing saved plans.
 
 ### Why
 
 - A successful repair worker removed its finished overlay and advanced the
   original plan, then the controller exited before persisting the boundary.
   Standard resume rejected the intentionally removed overlay before it could
-  replay the already finalized transition into review.
+  replay the already finalized transition into review; after installing that
+  repair, CLI startup also rejected the legitimately advanced primary HEAD
+  before resolving the explicit resume.
 
 ## 2026-07-29 — Manager worker-upgrade documentation
 

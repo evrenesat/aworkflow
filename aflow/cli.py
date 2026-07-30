@@ -1374,6 +1374,12 @@ def main(argv: list[str] | None = None) -> int:
 
     startup_workflow_name = workflow_arg or workflow_config.aflow.default_workflow
     startup_start_step = args.start_step
+    requested_resume_run_id: str | None = None
+    require_resume = False
+    if args.resume is not None:
+        require_resume = True
+        if args.resume != "AUTO":
+            requested_resume_run_id = args.resume
 
     startup_request = StartupRequest(
         repo_root=repo_root,
@@ -1385,18 +1391,12 @@ def main(argv: list[str] | None = None) -> int:
         max_turns=args.max_turns,
         team=args.team,
         extra_instructions=extra_instructions,
+        resume_requested=require_resume,
     )
 
     prepared_run = _handle_startup_questions(startup_request)
     if prepared_run is None:
         return 1
-
-    requested_resume_run_id: str | None = None
-    require_resume = False
-    if args.resume is not None:
-        require_resume = True
-        if args.resume != "AUTO":
-            requested_resume_run_id = args.resume
 
     try:
         resume_ctx = _detect_resume_candidate(

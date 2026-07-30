@@ -366,35 +366,46 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
             request.config_path,
         )
 
-    startup_base_head_refresh = _preflight_startup_base_head_refresh(request, parsed_plan)
-    if startup_base_head_refresh.status in {
-        StartupBaseHeadRefreshStatus.MALFORMED,
-        StartupBaseHeadRefreshStatus.EMPTY_BASE_STARTED,
-        StartupBaseHeadRefreshStatus.MISMATCH_STARTED,
-    }:
-        raise StartupError(
-            f"startup preflight rejected Pre-Handoff Base HEAD state: "
-            f"{startup_base_head_refresh.status.value}"
+    effective_startup_base_head_refresh_sha = None
+    if not request.resume_requested:
+        startup_base_head_refresh = _preflight_startup_base_head_refresh(
+            request,
+            parsed_plan,
         )
+        if startup_base_head_refresh.status in {
+            StartupBaseHeadRefreshStatus.MALFORMED,
+            StartupBaseHeadRefreshStatus.EMPTY_BASE_STARTED,
+            StartupBaseHeadRefreshStatus.MISMATCH_STARTED,
+        }:
+            raise StartupError(
+                f"startup preflight rejected Pre-Handoff Base HEAD state: "
+                f"{startup_base_head_refresh.status.value}"
+            )
 
-    effective_startup_base_head_refresh_sha = request.startup_base_head_refresh_sha
-    if startup_base_head_refresh.status in {
-        StartupBaseHeadRefreshStatus.EMPTY_BASE_PRISTINE,
-        StartupBaseHeadRefreshStatus.MISMATCH_PRISTINE,
-    } and effective_startup_base_head_refresh_sha is None:
-        effective_startup_base_head_refresh_sha = startup_base_head_refresh.current_head
-    if (
-        startup_base_head_refresh.status
-        in {
+        effective_startup_base_head_refresh_sha = (
+            request.startup_base_head_refresh_sha
+        )
+        if startup_base_head_refresh.status in {
             StartupBaseHeadRefreshStatus.EMPTY_BASE_PRISTINE,
             StartupBaseHeadRefreshStatus.MISMATCH_PRISTINE,
-        }
-        and effective_startup_base_head_refresh_sha is not None
-        and startup_base_head_refresh.current_head != effective_startup_base_head_refresh_sha
-    ):
-        raise StartupError(
-            "startup refresh target does not match current HEAD for Pre-Handoff Base HEAD refresh"
-        )
+        } and effective_startup_base_head_refresh_sha is None:
+            effective_startup_base_head_refresh_sha = (
+                startup_base_head_refresh.current_head
+            )
+        if (
+            startup_base_head_refresh.status
+            in {
+                StartupBaseHeadRefreshStatus.EMPTY_BASE_PRISTINE,
+                StartupBaseHeadRefreshStatus.MISMATCH_PRISTINE,
+            }
+            and effective_startup_base_head_refresh_sha is not None
+            and startup_base_head_refresh.current_head
+            != effective_startup_base_head_refresh_sha
+        ):
+            raise StartupError(
+                "startup refresh target does not match current HEAD for "
+                "Pre-Handoff Base HEAD refresh"
+            )
 
     is_dirty, dirty_desc = _check_worktree_dirtiness(request, workflow_name)
     if is_dirty and not request.dirty_worktree_confirmed:

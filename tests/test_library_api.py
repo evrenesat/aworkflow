@@ -647,6 +647,108 @@ class LibraryStartupTests(unittest.TestCase):
         assert isinstance(result, PreparedRun)
         self.assertEqual(result.startup_base_head_refresh_sha, current_head)
 
+    def test_prepare_startup_resume_skips_started_base_head_mismatch(self) -> None:
+        subprocess.run(
+            ['git', 'init', '-b', 'main'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'user.email', 'test@test.com'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'user.name', 'Test'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+        readme_path = self.repo_root / 'README.md'
+        readme_path.write_text('init\n', encoding='utf-8')
+        subprocess.run(
+            ['git', 'add', 'README.md'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'commit', '-m', 'init'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+        base_head = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        config_path = _write_config(
+            self.home_dir,
+            (
+                '[aflow]\ndefault_workflow = "test"\n\n'
+                '[workflow.test.steps.step1]\n'
+                'role = "architect"\nprompts = ["p"]\n'
+                'go = [{to = "END"}]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                '[roles]\narchitect = "opencode.default"\n\n'
+                '[prompts]\np = "do it"\n'
+            ),
+        )
+        workflow_config = load_workflow_config(config_path)
+        plan_path = self.repo_root / 'plan.md'
+        plan_path.write_text(
+            textwrap.dedent(
+                f"""\
+                # Plan
+
+                ## Git Tracking
+
+                - Plan Branch: `feature/work`
+                - Pre-Handoff Base HEAD: `{base_head}`
+
+                ### [ ] Checkpoint 1: Test
+                - [ ] step one
+                """
+            ),
+            encoding='utf-8',
+        )
+        subprocess.run(
+            ['git', 'add', 'plan.md'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'commit', '-m', 'add started plan'],
+            cwd=str(self.repo_root),
+            check=True,
+            capture_output=True,
+        )
+
+        result = prepare_startup(
+            StartupRequest(
+                repo_root=self.repo_root,
+                plan_path=plan_path,
+                config_path=config_path,
+                workflow_config=workflow_config,
+                workflow_name='test',
+                start_step=None,
+                max_turns=None,
+                team=None,
+                extra_instructions=(),
+                resume_requested=True,
+            )
+        )
+
+        self.assertIsInstance(result, PreparedRun)
+        assert isinstance(result, PreparedRun)
+        self.assertIsNone(result.startup_base_head_refresh_sha)
+
 
 class LibraryRunnerTests(unittest.TestCase):
     """Test the public runner library API with events."""

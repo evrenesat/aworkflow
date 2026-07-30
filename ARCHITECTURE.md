@@ -74,6 +74,10 @@ plan back to the original plan before replay. This recovery is permitted only
 when the durable turn records a nonterminal worker transition with no new plan
 and the saved implementation scope proves that the original checkpoint
 advanced; an otherwise missing saved active plan remains a hard failure.
+An explicit resume also bypasses the fresh-run Pre-Handoff Base HEAD refresh
+gate during startup preparation. Resume candidate validation and the reused
+worktree checks remain authoritative, and runtime does not rewrite the started
+plan's recorded base merely because the primary checkout advanced meanwhile.
 Follow-up plan version discovery runs in the execution checkout. An already
 active repair overlay is not reported as newly created, so approval returns the
 next checkpoint worker to the original plan while a newly written next-version

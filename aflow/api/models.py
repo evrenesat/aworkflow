@@ -49,6 +49,7 @@ class StartupRequest:
     startup_retry_error: str | None = None
     startup_base_head_refresh_sha: str | None = None
     dirty_worktree_confirmed: bool = False
+    resume_requested: bool = False
 
 
 @dataclass(frozen=True)
