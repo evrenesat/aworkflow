@@ -143,10 +143,10 @@ def _open_implementation_scope(
     original_plan_path: Path,
     original_snapshot: PlanSnapshot,
     turn_number: int,
-) -> ActiveImplementationScope:
-    """Open once for an original checkpoint and reuse across repair plans."""
+) -> tuple[ActiveImplementationScope, bool]:
+    """Open once for an original checkpoint and report whether it is new."""
     if state.active_implementation_scope is not None:
-        return state.active_implementation_scope
+        return state.active_implementation_scope, False
     index = original_snapshot.current_checkpoint_index
     name = original_snapshot.current_checkpoint_name
     scope = ActiveImplementationScope(
@@ -160,7 +160,7 @@ def _open_implementation_scope(
         opened_turn_number=turn_number,
     )
     state.active_implementation_scope = scope
-    return scope
+    return scope, True
 
 
 def _original_checkpoint_advanced(
@@ -172,7 +172,6 @@ def _original_checkpoint_advanced(
     if scope.checkpoint_index is None or snapshot.current_checkpoint_index is None:
         return False
     return snapshot.current_checkpoint_index > scope.checkpoint_index
-
 
 def _resume_completed_worker_can_use_original_plan(
     *,
@@ -201,6 +200,225 @@ def _resume_completed_worker_can_use_original_plan(
     ):
         return False
     return _exec_plan_path(original_plan_path, exec_ctx).is_file()
+
+
+def _capture_scope_envelope(
+    state: ControllerState,
+    *,
+    plan_text: str | None,
+    primary_plan_path: Path,
+    run_dir: Path,
+    exec_ctx: ExecutionContext | None,
+    repo_root: Path | None = None,
+) -> None:
+    """Capture and persist an immutable scope envelope at new-scope opening.
+
+    Must be called after ``_open_implementation_scope`` but before the first
+    worker harness invocation.  Idempotent: returns immediately when the
+    active scope already has an envelope artifact.
+
+    Raises ``WorkflowError`` when primary and execution plan copies disagree.
+    """
+    scope = state.active_implementation_scope
+    if scope is None:
+        return
+    reference_values = (
+        scope.envelope_artifact_path,
+        scope.envelope_artifact_sha256,
+        scope.envelope_canonical_sha256,
+    )
+    if any(value is not None for value in reference_values):
+        if scope.has_envelope:
+            # Envelope already captured — reuse across repair overlays,
+            # retries, one-edge upgrades, reviewer turns, and manager boundaries;
+            # a complete modern reference still fails closed if its immutable
+            # artifact was removed or altered.
+            load_scope_envelope_for_resume(run_dir, scope)
+            return
+        raise WorkflowError("cannot capture scope envelope: partial envelope reference")
+
+    # Require primary and execution original-plan copies to agree when both exist.
+    _validate_plan_copies_agree(
+        primary_plan_path=primary_plan_path,
+        exec_ctx=exec_ctx,
+    )
+
+    try:
+        primary_bytes = primary_plan_path.read_bytes()
+        decoded_plan_text = primary_bytes.decode("utf-8", "strict")
+        if plan_text is not None and decoded_plan_text != plan_text:
+            raise ValueError("provided plan text does not match primary plan bytes")
+        resolved_repo_root = (repo_root or primary_plan_path.parent).resolve()
+        from .repartition import (
+            create_envelope,
+            parse_envelope_bytes,
+            write_envelope_atomic,
+        )
+
+        checkpoint_index = scope.checkpoint_index if scope.checkpoint_index is not None else 0
+        envelope = create_envelope(
+            scope_id=scope.scope_id,
+            original_plan_path=primary_plan_path,
+            plan_text=decoded_plan_text,
+            checkpoint_index=checkpoint_index,
+            repo_root=resolved_repo_root,
+        )
+        envelope_path = write_envelope_atomic(
+            envelope,
+            run_dir / "scopes" / envelope.scope_digest,
+        )
+        artifact_bytes = envelope_path.read_bytes()
+        parsed = parse_envelope_bytes(artifact_bytes)
+        reference = replace(
+            scope,
+            envelope_artifact_path=(
+                envelope_path.resolve().relative_to(run_dir.resolve()).as_posix()
+            ),
+            envelope_artifact_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
+            envelope_canonical_sha256=parsed.canonical_envelope_sha256,
+        )
+        _validate_scope_envelope_bytes(reference, artifact_bytes)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise WorkflowError(f"cannot capture scope envelope: {exc}") from exc
+
+    state.active_implementation_scope = reference
+
+
+def _scope_envelope_reference(
+    scope: ActiveImplementationScope,
+) -> tuple[str, str, str] | None:
+    """Return a complete, layout-bound modern reference or fail closed."""
+    values = (
+        scope.envelope_artifact_path,
+        scope.envelope_artifact_sha256,
+        scope.envelope_canonical_sha256,
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise WorkflowError("invalid scope envelope reference: partial reference")
+    if not all(isinstance(value, str) and value for value in values):
+        raise WorkflowError("invalid scope envelope reference: fields must be nonempty strings")
+    artifact_path, artifact_sha256, canonical_sha256 = values
+    if not isinstance(scope.scope_id, str) or not scope.scope_id:
+        raise WorkflowError("invalid scope envelope reference: scope_id is invalid")
+    expected_digest = hashlib.sha256(scope.scope_id.encode("utf-8")).hexdigest()
+    expected_path = f"scopes/{expected_digest}/envelope.json"
+    if artifact_path != expected_path:
+        raise WorkflowError(
+            "invalid scope envelope reference: artifact path must be "
+            f"{expected_path}"
+        )
+    for field_name, value in (
+        ("artifact SHA-256", artifact_sha256),
+        ("canonical SHA-256", canonical_sha256),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise WorkflowError(
+                f"invalid scope envelope reference: {field_name} is invalid"
+            )
+    return artifact_path, artifact_sha256, canonical_sha256
+
+
+def _validate_scope_envelope_bytes(
+    scope: ActiveImplementationScope,
+    artifact_bytes: bytes,
+) -> None:
+    """Bind exact artifact bytes and parsed envelope authority to one scope."""
+    reference = _scope_envelope_reference(scope)
+    if reference is None:
+        raise WorkflowError("invalid scope envelope reference: legacy scope has no artifact")
+    _artifact_path, artifact_sha256, canonical_sha256 = reference
+    actual_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    if actual_sha256 != artifact_sha256:
+        raise WorkflowError("invalid scope envelope reference: artifact bytes hash mismatch")
+    try:
+        from .repartition import parse_envelope_bytes
+
+        envelope = parse_envelope_bytes(artifact_bytes)
+    except ValueError as exc:
+        raise WorkflowError(f"invalid scope envelope reference: corrupt envelope: {exc}") from exc
+    if envelope.scope_id != scope.scope_id:
+        raise WorkflowError("invalid scope envelope reference: scope_id mismatch")
+    if envelope.checkpoint_index != scope.checkpoint_index:
+        raise WorkflowError("invalid scope envelope reference: checkpoint index mismatch")
+    if envelope.checkpoint_name != scope.checkpoint_name:
+        raise WorkflowError("invalid scope envelope reference: checkpoint name mismatch")
+    expected_digest = hashlib.sha256(scope.scope_id.encode("utf-8")).hexdigest()
+    if envelope.scope_digest != expected_digest:
+        raise WorkflowError("invalid scope envelope reference: scope digest mismatch")
+    if envelope.canonical_envelope_sha256 != canonical_sha256:
+        raise WorkflowError("invalid scope envelope reference: canonical hash mismatch")
+
+
+def load_scope_envelope_for_resume(
+    source_run_dir: Path,
+    scope: ActiveImplementationScope,
+) -> bytes | None:
+    """Read and bind a source artifact before resume pruning can remove it."""
+    reference = _scope_envelope_reference(scope)
+    if reference is None:
+        return None
+    artifact_path, _artifact_sha256, _canonical_sha256 = reference
+    source_root = source_run_dir.resolve()
+    candidate = source_run_dir / artifact_path
+    if not candidate.exists():
+        raise WorkflowError("cannot resume: scope envelope artifact is missing from source run")
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(source_root)
+    except (OSError, ValueError) as exc:
+        raise WorkflowError(
+            "cannot resume: scope envelope artifact escapes source run"
+        ) from exc
+    if not resolved.is_file():
+        raise WorkflowError("cannot resume: scope envelope artifact is missing from source run")
+    try:
+        artifact_bytes = resolved.read_bytes()
+    except OSError as exc:
+        raise WorkflowError(f"cannot resume: cannot read scope envelope artifact: {exc}") from exc
+    _validate_scope_envelope_bytes(scope, artifact_bytes)
+    return artifact_bytes
+
+
+def _validate_existing_scope_envelope(
+    run_dir: Path,
+    scope: ActiveImplementationScope,
+) -> None:
+    """Fail closed for a modern active scope while retaining legacy scopes."""
+    if _scope_envelope_reference(scope) is not None:
+        load_scope_envelope_for_resume(run_dir, scope)
+
+
+def _validate_plan_copies_agree(
+    *,
+    primary_plan_path: Path,
+    exec_ctx: ExecutionContext | None,
+) -> None:
+    """Ensure primary and execution original-plan copies are byte-identical.
+
+    When a worktree is active and both copies exist, any divergence prevents
+    envelope capture.  The primary copy is always authoritative.
+    """
+    if exec_ctx is None or exec_ctx.worktree_path is None:
+        return
+    execution_path = _exec_plan_path(primary_plan_path, exec_ctx)
+    if not execution_path.is_file():
+        return
+    if not primary_plan_path.is_file():
+        raise WorkflowError(
+            "cannot capture scope envelope: primary plan is missing while "
+            f"execution copy exists at {execution_path}"
+        )
+    primary_bytes = primary_plan_path.read_bytes()
+    execution_bytes = execution_path.read_bytes()
+    if primary_bytes != execution_bytes:
+        raise WorkflowError(
+            "primary and execution original-plan copies must be identical "
+            "before scope-envelope capture: "
+            f"primary={primary_plan_path} "
+            f"execution={execution_path}"
+        )
 
 
 def _close_implementation_scope(state: ControllerState) -> None:
@@ -2439,6 +2657,26 @@ def run_workflow(
     )
     working_dir = working_dir or Path.cwd()
 
+    # Resume discovery carries already validated bytes so pruning the source
+    # run cannot turn a checked authority record into a late file read.
+    resumed_envelope_bytes = resume.scope_envelope_bytes if resume is not None else None
+    if resume is not None and resume.active_implementation_scope is not None:
+        reference = _scope_envelope_reference(resume.active_implementation_scope)
+        if reference is None:
+            if resumed_envelope_bytes is not None:
+                raise WorkflowError(
+                    "cannot resume: legacy scope unexpectedly carries envelope bytes"
+                )
+        elif resumed_envelope_bytes is None:
+            raise WorkflowError(
+                "cannot resume: modern scope envelope bytes were not validated before startup"
+            )
+        else:
+            _validate_scope_envelope_bytes(
+                resume.active_implementation_scope,
+                resumed_envelope_bytes,
+            )
+
     run_paths = create_run_paths(config)
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     state.run_id = run_paths.run_dir.name
@@ -2721,6 +2959,52 @@ def run_workflow(
         state.pending_step_team_override = resume.pending_step_team_override
         state.pending_boundary_decision = resume.pending_boundary_decision
         state.last_manager_report_path = resume.last_manager_report_path
+
+        # Carry the fully validated source artifact into the new run before
+        # any harness or manager call.  Do not consult the old source path.
+        if resumed_envelope_bytes is not None and state.active_implementation_scope is not None:
+            scope = state.active_implementation_scope
+            reference = _scope_envelope_reference(scope)
+            if reference is None:
+                raise WorkflowError(
+                    "cannot resume: legacy scope unexpectedly carries envelope bytes"
+                )
+            artifact_path, _artifact_sha256, _canonical_sha256 = reference
+            envelope_path = run_paths.run_dir / artifact_path
+            envelope_path.parent.mkdir(parents=True, exist_ok=True)
+            if not envelope_path.exists():
+                import os as _os
+                from uuid import uuid4 as _uuid4
+                tmp = envelope_path.with_name(f".envelope.json.{_uuid4().hex}.tmp")
+                try:
+                    tmp_fd = _os.open(str(tmp), _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+                    with _os.fdopen(tmp_fd, "wb") as handle:
+                        handle.write(resumed_envelope_bytes)
+                        handle.flush()
+                        _os.fsync(handle.fileno())
+                    _os.link(tmp, envelope_path)
+                except FileExistsError:
+                    existing = envelope_path.read_bytes()
+                    if existing != resumed_envelope_bytes:
+                        raise WorkflowError(
+                            "cannot resume: envelope artifact already exists with "
+                            "different bytes in new run"
+                        )
+                finally:
+                    try:
+                        tmp.unlink()
+                    except (FileNotFoundError, OSError):
+                        pass
+            else:
+                existing = envelope_path.read_bytes()
+                _validate_scope_envelope_bytes(scope, existing)
+                if existing != resumed_envelope_bytes:
+                    raise WorkflowError(
+                        "cannot resume: envelope artifact already exists with "
+                        "different bytes in new run"
+                    )
+
+            _validate_scope_envelope_bytes(scope, envelope_path.read_bytes())
         try:
             _validate_worktree_resume_context(config.repo_root, resume)
             exec_ctx = ExecutionContext(
@@ -4902,12 +5186,46 @@ def run_workflow(
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
             if step.role == "worker":
-                _open_implementation_scope(
-                    state,
-                    original_plan_path=original_plan_path,
-                    original_snapshot=state.last_snapshot,
-                    turn_number=turn_number,
-                )
+                try:
+                    _scope, scope_was_opened = _open_implementation_scope(
+                        state,
+                        original_plan_path=original_plan_path,
+                        original_snapshot=state.last_snapshot,
+                        turn_number=turn_number,
+                    )
+                    if scope_was_opened and not state.last_snapshot.is_complete:
+                        _capture_scope_envelope(
+                            state,
+                            plan_text=None,
+                            primary_plan_path=original_plan_path,
+                            run_dir=run_paths.run_dir,
+                            exec_ctx=exec_ctx,
+                            repo_root=config.repo_root,
+                        )
+                        write_run_metadata(
+                            run_paths, config, state, status="running",
+                            execution_context=exec_ctx,
+                            last_snapshot=state.last_snapshot,
+                            turns_completed=state.turns_completed,
+                            workflow_name=workflow_name,
+                            original_plan_path=original_plan_path,
+                            current_step_name=current_step_name,
+                            active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                            resumed_from_run_id=resumed_from_run_id,
+                        )
+                    elif not scope_was_opened:
+                        _validate_existing_scope_envelope(
+                            run_paths.run_dir,
+                            _scope,
+                        )
+                except WorkflowError as exc:
+                    _raise_pre_turn_failure(
+                        reason=exc.summary,
+                        snapshot=retry_ctx.snapshot_before,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
             pending_override = state.pending_step_team_override
             if (
                 pending_override is not None
@@ -5013,12 +5331,46 @@ def run_workflow(
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
             if step.role == "worker":
-                _open_implementation_scope(
-                    state,
-                    original_plan_path=original_plan_path,
-                    original_snapshot=current_plan.snapshot,
-                    turn_number=turn_number,
-                )
+                try:
+                    _scope, scope_was_opened = _open_implementation_scope(
+                        state,
+                        original_plan_path=original_plan_path,
+                        original_snapshot=current_plan.snapshot,
+                        turn_number=turn_number,
+                    )
+                    if scope_was_opened and not current_plan.snapshot.is_complete:
+                        _capture_scope_envelope(
+                            state,
+                            plan_text=None,
+                            primary_plan_path=original_plan_path,
+                            run_dir=run_paths.run_dir,
+                            exec_ctx=exec_ctx,
+                            repo_root=config.repo_root,
+                        )
+                        write_run_metadata(
+                            run_paths, config, state, status="running",
+                            execution_context=exec_ctx,
+                            last_snapshot=current_plan.snapshot,
+                            turns_completed=state.turns_completed,
+                            workflow_name=workflow_name,
+                            original_plan_path=original_plan_path,
+                            current_step_name=current_step_name,
+                            active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                            resumed_from_run_id=resumed_from_run_id,
+                        )
+                    elif not scope_was_opened:
+                        _validate_existing_scope_envelope(
+                            run_paths.run_dir,
+                            _scope,
+                        )
+                except WorkflowError as exc:
+                    _raise_pre_turn_failure(
+                        reason=exc.summary,
+                        snapshot=current_plan.snapshot,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                    )
             pending_override = state.pending_step_team_override
             if (
                 pending_override is not None

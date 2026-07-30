@@ -1,4 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
+import hashlib
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
 from aflow.api.events import ExecutionEventType
 from aflow.run_state import (
@@ -12,6 +13,36 @@ from aflow.run_state import (
     manager_resume_fields,
 )
 from aflow.runlog import create_run_paths, write_run_metadata
+
+
+def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
+    payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    scope = payload["active_implementation_scope"]
+    assert scope is not None
+    artifact_path = run_dir / scope["envelope_artifact_path"]
+    artifacts = list((run_dir / "scopes").glob("*/envelope.json"))
+    assert artifacts.count(artifact_path) == 1
+    artifact_bytes = artifact_path.read_bytes()
+    artifact_payload = json.loads(artifact_bytes)
+    assert (
+        scope["envelope_artifact_sha256"]
+        == hashlib.sha256(artifact_bytes).hexdigest()
+    )
+    assert (
+        scope["envelope_canonical_sha256"]
+        == artifact_payload["canonical_envelope_sha256"]
+    )
+    return (
+        scope["envelope_artifact_path"],
+        artifact_bytes,
+        scope["envelope_artifact_sha256"],
+        scope["envelope_canonical_sha256"],
+        scope["scope_id"],
+        scope["checkpoint_index"],
+        scope["checkpoint_name"],
+        len(artifacts),
+    )
+
 
 class WorkflowRuntimeTests(unittest.TestCase):
 
@@ -4813,9 +4844,19 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 awaiting_review=False,
             )
             captured_prompt: list[str] = []
+            next_scope_captured_before_worker: list[bool] = []
 
             def runner(argv, **kwargs):
                 captured_prompt.append(' '.join(argv))
+                run_dir = next((repo_root / '.aflow' / 'runs').iterdir())
+                payload = json.loads((run_dir / 'run.json').read_text())
+                resumed_scope = payload['active_implementation_scope']
+                next_scope_captured_before_worker.append(
+                    resumed_scope['checkpoint_index'] == 2
+                    and resumed_scope['envelope_artifact_path'] is not None
+                    and resumed_scope['envelope_artifact_sha256'] is not None
+                    and resumed_scope['envelope_canonical_sha256'] is not None
+                )
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             result = run_workflow(
@@ -4867,6 +4908,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             )
 
             assert len(captured_prompt) == 1
+            assert next_scope_captured_before_worker == [True]
             execution_plan = worktree_path / plan_path.relative_to(repo_root)
             assert str(execution_plan) in captured_prompt[0]
             assert str(execution_repair) not in captured_prompt[0]
@@ -4876,6 +4918,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert run_payload['active_plan_path'] == str(plan_path)
             assert run_payload['active_implementation_scope'] is not None
             assert run_payload['active_implementation_scope']['checkpoint_index'] == 2
+            assert run_payload['active_implementation_scope']['envelope_artifact_path'] is not None
 
     def test_resume_replays_completed_reviewer_boundary_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5871,6 +5914,294 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
             assert 'in-progress merge' in str(ctx.value).lower()
 
+    def test_scope_envelope_is_identical_across_repair_overlay_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review", preserve_active_plan=True),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement", when="NEW_PLAN_EXISTS"),),
+                    ),
+                },
+                first_step="implement",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={"worker": "codex.worker", "reviewer": "codex.reviewer"},
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                })},
+                workflows={"repair": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+            observations: list[tuple[object, ...]] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                if model == "worker":
+                    run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                    observations.append(_scope_envelope_observation(run_dir))
+                    if len(observations) == 2:
+                        _write_plan(
+                            repo_root / "plan-cp01-v01.md",
+                            "# Repair\n\n### [x] Checkpoint 1: Repair\n"
+                            "- [x] fix finding\n",
+                        )
+                    return subprocess.CompletedProcess(argv, 0, "worked", "")
+                _write_plan(
+                    repo_root / "plan-cp01-v01.md",
+                    "# Repair\n\n### [ ] Checkpoint 1: Repair\n"
+                    "- [ ] fix finding\n",
+                )
+                return subprocess.CompletedProcess(argv, 0, "rejected", "")
+
+            with pytest.raises(WorkflowError, match="reached max turns limit"):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    "repair",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert len(observations) == 2
+            assert observations[0] == observations[1]
+            assert observations[0][-1] == 1
+
+    def test_scope_envelope_is_identical_across_inconsistent_plan_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    ),
+                },
+                first_step="implement",
+                retry_inconsistent_checkpoint_state=1,
+            )
+            wf_config = WorkflowUserConfig(
+                roles={"worker": "codex.worker"},
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                })},
+                workflows={"retry": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+            observations: list[tuple[object, ...]] = []
+
+            def runner(argv, **kwargs):
+                run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                observations.append(_scope_envelope_observation(run_dir))
+                _write_plan(
+                    plan_path,
+                    (
+                        "# Plan\n\n### [x] Checkpoint 1: First\n"
+                        "- [ ] step one\n"
+                        if len(observations) == 1
+                        else _COMPLETE_PLAN
+                    ),
+                )
+                return subprocess.CompletedProcess(argv, 0, "worked", "")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                wf_config,
+                "retry",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert len(observations) == 2
+            assert observations[0] == observations[1]
+            assert observations[0][-1] == 1
+            first_turn = json.loads(
+                (
+                    result.run_dir / "turns" / "turn-001" / "result.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert first_turn["status"] == "retry-scheduled"
+
+    def test_legacy_resume_is_not_backfilled_until_next_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch="main")
+            worktree_path = root / "worktree"
+            plan_path = repo_root / "plan.md"
+            _write_plan(
+                plan_path,
+                "# Plan\n\n"
+                "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
+                "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+            )
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                [
+                    "git", "worktree", "add", "-b", "resume-feature",
+                    str(worktree_path), "main",
+                ],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="implement"),
+                        ),
+                    ),
+                },
+                first_step="implement",
+                setup=("worktree", "branch"),
+                teardown=(),
+                main_branch="main",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={"worker": "codex.worker"},
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                })},
+                workflows={"legacy": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+            legacy_scope_id = f"{plan_path}::checkpoint-1::first"
+            legacy_payload = {
+                "manager_decision_number": 2,
+                "semantic_stall_count": 1,
+                "reviewer_rejection_count": 0,
+                "implementation_attempts": {
+                    legacy_scope_id: [
+                        {
+                            "turn_number": 1,
+                            "step_name": "implement",
+                            "role": "worker",
+                            "team": None,
+                            "selector": "codex.worker",
+                            "outcome": "completed",
+                            "manager_decision_number": 1,
+                        },
+                    ],
+                },
+                "active_implementation_scope": {
+                    "scope_id": legacy_scope_id,
+                    "original_plan_path": str(plan_path),
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "First",
+                    "opened_turn_number": 1,
+                    "awaiting_review": False,
+                    "carried_reviewer_rejection_count": 0,
+                },
+            }
+            assert not any(
+                key in legacy_payload["active_implementation_scope"]
+                for key in (
+                    "envelope_artifact_path",
+                    "envelope_artifact_sha256",
+                    "envelope_canonical_sha256",
+                )
+            )
+            restored_manager_fields = manager_resume_fields(legacy_payload)
+            restored_scope = restored_manager_fields["active_implementation_scope"]
+            assert isinstance(restored_scope, ActiveImplementationScope)
+            assert not restored_scope.has_envelope
+            observations: list[object] = []
+
+            def runner(argv, **kwargs):
+                run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                payload = json.loads(
+                    (run_dir / "run.json").read_text(encoding="utf-8")
+                )
+                scope = payload["active_implementation_scope"]
+                execution_plan = Path(kwargs["cwd"]) / "plan.md"
+                if not observations:
+                    envelope_values = (
+                        scope.get("envelope_artifact_path"),
+                        scope.get("envelope_artifact_sha256"),
+                        scope.get("envelope_canonical_sha256"),
+                    )
+                    observations.append(
+                        (
+                            scope["checkpoint_index"],
+                            *envelope_values,
+                            not all(envelope_values),
+                            list((run_dir / "scopes").glob("*/envelope.json")),
+                        )
+                    )
+                    _write_plan(
+                        execution_plan,
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                        "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
+                    )
+                else:
+                    observations.append(_scope_envelope_observation(run_dir))
+                    _write_plan(
+                        execution_plan,
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
+                        "### [x] Checkpoint 2: Second\n- [x] step two\n",
+                    )
+                return subprocess.CompletedProcess(argv, 0, "worked", "")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config,
+                "legacy",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id="prior-run",
+                    feature_branch="resume-feature",
+                    worktree_path=worktree_path,
+                    main_branch="main",
+                    setup=("worktree", "branch"),
+                    teardown=(),
+                    interrupted_step_name="implement",
+                    **restored_manager_fields,
+                ),
+            )
+
+            assert result.final_snapshot.is_complete
+            assert observations[0] == (1, None, None, None, True, [])
+            next_scope = observations[1]
+            assert isinstance(next_scope, tuple)
+            assert next_scope[5:7] == (2, "Checkpoint 2: Second")
+            assert next_scope[-1] == 1
+            assert next_scope[4] != legacy_scope_id
+
 
 class WorkflowMaxTurnsEndToEndTests(unittest.TestCase):
 
@@ -6078,6 +6409,135 @@ class StopMarkerTests(unittest.TestCase):
             )
             assert result.turns_completed == 1
             assert result.final_snapshot.is_complete
+
+    def test_resume_envelope_survives_keep_runs_pruning_before_worker(self) -> None:
+        """A real keep_runs=1 resume carries validated bytes before pruning."""
+        from aflow.repartition import read_envelope
+        from aflow.workflow import load_scope_envelope_for_resume
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch="main")
+            worktree_root = root / "worktrees"
+            worktree_root.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(
+                plan_path,
+                "# Plan\r\n\r\n### [ ] Checkpoint 1: Café\r\n- [ ] preserve 🎉\r\n",
+            )
+            original_plan_bytes = plan_path.read_bytes()
+            _git_commit_file(repo_root, plan_path)
+            base = _make_worktree_wf_config(
+                worktree_root=str(worktree_root),
+            )
+            workflow_config = WorkflowUserConfig(
+                aflow=base.aflow,
+                roles={"worker": base.roles["architect"]},
+                harnesses=base.harnesses,
+                workflows={
+                    "wt_wf": WorkflowConfig(
+                        steps={
+                            "impl": WorkflowStepConfig(
+                                role="worker",
+                                prompts=("p",),
+                                go=(GoTransition(to="END", when="DONE"),),
+                            ),
+                        },
+                        first_step="impl",
+                        setup=("worktree", "branch"),
+                        teardown=("merge", "rm_worktree"),
+                        main_branch="main",
+                    ),
+                },
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+
+            observed_first_worker: list[bool] = []
+
+            def fail_runner(argv, **kwargs):
+                run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                payload = json.loads((run_dir / "run.json").read_text())
+                captured_scope = payload["active_implementation_scope"]
+                artifact = run_dir / captured_scope["envelope_artifact_path"]
+                envelope = read_envelope(artifact)
+                observed_first_worker.append(
+                    envelope is not None
+                    and envelope.original_plan_path == "plan.md"
+                    and envelope.plan_text.encode("utf-8") == original_plan_bytes
+                    and captured_scope["envelope_artifact_sha256"]
+                    == hashlib.sha256(artifact.read_bytes()).hexdigest()
+                )
+                return subprocess.CompletedProcess(argv, 1, "failed", "failed")
+
+            with pytest.raises(WorkflowError) as failed:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    "wt_wf",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=fail_runner,
+                )
+
+            source_run = next((repo_root / ".aflow" / "runs").iterdir())
+            assert observed_first_worker == [True]
+            source_payload = json.loads((source_run / "run.json").read_text())
+            fields = manager_resume_fields(source_payload)
+            scope = fields["active_implementation_scope"]
+            assert scope is not None and scope.has_envelope
+            source_bytes = load_scope_envelope_for_resume(source_run, scope)
+            assert source_bytes is not None
+            observed_before_worker: list[bool] = []
+
+            def complete_runner(argv, **kwargs):
+                run_dirs = list((repo_root / ".aflow" / "runs").iterdir())
+                assert len(run_dirs) == 1
+                resumed_payload = json.loads((run_dirs[0] / "run.json").read_text())
+                resumed_scope = resumed_payload["active_implementation_scope"]
+                artifact = run_dirs[0] / resumed_scope["envelope_artifact_path"]
+                observed_before_worker.append(
+                    artifact.read_bytes() == source_bytes
+                    and resumed_scope["envelope_artifact_sha256"]
+                    == hashlib.sha256(source_bytes).hexdigest()
+                )
+                _write_plan(Path(kwargs["cwd"]) / "plan.md", _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "complete", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=2,
+                    keep_runs=1,
+                ),
+                workflow_config,
+                "wt_wf",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=complete_runner,
+                resume=ResumeContext(
+                    resumed_from_run_id=source_run.name,
+                    feature_branch=source_payload["feature_branch"],
+                    worktree_path=Path(source_payload["worktree_path"]),
+                    main_branch=source_payload["main_branch"],
+                    setup=tuple(source_payload["lifecycle_setup"]),
+                    teardown=tuple(source_payload["lifecycle_teardown"]),
+                    active_implementation_scope=scope,
+                    scope_envelope_bytes=source_bytes,
+                ),
+            )
+            assert not source_run.exists()
+            assert observed_before_worker == [True]
+            artifact = result.run_dir / scope.envelope_artifact_path
+            assert artifact.read_bytes() == source_bytes
+            assert plan_path.read_bytes() != original_plan_bytes
 
 
 class LifecycleBootstrapTests(unittest.TestCase):
@@ -6446,6 +6906,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 ),
             )
             workflow_models: list[str] = []
+            worker_envelopes: list[tuple[str, tuple[object, ...]]] = []
             manager_calls = 0
             reviewer_calls = 0
 
@@ -6473,6 +6934,11 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     }), "")
 
                 workflow_models.append(model)
+                if model.startswith("worker-"):
+                    run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                    worker_envelopes.append(
+                        (model, _scope_envelope_observation(run_dir))
+                    )
                 if model == "worker-default":
                     if workflow_models.count("worker-default") == 1:
                         _write_plan(
@@ -6533,6 +6999,15 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 "reviewer-default",
                 "worker-default",
             ]
+            assert [model for model, _ in worker_envelopes[:4]] == [
+                "worker-default",
+                "worker-high",
+                "worker-max",
+                "worker-max",
+            ]
+            assert len({observation for _, observation in worker_envelopes[:4]}) == 1
+            assert worker_envelopes[0][1][-1] == 1
+            assert worker_envelopes[4][1][4] != worker_envelopes[0][1][4]
             second = json.loads(
                 (result.run_dir / "manager" / "decision-002" / "context.json").read_text()
             )

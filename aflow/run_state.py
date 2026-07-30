@@ -246,6 +246,29 @@ class ActiveImplementationScope:
     opened_turn_number: int
     awaiting_review: bool = False
     carried_reviewer_rejection_count: int = 0
+    # Immutable envelope reference.  The three values are deliberately kept
+    # separate so a resumed run can bind the artifact's exact bytes as well as
+    # its canonical semantic representation.  All three are absent for a
+    # legacy scope opened before scope-envelope capture existed.
+    #
+    # These use object rather than eagerly coercing deserialized JSON: resume
+    # validation must reject malformed persisted authority, not quietly turn
+    # it into a legacy/no-envelope scope.
+    envelope_artifact_path: object | None = None
+    envelope_artifact_sha256: object | None = None
+    envelope_canonical_sha256: object | None = None
+
+    @property
+    def has_envelope(self) -> bool:
+        """True only when a complete persisted envelope reference is present."""
+        return all(
+            value is not None
+            for value in (
+                self.envelope_artifact_path,
+                self.envelope_artifact_sha256,
+                self.envelope_canonical_sha256,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -416,6 +439,12 @@ class ResumeContext:
     override_source_run_dir: Path | None = None
     override_file_present: bool = False
     terminal_integration_only: bool = False
+    # Exact source artifact bytes, fully parsed and bound before pruning so a
+    # keep_runs resume never needs to reopen the source run.
+    scope_envelope_bytes: bytes | None = None
+    # Retained as diagnostic provenance for existing callers.  Workflow
+    # resume must use scope_envelope_bytes, never reopen this path.
+    scope_envelope_source_path: str | None = None
 
 
 @dataclass
@@ -630,6 +659,13 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
         has_scoped_rejection_count = (
             "carried_reviewer_rejection_count" in scope
         )
+        # Preserve raw persisted envelope-reference values.  The resume
+        # boundary validates their type, layout, hashes, and binding before
+        # they are used; silently coercing or discarding malformed values
+        # would make tampering indistinguishable from a legacy run.
+        envelope_artifact = scope.get("envelope_artifact_path")
+        envelope_artifact_sha256 = scope.get("envelope_artifact_sha256")
+        envelope_canonical_sha256 = scope.get("envelope_canonical_sha256")
         state.active_implementation_scope = ActiveImplementationScope(
             scope_id=str(scope["scope_id"]),
             original_plan_path=str(scope["original_plan_path"]),
@@ -646,6 +682,9 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             carried_reviewer_rejection_count=int(
                 scope.get("carried_reviewer_rejection_count", 0) or 0
             ),
+            envelope_artifact_path=envelope_artifact,
+            envelope_artifact_sha256=envelope_artifact_sha256,
+            envelope_canonical_sha256=envelope_canonical_sha256,
         )
         if not has_scoped_rejection_count:
             # Pre-scoped run metadata may contain a poisoned whole-run total.

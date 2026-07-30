@@ -373,6 +373,39 @@ class SourceBlockExtractionTests(unittest.TestCase):
 
 class EnvelopeTests(unittest.TestCase):
 
+    def test_create_envelope_normalizes_absolute_and_relative_plan_paths(self) -> None:
+        text = "# Plan\r\n\r\n### [ ] Checkpoint 1: Café\r\n- [ ] preserve bytes 🎉\r\n"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plans" / "plan.md"
+            plan_path.parent.mkdir()
+            plan_path.write_bytes(text.encode("utf-8"))
+            absolute = create_envelope(
+                scope_id="scope-paths",
+                original_plan_path=plan_path,
+                plan_text=text,
+                checkpoint_index=1,
+                repo_root=repo_root,
+            )
+            relative = create_envelope(
+                scope_id="scope-paths",
+                original_plan_path="plans/plan.md",
+                plan_text=text,
+                checkpoint_index=1,
+                repo_root=repo_root,
+            )
+            assert absolute.original_plan_path == "plans/plan.md"
+            assert relative.original_plan_path == "plans/plan.md"
+            assert absolute.plan_bytes_b64 == relative.plan_bytes_b64
+            with pytest.raises(ValueError, match="inside repository"):
+                create_envelope(
+                    scope_id="scope-paths",
+                    original_plan_path=repo_root.parent / "outside.md",
+                    plan_text=text,
+                    checkpoint_index=1,
+                    repo_root=repo_root,
+                )
+
     def test_create_envelope_basic(self) -> None:
         text = textwrap.dedent("""\
             # Plan
@@ -2303,3 +2336,466 @@ class ReviewRejectionRegressionTests(unittest.TestCase):
         reconstructed = "".join(b.text for b in blocks)
         assert reconstructed == sl.body_text
         assert sl.heading_prefix + reconstructed == sl.full_text
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 2: Envelope lifecycle and resume carry tests
+# ---------------------------------------------------------------------------
+
+from aflow.run_state import (
+    ActiveImplementationScope,
+    ControllerState,
+    ResumeContext,
+    manager_resume_fields,
+    manager_state_payload,
+    restore_manager_state,
+)
+from aflow.plan import PlanSnapshot
+
+
+class EnvelopeLifecycleTests(unittest.TestCase):
+    """Tests for ActiveImplementationScope envelope fields and serialization."""
+
+    def test_has_envelope_false_for_legacy_scope(self) -> None:
+        scope = ActiveImplementationScope(
+            scope_id="plan.md::checkpoint-1::test",
+            original_plan_path="plan.md",
+            checkpoint_index=1,
+            checkpoint_name="Test",
+            opened_turn_number=1,
+        )
+        assert scope.has_envelope is False
+        assert scope.envelope_artifact_path is None
+
+    def test_has_envelope_true_only_for_complete_reference(self) -> None:
+        scope = ActiveImplementationScope(
+            scope_id="plan.md::checkpoint-1::test",
+            original_plan_path="plan.md",
+            checkpoint_index=1,
+            checkpoint_name="Test",
+            opened_turn_number=1,
+            envelope_artifact_path="scopes/abc123/envelope.json",
+            envelope_artifact_sha256="a" * 64,
+            envelope_canonical_sha256="b" * 64,
+        )
+        assert scope.has_envelope is True
+
+        partial = replace(scope, envelope_canonical_sha256=None)
+        assert partial.has_envelope is False
+
+    def test_envelope_path_round_trip_via_manager_state(self) -> None:
+        """envelope_artifact_path survives manager_state_payload → restore_manager_state."""
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        state.active_implementation_scope = ActiveImplementationScope(
+            scope_id="plan.md::checkpoint-2::test",
+            original_plan_path="plan.md",
+            checkpoint_index=2,
+            checkpoint_name="Test",
+            opened_turn_number=3,
+            envelope_artifact_path="scopes/def456/envelope.json",
+            envelope_artifact_sha256="a" * 64,
+            envelope_canonical_sha256="b" * 64,
+        )
+        payload = manager_state_payload(state)
+        assert payload["active_implementation_scope"]["envelope_artifact_path"] == (
+            "scopes/def456/envelope.json"
+        )
+        assert payload["active_implementation_scope"]["envelope_artifact_sha256"] == "a" * 64
+        assert payload["active_implementation_scope"]["envelope_canonical_sha256"] == "b" * 64
+
+        restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        restore_manager_state(restored, payload)
+        assert restored.active_implementation_scope is not None
+        assert restored.active_implementation_scope.has_envelope is True
+        assert restored.active_implementation_scope.envelope_artifact_path == (
+            "scopes/def456/envelope.json"
+        )
+        assert restored.active_implementation_scope.envelope_artifact_sha256 == "a" * 64
+        assert restored.active_implementation_scope.envelope_canonical_sha256 == "b" * 64
+
+    def test_legacy_payload_without_envelope_path_restores_cleanly(self) -> None:
+        """A run.json from before CP2 should restore with envelope_artifact_path=None."""
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        state.active_implementation_scope = ActiveImplementationScope(
+            scope_id="plan.md::checkpoint-1::legacy",
+            original_plan_path="plan.md",
+            checkpoint_index=1,
+            checkpoint_name="Legacy",
+            opened_turn_number=1,
+        )
+        payload = manager_state_payload(state)
+        # Simulate a legacy payload that lacks envelope_artifact_path
+        legacy_payload = dict(payload)
+        legacy_scope = dict(legacy_payload["active_implementation_scope"])
+        del legacy_scope["envelope_artifact_path"]
+        del legacy_scope["envelope_artifact_sha256"]
+        del legacy_scope["envelope_canonical_sha256"]
+        legacy_payload["active_implementation_scope"] = legacy_scope
+
+        restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        restore_manager_state(restored, legacy_payload)
+        assert restored.active_implementation_scope is not None
+        assert restored.active_implementation_scope.has_envelope is False
+        assert restored.active_implementation_scope.envelope_artifact_path is None
+
+    def test_manager_resume_fields_preserves_envelope_path(self) -> None:
+        """manager_resume_fields carries envelope_artifact_path through to ResumeContext."""
+        payload: dict[str, object] = {
+            "manager_decision_number": 0,
+            "manager_history": [],
+            "semantic_stall_count": 0,
+            "reviewer_rejection_count": 0,
+            "implementation_attempts": {},
+            "active_implementation_scope": {
+                "scope_id": "plan.md::checkpoint-3::test",
+                "original_plan_path": "plan.md",
+                "checkpoint_index": 3,
+                "checkpoint_name": "Test",
+                "opened_turn_number": 5,
+                "awaiting_review": False,
+                "carried_reviewer_rejection_count": 0,
+                "envelope_artifact_path": "scopes/ghi789/envelope.json",
+                "envelope_artifact_sha256": "a" * 64,
+                "envelope_canonical_sha256": "b" * 64,
+            },
+            "review_rejection_history": [],
+            "pending_manager_notes": None,
+            "pending_step_team_override": None,
+            "pending_boundary_decision": None,
+            "last_manager_report_path": None,
+        }
+        fields = manager_resume_fields(payload)
+        scope = fields["active_implementation_scope"]
+        assert scope is not None
+        assert scope.envelope_artifact_path == "scopes/ghi789/envelope.json"
+        assert scope.has_envelope is True
+
+    def test_restore_preserves_malformed_reference_for_resume_rejection(self) -> None:
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        restore_manager_state(state, {
+            "active_implementation_scope": {
+                "scope_id": "plan.md::checkpoint-1::legacy",
+                "original_plan_path": "plan.md",
+                "checkpoint_index": 1,
+                "checkpoint_name": "Legacy",
+                "opened_turn_number": 1,
+                "envelope_artifact_path": 7,
+                "envelope_artifact_sha256": "a" * 64,
+                "envelope_canonical_sha256": "b" * 64,
+            },
+        })
+        assert state.active_implementation_scope is not None
+        assert state.active_implementation_scope.envelope_artifact_path == 7
+
+    def test_resume_context_carries_envelope_source_path(self) -> None:
+        rc = ResumeContext(
+            resumed_from_run_id="run-123",
+            feature_branch="feat",
+            worktree_path=Path("/tmp/wt"),
+            main_branch="main",
+            setup=("echo hi",),
+            teardown=("echo bye",),
+            scope_envelope_source_path="/tmp/.aflow/runs/oldrun/scopes/abc/envelope.json",
+        )
+        assert rc.scope_envelope_source_path == (
+            "/tmp/.aflow/runs/oldrun/scopes/abc/envelope.json"
+        )
+
+    def test_resume_context_defaults_envelope_source_to_none(self) -> None:
+        rc = ResumeContext(
+            resumed_from_run_id="run-456",
+            feature_branch="feat",
+            worktree_path=Path("/tmp/wt"),
+            main_branch="main",
+            setup=(),
+            teardown=(),
+        )
+        assert rc.scope_envelope_source_path is None
+
+
+class EnvelopeCaptureTests(unittest.TestCase):
+    """Tests for _capture_scope_envelope integration with temp directories."""
+
+    def test_existing_legacy_scope_is_not_a_new_capture_authority(self) -> None:
+        from aflow.workflow import _open_implementation_scope
+
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        legacy = ActiveImplementationScope(
+            scope_id="plan.md::checkpoint-1::legacy",
+            original_plan_path="/repo/plan.md",
+            checkpoint_index=1,
+            checkpoint_name="Checkpoint 1: First",
+            opened_turn_number=1,
+        )
+        state.active_implementation_scope = legacy
+        scope, was_opened = _open_implementation_scope(
+            state,
+            original_plan_path=Path("/repo/plan.md"),
+            original_snapshot=PlanSnapshot("Checkpoint 1: First", 1, 1, False),
+            turn_number=2,
+        )
+        assert was_opened is False
+        assert scope == legacy
+        assert scope.has_envelope is False
+
+    def test_capture_writes_envelope_artifact(self) -> None:
+        from aflow.workflow import _capture_scope_envelope
+
+        text = textwrap.dedent("""\
+            # Plan
+
+            ### [ ] Checkpoint 1: First
+
+            **Goal:**
+
+            Do something.
+
+            **Steps:**
+
+            - [ ] step one
+        """)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            plan_path = run_dir / "plan.md"
+            plan_path.write_text(text, encoding="utf-8")
+
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            state.active_implementation_scope = ActiveImplementationScope(
+                scope_id="plan.md::checkpoint-1::first",
+                original_plan_path="plan.md",
+                checkpoint_index=1,
+                checkpoint_name="Checkpoint 1: First",
+                opened_turn_number=1,
+            )
+
+            _capture_scope_envelope(
+                state,
+                plan_text=text,
+                primary_plan_path=plan_path,
+                run_dir=run_dir,
+                exec_ctx=None,
+            )
+
+            scope = state.active_implementation_scope
+            assert scope is not None
+            assert scope.has_envelope is True
+            assert scope.envelope_artifact_path is not None
+            assert scope.envelope_artifact_path.startswith("scopes/")
+            assert scope.envelope_artifact_path.endswith("/envelope.json")
+
+            # Verify the artifact is readable
+            artifact_path = run_dir / scope.envelope_artifact_path
+            assert artifact_path.is_file()
+            loaded = read_envelope(artifact_path)
+            assert loaded is not None
+            assert loaded.scope_id == "plan.md::checkpoint-1::first"
+
+
+    def _source_scope(self, root: Path) -> tuple[ActiveImplementationScope, Path, bytes]:
+        scope_id = "plan.md::checkpoint-1::first"
+        plan_text = "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n"
+        envelope = create_envelope(
+            scope_id=scope_id,
+            original_plan_path="plan.md",
+            plan_text=plan_text,
+            checkpoint_index=1,
+        )
+        artifact = write_envelope_atomic(envelope, root / "scopes" / envelope.scope_digest)
+        raw = artifact.read_bytes()
+        return (
+            ActiveImplementationScope(
+                scope_id=scope_id,
+                original_plan_path="/repo/plan.md",
+                checkpoint_index=1,
+                checkpoint_name="Checkpoint 1: First",
+                opened_turn_number=1,
+                envelope_artifact_path=f"scopes/{envelope.scope_digest}/envelope.json",
+                envelope_artifact_sha256=hashlib.sha256(raw).hexdigest(),
+                envelope_canonical_sha256=envelope.canonical_envelope_sha256,
+            ),
+            artifact,
+            raw,
+        )
+
+    def test_resume_reference_rejects_missing_partial_and_unsafe_paths(self) -> None:
+        from aflow.workflow import WorkflowError, load_scope_envelope_for_resume
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            scope, artifact, raw = self._source_scope(root)
+            assert load_scope_envelope_for_resume(root, scope) == raw
+
+            for invalid in (
+                replace(scope, envelope_artifact_path=None),
+                replace(scope, envelope_artifact_path="/tmp/envelope.json"),
+                replace(scope, envelope_artifact_path="scopes/../envelope.json"),
+                replace(scope, envelope_artifact_path="scopes\\unsafe\\envelope.json"),
+                replace(scope, envelope_artifact_path="scopes/not-the-scope/envelope.json"),
+            ):
+                with pytest.raises(WorkflowError, match="envelope reference"):
+                    load_scope_envelope_for_resume(root, invalid)
+
+            artifact.unlink()
+            with pytest.raises(WorkflowError, match="missing"):
+                load_scope_envelope_for_resume(root, scope)
+
+    def test_resume_reference_rejects_tampered_bytes_and_scope_binding(self) -> None:
+        from aflow.workflow import WorkflowError, load_scope_envelope_for_resume
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            scope, artifact, raw = self._source_scope(root)
+            artifact.write_bytes(b"{not json")
+            corrupt_scope = replace(
+                scope,
+                envelope_artifact_sha256=hashlib.sha256(b"{not json").hexdigest(),
+            )
+            with pytest.raises(WorkflowError, match="corrupt envelope"):
+                load_scope_envelope_for_resume(root, corrupt_scope)
+
+            artifact.write_bytes(raw)
+            with pytest.raises(WorkflowError, match="bytes hash mismatch"):
+                load_scope_envelope_for_resume(
+                    root,
+                    replace(scope, envelope_artifact_sha256="a" * 64),
+                )
+            with pytest.raises(WorkflowError, match="canonical hash mismatch"):
+                load_scope_envelope_for_resume(
+                    root,
+                    replace(scope, envelope_canonical_sha256="a" * 64),
+                )
+
+            wrong_scope_envelope = create_envelope(
+                scope_id="different-scope",
+                original_plan_path="plan.md",
+                plan_text="# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+                checkpoint_index=1,
+            )
+            wrong_raw = write_envelope_atomic(
+                wrong_scope_envelope,
+                root / "wrong",
+            ).read_bytes()
+            artifact.write_bytes(wrong_raw)
+            wrong_reference = replace(
+                scope,
+                envelope_artifact_sha256=hashlib.sha256(wrong_raw).hexdigest(),
+                envelope_canonical_sha256=wrong_scope_envelope.canonical_envelope_sha256,
+            )
+            with pytest.raises(WorkflowError, match="scope_id mismatch"):
+                load_scope_envelope_for_resume(root, wrong_reference)
+
+    def test_resume_reference_rejects_symlink_escape(self) -> None:
+        from aflow.workflow import WorkflowError, load_scope_envelope_for_resume
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            scope, artifact, raw = self._source_scope(root)
+            outside = root.parent / f"{root.name}-outside-envelope.json"
+            outside.write_bytes(raw)
+            artifact.unlink()
+            artifact.symlink_to(outside)
+            with pytest.raises(WorkflowError, match="escapes source run"):
+                load_scope_envelope_for_resume(root, scope)
+
+    def test_capture_is_idempotent(self) -> None:
+        from aflow.workflow import WorkflowError, _capture_scope_envelope
+
+        text = textwrap.dedent("""\
+            # Plan
+
+            ### [ ] Checkpoint 1: First
+
+            **Goal:** test
+        """)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            plan_path = run_dir / "plan.md"
+            plan_path.write_text(text, encoding="utf-8")
+
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            state.active_implementation_scope = ActiveImplementationScope(
+                scope_id="plan.md::checkpoint-1::first",
+                original_plan_path="plan.md",
+                checkpoint_index=1,
+                checkpoint_name="Checkpoint 1: First",
+                opened_turn_number=1,
+            )
+
+            # First capture
+            _capture_scope_envelope(
+                state, plan_text=text, primary_plan_path=plan_path,
+                run_dir=run_dir, exec_ctx=None,
+            )
+            first_path = state.active_implementation_scope.envelope_artifact_path
+
+            # Second capture (simulates repair overlay keeping same scope)
+            _capture_scope_envelope(
+                state, plan_text=text, primary_plan_path=plan_path,
+                run_dir=run_dir, exec_ctx=None,
+            )
+            second_path = state.active_implementation_scope.envelope_artifact_path
+
+            assert first_path == second_path
+            (run_dir / second_path).write_bytes(b"{tampered")
+            with pytest.raises(WorkflowError, match="bytes hash mismatch"):
+                _capture_scope_envelope(
+                    state, plan_text=text, primary_plan_path=plan_path,
+                    run_dir=run_dir, exec_ctx=None,
+                )
+
+    def test_capture_noop_when_no_active_scope(self) -> None:
+        from aflow.workflow import _capture_scope_envelope
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            _capture_scope_envelope(
+                state, plan_text="", primary_plan_path=Path(tmpdir) / "plan.md",
+                run_dir=Path(tmpdir), exec_ctx=None,
+            )
+            assert state.active_implementation_scope is None
+
+    def test_envelope_outlives_scope_recreation(self) -> None:
+        """The artifact persists on disk even when state is rebuilt from JSON."""
+        text = textwrap.dedent("""\
+            # Plan
+
+            ### [ ] Checkpoint 1: First
+
+            **Goal:** test
+        """)
+        from aflow.workflow import _capture_scope_envelope
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            plan_path = run_dir / "plan.md"
+            plan_path.write_text(text, encoding="utf-8")
+
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            state.active_implementation_scope = ActiveImplementationScope(
+                scope_id="plan.md::checkpoint-1::first",
+                original_plan_path="plan.md",
+                checkpoint_index=1,
+                checkpoint_name="Checkpoint 1: First",
+                opened_turn_number=1,
+            )
+            _capture_scope_envelope(
+                state, plan_text=text, primary_plan_path=plan_path,
+                run_dir=run_dir, exec_ctx=None,
+            )
+
+            # Serialize and restore state
+            payload = manager_state_payload(state)
+            restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            restore_manager_state(restored, payload)
+
+            # The restored scope should still reference the artifact
+            scope = restored.active_implementation_scope
+            assert scope is not None
+            assert scope.has_envelope is True
+            artifact_path = run_dir / scope.envelope_artifact_path
+            assert artifact_path.is_file()
+
+            # The restored artifact should validate
+            loaded = read_envelope(artifact_path)
+            assert loaded is not None
+            assert loaded.scope_id == "plan.md::checkpoint-1::first"

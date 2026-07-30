@@ -95,6 +95,34 @@ def _validate_relative_logical_path(value: object) -> str:
     return path
 
 
+def _resolve_envelope_original_plan_path(
+    value: str | Path,
+    *,
+    repo_root: Path | None,
+) -> str:
+    """Normalize an in-repository plan path to envelope logical form.
+
+    Direct library callers may provide an already repository-relative path.
+    Runtime callers also pass the absolute plan path and repository root; both
+    forms produce one strict logical path while outside and traversing paths
+    remain invalid.
+    """
+    raw = str(value)
+    if repo_root is None:
+        return _validate_relative_logical_path(raw)
+    logical_input = PurePosixPath(raw)
+    if "\\" in raw or (not Path(raw).is_absolute() and ".." in logical_input.parts):
+        raise ValueError("original_plan_path must be repository-relative without parent traversal")
+    root = repo_root.resolve()
+    candidate = Path(raw)
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        logical = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("original_plan_path must be inside repository root") from exc
+    return _validate_relative_logical_path(logical)
+
+
 # ---------------------------------------------------------------------------
 # 1. Fence-aware checkpoint source-slice helper
 # ---------------------------------------------------------------------------
@@ -692,9 +720,10 @@ def _source_block_to_dict(block: SourceBlock) -> dict[str, object]:
 def create_envelope(
     *,
     scope_id: str,
-    original_plan_path: str,
+    original_plan_path: str | Path,
     plan_text: str,
     checkpoint_index: int,
+    repo_root: Path | None = None,
 ) -> ScopeEnvelopeV1:
     """Build a ScopeEnvelopeV1 from the original plan at scope opening.
 
@@ -704,6 +733,10 @@ def create_envelope(
     3. Extracts deterministic source blocks
     4. Computes the canonical envelope hash
     """
+    resolved_original_plan_path = _resolve_envelope_original_plan_path(
+        original_plan_path,
+        repo_root=repo_root,
+    )
     plan_bytes = plan_text.encode("utf-8")
     plan_sha256 = _sha256_hex(plan_bytes)
     plan_bytes_b64 = base64.b64encode(plan_bytes).decode("ascii")
@@ -732,7 +765,7 @@ def create_envelope(
         schema_version=1,
         scope_id=scope_id,
         scope_digest=scope_digest,
-        original_plan_path=original_plan_path,
+        original_plan_path=resolved_original_plan_path,
         plan_sha256=plan_sha256,
         plan_bytes_b64=plan_bytes_b64,
         plan_text=plan_text,
@@ -756,7 +789,7 @@ def create_envelope(
         schema_version=1,
         scope_id=scope_id,
         scope_digest=scope_digest,
-        original_plan_path=original_plan_path,
+        original_plan_path=resolved_original_plan_path,
         plan_sha256=plan_sha256,
         plan_bytes_b64=plan_bytes_b64,
         plan_text=plan_text,
@@ -988,7 +1021,14 @@ def read_envelope(envelope_path: Path) -> ScopeEnvelopeV1 | None:
     if not envelope_path.exists():
         return None
     try:
-        raw = envelope_path.read_bytes()
+        return parse_envelope_bytes(envelope_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Invalid envelope artifact {envelope_path}: {exc}") from exc
+
+
+def parse_envelope_bytes(raw: bytes) -> ScopeEnvelopeV1:
+    """Parse validated immutable envelope bytes without newline conversion."""
+    try:
         text = raw.decode("utf-8", "strict")
         data = json.loads(text)
         if not isinstance(data, dict):
@@ -998,8 +1038,8 @@ def read_envelope(envelope_path: Path) -> ScopeEnvelopeV1 | None:
         if issues:
             raise ValueError("Envelope validation failed: " + "; ".join(issues))
         return envelope
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"Invalid envelope artifact {envelope_path}: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Invalid envelope bytes: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------

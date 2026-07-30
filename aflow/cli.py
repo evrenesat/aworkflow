@@ -45,6 +45,7 @@ from .run_state import (
 )
 from .workflow import (
     WorkflowError,
+    load_scope_envelope_for_resume,
     move_completed_plan_to_done,
 )
 from .runlog import load_run_json
@@ -610,6 +611,29 @@ def _detect_resume_candidate(
         else None
     )
 
+    scope_envelope_source_path: str | None = None
+    scope_envelope_bytes: bytes | None = None
+    active_scope = manager_fields.get("active_implementation_scope")
+    if (
+        not reset_scope
+        and active_scope is not None
+        and hasattr(active_scope, "envelope_artifact_path")
+    ):
+        try:
+            scope_envelope_bytes = load_scope_envelope_for_resume(
+                run_dir,
+                active_scope,
+            )
+        except WorkflowError as exc:
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' has invalid scope envelope "
+                f"reference: {exc.summary}"
+            ) from exc
+        if scope_envelope_bytes is not None:
+            scope_envelope_source_path = str(
+                run_dir / active_scope.envelope_artifact_path
+            )
+
     return ResumeContext(
         resumed_from_run_id=resolved_run_id.name,
         feature_branch=feature_branch,
@@ -642,6 +666,8 @@ def _detect_resume_candidate(
         override_source_run_dir=override_source_run_dir,
         override_file_present=bool(prev_run.get("override_file_present", False)),
         terminal_integration_only=terminal_integration_only,
+        scope_envelope_bytes=scope_envelope_bytes,
+        scope_envelope_source_path=scope_envelope_source_path,
         **manager_fields,
     )
 

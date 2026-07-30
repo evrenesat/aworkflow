@@ -2577,6 +2577,160 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             == "its last saved plan snapshot was already complete"
         )
 
+    def test_resume_rejects_tampered_scope_envelope_before_workflow_start(self) -> None:
+        import hashlib
+
+        import aflow.cli as cli_module
+        from aflow.repartition import create_envelope, write_envelope_atomic
+
+        cases = (
+            "missing_reference",
+            "missing_artifact",
+            "unsafe_path",
+            "symlink_escape",
+            "corrupt_bytes",
+            "wrong_scope",
+            "wrong_checkpoint",
+            "wrong_stored_hash",
+            "wrong_canonical_hash",
+            "wrong_expected_location",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                repo_root = Path(tmpdir).resolve()
+                plan_path = repo_root / "plan.md"
+                run_id = f"run-{case}"
+                run_dir = repo_root / ".aflow" / "runs" / run_id
+                scope_id = f"{plan_path}::checkpoint-1::first"
+                envelope = create_envelope(
+                    scope_id=scope_id,
+                    original_plan_path="plan.md",
+                    plan_text=_VALID_PLAN,
+                    checkpoint_index=1,
+                )
+                artifact = write_envelope_atomic(
+                    envelope,
+                    run_dir / "scopes" / envelope.scope_digest,
+                )
+                artifact_bytes = artifact.read_bytes()
+                scope = {
+                    "scope_id": scope_id,
+                    "original_plan_path": str(plan_path),
+                    "checkpoint_index": 1,
+                    "checkpoint_name": "Checkpoint 1: First",
+                    "opened_turn_number": 1,
+                    "awaiting_review": False,
+                    "carried_reviewer_rejection_count": 0,
+                    "envelope_artifact_path": (
+                        f"scopes/{envelope.scope_digest}/envelope.json"
+                    ),
+                    "envelope_artifact_sha256": hashlib.sha256(
+                        artifact_bytes
+                    ).hexdigest(),
+                    "envelope_canonical_sha256": (
+                        envelope.canonical_envelope_sha256
+                    ),
+                }
+                if case == "missing_reference":
+                    scope["envelope_artifact_path"] = None
+                elif case == "missing_artifact":
+                    artifact.unlink()
+                elif case == "unsafe_path":
+                    scope["envelope_artifact_path"] = "../../envelope.json"
+                elif case == "symlink_escape":
+                    outside = repo_root / "outside-envelope.json"
+                    outside.write_bytes(artifact_bytes)
+                    artifact.unlink()
+                    artifact.symlink_to(outside)
+                elif case == "corrupt_bytes":
+                    artifact.write_bytes(b"{not json")
+                    scope["envelope_artifact_sha256"] = hashlib.sha256(
+                        b"{not json"
+                    ).hexdigest()
+                elif case == "wrong_scope":
+                    scope["scope_id"] = "different-scope"
+                    different_digest = hashlib.sha256(
+                        b"different-scope"
+                    ).hexdigest()
+                    different_artifact = (
+                        run_dir
+                        / "scopes"
+                        / different_digest
+                        / "envelope.json"
+                    )
+                    different_artifact.parent.mkdir(parents=True)
+                    different_artifact.write_bytes(artifact_bytes)
+                    scope["envelope_artifact_path"] = (
+                        f"scopes/{different_digest}/envelope.json"
+                    )
+                elif case == "wrong_checkpoint":
+                    scope["checkpoint_index"] = 2
+                elif case == "wrong_stored_hash":
+                    scope["envelope_artifact_sha256"] = "a" * 64
+                elif case == "wrong_canonical_hash":
+                    scope["envelope_canonical_sha256"] = "b" * 64
+                elif case == "wrong_expected_location":
+                    wrong_digest = "f" * 64
+                    wrong_artifact = (
+                        run_dir / "scopes" / wrong_digest / "envelope.json"
+                    )
+                    wrong_artifact.parent.mkdir(parents=True)
+                    wrong_artifact.write_bytes(artifact_bytes)
+                    scope["envelope_artifact_path"] = (
+                        f"scopes/{wrong_digest}/envelope.json"
+                    )
+
+                run_payload = {
+                    "repo_root": str(repo_root),
+                    "workflow_name": "test_workflow",
+                    "plan_path": str(plan_path),
+                    "team": None,
+                    "selected_start_step": None,
+                    "max_turns": 15,
+                    "extra_instructions": [],
+                    "lifecycle_setup": ["worktree", "branch"],
+                    "lifecycle_teardown": ["merge", "rm_worktree"],
+                    "feature_branch": "feature/test-branch",
+                    "worktree_path": str(repo_root / "worktree"),
+                    "main_branch": "main",
+                    "status": "failed",
+                    "last_snapshot": {"is_complete": False},
+                    "active_implementation_scope": scope,
+                }
+                (run_dir / "run.json").write_text(
+                    json.dumps(run_payload),
+                    encoding="utf-8",
+                )
+
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(run_dir, "explicit"),
+                ), patch("aflow.cli.execute_workflow") as workflow_start:
+                    with pytest.raises(
+                        ValueError,
+                        match="invalid scope envelope reference",
+                    ):
+                        cli_module._detect_resume_candidate(
+                            repo_root=repo_root,
+                            workflow_config=type(
+                                "obj",
+                                (object,),
+                                {"setup": ("worktree", "branch")},
+                            )(),
+                            workflow_name="test_workflow",
+                            plan_path=plan_path,
+                            team=None,
+                            selected_start_step=None,
+                            max_turns=15,
+                            extra_instructions=(),
+                            requested_run_id=run_id,
+                            require_resume=True,
+                        )
+
+                workflow_start.assert_not_called()
+                assert run_dir.is_dir()
+                assert (run_dir / "run.json").is_file()
+
     def test_resume_flag_without_id_errors_when_no_prior_run_can_be_resolved(self) -> None:
         import aflow.cli as cli_module
 
