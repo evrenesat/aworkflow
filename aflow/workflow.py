@@ -476,9 +476,32 @@ def _pending_matches_scope_and_plan(
         getattr(pending, "target_plan_identity", None)
         or getattr(pending, "checkpoint_identity", None)
     )
+    pending_partition_identity = (
+        getattr(pending, "repartition_generation_id", None),
+        getattr(pending, "repartition_candidate_sha256", None),
+        getattr(pending, "repartition_partition_id", None),
+    )
+    scope = state.active_implementation_scope
+    active_partition_identity = (
+        (
+            scope.current_partition_generation_id,
+            scope.current_partition_candidate_sha256,
+            scope.current_partition_id,
+        )
+        if scope is not None
+        else (None, None, None)
+    )
+    partition_matches = not any(
+        value is not None
+        for value in (*active_partition_identity, *pending_partition_identity)
+    ) or (
+        all(value is not None for value in pending_partition_identity)
+        and pending_partition_identity == active_partition_identity
+    )
     return (
         (pending_scope_id is None or pending_scope_id == active_scope_id)
         and (pending_target is None or pending_target == target_plan_identity)
+        and partition_matches
     )
 
 
@@ -1804,6 +1827,108 @@ def _sync_plan_from_worktree(primary_plan_path: Path, exec_ctx: ExecutionContext
         ) from exc
 
 
+def _atomic_replace_bytes(path: Path, content: bytes) -> None:
+    """Durably replace one file without exposing a partial plan copy."""
+    from uuid import uuid4
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise WorkflowError(
+            f"cannot atomically replace repartitioned plan copy '{path}': {exc}"
+        ) from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _reconcile_repartition_plan_copies(
+    pending: PendingRepartitionV1,
+    *,
+    candidate_bytes: bytes,
+    execution_path: Path,
+    primary_path: Path,
+    persist: Callable[[PendingRepartitionV1], None],
+) -> PendingRepartitionV1:
+    """Apply source/candidate copies idempotently and persist each boundary."""
+    copies = (
+        ("execution_plan_applied", execution_path),
+        ("primary_plan_applied", primary_path),
+    )
+    stage_rank = {
+        "semantically_validated": 0,
+        "execution_plan_applied": 1,
+        "primary_plan_applied": 2,
+        "applied": 3,
+    }
+    observed: dict[Path, str] = {}
+    for _stage, plan_copy in copies:
+        if plan_copy in observed:
+            continue
+        try:
+            observed[plan_copy] = hashlib.sha256(plan_copy.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise WorkflowError(
+                f"cannot inspect repartition plan copy '{plan_copy}': {exc}"
+            ) from exc
+    unknown = {
+        path: digest
+        for path, digest in observed.items()
+        if digest not in {
+            pending.source_plan_sha256,
+            pending.candidate_plan_sha256,
+        }
+    }
+    if unknown:
+        details = "; ".join(
+            f"{path}: expected source={pending.source_plan_sha256} or "
+            f"candidate={pending.candidate_plan_sha256}, observed={digest}"
+            for path, digest in unknown.items()
+        )
+        raise WorkflowError(
+            "repartition plan-copy divergence; no copy was overwritten: " + details
+        )
+
+    for applied_stage, plan_copy in copies:
+        current_hash = hashlib.sha256(plan_copy.read_bytes()).hexdigest()
+        if current_hash == pending.source_plan_sha256:
+            _atomic_replace_bytes(plan_copy, candidate_bytes)
+            observed_hash = hashlib.sha256(plan_copy.read_bytes()).hexdigest()
+            if observed_hash != pending.candidate_plan_sha256:
+                raise WorkflowError(
+                    "repartition post-write hash mismatch for "
+                    f"'{plan_copy}': expected={pending.candidate_plan_sha256} "
+                    f"observed={observed_hash}"
+                )
+        elif current_hash != pending.candidate_plan_sha256:
+            raise WorkflowError(
+                "repartition plan copy changed during application: "
+                f"'{plan_copy}' observed={current_hash}"
+            )
+        if stage_rank.get(pending.stage, -1) < stage_rank[applied_stage]:
+            pending = replace(pending, stage=applied_stage)
+            persist(pending)
+    return pending
+
+
 def _prepare_primary_plan_for_merge(
     primary_root: Path,
     original_plan_path: Path,
@@ -2998,6 +3123,27 @@ def run_workflow(
         state.pending_boundary_decision = resume.pending_boundary_decision
         state.pending_repartition = resume.pending_repartition
         state.last_manager_report_path = resume.last_manager_report_path
+
+        # create_run_paths may already have pruned the source run. Restore the
+        # controller-owned transaction artifacts carried by ResumeContext
+        # before attempting any reconciliation or harness launch.
+        for relative_path, artifact_bytes in resume.repartition_artifact_bytes.items():
+            destination = (run_paths.run_dir / relative_path).resolve()
+            try:
+                destination.relative_to(run_paths.run_dir.resolve())
+            except ValueError as exc:
+                raise WorkflowError(
+                    "cannot resume: pending repartition artifact path escapes "
+                    f"the new run directory: {relative_path}"
+                ) from exc
+            if destination.exists():
+                if destination.read_bytes() != artifact_bytes:
+                    raise WorkflowError(
+                        "cannot resume: pending repartition artifact already "
+                        f"exists with different bytes: {relative_path}"
+                    )
+            else:
+                _atomic_replace_bytes(destination, artifact_bytes)
 
         # Carry the fully validated source artifact into the new run before
         # any harness or manager call.  Do not consult the old source path.
@@ -4549,6 +4695,169 @@ def run_workflow(
             resumed_from_run_id=resumed_from_run_id,
         )
 
+    def _apply_pending_repartition() -> None:
+        """Reconcile and route one semantically validated transaction."""
+        nonlocal active_plan_path, current_step_name
+
+        pending = state.pending_repartition
+        if pending is None:
+            return
+        if pending.stage in {"decided", "proposed", "mechanically_validated"}:
+            raise WorkflowError(
+                "pending repartition proposal/validation transaction must be "
+                f"reconciled before a harness can start (stage={pending.stage})",
+                run_dir=run_paths.run_dir,
+            )
+        if pending.stage == "failed":
+            raise WorkflowError(
+                "cannot resume a failed repartition transaction without "
+                "explicit scope reset",
+                run_dir=run_paths.run_dir,
+            )
+        if pending.stage not in {
+            "semantically_validated",
+            "execution_plan_applied",
+            "primary_plan_applied",
+            "applied",
+        }:
+            raise WorkflowError(
+                f"cannot apply repartition transaction at unknown stage '{pending.stage}'",
+                run_dir=run_paths.run_dir,
+            )
+        if (
+            pending.candidate_artifact_path is None
+            or pending.candidate_plan_sha256 is None
+            or pending.generation_id is None
+            or not pending.partition_ids
+            or pending.resolved_target_step is None
+            or pending.resolved_target_role is None
+        ):
+            raise WorkflowError(
+                "cannot apply repartition transaction: validated identity or "
+                "routing fields are incomplete",
+                run_dir=run_paths.run_dir,
+            )
+        artifact_path = (run_paths.run_dir / pending.candidate_artifact_path).resolve()
+        try:
+            artifact_path.relative_to(run_paths.run_dir.resolve())
+            candidate_bytes = artifact_path.read_bytes()
+        except (ValueError, OSError) as exc:
+            raise WorkflowError(
+                f"cannot read validated repartition candidate: {exc}",
+                run_dir=run_paths.run_dir,
+            ) from exc
+        candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
+        if candidate_hash != pending.candidate_plan_sha256:
+            raise WorkflowError(
+                "validated repartition candidate hash mismatch: "
+                f"expected={pending.candidate_plan_sha256} observed={candidate_hash}",
+                run_dir=run_paths.run_dir,
+            )
+
+        execution_path = _exec_plan_path(original_plan_path, exec_ctx)
+        primary_path = _primary_plan_path(original_plan_path, exec_ctx)
+        pending = _reconcile_repartition_plan_copies(
+            pending,
+            candidate_bytes=candidate_bytes,
+            execution_path=execution_path,
+            primary_path=primary_path,
+            persist=_persist_repartition,
+        )
+
+        try:
+            candidate_snapshot = load_plan_tolerant(
+                execution_path
+            ).parsed_plan.snapshot
+        except (OSError, PlanParseError, ValueError) as exc:
+            raise WorkflowError(
+                f"applied repartition candidate cannot be parsed: {exc}",
+                run_dir=run_paths.run_dir,
+            ) from exc
+        scope = state.active_implementation_scope
+        if scope is None or scope.scope_id != pending.scope_id:
+            raise WorkflowError(
+                "cannot apply repartition transaction without its active parent scope",
+                run_dir=run_paths.run_dir,
+            )
+        target_step = wf.steps.get(pending.resolved_target_step)
+        if target_step is None or target_step.role != pending.resolved_target_role:
+            raise WorkflowError(
+                "repartition target no longer resolves to the persisted workflow role",
+                run_dir=run_paths.run_dir,
+            )
+
+        # The split supersedes only one-hop state and overlay selection. Attempts,
+        # rejections, dirty code, and the immutable parent envelope remain.
+        state.pending_manager_notes = None
+        state.pending_step_team_override = None
+        state.active_implementation_scope = replace(
+            scope,
+            awaiting_review=target_step.role == "reviewer",
+            current_partition_generation_id=pending.generation_id,
+            current_partition_candidate_sha256=pending.candidate_plan_sha256,
+            current_partition_id=pending.partition_ids[0],
+        )
+        state.last_snapshot = candidate_snapshot
+        active_plan_path = original_plan_path
+        current_step_name = pending.resolved_target_step
+        state.pending_retry = None
+
+        target_team: str | None = None
+        if target_step.role == "worker":
+            attempts = state.implementation_attempts.get(scope.scope_id, [])
+            target_team = attempts[-1].team if attempts else baseline_team_name
+        selector, _resolved = _resolve_step_runtime(
+            target_step,
+            workflow_config,
+            team_name=target_team or baseline_team_name,
+            step_path=(
+                f"workflow.{workflow_name}.steps.{pending.resolved_target_step}"
+            ),
+        )
+        target_identity = _target_plan_identity(
+            original_plan_path, candidate_snapshot,
+        )
+        state.pending_boundary_decision = PendingBoundaryDecision(
+            finalized_turn_number=(
+                state.pending_boundary_decision.finalized_turn_number
+                if state.pending_boundary_decision is not None
+                else state.active_turn
+            ),
+            decision_number=pending.decision_number,
+            action="repartition_current_checkpoint",
+            proposed_action="transition",
+            proposed_transition=None,
+            resolved_next_step=pending.resolved_target_step,
+            target_role=target_step.role,
+            target_team=target_team,
+            target_selector=selector,
+            checkpoint_identity=target_identity,
+            post_transition_active_plan_path=str(original_plan_path),
+            post_transition_checkpoint_identity=target_identity,
+            scope_id=scope.scope_id,
+            target_plan_identity=target_identity,
+            repartition_generation_id=pending.generation_id,
+            repartition_candidate_sha256=pending.candidate_plan_sha256,
+            repartition_partition_id=pending.partition_ids[0],
+        )
+        if target_step.role == "worker" and target_team is not None:
+            state.pending_step_team_override = PendingTeamOverride(
+                target_step=pending.resolved_target_step,
+                role=target_step.role,
+                source_team=target_team,
+                target_team=target_team,
+                selector=selector,
+                checkpoint_identity=target_identity,
+                decision_number=pending.decision_number,
+                scope_id=scope.scope_id,
+                target_plan_identity=target_identity,
+                repartition_generation_id=pending.generation_id,
+                repartition_candidate_sha256=pending.candidate_plan_sha256,
+                repartition_partition_id=pending.partition_ids[0],
+            )
+        pending = replace(pending, stage="applied")
+        _persist_repartition(pending)
+
     def _invoke_repartition_full(
         *,
         system_prompt: str,
@@ -4926,6 +5235,7 @@ def run_workflow(
             pending = replace(
                 pending, stage="mechanically_validated",
                 candidate_plan_sha256=candidate_sha256,
+                partition_ids=partition_ids,
                 candidate_artifact_path=attempt_paths.candidate_plan.relative_to(
                     run_paths.run_dir
                 ).as_posix(),
@@ -5275,14 +5585,14 @@ def run_workflow(
                 decision_context=context,
                 disposition_targets=repartition_disposition_targets,
             )
-            # Checkpoint 4 deliberately stops before CP5's plan application
-            # and routing. Never launch another harness while a validated
-            # transaction is pending.
-            raise WorkflowError(
-                "repartition candidate is semantically validated and pending "
-                "transactional plan application",
-                run_dir=run_paths.run_dir,
-            )
+            _apply_pending_repartition()
+            pending = state.pending_repartition
+            if pending is None or pending.resolved_target_step is None:
+                raise WorkflowError(
+                    "repartition application did not resolve a post-split target",
+                    run_dir=run_paths.run_dir,
+                )
+            return pending.resolved_target_step
 
         target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
         target_config = wf.steps.get(target_step) if target_step not in {None, "END"} else None
@@ -5291,6 +5601,15 @@ def run_workflow(
         scope_id = (
             state.active_implementation_scope.scope_id
             if state.active_implementation_scope is not None else None
+        )
+        active_partition_identity = (
+            (
+                state.active_implementation_scope.current_partition_generation_id,
+                state.active_implementation_scope.current_partition_candidate_sha256,
+                state.active_implementation_scope.current_partition_id,
+            )
+            if state.active_implementation_scope is not None
+            else (None, None, None)
         )
         retain_scoped_team = (
             decision.action == "continue"
@@ -5337,6 +5656,9 @@ def run_workflow(
             post_transition_active_plan_path=str(target_plan),
             post_transition_checkpoint_identity=target_identity,
             notes_reference=(f"manager/decision-{state.manager_decision_number:03d}" if decision.next_step_notes else None),
+            repartition_generation_id=active_partition_identity[0],
+            repartition_candidate_sha256=active_partition_identity[1],
+            repartition_partition_id=active_partition_identity[2],
         )
         if decision.next_step_notes and target_step != "END":
             state.pending_manager_notes = PendingManagerNotes(
@@ -5346,6 +5668,9 @@ def run_workflow(
                 checkpoint_identity=target_identity,
                 scope_id=scope_id,
                 target_plan_identity=target_identity,
+                repartition_generation_id=active_partition_identity[0],
+                repartition_candidate_sha256=active_partition_identity[1],
+                repartition_partition_id=active_partition_identity[2],
             )
         # This is intentionally before changing any controller routing state.
         write_run_metadata(run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
@@ -5369,6 +5694,9 @@ def run_workflow(
                 target_team=upgrade.target_team, selector=upgrade.target_selector,
                 checkpoint_identity=target_identity, decision_number=state.manager_decision_number,
                 scope_id=scope_id, target_plan_identity=target_identity,
+                repartition_generation_id=active_partition_identity[0],
+                repartition_candidate_sha256=active_partition_identity[1],
+                repartition_partition_id=active_partition_identity[2],
             )
         elif (
             retain_scoped_team
@@ -5390,6 +5718,9 @@ def run_workflow(
                 decision_number=state.manager_decision_number,
                 scope_id=scope_id,
                 target_plan_identity=target_identity,
+                repartition_generation_id=active_partition_identity[0],
+                repartition_candidate_sha256=active_partition_identity[1],
+                repartition_partition_id=active_partition_identity[2],
             )
         return proposed_transition
 
@@ -5843,6 +6174,11 @@ def run_workflow(
         _write_override_boundary(status="running")
         return current_step_name, baseline_team_name
 
+    # A resumed transaction is reconciled before the first harness. Accepted
+    # proposal/validation artifacts are reused; no Full subcall is replayed.
+    if state.pending_repartition is not None:
+        _apply_pending_repartition()
+
     turn_number = 1
     while turn_number <= (state.effective_max_turns or config.max_turns):
         current_step_name, baseline_team_name = _apply_boundary_override()
@@ -6184,9 +6520,15 @@ def run_workflow(
         )
         if consume_manager_notes or consume_team_override or boundary_target_started:
             if boundary_target_started:
+                completed_repartition_boundary = (
+                    state.pending_boundary_decision.action
+                    == "repartition_current_checkpoint"
+                )
                 state.pending_boundary_decision = replace(
                     state.pending_boundary_decision, applied=True, consumed=True
                 )
+                if completed_repartition_boundary:
+                    state.pending_repartition = None
             write_run_metadata(
                 run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
                 workflow_name=workflow_name, original_plan_path=original_plan_path,
@@ -6792,7 +7134,7 @@ def run_workflow(
         write_run_metadata(
             run_paths, config, state, status="running",
             execution_context=exec_ctx,
-            last_snapshot=post_snapshot,
+            last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
             workflow_name=workflow_name, original_plan_path=original_plan_path,
             current_step_name=current_step_name, active_plan_path=active_plan_path,

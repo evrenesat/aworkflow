@@ -1,4 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
+import hashlib
 from aflow.api.models import PreparedRun
 from aflow.config import ManagerConfig
 from aflow.status import BannerRenderer as RealBannerRenderer
@@ -2029,6 +2030,14 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "action": "stop",
                 "proposed_action": "implement_plan",
             },
+            "pending_repartition": {
+                "schema_version": 1,
+                "decision_number": 38,
+                "scope_id": "old-scope",
+                "stage": "semantically_validated",
+                "envelope_sha256": "e" * 64,
+                "source_plan_sha256": "s" * 64,
+            },
             "last_manager_report_path": "manager-report.md",
         }
 
@@ -2070,7 +2079,80 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert result.pending_manager_notes is None
         assert result.pending_step_team_override is None
         assert result.pending_boundary_decision is None
+        assert result.pending_repartition is None
+        assert result.repartition_artifact_bytes == {}
         assert result.last_manager_report_path is None
+
+    def test_resume_carries_pending_repartition_artifacts_before_pruning(self) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+            run_dir = repo_root / ".aflow" / "runs" / "prior-run"
+            attempt = (
+                run_dir / "manager" / "decision-001"
+                / "repartition" / "attempt-001"
+            )
+            attempt.mkdir(parents=True)
+            candidate_rel = (
+                "manager/decision-001/repartition/attempt-001/candidate-plan.md"
+            )
+            candidate_bytes = b"# validated candidate\n"
+            (run_dir / candidate_rel).write_bytes(candidate_bytes)
+            prev_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": None,
+                "selected_start_step": None,
+                "max_turns": 15,
+                "extra_instructions": [],
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": [],
+                "feature_branch": "feature/repartition",
+                "worktree_path": str(repo_root / "worktree"),
+                "main_branch": "main",
+                "status": "failed",
+                "last_snapshot": {"is_complete": False},
+                "pending_repartition": {
+                    "schema_version": 1,
+                    "decision_number": 1,
+                    "scope_id": "scope",
+                    "stage": "semantically_validated",
+                    "envelope_sha256": "e" * 64,
+                    "source_plan_sha256": "s" * 64,
+                    "candidate_plan_sha256": hashlib.sha256(
+                        candidate_bytes
+                    ).hexdigest(),
+                    "latest_attempt_path": (
+                        "manager/decision-001/repartition/attempt-001"
+                    ),
+                    "candidate_artifact_path": candidate_rel,
+                },
+            }
+            with patch(
+                "aflow.cli.resolve_run_id",
+                return_value=(run_dir, "explicit_run_id"),
+            ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                result = cli_module._detect_resume_candidate(
+                    repo_root=repo_root,
+                    workflow_config=type(
+                        "obj", (object,), {"setup": ("worktree", "branch")}
+                    )(),
+                    workflow_name="test_workflow",
+                    plan_path=plan_path,
+                    team=None,
+                    selected_start_step=None,
+                    max_turns=15,
+                    extra_instructions=(),
+                    requested_run_id=run_dir.name,
+                    require_resume=True,
+                )
+
+            assert result is not None
+            assert result.repartition_artifact_bytes[candidate_rel] == candidate_bytes
 
     def test_resume_recomputes_active_scope_rejections_from_turn_artifacts(self) -> None:
         import aflow.cli as cli_module

@@ -1,4 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
+from dataclasses import replace
 import hashlib
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
@@ -9,11 +10,17 @@ from aflow.run_state import (
     ImplementationAttempt,
     PendingBoundaryDecision,
     PendingFinalizedTurn,
+    PendingManagerNotes,
+    PendingRepartitionV1,
     PendingTeamOverride,
     load_override_request,
     manager_resume_fields,
 )
 from aflow.runlog import create_run_paths, write_run_metadata
+from aflow.workflow import (
+    _pending_matches_scope_and_plan,
+    _reconcile_repartition_plan_copies,
+)
 
 
 def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
@@ -82,6 +89,237 @@ def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
 
 
 class WorkflowRuntimeTests(unittest.TestCase):
+
+    def test_repartition_route_requires_generation_candidate_and_partition(self) -> None:
+        state = ControllerState(
+            last_snapshot=PlanSnapshot("First child", 1, 1, False)
+        )
+        state.active_implementation_scope = ActiveImplementationScope(
+            scope_id="scope",
+            original_plan_path="/repo/plan.md",
+            checkpoint_index=1,
+            checkpoint_name="Parent",
+            opened_turn_number=1,
+            current_partition_generation_id="generation",
+            current_partition_candidate_sha256="c" * 64,
+            current_partition_id="partition-1",
+        )
+        pending_boundary = PendingBoundaryDecision(
+            finalized_turn_number=1,
+            decision_number=1,
+            action="repartition_current_checkpoint",
+            proposed_action="transition",
+            proposed_transition="review",
+            resolved_next_step="review",
+            scope_id="scope",
+            target_plan_identity="/repo/plan.md::checkpoint-1",
+            repartition_generation_id="generation",
+            repartition_candidate_sha256="c" * 64,
+            repartition_partition_id="partition-1",
+        )
+        pending_notes = PendingManagerNotes(
+            target_step="implement",
+            notes=("Keep the retained worker.",),
+            decision_number=1,
+            scope_id="scope",
+            target_plan_identity="/repo/plan.md::checkpoint-1",
+            repartition_generation_id="generation",
+            repartition_candidate_sha256="c" * 64,
+            repartition_partition_id="partition-1",
+        )
+        pending_override = PendingTeamOverride(
+            target_step="implement",
+            role="worker",
+            source_team="high",
+            target_team="high",
+            selector="codex.worker-high",
+            checkpoint_identity="/repo/plan.md::checkpoint-1",
+            decision_number=1,
+            scope_id="scope",
+            target_plan_identity="/repo/plan.md::checkpoint-1",
+            repartition_generation_id="generation",
+            repartition_candidate_sha256="c" * 64,
+            repartition_partition_id="partition-1",
+        )
+        for pending in (pending_boundary, pending_notes, pending_override):
+            assert _pending_matches_scope_and_plan(
+                pending, state, "/repo/plan.md::checkpoint-1"
+            )
+            for stale_pending in (
+                replace(
+                    pending,
+                    repartition_generation_id=None,
+                    repartition_candidate_sha256=None,
+                    repartition_partition_id=None,
+                ),
+                replace(pending, repartition_generation_id=None),
+                replace(pending, repartition_candidate_sha256=None),
+                replace(pending, repartition_partition_id=None),
+                replace(pending, repartition_generation_id="stale-generation"),
+                replace(pending, repartition_candidate_sha256="d" * 64),
+                replace(pending, repartition_partition_id="stale-parent"),
+            ):
+                assert not _pending_matches_scope_and_plan(
+                    stale_pending,
+                    state,
+                    "/repo/plan.md::checkpoint-1",
+                )
+
+        restored = manager_resume_fields({
+            "pending_manager_notes": {
+                **pending_notes.__dict__,
+                "notes": list(pending_notes.notes),
+            },
+            "pending_step_team_override": pending_override.__dict__,
+        })
+        assert restored["pending_manager_notes"] == pending_notes
+        assert restored["pending_step_team_override"] == pending_override
+
+        state.active_implementation_scope = replace(
+            state.active_implementation_scope,
+            current_partition_generation_id=None,
+            current_partition_candidate_sha256=None,
+            current_partition_id=None,
+        )
+        for pending in (pending_boundary, pending_notes, pending_override):
+            assert _pending_matches_scope_and_plan(
+                replace(
+                    pending,
+                    repartition_generation_id=None,
+                    repartition_candidate_sha256=None,
+                    repartition_partition_id=None,
+                ),
+                state,
+                "/repo/plan.md::checkpoint-1",
+            )
+
+    def test_repartition_copy_transaction_recovers_mixed_source_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            execution = root / "worktree" / "plan.md"
+            primary = root / "primary" / "plan.md"
+            execution.parent.mkdir()
+            primary.parent.mkdir()
+            source = b"# source\n"
+            candidate = b"# candidate\n"
+            execution.write_bytes(source)
+            primary.write_bytes(source)
+            pending = PendingRepartitionV1(
+                schema_version=1,
+                decision_number=1,
+                scope_id="scope",
+                stage="semantically_validated",
+                envelope_sha256="e" * 64,
+                source_plan_sha256=hashlib.sha256(source).hexdigest(),
+                candidate_plan_sha256=hashlib.sha256(candidate).hexdigest(),
+            )
+
+            def interrupt_after_execution(value):
+                assert value.stage == "execution_plan_applied"
+                raise RuntimeError("interrupted")
+
+            with pytest.raises(RuntimeError, match="interrupted"):
+                _reconcile_repartition_plan_copies(
+                    pending,
+                    candidate_bytes=candidate,
+                    execution_path=execution,
+                    primary_path=primary,
+                    persist=interrupt_after_execution,
+                )
+            assert execution.read_bytes() == candidate
+            assert primary.read_bytes() == source
+
+            stages = []
+            recovered = _reconcile_repartition_plan_copies(
+                pending,
+                candidate_bytes=candidate,
+                execution_path=execution,
+                primary_path=primary,
+                persist=lambda value: stages.append(value.stage),
+            )
+            assert execution.read_bytes() == candidate
+            assert primary.read_bytes() == candidate
+            assert recovered.stage == "primary_plan_applied"
+            assert stages == ["execution_plan_applied", "primary_plan_applied"]
+
+    def test_repartition_copy_transaction_preserves_unknown_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            execution = root / "execution.md"
+            primary = root / "primary.md"
+            source = b"# source\n"
+            candidate = b"# candidate\n"
+            unknown = b"# owner edit\n"
+            execution.write_bytes(source)
+            primary.write_bytes(unknown)
+            pending = PendingRepartitionV1(
+                schema_version=1,
+                decision_number=1,
+                scope_id="scope",
+                stage="semantically_validated",
+                envelope_sha256="e" * 64,
+                source_plan_sha256=hashlib.sha256(source).hexdigest(),
+                candidate_plan_sha256=hashlib.sha256(candidate).hexdigest(),
+            )
+            with pytest.raises(
+                WorkflowError,
+                match="no copy was overwritten",
+            ) as error:
+                _reconcile_repartition_plan_copies(
+                    pending,
+                    candidate_bytes=candidate,
+                    execution_path=execution,
+                    primary_path=primary,
+                    persist=lambda _value: None,
+                )
+            assert "expected source=" in str(error.value)
+            assert "observed=" in str(error.value)
+            assert execution.read_bytes() == source
+            assert primary.read_bytes() == unknown
+
+    def test_repartition_copy_transaction_resumes_each_persisted_stage(self) -> None:
+        source = b"# source\n"
+        candidate = b"# candidate\n"
+        cases = (
+            ("semantically_validated", source, source, [
+                "execution_plan_applied", "primary_plan_applied",
+            ]),
+            ("execution_plan_applied", candidate, source, [
+                "primary_plan_applied",
+            ]),
+            ("primary_plan_applied", candidate, candidate, []),
+            ("applied", candidate, candidate, []),
+        )
+        for stage, execution_bytes, primary_bytes, expected_stages in cases:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                execution = root / "execution.md"
+                primary = root / "primary.md"
+                execution.write_bytes(execution_bytes)
+                primary.write_bytes(primary_bytes)
+                pending = PendingRepartitionV1(
+                    schema_version=1,
+                    decision_number=1,
+                    scope_id="scope",
+                    stage=stage,
+                    envelope_sha256="e" * 64,
+                    source_plan_sha256=hashlib.sha256(source).hexdigest(),
+                    candidate_plan_sha256=hashlib.sha256(candidate).hexdigest(),
+                )
+                stages = []
+                recovered = _reconcile_repartition_plan_copies(
+                    pending,
+                    candidate_bytes=candidate,
+                    execution_path=execution,
+                    primary_path=primary,
+                    persist=lambda value: stages.append(value.stage),
+                )
+                assert execution.read_bytes() == candidate
+                assert primary.read_bytes() == candidate
+                assert stages == expected_stages
+                assert recovered.stage == (
+                    expected_stages[-1] if expected_stages else stage
+                )
 
     def test_override_loader_accepts_exact_grammar_and_digest_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7303,7 +7541,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             assert first_context["envelope"]["validated"] is True
 
-    def test_repartition_full_cycle_persists_semantically_validated_candidate(self) -> None:
+    def test_repartition_full_cycle_applies_routes_review_and_resets_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
@@ -7311,17 +7549,108 @@ class LifecycleBootstrapTests(unittest.TestCase):
             call_kinds: list[str] = []
             proposal_calls = 0
             validation_calls = 0
+            worker_calls = 0
+            decision_calls = 0
+            boundary_observations: list[str] = []
+            parent_scope_ids: list[str] = []
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review"),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="implement"),
+                        ),
+                    ),
+                },
+                first_step="implement",
+                team="base",
+            )
+            workflow_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.default",
+                    "reviewer": "codex.reviewer",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                teams={
+                    "base": TeamConfig(roles={
+                        "worker": "codex.default",
+                        "reviewer": "codex.reviewer",
+                    }),
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "default": HarnessProfileConfig(model="default"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
 
             def runner(argv, **kwargs):
-                nonlocal proposal_calls, validation_calls
+                nonlocal proposal_calls, validation_calls, worker_calls, decision_calls
                 prompt = argv[-1]
                 model = argv[argv.index("--model") + 1]
                 if model == "default":
                     call_kinds.append("worker")
+                    worker_calls += 1
+                    if worker_calls == 2:
+                        run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                        live = json.loads((run_dir / "run.json").read_text())
+                        next_scope = live["active_implementation_scope"]
+                        assert next_scope["checkpoint_index"] == 2
+                        assert next_scope["scope_id"] != parent_scope_ids[0]
+                        assert next_scope["current_partition_id"] is None
+                        text = plan_path.read_text(encoding="utf-8")
+                        text = text.replace(
+                            "### [ ] Checkpoint 1: First / Partition 2/2: Revised part 2",
+                            "### [x] Checkpoint 1: First / Partition 2/2: Revised part 2",
+                            1,
+                        ).replace("- [ ] Implement part 2.", "- [x] Implement part 2.", 1)
+                        plan_path.write_text(text, encoding="utf-8")
+                        return subprocess.CompletedProcess(argv, 0, "second child complete", "")
                     return subprocess.CompletedProcess(
                         argv, 0,
                         "AFLOW_SCOPE_PRESSURE: split this checkpoint", "",
                     )
+                if model == "reviewer":
+                    call_kinds.append("reviewer")
+                    run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                    live = json.loads((run_dir / "run.json").read_text())
+                    assert live["pending_repartition"] is None
+                    assert live["pending_boundary_decision"]["consumed"] is True
+                    parent_scope = live["active_implementation_scope"]
+                    assert parent_scope["checkpoint_index"] == 1
+                    assert parent_scope["current_partition_id"]
+                    parent_scope_ids.append(parent_scope["scope_id"])
+                    assert json.loads(
+                        (run_dir / "turns" / "turn-002" / "result.json").read_text()
+                    )["status"] == "starting"
+                    boundary_observations.append("consumed-after-starting")
+                    text = plan_path.read_text(encoding="utf-8")
+                    text = text.replace(
+                        "### [ ] Checkpoint 1: First / Partition 1/2: Revised part 1",
+                        "### [x] Checkpoint 1: First / Partition 1/2: Revised part 1",
+                        1,
+                    ).replace("- [ ] Implement part 1.", "- [x] Implement part 1.", 1)
+                    plan_path.write_text(text, encoding="utf-8")
+                    return subprocess.CompletedProcess(argv, 0, "first child approved", "")
                 if "REPARTITION_PROPOSE_CONTEXT_JSON:\n" in prompt:
                     call_kinds.append("propose")
                     proposal_calls += 1
@@ -7363,7 +7692,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         "source_plan_sha256": payload["source_plan_sha256"],
                         "rationale": "Two independently reviewable slices.",
                         "children": children,
-                        "current_disposition": "implement_current_partition",
+                        "current_disposition": "review_current_partition",
                         "cross_cutting_source_reasons": {
                             block_id: "The obligation constrains both slices."
                             for block_id in source_ids
@@ -7398,20 +7727,40 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         "findings": [],
                     }), "")
                 call_kinds.append("decision")
+                decision_calls += 1
+                action = (
+                    "repartition_current_checkpoint"
+                    if decision_calls == 1
+                    else "continue"
+                )
                 return subprocess.CompletedProcess(argv, 0, json.dumps({
                     "schema_version": 1,
-                    "action": "repartition_current_checkpoint",
+                    "action": action,
                     "reason": "The scope has two independently reviewable slices.",
                     "next_step_notes": [],
                     "stop_report": None,
                 }), "")
 
-            with pytest.raises(WorkflowError, match="pending transactional plan application"):
-                run_workflow(
+            from aflow.runlog import write_turn_artifacts_start as actual_start
+
+            def observe_start(*args, **kwargs):
+                if kwargs["turn_number"] == 2:
+                    run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                    live = json.loads((run_dir / "run.json").read_text())
+                    assert live["pending_repartition"]["stage"] == "applied"
+                    assert live["pending_boundary_decision"]["consumed"] is False
+                    boundary_observations.append("pending-before-starting")
+                return actual_start(*args, **kwargs)
+
+            with patch(
+                "aflow.workflow.write_turn_artifacts_start",
+                side_effect=observe_start,
+            ):
+                result = run_workflow(
                     ControllerConfig(
-                        repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                        repo_root=repo_root, plan_path=plan_path, max_turns=3,
                     ),
-                    _pressure_workflow_config(role="worker"),
+                    workflow_config,
                     "managed",
                     config_dir=repo_root,
                     adapter=CodexAdapter(),
@@ -7420,7 +7769,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
 
             run_dir = next((repo_root / ".aflow" / "runs").iterdir())
             payload = json.loads((run_dir / "run.json").read_text())
-            pending = payload["pending_repartition"]
             first_attempt = (
                 run_dir / "manager" / "decision-001"
                 / "repartition" / "attempt-001"
@@ -7431,24 +7779,265 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             assert call_kinds == [
                 "worker", "decision", "propose", "validate",
-                "propose", "validate",
+                "propose", "validate", "reviewer", "decision", "worker",
+                "decision",
             ]
-            assert payload["turns_completed"] == 1
-            assert len(payload["implementation_attempts"][pending["scope_id"]]) == 1
-            assert pending["stage"] == "semantically_validated"
-            assert pending["attempt_count"] == 2
-            assert pending["resolved_target_step"] == "step"
-            assert pending["resolved_target_role"] == "worker"
+            assert result.final_snapshot.is_complete
+            assert payload["turns_completed"] == 3
+            assert payload["pending_repartition"] is None
+            assert boundary_observations == [
+                "pending-before-starting", "consumed-after-starting",
+            ]
             assert json.loads(
                 (first_attempt / "result.json").read_text()
             )["status"] == "rejected"
             assert hashlib.sha256(
                 (attempt / "candidate-plan.md").read_bytes()
-            ).hexdigest() == pending["candidate_plan_sha256"]
+            ).hexdigest() != hashlib.sha256(_VALID_PLAN.encode()).hexdigest()
             assert json.loads(
                 (attempt / "result.json").read_text()
             )["status"] == "accepted"
-            assert plan_path.read_text(encoding="utf-8") == _VALID_PLAN
+            assert "Partition 1/2: Revised part 1" in plan_path.read_text(
+                encoding="utf-8"
+            )
+
+    def test_repartition_implement_current_partition_retains_upgraded_worker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            call_kinds: list[str] = []
+            decision_calls = 0
+            high_worker_calls = 0
+            boundary_observations: list[str] = []
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review"),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement"),),
+                    ),
+                },
+                first_step="implement",
+                team="base",
+            )
+            workflow_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker-default",
+                    "reviewer": "codex.reviewer",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                teams={
+                    "base": TeamConfig(
+                        roles={
+                            "worker": "codex.worker-default",
+                            "reviewer": "codex.reviewer",
+                        },
+                        upgrade_to="high",
+                    ),
+                    "high": TeamConfig(
+                        roles={
+                            "worker": "codex.worker-high",
+                            "reviewer": "codex.reviewer",
+                        },
+                    ),
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker-default": HarnessProfileConfig(model="worker-default"),
+                    "worker-high": HarnessProfileConfig(model="worker-high"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+
+            def runner(argv, **kwargs):
+                nonlocal decision_calls, high_worker_calls
+                prompt = argv[-1]
+                model = argv[argv.index("--model") + 1]
+                if model == "worker-default":
+                    call_kinds.append("worker-default")
+                    return subprocess.CompletedProcess(
+                        argv, 0, "implementation ready for review", ""
+                    )
+                if model == "reviewer":
+                    call_kinds.append("reviewer")
+                    return subprocess.CompletedProcess(
+                        argv, 0, "bounded repair required", ""
+                    )
+                if model == "worker-high":
+                    call_kinds.append("worker-high")
+                    high_worker_calls += 1
+                    if high_worker_calls == 1:
+                        return subprocess.CompletedProcess(
+                            argv,
+                            0,
+                            "AFLOW_SCOPE_PRESSURE: split this checkpoint",
+                            "",
+                        )
+                    run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                    live = json.loads((run_dir / "run.json").read_text())
+                    assert live["team"] == "base"
+                    assert live["pending_repartition"] is None
+                    assert live["pending_step_team_override"] is None
+                    assert live["pending_boundary_decision"]["consumed"] is True
+                    boundary_observations.append("consumed-after-starting")
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(
+                        argv, 0, "retained worker completed child", ""
+                    )
+                if "REPARTITION_PROPOSE_CONTEXT_JSON:\n" in prompt:
+                    call_kinds.append("propose")
+                    payload = json.loads(
+                        prompt.split("REPARTITION_PROPOSE_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    envelope = payload["envelope"]
+                    source_ids = [
+                        block["block_id"] for block in envelope["source_blocks"]
+                    ]
+                    repair_ids = [
+                        block["block_id"]
+                        for block in payload["repair_evidence_blocks"]
+                    ]
+                    proposal = {
+                        "schema_version": 1,
+                        "envelope_sha256": envelope[
+                            "canonical_envelope_sha256"
+                        ],
+                        "source_plan_sha256": payload["source_plan_sha256"],
+                        "rationale": "Two independently implementable slices.",
+                        "children": [
+                            {
+                                "title": f"Part {ordinal}",
+                                "narrow_goal": f"Implement part {ordinal}.",
+                                "source_block_ids": source_ids,
+                                "repair_evidence_ids": repair_ids,
+                                "implementation_steps": [
+                                    f"Implement part {ordinal}."
+                                ],
+                                "verification_commands": ["uv run pytest -q"],
+                                "done_criteria": [
+                                    f"Part {ordinal} is observable."
+                                ],
+                            }
+                            for ordinal in (1, 2)
+                        ],
+                        "current_disposition": "implement_current_partition",
+                        "cross_cutting_source_reasons": {
+                            block_id: "The obligation constrains both slices."
+                            for block_id in source_ids
+                        },
+                    }
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps(proposal), ""
+                    )
+                if "REPARTITION_VALIDATE_CONTEXT_JSON:\n" in prompt:
+                    call_kinds.append("validate")
+                    payload = json.loads(
+                        prompt.split("REPARTITION_VALIDATE_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "proposal_sha256": payload["proposal_sha256"],
+                        "candidate_sha256": payload["candidate_plan_sha256"],
+                        "verdict": "accept",
+                        "reason": "The split preserves exact obligations.",
+                        "findings": [],
+                    }), "")
+
+                call_kinds.append("decision")
+                decision_calls += 1
+                action = {
+                    1: "continue",
+                    2: "upgrade_next_implementation",
+                    3: "repartition_current_checkpoint",
+                }.get(decision_calls, "continue")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "schema_version": 1,
+                    "action": action,
+                    "reason": "Synthetic lifecycle routing decision.",
+                    "next_step_notes": [],
+                    "stop_report": None,
+                }), "")
+
+            from aflow.runlog import write_turn_artifacts_start as actual_start
+
+            def observe_start(*args, **kwargs):
+                if kwargs["turn_number"] == 4:
+                    run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+                    live = json.loads((run_dir / "run.json").read_text())
+                    assert live["pending_repartition"]["stage"] == "applied"
+                    assert live["pending_boundary_decision"]["consumed"] is False
+                    override = live["pending_step_team_override"]
+                    scope = live["active_implementation_scope"]
+                    assert override["target_team"] == "high"
+                    assert override["selector"] == "codex.worker-high"
+                    assert (
+                        override["repartition_generation_id"],
+                        override["repartition_candidate_sha256"],
+                        override["repartition_partition_id"],
+                    ) == (
+                        scope["current_partition_generation_id"],
+                        scope["current_partition_candidate_sha256"],
+                        scope["current_partition_id"],
+                    )
+                    boundary_observations.append("pending-before-starting")
+                return actual_start(*args, **kwargs)
+
+            with patch(
+                "aflow.workflow.write_turn_artifacts_start",
+                side_effect=observe_start,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=4,
+                    ),
+                    workflow_config,
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            payload = json.loads((result.run_dir / "run.json").read_text())
+            assert result.final_snapshot.is_complete
+            assert payload["pending_repartition"] is None
+            assert boundary_observations == [
+                "pending-before-starting",
+                "consumed-after-starting",
+            ]
+            assert call_kinds == [
+                "worker-default",
+                "decision",
+                "reviewer",
+                "decision",
+                "worker-high",
+                "decision",
+                "propose",
+                "validate",
+                "worker-high",
+                "decision",
+            ]
 
     def test_repartition_full_rejects_protected_run_artifact_mutation(self) -> None:
         for mutate_stage in ("propose", "validate"):

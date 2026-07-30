@@ -257,6 +257,9 @@ class ActiveImplementationScope:
     envelope_artifact_path: object | None = None
     envelope_artifact_sha256: object | None = None
     envelope_canonical_sha256: object | None = None
+    current_partition_generation_id: str | None = None
+    current_partition_candidate_sha256: str | None = None
+    current_partition_id: str | None = None
 
     @property
     def has_envelope(self) -> bool:
@@ -282,6 +285,9 @@ class PendingManagerNotes:
     consumed: bool = False
     scope_id: str | None = None
     target_plan_identity: str | None = None
+    repartition_generation_id: str | None = None
+    repartition_candidate_sha256: str | None = None
+    repartition_partition_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +302,9 @@ class PendingTeamOverride:
     consumed: bool = False
     scope_id: str | None = None
     target_plan_identity: str | None = None
+    repartition_generation_id: str | None = None
+    repartition_candidate_sha256: str | None = None
+    repartition_partition_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -338,7 +347,7 @@ class ReviewRejectionRecord:
 
 @dataclass(frozen=True)
 class PendingRepartitionV1:
-    """Durable proposal/validation transaction; application belongs to CP5."""
+    """Durable proposal, validation, and multi-copy application transaction."""
 
     schema_version: int
     decision_number: int
@@ -348,6 +357,7 @@ class PendingRepartitionV1:
     source_plan_sha256: str
     attempt_count: int = 0
     generation_id: str | None = None
+    partition_ids: tuple[str, ...] = ()
     candidate_plan_sha256: str | None = None
     current_disposition: str | None = None
     resolved_target_step: str | None = None
@@ -382,6 +392,9 @@ class PendingBoundaryDecision:
     consumed: bool = False
     scope_id: str | None = None
     target_plan_identity: str | None = None
+    repartition_generation_id: str | None = None
+    repartition_candidate_sha256: str | None = None
+    repartition_partition_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -483,6 +496,9 @@ class ResumeContext:
     # Retained as diagnostic provenance for existing callers.  Workflow
     # resume must use scope_envelope_bytes, never reopen this path.
     scope_envelope_source_path: str | None = None
+    # Pending repartition artifacts are copied before create_run_paths may
+    # prune the source run (notably with keep_runs = 1).
+    repartition_artifact_bytes: Mapping[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -729,6 +745,21 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             envelope_artifact_path=envelope_artifact,
             envelope_artifact_sha256=envelope_artifact_sha256,
             envelope_canonical_sha256=envelope_canonical_sha256,
+            current_partition_generation_id=(
+                str(scope["current_partition_generation_id"])
+                if scope.get("current_partition_generation_id") is not None
+                else None
+            ),
+            current_partition_candidate_sha256=(
+                str(scope["current_partition_candidate_sha256"])
+                if scope.get("current_partition_candidate_sha256") is not None
+                else None
+            ),
+            current_partition_id=(
+                str(scope["current_partition_id"])
+                if scope.get("current_partition_id") is not None
+                else None
+            ),
         )
         if not has_scoped_rejection_count:
             # Pre-scoped run metadata may contain a poisoned whole-run total.
@@ -751,6 +782,21 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 if notes.get("target_plan_identity") is not None
                 else None
             ),
+            repartition_generation_id=(
+                str(notes["repartition_generation_id"])
+                if notes.get("repartition_generation_id") is not None
+                else None
+            ),
+            repartition_candidate_sha256=(
+                str(notes["repartition_candidate_sha256"])
+                if notes.get("repartition_candidate_sha256") is not None
+                else None
+            ),
+            repartition_partition_id=(
+                str(notes["repartition_partition_id"])
+                if notes.get("repartition_partition_id") is not None
+                else None
+            ),
         )
     override = payload.get("pending_step_team_override")
     if isinstance(override, Mapping):
@@ -769,6 +815,21 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 target_plan_identity=(
                     str(override["target_plan_identity"])
                     if override.get("target_plan_identity") is not None
+                    else None
+                ),
+                repartition_generation_id=(
+                    str(override["repartition_generation_id"])
+                    if override.get("repartition_generation_id") is not None
+                    else None
+                ),
+                repartition_candidate_sha256=(
+                    str(override["repartition_candidate_sha256"])
+                    if override.get("repartition_candidate_sha256") is not None
+                    else None
+                ),
+                repartition_partition_id=(
+                    str(override["repartition_partition_id"])
+                    if override.get("repartition_partition_id") is not None
                     else None
                 ),
             )
@@ -798,6 +859,21 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                     if boundary.get("target_plan_identity") is not None
                     else None
                 ),
+                repartition_generation_id=(
+                    str(boundary["repartition_generation_id"])
+                    if boundary.get("repartition_generation_id") is not None
+                    else None
+                ),
+                repartition_candidate_sha256=(
+                    str(boundary["repartition_candidate_sha256"])
+                    if boundary.get("repartition_candidate_sha256") is not None
+                    else None
+                ),
+                repartition_partition_id=(
+                    str(boundary["repartition_partition_id"])
+                    if boundary.get("repartition_partition_id") is not None
+                    else None
+                ),
             )
     pending_repartition = payload.get("pending_repartition")
     if isinstance(pending_repartition, Mapping):
@@ -816,6 +892,16 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             and pending_repartition.get("stage") in valid_stages
         ):
             try:
+                raw_partition_ids = pending_repartition.get("partition_ids", ())
+                partition_ids = (
+                    tuple(raw_partition_ids)
+                    if isinstance(raw_partition_ids, (list, tuple))
+                    and all(
+                        isinstance(value, str) and bool(value)
+                        for value in raw_partition_ids
+                    )
+                    else ()
+                )
                 state.pending_repartition = PendingRepartitionV1(
                     schema_version=1,
                     decision_number=int(pending_repartition["decision_number"]),
@@ -828,6 +914,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                         str(pending_repartition["generation_id"])
                         if pending_repartition.get("generation_id") is not None else None
                     ),
+                    partition_ids=partition_ids,
                     candidate_plan_sha256=(
                         str(pending_repartition["candidate_plan_sha256"])
                         if pending_repartition.get("candidate_plan_sha256") is not None else None

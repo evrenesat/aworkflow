@@ -426,6 +426,7 @@ def _manager_resume_fields_for_scope(
             "pending_manager_notes": None,
             "pending_step_team_override": None,
             "pending_boundary_decision": None,
+            "pending_repartition": None,
             "last_manager_report_path": None,
         })
         return fields
@@ -634,6 +635,35 @@ def _detect_resume_candidate(
                 run_dir / active_scope.envelope_artifact_path
             )
 
+    repartition_artifact_bytes: dict[str, bytes] = {}
+    pending_repartition = manager_fields.get("pending_repartition")
+    latest_attempt_path = getattr(pending_repartition, "latest_attempt_path", None)
+    if not reset_scope and isinstance(latest_attempt_path, str):
+        attempt_root = (run_dir / latest_attempt_path).resolve()
+        try:
+            attempt_root.relative_to(run_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' has an unsafe pending "
+                "repartition artifact path."
+            ) from exc
+        if not attempt_root.is_dir():
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' is missing pending "
+                f"repartition artifacts at '{latest_attempt_path}'."
+            )
+        for artifact_path in sorted(attempt_root.rglob("*")):
+            if not artifact_path.is_file():
+                continue
+            relative = artifact_path.resolve().relative_to(run_dir.resolve()).as_posix()
+            try:
+                repartition_artifact_bytes[relative] = artifact_path.read_bytes()
+            except OSError as exc:
+                raise ValueError(
+                    f"error: run '{resolved_run_id.name}' cannot read pending "
+                    f"repartition artifact '{relative}': {exc}"
+                ) from exc
+
     return ResumeContext(
         resumed_from_run_id=resolved_run_id.name,
         feature_branch=feature_branch,
@@ -668,6 +698,7 @@ def _detect_resume_candidate(
         terminal_integration_only=terminal_integration_only,
         scope_envelope_bytes=scope_envelope_bytes,
         scope_envelope_source_path=scope_envelope_source_path,
+        repartition_artifact_bytes=repartition_artifact_bytes,
         **manager_fields,
     )
 
