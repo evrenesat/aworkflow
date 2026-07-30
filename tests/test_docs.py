@@ -113,16 +113,56 @@ class SkillDocsTests(unittest.TestCase):
         assert '25 changed files or 3,000 changed lines' not in text
         assert 'AFLOW_STOP' not in text
 
-    def test_manager_skill_documents_lite_then_full_worker_upgrade_sequence(self) -> None:
+    def test_manager_skill_documents_cause_based_recovery_and_repartition(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-manager' / 'SKILL.md').read_text(encoding='utf-8')
         normalized = ' '.join(text.split())
 
         assert 'first reviewer rejection' in normalized
-        assert 'choose that upgrade at Lite level' in normalized
-        assert 'invokes Full directly for the second rejection' in normalized
+        assert 'decide by cause' in normalized
+        assert 'available edge never mandates an upgrade' in normalized
+        assert 'second rejection in that same open scope invokes Full directly' in normalized
+        assert 'repartition_current_checkpoint' in normalized
+        assert 'A real `AFLOW_STOP` remains terminal' in normalized
         assert 'controller validates all routing and decides the concrete target' in normalized
         assert "next checkpoint's initial worker" in normalized
+
+    def test_repartition_skill_has_strict_read_only_dual_mode_contract(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-repartition-checkpoint' / 'SKILL.md').read_text(encoding='utf-8')
+        normalized = ' '.join(text.split())
+
+        assert '## Propose Mode' in text
+        assert '## Validate Mode' in text
+        assert 'You are read-only' in text
+        assert 'non-authoritative guidance' in text
+        assert 'summary cannot replace, weaken, or prove coverage' in text
+        assert 'single bounded correction attempt' in normalized
+        assert 'semantic validation must remain a separate Full-manager call' in text
+        assert '"current_disposition": "review_current_partition"' in text
+        assert '"verdict": "accept"' in text
+
+    def test_active_manager_docs_forbid_numeric_gates_and_keep_stop_terminal(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        active_paths = (
+            repo_root / 'README.md',
+            repo_root / 'ARCHITECTURE.md',
+            repo_root / 'docs' / 'configuration.md',
+            repo_root / 'docs' / 'runtime-behavior.md',
+            repo_root / 'docs' / 'installation.md',
+            repo_root / 'docs' / 'library-api.md',
+            repo_root / 'aflow' / 'bundled_skills' / 'aflow-manager' / 'SKILL.md',
+            repo_root / 'aflow' / 'bundled_skills' / 'aflow-repartition-checkpoint' / 'SKILL.md',
+        )
+        combined = '\n'.join(path.read_text(encoding='utf-8') for path in active_paths)
+
+        assert '25 changed files' not in combined
+        assert '3,000 changed lines' not in combined
+        assert 'must select the exposed one-edge upgrade' not in combined
+        assert 'Owner-authorized checkpoint repartition' not in combined
+        assert 'summaries are non-authoritative' in combined
+        assert 'Full manager is read-only' in combined
+        assert '`AFLOW_STOP` remains terminal' in combined
 
     def test_bundled_config_review_implement_review_max_turns_transitions(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

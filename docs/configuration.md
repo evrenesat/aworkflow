@@ -130,6 +130,7 @@ lite_role = "manager_lite"
 full_role = "manager_full"
 full_after_stalled_turns = 2
 skill = "aflow-manager"
+repartition_skill = "aflow-repartition-checkpoint"
 ```
 
 `lite_role` and `full_role` are required when `enabled = true`, must be
@@ -145,6 +146,23 @@ scope.
 `skill` defaults to `aflow-manager`. Each manager prompt requests that configured
 skill when the harness supports skills and also carries the complete strict JSON
 contract inline, so protocol correctness does not depend on skill installation.
+`repartition_skill` defaults to `aflow-repartition-checkpoint`. The same resolved
+`full_role` performs both strict read-only repartition subcalls; no third role is
+introduced. The controller freezes both skill names in the run configuration.
+
+At a first scoped reviewer rejection, Lite decides by cause: it may retain the
+same worker for a bounded repair, use one eligible `upgrade_to` edge for a
+capability/convergence failure, or escalate structural uncertainty. An exposed
+edge is not mandatory. The second rejection in the same open scope selects Full
+directly with the complete rejection and attempt history.
+
+Full alone may select `repartition_current_checkpoint`, and only when the
+controller exposes it for a live scope with an immutable envelope. A worker or
+reviewer `AFLOW_SCOPE_PRESSURE` marker forces Full evaluation but does not
+mandate a split. File counts, line counts, elapsed time, and generated volume
+are evidence rather than gates. The Full manager is read-only; the controller
+owns rendering, validation, application, and routing. `AFLOW_STOP` remains
+terminal for semantic, safety, ownership, destructive, and other hard blockers.
 
 Lite is the normal cost-aware supervisor. It receives the finished turn's
 complete semantic result, compact run history, structured plan state, routing

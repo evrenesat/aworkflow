@@ -192,11 +192,13 @@ notes, the controller retains the first eight instead of spending a Full call
 solely on surplus advice. Invalid note types, empty notes, overlong notes, and
 notes forbidden for the selected action remain protocol errors.
 
-At the first reviewer rejection in an open implementation scope, Lite is
-instructed to select the available one-edge worker upgrade before spending
-another attempt on the same worker or escalating to Full. If that upgraded
-attempt is also rejected, the second rejection selects Full with the next
-configured upgrade edge, if any, exposed in context.
+At the first reviewer rejection in an open implementation scope, Lite decides
+from the cause: it can keep the same worker for a bounded repair, select one
+available upgrade edge for a capability/convergence problem, or escalate
+structural ambiguity. An available edge never mandates an upgrade. The second
+rejection in that same scope selects Full directly with the immutable envelope,
+all ordered rejections and attempts, the latest exact rejection, original and
+active plan bodies, and prior decisions.
 After the configured chain is exhausted, a manager `continue` into another
 repair attempt retains the most recently reviewed worker team. It cannot fall
 back to the baseline team while the original-checkpoint scope remains open.
@@ -232,8 +234,8 @@ opening turn, so prior-checkpoint repairs cannot stop a new checkpoint before
 its first review. A rejected review is counted from its own unchanged finalized
 outcome or from its creation of a new focused follow-up plan. The latter also
 counts when the reviewer reopens the original checkpoint, so the first
-rejection exposes the required Lite worker upgrade and the second rejection
-selects Full before another worker starts.
+rejection exposes cause-based Lite choices and the second rejection selects
+Full before another worker starts.
 For newly finalized reviewer turns, the controller stores an explicit
 `review_rejection` object (or JSON `null`) in `result.json` and retains the
 scope history in `run.json`. It records bounded plain-text reviewer and repair
@@ -243,6 +245,56 @@ When a run resumes into a fresh run directory, the scope opening turn is rebased
 to the new run and its prior rejection count is carried separately. Legacy
 scopes written before that carried counter existed discard the old top-level
 run-wide count rather than treating earlier-checkpoint rejections as current.
+
+### Automatic checkpoint repartition
+
+A new implementation scope captures an immutable envelope after startup-owned
+plan synchronization and metadata refresh but before its first worker starts.
+The envelope contains exact original-plan and current-checkpoint UTF-8 bytes,
+hashes, spans, and deterministic source blocks. It is reused across repair
+overlays, upgrades, and resume. Generated summaries are non-authoritative.
+Legacy active scopes without an envelope are never backfilled and cannot use
+automatic repartition.
+
+`AFLOW_SCOPE_PRESSURE: <reason>` is a nonterminal structural signal. With an
+enabled manager and a valid envelope it forces Full evaluation, but Full can
+still continue, upgrade, repartition, or stop. It is not a numeric size gate.
+A real `AFLOW_STOP` wins when both markers occur and remains terminal.
+Manager-disabled workflows fail clearly on real scope pressure rather than
+silently ignoring it.
+
+When Full returns `repartition_current_checkpoint`, the controller:
+
+1. captures the exact boundary source and corrective evidence;
+2. asks the configured read-only Full role for a strict proposal;
+3. renders and mechanically validates an unchecked candidate;
+4. asks Full again for an independent semantic verdict; and
+5. applies an accepted candidate through atomic per-copy replacement plus a
+   durable multi-copy transaction.
+
+Only one bounded correction is allowed after a mechanical or semantic
+rejection. Malformed protocol output stops immediately; a second rejected
+candidate stops with the workspace and all evidence preserved. Mechanical block
+coverage cannot prove semantic equivalence, so the separate Full verdict rejects
+changed meaning, weakened acceptance, new business decisions, contradictory
+guidance, lost corrective evidence, or unsupported review-readiness claims.
+
+Artifacts live under
+`.aflow/runs/<run-id>/manager/decision-NNN/repartition/attempt-NN/` and include
+the envelope, source plan, corrective evidence, proposal/validation prompts and
+stdout/stderr, strict proposal, rendered candidate, mechanical result, semantic
+verdict, hashes, and result. `run.json` records pending stage and applied
+history; status and terminal reports link to these paths without embedding full
+plan text.
+
+Resume validates carried artifacts before pruning a source run, reconciles any
+partial primary/worktree plan-copy transaction, and never starts a harness or
+replays an applied copy until reconciliation is complete. The first child keeps
+the parent scope and can retain the last worker only for an
+`implement_current_partition` disposition. Review approval closes that scope;
+the next inserted child opens normally with the baseline worker. The proposal
+cannot route later children, approve code, commit work, or discard dirty
+implementation.
 
 Every successful finalized turn is written with `status: "completed"`, a single
 authoritative finish timestamp, and its duration even while the overall
@@ -352,14 +404,15 @@ Resume repairs older affected run state when the original checkpoint has
 advanced, the saved checkpoint or checklist-style repair overlay is complete,
 and the scope is no longer awaiting review. The stale scope and one-hop routing
 state are cleared before the next worker invocation.
-For an owner-authorized checkpoint repartition, CLI
+For a manual owner-directed scope reset, CLI
 `--resume RUN_ID --resume-reset-scope` preserves the reused worktree and
 historical manager/attempt audit trail while explicitly discarding the saved
 repair overlay, interrupted step, active implementation scope, scoped counters,
 live attempt index, pending one-hop actions, and prior terminal report pointer.
 The source run remains the immutable attempt audit record. The next worker
 therefore opens a new scope from the invocation's original plan and baseline
-team.
+team. This manual compatibility path is distinct from the automatic
+scope-preserving repartition transaction above.
 
 - stdout and stderr
 - plan snapshots before and after each step

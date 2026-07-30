@@ -17,6 +17,11 @@ edit plans, create commits, or modify repository state.
 - Lite contexts intentionally omit active-plan content. Never infer or request
   plan prose from Lite context.
 - Full contexts include the active plan when deeper diagnosis is justified.
+- Full retrospective contexts can also include the immutable original
+  checkpoint envelope, the active repair plan, ordered rejection history, the
+  latest exact rejection, implementation attempts, and prior manager decisions.
+  Treat the verbatim envelope as authority and summaries/change-surface values
+  as evidence only.
 - Inspect a referenced raw artifact only when the supplied semantic evidence is
   insufficient. Do not read prompts, write files, or run mutating commands.
 - Prefer `continue` when the controller's proposed route is safe and supported.
@@ -40,7 +45,8 @@ fences. Do not include unknown keys.
 
 Allowed actions are `continue`, `retry_current_step`,
 `upgrade_next_implementation`, `switch_to_backup_and_retry`,
-`escalate_to_full` (Lite only), and `stop`.
+`escalate_to_full` (Lite only), `repartition_current_checkpoint` (Full only
+when exposed), and `stop`.
 
 - `reason` must be non-empty and grounded in supplied evidence.
 - `next_step_notes` must contain at most 8 non-empty strings of at most 1,000
@@ -56,13 +62,23 @@ Allowed actions are `continue`, `retry_current_step`,
   the worker attempt the reviewer just assessed. After another rejection, use
   the newly exposed edge only when the scope history and eligible action support
   it. Reviewers and managers remain on baseline routing.
-- On the first reviewer rejection in an active implementation scope, when the
-  controller exposes `upgrade_next_implementation`, choose that upgrade at Lite
-  level. Do not spend another attempt on the same worker and do not escalate to
-  Full before applying the eligible one-edge upgrade.
-- If the upgraded attempt is rejected, the boundary selector invokes Full
-  directly for the second rejection in that same scope. At Full, select the
-  next exposed one-edge upgrade only when it is eligible; otherwise choose
-  among the other controller-exposed actions from the supplied evidence.
+- On the first reviewer rejection in an active implementation scope, decide by
+  cause. Keep the same worker with `continue` for a bounded repair, select the
+  exposed one-edge upgrade for a capability or convergence failure, or escalate
+  structural ambiguity to Full. An available edge never mandates an upgrade.
+- The second rejection in that same open scope invokes Full directly. Full
+  decides retrospectively from the complete scope evidence whether to continue
+  the worker, choose an eligible one-edge upgrade, repartition, or stop.
+- `repartition_current_checkpoint` is legal only at Full when the controller
+  exposes it and the agreed checkpoint has structural execution pressure that a
+  scope-preserving split can address. `AFLOW_SCOPE_PRESSURE` and file/line/change
+  counts are evidence, never an automatic split or stop threshold.
+- Repartitioning delegates proposal and independent semantic validation to the
+  configured read-only Full role. It changes execution boundaries only; it
+  cannot approve code, invent workflow nodes, or alter business meaning.
+- Use `stop` for genuine semantic ambiguity, conflicting requirements, safety
+  or ownership boundaries, destructive handling of user work, protocol failure,
+  or inability to preserve the accepted scope. A real `AFLOW_STOP` remains
+  terminal even when scope pressure is also present.
 - Checkpoint approval closes the implementation scope. Do not use attempts from
   a closed scope to justify upgrading the next checkpoint's initial worker.

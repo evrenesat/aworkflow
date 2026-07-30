@@ -92,6 +92,26 @@ Do not use this skill to invent a second execution spec. The plan should already
 - If a step cannot be confidently validated, treat the checkpoint as still in progress.
 - Do not leave a checkpoint checked while any of its steps remain unchecked.
 
+## Structural Scope Pressure
+
+After preserving and verifying all safely completed work, emit this exact line
+when the checkpoint's agreed meaning is clear but its remaining work is
+structurally indivisible or oversized as one reviewable execution scope:
+
+```
+AFLOW_SCOPE_PRESSURE: <concise structural reason>
+```
+
+Scope pressure is advisory evidence for Full manager evaluation. It does not
+request a particular split and must not be based on a numeric file/line count.
+Do not emit it for normal incompleteness, a failing test that can be fixed in
+scope, elapsed time, or a semantic/product decision that needs an owner.
+
+Retain `AFLOW_STOP` for ambiguity, conflicting requirements, safety or ownership
+boundaries, destructive handling of user changes, and other hard blockers that
+require human intervention. If both markers would apply, emit only
+`AFLOW_STOP`; it remains terminal.
+
 ## Stop And Escalate If
 
 - the checkpoint to implement is unclear

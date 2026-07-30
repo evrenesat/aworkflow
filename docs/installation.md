@@ -38,10 +38,13 @@ aflow run path/to/plan.md
 ## Install Bundled Skills
 
 `aflow install-skills` copies the default bundled skills, including
-`aflow-harness-recovery-lead` and the read-only `aflow-manager`, into harness
-skill directories. The optional `aflow-assistant` skill is not installed unless
+`aflow-harness-recovery-lead`, the read-only `aflow-manager`, and the strict
+read-only `aflow-repartition-checkpoint`, into every detected supported harness
+skill directory. The optional `aflow-assistant` skill is not installed unless
 you ask for it. Keep the legacy recovery skill installed even when using manager
-supervision: manager-disabled configurations retain that recovery path.
+supervision: manager-disabled configurations retain that recovery path. Manager
+and repartition prompts also carry their complete JSON contracts inline, so a
+missing static skill does not weaken protocol validation.
 
 Auto mode:
 
@@ -85,6 +88,8 @@ Default skills:
 - `aflow-merge` - local-only merge handoff.
 - `aflow-init-repo` - pre-lifecycle bootstrap for empty repositories.
 - `aflow-harness-recovery-lead` - team-lead fallback for harness recovery decisions.
+- `aflow-manager` - read-only Lite/Full interstep supervision.
+- `aflow-repartition-checkpoint` - strict Full proposal and independent semantic validation for scope-preserving splits.
 
 Optional skills:
 

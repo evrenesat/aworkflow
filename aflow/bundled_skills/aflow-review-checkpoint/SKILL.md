@@ -92,6 +92,26 @@ If the checkpoint is not acceptable:
 9. Keep `Pre-Handoff Base HEAD` unchanged.
 10. Do not compact `DEVLOG.md` and do not squash the whole handoff.
 
+## Structural Scope Pressure
+
+If the checkpoint's accepted meaning is clear but review evidence proves the
+scope cannot converge as one reviewable execution unit, preserve the work,
+leave the checkpoint unapproved, do not rewrite its plan, and emit:
+
+```
+AFLOW_SCOPE_PRESSURE: <concise structural reason>
+```
+
+Use this only for structural indivisibility or oversize, never ordinary
+incompleteness, a bounded defect suitable for a fix plan, elapsed time, or a
+numeric file/line threshold. The marker advises Full manager evaluation and
+does not authorize the reviewer to choose or apply a split.
+
+Use `AFLOW_STOP` instead for semantic ambiguity, conflicting requirements,
+safety or ownership boundaries, destructive handling of user changes, or
+another hard blocker requiring human intervention. A real `AFLOW_STOP` is
+terminal and takes precedence over scope pressure.
+
 ## Stop And Escalate If
 
 - no original aflow plan with `Git Tracking` can be found

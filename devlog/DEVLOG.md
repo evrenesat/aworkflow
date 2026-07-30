@@ -44,12 +44,37 @@
   repair, CLI startup also rejected the legitimately advanced primary HEAD
   before resolving the explicit resume.
 
-## 2026-07-29 — Manager worker-upgrade documentation
+## 2026-07-30 — Automatic scope-preserving checkpoint repartition
 
 ### What changed
 
-- Made the first-rejection Lite upgrade and second-rejection direct Full
-  selection explicit in the README and bundled manager skill.
+- Added immutable checkpoint envelopes, cause-based Lite recovery, retrospective
+  Full context, advisory scope pressure, and Full-only repartition decisions.
+- Added strict read-only proposal and independent semantic-validation calls,
+  mechanical conservation, bounded correction, durable multi-copy application,
+  resume reconciliation, events, status, reports, and analysis reconstruction.
+- Added the default-installed `aflow-repartition-checkpoint` skill and aligned
+  operator documentation with runtime behavior.
+
+### Why
+
+- Mechanical execution-boundary changes can preserve an already accepted
+  checkpoint outcome without owner babysitting. Human intervention remains
+  appropriate for semantic ambiguity, conflicting requirements, safety or
+  ownership boundaries, destructive handling, or repeated inability to
+  conserve scope.
+- This supersedes the earlier policy that mandated a first-rejection upgrade and
+  the earlier use of owner authorization as the only checkpoint-repartition
+  path. Those entries remain below as historical context.
+
+## 2026-07-29 — Manager worker-upgrade documentation (superseded policy)
+
+### What changed
+
+- Documented the then-current first-rejection Lite upgrade and
+  second-rejection direct Full selection in the README and bundled manager
+  skill. The 2026-07-30 cause-based policy above supersedes the mandatory first
+  action while retaining direct Full selection for the second rejection.
 - Clarified that managers choose an abstract eligible action while the
   controller resolves and persists the concrete worker team and selector.
 - Added a documentation regression test for the complete scoped sequence,
@@ -123,9 +148,11 @@
 
 ### Why
 
-- A live first-rejection Lite manager correctly selected the required Terra
-  upgrade but returned nine useful notes. The undisclosed eight-note validator
-  rejected it and spent an unnecessary Full call on the same action.
+- Under the then-current mandatory-upgrade policy, a live first-rejection Lite
+  manager selected Terra but returned nine useful notes. The undisclosed
+  eight-note validator rejected it and spent an unnecessary Full call on the
+  same action. The cause-based policy above supersedes the mandate, not this
+  historical note-boundary incident.
 
 ## 2026-07-29 — Durable live review-rejection history
 
@@ -190,7 +217,7 @@
   `json` fence despite the no-fence instruction. Strict transport parsing
   escalated healthy CP9 progress to Full unnecessarily.
 
-## 2026-07-29 — Owner-authorized checkpoint repartition resume
+## 2026-07-29 — Owner-authorized checkpoint repartition resume (historical manual path)
 
 ### What changed
 
@@ -202,10 +229,12 @@
 
 ### Why
 
-- A legitimate Full-manager stop can ask the owner to repartition an oversized
-  checkpoint. Reusing the durable worktree must not also revive the rejected
-  repair overlay and exhausted rejection state, and operators should not need
-  to edit `run.json` manually.
+- At the time, a legitimate Full-manager stop could ask the owner to repartition
+  an oversized checkpoint. Reusing the durable worktree could not also revive
+  the rejected repair overlay and exhausted rejection state, and operators
+  needed a safe alternative to editing `run.json`. Automatic conservative
+  repartition now handles mechanical splits; this manual reset remains for
+  owner-directed scope replacement.
 
 ## 2026-07-28 — Repair approval active-plan restoration
 
@@ -243,13 +272,15 @@
   repaired, resume also skipped the unfinished reviewer and restarted the
   implementor.
 
-## 2026-07-28 — First-rejection worker upgrade policy
+## 2026-07-28 — First-rejection worker upgrade policy (superseded)
 
 ### What changed
 
-- Tightened the inline and bundled interstep-manager policy so Lite selects an
-  eligible one-edge worker upgrade immediately after the first reviewer
-  rejection, before Full-manager escalation.
+- Tightened the then-current inline and bundled interstep-manager policy so Lite
+  selected an eligible one-edge worker upgrade immediately after the first
+  reviewer rejection. The 2026-07-30 cause-based policy supersedes this:
+  bounded repair may retain the worker, capability/convergence evidence may
+  upgrade, and structural pressure may escalate to Full.
 - Added prompt coverage for the DS4-pro to Terra-style upgrade boundary.
 
 ### Why

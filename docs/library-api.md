@@ -93,16 +93,29 @@ artifact; legacy artifacts without an explicit duration derive it from their
 timestamps when possible.
 Versioned boundaries also preserve the structured plan state and distinguish a
 closed scope from absent legacy scope data. Resume rebases the run-local scope
-window and carries its accumulated reviewer-rejection count.
+window and carries its accumulated reviewer-rejection count. Selector-3 Full
+contexts additionally expose the validated immutable scope envelope, ordered
+active-scope rejection and attempt histories, the latest exact rejection, prior
+decisions, and pending/applied repartition evidence. Stored boundaries rebuild
+from captured inputs rather than mutable live plans.
 
 ## Manager Events
 
 `ExecutionObserver` can receive additive `manager_started` and
-`manager_decided` events. They provide a decision number, level, trigger,
+`manager_decided` events. It can also receive
+`checkpoint_repartitioned` as `CheckpointRepartitionedEvent` after both plan
+copies are reconciled. Manager events provide a decision number, level, trigger,
 action when decided, selected target step/team, optional report path, and
 run-relative manager artifact paths. Events intentionally do not embed the
 active plan, manager context, prompts, or raw stdout/stderr; retrieve those
 from the run directory only when authorized and needed.
+
+`CheckpointRepartitionedEvent` provides the decision number, scope and
+generation identities, candidate hash, ordered partition IDs and titles,
+current disposition, resolved target step/role, and run-relative proposal,
+candidate, mechanical-validation, and semantic-verdict paths. The additive
+event reports a controller-applied execution-boundary change; it does not mean
+the first child passed review.
 
 ## Public Types
 
@@ -124,5 +137,6 @@ The stable public API includes:
 - `analyze_runs`
 - `ManagerStartedEvent`
 - `ManagerDecidedEvent`
+- `CheckpointRepartitionedEvent`
 
 See [Architecture](../ARCHITECTURE.md) for module-level notes and model details.

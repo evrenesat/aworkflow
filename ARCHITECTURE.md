@@ -169,7 +169,7 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - **`[aflow]`** section: `default_workflow`, `keep_runs`, `max_turns`, `retry_inconsistent_checkpoint_state`, `banner_files_limit`, `max_same_step_turns`, `team_lead`, `branch_prefix`, `worktree_prefix`, `worktree_root`.
 - **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
 - **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining.
-- **`[manager]`**: optional interstep supervision with Lite and Full role names, a semantic-stall threshold, and the bundled read-only skill name. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
+- **`[manager]`**: optional interstep supervision with Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
 - **`[error_handling.harness_error_recovery]`**: ordered recovery rules, `max_consecutive_recoveries`, and the bundled fallback skill name used when deterministic matching cannot decide safely.
 - **`[prompts]`** section: named prompt templates.
 - Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) inherited by all workflows that don't override them. Not a runnable workflow.
@@ -216,12 +216,47 @@ The core engine. `run_workflow()` executes the turn loop:
       execution path while persisted controller state uses the primary-checkout
       logical path.
    l. Update run metadata with the active plan selected for the next turn.
-   m. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout fingerprints detect mutation. Its own invocation does not count as a workflow turn.
+   m. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The Full manager is read-only: the manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout and current-run fingerprints detect mutation. Its own invocation does not count as a workflow turn.
    n. Persist accepted one-hop notes, exact selector, target active-plan identity, stable implementation-scope identity, and an eligible implementation-team override before the next step begins. Resume restores the scope and an unconsumed target before launching it, normalizes attempt histories to mutable live lists, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
 
    Harness error recovery is inserted after the harness returns and before normal transition handling. If the turn made no plan progress and a configured error-handling rule matches the harness output, the engine produces that cheap deterministic action for manager acceptance. Rules can keep the same team, switch to a configured `backup_team`, or fail immediately. An unmatched ambiguous error goes directly to Full supervision when enabled; manager-disabled runs retain the team-lead recovery handoff. Progress-gated turns skip recovery entirely and continue on the normal transition path.
 5. After normal workflow completion, if `teardown` includes `merge`, execute the merge handoff: resolve `[aflow].team_lead` through the effective team, build a merge prompt (built-in `aflow-merge` instruction plus rendered `merge_prompt` entries), and run the `team_lead` agent from the primary checkout. After the agent returns, verify: no unmerged index entries, clean working tree, HEAD on `main_branch`, and feature branch is an ancestor of the target. Only after all checks pass does `rm_worktree` (if configured) remove the linked worktree. Any verification failure leaves the feature branch and worktree intact and fails the run with the specific failed check.
-6. If the workflow uses the worktree+branch lifecycle, `aflow` can resume an unfinished prior run. Resume candidate lookup resolves the previous run id through the current shell's `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID` supplied an explicit run id. A run is resumable only when `run.json` shows a worktree lifecycle with recorded feature branch and worktree path, status `failed` or `running`, `last_snapshot.is_complete != true`, no `merge_status`, and the resolved invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup. Plain `aflow run` treats that as an optional interactive prompt in TTY mode and otherwise falls back to the fresh-run path. `aflow run --resume` makes resume mandatory: with no run id it must resolve a prior run from that lookup order or fail; with a run id it must use that run or fail. Accepted resume builds a `ResumeContext` from the recorded branch, worktree, and active logical plan path, validates that worktree and active execution path before prompting, and starts `run_workflow()` directly in the reused execution context instead of provisioning a fresh one. The plan file on disk still remains the durable checkpoint state. Resume recomputes the active scope's rejection count from durable review artifacts so corrected classifiers repair older metadata. If a completed active turn is newer than `run.json.turns_completed`, its finalized result becomes a pending replay boundary: the new run uses the source artifacts for one manager decision before routing another harness. An explicit `--resume RUN_ID --resume-reset-scope` owner-repartition boundary preserves lifecycle identity and manager history while omitting the saved active overlay and clearing the live scope/attempt index; the linked source run retains the immutable attempt audit.
+6. If the workflow uses the worktree+branch lifecycle, `aflow` can resume an unfinished prior run. Resume candidate lookup resolves the previous run id through the current shell's `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID` supplied an explicit run id. A run is resumable only when `run.json` shows a worktree lifecycle with recorded feature branch and worktree path, status `failed` or `running`, `last_snapshot.is_complete != true`, no `merge_status`, and the resolved invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup. Plain `aflow run` treats that as an optional interactive prompt in TTY mode and otherwise falls back to the fresh-run path. `aflow run --resume` makes resume mandatory: with no run id it must resolve a prior run from that lookup order or fail; with a run id it must use that run or fail. Accepted resume builds a `ResumeContext` from the recorded branch, worktree, and active logical plan path, validates that worktree and active execution path before prompting, and starts `run_workflow()` directly in the reused execution context instead of provisioning a fresh one. The plan file on disk still remains the durable checkpoint state. Resume recomputes the active scope's rejection count from durable review artifacts so corrected classifiers repair older metadata. If a completed active turn is newer than `run.json.turns_completed`, its finalized result becomes a pending replay boundary: the new run uses the source artifacts for one manager decision before routing another harness. Pending repartition stages and both plan copies are validated and reconciled before any harness starts; an already applied copy is not replayed. An explicit `--resume RUN_ID --resume-reset-scope` manual boundary remains available for owner-directed replacement and preserves lifecycle identity and manager history while omitting the saved active overlay and clearing the live scope/attempt index; the linked source run retains the immutable attempt audit.
+
+### `repartition.py`
+
+Captures the complete original-plan and current-checkpoint bytes in a versioned,
+content-addressed scope envelope before the first worker attempt. It records
+zero-based byte spans, one-based half-open line spans, exact source blocks, and
+SHA-256 identities; summaries are non-authoritative and cannot establish
+coverage.
+
+Automatic repartition is a four-boundary protocol:
+
+1. Full selects `repartition_current_checkpoint` only when the controller
+   exposes it for a valid live scope.
+2. The configured Full role returns a strict read-only proposal covering every
+   authoritative and corrective-evidence block.
+3. The controller renders the candidate and proves mechanical conservation,
+   then a separate Full call validates semantic preservation.
+4. The controller alone applies accepted bytes with atomic per-file replacement
+   and a durable multi-copy transaction.
+
+Each attempt stores the envelope, boundary source, evidence, prompts,
+stdout/stderr, proposal, candidate, mechanical result, semantic verdict, hashes,
+and final result under the manager decision's repartition directory. `run.json`
+stores the pending stage, identities, disposition, paths, and applied record.
+Resume reconciles a partial transaction before another harness. The first child
+retains the parent scope and may retain its last worker for
+`implement_current_partition`; approval closes it, and the next inserted child
+opens a fresh scope on the baseline team.
+
+Mechanical conservation cannot prove semantic equivalence. The independent Full
+verdict handles that unavoidable boundary, and two rejected candidates stop
+safely with all work and evidence preserved. Legacy scopes without an envelope
+cannot be repartitioned automatically. Manager-disabled workflows keep their
+existing behavior; a real scope-pressure marker fails clearly rather than being
+ignored. `AFLOW_STOP` remains terminal.
 
 A scheduled retry skips the pre-turn plan reload and reuses the last valid snapshot and saved prompt context. The same `ACTIVE_PLAN_PATH`, `NEW_PLAN_PATH`, and resolved step selector are reused; the retry appendix (containing the exact parse error) is added to the prompt. Startup recovery seeds that same retry machinery by passing a `RetryContext` into `run_workflow()`, which stores the step name, role, resolved selector, and prompt context in `state.pending_retry` before turn 1. Retry turns still count toward `max_turns`.
 
@@ -394,6 +429,7 @@ aflow/
     runner.py          # workflow execution runner
     events.py          # execution events and observers
   run_state.py         # runtime data classes
+  repartition.py       # immutable envelopes, strict split protocol, validation
   runlog.py            # run/turn artifact persistence
   status.py            # Rich live banner with background refresh thread
   git_status.py        # git snapshot helpers (probe, baseline, summary)

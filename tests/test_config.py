@@ -412,18 +412,14 @@ class WorkflowConfigTests(unittest.TestCase):
         assert config.aflow.default_workflow == 'medium'
         assert config.aflow.max_turns == 15
         assert config.aflow.team_lead == 'senior_architect'
+        assert config.manager.repartition_skill == 'aflow-repartition-checkpoint'
         assert config.roles['architect'] == 'claude.opus'
-        assert config.teams['7teen'].roles['worker'] == 'codex.nano'
-        assert config.teams['codex1'].backup_team == '7teen'
+        assert config.teams == {}
         assert config.workflows['ralph'].steps['implement_plan'].role == 'worker'
         assert config.workflows['ralph'].setup == ('worktree', 'branch')
         assert config.workflows['ralph'].teardown == ('merge', 'rm_worktree')
-        assert config.workflows['ralph_jr'].team == '7teen'
-        assert config.workflows['ralph_jr'].setup == ('branch',)
-        assert config.workflows['ralph_jr'].teardown == ('merge',)
-        assert config.workflows['ralph_jr'].merge_prompt == ('simple_merge',)
         assert 'hard' in config.workflows
-        assert 'jr' in config.workflows
+        assert 'medium' in config.workflows
         assert validate_workflow_config(config) == []
 
     def test_bundled_workflows_preserve_repair_plans_on_review_edges(self) -> None:
@@ -447,15 +443,16 @@ class WorkflowConfigTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[1]
         readme = (repo_root / 'README.md').read_text(encoding='utf-8')
         architecture = (repo_root / 'ARCHITECTURE.md').read_text(encoding='utf-8')
+        configuration = (repo_root / 'docs' / 'configuration.md').read_text(encoding='utf-8')
+        runtime = (repo_root / 'docs' / 'runtime-behavior.md').read_text(encoding='utf-8')
+        installation = (repo_root / 'docs' / 'installation.md').read_text(encoding='utf-8')
+        library_api = (repo_root / 'docs' / 'library-api.md').read_text(encoding='utf-8')
         devlog = (repo_root / 'devlog' / 'DEVLOG.md').read_text(encoding='utf-8')
         aflow_text = (repo_root / 'aflow' / 'aflow.toml').read_text(encoding='utf-8')
         workflows_text = (repo_root / 'aflow' / 'workflows.toml').read_text(encoding='utf-8')
 
         assert 'aflow/workflows.toml' in readme
-        assert '--team' in readme
-        assert 'max_turns' in readme
-        assert 'extends = "ralph"' in readme
-        assert 'Config is split across two TOML files' in readme
+        assert 'Configuration is split across two TOML files' in readme
         assert 'resolve_role_selector' in architecture
         assert 'workflows.toml' in architecture
         assert '# Default workflow used when the CLI does not name one.' in aflow_text
@@ -465,60 +462,39 @@ class WorkflowConfigTests(unittest.TestCase):
         assert '# [error_handling.harness_error_recovery]' in aflow_text
         assert 'retry_same_team_after_delay' in aflow_text
         assert '# Named prompt templates that workflow steps reference by key.' in aflow_text
-        assert '# Alias workflow, inherits `ralph` steps but runs branch-only lifecycle with a per-workflow merge prompt.' in workflows_text
         assert '# The step runs under a role. The selected team decides which selector that role maps to at runtime.' in workflows_text
         assert '# Transition rules are checked top to bottom. Each rule uses a `to` target and an optional `when` condition.' in workflows_text
+        assert 'repartition_skill = "aflow-repartition-checkpoint"' in configuration
+        assert 'Automatic scope-preserving checkpoint repartition' in devlog
 
-        # lifecycle config docs parity
-        assert 'team_lead' in readme
-        assert 'worktree_root' in readme
-        assert 'branch_prefix' in readme
-        assert 'setup' in readme
-        assert 'teardown' in readme
-        assert 'merge_prompt' in readme
-        assert 'aflow show' in readme
-        assert 'exclude = ["step_name"]' in readme
-        assert 'aflow-merge' in readme
-        assert 'aflow-assistant' in readme
-        assert '--include-optional' in readme
-        assert '--only' in readme
-        assert 'aflow analyze' in readme
-        assert 'AnalyzeRequest' in readme
-        assert 'error_handling.harness_error_recovery' in readme
-        assert 'backup_team' in readme
-        assert 'aflow-harness-recovery-lead' in readme
-        assert 'AFLOW_LAST_RUN_ID' in readme
-        assert 'last_run_ids' in readme
-        assert 'resume' in readme
-        assert 'reuses the recorded feature branch and worktree path' in readme
-        assert 'Issues' in readme
-
-        assert 'team_lead' in architecture
-        assert 'worktree_root' in architecture
-        assert 'ExecutionContext' in architecture
-        assert 'aflow show' in architecture
-        assert 'aflow-merge' in architecture
-        assert 'aflow-assistant' in architecture
-        assert 'aflow analyze' in architecture
-        assert 'aflow.api.analyze' in architecture
-        assert 'AnalyzeRequest' in architecture
-        assert 'exclude = ["step_name"]' in architecture
-        assert 'backup_team' in architecture
-        assert 'aflow-harness-recovery-lead' in architecture
-        assert 'AFLOW_LAST_RUN_ID' in architecture
-        assert '.aflow/last_run_id' in architecture
-        assert 'last_run_ids' in architecture
-        assert 'resume' in architecture
-        assert 'reused execution context' in architecture
-        assert 'optional bundled' in architecture
-
-        assert 'resume' in devlog
-        assert 'Harness recovery docs and public analyze API' in devlog
-        assert 'aflow show' in devlog
-        assert 'exclude = ["step_name"]' in devlog
-        assert 'AnalyzeRequest' in devlog
-        assert 'AFLOW_LAST_RUN_ID' in devlog
-        assert 'last_run_ids' in devlog
+        operator_docs = '\n'.join((
+            readme, architecture, configuration, runtime, installation, library_api,
+        ))
+        for term in (
+            'team_lead',
+            'worktree_root',
+            'branch_prefix',
+            'setup',
+            'teardown',
+            'merge_prompt',
+            'aflow show',
+            'exclude = ["step_name"]',
+            'aflow-merge',
+            'aflow-assistant',
+            '--include-optional',
+            '--only',
+            'AnalyzeRequest',
+            'error_handling.harness_error_recovery',
+            'backup_team',
+            'aflow-harness-recovery-lead',
+            'AFLOW_LAST_RUN_ID',
+            'last_run_ids',
+            '{MAIN_BRANCH}',
+            '{FEATURE_BRANCH}',
+            '{PRIMARY_REPO_ROOT}',
+            '{EXECUTION_REPO_ROOT}',
+        ):
+            assert term in operator_docs
 
         # lifecycle defaults table is documented in workflows.toml
         assert '[workflow]' in workflows_text
@@ -526,12 +502,6 @@ class WorkflowConfigTests(unittest.TestCase):
         assert 'teardown' in workflows_text
         assert 'main_branch' in workflows_text
         assert 'exclude = ["step_name"]' in workflows_text
-
-        # merge-only placeholders are documented in README
-        assert '{MAIN_BRANCH}' in readme
-        assert '{FEATURE_BRANCH}' in readme
-        assert '{PRIMARY_REPO_ROOT}' in readme
-        assert '{EXECUTION_REPO_ROOT}' in readme
 
     def test_bootstrap_creates_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

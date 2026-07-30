@@ -40,6 +40,11 @@ aflow run --plan path/to/plan.md --workflow review_implement_cp_review
 aflow analyze
 ```
 
+Configuration is split across two TOML files: global settings, profiles, roles,
+teams, prompts, and manager policy come from packaged `aflow/aflow.toml`, while
+lifecycle defaults and workflow graphs come from `aflow/workflows.toml`. First
+run copies both beside each other under `~/.config/aflow/`.
+
 ### Safe next-turn overrides
 
 Each run writes an atomic, versioned controller snapshot to
@@ -60,17 +65,29 @@ For a rejected implementation, configured team `upgrade_to` edges can raise
 only the next worker invocation one level at a time; repeated rejection can
 advance farther along the chain, while the next checkpoint starts again from
 the baseline team. On the first rejection in an open checkpoint scope, Lite
-must select the exposed one-edge upgrade before another implementation attempt.
-If that upgraded attempt is rejected, the second rejection invokes Full
-directly. The manager selects only the abstract upgrade action; the controller
-resolves and persists the concrete next team and selector. Full supervision is
-also selected for repeated unchanged executions of one workflow step; ordinary
-implement/review alternation stays on Lite.
+decides by cause: a bounded omission can stay with the same worker, a capability
+or convergence failure can take one exposed upgrade edge, and structural
+pressure can escalate to Full. The second rejection in the same scope invokes
+Full directly with the complete retrospective evidence.
+
+When exposed at a valid live checkpoint, Full can request automatic checkpoint
+repartitioning. The immutable verbatim scope envelope remains authoritative;
+generated summaries are non-authoritative. The same configured Full role makes
+a read-only proposal and a separate semantic-validation decision, while the
+controller alone mechanically validates, transactionally applies, resumes, and
+routes the split. No file/line count mandates a split. The first child may retain
+its worker when it needs stabilization; later children start from the baseline
+team after normal review approval closes the prior scope. The Full manager is
+read-only, and `AFLOW_STOP` remains terminal for genuine semantic, safety,
+ownership, or destructive blockers.
+
+Full supervision is also selected for repeated unchanged executions of one
+workflow step; ordinary implement/review alternation stays on Lite.
 Existing configurations remain compatible: supervision stays off until you add
 a `[manager]` section and the corresponding manager roles. See
 [Configuration](docs/configuration.md#interstep-manager-supervision) for the
 safe opt-in example, and [Runtime Behavior](docs/runtime-behavior.md#interstep-manager-supervision)
-for lifecycle and artifact details.
+for lifecycle, repartition artifacts, resume semantics, and limitations.
 
 Minimal plan:
 

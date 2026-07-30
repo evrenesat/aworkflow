@@ -104,6 +104,7 @@ lite_role = 'manager_lite'
 full_role = 'manager_full'
 full_after_stalled_turns = 2
 skill = 'aflow-manager'
+repartition_skill = 'aflow-repartition-checkpoint'
 
 # Team-specific role overrides live under [teams.<name>.roles]. Missing roles fall back
 # to the global [roles] map. backup_team names the next team to try for harness
