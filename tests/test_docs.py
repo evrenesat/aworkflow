@@ -27,6 +27,15 @@ class SkillDocsTests(unittest.TestCase):
             skill_path = repo_root / 'aflow' / 'bundled_skills' / skill_name / 'SKILL.md'
             assert skill_path.exists()
 
+    def test_merge_skill_rebases_a_checked_out_feature_branch_in_its_worktree(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / 'aflow' / 'bundled_skills' / 'aflow-merge' / 'SKILL.md').read_text(encoding='utf-8')
+
+        assert 'git worktree list --porcelain' in text
+        assert 'git -C <feature_worktree> rebase <target_branch>' in text
+        assert 'Git refuses to update a branch checked out elsewhere' in text
+        assert 'Run `git rebase --abort` or `git rebase --continue` in the same checkout' in text
+
     def test_aflow_assistant_bundled_resources_exist(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         skill_root = repo_root / 'aflow' / 'bundled_skills' / 'aflow-assistant'

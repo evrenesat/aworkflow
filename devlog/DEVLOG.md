@@ -1,3 +1,20 @@
+## 2026-07-30 — Managed-worktree terminal rebase
+
+### What changed
+
+- Taught the bundled merge role to locate the worktree that owns a checked-out
+  feature branch and perform the required rebase there.
+- Kept the primary checkout responsible for the final fast-forward merge and
+  required the owning feature worktree to be clean and on the exact branch.
+- Added a documentation regression preventing the invalid primary-checkout
+  rebase form from returning.
+
+### Why
+
+- A fully approved seven-checkpoint run reached terminal integration with a
+  clean managed feature worktree, but Git refused to rebase that branch from
+  the primary checkout because the branch was checked out elsewhere.
+
 ## 2026-07-30 — Resume after completed repair-overlay removal
 
 ### What changed

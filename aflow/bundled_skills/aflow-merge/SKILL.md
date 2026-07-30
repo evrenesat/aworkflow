@@ -10,7 +10,7 @@ Use this skill only when the aflow engine invokes it as the post-workflow merge 
 ## Rules
 
 - Operate only on local refs and local worktrees. Do not run `git fetch`, `git pull`, or any command that contacts a remote.
-- The primary checkout is your working root. The feature worktree (when present) is for reading only — its branch is already tracked locally.
+- The primary checkout is your working root. Treat the feature worktree as read-only except for a required rebase when it is the worktree that owns the feature branch.
 - Preserve commits. Do not squash, collapse, or rebase onto anything other than the local target branch.
 - Leave worktree removal to the engine. Do not run `git worktree remove`.
 - Do not delete the feature branch.
@@ -24,9 +24,10 @@ Use this skill only when the aflow engine invokes it as the post-workflow merge 
    - If exit code is 0, the feature branch is already based on target — fast-forward merge directly with `git merge --ff-only <feature_branch>`.
    - If exit code is non-zero, rebase is needed first.
 3. If rebase is needed:
-   - Run `git rebase <target_branch> <feature_branch>` from the primary checkout.
-   - For each conflict, examine both sides carefully and resolve by preserving the intent of both. If the intent is genuinely ambiguous, run `git rebase --abort` and emit `AFLOW_STOP: conflict resolution is ambiguous for <file>`.
-   - After resolving all conflicts, run `git rebase --continue`.
+   - Use `git worktree list --porcelain` to determine whether the feature branch is checked out in a linked worktree.
+   - If a linked worktree owns the feature branch, require that worktree to be clean and on the exact feature branch, then run `git -C <feature_worktree> rebase <target_branch>`. Do not run `git rebase <target_branch> <feature_branch>` from the primary checkout while another worktree owns the branch; Git refuses to update a branch checked out elsewhere.
+   - If no linked worktree owns the feature branch, run `git rebase <target_branch> <feature_branch>` from the primary checkout.
+   - For each conflict, examine both sides carefully and resolve by preserving the intent of both. Run `git rebase --abort` or `git rebase --continue` in the same checkout where the rebase started. If the intent is genuinely ambiguous, abort and emit `AFLOW_STOP: conflict resolution is ambiguous for <file>`.
    - After a successful rebase, fast-forward merge with `git merge --ff-only <feature_branch>`.
 4. After the merge, verify:
    - `git ls-files --unmerged` is empty (no unresolved index entries).
