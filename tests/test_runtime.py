@@ -7543,6 +7543,11 @@ class LifecycleBootstrapTests(unittest.TestCase):
 
     def test_repartition_full_cycle_applies_routes_review_and_resets_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            from aflow.api import (
+                CheckpointRepartitionedEvent,
+                CollectingObserver,
+            )
+
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
@@ -7752,6 +7757,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     boundary_observations.append("pending-before-starting")
                 return actual_start(*args, **kwargs)
 
+            observer = CollectingObserver()
             with patch(
                 "aflow.workflow.write_turn_artifacts_start",
                 side_effect=observe_start,
@@ -7765,6 +7771,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     config_dir=repo_root,
                     adapter=CodexAdapter(),
                     runner=runner,
+                    observer=observer,
                 )
 
             run_dir = next((repo_root / ".aflow" / "runs").iterdir())
@@ -7785,6 +7792,24 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert result.final_snapshot.is_complete
             assert payload["turns_completed"] == 3
             assert payload["pending_repartition"] is None
+            history = payload["repartition_history"]
+            assert len(history) == 1
+            applied = history[0]
+            assert applied["scope_pressure_reason"] == "split this checkpoint"
+            assert applied["current_partition_id"] == applied["partition_ids"][0]
+            assert applied["child_summaries"] == [
+                "Revised part 1: Implement part 1.",
+                "Revised part 2: Implement part 2.",
+            ]
+            repartition_events = [
+                event for event in observer.events
+                if isinstance(event, CheckpointRepartitionedEvent)
+            ]
+            assert len(repartition_events) == 1
+            assert repartition_events[0].generation_id == applied["generation_id"]
+            assert repartition_events[0].artifact_paths["candidate"] == (
+                applied["candidate_artifact_path"]
+            )
             assert boundary_observations == [
                 "pending-before-starting", "consumed-after-starting",
             ]
@@ -8197,6 +8222,14 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         "stage": mutate_stage,
                         "status": "failed",
                     }
+                    report = (run_dir / "manager-report.md").read_text(
+                        encoding="utf-8"
+                    )
+                    assert "## Repartition recovery evidence" in report
+                    assert f"- Pending stage: failed" in report
+                    assert f"- Failed stage: {mutate_stage}" in report
+                    assert "- Exact next action:" in report
+                    assert pending["latest_attempt_path"] in report
                     assert plan_path.read_text(encoding="utf-8") == _VALID_PLAN
 
     def test_scope_pressure_with_tampered_envelope_fails_before_manager_decision(self) -> None:

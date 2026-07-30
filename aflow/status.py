@@ -653,6 +653,68 @@ def _build_summary_table(
         table.add_row("Manager Upgrade", f"{override.target_step}: {override.target_team}")
     if state.last_manager_report_path is not None:
         table.add_row("Manager Report", state.last_manager_report_path)
+    if state.scope_pressure_reason is not None:
+        table.add_row(
+            "Scope Pressure",
+            Text(state.scope_pressure_reason),
+        )
+    if state.pending_repartition is not None:
+        pending = state.pending_repartition
+        pending_text = Text(pending.stage)
+        if pending.failed_stage is not None:
+            pending_text.append(f" / failed: {pending.failed_stage}")
+        table.add_row("Repartition", pending_text)
+    if state.repartition_history:
+        latest = state.repartition_history[-1]
+        table.add_row(
+            "Latest Split",
+            Text(
+                f"{latest.generation_id} / {len(latest.partition_ids)} parts / "
+                f"{latest.current_disposition}"
+            ),
+        )
+        table.add_row(
+            "Split Children",
+            Text(" | ".join(latest.child_summaries)),
+        )
+        table.add_row(
+            "Split Target",
+            Text(
+                f"{latest.resolved_target_step} ({latest.resolved_target_role}) / "
+                f"current {latest.current_partition_id}"
+            ),
+        )
+        table.add_row(
+            "Split Hashes",
+            Text(
+                f"envelope {latest.envelope_sha256[:12]} / "
+                f"proposal {latest.proposal_sha256[:12]} / "
+                f"candidate {latest.candidate_plan_sha256[:12]}"
+            ),
+        )
+        table.add_row(
+            "Split Evidence",
+            Text(
+                f"{latest.envelope_artifact_path} / "
+                f"{latest.proposal_artifact_path} / "
+                f"{latest.candidate_artifact_path} / "
+                f"{latest.mechanical_validation_artifact_path} / "
+                f"{latest.semantic_verdict_artifact_path}"
+            ),
+        )
+    scope = state.active_implementation_scope
+    if (
+        scope is not None
+        and scope.current_partition_generation_id is not None
+        and scope.current_partition_id is not None
+    ):
+        table.add_row(
+            "Current Partition",
+            Text(
+                f"{scope.current_partition_id} / "
+                f"{scope.current_partition_generation_id}"
+            ),
+        )
 
     if git_summary is not None:
         table.add_row("Git", _git_row(git_summary))

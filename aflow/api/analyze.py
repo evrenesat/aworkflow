@@ -2,15 +2,69 @@
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 from aflow.analyzer import analyze_corpus, analyze_single_run, collect_run_dirs, resolve_run_id
 from aflow.analyzer import load_turns
 from aflow.manager_context import build_manager_context
 
 from .models import AnalyzeRequest
+
+
+def _validated_repartition_history(
+    run_dir: Path,
+    boundary: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Validate compact captured repartition records against exact artifacts."""
+
+    raw_history = boundary.get("repartition_history")
+    if raw_history is None:
+        return None
+    if not isinstance(raw_history, list):
+        raise ValueError("manager boundary repartition history is not a list")
+    validated: list[dict[str, Any]] = []
+    for raw in raw_history:
+        if not isinstance(raw, dict):
+            raise ValueError("manager boundary repartition record is not an object")
+        record = dict(raw)
+        artifact_hashes = {
+            "envelope_artifact_path": record.get("envelope_artifact_sha256"),
+            "proposal_artifact_path": record.get("proposal_sha256"),
+            "candidate_artifact_path": record.get("candidate_plan_sha256"),
+        }
+        for path_key in (
+            "envelope_artifact_path",
+            "proposal_artifact_path",
+            "candidate_artifact_path",
+            "mechanical_validation_artifact_path",
+            "semantic_verdict_artifact_path",
+        ):
+            relative = record.get(path_key)
+            if not isinstance(relative, str) or not relative:
+                raise ValueError(
+                    f"manager boundary repartition record lacks {path_key}"
+                )
+            artifact = (run_dir / relative).resolve()
+            try:
+                artifact.relative_to(run_dir.resolve())
+                artifact_bytes = artifact.read_bytes()
+            except (ValueError, OSError) as exc:
+                raise ValueError(
+                    f"manager boundary repartition artifact is unavailable: {relative}"
+                ) from exc
+            expected_hash = artifact_hashes.get(path_key)
+            if (
+                isinstance(expected_hash, str)
+                and hashlib.sha256(artifact_bytes).hexdigest() != expected_hash
+            ):
+                raise ValueError(
+                    f"manager boundary repartition artifact hash drift: {relative}"
+                )
+        validated.append(record)
+    return validated
 
 
 def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
@@ -108,6 +162,15 @@ def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
                                 active_plan_content=(str(durable["active_plan_content"])
                                     if durable.get("active_plan_content") is not None else None),
                             )
+                            repartition_history = _validated_repartition_history(
+                                run_dir, boundary,
+                            )
+                            if repartition_history is not None:
+                                controller_state = rebuilt.get("controller_state")
+                                if isinstance(controller_state, dict):
+                                    controller_state["checkpoint_repartitions"] = (
+                                        repartition_history
+                                    )
                             if rebuilt != stored:
                                 differing_keys = sorted({*rebuilt, *stored} - {
                                     key for key in {*rebuilt, *stored}

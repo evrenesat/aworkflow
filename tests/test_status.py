@@ -7,11 +7,13 @@ import pytest
 
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
+    CheckpointRepartitionRecord,
     ControllerState,
     FrozenRunIdentity,
     ManagerDecisionSummary,
     OverrideResult,
     PendingManagerNotes,
+    PendingRepartitionV1,
     PendingTeamOverride,
 )
 from aflow.status import _RICH_AVAILABLE, _build_summary_table
@@ -101,3 +103,67 @@ def test_status_summary_surfaces_safe_override_diagnostics() -> None:
     assert "Override File" in rendered
     assert "rejected: team is incompatible" in rendered
     assert "correct overrides.toml and resume" in rendered
+
+
+def test_status_summary_surfaces_literal_repartition_observability() -> None:
+    from rich.console import Console
+
+    state = ControllerState(
+        last_snapshot=PlanSnapshot("Checkpoint 1 / Partition 1", 1, 1, False, 2, 2)
+    )
+    state.scope_pressure_reason = "[bold red]split safely[/bold red]"
+    state.pending_repartition = PendingRepartitionV1(
+        schema_version=1,
+        decision_number=4,
+        scope_id="scope-1",
+        stage="failed",
+        envelope_sha256="a" * 64,
+        source_plan_sha256="b" * 64,
+        failed_stage="validate",
+    )
+    state.repartition_history.append(CheckpointRepartitionRecord(
+        schema_version=1,
+        decision_number=3,
+        scope_id="scope-1",
+        generation_id="gen-123",
+        envelope_sha256="a" * 64,
+        envelope_artifact_sha256="c" * 64,
+        source_plan_sha256="b" * 64,
+        proposal_sha256="d" * 64,
+        candidate_plan_sha256="e" * 64,
+        partition_ids=("part-1", "part-2"),
+        child_summaries=("Part one", "Part two"),
+        current_disposition="review_current_partition",
+        resolved_target_step="review",
+        resolved_target_role="reviewer",
+        current_partition_id="part-1",
+        scope_pressure_reason="[bold red]split safely[/bold red]",
+        envelope_artifact_path="scope/envelope.json",
+        proposal_artifact_path="manager/proposal.json",
+        candidate_artifact_path="manager/candidate.md",
+        mechanical_validation_artifact_path="manager/mechanical.json",
+        semantic_verdict_artifact_path="manager/verdict.json",
+    ))
+
+    table = _build_summary_table(
+        workflow_name="test",
+        config_harness=None,
+        config_model=None,
+        config_effort=None,
+        config_max_turns=5,
+        config_plan_path=Path("plan.md"),
+        original_plan_path=None,
+        active_plan_path=None,
+        new_plan_path=None,
+        state=state,
+        git_summary=None,
+        banner_files_limit=10,
+    )
+    output = StringIO()
+    Console(file=output, force_terminal=False).print(table)
+    rendered = output.getvalue()
+
+    assert "[bold red]split safely[/bold red]" in rendered
+    assert "failed / failed: validate" in rendered
+    assert "gen-123 / 2 parts / review_current_partition" in rendered
+    assert "manager/candidate.md" in rendered

@@ -22,6 +22,7 @@ class ExecutionEventType(str, Enum):
     TURN_FINISHED = "turn_finished"
     MANAGER_STARTED = "manager_started"
     MANAGER_DECIDED = "manager_decided"
+    CHECKPOINT_REPARTITIONED = "checkpoint_repartitioned"
     QUESTION_REQUIRED = "question_required"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
@@ -227,6 +228,72 @@ class ManagerDecidedEvent:
 
 
 @dataclass(frozen=True)
+class CheckpointRepartitionedEvent:
+    """Event emitted after a verified candidate is durably applied."""
+
+    event_type: Literal[ExecutionEventType.CHECKPOINT_REPARTITIONED]
+    timestamp: datetime
+    decision_number: int
+    scope_id: str
+    generation_id: str
+    envelope_sha256: str
+    envelope_artifact_sha256: str
+    source_plan_sha256: str
+    proposal_sha256: str
+    candidate_plan_sha256: str
+    partition_ids: tuple[str, ...]
+    child_summaries: tuple[str, ...]
+    current_disposition: str
+    resolved_target_step: str
+    resolved_target_role: str
+    current_partition_id: str
+    scope_pressure_reason: str | None
+    artifact_paths: dict[str, str]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        decision_number: int,
+        scope_id: str,
+        generation_id: str,
+        envelope_sha256: str,
+        envelope_artifact_sha256: str,
+        source_plan_sha256: str,
+        proposal_sha256: str,
+        candidate_plan_sha256: str,
+        partition_ids: tuple[str, ...],
+        child_summaries: tuple[str, ...],
+        current_disposition: str,
+        resolved_target_step: str,
+        resolved_target_role: str,
+        current_partition_id: str,
+        scope_pressure_reason: str | None,
+        artifact_paths: dict[str, str],
+    ) -> CheckpointRepartitionedEvent:
+        return cls(
+            event_type=ExecutionEventType.CHECKPOINT_REPARTITIONED,
+            timestamp=datetime.now(timezone.utc),
+            decision_number=decision_number,
+            scope_id=scope_id,
+            generation_id=generation_id,
+            envelope_sha256=envelope_sha256,
+            envelope_artifact_sha256=envelope_artifact_sha256,
+            source_plan_sha256=source_plan_sha256,
+            proposal_sha256=proposal_sha256,
+            candidate_plan_sha256=candidate_plan_sha256,
+            partition_ids=tuple(partition_ids),
+            child_summaries=tuple(child_summaries),
+            current_disposition=current_disposition,
+            resolved_target_step=resolved_target_step,
+            resolved_target_role=resolved_target_role,
+            current_partition_id=current_partition_id,
+            scope_pressure_reason=scope_pressure_reason,
+            artifact_paths=dict(artifact_paths),
+        )
+
+
+@dataclass(frozen=True)
 class QuestionRequiredEvent:
     """Event emitted when a workflow requires a question to be answered."""
 
@@ -338,6 +405,7 @@ ExecutionEvent = (
     | TurnFinishedEvent
     | ManagerStartedEvent
     | ManagerDecidedEvent
+    | CheckpointRepartitionedEvent
     | QuestionRequiredEvent
     | RunCompletedEvent
     | RunFailedEvent

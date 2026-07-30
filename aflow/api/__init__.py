@@ -2,6 +2,7 @@
 
 from .events import (
     CallbackObserver,
+    CheckpointRepartitionedEvent,
     CollectingObserver,
     ExecutionEvent,
     ExecutionEventType,
@@ -47,6 +48,7 @@ __all__ = [
     "ExecutionObserver",
     "ManagerStartedEvent",
     "ManagerDecidedEvent",
+    "CheckpointRepartitionedEvent",
     "CallbackObserver",
     "CollectingObserver",
     "RunStartedEvent",

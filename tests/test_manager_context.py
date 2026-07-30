@@ -406,6 +406,103 @@ def test_legacy_null_scope_context_rebuild_uses_stored_plan_state(
     assert rebuilt == stored
 
 
+def test_schema_v2_analysis_rebuilds_validated_repartition_artifact_references(
+    tmp_path: Path,
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="approved")
+    artifact_contents = {
+        "scope/envelope.json": b'{"scope":"one"}\n',
+        "manager/repartition/proposal.json": b'{"children":[]}\n',
+        "manager/repartition/candidate.md": b"# candidate\n",
+        "manager/repartition/mechanical.json": b'{"valid":true}\n',
+        "manager/repartition/verdict.json": b'{"verdict":"accept"}\n',
+    }
+    for relative, content in artifact_contents.items():
+        artifact = run_dir / relative
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(content)
+    record = {
+        "schema_version": 1,
+        "decision_number": 1,
+        "scope_id": "scope-1",
+        "generation_id": "gen-1",
+        "envelope_sha256": "a" * 64,
+        "envelope_artifact_sha256": hashlib.sha256(
+            artifact_contents["scope/envelope.json"]
+        ).hexdigest(),
+        "source_plan_sha256": "b" * 64,
+        "proposal_sha256": hashlib.sha256(
+            artifact_contents["manager/repartition/proposal.json"]
+        ).hexdigest(),
+        "candidate_plan_sha256": hashlib.sha256(
+            artifact_contents["manager/repartition/candidate.md"]
+        ).hexdigest(),
+        "partition_ids": ["part-1", "part-2"],
+        "child_summaries": ["Part one", "Part two"],
+        "current_disposition": "review_current_partition",
+        "resolved_target_step": "review",
+        "resolved_target_role": "reviewer",
+        "current_partition_id": "part-1",
+        "scope_pressure_reason": "split this checkpoint",
+        "envelope_artifact_path": "scope/envelope.json",
+        "proposal_artifact_path": "manager/repartition/proposal.json",
+        "candidate_artifact_path": "manager/repartition/candidate.md",
+        "mechanical_validation_artifact_path": (
+            "manager/repartition/mechanical.json"
+        ),
+        "semantic_verdict_artifact_path": "manager/repartition/verdict.json",
+    }
+    boundary = {
+        "context_schema_version": 3,
+        "active_implementation_scope": None,
+        "proposed_transition": "implement",
+        "repartition_history": [record],
+    }
+    run_metadata = {
+        "plan_path": str(plan),
+        "active_plan_path": str(plan),
+        "original_plan_path": str(plan),
+        "team": "base",
+        "turns_completed": 1,
+        "max_turns": 5,
+    }
+    stored = build_manager_context(
+        run_dir,
+        level="full",
+        trigger="post_turn",
+        decision_number=2,
+        run_metadata=run_metadata,
+        boundary=boundary,
+    )
+    stored["controller_state"]["checkpoint_repartitions"] = [record]
+    decision_dir = run_dir / "manager" / "decision-002"
+    _write_json(decision_dir / "context.json", stored)
+    _write_json(decision_dir / "result.json", {
+        "decision_number": 2,
+        "finalized_turn_number": 1,
+        "level": "full",
+        "status": "accepted",
+    })
+    _write_json(decision_dir / "boundary.json", {
+        "decision_number": 2,
+        "trigger": "post_turn",
+        "run_metadata": run_metadata,
+        "boundary": boundary,
+        "active_plan_content": plan.read_text(encoding="utf-8"),
+    })
+
+    rebuilt = analyze_runs(AnalyzeRequest(
+        repo_root=run_dir.parent.parent.parent,
+        run_id=run_dir.name,
+        manager_context="full",
+        turn=1,
+    ))
+
+    assert rebuilt == stored
+    assert rebuilt["controller_state"]["checkpoint_repartitions"] == [record]
+
+
 def test_stop_parser_ignores_fences_and_placeholder_examples() -> None:
     text = "```text\nAFLOW_STOP: <reason>\n```\nAFLOW_STOP: <reason>\nAFLOW_STOP: actual blocker\n"
     assert extract_aflow_stop(text) == ["actual blocker"]

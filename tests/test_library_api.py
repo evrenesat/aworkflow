@@ -965,6 +965,37 @@ class LibraryRunnerTests(unittest.TestCase):
         self.assertEqual(payload["artifact_paths"]["context"], "manager/decision-003/context.json")
         self.assertNotIn("active_plan_content", json.dumps(payload, default=str))
 
+    def test_repartition_event_is_public_and_compact(self) -> None:
+        from aflow.api import CheckpointRepartitionedEvent
+
+        event = CheckpointRepartitionedEvent.create(
+            decision_number=3,
+            scope_id="scope-1",
+            generation_id="gen-1",
+            envelope_sha256="a" * 64,
+            envelope_artifact_sha256="b" * 64,
+            source_plan_sha256="e" * 64,
+            proposal_sha256="c" * 64,
+            candidate_plan_sha256="d" * 64,
+            partition_ids=("part-1", "part-2"),
+            child_summaries=("Part one: core", "Part two: integration"),
+            current_disposition="review_current_partition",
+            resolved_target_step="review",
+            resolved_target_role="reviewer",
+            current_partition_id="part-1",
+            scope_pressure_reason="split this checkpoint",
+            artifact_paths={
+                "envelope": "scope/envelope.json",
+                "candidate": "manager/candidate.md",
+            },
+        )
+
+        payload = asdict(event)
+        self.assertEqual(payload["event_type"].value, "checkpoint_repartitioned")
+        self.assertEqual(payload["partition_ids"], ("part-1", "part-2"))
+        self.assertEqual(payload["artifact_paths"]["candidate"], "manager/candidate.md")
+        self.assertNotIn("plan_text", json.dumps(payload, default=str))
+
 
 class LibraryAnalyzeTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -63,12 +63,13 @@ from .recovery import (
     resolve_backup_team,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
 from aflow.api.events import (
+    CheckpointRepartitionedEvent,
     ManagerDecidedEvent,
     ManagerStartedEvent,
     RunCompletedEvent,
@@ -3122,6 +3123,8 @@ def run_workflow(
         state.pending_step_team_override = resume.pending_step_team_override
         state.pending_boundary_decision = resume.pending_boundary_decision
         state.pending_repartition = resume.pending_repartition
+        state.repartition_history = list(resume.repartition_history)
+        state.scope_pressure_reason = resume.scope_pressure_reason
         state.last_manager_report_path = resume.last_manager_report_path
 
         # create_run_paths may already have pruned the source run. Restore the
@@ -4489,6 +4492,86 @@ def run_workflow(
             stop_report=decision.stop_report if decision is not None else None,
             failure_reason=reason,
         )
+        pending = state.pending_repartition
+        if pending is not None:
+            stage_actions = {
+                "decided": (
+                    "Resume the run to retry the bounded proposal cycle, or reset "
+                    "the active scope if its authoritative envelope is no longer valid."
+                ),
+                "proposed": (
+                    "Inspect the proposal and attempt result artifacts, correct the "
+                    "reported proposal failure, then resume from durable state."
+                ),
+                "mechanically_validated": (
+                    "Inspect the candidate and mechanical-validation artifacts, then "
+                    "resume semantic validation from the preserved transaction."
+                ),
+                "semantically_validated": (
+                    "Restore any missing plan copy or resolve the reported plan-copy "
+                    "divergence, then resume application without rerunning Full."
+                ),
+                "execution_plan_applied": (
+                    "Reconcile the primary plan copy to the verified candidate, then "
+                    "resume the persisted multi-copy application."
+                ),
+                "primary_plan_applied": (
+                    "Resume to verify both plan copies and finish post-split routing."
+                ),
+                "applied": (
+                    "Resume to launch the recorded target step for the current partition."
+                ),
+                "failed": (
+                    "Inspect the named failed-stage artifacts; resume only after "
+                    "correcting the reported cause or explicitly reset the active scope."
+                ),
+            }
+            artifact_references = {
+                "latest attempt": pending.latest_attempt_path,
+                "proposal": pending.proposal_artifact_path,
+                "candidate": pending.candidate_artifact_path,
+                "mechanical validation": (
+                    pending.mechanical_validation_artifact_path
+                ),
+                "semantic verdict": pending.semantic_verdict_artifact_path,
+            }
+            report += "\n".join((
+                "",
+                "## Repartition recovery evidence",
+                f"- Pending stage: {pending.stage}",
+                f"- Failed stage: {pending.failed_stage or 'none'}",
+                f"- Failure reason: {pending.failure_reason or reason}",
+                f"- Scope pressure: {state.scope_pressure_reason or 'not recorded'}",
+                f"- Scope ID: {pending.scope_id}",
+                f"- Generation: {pending.generation_id or 'not assigned'}",
+                f"- Envelope SHA-256: {pending.envelope_sha256}",
+                f"- Source plan SHA-256: {pending.source_plan_sha256}",
+                f"- Proposal SHA-256: {pending.proposal_sha256 or 'not assigned'}",
+                (
+                    "- Candidate plan SHA-256: "
+                    f"{pending.candidate_plan_sha256 or 'not assigned'}"
+                ),
+                (
+                    "- Children: "
+                    + (
+                        "; ".join(pending.child_summaries)
+                        if pending.child_summaries else "not assigned"
+                    )
+                ),
+                (
+                    "- Exact next action: "
+                    + stage_actions.get(
+                        pending.stage,
+                        "Inspect run.json and the referenced artifacts before resuming.",
+                    )
+                ),
+                *(
+                    f"- {label.title()} artifact: {path}"
+                    for label, path in artifact_references.items()
+                    if path is not None
+                ),
+                "",
+            ))
         path = run_paths.run_dir / "manager-report.md"
         path.write_text(report, encoding="utf-8")
         state.last_manager_report_path = "manager-report.md"
@@ -4580,6 +4663,12 @@ def run_workflow(
             boundary=boundary_payload,
             active_plan_content=captured_active_plan,
         )
+        if boundary.context_schema_version >= 3:
+            controller_state = context.get("controller_state")
+            if isinstance(controller_state, dict):
+                controller_state["checkpoint_repartitions"] = list(
+                    boundary.repartition_history
+                )
         boundary_payload["captured_plan_state"] = context["plan_state"]
         eligible = set(boundary.__dict__.get("eligible_actions", ()))
         if level == "lite":
@@ -4725,10 +4814,47 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
             )
         if (
+            (pending.proposal_sha256 is None or not pending.child_summaries)
+            and pending.proposal_artifact_path is not None
+        ):
+            proposal_path = (
+                run_paths.run_dir / pending.proposal_artifact_path
+            ).resolve()
+            try:
+                proposal_path.relative_to(run_paths.run_dir.resolve())
+                proposal_bytes = proposal_path.read_bytes()
+                proposal_payload = json.loads(proposal_bytes)
+                raw_children = proposal_payload.get("children")
+                if not isinstance(raw_children, list):
+                    raise ValueError("proposal children are unavailable")
+                child_summaries = tuple(
+                    f"{child['title']}: {child['narrow_goal']}"
+                    for child in raw_children
+                    if isinstance(child, dict)
+                    and isinstance(child.get("title"), str)
+                    and isinstance(child.get("narrow_goal"), str)
+                )
+                if len(child_summaries) != len(raw_children):
+                    raise ValueError("proposal child summaries are incomplete")
+                pending = replace(
+                    pending,
+                    proposal_sha256=hashlib.sha256(proposal_bytes).hexdigest(),
+                    child_summaries=child_summaries,
+                )
+                _persist_repartition(pending)
+            except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
+                raise WorkflowError(
+                    f"cannot restore compact repartition proposal evidence: {exc}",
+                    run_dir=run_paths.run_dir,
+                ) from exc
+        if (
             pending.candidate_artifact_path is None
             or pending.candidate_plan_sha256 is None
             or pending.generation_id is None
             or not pending.partition_ids
+            or len(pending.child_summaries) != len(pending.partition_ids)
+            or pending.proposal_sha256 is None
+            or pending.current_disposition is None
             or pending.resolved_target_step is None
             or pending.resolved_target_role is None
         ):
@@ -4855,8 +4981,83 @@ def run_workflow(
                 repartition_candidate_sha256=pending.candidate_plan_sha256,
                 repartition_partition_id=pending.partition_ids[0],
             )
+        required_artifact_paths = (
+            scope.envelope_artifact_path,
+            pending.proposal_artifact_path,
+            pending.candidate_artifact_path,
+            pending.mechanical_validation_artifact_path,
+            pending.semantic_verdict_artifact_path,
+        )
+        if not all(
+            isinstance(path, str) and path for path in required_artifact_paths
+        ) or not isinstance(scope.envelope_artifact_sha256, str):
+            raise WorkflowError(
+                "cannot publish applied repartition evidence with incomplete "
+                "artifact references",
+                run_dir=run_paths.run_dir,
+            )
+        record = CheckpointRepartitionRecord(
+            schema_version=1,
+            decision_number=pending.decision_number,
+            scope_id=pending.scope_id,
+            generation_id=pending.generation_id,
+            envelope_sha256=pending.envelope_sha256,
+            envelope_artifact_sha256=str(scope.envelope_artifact_sha256),
+            source_plan_sha256=pending.source_plan_sha256,
+            proposal_sha256=pending.proposal_sha256,
+            candidate_plan_sha256=pending.candidate_plan_sha256,
+            partition_ids=pending.partition_ids,
+            child_summaries=pending.child_summaries,
+            current_disposition=pending.current_disposition or "",
+            resolved_target_step=pending.resolved_target_step,
+            resolved_target_role=pending.resolved_target_role,
+            current_partition_id=pending.partition_ids[0],
+            scope_pressure_reason=state.scope_pressure_reason,
+            envelope_artifact_path=str(scope.envelope_artifact_path),
+            proposal_artifact_path=str(pending.proposal_artifact_path),
+            candidate_artifact_path=str(pending.candidate_artifact_path),
+            mechanical_validation_artifact_path=str(
+                pending.mechanical_validation_artifact_path
+            ),
+            semantic_verdict_artifact_path=str(
+                pending.semantic_verdict_artifact_path
+            ),
+        )
+        is_new_record = not any(
+            item.generation_id == record.generation_id
+            for item in state.repartition_history
+        )
+        if is_new_record:
+            state.repartition_history.append(record)
         pending = replace(pending, stage="applied")
         _persist_repartition(pending)
+        if is_new_record:
+            _emit_event(observer, CheckpointRepartitionedEvent.create(
+                decision_number=record.decision_number,
+                scope_id=record.scope_id,
+                generation_id=record.generation_id,
+                envelope_sha256=record.envelope_sha256,
+                envelope_artifact_sha256=record.envelope_artifact_sha256,
+                source_plan_sha256=record.source_plan_sha256,
+                proposal_sha256=record.proposal_sha256,
+                candidate_plan_sha256=record.candidate_plan_sha256,
+                partition_ids=record.partition_ids,
+                child_summaries=record.child_summaries,
+                current_disposition=record.current_disposition,
+                resolved_target_step=record.resolved_target_step,
+                resolved_target_role=record.resolved_target_role,
+                current_partition_id=record.current_partition_id,
+                scope_pressure_reason=record.scope_pressure_reason,
+                artifact_paths={
+                    "envelope": record.envelope_artifact_path,
+                    "proposal": record.proposal_artifact_path,
+                    "candidate": record.candidate_artifact_path,
+                    "mechanical_validation": (
+                        record.mechanical_validation_artifact_path
+                    ),
+                    "semantic_verdict": record.semantic_verdict_artifact_path,
+                },
+            ))
 
     def _invoke_repartition_full(
         *,
@@ -5153,6 +5354,11 @@ def run_workflow(
             pending = replace(
                 pending, stage="proposed", attempt_count=attempt_number,
                 latest_attempt_path=attempt_rel,
+                child_summaries=tuple(
+                    f"{child.title}: {child.narrow_goal}"
+                    for child in proposal.children
+                ),
+                proposal_sha256=proposal_sha256,
                 proposal_artifact_path=attempt_paths.proposal.relative_to(
                     run_paths.run_dir
                 ).as_posix(),
@@ -5390,6 +5596,7 @@ def run_workflow(
         if not workflow_config.manager.enabled:
             return proposed_transition
         if scope_pressure_reason is not None:
+            state.scope_pressure_reason = scope_pressure_reason
             _require_valid_pressure_scope(
                 run_paths.run_dir,
                 state.active_implementation_scope,
@@ -5544,6 +5751,9 @@ def run_workflow(
                 if scope is not None and scope.envelope_canonical_sha256 is not None
                 else None
             ),
+            repartition_history=[
+                asdict(record) for record in state.repartition_history
+            ],
         )
         # Build once to select Lite or Full without exposing plan text to Lite.
         selection_context = build_manager_context(
@@ -5749,6 +5959,10 @@ def run_workflow(
             actual_selector=active_selector, original_plan_path=str(original_plan_path),
             active_plan_path=str(active_plan_path), checkpoint_identity=_target_plan_identity(active_plan_path),
             eligible_actions=["stop"], evidence=reason,
+            scope_pressure_reason=state.scope_pressure_reason,
+            repartition_history=[
+                asdict(record) for record in state.repartition_history
+            ],
         )
         decision, context, error = _run_manager_call(level="full", boundary=boundary)
         report = _write_manager_report(

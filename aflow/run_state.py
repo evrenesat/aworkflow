@@ -358,6 +358,8 @@ class PendingRepartitionV1:
     attempt_count: int = 0
     generation_id: str | None = None
     partition_ids: tuple[str, ...] = ()
+    child_summaries: tuple[str, ...] = ()
+    proposal_sha256: str | None = None
     candidate_plan_sha256: str | None = None
     current_disposition: str | None = None
     resolved_target_step: str | None = None
@@ -369,6 +371,33 @@ class PendingRepartitionV1:
     semantic_verdict_artifact_path: str | None = None
     failed_stage: str | None = None
     failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CheckpointRepartitionRecord:
+    """Compact durable evidence for one verified checkpoint repartition."""
+
+    schema_version: int
+    decision_number: int
+    scope_id: str
+    generation_id: str
+    envelope_sha256: str
+    envelope_artifact_sha256: str
+    source_plan_sha256: str
+    proposal_sha256: str
+    candidate_plan_sha256: str
+    partition_ids: tuple[str, ...]
+    child_summaries: tuple[str, ...]
+    current_disposition: str
+    resolved_target_step: str
+    resolved_target_role: str
+    current_partition_id: str
+    scope_pressure_reason: str | None
+    envelope_artifact_path: str
+    proposal_artifact_path: str
+    candidate_artifact_path: str
+    mechanical_validation_artifact_path: str
+    semantic_verdict_artifact_path: str
 
 
 @dataclass(frozen=True)
@@ -440,6 +469,7 @@ class FinalizedTurnBoundary:
     envelope_artifact_path: str | None = None
     envelope_artifact_sha256: str | None = None
     envelope_canonical_sha256: str | None = None
+    repartition_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -481,6 +511,8 @@ class ResumeContext:
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
     pending_repartition: PendingRepartitionV1 | None = None
+    repartition_history: tuple[CheckpointRepartitionRecord, ...] = ()
+    scope_pressure_reason: str | None = None
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
@@ -584,6 +616,8 @@ class ControllerState:
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
     pending_repartition: PendingRepartitionV1 | None = None
+    repartition_history: list[CheckpointRepartitionRecord] = field(default_factory=list)
+    scope_pressure_reason: str | None = None
     last_manager_report_path: str | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     override_result: OverrideResult | None = None
@@ -634,6 +668,8 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
             if state.pending_repartition is not None
             else None
         ),
+        "repartition_history": [asdict(item) for item in state.repartition_history],
+        "scope_pressure_reason": state.scope_pressure_reason,
         "last_manager_report_path": state.last_manager_report_path,
     }
 
@@ -902,6 +938,13 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                     )
                     else ()
                 )
+                raw_child_summaries = pending_repartition.get("child_summaries", ())
+                child_summaries = (
+                    tuple(raw_child_summaries)
+                    if isinstance(raw_child_summaries, (list, tuple))
+                    and all(isinstance(value, str) and bool(value) for value in raw_child_summaries)
+                    else ()
+                )
                 state.pending_repartition = PendingRepartitionV1(
                     schema_version=1,
                     decision_number=int(pending_repartition["decision_number"]),
@@ -915,6 +958,11 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                         if pending_repartition.get("generation_id") is not None else None
                     ),
                     partition_ids=partition_ids,
+                    child_summaries=child_summaries,
+                    proposal_sha256=(
+                        str(pending_repartition["proposal_sha256"])
+                        if pending_repartition.get("proposal_sha256") is not None else None
+                    ),
                     candidate_plan_sha256=(
                         str(pending_repartition["candidate_plan_sha256"])
                         if pending_repartition.get("candidate_plan_sha256") is not None else None
@@ -962,6 +1010,77 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 )
             except (TypeError, ValueError):
                 state.pending_repartition = None
+    state.repartition_history = []
+    repartition_history = payload.get("repartition_history")
+    if isinstance(repartition_history, list):
+        required_record_fields = {
+            "schema_version", "decision_number", "scope_id", "generation_id",
+            "envelope_sha256", "source_plan_sha256", "proposal_sha256",
+            "envelope_artifact_sha256",
+            "candidate_plan_sha256", "partition_ids", "child_summaries",
+            "current_disposition", "resolved_target_step", "resolved_target_role",
+            "current_partition_id", "envelope_artifact_path",
+            "proposal_artifact_path", "candidate_artifact_path",
+            "mechanical_validation_artifact_path",
+            "semantic_verdict_artifact_path",
+        }
+        for item in repartition_history:
+            if (
+                not isinstance(item, Mapping)
+                or not required_record_fields <= set(item)
+                or item.get("schema_version") != 1
+            ):
+                continue
+            partition_ids = item.get("partition_ids")
+            child_summaries = item.get("child_summaries")
+            if (
+                not isinstance(partition_ids, (list, tuple))
+                or not partition_ids
+                or not all(isinstance(value, str) and value for value in partition_ids)
+                or not isinstance(child_summaries, (list, tuple))
+                or len(child_summaries) != len(partition_ids)
+                or not all(isinstance(value, str) and value for value in child_summaries)
+            ):
+                continue
+            try:
+                state.repartition_history.append(CheckpointRepartitionRecord(
+                    schema_version=1,
+                    decision_number=int(item["decision_number"]),
+                    scope_id=str(item["scope_id"]),
+                    generation_id=str(item["generation_id"]),
+                    envelope_sha256=str(item["envelope_sha256"]),
+                    envelope_artifact_sha256=str(
+                        item["envelope_artifact_sha256"]
+                    ),
+                    source_plan_sha256=str(item["source_plan_sha256"]),
+                    proposal_sha256=str(item["proposal_sha256"]),
+                    candidate_plan_sha256=str(item["candidate_plan_sha256"]),
+                    partition_ids=tuple(partition_ids),
+                    child_summaries=tuple(child_summaries),
+                    current_disposition=str(item["current_disposition"]),
+                    resolved_target_step=str(item["resolved_target_step"]),
+                    resolved_target_role=str(item["resolved_target_role"]),
+                    current_partition_id=str(item["current_partition_id"]),
+                    scope_pressure_reason=(
+                        str(item["scope_pressure_reason"])
+                        if item.get("scope_pressure_reason") is not None else None
+                    ),
+                    envelope_artifact_path=str(item["envelope_artifact_path"]),
+                    proposal_artifact_path=str(item["proposal_artifact_path"]),
+                    candidate_artifact_path=str(item["candidate_artifact_path"]),
+                    mechanical_validation_artifact_path=str(
+                        item["mechanical_validation_artifact_path"]
+                    ),
+                    semantic_verdict_artifact_path=str(
+                        item["semantic_verdict_artifact_path"]
+                    ),
+                ))
+            except (TypeError, ValueError):
+                continue
+    pressure_reason = payload.get("scope_pressure_reason")
+    state.scope_pressure_reason = (
+        str(pressure_reason) if pressure_reason is not None else None
+    )
     report_path = payload.get("last_manager_report_path")
     state.last_manager_report_path = str(report_path) if report_path is not None else None
 
@@ -985,6 +1104,8 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
         "pending_step_team_override": restored.pending_step_team_override,
         "pending_boundary_decision": restored.pending_boundary_decision,
         "pending_repartition": restored.pending_repartition,
+        "repartition_history": tuple(restored.repartition_history),
+        "scope_pressure_reason": restored.scope_pressure_reason,
         "last_manager_report_path": restored.last_manager_report_path,
     }
 
