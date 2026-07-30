@@ -30,6 +30,7 @@ from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
     build_manager_prompts,
+    build_repartition_prompts,
     eligible_implementation_upgrade,
     parse_manager_decision,
     render_manager_stop_report,
@@ -62,8 +63,8 @@ from .recovery import (
     resolve_backup_team,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
-from .runlog import create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_run_metadata, write_turn_artifacts_start
+from .run_state import ActiveImplementationScope, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
+from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
@@ -2995,6 +2996,7 @@ def run_workflow(
         state.pending_manager_notes = resume.pending_manager_notes
         state.pending_step_team_override = resume.pending_step_team_override
         state.pending_boundary_decision = resume.pending_boundary_decision
+        state.pending_repartition = resume.pending_repartition
         state.last_manager_report_path = resume.last_manager_report_path
 
         # Carry the fully validated source artifact into the new run before
@@ -4290,6 +4292,49 @@ def run_workflow(
                 plan_hashes.append((str(plan_path), "<missing>"))
         return head.strip(), status, tuple(plan_hashes)
 
+    def _protected_repartition_fingerprint() -> tuple[
+        tuple[str, str, tuple[tuple[str, str], ...]],
+        tuple[tuple[str, str], ...],
+    ]:
+        """Capture repository state plus every protected current-run artifact."""
+        artifact_hashes: list[tuple[str, str]] = []
+        run_dir = run_paths.run_dir
+        if not run_dir.is_dir():
+            return _manager_repo_fingerprint(), ((".", "<missing-run-directory>"),)
+
+        def _record_walk_error(exc: OSError) -> None:
+            error_path = Path(exc.filename) if exc.filename else run_dir
+            try:
+                relative = error_path.relative_to(run_dir).as_posix()
+            except ValueError:
+                relative = "."
+            artifact_hashes.append(
+                (relative or ".", f"<unreadable:{type(exc).__name__}>")
+            )
+
+        for root, directory_names, file_names in os.walk(
+            run_dir, onerror=_record_walk_error, followlinks=False,
+        ):
+            directory_names.sort()
+            file_names.sort()
+            root_path = Path(root)
+            for file_name in file_names:
+                artifact_path = root_path / file_name
+                relative = artifact_path.relative_to(run_dir).as_posix()
+                try:
+                    if not artifact_path.is_file():
+                        if not artifact_path.exists():
+                            artifact_hashes.append((relative, "<missing>"))
+                        continue
+                    digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+                except FileNotFoundError:
+                    digest = "<missing>"
+                except OSError as exc:
+                    digest = f"<unreadable:{type(exc).__name__}>"
+                artifact_hashes.append((relative, digest))
+
+        return _manager_repo_fingerprint(), tuple(sorted(artifact_hashes))
+
     def _write_manager_report(
         context: dict[str, object], *, reason: str, decision: ManagerDecisionV1 | None = None
     ) -> str:
@@ -4491,6 +4536,521 @@ def run_workflow(
         ))
         return parsed, context, error
 
+    def _persist_repartition(pending: PendingRepartitionV1) -> None:
+        state.pending_repartition = pending
+        write_run_metadata(
+            run_paths, config, state, status="running",
+            last_snapshot=state.last_snapshot,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+
+    def _invoke_repartition_full(
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple[str, str, str | None]:
+        """Invoke the configured Full role without manager/turn accounting."""
+        stdout = ""
+        stderr = ""
+        error: str | None = None
+        fingerprint_before = _protected_repartition_fingerprint()
+        try:
+            role_resolution = resolve_manager_role(
+                workflow_config, level="full", baseline_team=baseline_team_name,
+            )
+            profile = resolve_profile(
+                role_resolution.selector, workflow_config,
+                step_path="manager.repartition",
+            )
+            call_adapter = adapter or get_adapter(profile.harness_name)
+            invocation = call_adapter.build_invocation(
+                repo_root=execution_repo_root,
+                model=profile.model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                effort=profile.effort,
+            ).for_final_output()
+            if runner is None:
+                completed = _run_process(invocation, execution_repo_root, banner, state)
+            else:
+                completed = runner(
+                    list(invocation.argv), cwd=str(execution_repo_root),
+                    env={**os.environ, **invocation.env},
+                    capture_output=True, text=True, check=False,
+                )
+            stdout, stderr = completed.stdout, completed.stderr
+            if completed.returncode != 0:
+                error = f"repartition Full harness exited with code {completed.returncode}"
+        except (ValueError, WorkflowError) as exc:
+            error = str(exc)
+        if _protected_repartition_fingerprint() != fingerprint_before:
+            error = (
+                "repartition Full call mutated repository, plan, "
+                "or protected run-artifact state"
+            )
+        return stdout, stderr, error
+
+    def _run_repartition_cycle(
+        *,
+        decision_context: dict[str, object],
+        disposition_targets: Mapping[str, tuple[str, str]],
+    ) -> None:
+        """Produce and semantically validate at most two candidates."""
+        from .repartition import (
+            canonical_json_bytes,
+            derive_generation_id,
+            derive_partition_ids,
+            extract_source_blocks,
+            make_repair_evidence_block,
+            parse_envelope_bytes,
+            parse_proposal_json,
+            parse_verdict_json,
+            render_candidate_plan,
+            repartition_proposal_sha256,
+            slice_checkpoint_source,
+            validate_candidate_mechanically,
+            validate_envelope_boundary_drift,
+        )
+
+        scope = state.active_implementation_scope
+        if scope is None or state.pending_repartition is not None:
+            _fail_manager_gate(
+                decision_context,
+                reason="accepted repartition decision has no unique active scope transaction",
+            )
+        envelope_bytes = load_scope_envelope_for_resume(run_paths.run_dir, scope)
+        if envelope_bytes is None:
+            _fail_manager_gate(
+                decision_context,
+                reason="accepted repartition decision lacks an immutable scope envelope",
+            )
+        try:
+            envelope = parse_envelope_bytes(envelope_bytes)
+            source_path = _exec_plan_path(original_plan_path, exec_ctx)
+            source_plan_text = source_path.read_bytes().decode("utf-8", "strict")
+            drift = validate_envelope_boundary_drift(
+                envelope=envelope, boundary_plan_text=source_plan_text,
+            )
+            if not drift.allowed:
+                raise ValueError(
+                    "boundary source plan drift is not allowed: " + "; ".join(drift.issues)
+                )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            _fail_manager_gate(
+                decision_context,
+                reason=f"cannot capture repartition boundary artifacts: {exc}",
+            )
+        source_sha256 = hashlib.sha256(source_plan_text.encode("utf-8")).hexdigest()
+        generation_id = derive_generation_id(
+            scope_id=scope.scope_id,
+            decision_number=state.manager_decision_number,
+            envelope_sha256=envelope.canonical_envelope_sha256,
+            source_plan_sha256=source_sha256,
+        )
+        pending = PendingRepartitionV1(
+            schema_version=1,
+            decision_number=state.manager_decision_number,
+            scope_id=scope.scope_id,
+            stage="decided",
+            envelope_sha256=envelope.canonical_envelope_sha256,
+            source_plan_sha256=source_sha256,
+            generation_id=generation_id,
+        )
+        _persist_repartition(pending)
+
+        evidence_blocks = []
+        evidence_references: dict[str, str] = {}
+        active_source_path = _exec_plan_path(active_plan_path, exec_ctx)
+        if active_source_path.resolve() != source_path.resolve():
+            try:
+                repair_text = active_source_path.read_bytes().decode("utf-8", "strict")
+                repair_slice = slice_checkpoint_source(
+                    repair_text,
+                    checkpoint_index=scope.checkpoint_index,
+                )
+                if repair_slice is None:
+                    raise ValueError("active repair checkpoint is missing")
+                repair_units = extract_source_blocks(
+                    repair_slice,
+                    envelope_checkpoint_sha256=hashlib.sha256(
+                        repair_slice.full_text.encode("utf-8")
+                    ).hexdigest(),
+                    plan_text=repair_text,
+                )
+                for ordinal, unit in enumerate(repair_units, start=1):
+                    block = make_repair_evidence_block(
+                        evidence_kind="active-repair",
+                        ordinal=ordinal,
+                        text=unit.text,
+                    )
+                    evidence_blocks.append(block)
+                    evidence_references[block.block_id] = (
+                        f"{active_plan_path}#checkpoint={scope.checkpoint_index}&block={ordinal}"
+                    )
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                pending = replace(
+                    pending, stage="failed", failed_stage="evidence",
+                    failure_reason=str(exc),
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(
+                    decision_context,
+                    reason=f"cannot capture active corrective evidence: {exc}",
+                )
+        controller = decision_context.get("controller_state")
+        latest_rejection = (
+            controller.get("latest_full_rejection")
+            if isinstance(controller, Mapping) else None
+        )
+        if isinstance(latest_rejection, Mapping):
+            reviewer_output = latest_rejection.get("exact_reviewer_output")
+            reviewer_artifact = latest_rejection.get("review_stdout_artifact_path")
+            if isinstance(reviewer_output, str) and reviewer_output.strip():
+                block = make_repair_evidence_block(
+                    evidence_kind="latest-reviewer-output",
+                    ordinal=1,
+                    text=reviewer_output,
+                )
+                evidence_blocks.append(block)
+                evidence_references[block.block_id] = (
+                    str(reviewer_artifact)
+                    if isinstance(reviewer_artifact, str) and reviewer_artifact
+                    else "latest-reviewer-output"
+                )
+        repair_evidence = tuple(evidence_blocks)
+        evidence_payload = {
+            "blocks": [
+                {**asdict(block), "artifact_reference": evidence_references[block.block_id]}
+                for block in repair_evidence
+            ],
+        }
+        base_payload: dict[str, object] = {
+            "schema_version": 1,
+            "decision_number": state.manager_decision_number,
+            "scope_id": scope.scope_id,
+            "envelope": {
+                **envelope.to_dict(),
+                "canonical_envelope_sha256": (
+                    envelope.canonical_envelope_sha256
+                ),
+            },
+            "source_plan_sha256": source_sha256,
+            "source_plan_text": source_plan_text,
+            "manager_context": decision_context,
+            "repair_evidence_blocks": evidence_payload["blocks"],
+            "allowed_current_dispositions": sorted(disposition_targets),
+        }
+
+        correction_findings: tuple[str, ...] = ()
+        rejected_proposal_sha256: str | None = None
+        for attempt_number in (1, 2):
+            attempt_paths = create_repartition_attempt_paths(
+                run_paths,
+                decision_number=state.manager_decision_number,
+                attempt_number=attempt_number,
+            )
+            attempt_rel = attempt_paths.directory.relative_to(run_paths.run_dir).as_posix()
+            write_repartition_artifact(attempt_paths.source_plan, source_plan_text)
+            write_repartition_artifact(attempt_paths.envelope, envelope_bytes)
+            write_repartition_artifact(attempt_paths.evidence, evidence_payload)
+            propose_system, propose_user = build_repartition_prompts(
+                base_payload,
+                mode="propose",
+                skill_name=workflow_config.manager.repartition_skill,
+                correction_findings=correction_findings,
+            )
+            write_repartition_artifact(attempt_paths.propose_system_prompt, propose_system)
+            write_repartition_artifact(attempt_paths.propose_user_prompt, propose_user)
+            propose_stdout, propose_stderr, call_error = _invoke_repartition_full(
+                system_prompt=propose_system, user_prompt=propose_user,
+            )
+            write_repartition_artifact(attempt_paths.propose_stdout, propose_stdout)
+            write_repartition_artifact(attempt_paths.propose_stderr, propose_stderr)
+            if call_error is not None:
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {"status": "failed", "stage": "propose", "reason": call_error},
+                )
+                pending = replace(
+                    pending, stage="failed", attempt_count=attempt_number,
+                    latest_attempt_path=attempt_rel, failed_stage="propose",
+                    failure_reason=call_error,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=call_error)
+            try:
+                proposal = parse_proposal_json(
+                    propose_stdout,
+                    expected_envelope_sha256=envelope.canonical_envelope_sha256,
+                    expected_source_plan_sha256=source_sha256,
+                    valid_source_block_ids=tuple(
+                        block.block_id for block in envelope.source_blocks
+                    ),
+                    valid_repair_evidence_ids=tuple(
+                        block.block_id for block in repair_evidence
+                    ),
+                )
+                if proposal.current_disposition not in disposition_targets:
+                    raise ValueError(
+                        "proposal current_disposition has no controller-resolvable "
+                        "worker or reviewer continuation"
+                    )
+            except ValueError as exc:
+                reason = f"invalid repartition proposal: {exc}"
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {"status": "failed", "stage": "proposal-schema", "reason": reason},
+                )
+                pending = replace(
+                    pending, stage="failed", attempt_count=attempt_number,
+                    latest_attempt_path=attempt_rel, failed_stage="proposal-schema",
+                    failure_reason=reason,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=reason)
+
+            proposal_bytes = canonical_json_bytes(proposal.to_dict())
+            proposal_sha256 = repartition_proposal_sha256(proposal)
+            if (
+                attempt_number == 2
+                and rejected_proposal_sha256 == proposal_sha256
+            ):
+                reason = (
+                    "corrected repartition proposal is byte-identical to the "
+                    "rejected proposal"
+                )
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {
+                        "status": "failed",
+                        "stage": "proposal-correction",
+                        "reason": reason,
+                    },
+                )
+                pending = replace(
+                    pending, stage="failed", attempt_count=attempt_number,
+                    latest_attempt_path=attempt_rel,
+                    failed_stage="proposal-correction",
+                    failure_reason=reason,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=reason)
+            write_repartition_artifact(attempt_paths.proposal, proposal_bytes)
+            pending = replace(
+                pending, stage="proposed", attempt_count=attempt_number,
+                latest_attempt_path=attempt_rel,
+                proposal_artifact_path=attempt_paths.proposal.relative_to(
+                    run_paths.run_dir
+                ).as_posix(),
+                current_disposition=proposal.current_disposition,
+                resolved_target_step=disposition_targets[
+                    proposal.current_disposition
+                ][0],
+                resolved_target_role=disposition_targets[
+                    proposal.current_disposition
+                ][1],
+                failed_stage=None, failure_reason=None,
+            )
+            _persist_repartition(pending)
+
+            mechanical_findings: tuple[str, ...] = ()
+            try:
+                partition_ids = derive_partition_ids(
+                    generation_id=generation_id, proposal=proposal,
+                )
+                candidate_text = render_candidate_plan(
+                    envelope=envelope,
+                    proposal=proposal,
+                    source_plan_text=source_plan_text,
+                    generation_id=generation_id,
+                    partition_ids=partition_ids,
+                    repair_evidence_blocks=repair_evidence,
+                    repair_evidence_artifact_references=evidence_references,
+                )
+                mechanical = validate_candidate_mechanically(
+                    source_plan_text=source_plan_text,
+                    candidate_plan_text=candidate_text,
+                    envelope=envelope,
+                    proposal=proposal,
+                    repair_evidence_blocks=repair_evidence,
+                    repair_evidence_artifact_references=evidence_references,
+                    expected_generation_id=generation_id,
+                    expected_partition_ids=partition_ids,
+                )
+                mechanical_payload = mechanical.to_dict()
+                mechanical_findings = mechanical.issues
+            except ValueError as exc:
+                candidate_text = ""
+                mechanical_payload = {
+                    "valid": False,
+                    "issues": [f"candidate_render_failed:{exc}"],
+                }
+                mechanical_findings = tuple(mechanical_payload["issues"])
+            write_repartition_artifact(attempt_paths.candidate_plan, candidate_text)
+            write_repartition_artifact(
+                attempt_paths.mechanical_validation, mechanical_payload,
+            )
+            if not bool(mechanical_payload.get("valid")):
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {
+                        "status": "rejected", "stage": "mechanical",
+                        "findings": list(mechanical_findings),
+                    },
+                )
+                if attempt_number == 1:
+                    rejected_proposal_sha256 = proposal_sha256
+                    correction_findings = tuple(
+                        finding[:1_000] for finding in mechanical_findings[:16]
+                    )
+                    continue
+                reason = (
+                    "second repartition candidate failed mechanical validation: "
+                    + "; ".join(mechanical_findings)
+                )
+                pending = replace(
+                    pending, stage="failed", failed_stage="mechanical",
+                    failure_reason=reason,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=reason)
+
+            candidate_sha256 = hashlib.sha256(
+                candidate_text.encode("utf-8")
+            ).hexdigest()
+            pending = replace(
+                pending, stage="mechanically_validated",
+                candidate_plan_sha256=candidate_sha256,
+                candidate_artifact_path=attempt_paths.candidate_plan.relative_to(
+                    run_paths.run_dir
+                ).as_posix(),
+                mechanical_validation_artifact_path=(
+                    attempt_paths.mechanical_validation.relative_to(
+                        run_paths.run_dir
+                    ).as_posix()
+                ),
+            )
+            _persist_repartition(pending)
+            validate_payload = {
+                **base_payload,
+                "proposal": proposal.to_dict(),
+                "proposal_sha256": proposal_sha256,
+                "candidate_plan_text": candidate_text,
+                "candidate_plan_sha256": candidate_sha256,
+                "mechanical_validation": mechanical_payload,
+            }
+            validate_system, validate_user = build_repartition_prompts(
+                validate_payload,
+                mode="validate",
+                skill_name=workflow_config.manager.repartition_skill,
+            )
+            write_repartition_artifact(
+                attempt_paths.validate_system_prompt, validate_system,
+            )
+            write_repartition_artifact(
+                attempt_paths.validate_user_prompt, validate_user,
+            )
+            validate_stdout, validate_stderr, call_error = _invoke_repartition_full(
+                system_prompt=validate_system, user_prompt=validate_user,
+            )
+            write_repartition_artifact(
+                attempt_paths.validate_stdout, validate_stdout,
+            )
+            write_repartition_artifact(
+                attempt_paths.validate_stderr, validate_stderr,
+            )
+            if call_error is not None:
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {"status": "failed", "stage": "validate", "reason": call_error},
+                )
+                pending = replace(
+                    pending, stage="failed", failed_stage="validate",
+                    failure_reason=call_error,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=call_error)
+            try:
+                verdict = parse_verdict_json(
+                    validate_stdout,
+                    expected_proposal_sha256=proposal_sha256,
+                    expected_candidate_sha256=candidate_sha256,
+                )
+            except ValueError as exc:
+                reason = f"invalid repartition semantic verdict: {exc}"
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {"status": "failed", "stage": "verdict-schema", "reason": reason},
+                )
+                pending = replace(
+                    pending, stage="failed", failed_stage="verdict-schema",
+                    failure_reason=reason,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=reason)
+            verdict_bytes = canonical_json_bytes(verdict.to_dict())
+            write_repartition_artifact(
+                attempt_paths.semantic_verdict, verdict_bytes,
+            )
+            if verdict.verdict == "reject":
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {
+                        "status": "rejected", "stage": "semantic",
+                        "reason": verdict.reason,
+                        "findings": list(verdict.findings),
+                    },
+                )
+                if attempt_number == 1:
+                    rejected_proposal_sha256 = proposal_sha256
+                    correction_findings = tuple(
+                        finding[:1_000]
+                        for finding in (verdict.findings or (verdict.reason,))[:16]
+                    )
+                    continue
+                reason = (
+                    "second repartition candidate failed semantic validation: "
+                    + verdict.reason
+                )
+                pending = replace(
+                    pending, stage="failed", failed_stage="semantic",
+                    semantic_verdict_artifact_path=(
+                        attempt_paths.semantic_verdict.relative_to(
+                            run_paths.run_dir
+                        ).as_posix()
+                    ),
+                    failure_reason=reason,
+                )
+                _persist_repartition(pending)
+                _fail_manager_gate(decision_context, reason=reason)
+
+            write_repartition_artifact(
+                attempt_paths.result,
+                {
+                    "status": "accepted",
+                    "stage": "semantically_validated",
+                    "proposal_sha256": proposal_sha256,
+                    "candidate_plan_sha256": candidate_sha256,
+                },
+            )
+            pending = replace(
+                pending, stage="semantically_validated",
+                semantic_verdict_artifact_path=(
+                    attempt_paths.semantic_verdict.relative_to(
+                        run_paths.run_dir
+                    ).as_posix()
+                ),
+                failed_stage=None, failure_reason=None,
+            )
+            _persist_repartition(pending)
+            return
+        raise AssertionError("bounded repartition cycle exhausted without a result")
+
     def _manager_gate(
         *,
         proposed_transition: str,
@@ -4584,6 +5144,53 @@ def run_workflow(
             eligible.add("switch_to_backup_and_retry")
         if upgrade.available:
             eligible.add("upgrade_next_implementation")
+        repartition_disposition_targets: dict[str, tuple[str, str]] = {}
+        for routed_step_name, routed_step in (
+            (next_step, candidate_step),
+            (current_step, wf.steps.get(current_step)),
+        ):
+            if routed_step is None:
+                continue
+            if routed_step.role == "worker":
+                repartition_disposition_targets.setdefault(
+                    "implement_current_partition",
+                    (str(routed_step_name), routed_step.role),
+                )
+            elif routed_step.role == "reviewer":
+                repartition_disposition_targets.setdefault(
+                    "review_current_partition",
+                    (str(routed_step_name), routed_step.role),
+                )
+        if (
+            scope is not None
+            and scope.checkpoint_index is not None
+            and scope.checkpoint_name is not None
+            and state.pending_repartition is None
+            and repartition_disposition_targets
+        ):
+            try:
+                from .repartition import (
+                    parse_envelope_bytes,
+                    validate_envelope_boundary_drift,
+                )
+                envelope_bytes = load_scope_envelope_for_resume(
+                    run_paths.run_dir, scope,
+                )
+                if envelope_bytes is not None:
+                    eligible_envelope = parse_envelope_bytes(envelope_bytes)
+                    eligible_source = _exec_plan_path(
+                        original_plan_path, exec_ctx,
+                    ).read_bytes().decode("utf-8", "strict")
+                    eligible_drift = validate_envelope_boundary_drift(
+                        envelope=eligible_envelope,
+                        boundary_plan_text=eligible_source,
+                    )
+                    if eligible_drift.allowed:
+                        eligible.add("repartition_current_checkpoint")
+            except (OSError, UnicodeDecodeError, ValueError, WorkflowError):
+                # Invalid authority makes repartition unavailable. Full still
+                # receives continue/upgrade/stop and may report the boundary.
+                pass
         boundary = FinalizedTurnBoundary(
             finalized_turn_number=(
                 state.active_turn
@@ -4663,6 +5270,19 @@ def run_workflow(
             )
         if decision.action == "stop":
             _fail_manager_gate(context, reason=decision.reason, decision=decision)
+        if decision.action == "repartition_current_checkpoint":
+            _run_repartition_cycle(
+                decision_context=context,
+                disposition_targets=repartition_disposition_targets,
+            )
+            # Checkpoint 4 deliberately stops before CP5's plan application
+            # and routing. Never launch another harness while a validated
+            # transaction is pending.
+            raise WorkflowError(
+                "repartition candidate is semantically validated and pending "
+                "transactional plan application",
+                run_dir=run_paths.run_dir,
+            )
 
         target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
         target_config = wf.steps.get(target_step) if target_step not in {None, "END"} else None

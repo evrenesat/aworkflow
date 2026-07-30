@@ -337,6 +337,31 @@ class ReviewRejectionRecord:
 
 
 @dataclass(frozen=True)
+class PendingRepartitionV1:
+    """Durable proposal/validation transaction; application belongs to CP5."""
+
+    schema_version: int
+    decision_number: int
+    scope_id: str
+    stage: str
+    envelope_sha256: str
+    source_plan_sha256: str
+    attempt_count: int = 0
+    generation_id: str | None = None
+    candidate_plan_sha256: str | None = None
+    current_disposition: str | None = None
+    resolved_target_step: str | None = None
+    resolved_target_role: str | None = None
+    latest_attempt_path: str | None = None
+    proposal_artifact_path: str | None = None
+    candidate_artifact_path: str | None = None
+    mechanical_validation_artifact_path: str | None = None
+    semantic_verdict_artifact_path: str | None = None
+    failed_stage: str | None = None
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class PendingBoundaryDecision:
     """Accepted manager decision persisted before controller side effects."""
 
@@ -442,6 +467,7 @@ class ResumeContext:
     pending_manager_notes: PendingManagerNotes | None = None
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
+    pending_repartition: PendingRepartitionV1 | None = None
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
@@ -541,6 +567,7 @@ class ControllerState:
     pending_manager_notes: PendingManagerNotes | None = None
     pending_step_team_override: PendingTeamOverride | None = None
     pending_boundary_decision: PendingBoundaryDecision | None = None
+    pending_repartition: PendingRepartitionV1 | None = None
     last_manager_report_path: str | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     override_result: OverrideResult | None = None
@@ -584,6 +611,11 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
         "pending_boundary_decision": (
             asdict(state.pending_boundary_decision)
             if state.pending_boundary_decision is not None
+            else None
+        ),
+        "pending_repartition": (
+            asdict(state.pending_repartition)
+            if state.pending_repartition is not None
             else None
         ),
         "last_manager_report_path": state.last_manager_report_path,
@@ -767,6 +799,82 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                     else None
                 ),
             )
+    pending_repartition = payload.get("pending_repartition")
+    if isinstance(pending_repartition, Mapping):
+        required = {
+            "schema_version", "decision_number", "scope_id", "stage",
+            "envelope_sha256", "source_plan_sha256",
+        }
+        valid_stages = {
+            "decided", "proposed", "mechanically_validated",
+            "semantically_validated", "execution_plan_applied",
+            "primary_plan_applied", "applied", "failed",
+        }
+        if (
+            required <= set(pending_repartition)
+            and pending_repartition.get("schema_version") == 1
+            and pending_repartition.get("stage") in valid_stages
+        ):
+            try:
+                state.pending_repartition = PendingRepartitionV1(
+                    schema_version=1,
+                    decision_number=int(pending_repartition["decision_number"]),
+                    scope_id=str(pending_repartition["scope_id"]),
+                    stage=str(pending_repartition["stage"]),
+                    envelope_sha256=str(pending_repartition["envelope_sha256"]),
+                    source_plan_sha256=str(pending_repartition["source_plan_sha256"]),
+                    attempt_count=int(pending_repartition.get("attempt_count", 0) or 0),
+                    generation_id=(
+                        str(pending_repartition["generation_id"])
+                        if pending_repartition.get("generation_id") is not None else None
+                    ),
+                    candidate_plan_sha256=(
+                        str(pending_repartition["candidate_plan_sha256"])
+                        if pending_repartition.get("candidate_plan_sha256") is not None else None
+                    ),
+                    current_disposition=(
+                        str(pending_repartition["current_disposition"])
+                        if pending_repartition.get("current_disposition") is not None else None
+                    ),
+                    resolved_target_step=(
+                        str(pending_repartition["resolved_target_step"])
+                        if pending_repartition.get("resolved_target_step") is not None else None
+                    ),
+                    resolved_target_role=(
+                        str(pending_repartition["resolved_target_role"])
+                        if pending_repartition.get("resolved_target_role") is not None else None
+                    ),
+                    latest_attempt_path=(
+                        str(pending_repartition["latest_attempt_path"])
+                        if pending_repartition.get("latest_attempt_path") is not None else None
+                    ),
+                    proposal_artifact_path=(
+                        str(pending_repartition["proposal_artifact_path"])
+                        if pending_repartition.get("proposal_artifact_path") is not None else None
+                    ),
+                    candidate_artifact_path=(
+                        str(pending_repartition["candidate_artifact_path"])
+                        if pending_repartition.get("candidate_artifact_path") is not None else None
+                    ),
+                    mechanical_validation_artifact_path=(
+                        str(pending_repartition["mechanical_validation_artifact_path"])
+                        if pending_repartition.get("mechanical_validation_artifact_path") is not None else None
+                    ),
+                    semantic_verdict_artifact_path=(
+                        str(pending_repartition["semantic_verdict_artifact_path"])
+                        if pending_repartition.get("semantic_verdict_artifact_path") is not None else None
+                    ),
+                    failed_stage=(
+                        str(pending_repartition["failed_stage"])
+                        if pending_repartition.get("failed_stage") is not None else None
+                    ),
+                    failure_reason=(
+                        str(pending_repartition["failure_reason"])
+                        if pending_repartition.get("failure_reason") is not None else None
+                    ),
+                )
+            except (TypeError, ValueError):
+                state.pending_repartition = None
     report_path = payload.get("last_manager_report_path")
     state.last_manager_report_path = str(report_path) if report_path is not None else None
 
@@ -789,6 +897,7 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
         "pending_manager_notes": restored.pending_manager_notes,
         "pending_step_team_override": restored.pending_step_team_override,
         "pending_boundary_decision": restored.pending_boundary_decision,
+        "pending_repartition": restored.pending_repartition,
         "last_manager_report_path": restored.last_manager_report_path,
     }
 

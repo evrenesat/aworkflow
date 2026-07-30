@@ -1173,6 +1173,86 @@ class RepartitionVerdictV1:
         )
 
 
+def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
+    """Return the canonical JSON representation used for durable identities."""
+    return json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def repartition_proposal_sha256(proposal: RepartitionProposalV1) -> str:
+    return _sha256_hex(canonical_json_bytes(proposal.to_dict()))
+
+
+def derive_generation_id(
+    *,
+    scope_id: str,
+    decision_number: int,
+    envelope_sha256: str,
+    source_plan_sha256: str,
+) -> str:
+    """Derive an identity that cannot be retargeted through generated wording."""
+    if not _is_nonblank_string(scope_id):
+        raise ValueError("scope_id must be nonblank")
+    if not isinstance(decision_number, int) or isinstance(decision_number, bool) or decision_number < 1:
+        raise ValueError("decision_number must be a positive integer")
+    if not _is_valid_sha256_hex(envelope_sha256) or not _is_valid_sha256_hex(source_plan_sha256):
+        raise ValueError("generation hashes must be lowercase SHA-256 hex strings")
+    material = canonical_json_bytes({
+        "scope_id": scope_id,
+        "decision_number": decision_number,
+        "envelope_sha256": envelope_sha256,
+        "source_plan_sha256": source_plan_sha256,
+    })
+    return "gen-" + _sha256_hex(material)
+
+
+def derive_partition_ids(
+    *,
+    generation_id: str,
+    proposal: RepartitionProposalV1,
+) -> tuple[str, ...]:
+    """Bind each child only to ordered authoritative/evidence assignments."""
+    generation_id = _require_identifier(generation_id, "generation_id")
+    identities: list[str] = []
+    for ordinal, child in enumerate(proposal.children, start=1):
+        material = canonical_json_bytes({
+            "generation_id": generation_id,
+            "ordinal": ordinal,
+            "source_block_ids": list(child.source_block_ids),
+            "repair_evidence_ids": list(child.repair_evidence_ids),
+        })
+        identities.append("part-" + _sha256_hex(material))
+    return tuple(identities)
+
+
+def make_repair_evidence_block(
+    *,
+    evidence_kind: str,
+    ordinal: int,
+    text: str,
+) -> SourceBlock:
+    """Create one stable, separately hashed non-authoritative evidence block."""
+    if not _is_nonblank_string(evidence_kind):
+        raise ValueError("evidence_kind must be nonblank")
+    if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
+        raise ValueError("evidence ordinal must be a positive integer")
+    if not _is_nonblank_string(text):
+        raise ValueError("repair evidence text must be nonblank")
+    content_hash = _sha256_hex(text.encode("utf-8"))
+    block_id = f"repair-{_sha256_hex(f'{evidence_kind}:{ordinal}:{content_hash}'.encode('utf-8'))[:24]}"
+    return SourceBlock(
+        block_id=block_id,
+        text=text,
+        byte_start=0,
+        byte_end=len(text.encode("utf-8")),
+        line_start=1,
+        line_end=text.count("\n") + 2,
+        section_label=None,
+        content_sha256=content_hash,
+    )
+
+
 def _require_string_list(data: Mapping[str, object], key: str, *, required: bool = True) -> list[str]:
     raw = data.get(key)
     if raw is None:
@@ -1371,6 +1451,8 @@ def parse_verdict_json(
         raise ValueError("verdict must be 'accept' or 'reject'")
     reason = _require_nonblank_string(data, "reason", "verdict")
     findings = _require_string_list(data, "findings", required=False)
+    if len(findings) > 16 or any(len(finding) > 1_000 for finding in findings):
+        raise ValueError("verdict findings exceed protocol bounds")
     return RepartitionVerdictV1(
         schema_version=1, proposal_sha256=proposal_sha256, candidate_sha256=candidate_sha256,
         verdict=verdict, reason=reason, findings=tuple(findings),
@@ -1414,7 +1496,8 @@ def render_candidate_plan(
         raise ValueError("Cannot render with invalid envelope: " + "; ".join(issues))
     if proposal.schema_version != 1 or proposal.envelope_sha256 != envelope.canonical_envelope_sha256:
         raise ValueError("proposal does not match the envelope")
-    if proposal.source_plan_sha256 != envelope.plan_sha256 or len(proposal.children) < 2:
+    source_plan_sha256 = _sha256_hex(source_plan_text.encode("utf-8"))
+    if proposal.source_plan_sha256 != source_plan_sha256 or len(proposal.children) < 2:
         raise ValueError("proposal does not match the source plan or lacks children")
     generation_id = _require_identifier(generation_id, "generation_id")
     if len(partition_ids) != len(proposal.children):
@@ -1423,10 +1506,19 @@ def render_candidate_plan(
     if len(set(partition_ids)) != len(partition_ids):
         raise ValueError("partition_ids must be unique")
     plan_bytes = source_plan_text.encode("utf-8")
-    if _sha256_hex(plan_bytes) != envelope.plan_sha256:
-        raise ValueError("source plan hash does not match envelope")
-    if plan_bytes[envelope.checkpoint_byte_start:envelope.checkpoint_byte_end] != envelope.checkpoint_text.encode("utf-8"):
-        raise ValueError("source plan checkpoint bytes do not match envelope")
+    drift = validate_envelope_boundary_drift(
+        envelope=envelope, boundary_plan_text=source_plan_text,
+    )
+    if not drift.allowed:
+        raise ValueError(
+            "source plan drift is outside the controller allowlist: "
+            + "; ".join(drift.issues)
+        )
+    boundary_slice = slice_checkpoint_source(
+        source_plan_text, checkpoint_index=envelope.checkpoint_index,
+    )
+    if boundary_slice is None or boundary_slice.checkpoint_name != envelope.checkpoint_name:
+        raise ValueError("source plan checkpoint identity does not match envelope")
     source_by_id = {block.block_id: block for block in envelope.source_blocks}
     repair_by_id = {block.block_id: block for block in repair_evidence_blocks}
     if len(source_by_id) != len(envelope.source_blocks) or len(repair_by_id) != len(repair_evidence_blocks):
@@ -1463,9 +1555,9 @@ def render_candidate_plan(
             artifact_references=artifact_references, newline=newline,
         ))
     candidate_bytes = (
-        plan_bytes[:envelope.checkpoint_byte_start]
+        plan_bytes[:boundary_slice.checkpoint_byte_start]
         + newline.encode("ascii").join(children)
-        + plan_bytes[envelope.checkpoint_byte_end:]
+        + plan_bytes[boundary_slice.checkpoint_byte_end:]
     )
     return candidate_bytes.decode("utf-8", "strict")
 
@@ -1650,21 +1742,32 @@ def validate_candidate_mechanically(
     envelope_issues = validate_envelope(envelope)
     if envelope_issues:
         issues.extend(f"invalid_envelope:{issue}" for issue in envelope_issues)
-    if source_hash != envelope.plan_sha256:
-        issues.append("source_plan_hash_does_not_match_envelope")
+    drift = validate_envelope_boundary_drift(
+        envelope=envelope, boundary_plan_text=source_plan_text,
+    )
+    if not drift.allowed:
+        issues.extend(f"source_plan_drift:{issue}" for issue in drift.issues)
     if source_hash != proposal.source_plan_sha256:
         issues.append("source_plan_hash_does_not_match_proposal")
     if proposal.envelope_sha256 != envelope.canonical_envelope_sha256:
         issues.append("proposal_envelope_hash_mismatch")
     if len(proposal.children) < 2:
         issues.append("proposal_requires_at_least_two_children")
-    if source_bytes[envelope.checkpoint_byte_start:envelope.checkpoint_byte_end] != envelope.checkpoint_text.encode("utf-8"):
+    boundary_slice = slice_checkpoint_source(
+        source_plan_text, checkpoint_index=envelope.checkpoint_index,
+    )
+    if boundary_slice is None or boundary_slice.checkpoint_name != envelope.checkpoint_name:
         issues.append("source_checkpoint_slice_mismatch")
+        boundary_start = envelope.checkpoint_byte_start
+        boundary_end = envelope.checkpoint_byte_end
+    else:
+        boundary_start = boundary_slice.checkpoint_byte_start
+        boundary_end = boundary_slice.checkpoint_byte_end
 
-    prefix_unchanged = candidate_bytes[:envelope.checkpoint_byte_start] == source_bytes[:envelope.checkpoint_byte_start]
+    prefix_unchanged = candidate_bytes[:boundary_start] == source_bytes[:boundary_start]
     if not prefix_unchanged:
         issues.append("prefix_bytes_changed")
-    source_suffix = source_bytes[envelope.checkpoint_byte_end:]
+    source_suffix = source_bytes[boundary_end:]
     candidate_suffix = candidate_bytes[-len(source_suffix):] if source_suffix else b""
     suffix_unchanged = candidate_suffix == source_suffix
     if not suffix_unchanged:

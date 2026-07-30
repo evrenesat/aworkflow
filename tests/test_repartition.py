@@ -20,10 +20,13 @@ from aflow.repartition import (
     ScopeEnvelopeV1,
     SourceBlock,
     create_envelope,
+    derive_generation_id,
+    derive_partition_ids,
     extract_source_blocks,
     parse_proposal_json,
     parse_verdict_json,
     read_envelope,
+    repartition_proposal_sha256,
     render_candidate_plan,
     slice_checkpoint_source,
     validate_candidate_mechanically,
@@ -33,6 +36,63 @@ from aflow.repartition import (
 )
 
 _EMPTY_MAPPING: Mapping[str, str] = {}
+
+
+def test_repartition_identities_ignore_generated_wording() -> None:
+    fixture = ReviewRejectionRegressionTests()
+    envelope, proposal = fixture._envelope_and_proposal(fixture._plan())
+    generation = derive_generation_id(
+        scope_id=envelope.scope_id,
+        decision_number=7,
+        envelope_sha256=envelope.canonical_envelope_sha256,
+        source_plan_sha256=envelope.plan_sha256,
+    )
+    rewritten = replace(
+        proposal,
+        rationale="Different wording.",
+        children=tuple(
+            replace(child, title=f"Renamed {index}", narrow_goal="Reworded.")
+            for index, child in enumerate(proposal.children, start=1)
+        ),
+    )
+
+    assert derive_partition_ids(
+        generation_id=generation, proposal=proposal,
+    ) == derive_partition_ids(generation_id=generation, proposal=rewritten)
+    assert repartition_proposal_sha256(proposal) != repartition_proposal_sha256(rewritten)
+
+
+def test_render_and_validate_use_allowed_boundary_source_offsets() -> None:
+    fixture = ReviewRejectionRegressionTests()
+    opening = fixture._plan(git_tracking=True)
+    envelope, proposal = fixture._envelope_and_proposal(opening)
+    boundary = opening.replace(
+        "- Plan Branch: `a`", "- Plan Branch: `a-much-longer-controller-value`"
+    )
+    proposal = replace(
+        proposal,
+        source_plan_sha256=hashlib.sha256(boundary.encode("utf-8")).hexdigest(),
+    )
+    candidate = render_candidate_plan(
+        envelope=envelope,
+        proposal=proposal,
+        source_plan_text=boundary,
+        generation_id="generation-boundary",
+        partition_ids=("partition-a", "partition-b"),
+        repair_evidence_artifact_references={},
+    )
+    result = validate_candidate_mechanically(
+        source_plan_text=boundary,
+        candidate_plan_text=candidate,
+        envelope=envelope,
+        proposal=proposal,
+        repair_evidence_artifact_references={},
+        expected_generation_id="generation-boundary",
+        expected_partition_ids=("partition-a", "partition-b"),
+    )
+
+    assert result.valid, result.issues
+    assert "- Plan Branch: `a-much-longer-controller-value`" in candidate
 
 
 # ---------------------------------------------------------------------------

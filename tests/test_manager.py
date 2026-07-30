@@ -17,6 +17,7 @@ from aflow.manager import (
     ManagerDecisionError,
     ManagerStopReport,
     build_manager_prompts,
+    build_repartition_prompts,
     eligible_implementation_upgrade,
     parse_manager_decision,
     render_manager_stop_report,
@@ -32,13 +33,20 @@ from aflow.run_state import (
     ImplementationAttempt,
     ManagerDecisionSummary,
     PendingManagerNotes,
+    PendingRepartitionV1,
     PendingTeamOverride,
     ReviewRejectionRecord,
     manager_resume_fields,
     manager_state_payload,
     restore_manager_state,
 )
-from aflow.runlog import create_run_paths, write_manager_artifacts, write_run_metadata
+from aflow.runlog import (
+    create_repartition_attempt_paths,
+    create_run_paths,
+    write_manager_artifacts,
+    write_repartition_artifact,
+    write_run_metadata,
+)
 from aflow.workflow import _implementation_upgrade_depth, _mutable_implementation_attempts
 
 
@@ -321,6 +329,74 @@ def test_full_prompt_includes_repartition_guidance() -> None:
     assert "repartition_current_checkpoint splits the current" in system
     assert "Do not name workflow steps, teams, or business logic" in system
     assert "next_step_notes must be []" in system
+
+
+def test_repartition_subcall_prompts_have_authoritative_strict_contracts() -> None:
+    payload = {"envelope": {"canonical_envelope_sha256": "a" * 64}}
+    propose_system, propose_user = build_repartition_prompts(
+        payload,
+        mode="propose",
+        skill_name="custom-repartition",
+        correction_findings=("Keep the verification obligation.",),
+    )
+    validate_system, validate_user = build_repartition_prompts(
+        payload, mode="validate",
+    )
+
+    assert "inline contract and rules below are authoritative" in propose_system
+    assert "single correction attempt" in propose_system
+    assert "custom-repartition" in propose_system
+    assert propose_user.startswith("REPARTITION_PROPOSE_CONTEXT_JSON:\n")
+    assert json.loads(
+        propose_user.removeprefix("REPARTITION_PROPOSE_CONTEXT_JSON:\n")
+    )["correction_findings"] == ["Keep the verification obligation."]
+    assert "Independently compare the exact envelope" in validate_system
+    assert validate_user.startswith("REPARTITION_VALIDATE_CONTEXT_JSON:\n")
+
+
+def test_pending_repartition_and_attempt_artifacts_round_trip(tmp_path: Path) -> None:
+    config = ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md")
+    paths = create_run_paths(config)
+    manager_dir = paths.manager_dir / "decision-001"
+    manager_dir.mkdir(parents=True)
+    attempt = create_repartition_attempt_paths(
+        paths, decision_number=1, attempt_number=1,
+    )
+    write_repartition_artifact(attempt.source_plan, "# exact source\n")
+    write_repartition_artifact(attempt.result, {"status": "accepted"})
+    with pytest.raises(FileExistsError):
+        write_repartition_artifact(attempt.result, {"status": "overwritten"})
+
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    state.pending_repartition = PendingRepartitionV1(
+        schema_version=1,
+        decision_number=1,
+        scope_id="scope-1",
+        stage="semantically_validated",
+        envelope_sha256="a" * 64,
+        source_plan_sha256="b" * 64,
+        attempt_count=1,
+        generation_id="gen-" + "c" * 64,
+        candidate_plan_sha256="d" * 64,
+        latest_attempt_path="manager/decision-001/repartition/attempt-001",
+        proposal_artifact_path=(
+            "manager/decision-001/repartition/attempt-001/proposal.json"
+        ),
+        candidate_artifact_path=(
+            "manager/decision-001/repartition/attempt-001/candidate-plan.md"
+        ),
+        semantic_verdict_artifact_path=(
+            "manager/decision-001/repartition/attempt-001/semantic-verdict.json"
+        ),
+    )
+    payload = manager_state_payload(state)
+    restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    restore_manager_state(restored, payload)
+
+    assert restored.pending_repartition == state.pending_repartition
+    assert manager_resume_fields(payload)["pending_repartition"] == state.pending_repartition
+    assert attempt.source_plan.read_text(encoding="utf-8") == "# exact source\n"
+    assert json.loads(attempt.result.read_text(encoding="utf-8"))["status"] == "accepted"
 
 
 def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:

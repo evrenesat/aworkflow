@@ -7303,6 +7303,313 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             assert first_context["envelope"]["validated"] is True
 
+    def test_repartition_full_cycle_persists_semantically_validated_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            call_kinds: list[str] = []
+            proposal_calls = 0
+            validation_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal proposal_calls, validation_calls
+                prompt = argv[-1]
+                model = argv[argv.index("--model") + 1]
+                if model == "default":
+                    call_kinds.append("worker")
+                    return subprocess.CompletedProcess(
+                        argv, 0,
+                        "AFLOW_SCOPE_PRESSURE: split this checkpoint", "",
+                    )
+                if "REPARTITION_PROPOSE_CONTEXT_JSON:\n" in prompt:
+                    call_kinds.append("propose")
+                    proposal_calls += 1
+                    payload = json.loads(
+                        prompt.split("REPARTITION_PROPOSE_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    if proposal_calls == 2:
+                        assert payload["correction_findings"] == [
+                            "Make the seam between children explicit."
+                        ]
+                    envelope = payload["envelope"]
+                    source_ids = [
+                        block["block_id"] for block in envelope["source_blocks"]
+                    ]
+                    repair_ids = [
+                        block["block_id"]
+                        for block in payload["repair_evidence_blocks"]
+                    ]
+                    children = []
+                    for ordinal in (1, 2):
+                        children.append({
+                            "title": (
+                                f"Revised part {ordinal}"
+                                if proposal_calls == 2
+                                else f"Part {ordinal}"
+                            ),
+                            "narrow_goal": f"Implement part {ordinal}.",
+                            "source_block_ids": source_ids,
+                            "repair_evidence_ids": repair_ids,
+                            "implementation_steps": [f"Implement part {ordinal}."],
+                            "verification_commands": ["uv run pytest -q"],
+                            "done_criteria": [f"Part {ordinal} is observable."],
+                        })
+                    proposal = {
+                        "schema_version": 1,
+                        "envelope_sha256": envelope[
+                            "canonical_envelope_sha256"
+                        ],
+                        "source_plan_sha256": payload["source_plan_sha256"],
+                        "rationale": "Two independently reviewable slices.",
+                        "children": children,
+                        "current_disposition": "implement_current_partition",
+                        "cross_cutting_source_reasons": {
+                            block_id: "The obligation constrains both slices."
+                            for block_id in source_ids
+                        },
+                    }
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps(proposal), "",
+                    )
+                if "REPARTITION_VALIDATE_CONTEXT_JSON:\n" in prompt:
+                    call_kinds.append("validate")
+                    validation_calls += 1
+                    payload = json.loads(
+                        prompt.split("REPARTITION_VALIDATE_CONTEXT_JSON:\n", 1)[1]
+                    )
+                    if validation_calls == 1:
+                        return subprocess.CompletedProcess(argv, 0, json.dumps({
+                            "schema_version": 1,
+                            "proposal_sha256": payload["proposal_sha256"],
+                            "candidate_sha256": payload["candidate_plan_sha256"],
+                            "verdict": "reject",
+                            "reason": "The child seam is unclear.",
+                            "findings": [
+                                "Make the seam between children explicit."
+                            ],
+                        }), "")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "proposal_sha256": payload["proposal_sha256"],
+                        "candidate_sha256": payload["candidate_plan_sha256"],
+                        "verdict": "accept",
+                        "reason": "The split preserves all exact obligations.",
+                        "findings": [],
+                    }), "")
+                call_kinds.append("decision")
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "repartition_current_checkpoint",
+                    "reason": "The scope has two independently reviewable slices.",
+                    "next_step_notes": [],
+                    "stop_report": None,
+                }), "")
+
+            with pytest.raises(WorkflowError, match="pending transactional plan application"):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                    ),
+                    _pressure_workflow_config(role="worker"),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = next((repo_root / ".aflow" / "runs").iterdir())
+            payload = json.loads((run_dir / "run.json").read_text())
+            pending = payload["pending_repartition"]
+            first_attempt = (
+                run_dir / "manager" / "decision-001"
+                / "repartition" / "attempt-001"
+            )
+            attempt = (
+                run_dir / "manager" / "decision-001"
+                / "repartition" / "attempt-002"
+            )
+            assert call_kinds == [
+                "worker", "decision", "propose", "validate",
+                "propose", "validate",
+            ]
+            assert payload["turns_completed"] == 1
+            assert len(payload["implementation_attempts"][pending["scope_id"]]) == 1
+            assert pending["stage"] == "semantically_validated"
+            assert pending["attempt_count"] == 2
+            assert pending["resolved_target_step"] == "step"
+            assert pending["resolved_target_role"] == "worker"
+            assert json.loads(
+                (first_attempt / "result.json").read_text()
+            )["status"] == "rejected"
+            assert hashlib.sha256(
+                (attempt / "candidate-plan.md").read_bytes()
+            ).hexdigest() == pending["candidate_plan_sha256"]
+            assert json.loads(
+                (attempt / "result.json").read_text()
+            )["status"] == "accepted"
+            assert plan_path.read_text(encoding="utf-8") == _VALID_PLAN
+
+    def test_repartition_full_rejects_protected_run_artifact_mutation(self) -> None:
+        for mutate_stage in ("propose", "validate"):
+            with self.subTest(mutate_stage=mutate_stage):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    repo_root = Path(tmpdir)
+                    plan_path = repo_root / "plan.md"
+                    _write_plan(plan_path, _VALID_PLAN)
+
+                    def runner(argv, **kwargs):
+                        prompt = argv[-1]
+                        model = argv[argv.index("--model") + 1]
+                        if model == "default":
+                            return subprocess.CompletedProcess(
+                                argv, 0,
+                                "AFLOW_SCOPE_PRESSURE: split this checkpoint", "",
+                            )
+                        if "REPARTITION_PROPOSE_CONTEXT_JSON:\n" in prompt:
+                            payload = json.loads(
+                                prompt.split(
+                                    "REPARTITION_PROPOSE_CONTEXT_JSON:\n", 1,
+                                )[1]
+                            )
+                            envelope = payload["envelope"]
+                            source_ids = [
+                                block["block_id"]
+                                for block in envelope["source_blocks"]
+                            ]
+                            proposal = {
+                                "schema_version": 1,
+                                "envelope_sha256": envelope[
+                                    "canonical_envelope_sha256"
+                                ],
+                                "source_plan_sha256": payload[
+                                    "source_plan_sha256"
+                                ],
+                                "rationale": "Two reviewable slices.",
+                                "children": [
+                                    {
+                                        "title": f"Part {ordinal}",
+                                        "narrow_goal": f"Implement part {ordinal}.",
+                                        "source_block_ids": source_ids,
+                                        "repair_evidence_ids": [],
+                                        "implementation_steps": [
+                                            f"Implement part {ordinal}."
+                                        ],
+                                        "verification_commands": [
+                                            "uv run pytest -q"
+                                        ],
+                                        "done_criteria": [
+                                            f"Part {ordinal} is observable."
+                                        ],
+                                    }
+                                    for ordinal in (1, 2)
+                                ],
+                                "current_disposition": (
+                                    "implement_current_partition"
+                                ),
+                                "cross_cutting_source_reasons": {
+                                    block_id: (
+                                        "The obligation constrains both slices."
+                                    )
+                                    for block_id in source_ids
+                                },
+                            }
+                            if mutate_stage == "propose":
+                                run_dir = next(
+                                    (repo_root / ".aflow" / "runs").iterdir()
+                                )
+                                source_artifact = (
+                                    run_dir / "manager" / "decision-001"
+                                    / "repartition" / "attempt-001"
+                                    / "source-plan.md"
+                                )
+                                source_artifact.write_bytes(
+                                    source_artifact.read_bytes() + b"tampered"
+                                )
+                            return subprocess.CompletedProcess(
+                                argv, 0, json.dumps(proposal), "",
+                            )
+                        if "REPARTITION_VALIDATE_CONTEXT_JSON:\n" in prompt:
+                            payload = json.loads(
+                                prompt.split(
+                                    "REPARTITION_VALIDATE_CONTEXT_JSON:\n", 1,
+                                )[1]
+                            )
+                            if mutate_stage == "validate":
+                                run_dir = next(
+                                    (repo_root / ".aflow" / "runs").iterdir()
+                                )
+                                candidate_artifact = (
+                                    run_dir / "manager" / "decision-001"
+                                    / "repartition" / "attempt-001"
+                                    / "candidate-plan.md"
+                                )
+                                candidate_artifact.write_bytes(
+                                    candidate_artifact.read_bytes() + b"tampered"
+                                )
+                            verdict = {
+                                "schema_version": 1,
+                                "proposal_sha256": payload["proposal_sha256"],
+                                "candidate_sha256": payload[
+                                    "candidate_plan_sha256"
+                                ],
+                                "verdict": "accept",
+                                "reason": "The split preserves exact obligations.",
+                                "findings": [],
+                            }
+                            return subprocess.CompletedProcess(
+                                argv, 0, json.dumps(verdict), "",
+                            )
+                        return subprocess.CompletedProcess(argv, 0, json.dumps({
+                            "schema_version": 1,
+                            "action": "repartition_current_checkpoint",
+                            "reason": "The scope has two reviewable slices.",
+                            "next_step_notes": [],
+                            "stop_report": None,
+                        }), "")
+
+                    with pytest.raises(
+                        WorkflowError, match="protected run-artifact state",
+                    ):
+                        run_workflow(
+                            ControllerConfig(
+                                repo_root=repo_root,
+                                plan_path=plan_path,
+                                max_turns=2,
+                            ),
+                            _pressure_workflow_config(role="worker"),
+                            "managed",
+                            config_dir=repo_root,
+                            adapter=CodexAdapter(),
+                            runner=runner,
+                        )
+
+                    run_dir = next(
+                        (repo_root / ".aflow" / "runs").iterdir()
+                    )
+                    payload = json.loads(
+                        (run_dir / "run.json").read_text(encoding="utf-8")
+                    )
+                    pending = payload["pending_repartition"]
+                    result = json.loads(
+                        (
+                            run_dir / pending["latest_attempt_path"]
+                            / "result.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    assert pending["stage"] == "failed"
+                    assert pending["failed_stage"] == mutate_stage
+                    assert pending["semantic_verdict_artifact_path"] is None
+                    assert result == {
+                        "reason": (
+                            "repartition Full call mutated repository, plan, "
+                            "or protected run-artifact state"
+                        ),
+                        "stage": mutate_stage,
+                        "status": "failed",
+                    }
+                    assert plan_path.read_text(encoding="utf-8") == _VALID_PLAN
+
     def test_scope_pressure_with_tampered_envelope_fails_before_manager_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

@@ -70,6 +70,27 @@ class ManagerDecisionPaths:
     boundary: Path
 
 
+@dataclass(frozen=True)
+class RepartitionAttemptPaths:
+    directory: Path
+    source_plan: Path
+    envelope: Path
+    evidence: Path
+    propose_system_prompt: Path
+    propose_user_prompt: Path
+    propose_stdout: Path
+    propose_stderr: Path
+    proposal: Path
+    candidate_plan: Path
+    mechanical_validation: Path
+    validate_system_prompt: Path
+    validate_user_prompt: Path
+    validate_stdout: Path
+    validate_stderr: Path
+    semantic_verdict: Path
+    result: Path
+
+
 def _utc_run_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid4().hex[:8]}"
@@ -148,6 +169,74 @@ def write_manager_artifacts(
     if boundary is not None:
         _write_json(artifact_paths.boundary, dict(boundary))
     return artifact_paths
+
+
+def create_repartition_attempt_paths(
+    paths: RunPaths,
+    *,
+    decision_number: int,
+    attempt_number: int,
+) -> RepartitionAttemptPaths:
+    if decision_number < 1 or attempt_number not in {1, 2}:
+        raise ValueError("repartition attempt requires positive decision and attempt 1 or 2")
+    directory = (
+        manager_decision_paths(paths, decision_number).directory
+        / "repartition"
+        / f"attempt-{attempt_number:03d}"
+    )
+    directory.mkdir(parents=True, exist_ok=False)
+    return RepartitionAttemptPaths(
+        directory=directory,
+        source_plan=directory / "source-plan.md",
+        envelope=directory / "envelope.json",
+        evidence=directory / "repair-evidence.json",
+        propose_system_prompt=directory / "propose-system-prompt.txt",
+        propose_user_prompt=directory / "propose-user-prompt.txt",
+        propose_stdout=directory / "propose-stdout.txt",
+        propose_stderr=directory / "propose-stderr.txt",
+        proposal=directory / "proposal.json",
+        candidate_plan=directory / "candidate-plan.md",
+        mechanical_validation=directory / "mechanical-validation.json",
+        validate_system_prompt=directory / "validate-system-prompt.txt",
+        validate_user_prompt=directory / "validate-user-prompt.txt",
+        validate_stdout=directory / "validate-stdout.txt",
+        validate_stderr=directory / "validate-stderr.txt",
+        semantic_verdict=directory / "semantic-verdict.json",
+        result=directory / "result.json",
+    )
+
+
+def write_repartition_artifact(
+    path: Path,
+    content: str | bytes | Mapping[str, object],
+) -> None:
+    """Durably write one immutable attempt artifact without overwriting."""
+    if path.exists():
+        raise FileExistsError(f"repartition artifact already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, Mapping):
+        payload = _json_dump(dict(content)).encode("utf-8")
+    elif isinstance(content, str):
+        payload = content.encode("utf-8")
+    else:
+        payload = content
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _aflow_dir(repo_root: Path) -> Path:

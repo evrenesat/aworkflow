@@ -360,6 +360,95 @@ def build_manager_prompts(
     return system_prompt, user_prompt
 
 
+def build_repartition_prompts(
+    payload: Mapping[str, Any],
+    *,
+    mode: Literal["propose", "validate"],
+    skill_name: str = "aflow-repartition-checkpoint",
+    correction_findings: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    """Build one strict, read-only Full repartition subcall.
+
+    The bundled skill is optional at runtime.  Consequently the inline schema
+    and semantic rules are complete and authoritative rather than merely
+    referring the model to the skill.
+    """
+    if mode not in {"propose", "validate"}:
+        raise ValueError("repartition mode must be 'propose' or 'validate'")
+    if mode == "propose":
+        contract = {
+            "schema_version": 1,
+            "envelope_sha256": "<64 lowercase hex characters>",
+            "source_plan_sha256": "<64 lowercase hex characters>",
+            "rationale": "<non-empty conservative rationale>",
+            "children": [{
+                "title": "<concise title>",
+                "narrow_goal": "<non-authoritative execution goal>",
+                "source_block_ids": ["<controller supplied id>"],
+                "repair_evidence_ids": [],
+                "implementation_steps": ["<unchecked implementation guidance>"],
+                "verification_commands": ["<command>"],
+                "done_criteria": ["<observable criterion>"],
+            }],
+            "current_disposition": "review_current_partition",
+            "cross_cutting_source_reasons": {},
+        }
+        rules = (
+            "Return at least two ordered children and cover every supplied authoritative "
+            "source block and corrective-evidence block at least once.",
+            "Use only controller-supplied block IDs. Repeated authoritative blocks require "
+            "a non-empty cross_cutting_source_reasons entry.",
+            "current_disposition must be review_current_partition or "
+            "implement_current_partition and applies only to the first child.",
+            "Generated titles, goals, steps, commands, and criteria are guidance only. "
+            "Do not add business decisions or claim implementation is approved.",
+        )
+    else:
+        contract = {
+            "schema_version": 1,
+            "proposal_sha256": "<exact supplied proposal hash>",
+            "candidate_sha256": "<exact supplied candidate hash>",
+            "verdict": "accept",
+            "reason": "<non-empty semantic reason>",
+            "findings": [],
+        }
+        rules = (
+            "Independently compare the exact envelope, source plan, proposal, rendered "
+            "candidate, scope history, repair evidence, and workspace evidence.",
+            "Reject changed meaning, missing obligations, new business decisions, weakened "
+            "acceptance criteria, contradictory guidance, incoherent seams, dropped or "
+            "misassigned corrective evidence, and unsupported disposition.",
+            "verdict must be accept or reject. On reject, return bounded, actionable findings.",
+        )
+    correction = (
+        "This is the single correction attempt. Correct all bounded findings supplied by "
+        "the controller; do not silently reuse the rejected candidate."
+        if correction_findings
+        else ""
+    )
+    system_prompt = "\n".join((
+        "You are the AFlow Full manager in checkpoint-repartition mode.",
+        f"Mode: {mode}.",
+        f"Use the configured skill '{skill_name}' when it is available.",
+        "The inline contract and rules below are authoritative even when the skill is unavailable.",
+        "You are read-only. You may inspect the repository, but must not edit source, plans, "
+        "git state, configuration, run state, or artifacts.",
+        *rules,
+        correction,
+        "Return exactly one JSON object and no Markdown fences or explanatory text.",
+        "Exact JSON shape: " + json.dumps(contract, separators=(",", ":")),
+    )).replace("\n\n", "\n")
+    user_payload = dict(payload)
+    if correction_findings:
+        user_payload["correction_findings"] = list(correction_findings)
+    user_prompt = (
+        f"REPARTITION_{mode.upper()}_CONTEXT_JSON:\n"
+        + json.dumps(user_payload, indent=2, sort_keys=True)
+        + "\n"
+    )
+    return system_prompt, user_prompt
+
+
 def render_manager_stop_report(
     *,
     context: Mapping[str, Any],
