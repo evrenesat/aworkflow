@@ -36,12 +36,12 @@ from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
     FrozenRunIdentity,
-    OverrideResult,
     PendingFinalizedTurn,
     ResumeContext,
     WorkflowEndReason,
     describe_end_reason,
     manager_resume_fields,
+    resolve_resume_override,
 )
 from .workflow import (
     WorkflowError,
@@ -555,45 +555,11 @@ def _detect_resume_candidate(
                 config_fingerprint=fingerprint_value,
             )
 
-    override_result = None
     override_value = prev_run.get("override_result")
-    if isinstance(override_value, Mapping):
-        override_status = override_value.get("status")
-        digest = override_value.get("digest")
-        message = override_value.get("message")
-        if (
-            override_status in {"accepted", "rejected"}
-            and isinstance(digest, str)
-            and isinstance(message, str)
-        ):
-            override_result = OverrideResult(
-                status=override_status,
-                digest=digest,
-                message=message,
-                source_text=(
-                    str(override_value["source_text"])
-                    if isinstance(override_value.get("source_text"), str)
-                    else None
-                ),
-                next_step=(
-                    str(override_value["next_step"])
-                    if override_value.get("next_step") is not None
-                    else None
-                ),
-                team=(
-                    str(override_value["team"])
-                    if override_value.get("team") is not None
-                    else None
-                ),
-                max_turns=(
-                    int(override_value["max_turns"])
-                    if isinstance(override_value.get("max_turns"), int)
-                    else None
-                ),
-                has_notes=bool(override_value.get("has_notes", False)),
-                applied=bool(override_value.get("applied", False)),
-                recorded_at=str(override_value.get("recorded_at", "")),
-            )
+    override_resolution = resolve_resume_override(
+        run_dir,
+        override_value if isinstance(override_value, Mapping) else None,
+    )
     pending_override_notes = prev_run.get("pending_override_notes")
     if not isinstance(pending_override_notes, list) or not all(
         isinstance(note, str) for note in pending_override_notes
@@ -602,16 +568,6 @@ def _detect_resume_candidate(
     effective_max_turns = prev_run.get("effective_max_turns")
     if not isinstance(effective_max_turns, int) or effective_max_turns < 1:
         effective_max_turns = None
-    override_source_run_dir = (
-        run_dir
-        if override_result is not None
-        and (
-            override_result.status == "rejected"
-            or not override_result.applied
-        )
-        else None
-    )
-
     scope_envelope_source_path: str | None = None
     scope_envelope_bytes: bytes | None = None
     active_scope = manager_fields.get("active_implementation_scope")
@@ -690,11 +646,11 @@ def _detect_resume_candidate(
         ),
         pending_finalized_turn=pending_finalized_turn,
         frozen_run_identity=frozen_run_identity,
-        override_result=override_result,
+        override_result=override_resolution.override_result,
         effective_max_turns=effective_max_turns,
         pending_override_notes=tuple(pending_override_notes),
-        override_source_run_dir=override_source_run_dir,
-        override_file_present=bool(prev_run.get("override_file_present", False)),
+        override_source_run_dir=override_resolution.source_run_dir,
+        override_file_present=override_resolution.file_present,
         terminal_integration_only=terminal_integration_only,
         scope_envelope_bytes=scope_envelope_bytes,
         scope_envelope_source_path=scope_envelope_source_path,

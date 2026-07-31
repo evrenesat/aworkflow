@@ -78,7 +78,9 @@ def test_status_summary_surfaces_safe_override_diagnostics() -> None:
         status="rejected",
         digest="abc",
         message="team is incompatible",
+        source_text='notes = ["private status note"]',
     )
+    state.pending_override_notes = ("private status note",)
 
     table = _build_summary_table(
         workflow_name="test",
@@ -103,6 +105,7 @@ def test_status_summary_surfaces_safe_override_diagnostics() -> None:
     assert "Override File" in rendered
     assert "rejected: team is incompatible" in rendered
     assert "correct overrides.toml and resume" in rendered
+    assert "private status note" not in rendered
 
 
 def test_status_summary_surfaces_literal_repartition_observability() -> None:

@@ -1,3 +1,32 @@
+## 2026-07-31 — Resume-safe predecessor boundary overrides
+
+### What changed
+
+- Resume now classifies the explicitly selected predecessor's actual
+  `overrides.toml` with the existing parser and content digest instead of
+  trusting recorded file-presence metadata.
+- A successor durable run consumes new, changed, corrected, or
+  accepted-but-unapplied predecessor state before its first harness launch.
+  Accepted/rejected results are durable before routing, while successful
+  application returns later boundaries to the successor's own override file.
+- Rejected predecessor state stays launch-blocking when its required file is
+  missing or unreadable. Unchanged accepted digests do not replay routing,
+  limits, teams, or prompt notes across chained resumes.
+- Added source-resolution, first-selector, crash-window, chained-resume,
+  correction, zero-harness rejection, and successor-ownership regressions.
+  Status and analysis continue to expose safe decisions/actions without raw
+  override source or note content.
+
+### Why
+
+- A boundary override written after a controller stopped existed only in the
+  predecessor directory, while resume immediately created a successor and read
+  that new directory. The stale selector could therefore launch before the
+  user's request was discovered.
+- Distinct run ids remain intentional durable generations: `resumed_from_run_id`
+  preserves lineage, while the selected predecessor owns only the first
+  successor boundary until its request is safely consumed.
+
 ## 2026-07-30 — Managed-worktree terminal rebase
 
 ### What changed

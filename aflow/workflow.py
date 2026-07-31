@@ -2847,7 +2847,17 @@ def run_workflow(
                 resumed_envelope_bytes,
             )
 
-    run_paths = create_run_paths(config)
+    preserve_resume_override_source = (
+        resume is not None
+        and resume.override_source_run_dir is not None
+        and resume.override_source_run_dir.parent.resolve()
+        == (config.repo_root / ".aflow" / "runs").resolve()
+    )
+    run_paths = create_run_paths(
+        replace(config, keep_runs=config.keep_runs + 1)
+        if preserve_resume_override_source
+        else config
+    )
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
@@ -6491,6 +6501,10 @@ def run_workflow(
         source_run_dir = state.override_source_run_dir or run_paths.run_dir
         override_path = source_run_dir / "overrides.toml"
         prior = state.override_result
+        required_predecessor_override = (
+            state.override_source_run_dir is not None
+            and source_run_dir.resolve() != run_paths.run_dir.resolve()
+        )
         if (
             prior is not None
             and prior.status == "accepted"
@@ -6507,6 +6521,8 @@ def run_workflow(
             state.override_result = replace(prior, applied=True)
             state.override_source_run_dir = None
             _write_override_boundary(status="running")
+            if preserve_resume_override_source:
+                prune_old_runs(run_paths.runs_root, config.keep_runs)
             return current_step_name, baseline_team_name
         consumed_digest = (
             prior.digest
@@ -6518,7 +6534,7 @@ def run_workflow(
             consumed_digest=consumed_digest,
         )
         state.override_file_present = loaded.status != "absent"
-        if loaded.status == "absent":
+        if loaded.status == "absent" and not required_predecessor_override:
             return current_step_name, baseline_team_name
         if (
             loaded.status == "already_consumed"
@@ -6529,6 +6545,11 @@ def run_workflow(
             return current_step_name, baseline_team_name
         request = loaded.request
         validation_error = loaded.message
+        if loaded.status == "absent" and required_predecessor_override:
+            validation_error = (
+                "required predecessor override file is missing; restore or "
+                f"correct '{override_path}' before resuming"
+            )
         if loaded.status == "valid" and request is not None:
             target_step = request.next_step or current_step_name
             if target_step not in wf.steps:
@@ -6566,9 +6587,13 @@ def run_workflow(
                 )
 
         if validation_error is not None or request is None:
-            digest = loaded.digest or hashlib.sha256(
-                (validation_error or "invalid override").encode("utf-8")
-            ).hexdigest()
+            digest = (
+                loaded.digest
+                or (prior.digest if prior is not None else None)
+                or hashlib.sha256(
+                    (validation_error or "invalid override").encode("utf-8")
+                ).hexdigest()
+            )
             state.override_result = OverrideResult(
                 status="rejected",
                 digest=digest,
@@ -6581,6 +6606,8 @@ def run_workflow(
             )
             state.override_source_run_dir = source_run_dir
             _write_override_boundary(status="waiting_for_valid_override")
+            if preserve_resume_override_source:
+                prune_old_runs(run_paths.runs_root, config.keep_runs)
             banner.stop(state)
             raise WorkflowError(
                 state.status_message,
@@ -6612,6 +6639,8 @@ def run_workflow(
         state.override_result = replace(state.override_result, applied=True)
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
+        if preserve_resume_override_source:
+            prune_old_runs(run_paths.runs_root, config.keep_runs)
         return current_step_name, baseline_team_name
 
     # A resumed transaction is reconciled before the first harness. Accepted

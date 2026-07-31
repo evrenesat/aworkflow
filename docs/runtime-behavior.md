@@ -129,6 +129,39 @@ Invalid TOML, unknown keys, incompatible routing, and invalid limits leave the
 run in `waiting_for_valid_override` without launching another harness. Correct
 the same file and resume the recorded run id.
 
+Resume always creates a new durable successor under
+`.aflow/runs/<successor-run-id>/` and records `resumed_from_run_id`; it does not
+reuse or edit the predecessor's `run.json`. Before the successor's first harness
+launch, AFlow inspects only the explicitly selected predecessor:
+
+```text
+.aflow/runs/<predecessor-run-id>/overrides.toml
+```
+
+There is no latest-run or modification-time scan. With no persisted result, an
+absent file means normal resume and a present file becomes the first-boundary
+request, including malformed content that must be rejected. An accepted but
+unapplied result uses its already-persisted values once. For an applied result,
+an unchanged digest is consumed and never replays `next_step`, `team`,
+`max_turns`, or `notes`; changed content is one new request.
+
+A rejected selected-predecessor request remains launch-blocking. Present content
+is revalidated, so a correction can proceed, but a missing or unreadable
+required file persists `waiting_for_valid_override` with a corrective message
+and launches no harness. Correct the `overrides.toml` in the exact run you
+select, then resume that same run id with its recorded invocation identity.
+Deleting the file is not cancellation. A rejected resume attempt is itself a
+new successor generation; if you select that successor for another resume, its
+own run directory is the predecessor source.
+
+Once a predecessor request is accepted and applied, cross-run ownership is
+released. Later boundaries read only the successor's
+`.aflow/runs/<successor-run-id>/overrides.toml`. The accepted digest/result stays
+durable to prevent replay across further resume generations. `team` becomes the
+successor's effective baseline, `max_turns` remains the effective limit,
+`next_step` affects only the applying boundary, and `notes` reach only the next
+worker prompt.
+
 Protected state has no override syntax. For example, this is rejected because
 `active_turn` is not a supported key:
 

@@ -56,6 +56,25 @@ configuration or changes an active harness. See
 [Runtime Behavior](docs/runtime-behavior.md#disk-backed-run-state-and-boundary-overrides)
 for the exact grammar, examples, rejection recovery, and non-goals.
 
+If the controller has already stopped, write the request in the exact run you
+will resume, for example
+`.aflow/runs/<predecessor-run-id>/overrides.toml`, then resume that run with its
+recorded workflow, plan, team, start step, turn limit, extra instructions, and
+lifecycle identity:
+
+```bash
+aflow run --resume <predecessor-run-id> \
+  --workflow <recorded-workflow> --plan <recorded-plan> \
+  --team <recorded-team> --max-turns <recorded-limit>
+```
+
+Resume creates a distinct successor run, but an unconsumed or corrected request
+in that selected predecessor owns the successor's first boundary. After it is
+accepted and applied, later requests belong in the successor run directory.
+Resume never scans other runs. An unchanged accepted digest is not replayed;
+malformed, unreadable, rejected, or missing-required predecessor requests block
+launch until the exact selected predecessor has a valid file.
+
 ### Interstep supervision
 
 Freshly bootstrapped configuration enables a lightweight manager between

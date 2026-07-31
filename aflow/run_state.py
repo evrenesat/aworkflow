@@ -67,6 +67,101 @@ class OverrideResult:
     )
 
 
+@dataclass(frozen=True)
+class ResumeOverrideResolution:
+    """Decision-complete ownership for the first boundary of a resumed run."""
+
+    override_result: OverrideResult | None
+    source_run_dir: Path | None
+    file_present: bool
+
+
+def resolve_resume_override(
+    run_dir: Path,
+    persisted_result: Mapping[str, Any] | None,
+) -> ResumeOverrideResolution:
+    """Resolve only the selected predecessor's override source.
+
+    The loader remains the single parser and digest authority. Persisted
+    accepted values are retained for crash-safe application, while the actual
+    predecessor file decides whether a new or corrected request owns the first
+    resumed boundary.
+    """
+    prior = None
+    if persisted_result is not None:
+        override_status = persisted_result.get("status")
+        digest = persisted_result.get("digest")
+        message = persisted_result.get("message")
+        if (
+            override_status in {"accepted", "rejected"}
+            and isinstance(digest, str)
+            and isinstance(message, str)
+        ):
+            prior = OverrideResult(
+                status=override_status,
+                digest=digest,
+                message=message,
+                source_text=(
+                    str(persisted_result["source_text"])
+                    if isinstance(persisted_result.get("source_text"), str)
+                    else None
+                ),
+                next_step=(
+                    str(persisted_result["next_step"])
+                    if persisted_result.get("next_step") is not None
+                    else None
+                ),
+                team=(
+                    str(persisted_result["team"])
+                    if persisted_result.get("team") is not None
+                    else None
+                ),
+                max_turns=(
+                    int(persisted_result["max_turns"])
+                    if isinstance(persisted_result.get("max_turns"), int)
+                    and not isinstance(persisted_result.get("max_turns"), bool)
+                    else None
+                ),
+                has_notes=bool(persisted_result.get("has_notes", False)),
+                applied=bool(persisted_result.get("applied", False)),
+                recorded_at=str(persisted_result.get("recorded_at", "")),
+            )
+
+    consumed_digest = (
+        prior.digest
+        if prior is not None
+        and prior.status == "accepted"
+        and prior.applied
+        else None
+    )
+    loaded = load_override_request(
+        run_dir / "overrides.toml",
+        consumed_digest=consumed_digest,
+    )
+    file_present = loaded.status != "absent"
+
+    if prior is None:
+        source_run_dir = run_dir if file_present else None
+    elif prior.status == "rejected" or not prior.applied:
+        # A rejected request stays launch-blocking even when its expected file
+        # was removed, while accepted-but-unapplied values remain crash-safe.
+        source_run_dir = run_dir
+    elif loaded.status in {"valid", "invalid"}:
+        # The accepted digest changed or cannot safely be identified as the
+        # unchanged consumed request. Re-evaluate it at the resumed boundary.
+        source_run_dir = run_dir
+    else:
+        # An absent file or unchanged accepted digest has no predecessor work
+        # left to consume.
+        source_run_dir = None
+
+    return ResumeOverrideResolution(
+        override_result=prior,
+        source_run_dir=source_run_dir,
+        file_present=file_present,
+    )
+
+
 def load_override_request(
     path: Path,
     *,

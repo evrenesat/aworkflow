@@ -1898,8 +1898,170 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert result.override_result is not None
         assert result.override_result.status == "rejected"
         assert result.effective_max_turns == 9
-        assert result.override_file_present is True
+        assert result.override_file_present is False
         assert result.override_source_run_dir == repo_root / ".aflow" / "runs" / run_id
+
+    def test_resume_override_source_resolution_matrix(self) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            run_id = "20260101T000000Z-abc123"
+            run_dir = repo_root / ".aflow" / "runs" / run_id
+            run_dir.mkdir(parents=True)
+            base_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": "base",
+                "selected_start_step": None,
+                "max_turns": 15,
+                "extra_instructions": [],
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": [],
+                "feature_branch": "feature/test-branch",
+                "worktree_path": str(repo_root / "worktree"),
+                "main_branch": "main",
+                "status": "failed",
+                "last_snapshot": {"is_complete": False},
+            }
+            accepted_text = 'team = "strong"\n'
+            accepted_digest = hashlib.sha256(
+                accepted_text.encode("utf-8")
+            ).hexdigest()
+            cases = (
+                ("no_prior_no_file", None, None, False, False),
+                (
+                    "post_stop_valid",
+                    None,
+                    accepted_text,
+                    True,
+                    True,
+                ),
+                (
+                    "post_stop_malformed",
+                    None,
+                    'team = "strong"\ninvalid = [\n',
+                    True,
+                    True,
+                ),
+                (
+                    "accepted_applied_unchanged",
+                    {
+                        "status": "accepted",
+                        "digest": accepted_digest,
+                        "message": "accepted",
+                        "team": "strong",
+                        "applied": True,
+                    },
+                    accepted_text,
+                    False,
+                    True,
+                ),
+                (
+                    "accepted_applied_changed",
+                    {
+                        "status": "accepted",
+                        "digest": accepted_digest,
+                        "message": "accepted",
+                        "team": "strong",
+                        "applied": True,
+                    },
+                    'team = "base"\n',
+                    True,
+                    True,
+                ),
+                (
+                    "accepted_not_applied",
+                    {
+                        "status": "accepted",
+                        "digest": accepted_digest,
+                        "message": "accepted",
+                        "team": "strong",
+                        "applied": False,
+                    },
+                    None,
+                    True,
+                    False,
+                ),
+                (
+                    "rejected_present",
+                    {
+                        "status": "rejected",
+                        "digest": accepted_digest,
+                        "message": "unknown team",
+                        "applied": False,
+                    },
+                    'team = "strong"\n',
+                    True,
+                    True,
+                ),
+                (
+                    "rejected_missing",
+                    {
+                        "status": "rejected",
+                        "digest": accepted_digest,
+                        "message": "unknown team",
+                        "applied": False,
+                    },
+                    None,
+                    True,
+                    False,
+                ),
+            )
+
+            for (
+                name,
+                override_result,
+                override_text,
+                expect_source,
+                expect_present,
+            ) in cases:
+                with self.subTest(name=name):
+                    override_path = run_dir / "overrides.toml"
+                    override_path.unlink(missing_ok=True)
+                    if override_text is not None:
+                        override_path.write_text(
+                            override_text,
+                            encoding="utf-8",
+                        )
+                    prev_run = dict(base_run)
+                    if override_result is not None:
+                        prev_run["override_result"] = override_result
+
+                    with patch(
+                        "aflow.cli.resolve_run_id",
+                        return_value=(run_dir, "explicit_run_id"),
+                    ), patch(
+                        "aflow.cli.load_run_json",
+                        return_value=prev_run,
+                    ):
+                        result = cli_module._detect_resume_candidate(
+                            repo_root=repo_root,
+                            workflow_config=type(
+                                "obj",
+                                (object,),
+                                {"setup": ("worktree", "branch")},
+                            )(),
+                            workflow_name="test_workflow",
+                            plan_path=plan_path,
+                            team="base",
+                            selected_start_step=None,
+                            max_turns=15,
+                            extra_instructions=(),
+                            requested_run_id=run_id,
+                            require_resume=True,
+                        )
+
+                    assert result is not None
+                    assert (
+                        result.override_source_run_dir == run_dir
+                    ) is expect_source
+                    assert result.override_file_present is expect_present
+                    assert (
+                        result.override_result is not None
+                    ) is (override_result is not None)
 
     def test_resume_restores_step_from_unfinished_active_turn(self) -> None:
         import aflow.cli as cli_module

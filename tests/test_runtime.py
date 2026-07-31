@@ -1,6 +1,8 @@
 from aflow._test_support import *  # noqa: F401,F403
+from contextlib import nullcontext
 from dataclasses import replace
 import hashlib
+from typing import Mapping
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
 from aflow.api.events import ExecutionEventType
@@ -8,6 +10,8 @@ from aflow.run_state import (
     ActiveImplementationScope,
     FrozenRunIdentity,
     ImplementationAttempt,
+    OverrideLoadResult,
+    OverrideResult,
     PendingBoundaryDecision,
     PendingFinalizedTurn,
     PendingManagerNotes,
@@ -15,6 +19,7 @@ from aflow.run_state import (
     PendingTeamOverride,
     load_override_request,
     manager_resume_fields,
+    resolve_resume_override,
 )
 from aflow.runlog import create_run_paths, write_run_metadata
 from aflow.workflow import (
@@ -49,6 +54,74 @@ def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
         scope["checkpoint_index"],
         scope["checkpoint_name"],
         len(artifacts),
+    )
+
+
+def _resume_override_workflow_config() -> WorkflowUserConfig:
+    workflow = WorkflowConfig(
+        steps={
+            "implement": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(
+                    GoTransition(to="END", when="DONE"),
+                    GoTransition(to="implement"),
+                ),
+            ),
+            "review": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(
+                    GoTransition(to="END", when="DONE"),
+                    GoTransition(to="review"),
+                ),
+            ),
+        },
+        first_step="implement",
+        team="base",
+    )
+    return WorkflowUserConfig(
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={
+                    "base": HarnessProfileConfig(model="base"),
+                    "strong": HarnessProfileConfig(model="strong"),
+                }
+            )
+        },
+        roles={"worker": "codex.base"},
+        teams={
+            "base": TeamConfig(roles={"worker": "codex.base"}),
+            "strong": TeamConfig(roles={"worker": "codex.strong"}),
+        },
+        workflows={"resume_override": workflow},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+def _resume_override_context(
+    *,
+    repo_root: Path,
+    worktree_path: Path,
+    predecessor_dir: Path,
+    persisted_result: Mapping[str, object] | None = None,
+    pending_notes: tuple[str, ...] = (),
+) -> ResumeContext:
+    resolution = resolve_resume_override(
+        predecessor_dir,
+        persisted_result,
+    )
+    return ResumeContext(
+        resumed_from_run_id=predecessor_dir.name,
+        feature_branch="feature/resume-override",
+        worktree_path=worktree_path,
+        main_branch="main",
+        setup=(),
+        teardown=(),
+        override_result=resolution.override_result,
+        pending_override_notes=pending_notes,
+        override_source_run_dir=resolution.source_run_dir,
+        override_file_present=resolution.file_present,
     )
 
 
@@ -350,6 +423,536 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert changed.status == "valid"
             assert changed.request is not None
             assert changed.request.digest != loaded.request.digest
+
+    def test_resume_override_applies_post_stop_before_launch_and_does_not_replay(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            worktree_path = root / "worktree"
+            repo_root.mkdir()
+            worktree_path.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            _write_plan(worktree_path / "plan.md", _VALID_PLAN)
+            predecessor_dir = (
+                repo_root / ".aflow" / "runs" / "predecessor"
+            )
+            predecessor_dir.mkdir(parents=True)
+            (predecessor_dir / "overrides.toml").write_text(
+                'next_step = "review"\n'
+                'team = "strong"\n'
+                "max_turns = 3\n"
+                'notes = ["first resumed worker only"]\n',
+                encoding="utf-8",
+            )
+            workflow_config = _resume_override_workflow_config()
+            resume = _resume_override_context(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                predecessor_dir=predecessor_dir,
+            )
+            invocations: list[str] = []
+            persisted_before_invocation: list[bool] = []
+
+            def first_resumed_runner(argv, **kwargs):
+                invocation = " ".join(argv)
+                invocations.append(invocation)
+                successors = [
+                    path
+                    for path in (repo_root / ".aflow" / "runs").iterdir()
+                    if path != predecessor_dir
+                ]
+                assert len(successors) == 1
+                payload = json.loads(
+                    (successors[0] / "run.json").read_text(encoding="utf-8")
+                )
+                persisted_before_invocation.append(
+                    payload["override_result"]["status"] == "accepted"
+                    and payload["override_result"]["applied"] is True
+                    and payload["team"] == "strong"
+                    and payload["current_step_name"] == "review"
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "failed",
+                    "stopped after first resumed invocation",
+                )
+
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ), pytest.raises(WorkflowError) as first_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    "resume_override",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=first_resumed_runner,
+                    resume=resume,
+                )
+
+            successor_dir = first_error.value.run_dir
+            successor_payload = json.loads(
+                (successor_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert persisted_before_invocation == [True]
+            assert len(invocations) == 1
+            assert "strong" in invocations[0]
+            assert "first resumed worker only" in invocations[0]
+            assert successor_payload["resumed_from_run_id"] == "predecessor"
+            assert successor_payload["override_result"]["applied"] is True
+            assert "override_source_run_dir" not in successor_payload
+
+            chained_resolution = resolve_resume_override(
+                successor_dir,
+                successor_payload["override_result"],
+            )
+            assert chained_resolution.source_run_dir is None
+            chained_invocations: list[str] = []
+
+            def chained_runner(argv, **kwargs):
+                chained_invocations.append(" ".join(argv))
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "failed",
+                    "stop chained resume",
+                )
+
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ), pytest.raises(WorkflowError) as chained_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                        team="strong",
+                    ),
+                    workflow_config,
+                    "resume_override",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=chained_runner,
+                    resume=ResumeContext(
+                        resumed_from_run_id=successor_dir.name,
+                        feature_branch="feature/resume-override",
+                        worktree_path=worktree_path,
+                        main_branch="main",
+                        setup=(),
+                        teardown=(),
+                        override_result=chained_resolution.override_result,
+                        override_source_run_dir=(
+                            chained_resolution.source_run_dir
+                        ),
+                        override_file_present=(
+                            chained_resolution.file_present
+                        ),
+                    ),
+                )
+
+            assert len(chained_invocations) == 1
+            assert "strong" in chained_invocations[0]
+            assert "first resumed worker only" not in chained_invocations[0]
+            chained_turn = json.loads(
+                (
+                    chained_error.value.run_dir
+                    / "turns"
+                    / "turn-001"
+                    / "result.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert chained_turn["step_name"] == "implement"
+            assert chained_error.value.run_dir != successor_dir
+
+    def test_resume_override_changed_digest_and_unapplied_state_each_apply_once(
+        self,
+    ) -> None:
+        workflow_config = _resume_override_workflow_config()
+        cases = ("changed_digest", "accepted_not_applied")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                repo_root = root / "repo"
+                worktree_path = root / "worktree"
+                repo_root.mkdir()
+                worktree_path.mkdir()
+                plan_path = repo_root / "plan.md"
+                _write_plan(plan_path, _VALID_PLAN)
+                _write_plan(worktree_path / "plan.md", _VALID_PLAN)
+                predecessor_dir = (
+                    repo_root / ".aflow" / "runs" / "predecessor"
+                )
+                predecessor_dir.mkdir(parents=True)
+                old_text = (
+                    'next_step = "review"\n'
+                    'team = "base"\n'
+                    'notes = ["old note must not replay"]\n'
+                )
+                old_digest = hashlib.sha256(
+                    old_text.encode("utf-8")
+                ).hexdigest()
+                persisted = {
+                    "status": "accepted",
+                    "digest": old_digest,
+                    "message": "accepted",
+                    "next_step": "review",
+                    "team": "strong",
+                    "max_turns": 3,
+                    "has_notes": True,
+                    "applied": case == "changed_digest",
+                }
+                pending_notes: tuple[str, ...] = ()
+                if case == "changed_digest":
+                    (predecessor_dir / "overrides.toml").write_text(
+                        'next_step = "implement"\n'
+                        'team = "strong"\n'
+                        'notes = ["changed request"]\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    pending_notes = ("persisted request",)
+
+                resume = _resume_override_context(
+                    repo_root=repo_root,
+                    worktree_path=worktree_path,
+                    predecessor_dir=predecessor_dir,
+                    persisted_result=persisted,
+                    pending_notes=pending_notes,
+                )
+                invocations: list[str] = []
+
+                def runner(argv, **kwargs):
+                    invocations.append(" ".join(argv))
+                    return subprocess.CompletedProcess(
+                        argv,
+                        1,
+                        "failed",
+                        "stop after boundary",
+                    )
+
+                with patch(
+                    "aflow.workflow._validate_worktree_resume_context",
+                    return_value=None,
+                ), pytest.raises(WorkflowError) as error:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=2,
+                        ),
+                        workflow_config,
+                        "resume_override",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                        resume=resume,
+                    )
+
+                assert len(invocations) == 1
+                assert "strong" in invocations[0]
+                payload = json.loads(
+                    (error.value.run_dir / "run.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert payload["override_result"]["applied"] is True
+                if case == "changed_digest":
+                    assert "changed request" in invocations[0]
+                    assert "old note must not replay" not in invocations[0]
+                    assert (
+                        payload["override_result"]["digest"] != old_digest
+                    )
+                    turn_step = "implement"
+                else:
+                    assert "persisted request" in invocations[0]
+                    turn_step = "review"
+                turn = json.loads(
+                    (
+                        error.value.run_dir
+                        / "turns"
+                        / "turn-001"
+                        / "result.json"
+                    ).read_text(encoding="utf-8")
+                )
+                assert turn["step_name"] == turn_step
+
+    def test_resume_override_returns_later_boundaries_to_successor_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            worktree_path = root / "worktree"
+            repo_root.mkdir()
+            worktree_path.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            _write_plan(worktree_path / "plan.md", _VALID_PLAN)
+            predecessor_dir = (
+                repo_root / ".aflow" / "runs" / "predecessor"
+            )
+            predecessor_dir.mkdir(parents=True)
+            (predecessor_dir / "overrides.toml").write_text(
+                'team = "strong"\n'
+                'notes = ["predecessor request"]\n',
+                encoding="utf-8",
+            )
+            resume = _resume_override_context(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                predecessor_dir=predecessor_dir,
+            )
+            invocations: list[str] = []
+
+            def runner(argv, **kwargs):
+                invocations.append(" ".join(argv))
+                successors = [
+                    path
+                    for path in (repo_root / ".aflow" / "runs").iterdir()
+                    if path != predecessor_dir
+                ]
+                assert len(successors) == 1
+                if len(invocations) == 1:
+                    (successors[0] / "overrides.toml").write_text(
+                        'team = "base"\n'
+                        'notes = ["successor request"]\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    _write_plan(
+                        Path(kwargs["cwd"]) / "plan.md",
+                        _COMPLETE_PLAN,
+                    )
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    _resume_override_workflow_config(),
+                    "resume_override",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    resume=resume,
+                )
+
+            assert result.turns_completed == 2
+            assert "strong" in invocations[0]
+            assert "predecessor request" in invocations[0]
+            assert "base" in invocations[1]
+            assert "successor request" in invocations[1]
+            payload = json.loads(
+                (result.run_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert payload["team"] == "base"
+            assert payload["override_result"]["applied"] is True
+
+    def test_resume_override_invalid_sources_block_and_correction_launches(
+        self,
+    ) -> None:
+        workflow_config = _resume_override_workflow_config()
+        rejected_digest = hashlib.sha256(
+            b'team = "missing"\n'
+        ).hexdigest()
+        rejected = {
+            "status": "rejected",
+            "digest": rejected_digest,
+            "message": "team 'missing' is not configured",
+            "applied": False,
+        }
+        cases = (
+            (
+                "malformed",
+                None,
+                'team = "strong"\ninvalid = [\n',
+                None,
+                "malformed TOML",
+            ),
+            (
+                "incompatible",
+                None,
+                'team = "missing"\n',
+                None,
+                "not configured",
+            ),
+            (
+                "selected_then_deleted",
+                None,
+                None,
+                None,
+                "required predecessor override file is missing",
+            ),
+            (
+                "rejected_then_deleted",
+                rejected,
+                None,
+                None,
+                "required predecessor override file is missing",
+            ),
+            (
+                "unreadable",
+                rejected,
+                'team = "strong"\n',
+                OverrideLoadResult(
+                    status="invalid",
+                    message="cannot read override file: permission denied",
+                ),
+                "cannot read override file",
+            ),
+        )
+
+        for (
+            case,
+            persisted,
+            override_text,
+            forced_load,
+            expected_message,
+        ) in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                repo_root = root / "repo"
+                worktree_path = root / "worktree"
+                repo_root.mkdir()
+                worktree_path.mkdir()
+                plan_path = repo_root / "plan.md"
+                _write_plan(plan_path, _VALID_PLAN)
+                _write_plan(worktree_path / "plan.md", _VALID_PLAN)
+                predecessor_dir = (
+                    repo_root / ".aflow" / "runs" / "predecessor"
+                )
+                predecessor_dir.mkdir(parents=True)
+                if override_text is not None:
+                    (predecessor_dir / "overrides.toml").write_text(
+                        override_text,
+                        encoding="utf-8",
+                    )
+                resume = _resume_override_context(
+                    repo_root=repo_root,
+                    worktree_path=worktree_path,
+                    predecessor_dir=predecessor_dir,
+                    persisted_result=persisted,
+                )
+                if case == "selected_then_deleted":
+                    selected_path = predecessor_dir / "overrides.toml"
+                    selected_path.write_text(
+                        'team = "strong"\n',
+                        encoding="utf-8",
+                    )
+                    resume = _resume_override_context(
+                        repo_root=repo_root,
+                        worktree_path=worktree_path,
+                        predecessor_dir=predecessor_dir,
+                    )
+                    selected_path.unlink()
+                runner = unittest.mock.Mock()
+                loader_patch = (
+                    patch(
+                        "aflow.workflow.load_override_request",
+                        return_value=forced_load,
+                    )
+                    if forced_load is not None
+                    else nullcontext()
+                )
+
+                with patch(
+                    "aflow.workflow._validate_worktree_resume_context",
+                    return_value=None,
+                ), loader_patch, pytest.raises(
+                    WorkflowError,
+                    match="waiting_for_valid_override",
+                ) as error:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=2,
+                        ),
+                        workflow_config,
+                        "resume_override",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                        resume=resume,
+                    )
+
+                runner.assert_not_called()
+                payload = json.loads(
+                    (error.value.run_dir / "run.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert payload["status"] == "waiting_for_valid_override"
+                assert payload["override_result"]["status"] == "rejected"
+                assert expected_message in payload["status_message"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            worktree_path = root / "worktree"
+            repo_root.mkdir()
+            worktree_path.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            _write_plan(worktree_path / "plan.md", _VALID_PLAN)
+            predecessor_dir = (
+                repo_root / ".aflow" / "runs" / "predecessor"
+            )
+            predecessor_dir.mkdir(parents=True)
+            (predecessor_dir / "overrides.toml").write_text(
+                'team = "strong"\n',
+                encoding="utf-8",
+            )
+            resume = _resume_override_context(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                predecessor_dir=predecessor_dir,
+                persisted_result=rejected,
+            )
+            invocations: list[str] = []
+
+            def corrected_runner(argv, **kwargs):
+                invocations.append(" ".join(argv))
+                _write_plan(Path(kwargs["cwd"]) / "plan.md", _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "complete", "")
+
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    "resume_override",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=corrected_runner,
+                    resume=resume,
+                )
+
+            assert result.turns_completed == 1
+            assert len(invocations) == 1
+            assert "strong" in invocations[0]
 
     def test_atomic_run_metadata_failure_preserves_previous_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

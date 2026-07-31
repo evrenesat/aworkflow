@@ -303,6 +303,7 @@ Data classes for runtime state:
   - Also carries the current run id and, for resumed runs, the source run id so the banner and startup output can surface both immediately.
 - `FrozenRunIdentity` -- selected workflow name, resolved configuration path, and a canonical SHA-256 fingerprint computed once from the resolved in-memory execution configuration.
 - `OverrideRequest` / `OverrideResult` -- the strict user request and durable controller decision for one `overrides.toml` content digest. Raw notes stay out of broad status output.
+- `ResumeOverrideResolution` -- the selected predecessor's persisted result plus actual-file classification for the successor's first boundary. It uses the normal override loader and never scans other runs.
 - `RetryContext` -- frozen dataclass holding everything needed to rerun the same step on the next turn without re-parsing the broken plan (step name, role, resolved selector, pre-failure snapshot, saved plan paths, base prompt, parse error string, attempt counter, retry limit).
 - `ExecutionContext` -- frozen dataclass holding lifecycle execution state: `primary_repo_root`, `execution_repo_root` (worktree path for worktree flows, same as primary for branch-only), `main_branch`, `feature_branch`, `worktree_path` (or `None` for branch-only), `setup`, `teardown`.
 - `ControllerConfig` also carries the selected startup step, if any, so the workflow loop can start from a non-default step without re-parsing CLI arguments.
@@ -323,6 +324,17 @@ digests are durable before routing changes, rejected digests produce
 `waiting_for_valid_override`, and corrected content can be retried on resume.
 Direct `run.json` editing, graph mutation, active-harness mutation, and
 lifecycle/manager/plan-lineage overrides are intentionally unsupported.
+
+Every resume still creates a distinct durable run id linked through
+`resumed_from_run_id`; lifecycle identity and the reused worktree do not change.
+Before that successor launches its first harness, resume classifies only the
+explicitly selected predecessor's `overrides.toml` against the predecessor's
+durable result. A new, changed, rejected, or accepted-but-unapplied request owns
+that first boundary. Acceptance/rejection is atomically durable before routing;
+successful application releases cross-run ownership, so later boundaries read
+the successor's own file. An unchanged accepted digest is already consumed.
+Rejected state remains a hard gate when the required selected-predecessor file
+is missing or unreadable.
 
 Prunes old run directories to respect `keep_runs`.
 
