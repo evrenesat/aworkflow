@@ -101,6 +101,20 @@ single object, while continuing to reject all other transport prose/noise.
 It also bounds advisory notes to the first eight after validating their types
 and per-note size, avoiding a Full fallback caused only by surplus useful
 advice.
+For selector-3 contexts, Lite receives bounded controller-owned note scope,
+not plan prose: the flat `manager_note_scope` describes the proposed route and
+an optional retry scope appears only for a distinct eligible retry route.
+Same-plan retry and backup-retry decisions validate against that flat scope
+when the duplicate retry field is omitted. File identities remain
+case-sensitive, extensionless list entries are either represented or make the
+scope incomplete, and direct `plans/...` selection instructions are rejected.
+Immutable boundary artifacts retain these facts so context rebuilding does not
+read changed plans. Notes remain advisory: exact controller-scope restatement
+is the only allowed file authority, while restrictive paraphrases, plan
+selection, and worker-mandate language are rejected locally. Before any worker
+launch, an invalid persisted note is marked, receives exactly one Full
+`pending_notes_invalid` correction, and either has corrected/empty notes made
+durable or stops; legacy notes without the marker remain readable.
 Boundary schema versioning preserves the legacy shape for old artifacts while
 new boundaries snapshot structured plan state. Resume rebases run-local scope
 turn numbering and carries prior rejection progress explicitly. Legacy scopes

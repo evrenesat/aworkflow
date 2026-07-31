@@ -726,3 +726,23 @@ All 71 server tests pass.
 ### Next Steps
 
 Checkpoint 5 will add the mobile-first web client for repos, plans, sessions, and execution.
+
+# 2026-07-31 — Manager-note scope authority
+
+- Added bounded, controller-owned note-scope metadata to selector-3 manager
+  contexts while keeping Lite plan prose redacted, including a distinct retry
+  scope only when its target differs from the proposed route.
+- Replaced transition-local note targeting with explicit immutable manager-call
+  targets, fixing first-turn terminal `AFLOW_STOP` reporting without a stale
+  or unbound plan path.
+- Added deterministic authority classification for restrictive scope and plan
+  selection paraphrases, while retaining path-bearing defect and test advice.
+  Plain and Markdown-code file constraints now parse within bounds or fail
+  closed.
+- Closed the review edge cases for extensionless list entries, direct
+  `plans/...` selections, case-sensitive path identity, and same-plan
+  retry/backup scope fallback; runtime regressions cover both recovery routes
+  and persisted-note scope drift under an unchanged plan identity.
+- Revalidated unconsumed persisted notes before prompt injection. Invalid notes
+  receive one durable Full `pending_notes_invalid` correction; the additive
+  correction marker keeps legacy state compatible and prevents correction loops.

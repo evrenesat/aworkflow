@@ -38,6 +38,51 @@ _DECISION_KEYS = frozenset({"schema_version", "action", "reason", "next_step_not
 _STOP_REPORT_KEYS = frozenset({"summary", "root_cause", "evidence", "attempts", "workspace_state", "next_actions"})
 MAX_MANAGER_NOTES = 8
 MAX_MANAGER_NOTE_LENGTH = 1_000
+# These rules intentionally classify authority from normalized note text rather
+# than asking another model to infer intent.  A path is ordinary evidence until
+# a rule below pairs it with scope or plan-control language.
+_SCOPE_AUTHORITY_RULES = (
+    re.compile(
+        r"\b(?:restrict|limit|confine|scope)\s+(?:edits?|changes?|work)\b|"
+        r"\b(?:changes?|work)\s+(?:are|is)\s+confined\b|"
+        r"\bkeep\s+(?:changes?|work)\s+scoped\b",
+    ),
+    re.compile(
+        r"\b(?:sole|only)\s+(?:permitted|allowed)\s+(?:file|path)s?\b|"
+        r"\bonly\s+(?:the\s+)?(?:files?|paths?|dirty\s+(?:files?|set))\b|"
+        r"\bonly\s+(?:change|edit|touch|modify)\b",
+    ),
+    re.compile(
+        r"\b(?:allow(?:ed)?\s+(?:files?|paths?)|allowlist|permit(?:ted)?\s+"
+        r"(?:files?|paths?)|may\s+modify)\b",
+    ),
+    re.compile(
+        r"\b(?:never\s+(?:modify|change|edit|touch)|must\s+not\s+touch|"
+        r"do\s+not\s+(?:modify|change|edit|touch)|don't\s+(?:modify|change|edit|touch)|"
+        r"outside\s+(?:the\s+)?(?:dirty\s+)?(?:files?|paths?|set))\b",
+    ),
+    re.compile(r"\b(?:current\s+)?dirty\s+(?:files?|set)\b"),
+)
+_PROHIBITION_AUTHORITY_RE = re.compile(
+    r"\b(?:never\s+(?:modify|change|edit|touch)|must\s+not\s+touch|"
+    r"do\s+not\s+(?:modify|change|edit|touch)|don't\s+(?:modify|change|edit|touch)|"
+    r"outside\s+(?:the\s+)?(?:dirty\s+)?(?:files?|paths?|set))\b"
+)
+_PLAN_REFERENCE_RE = re.compile(r"\b(?:active|repair|current)?\s*plan\b")
+_PLAN_SELECTION_RE = re.compile(
+    r"\b(?:use|follow|switch(?:\s+to)?|replace|adopt|work\s+from)\b"
+)
+_DIRECT_PLAN_SELECTION_RE = re.compile(
+    r"\b(?:use|follow|switch(?:\s+to)?|replace|adopt|work\s+from)\s+"
+    r"(?:the\s+)?`?plans/[a-z0-9][a-z0-9._/-]*`?"
+)
+_IMPLEMENTATION_REQUIREMENT_RE = re.compile(
+    r"\bensure\s+(?:the\s+)?(?:worker|implementation)\b|"
+    r"\b(?:worker|implementation)\s+(?:must|should|needs?\s+to|is\s+required\s+to)\b|"
+    r"\brequire\s+(?:the\s+)?(?:worker|implementation)\s+to\b"
+)
+_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9][A-Za-z0-9._/-]*)(?![A-Za-z0-9_./-])")
+_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 _SINGLE_JSON_FENCE = re.compile(
     r"\A\s*```json[ \t]*\r?\n(?P<body>.*?)\r?\n```[ \t]*\s*\Z",
     re.DOTALL,
@@ -200,6 +245,123 @@ def validate_manager_decision(
     return decision
 
 
+def validate_manager_note_authority(
+    notes: tuple[str, ...],
+    *,
+    scope: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Validate manager advice against controller-owned scope facts.
+
+    A path in an ordinary defect or test-focus note is evidence, not scope
+    authority. Explicit allowlists and prohibitions are allowed only when they
+    exactly restate the corresponding controller constraint; a subset would
+    narrow the active plan. Plans and mandatory implementation requirements
+    remain controller-owned regardless of the scope summary.
+    """
+    for note in notes:
+        normalized = _normalize_authority_text(note)
+        if (
+            _DIRECT_PLAN_SELECTION_RE.search(normalized)
+            or (
+                _PLAN_REFERENCE_RE.search(normalized)
+                and _PLAN_SELECTION_RE.search(normalized)
+            )
+        ):
+            _raise_note_authority_error(scope, "replace or select an active plan")
+        if any(rule.search(normalized) for rule in _SCOPE_AUTHORITY_RULES):
+            _validate_file_scope_claim(note, scope)
+            continue
+        if _IMPLEMENTATION_REQUIREMENT_RE.search(normalized):
+            _raise_note_authority_error(scope, "impose a mandatory implementation requirement")
+    return notes
+
+
+def _normalize_authority_text(note: str) -> str:
+    """Normalize control-language matching; path extraction uses the source note."""
+    return re.sub(r"\s+", " ", note.strip().lower())
+
+
+def _raise_note_authority_error(
+    scope: Mapping[str, Any] | None,
+    detail: str,
+) -> None:
+    identity = scope.get("active_plan_identity") if isinstance(scope, Mapping) else None
+    suffix = f" for active plan {identity}" if isinstance(identity, str) else ""
+    raise ManagerDecisionError(f"next_step_notes may not {detail}{suffix}")
+
+
+def _normalized_scope_paths(
+    scope: Mapping[str, Any] | None,
+    key: str,
+) -> frozenset[str] | None:
+    if not isinstance(scope, Mapping) or scope.get("constraints_complete") is not True:
+        return None
+    raw_paths = scope.get(key)
+    if not isinstance(raw_paths, (list, tuple)):
+        return None
+    normalized: set[str] = set()
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str):
+            return None
+        path = _normalize_note_path(raw_path)
+        if path is None:
+            return None
+        normalized.add(path)
+    return frozenset(normalized)
+
+
+def _normalize_note_path(value: str) -> str | None:
+    path = value.strip().strip(".,:;()[]{}")
+    if (
+        not path
+        or path.startswith("/")
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", path)
+    ):
+        return None
+    return path
+
+
+def _note_paths(note: str) -> tuple[frozenset[str], bool]:
+    """Return asserted paths and whether all path-shaped assertions parsed."""
+    candidates = list(_CODE_SPAN_RE.findall(note))
+    unquoted = _CODE_SPAN_RE.sub(" ", note)
+    candidates.extend(
+        candidate
+        for candidate in _PATH_TOKEN_RE.findall(unquoted)
+        if "/" in candidate or "." in candidate
+    )
+    paths: set[str] = set()
+    malformed = False
+    for candidate in candidates:
+        normalized = _normalize_note_path(candidate)
+        if normalized is None:
+            malformed = True
+        else:
+            paths.add(normalized)
+    return frozenset(paths), malformed
+
+
+def _validate_file_scope_claim(
+    note: str,
+    scope: Mapping[str, Any] | None,
+) -> None:
+    is_prohibition = (
+        _PROHIBITION_AUTHORITY_RE.search(_normalize_authority_text(note)) is not None
+    )
+    scope_key = "prohibited_paths" if is_prohibition else "allowed_paths"
+    authoritative_paths = _normalized_scope_paths(scope, scope_key)
+    asserted_paths, malformed = _note_paths(note)
+    if (
+        authoritative_paths is None
+        or malformed
+        or not asserted_paths
+        or asserted_paths != authoritative_paths
+    ):
+        _raise_note_authority_error(scope, "assert file or scope authority")
+
+
 def resolve_manager_role(
     config: WorkflowUserConfig,
     *,
@@ -316,6 +478,9 @@ def build_manager_prompts(
         "You are read-only: do not edit source, plans, git state, configuration, or run files.",
         "Accept or alter only the controller action exposed as eligible in the supplied context.",
         "Do not choose workflow nodes, teams, selectors, or business logic.",
+        "next_step_notes are advisory evidence only: do not introduce file allowlists, "
+        "prohibitions, plan replacement, scope limits, or mandatory implementation requirements. "
+        "Any unavoidable file constraint must exactly restate manager_note_scope.",
         *(
             (
                 "When Lite, evaluate the rejection cause before choosing an action:",

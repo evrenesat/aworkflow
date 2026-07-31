@@ -52,6 +52,10 @@ when exposed), and `stop`.
 - `next_step_notes` must contain at most 8 non-empty strings of at most 1,000
   characters each. Keep it empty for `stop`, `escalate_to_full`, and accepted
   `END` transitions.
+- Notes are advisory only. Do not introduce file allowlists, prohibitions,
+  plan replacement, scope limits, or mandatory implementation requirements;
+  the active plan and controller own that authority. If a file constraint is
+  unavoidable, it must exactly restate `manager_note_scope`.
 - For `stop`, provide a `stop_report` object with non-empty `summary`,
   `root_cause`, `evidence`, `attempts`, `workspace_state`, and `next_actions`.
   `evidence` and `next_actions` must be lists.

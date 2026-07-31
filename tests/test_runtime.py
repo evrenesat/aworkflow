@@ -8310,6 +8310,397 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert full_result['level'] == 'full'
             assert full_result['action'] == 'continue'
 
+    def test_scope_authority_note_escalates_before_another_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(
+                plan_path,
+                "# Plan\n\n## Files\n\nMay modify only:\n\n"
+                "- `aflow/manager.py`\n- `tests/test_runtime.py`\n\n"
+                "### [ ] Checkpoint 1: First\n- [ ] step one\n",
+            )
+            worker_prompts: list[str] = []
+            manager_models: list[str] = []
+
+            def decision(*, notes: list[str]) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(
+                    [], 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "Synthetic manager decision.",
+                        "next_step_notes": notes,
+                        "stop_report": None,
+                    }), "",
+                )
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    manager_models.append(model)
+                    if len(manager_models) > 2:
+                        return decision(notes=[])
+                    if model == "manager-lite":
+                        return decision(notes=[
+                            "Keep changes scoped to the allowed file "
+                            "`aflow/manager.py`."
+                        ])
+                    return decision(notes=["Focus verification on the upgrade regression."])
+                worker_prompts.append(argv[-1])
+                if len(worker_prompts) == 2:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "worker output", "")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                _pressure_workflow_config(role="worker"),
+                "managed",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            first = json.loads(
+                (result.run_dir / "manager" / "decision-001" / "result.json").read_text()
+            )
+            corrected = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "result.json").read_text()
+            )
+            assert first["status"] == "invalid"
+            assert "may not assert file" in first["error"]
+            assert corrected["level"] == "full"
+            assert corrected["status"] == "accepted"
+            assert manager_models[:2] == ["manager-lite", "manager-full"]
+            assert len(worker_prompts) == 2
+            assert "Keep changes scoped" not in worker_prompts[1]
+            assert "Focus verification on the upgrade regression." in worker_prompts[1]
+
+    def test_manager_harness_recovery_same_plan_retry_notes_use_current_scope(self) -> None:
+        for action, expected_retry_model in (
+            ("retry_current_step", "primary"),
+            ("switch_to_backup_and_retry", "backup"),
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmpdir:
+                repo_root = Path(tmpdir)
+                plan_path = repo_root / "plan.md"
+                in_progress_plan = (
+                    "# Plan\n\n## Files\n\nMay modify only:\n- README.md\n\n"
+                    "### [ ] Checkpoint 1: First\n- [ ] step one\n"
+                )
+                complete_plan = in_progress_plan.replace(
+                    "### [ ] Checkpoint 1", "### [x] Checkpoint 1"
+                ).replace("- [ ] step one", "- [x] step one")
+                _write_plan(plan_path, in_progress_plan)
+                workflow = WorkflowConfig(
+                    steps={"implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="implement"),
+                        ),
+                    )},
+                    first_step="implement",
+                    team="primary",
+                )
+                wf_config = WorkflowUserConfig(
+                    roles={
+                        "worker": "codex.primary",
+                        "manager_lite": "codex.manager-lite",
+                        "manager_full": "codex.manager-full",
+                    },
+                    harnesses={"codex": WorkflowHarnessConfig(profiles={
+                        "primary": HarnessProfileConfig(model="primary"),
+                        "backup": HarnessProfileConfig(model="backup"),
+                        "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                        "manager-full": HarnessProfileConfig(model="manager-full"),
+                    })},
+                    teams={
+                        "primary": TeamConfig(
+                            roles={"worker": "codex.primary"},
+                            backup_team="backup",
+                        ),
+                        "backup": TeamConfig(roles={"worker": "codex.backup"}),
+                    },
+                    workflows={"managed": workflow},
+                    prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                    manager=ManagerConfig(
+                        enabled=True,
+                        lite_role="manager_lite",
+                        full_role="manager_full",
+                    ),
+                    error_handling=ErrorHandlingConfig(
+                        harness_error_recovery=HarnessErrorRecoveryConfig(
+                            rules=(HarnessErrorRecoveryRuleConfig(
+                                action="retry_same_team_after_delay",
+                                match=("throttled",),
+                                delay_seconds=0,
+                            ),),
+                        ),
+                    ),
+                )
+                worker_models: list[str] = []
+                worker_prompts: list[str] = []
+                manager_calls = 0
+
+                def runner(argv, **kwargs):
+                    nonlocal manager_calls
+                    model = argv[argv.index("--model") + 1]
+                    if model.startswith("manager-"):
+                        manager_calls += 1
+                        context = json.loads(
+                            argv[-1].split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                        )
+                        if manager_calls == 1:
+                            assert context["trigger"] == "harness_recovery"
+                            assert context["manager_note_scope"]["allowed_paths"] == [
+                                "README.md"
+                            ]
+                            assert context.get("retry_manager_note_scope") is None
+                            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                                "schema_version": 1,
+                                "action": action,
+                                "reason": "Retry the operational failure.",
+                                "next_step_notes": [
+                                    "Restrict edits to README.md."
+                                ],
+                                "stop_report": None,
+                            }), "")
+                        return subprocess.CompletedProcess(argv, 0, json.dumps({
+                            "schema_version": 1,
+                            "action": "continue",
+                            "reason": "The plan is complete.",
+                            "next_step_notes": [],
+                            "stop_report": None,
+                        }), "")
+
+                    worker_models.append(model)
+                    worker_prompts.append(argv[-1])
+                    if len(worker_models) == 1:
+                        return subprocess.CompletedProcess(
+                            argv, 1, "", "throttled\n"
+                        )
+                    _write_plan(plan_path, complete_plan)
+                    return subprocess.CompletedProcess(argv, 0, "complete", "")
+
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                        team="primary",
+                    ),
+                    wf_config,
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+                first_decision = json.loads(
+                    (
+                        result.run_dir
+                        / "manager"
+                        / "decision-001"
+                        / "result.json"
+                    ).read_text()
+                )
+                assert first_decision["status"] == "accepted"
+                assert first_decision["action"] == action
+                assert worker_models == ["primary", expected_retry_model]
+                assert "Restrict edits to README.md." in worker_prompts[1]
+
+    def test_first_turn_explicit_stop_uses_terminal_full_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "default":
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_STOP: first turn needs owner input\n", ""
+                    )
+                context = json.loads(
+                    argv[-1].split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                )
+                assert context["trigger"] == "explicit_stop"
+                assert context["manager_note_scope"]["constraints_complete"] is True
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "stop",
+                    "reason": "The worker reached an owner boundary.",
+                    "next_step_notes": [],
+                    "stop_report": {
+                        "summary": "Owner input is required.",
+                        "root_cause": "The first worker stopped.",
+                        "evidence": ["AFLOW_STOP was emitted."],
+                        "attempts": "One worker turn.",
+                        "workspace_state": "Plan remains in progress.",
+                        "next_actions": ["Review the manager report."],
+                    },
+                }), "")
+
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _pressure_workflow_config(role="worker"),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert calls == ["default", "manager-full"]
+            assert "Owner input is required." in str(raised.value)
+            assert "NameError" not in str(raised.value)
+
+    def test_rejected_repair_upgrade_keeps_dirty_work_and_corrects_scope_notes(self) -> None:
+        """Reproduce Decision 22 without allowing its note to reach a worker."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(
+                plan_path,
+                "# Plan\n\n### [ ] Checkpoint 1: Repair\n- [ ] finish repair\n",
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review", preserve_active_plan=True),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement"),),
+                    ),
+                },
+                first_step="implement",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker-default",
+                    "reviewer": "codex.reviewer",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker-default": HarnessProfileConfig(model="worker-default"),
+                    "worker-high": HarnessProfileConfig(model="worker-high"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                teams={
+                    "default": TeamConfig(
+                        roles={"worker": "codex.worker-default"}, upgrade_to="high",
+                    ),
+                    "high": TeamConfig(roles={"worker": "codex.worker-high"}),
+                },
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                    full_after_stalled_turns=99,
+                ),
+            )
+            dirty_path = repo_root / "accepted.txt"
+            dirty_bytes = b"accepted dirty work\n"
+            worker_prompts: list[str] = []
+            manager_contexts: dict[int, dict[str, object]] = {}
+            manager_models: list[str] = []
+            invalid_note = "Keep changes scoped to the dirty file `accepted.txt`."
+            compatible_note = "The rejected evidence is in `accepted.txt`; focus verification there."
+
+            def decision(*, action: str, notes: list[str]) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
+                    "action": action,
+                    "reason": "Synthetic manager decision.",
+                    "next_step_notes": notes,
+                    "stop_report": None,
+                }), "")
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                cwd = Path(kwargs["cwd"])
+                if model.startswith("manager-"):
+                    context = json.loads(argv[-1].split("MANAGER_CONTEXT_JSON:\n", 1)[1])
+                    number = context["decision_number"]
+                    assert isinstance(number, int)
+                    manager_models.append(model)
+                    manager_contexts[number] = context
+                    if number == 2:
+                        return decision(action="upgrade_next_implementation", notes=[invalid_note])
+                    if number == 3:
+                        return decision(action="upgrade_next_implementation", notes=[compatible_note])
+                    return decision(action="continue", notes=[])
+
+                worker_prompts.append(argv[-1])
+                if model == "worker-default":
+                    dirty_path.write_bytes(dirty_bytes)
+                    return subprocess.CompletedProcess(argv, 0, "implementation attempt", "")
+                if invalid_note in argv[-1]:
+                    return subprocess.CompletedProcess(argv, 0, "AFLOW_STOP: refused narrowed scope", "")
+                assert model == "worker-high"
+                _write_plan(cwd / "plan.md", _COMPLETE_PLAN)
+                repair_path = next(cwd.glob("plan-*.md"))
+                _write_plan(repair_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "repair completed", "")
+
+            original_runner = runner
+
+            def role_runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                if model == "reviewer":
+                    _write_plan(
+                        Path(kwargs["cwd"]) / "plan-repair.md",
+                        "# Repair\n\n## Files\n\nMay modify only:\n\n"
+                        "- `accepted.txt`\n- `aflow/workflow.py`\n"
+                        "- `tests/test_runtime.py`\n\n"
+                        "### [ ] Checkpoint 1: Repair\n- [ ] finish repair\n",
+                    )
+                    return subprocess.CompletedProcess(argv, 0, "rejected", "")
+                return original_runner(argv, **kwargs)
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root, plan_path=plan_path, max_turns=3, team="default",
+                ),
+                wf_config,
+                "managed",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=role_runner,
+            )
+
+            lite_scope = manager_contexts[2]["manager_note_scope"]
+            assert isinstance(lite_scope, dict)
+            assert lite_scope["active_plan_identity"].endswith("plan-repair.md::checkpoint-1")
+            assert lite_scope["allowed_paths"] == [
+                "accepted.txt", "aflow/workflow.py", "tests/test_runtime.py",
+            ]
+            assert manager_contexts[2]["plan_state"]["active_plan_path"].endswith("plan-repair.md")
+            assert manager_contexts[2]["active_plan_content"] is None
+            assert manager_models[:3] == ["manager-lite", "manager-lite", "manager-full"]
+            assert worker_prompts[1].find(invalid_note) == -1
+            assert compatible_note in worker_prompts[1]
+            assert dirty_path.read_bytes() == dirty_bytes
+            assert not any(
+                json.loads(path.read_text())["trigger"] == "explicit_stop"
+                for path in (result.run_dir / "manager").glob("decision-*/result.json")
+            )
+
     def test_reasonix_lite_manager_accepts_fenced_final_output_without_full_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -8627,7 +9018,10 @@ def _run_upgrade_resume_scenario(
     prior_reviewer_rejections: int = 0,
     legacy_scope: bool = False,
     pressure_on_first_reviewer: bool = False,
-) -> tuple[list[str], list[int], dict[str, object], Path]:
+    pending_note: str | None = None,
+    correction_notes: list[str] | None = None,
+    repair_allowed_paths: tuple[str, ...] | None = None,
+) -> tuple[list[str], list[int], dict[str, object], Path, list[str]]:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     _make_lifecycle_git_repo(repo_root, branch="main")
@@ -8648,7 +9042,18 @@ def _run_upgrade_resume_scenario(
         text=True,
     )
     repair_path = repo_root / "repair.md"
-    repair_text = "# Repair\n\n### [ ] Checkpoint 1: Repair\n- [ ] repair step\n"
+    repair_scope = (
+        "## Files\n\nMay modify only:\n"
+        + "".join(f"- {path}\n" for path in repair_allowed_paths)
+        + "\n"
+        if repair_allowed_paths is not None
+        else ""
+    )
+    repair_text = (
+        "# Repair\n\n"
+        + repair_scope
+        + "### [ ] Checkpoint 1: Repair\n- [ ] repair step\n"
+    )
     _write_plan(repair_path, repair_text)
     _write_plan(worktree_path / "repair.md", repair_text)
 
@@ -8733,6 +9138,7 @@ def _run_upgrade_resume_scenario(
     target_identity = f"{repair_path}::checkpoint-1"
     pending_override = None
     pending_boundary = None
+    pending_notes = None
     decision_number = 2 if interruption == "before_review" else 3
     if interruption == "before_worker":
         pending_override = PendingTeamOverride(
@@ -8760,6 +9166,17 @@ def _run_upgrade_resume_scenario(
             scope_id=scope.scope_id,
             target_plan_identity=target_identity,
         )
+        if pending_note is not None:
+            pending_notes = PendingManagerNotes(
+                target_step="implement",
+                notes=(pending_note,),
+                decision_number=3,
+                target_role="worker",
+                target_selector="codex.worker-max",
+                checkpoint_identity=target_identity,
+                scope_id=scope.scope_id,
+                target_plan_identity=target_identity,
+            )
     elif interruption == "after_consumption":
         pending_boundary = PendingBoundaryDecision(
             finalized_turn_number=4,
@@ -8785,6 +9202,7 @@ def _run_upgrade_resume_scenario(
         "active_implementation_scope": scope,
         "pending_step_team_override": pending_override,
         "pending_boundary_decision": pending_boundary,
+        "pending_manager_notes": pending_notes,
     }
     if legacy_scope:
         assert pending_override is None
@@ -8826,6 +9244,7 @@ def _run_upgrade_resume_scenario(
         **resume_manager_fields,
     )
     workflow_models: list[str] = []
+    workflow_prompts: list[str] = []
     manager_numbers: list[int] = []
     reviewer_calls = 0
 
@@ -8841,15 +9260,22 @@ def _run_upgrade_resume_scenario(
                 if interruption == "before_review" and len(manager_numbers) == 1
                 else "continue"
             )
+            notes = (
+                correction_notes
+                if context["trigger"] == "pending_notes_invalid"
+                and correction_notes is not None
+                else []
+            )
             return subprocess.CompletedProcess(argv, 0, json.dumps({
                 "schema_version": 1,
                 "action": action,
                 "reason": "Synthetic resumed manager decision.",
-                "next_step_notes": [],
+                "next_step_notes": notes,
                 "stop_report": None,
             }), "")
 
         workflow_models.append(model)
+        workflow_prompts.append(argv[-1])
         if model == "reviewer-default":
             reviewer_calls += 1
             replacement = Path(kwargs["cwd"]) / f"plan-resume-{interruption}-{reviewer_calls}.md"
@@ -8888,13 +9314,13 @@ def _run_upgrade_resume_scenario(
         resume=resume,
     )
     run_json = json.loads((result.run_dir / "run.json").read_text())
-    return workflow_models, manager_numbers, run_json, result.run_dir
+    return workflow_models, manager_numbers, run_json, result.run_dir, workflow_prompts
 
 
 def test_manager_resume_after_upgraded_worker_uses_it_as_next_upgrade_source(
     tmp_path: Path,
 ) -> None:
-    models, decisions, _, run_dir = _run_upgrade_resume_scenario(
+    models, decisions, _, run_dir, _ = _run_upgrade_resume_scenario(
         tmp_path, interruption="before_review"
     )
     assert models == ["reviewer-default", "worker-max"]
@@ -8909,7 +9335,7 @@ def test_manager_resume_after_upgraded_worker_uses_it_as_next_upgrade_source(
 def test_manager_resume_carries_scope_rejections_into_first_boundary(
     tmp_path: Path,
 ) -> None:
-    _, _, _, run_dir = _run_upgrade_resume_scenario(
+    _, _, _, run_dir, _ = _run_upgrade_resume_scenario(
         tmp_path,
         interruption="before_review",
         prior_reviewer_rejections=2,
@@ -8930,7 +9356,7 @@ def test_manager_resume_carries_scope_rejections_into_first_boundary(
 def test_manager_legacy_resume_discards_prior_checkpoint_rejections(
     tmp_path: Path,
 ) -> None:
-    _, _, _, run_dir = _run_upgrade_resume_scenario(
+    _, _, _, run_dir, _ = _run_upgrade_resume_scenario(
         tmp_path,
         interruption="before_review",
         prior_reviewer_rejections=2,
@@ -8965,7 +9391,7 @@ def test_scope_pressure_with_legacy_resume_scope_fails_before_manager_decision(
 
 
 def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: Path) -> None:
-    models, decisions, run_json, _ = _run_upgrade_resume_scenario(
+    models, decisions, run_json, _, _ = _run_upgrade_resume_scenario(
         tmp_path, interruption="before_worker"
     )
     assert models == ["worker-max"]
@@ -8973,10 +9399,95 @@ def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: 
     assert run_json["pending_step_team_override"] is None
 
 
+def test_manager_resume_injects_compatible_notes_once(tmp_path: Path) -> None:
+    note = "The repair evidence is in `repair.md`; focus verification there."
+    models, decisions, run_json, _, prompts = _run_upgrade_resume_scenario(
+        tmp_path,
+        interruption="before_worker",
+        pending_note=note,
+    )
+
+    assert models == ["worker-max"]
+    assert decisions == [4]
+    assert sum(note in prompt for prompt in prompts) == 1
+    assert run_json["pending_manager_notes"] is None
+
+
+def test_manager_resume_corrects_invalid_pending_notes_once_before_launch(
+    tmp_path: Path,
+) -> None:
+    invalid = "Restrict edits to the sole permitted file `repair.md`."
+    corrected = "The repair evidence is in `repair.md`; focus verification there."
+    models, decisions, run_json, run_dir, prompts = _run_upgrade_resume_scenario(
+        tmp_path,
+        interruption="before_worker",
+        pending_note=invalid,
+        correction_notes=[corrected],
+    )
+
+    assert models == ["worker-max"]
+    assert decisions == [4, 5]
+    correction_result = json.loads(
+        (run_dir / "manager" / "decision-004" / "result.json").read_text()
+    )
+    assert correction_result["trigger"] == "pending_notes_invalid"
+    assert correction_result["level"] == "full"
+    assert invalid not in prompts[0]
+    assert prompts[0].count(corrected) == 1
+    assert run_json["pending_manager_notes"] is None
+
+
+def test_manager_resume_corrects_notes_after_same_identity_scope_drift(
+    tmp_path: Path,
+) -> None:
+    stale = "Restrict edits to legacy.txt."
+    corrected = "The prior failure evidence is in legacy.txt; verify the current repair."
+    models, decisions, run_json, run_dir, prompts = _run_upgrade_resume_scenario(
+        tmp_path,
+        interruption="before_worker",
+        pending_note=stale,
+        correction_notes=[corrected],
+        repair_allowed_paths=("current.txt",),
+    )
+
+    assert models == ["worker-max"]
+    assert decisions == [4, 5]
+    correction_context = json.loads(
+        (run_dir / "manager" / "decision-004" / "context.json").read_text()
+    )
+    assert correction_context["manager_note_scope"]["allowed_paths"] == [
+        "current.txt"
+    ]
+    assert stale not in prompts[0]
+    assert prompts[0].count(corrected) == 1
+    assert run_json["pending_manager_notes"] is None
+
+
+def test_manager_resume_invalid_pending_correction_output_stops_before_worker(
+    tmp_path: Path,
+) -> None:
+    invalid = "Restrict edits to the sole permitted file `repair.md`."
+    with pytest.raises(WorkflowError) as raised:
+        _run_upgrade_resume_scenario(
+            tmp_path,
+            interruption="before_worker",
+            pending_note=invalid,
+            correction_notes=[invalid],
+        )
+    run_dir = raised.value.run_dir
+    assert run_dir is not None
+    result = json.loads(
+        (run_dir / "manager" / "decision-004" / "result.json").read_text()
+    )
+    assert result["trigger"] == "pending_notes_invalid"
+    assert result["status"] == "invalid"
+    assert not list((run_dir / "turns").glob("turn-001"))
+
+
 def test_manager_resume_after_consumption_retains_scope_team_without_replaying_boundary(
     tmp_path: Path,
 ) -> None:
-    models, decisions, _, run_dir = _run_upgrade_resume_scenario(
+    models, decisions, _, run_dir, _ = _run_upgrade_resume_scenario(
         tmp_path, interruption="after_consumption"
     )
     assert models == ["reviewer-default", "worker-max"]

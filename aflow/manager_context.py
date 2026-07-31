@@ -1,7 +1,8 @@
 """Versioned, plan-safe semantic evidence for manager supervision.
 
-The builder deliberately reads turn artifacts and result metadata only.  Lite
-contexts never read prompt artifacts or active-plan contents.
+The builder deliberately reads turn artifacts and result metadata only. Lite
+never exposes prompt artifacts or active-plan prose; runtime may provide a
+captured plan solely to derive bounded controller-owned scope metadata.
 """
 
 from __future__ import annotations
@@ -24,7 +25,25 @@ from .stop_marker import extract_stop_markers
 MANAGER_CONTEXT_SCHEMA_VERSION = 1
 MANAGER_CONTEXT_SCHEMA_VERSION_V2 = 2
 DIAGNOSTIC_LIMIT = 2_000
+MAX_MANAGER_NOTE_SCOPE_PATHS = 32
+MAX_MANAGER_NOTE_SCOPE_PATH_LENGTH = 240
+MAX_MANAGER_NOTE_SCOPE_IDENTITY_LENGTH = 512
 ManagerLevel = Literal["lite", "full"]
+_ALLOWED_SCOPE_DIRECTIVE_RE = re.compile(
+    r"^(?:may\s+(?:create(?:\s+(?:or\s+)?modify|/modify)?|modify(?:\s+only)?)|"
+    r"allowed\s+files?)\s*:?\s*(?P<paths>.*)$",
+    re.IGNORECASE,
+)
+_PROHIBITED_SCOPE_DIRECTIVE_RE = re.compile(
+    r"^(?:must\s+not\s+touch|do\s+not\s+modify)\s*:?\s*(?P<paths>.*)$",
+    re.IGNORECASE,
+)
+_LIST_ITEM_RE = re.compile(r"^[-*]\s+(.+)$")
+_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+_EXPLICIT_RELATIVE_PATH_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+_SCOPE_PATH_SEPARATOR_RE = re.compile(r"\s*(?:,|\band\b)\s*", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -110,6 +129,8 @@ class ManagerContextV2:
     implementation_attempts: dict[str, Any] | None = None
     manager_decisions: tuple[dict[str, Any], ...] = ()
     change_surface_evidence: dict[str, Any] | None = None
+    manager_note_scope: dict[str, Any] | None = None
+    retry_manager_note_scope: dict[str, Any] | None = None
     scope_pressure_detected: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -360,9 +381,136 @@ def _unavailable_envelope(reason: str) -> dict[str, Any]:
     return {"available": False, "validated": False, "reason": reason}
 
 
+def build_manager_note_scope(
+    *,
+    active_plan_identity: str | None,
+    active_plan_content: str | None,
+) -> dict[str, Any]:
+    """Return bounded controller-owned scope facts without exposing plan prose."""
+    allowed_paths: list[str] = []
+    prohibited_paths: list[str] = []
+    mode: str | None = None
+    constraints_complete = isinstance(active_plan_content, str)
+    mode_has_path = False
+
+    def collect_paths(text: str, target: list[str]) -> bool:
+        nonlocal constraints_complete
+        raw_paths, parsed_completely = _scope_path_candidates(text)
+        if not parsed_completely:
+            constraints_complete = False
+        found_path = False
+        for raw_path in raw_paths:
+            found_path = True
+            path = raw_path
+            if path in target:
+                continue
+            if len(target) >= MAX_MANAGER_NOTE_SCOPE_PATHS:
+                constraints_complete = False
+                continue
+            target.append(path)
+        return found_path
+
+    if isinstance(active_plan_content, str):
+        for raw_line in active_plan_content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("#"):
+                if mode is not None and not mode_has_path:
+                    constraints_complete = False
+                mode = None
+                mode_has_path = False
+                continue
+            item = _LIST_ITEM_RE.match(line)
+            content = item.group(1) if item is not None else line
+            allowed = _ALLOWED_SCOPE_DIRECTIVE_RE.match(content)
+            prohibited = _PROHIBITED_SCOPE_DIRECTIVE_RE.match(content)
+            if allowed is not None:
+                mode = "allowed"
+                mode_has_path = collect_paths(allowed.group("paths"), allowed_paths)
+                continue
+            if prohibited is not None:
+                mode = "prohibited"
+                mode_has_path = collect_paths(prohibited.group("paths"), prohibited_paths)
+                continue
+            if mode is None:
+                continue
+            if item is None:
+                if line:
+                    if not mode_has_path:
+                        constraints_complete = False
+                    mode = None
+                    mode_has_path = False
+                continue
+            target = allowed_paths if mode == "allowed" else prohibited_paths
+            mode_has_path = collect_paths(content, target) or mode_has_path
+        if mode is not None and not mode_has_path:
+            constraints_complete = False
+    return {
+        "active_plan_identity": _bounded_scope_identity(active_plan_identity),
+        "allowed_paths": allowed_paths,
+        "prohibited_paths": prohibited_paths,
+        "authority": "controller_owned",
+        "constraints_complete": constraints_complete,
+    }
+
+
+def _is_explicit_scope_path(path: str) -> bool:
+    return (
+        0 < len(path) <= MAX_MANAGER_NOTE_SCOPE_PATH_LENGTH
+        and _is_relative_path_candidate(path)
+    )
+
+
+def _is_relative_path_candidate(path: str) -> bool:
+    return (
+        _EXPLICIT_RELATIVE_PATH_RE.fullmatch(path) is not None
+        and all(part not in {".", ".."} for part in path.split("/"))
+    )
+
+
+def _scope_path_candidates(text: str) -> tuple[list[str], bool]:
+    """Parse every explicit scope-list item or report that extraction is incomplete."""
+    raw_candidates = list(_CODE_SPAN_RE.findall(text))
+    plain_text = _CODE_SPAN_RE.sub(" ", text)
+    for segment in _SCOPE_PATH_SEPARATOR_RE.split(plain_text):
+        candidate = segment.strip().strip(".,;()[]{}")
+        if not candidate:
+            continue
+        if ":" in candidate:
+            candidate = candidate.split(":", 1)[0].strip()
+            if not candidate:
+                continue
+        raw_candidates.append(candidate)
+
+    paths: list[str] = []
+    complete = True
+    for raw_candidate in raw_candidates:
+        candidate = raw_candidate.strip().strip(".,:;()[]{}")
+        if not _is_explicit_scope_path(candidate):
+            complete = False
+            continue
+        paths.append(candidate)
+    return paths, complete
+
+
+def _bounded_scope_identity(identity: str | None) -> str | None:
+    if not isinstance(identity, str) or len(identity) <= MAX_MANAGER_NOTE_SCOPE_IDENTITY_LENGTH:
+        return identity
+    return "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def _plan_state(run_dir: Path, run_json: dict[str, Any], finished_turn: dict[str, Any]) -> tuple[StructuredPlanState, Path | None]:
-    active_value = finished_turn.get("active_plan_path") or run_json.get("active_plan_path") or run_json.get("plan_path")
-    original_value = finished_turn.get("original_plan_path") or run_json.get("original_plan_path") or run_json.get("plan_path")
+    # ``run_json`` carries boundary overrides applied immediately above. Prefer
+    # it over the finalized turn, whose active path is necessarily pre-routing.
+    active_value = (
+        run_json.get("active_plan_path")
+        or finished_turn.get("active_plan_path")
+        or run_json.get("plan_path")
+    )
+    original_value = (
+        run_json.get("original_plan_path")
+        or finished_turn.get("original_plan_path")
+        or run_json.get("plan_path")
+    )
     active_path = _path_from_metadata(run_dir, active_value)
     original_path = _path_from_metadata(run_dir, original_value)
     checkpoints: tuple[dict[str, Any], ...] = ()
@@ -520,16 +668,29 @@ def build_manager_context(
             run_json = json.loads(run_json_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             run_json = {}
+    boundary_was_supplied = boundary is not None
+    boundary = dict(boundary or {})
     turns = list(turns) if turns is not None else _load_turns(run_dir)
-    if not turns:
+    if turns:
+        finished = turns[-1]
+    elif trigger == "pending_notes_invalid":
+        # Restored notes are corrected before the resumed run has launched a
+        # worker, so no local turn artifact exists yet. The boundary itself is
+        # the durable controller evidence for this nonterminal manager call.
+        finished = {
+            "_turn_dir": str(run_dir),
+            "turn_number": boundary.get("finalized_turn_number"),
+            "step_name": boundary.get("current_step"),
+            "step_role": boundary.get("current_role"),
+            "selector": boundary.get("actual_selector"),
+            "status": "prelaunch-note-correction",
+        }
+    else:
         raise ValueError(f"{run_dir}: no finalized workflow turn artifacts found")
-    finished = turns[-1]
     finished_dir = Path(finished["_turn_dir"])
     stdout = _read_text(finished_dir / "stdout.txt") or str(finished.get("stdout", ""))
     stderr = _read_text(finished_dir / "stderr.txt") or str(finished.get("stderr", ""))
     semantic = extract_semantic_result(stdout)
-    boundary_was_supplied = boundary is not None
-    boundary = dict(boundary or {})
     legacy_boundary = (
         boundary_was_supplied
         and "context_schema_version" not in boundary
@@ -858,6 +1019,44 @@ def build_manager_context(
         "reviewer_non_convergence": progress.reviewer_non_convergence,
     }
 
+    active_plan_identity = boundary.get("target_plan_identity") or boundary.get(
+        "checkpoint_identity"
+    )
+    if not isinstance(active_plan_identity, str):
+        active_path = plan_state_payload.get("active_plan_path")
+        checkpoint = plan_state_payload.get("current_checkpoint")
+        checkpoint_index = checkpoint.get("index") if isinstance(checkpoint, dict) else None
+        active_plan_identity = (
+            f"{active_path}::checkpoint-{checkpoint_index}"
+            if isinstance(active_path, str) and isinstance(checkpoint_index, int)
+            else active_path if isinstance(active_path, str) else None
+        )
+    supplied_scope = boundary.get("manager_note_scope")
+    if isinstance(supplied_scope, Mapping):
+        # Runtime captures controller-owned scope facts before a manager call.
+        # Reusing that immutable evidence keeps artifact reconstruction stable
+        # even if either route's plan changes later.
+        manager_note_scope = dict(supplied_scope)
+    else:
+        scope_source = active_plan_content
+        if scope_source is None:
+            supplied_scope_source = boundary.get("active_plan_content")
+            scope_source = (
+                supplied_scope_source
+                if isinstance(supplied_scope_source, str)
+                else context.active_plan_content
+            )
+        manager_note_scope = build_manager_note_scope(
+            active_plan_identity=active_plan_identity,
+            active_plan_content=scope_source,
+        )
+    supplied_retry_scope = boundary.get("retry_manager_note_scope")
+    retry_manager_note_scope = (
+        dict(supplied_retry_scope)
+        if isinstance(supplied_retry_scope, Mapping)
+        else None
+    )
+
     # --- Original plan content (Full only) ---
     original_plan_content: str | None = None
     if level == "full":
@@ -895,12 +1094,19 @@ def build_manager_context(
         implementation_attempts=scoped_attempts,
         manager_decisions=tuple(manager_decisions),
         change_surface_evidence=change_surface,
+        manager_note_scope=manager_note_scope,
+        retry_manager_note_scope=retry_manager_note_scope,
         scope_pressure_detected=scope_pressure,
     )
     # Attach latest-full-rejection to controller_state for Full only.
     if level == "full" and latest_full_rejection is not None:
         context.controller_state["latest_full_rejection"] = latest_full_rejection
     v2_context_dict = v2_context.to_dict()
+    if retry_manager_note_scope is None:
+        # The retry destination is meaningful only when it differs from the
+        # proposed route. Preserve the flat proposed-route field for legacy
+        # consumers without advertising a nonexistent second target.
+        v2_context_dict.pop("retry_manager_note_scope", None)
     context_dict = json.loads(json.dumps(v2_context_dict, sort_keys=True))
     # Carry the controller_state additions through the round-trip.
     if level == "full" and latest_full_rejection is not None:

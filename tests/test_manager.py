@@ -23,6 +23,7 @@ from aflow.manager import (
     render_manager_stop_report,
     resolve_manager_role,
     validate_manager_decision,
+    validate_manager_note_authority,
 )
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
@@ -154,6 +155,102 @@ def test_decision_protocol_bounds_surplus_advisory_notes_without_escalation() ->
     assert decision.next_step_notes == tuple(notes[:MAX_MANAGER_NOTES])
 
 
+def test_note_authority_compares_scope_claims_but_keeps_advisory_evidence() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["aflow/manager.py", "tests/test_runtime.py"],
+        "prohibited_paths": ["aflow/run_state.py"],
+        "constraints_complete": True,
+    }
+    assert validate_manager_note_authority(
+        ("The failure occurs in tests/test_runtime.py; focus verification there.",),
+        scope=scope,
+    ) == ("The failure occurs in tests/test_runtime.py; focus verification there.",)
+    assert validate_manager_note_authority(
+        ("Keep changes scoped to the allowed files `aflow/manager.py` and `tests/test_runtime.py`.",),
+        scope=scope,
+    ) == ("Keep changes scoped to the allowed files `aflow/manager.py` and `tests/test_runtime.py`.",)
+    assert validate_manager_note_authority(
+        ("Must not touch `aflow/run_state.py`.",),
+        scope=scope,
+    ) == ("Must not touch `aflow/run_state.py`.",)
+
+    with pytest.raises(ManagerDecisionError, match="may not assert file"):
+        validate_manager_note_authority(
+            (
+                "Keep changes scoped to the allowed file `aflow/manager.py`.",
+            ),
+            scope=scope,
+        )
+    with pytest.raises(ManagerDecisionError, match="may not assert file"):
+        validate_manager_note_authority(("Use the eight dirty files and nothing else.",), scope=scope)
+    with pytest.raises(ManagerDecisionError, match="mandatory implementation requirement"):
+        validate_manager_note_authority(
+            ("Ensure the worker implements the missing routing behavior.",),
+            scope=scope,
+        )
+
+
+def test_note_authority_preserves_case_sensitive_path_identity() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["README.md"],
+        "prohibited_paths": [],
+        "constraints_complete": True,
+    }
+
+    assert validate_manager_note_authority(
+        ("Restrict edits to README.md.",),
+        scope=scope,
+    ) == ("Restrict edits to README.md.",)
+    with pytest.raises(ManagerDecisionError, match="may not assert file"):
+        validate_manager_note_authority(
+            ("Restrict edits to readme.md.",),
+            scope=scope,
+        )
+
+
+def test_note_authority_rejects_restrictive_paraphrases_but_allows_advice() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["a.py", "b.py"],
+        "prohibited_paths": ["c.py"],
+        "constraints_complete": True,
+    }
+    restrictive_notes = (
+        "Restrict edits to a.py.",
+        "Limit work to a.py.",
+        "Never modify a.py.",
+        "The sole permitted file is a.py.",
+        "Changes are confined to a.py.",
+    )
+    for note in restrictive_notes:
+        with pytest.raises(ManagerDecisionError, match="may not assert file"):
+            validate_manager_note_authority((note,), scope=scope)
+    for verb in ("use", "follow", "switch to", "replace", "adopt", "work from"):
+        with pytest.raises(ManagerDecisionError, match="replace or select"):
+            validate_manager_note_authority(
+                (f"{verb.title()} the repair plan.",), scope=scope
+            )
+    for note in (
+        "Work from plans/new-repair.md.",
+        "Adopt `plans/new-repair.md`.",
+        "Switch to plans/new-repair.md.",
+    ):
+        with pytest.raises(ManagerDecisionError, match="replace or select"):
+            validate_manager_note_authority((note,), scope=scope)
+    assert validate_manager_note_authority(
+        (
+            "The defect is in a.py; focus the verification on tests/test_a.py.",
+            "Ensure the regression test is exercised.",
+        ),
+        scope=scope,
+    ) == (
+        "The defect is in a.py; focus the verification on tests/test_a.py.",
+        "Ensure the regression test is exercised.",
+    )
+
+
 def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
     decision = parse_manager_decision(_decision(
         action="stop",
@@ -273,6 +370,7 @@ def test_prompts_preserve_only_the_supplied_context_level() -> None:
     assert "configured manager skill 'custom-manager'" in system
     assert "Eligible actions at this boundary: continue, escalate_to_full, stop." in system
     assert "next_step_notes must always be an array" in system
+    assert "next_step_notes are advisory evidence only" in system
     assert f"use at most {MAX_MANAGER_NOTES} notes" in system
     assert '"stop_report":{"summary":' in system
     assert user.startswith("MANAGER_CONTEXT_JSON:\n")

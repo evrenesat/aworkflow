@@ -36,8 +36,14 @@ from .manager import (
     render_manager_stop_report,
     resolve_manager_role,
     validate_manager_decision,
+    validate_manager_note_authority,
 )
-from .manager_context import build_manager_context, summarize_repair_plan, summarize_review_rejection
+from .manager_context import (
+    build_manager_context,
+    build_manager_note_scope,
+    summarize_repair_plan,
+    summarize_review_rejection,
+)
 from .git_status import classify_dirtiness_by_prefix, RepoState, probe_repo_state
 from .harnesses import get_adapter
 from .harnesses.base import HarnessAdapter, HarnessInvocation
@@ -4625,28 +4631,57 @@ def run_workflow(
         *,
         level: str,
         boundary: FinalizedTurnBoundary,
+        proposed_target_plan: Path | None,
+        retry_target_plan: Path | None,
         context_run_dir: Path | None = None,
     ) -> tuple[ManagerDecisionV1 | None, dict[str, object], str | None]:
         """Run and durably record one manager attempt without altering turn accounting."""
         decision_number = state.manager_decision_number + 1
+        manager_plan_path = (
+            Path(boundary.active_plan_path)
+            if isinstance(boundary.active_plan_path, str)
+            else active_plan_path
+        )
         metadata = {
             "run_id": state.run_id,
             "team": baseline_team_name,
             "max_turns": config.max_turns,
             "turns_completed": state.turns_completed,
             "original_plan_path": str(original_plan_path),
-            "active_plan_path": str(active_plan_path),
+            "active_plan_path": str(manager_plan_path),
             "current_step_name": current_step_name,
         }
         captured_active_plan = None
         try:
-            captured_active_plan = _exec_plan_path(active_plan_path, exec_ctx).read_text(encoding="utf-8")
+            captured_active_plan = _exec_plan_path(manager_plan_path, exec_ctx).read_text(encoding="utf-8")
         except OSError:
             pass
+
+        def note_scope_for(plan_path: Path | None) -> dict[str, object] | None:
+            if plan_path is None:
+                return None
+            content: str | None = None
+            try:
+                content = _exec_plan_path(plan_path, exec_ctx).read_text(
+                    encoding="utf-8"
+                )
+            except OSError:
+                pass
+            return build_manager_note_scope(
+                active_plan_identity=_target_plan_identity(plan_path),
+                active_plan_content=content,
+            )
+
+        proposed_note_scope = note_scope_for(proposed_target_plan)
+        retry_note_scope = note_scope_for(retry_target_plan)
+        if retry_target_plan == proposed_target_plan:
+            retry_note_scope = None
         fingerprint_before = _manager_repo_fingerprint()
         boundary_payload = {
             **boundary.__dict__,
             "active_plan_content": captured_active_plan,
+            "manager_note_scope": proposed_note_scope,
+            "retry_manager_note_scope": retry_note_scope,
             "workspace_state": {
                 "branch": exec_ctx.feature_branch if exec_ctx is not None else None,
                 "head": fingerprint_before[0],
@@ -4727,14 +4762,33 @@ def run_workflow(
             stdout, stderr = completed.stdout, completed.stderr
             if completed.returncode != 0:
                 raise ManagerDecisionError(f"manager harness exited with code {completed.returncode}")
-            parsed = validate_manager_decision(
+            candidate = validate_manager_decision(
                 parse_manager_decision(stdout),
                 level=level,  # type: ignore[arg-type]
                 eligible_actions=eligible,
                 proposed_transition=boundary.proposed_transition,
             )
+            if candidate.next_step_notes:
+                note_scope = (
+                    (
+                        retry_note_scope
+                        if retry_note_scope is not None
+                        else proposed_note_scope
+                    )
+                    if candidate.action in {
+                        "retry_current_step",
+                        "switch_to_backup_and_retry",
+                    }
+                    else proposed_note_scope
+                )
+                validate_manager_note_authority(
+                    candidate.next_step_notes,
+                    scope=note_scope,
+                )
+            parsed = candidate
             result_payload.update({"status": "accepted", **parsed.to_dict()})
         except (ManagerDecisionError, ValueError, WorkflowError) as exc:
+            parsed = None
             error = str(exc)
             result_payload["error"] = error
 
@@ -5603,7 +5657,12 @@ def run_workflow(
             )
         next_step = None if proposed_transition == "END" else proposed_transition
         candidate_step = wf.steps.get(next_step) if next_step is not None else None
-        target_plan_identity = _target_plan_identity(active_plan_path)
+        proposed_target_plan = (
+            active_plan_path
+            if proposed_transition == current_step
+            else post_transition_active_path
+        )
+        target_plan_identity = _target_plan_identity(proposed_target_plan)
         scope = state.active_implementation_scope
         attempts = (
             state.implementation_attempts.get(scope.scope_id, [])
@@ -5723,7 +5782,7 @@ def run_workflow(
             proposed_action=proposed_action, proposed_transition=proposed_transition,
             current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
             actual_team=active_team, actual_selector=active_selector,
-            original_plan_path=str(original_plan_path), active_plan_path=str(active_plan_path),
+            original_plan_path=str(original_plan_path), active_plan_path=str(proposed_target_plan),
             checkpoint_identity=target_plan_identity, safely_retryable=safely_retryable,
             operational_failure=operational_failure, backup_team=backup_team,
             backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
@@ -5769,18 +5828,40 @@ def run_workflow(
             state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
         level = _manager_level_for_boundary(selection_context)
         decision, context, error = _run_manager_call(
-            level=level, boundary=boundary, context_run_dir=context_run_dir,
+            level=level,
+            boundary=boundary,
+            proposed_target_plan=proposed_target_plan,
+            retry_target_plan=(
+                active_plan_path
+                if {"retry_current_step", "switch_to_backup_and_retry"} & eligible
+                else None
+            ),
+            context_run_dir=context_run_dir,
         )
         if decision is None and level == "lite" and error != "manager mutated repository or plan state":
             boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_invalid", "evidence": error})
             decision, context, error = _run_manager_call(
-                level="full", boundary=boundary,
+                level="full",
+                boundary=boundary,
+                proposed_target_plan=proposed_target_plan,
+                retry_target_plan=(
+                    active_plan_path
+                    if {"retry_current_step", "switch_to_backup_and_retry"} & eligible
+                    else None
+                ),
                 context_run_dir=context_run_dir,
             )
         elif decision is not None and decision.action == "escalate_to_full":
             boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_escalation", "evidence": decision.reason})
             decision, context, error = _run_manager_call(
-                level="full", boundary=boundary,
+                level="full",
+                boundary=boundary,
+                proposed_target_plan=proposed_target_plan,
+                retry_target_plan=(
+                    active_plan_path
+                    if {"retry_current_step", "switch_to_backup_and_retry"} & eligible
+                    else None
+                ),
                 context_run_dir=context_run_dir,
             )
         if decision is None:
@@ -5964,7 +6045,12 @@ def run_workflow(
                 asdict(record) for record in state.repartition_history
             ],
         )
-        decision, context, error = _run_manager_call(level="full", boundary=boundary)
+        decision, context, error = _run_manager_call(
+            level="full",
+            boundary=boundary,
+            proposed_target_plan=None,
+            retry_target_plan=None,
+        )
         report = _write_manager_report(
             context,
             reason=reason if decision is not None else (error or reason),
@@ -5979,6 +6065,146 @@ def run_workflow(
                            current_step_name=current_step_name, active_plan_path=active_plan_path,
                            new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
         return report
+
+    def _prepare_pending_manager_notes(
+        *,
+        step_name: str,
+        step_role: str,
+        selector: str,
+        target_plan_path: Path,
+        active_team: str | None,
+    ) -> tuple[tuple[str, ...], bool]:
+        """Validate or correct one matching persisted manager note before launch.
+
+        The correction marker is written before invoking Full, so a resume can
+        never re-run a correction for the same durable pending record.
+        """
+        pending = state.pending_manager_notes
+        if not (
+            pending is not None
+            and not pending.consumed
+            and pending.target_step == step_name
+            and (pending.target_role is None or pending.target_role == step_role)
+            and (pending.target_selector is None or pending.target_selector == selector)
+            and _pending_matches_scope_and_plan(
+                pending,
+                state,
+                _target_plan_identity(target_plan_path),
+            )
+        ):
+            return (), False
+
+        scope = build_manager_note_scope(
+            active_plan_identity=_target_plan_identity(target_plan_path),
+            active_plan_content=_exec_plan_path(
+                target_plan_path, exec_ctx
+            ).read_text(encoding="utf-8"),
+        )
+        try:
+            validate_manager_note_authority(pending.notes, scope=scope)
+        except ManagerDecisionError as validation_error:
+            if pending.correction_attempted:
+                raise WorkflowError(
+                    "pending manager notes already received their one Full "
+                    "correction attempt and remain invalid",
+                    run_dir=run_paths.run_dir,
+                ) from validation_error
+
+            state.pending_manager_notes = replace(
+                pending,
+                correction_attempted=True,
+            )
+            write_run_metadata(
+                run_paths,
+                config,
+                state,
+                status="running",
+                last_snapshot=state.last_snapshot,
+                workflow_name=workflow_name,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            boundary = FinalizedTurnBoundary(
+                finalized_turn_number=state.active_turn,
+                artifact_path=f"turns/turn-{state.active_turn:03d}",
+                trigger="pending_notes_invalid",
+                terminal=False,
+                proposed_action="pending_note_correction",
+                proposed_transition=step_name,
+                current_step=step_name,
+                current_role=step_role,
+                baseline_team=baseline_team_name,
+                actual_team=active_team,
+                actual_selector=selector,
+                original_plan_path=str(original_plan_path),
+                active_plan_path=str(target_plan_path),
+                checkpoint_identity=_target_plan_identity(target_plan_path),
+                eligible_actions=["continue", "stop"],
+                evidence=(
+                    f"pending manager decision {pending.decision_number} is "
+                    f"incompatible with current controller scope: {validation_error}"
+                ),
+                scope_pressure_reason=state.scope_pressure_reason,
+                review_rejection_history=[
+                    asdict(record) for record in state.review_rejection_history
+                ],
+                implementation_attempts={
+                    scope_id: [asdict(attempt) for attempt in attempts]
+                    for scope_id, attempts in state.implementation_attempts.items()
+                },
+                repartition_history=[
+                    asdict(record) for record in state.repartition_history
+                ],
+            )
+            decision, context, error = _run_manager_call(
+                level="full",
+                boundary=boundary,
+                proposed_target_plan=target_plan_path,
+                retry_target_plan=None,
+            )
+            if decision is None:
+                _fail_manager_gate(
+                    context,
+                    reason=error or "pending-note correction returned invalid output",
+                )
+            if decision.action == "stop":
+                _fail_manager_gate(context, reason=decision.reason, decision=decision)
+            if decision.action != "continue":
+                _fail_manager_gate(
+                    context,
+                    reason="pending-note correction selected an illegal action",
+                )
+            if decision.next_step_notes:
+                state.pending_manager_notes = replace(
+                    pending,
+                    notes=decision.next_step_notes,
+                    decision_number=state.manager_decision_number,
+                    correction_attempted=True,
+                )
+            else:
+                state.pending_manager_notes = None
+            write_run_metadata(
+                run_paths,
+                config,
+                state,
+                status="running",
+                last_snapshot=state.last_snapshot,
+                workflow_name=workflow_name,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            corrected = state.pending_manager_notes
+            return (
+                corrected.notes if corrected is not None else (),
+                corrected is not None,
+            )
+        return pending.notes, True
 
     if terminal_integration_only:
         if not done:
@@ -6491,20 +6717,19 @@ def run_workflow(
             )
             step_adapter = adapter or get_adapter(resolved.harness_name)
             snapshot_before = retry_ctx.snapshot_before
+            manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
+                step_name=current_step_name,
+                step_role=step.role,
+                selector=selector,
+                target_plan_path=active_plan_path,
+                active_team=active_team_name,
+            )
             try:
                 user_prompt = retry_ctx.base_user_prompt + "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
-                pending_notes = state.pending_manager_notes
-                if (pending_notes is not None and not pending_notes.consumed
-                        and pending_notes.target_step == current_step_name
-                        and (pending_notes.target_role is None or pending_notes.target_role == step.role)
-                        and (pending_notes.target_selector is None or pending_notes.target_selector == selector)
-                        and _pending_matches_scope_and_plan(
-                            pending_notes,
-                            state,
-                            _target_plan_identity(active_plan_path),
-                        )):
-                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
-                    consume_manager_notes = True
+                if manager_notes:
+                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
+                        f"- {note}" for note in manager_notes
+                    )
                 if step.role == "worker" and state.pending_override_notes:
                     user_prompt += (
                         "\n\n## User override notes for this turn\n"
@@ -6642,6 +6867,13 @@ def run_workflow(
             followup_candidates_before = _list_followup_plan_candidates(
                 _exec_plan_path(original_plan_path, exec_ctx)
             )
+            manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
+                step_name=current_step_name,
+                step_role=step.role,
+                selector=selector,
+                target_plan_path=active_plan_path,
+                active_team=active_team_name,
+            )
 
             try:
                 user_prompt = render_step_prompts(
@@ -6658,18 +6890,10 @@ def run_workflow(
                     extra_text = " ".join(config.extra_instructions).strip()
                     user_prompt = "\n\n".join((user_prompt, extra_text))
 
-                pending_notes = state.pending_manager_notes
-                if (pending_notes is not None and not pending_notes.consumed
-                        and pending_notes.target_step == current_step_name
-                        and (pending_notes.target_role is None or pending_notes.target_role == step.role)
-                        and (pending_notes.target_selector is None or pending_notes.target_selector == selector)
-                        and _pending_matches_scope_and_plan(
-                            pending_notes,
-                            state,
-                            _target_plan_identity(active_plan_path),
-                        )):
-                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(f"- {note}" for note in pending_notes.notes)
-                    consume_manager_notes = True
+                if manager_notes:
+                    user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
+                        f"- {note}" for note in manager_notes
+                    )
                 if step.role == "worker" and state.pending_override_notes:
                     user_prompt += (
                         "\n\n## User override notes for this turn\n"

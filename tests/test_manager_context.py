@@ -9,6 +9,7 @@ from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.manager_context import (
     DIAGNOSTIC_LIMIT,
     build_manager_context,
+    build_manager_note_scope,
     extract_semantic_result,
     summarize_repair_plan,
     summarize_review_rejection,
@@ -607,6 +608,155 @@ def test_schema_v2_lite_context_omits_plan_content(tmp_path: Path) -> None:
 
     assert context["active_plan_content"] is None
     assert context["original_plan_content"] is None
+
+
+def test_lite_context_has_bounded_controller_owned_note_scope(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan.write_text(
+        "# Secret implementation plan\n\n"
+        "## Files\n\nMay modify only:\n\n"
+        "- `aflow/manager.py`\n- `tests/test_runtime.py`\n\n"
+        "### [ ] Checkpoint 1: Context\n- [ ] private instruction\n",
+        encoding="utf-8",
+    )
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+
+    context = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={"context_schema_version": 3, "target_plan_identity": "plan.md::checkpoint-1"},
+        active_plan_content=plan.read_text(encoding="utf-8"),
+    )
+
+    assert context["manager_note_scope"] == {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["aflow/manager.py", "tests/test_runtime.py"],
+        "prohibited_paths": [],
+        "authority": "controller_owned",
+        "constraints_complete": True,
+    }
+    assert "Secret implementation plan" not in json.dumps(context)
+
+
+def test_note_scope_collects_only_explicit_file_list_entries() -> None:
+    scope = build_manager_note_scope(
+        active_plan_identity="plan.md::checkpoint-1",
+        active_plan_content=(
+            "## Files\n\nMay modify only:\n"
+            "- `aflow/manager.py`\n"
+            "- `tests/test_runtime.py`: regression coverage\n\n"
+            "Run `uv run pytest tests/test_runtime.py`.\n"
+            "- Run `uv run pytest tests/test_runtime.py`.\n"
+            "- May create/modify: `aflow/run_state.py`\n"
+            "### [ ] Checkpoint 1\n"
+        ),
+    )
+
+    assert scope["allowed_paths"] == [
+        "aflow/manager.py", "tests/test_runtime.py", "aflow/run_state.py",
+    ]
+    assert scope["constraints_complete"] is True
+
+
+def test_note_scope_marks_unrepresentable_explicit_constraints_incomplete() -> None:
+    too_long_path = "a" * 241
+    scope = build_manager_note_scope(
+        active_plan_identity="plan.md::checkpoint-1",
+        active_plan_content=f"May modify only:\n- `{too_long_path}`\n",
+    )
+
+    assert scope["allowed_paths"] == []
+    assert scope["constraints_complete"] is False
+
+    glob_scope = build_manager_note_scope(
+        active_plan_identity="plan.md::checkpoint-1",
+        active_plan_content="Must not touch:\n- `plans/**`\n",
+    )
+    assert glob_scope["prohibited_paths"] == []
+    assert glob_scope["constraints_complete"] is False
+
+    long_identity = "p" * 513
+    bounded_identity_scope = build_manager_note_scope(
+        active_plan_identity=long_identity,
+        active_plan_content=None,
+    )
+    assert bounded_identity_scope["active_plan_identity"] == (
+        "sha256:" + hashlib.sha256(long_identity.encode("utf-8")).hexdigest()
+    )
+
+
+def test_note_scope_parses_plain_paths_and_fails_closed_on_ambiguous_items() -> None:
+    plain = build_manager_note_scope(
+        active_plan_identity="plan.md::checkpoint-1",
+        active_plan_content=(
+            "May create or modify: aflow/manager.py, tests/test_manager.py\n"
+            "Must not touch:\n- aflow/run_state.py\n"
+        ),
+    )
+    assert plain["allowed_paths"] == ["aflow/manager.py", "tests/test_manager.py"]
+    assert plain["prohibited_paths"] == ["aflow/run_state.py"]
+    assert plain["constraints_complete"] is True
+
+    extensionless = build_manager_note_scope(
+        active_plan_identity="plan.md::checkpoint-1",
+        active_plan_content=(
+            "May modify only:\n"
+            "- aflow/manager.py\n"
+            "- Makefile\n"
+            "- Dockerfile: container build\n"
+            "Must not touch: LICENSE\n"
+        ),
+    )
+    assert extensionless["allowed_paths"] == [
+        "aflow/manager.py", "Makefile", "Dockerfile",
+    ]
+    assert extensionless["prohibited_paths"] == ["LICENSE"]
+    assert extensionless["constraints_complete"] is True
+
+    for text in (
+        "May modify only:\n- plans/**\n",
+        "May modify only:\n- /tmp/escape.py\n",
+        "May modify only:\n- ../escape.py\n",
+        "May modify only:\n- worker implementation\n",
+        "May modify only:\n- aflow/manager.py\n- worker implementation\n",
+    ):
+        scope = build_manager_note_scope(
+            active_plan_identity="plan.md::checkpoint-1",
+            active_plan_content=text,
+        )
+        assert scope["constraints_complete"] is False
+
+
+def test_lite_context_exposes_retry_scope_without_plan_prose(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+    proposed_scope = {
+        "active_plan_identity": "proposed.md::checkpoint-1",
+        "allowed_paths": ["proposed.py"],
+        "prohibited_paths": [],
+        "authority": "controller_owned",
+        "constraints_complete": True,
+    }
+    retry_scope = {
+        "active_plan_identity": "current.md::checkpoint-1",
+        "allowed_paths": ["current.py"],
+        "prohibited_paths": [],
+        "authority": "controller_owned",
+        "constraints_complete": True,
+    }
+    context = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={
+            "context_schema_version": 3,
+            "manager_note_scope": proposed_scope,
+            "retry_manager_note_scope": retry_scope,
+        },
+        active_plan_content=plan.read_text(encoding="utf-8"),
+    )
+    assert context["manager_note_scope"] == proposed_scope
+    assert context["retry_manager_note_scope"] == retry_scope
+    assert "Checkpoint One" not in json.dumps(context)
 
 
 def test_schema_v2_full_includes_active_plan_content(tmp_path: Path) -> None:

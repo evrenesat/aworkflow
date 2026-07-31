@@ -283,6 +283,9 @@ class PendingManagerNotes:
     target_selector: str | None = None
     checkpoint_identity: str | None = None
     consumed: bool = False
+    # Set before the one permitted Full correction of an invalid restored note.
+    # Old persisted notes omit this field and remain readable as ``False``.
+    correction_attempted: bool = False
     scope_id: str | None = None
     target_plan_identity: str | None = None
     repartition_generation_id: str | None = None
@@ -812,6 +815,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             notes=tuple(str(note) for note in notes["notes"]),
             decision_number=int(notes.get("decision_number", 0) or 0),
             consumed=bool(notes.get("consumed", False)),
+            correction_attempted=bool(notes.get("correction_attempted", False)),
             scope_id=str(notes["scope_id"]) if notes.get("scope_id") is not None else None,
             target_plan_identity=(
                 str(notes["target_plan_identity"])
