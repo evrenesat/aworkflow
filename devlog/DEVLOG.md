@@ -1,3 +1,19 @@
+## 2026-08-01 — AFlow-owned live banner cadence
+
+### What changed
+
+- Disabled Rich automatic refresh and made `BannerRenderer` own a single
+  three-second periodic repaint loop with an initial interval delay.
+- Coalesced ordinary state/context updates, kept Git polling on its separate
+  ten-second cadence, and made periodic/final paints explicit.
+- Added deterministic fake-`Live` coverage for cadence, coalescing, lifecycle
+  parity, and exactly-once final painting.
+
+### Why
+
+- A slower, controller-owned cadence keeps dashboard output calmer over SSH and
+  prevents state pushes from racing an independent Rich refresh loop.
+
 ## 2026-07-31 — Resume-safe predecessor boundary overrides
 
 ### What changed

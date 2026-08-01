@@ -370,7 +370,13 @@ The interactive prompt accepts `y` or `yes`; any other input exits with code `1`
 
 ## Live Status
 
-While a step is running, `aflow` shows a Rich status panel on stderr. The elapsed timer refreshes every second, and git stats refresh every 10 seconds.
+While a step is running, `aflow` shows a Rich status panel on stderr. Rich's
+automatic refresh is disabled; AFlow owns one render loop that waits three
+seconds before its first periodic repaint and then repaints at most once every
+three seconds. Ordinary state and banner-context updates coalesce into that
+next repaint, while Git statistics retain their independent 10-second polling
+cadence. Lifecycle paints are explicit so the final manager report remains
+visible exactly once after the banner stops.
 
 Fields include:
 

@@ -1083,31 +1083,313 @@ class GitBannerTests(unittest.TestCase):
         assert "review" in text
         assert "implement" in text
 
-    def test_banner_renderer_refresh_thread_updates_live(self) -> None:
+    def test_banner_renderer_refresh_thread_is_manual_and_coalesces_updates(self) -> None:
         import aflow.status as status_mod
         from unittest.mock import MagicMock, patch
-        live_updates: list[object] = []
 
         class FakeLive:
-            def __init__(self, panel, **kwargs: object) -> None:
-                live_updates.append(panel)
-            def start(self) -> None:
-                pass
-            def update(self, panel: object) -> None:
-                live_updates.append(panel)
-            def stop(self) -> None:
-                pass
+            def __init__(self) -> None:
+                self.update_calls: list[tuple[object, bool]] = []
+                self.refresh_calls = 0
 
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                self.update_calls.append((panel, refresh))
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+
+        class FakeStopEvent:
+            def __init__(self) -> None:
+                self.wait_calls: list[float] = []
+
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, *, timeout: float) -> bool:
+                self.wait_calls.append(timeout)
+                if len(self.wait_calls) == 1:
+                    clock[0] += timeout
+                    return False
+                return True
+
+        clock = [100.0]
+        first_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        latest_state = ControllerState(last_snapshot=PlanSnapshot("latest", 1, 1, False))
+        live = FakeLive()
         with patch.object(status_mod, "_RICH_AVAILABLE", True), \
-             patch.object(status_mod, "Live", FakeLive):
+             patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]):
             renderer = status_mod.BannerRenderer(
                 config_max_turns=10,
                 config_plan_path=Path("/fake/plan.md"),
-                refresh_interval_seconds=0.05,
                 git_poll_interval_seconds=9999.0,
             )
-            renderer.start(state)
-            time.sleep(0.2)
-            renderer.stop(state)
-        assert len(live_updates) >= 3
+            renderer._live = live
+            renderer._stop_event = FakeStopEvent()
+            renderer.update(first_state)
+            renderer.update(latest_state)
+            renderer.set_context(current_step_name="latest-step")
+            assert live.update_calls == []
+            build = MagicMock(
+                side_effect=lambda state, git_summary=None: (state, renderer._current_step_name)
+            )
+            with patch.object(renderer, "_build", build):
+                renderer._refresh_loop()
+
+        assert renderer._stop_event.wait_calls == [3.0, 3.0]
+        assert renderer._refresh_interval_seconds == 3.0
+        build.assert_called_once_with(latest_state, None)
+        assert live.update_calls == [((latest_state, "latest-step"), False)]
+        assert live.refresh_calls == 1
+
+    def test_banner_renderer_start_resume_and_stop_use_manual_live_lifecycle(self) -> None:
+        import aflow.status as status_mod
+        import threading
+        from unittest.mock import patch
+
+        class ControllableStopEvent:
+            def __init__(self) -> None:
+                self._event = threading.Event()
+                self.wait_started = threading.Event()
+
+            def clear(self) -> None:
+                self._event.clear()
+                self.wait_started.clear()
+
+            def is_set(self) -> bool:
+                return self._event.is_set()
+
+            def set(self) -> None:
+                self._event.set()
+
+            def wait(self, *, timeout: float) -> bool:
+                del timeout
+                self.wait_started.set()
+                self._event.wait()
+                return True
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                self.initial_panel = panel
+                self.kwargs = kwargs
+                self.update_calls: list[tuple[object, bool]] = []
+                self.refresh_calls = 0
+                self.calls: list[str] = []
+                self.started = False
+                self.stopped = False
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.started = True
+                self.calls.append("start")
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                self.update_calls.append((panel, refresh))
+                self.calls.append("update")
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+                self.calls.append("refresh")
+
+            def stop(self) -> None:
+                self.refresh()
+                self.stopped = True
+                self.calls.append("stop")
+
+        initial_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        resumed_state = ControllerState(last_snapshot=PlanSnapshot("resumed", 1, 1, False))
+        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
+             patch.object(status_mod, "Live", FakeLive), \
+             patch.object(status_mod.BannerRenderer, "_build", return_value="panel") as build:
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                git_poll_interval_seconds=9999.0,
+            )
+            stop_event = ControllableStopEvent()
+            renderer._stop_event = stop_event
+            renderer.start(initial_state)
+            first_live = FakeLive.instances[-1]
+            first_thread = renderer._refresh_thread
+            assert first_thread is not None
+            assert stop_event.wait_started.wait(timeout=1.0)
+            renderer.pause()
+            paused_calls = list(first_live.calls)
+            renderer.update(resumed_state)
+            renderer.resume(resumed_state)
+            resumed_live = FakeLive.instances[-1]
+            resumed_thread = renderer._refresh_thread
+            assert resumed_thread is not None
+            assert stop_event.wait_started.wait(timeout=1.0)
+            renderer.stop(resumed_state)
+            stopped_calls = list(resumed_live.calls)
+            renderer.update(initial_state)
+
+        assert first_live.started is True
+        assert first_live.stopped is True
+        assert first_live.update_calls == []
+        assert first_thread.is_alive() is False
+        assert first_live.calls == paused_calls
+        assert first_live.refresh_calls == 1
+        assert resumed_live.started is True
+        assert resumed_live.stopped is True
+        assert resumed_thread.is_alive() is False
+        assert resumed_live.calls == stopped_calls
+        assert [live.kwargs["auto_refresh"] for live in FakeLive.instances] == [False, False]
+        assert all("refresh_per_second" not in live.kwargs for live in FakeLive.instances)
+        assert resumed_live.update_calls == [("panel", False)]
+        assert resumed_live.refresh_calls == 1
+        assert build.call_count == 3
+
+    def test_banner_renderer_stop_cancels_due_refresh_after_git_poll(self) -> None:
+        import aflow.git_status as git_status_mod
+        import aflow.status as status_mod
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        class PollStopEvent:
+            def __init__(self) -> None:
+                self._event = threading.Event()
+                self.wait_calls: list[float] = []
+                self.stop_requested = threading.Event()
+
+            def clear(self) -> None:
+                self._event.clear()
+
+            def is_set(self) -> bool:
+                return self._event.is_set()
+
+            def set(self) -> None:
+                self._event.set()
+                self.stop_requested.set()
+
+            def wait(self, *, timeout: float) -> bool:
+                self.wait_calls.append(timeout)
+                if len(self.wait_calls) == 1:
+                    clock[0] += timeout
+                    return False
+                self._event.wait()
+                return True
+
+        class FakeLive:
+            def __init__(self) -> None:
+                self.update_calls: list[tuple[object, bool]] = []
+                self.refresh_calls = 0
+                self.stopped = False
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                self.update_calls.append((panel, refresh))
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+
+            def stop(self) -> None:
+                self.refresh()
+                self.stopped = True
+
+        clock = [100.0]
+        poll_started = threading.Event()
+        release_poll = threading.Event()
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        live = FakeLive()
+        stop_event = PollStopEvent()
+        renderer = status_mod.BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            repo_root=Path("/fake/repo"),
+            refresh_interval_seconds=999.0,
+            git_poll_interval_seconds=1.0,
+        )
+        renderer._live = live
+        renderer._state = state
+        renderer._stop_event = stop_event
+        build = MagicMock(return_value="periodic")
+
+        def summarize(_repo_root: Path, _baseline: object) -> object:
+            poll_started.set()
+            assert release_poll.wait(timeout=1.0)
+            return "summary"
+
+        with patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(renderer, "_build", build), \
+             patch.object(git_status_mod, "capture_baseline", return_value=object()), \
+             patch.object(git_status_mod, "summarize_since_baseline", side_effect=summarize):
+            renderer._start_refresh_thread()
+            refresh_thread = renderer._refresh_thread
+            assert refresh_thread is not None
+            assert poll_started.wait(timeout=1.0)
+
+            stop_thread = threading.Thread(
+                target=renderer.stop,
+                args=(state,),
+                daemon=True,
+            )
+            stop_thread.start()
+            assert stop_event.stop_requested.wait(timeout=1.0)
+            release_poll.set()
+            stop_thread.join(timeout=1.0)
+
+        assert stop_thread.is_alive() is False
+        assert refresh_thread.is_alive() is False
+        assert build.call_count == 1
+        assert build.call_args.args == (state, None)
+        assert live.update_calls == [("periodic", False)]
+        assert live.refresh_calls == 1
+        assert live.stopped is True
+
+    def test_banner_renderer_git_poll_waits_for_its_own_deadline(self) -> None:
+        import aflow.git_status as git_status_mod
+        import aflow.status as status_mod
+        from unittest.mock import MagicMock, patch
+
+        class DeadlineStopEvent:
+            def __init__(self) -> None:
+                self.wait_calls: list[float] = []
+
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, *, timeout: float) -> bool:
+                self.wait_calls.append(timeout)
+                if len(self.wait_calls) <= 4:
+                    clock[0] += timeout
+                    return False
+                return True
+
+        class FakeLive:
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+
+            def refresh(self) -> None:
+                pass
+
+        clock = [100.0]
+        poll_times: list[float] = []
+        state = ControllerState(last_snapshot=PlanSnapshot("latest", 1, 1, False))
+        renderer = status_mod.BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            repo_root=Path("/fake/repo"),
+            refresh_interval_seconds=3.0,
+            git_poll_interval_seconds=10.0,
+        )
+        renderer._live = FakeLive()
+        renderer._stop_event = DeadlineStopEvent()
+        renderer.update(state)
+        renderer.set_context(current_step_name="latest-step")
+        build = MagicMock(return_value="panel")
+
+        def summarize(_repo_root: Path, _baseline: object) -> object:
+            poll_times.append(clock[0])
+            return "summary"
+
+        with patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(renderer, "_build", build), \
+             patch.object(git_status_mod, "capture_baseline", return_value=object()), \
+             patch.object(git_status_mod, "summarize_since_baseline", side_effect=summarize):
+            renderer._refresh_loop()
+
+        assert poll_times == [110.0]
+        assert renderer._stop_event.wait_calls == [3.0, 3.0, 3.0, 1.0, 2.0]
+        assert build.call_count == 3

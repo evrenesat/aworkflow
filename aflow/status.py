@@ -807,7 +807,7 @@ class BannerRenderer:
         workflow_graph_source: WorkflowGraphSource | None = None,
         console: Console | None = None,
         repo_root: Path | None = None,
-        refresh_interval_seconds: float = 1.0,
+        refresh_interval_seconds: float = 3.0,
         git_poll_interval_seconds: float = 10.0,
     ) -> None:
         self._config_harness = config_harness
@@ -887,30 +887,48 @@ class BannerRenderer:
         if self._repo_root is not None:
             baseline = capture_baseline(self._repo_root)
 
-        last_git_poll = 0.0
+        next_refresh_at = time.monotonic() + self._refresh_interval_seconds
+        next_git_poll_at = None
+        if self._repo_root is not None and baseline is not None:
+            next_git_poll_at = time.monotonic() + self._git_poll_interval_seconds
 
-        while not self._stop_event.is_set():
+        while True:
             now = time.monotonic()
+            deadlines = [next_refresh_at]
+            if next_git_poll_at is not None:
+                deadlines.append(next_git_poll_at)
+            timeout = max(0.0, min(deadlines) - now)
+            if self._stop_event.wait(timeout=timeout):
+                return
 
-            if self._repo_root is not None and baseline is not None:
-                if now - last_git_poll >= self._git_poll_interval_seconds:
-                    summary = summarize_since_baseline(self._repo_root, baseline)
-                    with self._lock:
-                        self._git_summary = summary
-                    last_git_poll = now
-
-            with self._lock:
-                state = self._state
-                git_summary = self._git_summary
-                live = self._live
-
-            if state is not None and live is not None:
+            now = time.monotonic()
+            if next_git_poll_at is not None and now >= next_git_poll_at:
+                summary = summarize_since_baseline(self._repo_root, baseline)
                 with self._lock:
-                    panel = self._build(state, git_summary)
-                if panel is not None:
-                    live.update(panel)
+                    if self._stop_event.is_set():
+                        return
+                    self._git_summary = summary
+                next_git_poll_at = time.monotonic() + self._git_poll_interval_seconds
+                now = time.monotonic()
 
-            self._stop_event.wait(timeout=self._refresh_interval_seconds)
+            if now >= next_refresh_at and not self._stop_event.is_set():
+                self._refresh_live()
+                next_refresh_at = time.monotonic() + self._refresh_interval_seconds
+
+    def _refresh_live(self) -> None:
+        with self._lock:
+            if self._stop_event.is_set():
+                return
+            state = self._state
+            git_summary = self._git_summary
+            live = self._live
+            if state is None or live is None:
+                return
+            panel = self._build(state, git_summary)
+            if panel is None or self._stop_event.is_set():
+                return
+            live.update(panel, refresh=False)
+            live.refresh()
 
     def _start_refresh_thread(self) -> None:
         self._stop_event.clear()
@@ -919,9 +937,10 @@ class BannerRenderer:
         t.start()
 
     def _stop_refresh_thread(self) -> None:
-        self._stop_event.set()
+        with self._lock:
+            self._stop_event.set()
         if self._refresh_thread is not None:
-            self._refresh_thread.join(timeout=2.0)
+            self._refresh_thread.join()
             self._refresh_thread = None
 
     def start(self, state: ControllerState) -> None:
@@ -929,11 +948,13 @@ class BannerRenderer:
             return
         with self._lock:
             self._state = state
-        panel = self._build(state)
+            panel = self._build(state)
         if panel is None:
             return
-        self._live = Live(panel, console=self._console, refresh_per_second=4, vertical_overflow="visible")
-        self._live.start()
+        live = Live(panel, console=self._console, auto_refresh=False, vertical_overflow="visible")
+        live.start()
+        with self._lock:
+            self._live = live
         self._start_refresh_thread()
 
     def update(self, state: ControllerState) -> None:
@@ -941,46 +962,43 @@ class BannerRenderer:
             return
         with self._lock:
             self._state = state
-            git_summary = self._git_summary
-            live = self._live
-        if live is None:
-            return
-        panel = self._build(state, git_summary)
-        if panel is None:
-            return
-        live.update(panel)
 
     def pause(self) -> None:
         if self._live is None or not _RICH_AVAILABLE:
             return
         self._stop_refresh_thread()
-        self._live.stop()
-        self._live = None
+        with self._lock:
+            live = self._live
+            self._live = None
+        if live is not None:
+            live.stop()
 
     def resume(self, state: ControllerState) -> None:
         if not _RICH_AVAILABLE:
             return
         with self._lock:
             self._state = state
-            git_summary = self._git_summary
-        panel = self._build(state, git_summary)
+            panel = self._build(state, self._git_summary)
         if panel is None:
             return
-        self._live = Live(panel, console=self._console, refresh_per_second=4, vertical_overflow="visible")
-        self._live.start()
+        live = Live(panel, console=self._console, auto_refresh=False, vertical_overflow="visible")
+        live.start()
+        with self._lock:
+            self._live = live
         self._start_refresh_thread()
 
     def stop(self, state: ControllerState) -> None:
         if not _RICH_AVAILABLE:
             return
         self._stop_refresh_thread()
-        if self._live is None:
-            return
         with self._lock:
+            live = self._live
+            self._live = None
+            self._state = state
             git_summary = self._git_summary
-        panel = self._build(state, git_summary)
-        if panel is None:
+            panel = self._build(state, git_summary) if live is not None else None
+        if live is None:
             return
-        self._live.update(panel)
-        self._live.stop()
-        self._live = None
+        if panel is not None:
+            live.update(panel, refresh=False)
+        live.stop()

@@ -363,7 +363,14 @@ current-scope rejection before the chronological turn cards and labels the next
 worker as a re-implementation with its compact rejection reason.
 The module also owns the shared workflow-graph and role/team render helpers used by both the live banner and `aflow show`, so classification rules stay identical across the two views.
 
-`BannerRenderer` owns a background daemon thread that rebuilds and pushes the panel every `refresh_interval_seconds` (default 1 s) and polls for a new `GitSummary` every `git_poll_interval_seconds` (default 10 s). This keeps the elapsed timer alive between step transitions without requiring external pushes. `set_context(...)` is used to update mutable banner fields instead of directly writing private attributes.
+`BannerRenderer` owns a background daemon thread that waits for the first
+`refresh_interval_seconds` deadline and then performs one explicit
+`Live.update(..., refresh=False)` plus `Live.refresh()` per periodic repaint
+(default 3 s). Rich automatic refresh is disabled, and ordinary
+`update(...)`/`set_context(...)` calls only replace the newest state/context
+for the next tick. Git collection remains independently due every
+`git_poll_interval_seconds` (default 10 s), while lifecycle paints are kept
+explicit and bounded so manager reports can follow the stopped banner.
 
 ### `skill_installer.py`
 Discovers the nine default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
@@ -469,7 +476,7 @@ aflow/
   run_state.py         # runtime data classes
   repartition.py       # immutable envelopes, strict split protocol, validation
   runlog.py            # run/turn artifact persistence
-  status.py            # Rich live banner with background refresh thread
+  status.py            # Rich live banner with AFlow-owned refresh thread
   git_status.py        # git snapshot helpers (probe, baseline, summary)
   skill_installer.py   # bundled skill installer
   aflow.toml           # global config, harness profiles, roles, teams, prompts
