@@ -59,7 +59,7 @@ class AdaptersTests(unittest.TestCase):
         adapter = CodexAdapter()
         invocation = adapter.build_invocation(repo_root=Path('/repo'), model='gpt-5.4', system_prompt='SYSTEM', user_prompt='USER')
         assert invocation.argv == ('codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '-C', '/repo', '--model', 'gpt-5.4', 'SYSTEM\n\nUSER')
-        assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
+        assert invocation.prompt_mode == 'stdin'
         assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
 
     def test_codex_with_effort(self) -> None:

@@ -35,7 +35,7 @@ class CodexAdapter:
             label=self.name,
             argv=tuple(argv),
             env={},
-            prompt_mode="prefix-system-into-user-prompt",
+            prompt_mode="stdin",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             effective_prompt=effective_prompt,

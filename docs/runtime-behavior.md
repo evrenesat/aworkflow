@@ -3,6 +3,10 @@
 ## How A Run Works
 
 Each workflow step launches one fresh harness process.
+Codex receives its combined system and user prompt through standard input, so
+large Full-manager contexts and implementation prompts are not constrained by
+the operating system's per-argument size limit. Durable prompt artifacts still
+record the exact effective prompt.
 
 At a high level:
 

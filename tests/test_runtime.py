@@ -1380,6 +1380,45 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert stderr_capture.getvalue() == ''
             assert banner.updated
 
+    def test_run_process_sends_large_stdin_prompt_without_argv_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = root / 'read_prompt.py'
+            script.write_text(
+                "import sys\n"
+                "payload = sys.stdin.read()\n"
+                "print(f'{sys.argv[-1] == \"-\"}:{len(payload)}')\n",
+                encoding='utf-8',
+            )
+            prompt = 'x' * 200_000
+            invocation = HarnessInvocation(
+                label='codex',
+                argv=(sys.executable, str(script), prompt),
+                env={},
+                prompt_mode='stdin',
+                system_prompt='',
+                user_prompt=prompt,
+                effective_prompt=prompt,
+            )
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+
+            class FakeBanner:
+                def update(self, state: ControllerState) -> None:
+                    pass
+
+            completed = _run_process(
+                invocation,
+                root,
+                FakeBanner(),  # type: ignore[arg-type]
+                state,
+            )
+
+            assert completed.returncode == 0
+            assert completed.stdout == 'True:200000\n'
+            assert completed.stderr == ''
+            assert completed.args[-1] == '-'
+            assert prompt not in completed.args
+
     def test_prompt_rendering_supports_inline_and_file_uri_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

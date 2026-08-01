@@ -1294,10 +1294,21 @@ def _run_process(
     banner: BannerRenderer,
     state: ControllerState,
 ) -> subprocess.CompletedProcess[str]:
+    argv = list(invocation.argv)
+    stdin_payload: str | None = None
+    if invocation.prompt_mode == "stdin":
+        stdin_payload = invocation.effective_prompt
+        # Adapters retain the logical prompt argument for injected runners and
+        # durable invocation artifacts.  Real subprocesses use the harness's
+        # stdin sentinel so large prompts never hit the OS argv-size limit.
+        if argv and argv[-1] == stdin_payload:
+            argv[-1] = "-"
+
     proc = subprocess.Popen(
-        list(invocation.argv),
+        argv,
         cwd=str(repo_root),
         env={**os.environ, **invocation.env},
+        stdin=subprocess.PIPE if stdin_payload is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1329,6 +1340,16 @@ def _run_process(
     )
     t_out.start()
     t_err.start()
+
+    if stdin_payload is not None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(stdin_payload)
+        except BrokenPipeError:
+            # Preserve the child return code and stderr as the harness failure.
+            pass
+        finally:
+            proc.stdin.close()
 
     while True:
         try:
