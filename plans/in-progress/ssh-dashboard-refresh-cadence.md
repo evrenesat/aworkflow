@@ -12,6 +12,9 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 - Plan Branch: `aflow-ssh-dashboard-refresh-cadence-20260801-214511`
 - Pre-Handoff Base HEAD: `c9616c50d93106024ebdfd79b892c174136fb0de`
+- Last Reviewed Checkpoint: `cp1 v02`
+- Review Log:
+  - `cp1 v02`: approved the fresh pause snapshot repair; pause joins the render thread, installs the newest coalesced state and context without an eager refresh, and relies on `Live.stop()` for the single lifecycle repaint.
 
 ## Done Means
 

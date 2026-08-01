@@ -964,13 +964,25 @@ class BannerRenderer:
             self._state = state
 
     def pause(self) -> None:
-        if self._live is None or not _RICH_AVAILABLE:
+        if not _RICH_AVAILABLE:
             return
+        with self._lock:
+            if self._live is None:
+                return
         self._stop_refresh_thread()
         with self._lock:
             live = self._live
+            state = self._state
+            git_summary = self._git_summary
+            panel = (
+                self._build(state, git_summary)
+                if live is not None and state is not None
+                else None
+            )
             self._live = None
         if live is not None:
+            if panel is not None:
+                live.update(panel, refresh=False)
             live.stop()
 
     def resume(self, state: ControllerState) -> None:

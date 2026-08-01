@@ -1198,49 +1198,63 @@ class GitBannerTests(unittest.TestCase):
                 self.calls.append("stop")
 
         initial_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        resumed_state = ControllerState(last_snapshot=PlanSnapshot("resumed", 1, 1, False))
+        paused_state = ControllerState(last_snapshot=PlanSnapshot("paused", 1, 1, False))
+        resumed_state = ControllerState(last_snapshot=PlanSnapshot("resumed", 2, 2, False))
+        final_state = ControllerState(last_snapshot=PlanSnapshot("final", 3, 3, False))
         with patch.object(status_mod, "_RICH_AVAILABLE", True), \
-             patch.object(status_mod, "Live", FakeLive), \
-             patch.object(status_mod.BannerRenderer, "_build", return_value="panel") as build:
+             patch.object(status_mod, "Live", FakeLive):
             renderer = status_mod.BannerRenderer(
                 config_max_turns=10,
                 config_plan_path=Path("/fake/plan.md"),
+                current_step_name="initial-step",
                 git_poll_interval_seconds=9999.0,
             )
             stop_event = ControllableStopEvent()
             renderer._stop_event = stop_event
-            renderer.start(initial_state)
-            first_live = FakeLive.instances[-1]
-            first_thread = renderer._refresh_thread
-            assert first_thread is not None
-            assert stop_event.wait_started.wait(timeout=1.0)
-            renderer.pause()
-            paused_calls = list(first_live.calls)
-            renderer.update(resumed_state)
-            renderer.resume(resumed_state)
-            resumed_live = FakeLive.instances[-1]
-            resumed_thread = renderer._refresh_thread
-            assert resumed_thread is not None
-            assert stop_event.wait_started.wait(timeout=1.0)
-            renderer.stop(resumed_state)
-            stopped_calls = list(resumed_live.calls)
-            renderer.update(initial_state)
+            with patch.object(
+                renderer,
+                "_build",
+                side_effect=lambda state, git_summary=None: (state, renderer._current_step_name),
+            ) as build:
+                renderer.start(initial_state)
+                first_live = FakeLive.instances[-1]
+                first_thread = renderer._refresh_thread
+                assert first_thread is not None
+                assert stop_event.wait_started.wait(timeout=1.0)
+                renderer.update(paused_state)
+                renderer.set_context(current_step_name="latest-step")
+                assert first_live.update_calls == []
+                renderer.pause()
+                paused_calls = list(first_live.calls)
+                renderer.update(resumed_state)
+                assert first_live.calls == paused_calls
+                renderer.resume(resumed_state)
+                resumed_live = FakeLive.instances[-1]
+                resumed_thread = renderer._refresh_thread
+                assert resumed_thread is not None
+                assert stop_event.wait_started.wait(timeout=1.0)
+                renderer.stop(final_state)
+                stopped_calls = list(resumed_live.calls)
+                renderer.update(initial_state)
+                assert resumed_live.calls == stopped_calls
 
         assert first_live.started is True
         assert first_live.stopped is True
-        assert first_live.update_calls == []
+        assert first_live.initial_panel == (initial_state, "initial-step")
+        assert first_live.update_calls == [((paused_state, "latest-step"), False)]
         assert first_thread.is_alive() is False
-        assert first_live.calls == paused_calls
+        assert first_live.calls == ["start", "update", "refresh", "stop"]
         assert first_live.refresh_calls == 1
         assert resumed_live.started is True
         assert resumed_live.stopped is True
         assert resumed_thread.is_alive() is False
-        assert resumed_live.calls == stopped_calls
+        assert resumed_live.calls == ["start", "update", "refresh", "stop"]
+        assert resumed_live.initial_panel == (resumed_state, "latest-step")
         assert [live.kwargs["auto_refresh"] for live in FakeLive.instances] == [False, False]
         assert all("refresh_per_second" not in live.kwargs for live in FakeLive.instances)
-        assert resumed_live.update_calls == [("panel", False)]
+        assert resumed_live.update_calls == [((final_state, "latest-step"), False)]
         assert resumed_live.refresh_calls == 1
-        assert build.call_count == 3
+        assert build.call_count == 4
 
     def test_banner_renderer_stop_cancels_due_refresh_after_git_poll(self) -> None:
         import aflow.git_status as git_status_mod
