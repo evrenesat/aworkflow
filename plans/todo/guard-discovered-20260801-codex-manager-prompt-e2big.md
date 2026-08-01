@@ -17,11 +17,12 @@ The immediate trigger is a resumed pending manager boundary whose effective prom
 
 - Plan Branch: `aflow-guard-discovered-20260801-codex-manager-prompt-e2b-20260801-223957`
 - Pre-Handoff Base HEAD: `afb55b387269832adb1d57ab49251692b3d0e1c3`
-- Last Reviewed Checkpoint: `cp1 v01`
+- Last Reviewed Checkpoint: `cp2 v01`
 
 ## Review Log
 
 - 2026-08-01: Approved Checkpoint 1 through `cp1 v01` using the current-worktree fallback from `afb55b3`; Codex stdin transport, injected-runner parity, large-prompt streaming, and prompt-free argv artifacts passed focused verification. The 10 lifecycle failures in the combined harness/runtime files reproduce unchanged at the pre-handoff base and remain outside this checkpoint.
+- 2026-08-01: Approved Checkpoint 2 through `cp2 v01`; default and injected launch errors normalize to bounded nonzero results, and manager, worker, and lifecycle fixtures persist terminal failure evidence. Focused runtime tests, the app-server suite, compilation, and diff hygiene passed. The same 10 pre-existing lifecycle failures remain in the combined harness/runtime files, while the root-level pytest command also encounters the unchanged nested app-server environment collection boundary; the server-local suite passes independently.
 
 ## Done Means
 
@@ -158,7 +159,7 @@ Harness adapter/recovery. The cdx reviewer completed normally and produced a val
 - Stop and report if the installed Codex CLI no longer supports stdin prompt input with `-`.
 - Stop and report if unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 2: Persist process-launch failures through normal terminal paths
+### [x] Checkpoint 2: Persist process-launch failures through normal terminal paths
 
 **Goal:**
 
@@ -178,12 +179,12 @@ Harness adapter/recovery. The cdx reviewer completed normally and produced a val
 
 **Steps:**
 
-- [ ] Add a small process-launch normalization helper used by both default `Popen` execution and injected runners. Map `FileNotFoundError` to return code 127 and other launch-time `OSError` values, including `EACCES` and `E2BIG`, to return code 126.
-- [ ] Route the synthetic nonzero result through each caller's existing nonzero-harness handling rather than adding new manager or workflow transitions.
-- [ ] Prove manager invocation failure writes manager result/error artifacts and ends the run durably instead of escaping before persistence; if Lite-to-Full fallback is existing behavior, keep it and make both launch failures auditable.
-- [ ] Prove worker and lifecycle launch failures finalize their existing artifacts and set `run.json.status=failed`; they must not record plan progress or successful turns.
-- [ ] Add regression coverage for `errno.E2BIG`, missing executable, and a child that closes stdin early. Assert no raw prompt, full argv, or traceback is stored in the concise launch diagnostic.
-- [ ] Update `ARCHITECTURE.md` at the harness adapter and subprocess execution sections. Record the completed behavior in `DEVLOG.md`; leave `README.md` unchanged unless a user-facing contract actually changes.
+- [x] Add a small process-launch normalization helper used by both default `Popen` execution and injected runners. Map `FileNotFoundError` to return code 127 and other launch-time `OSError` values, including `EACCES` and `E2BIG`, to return code 126.
+- [x] Route the synthetic nonzero result through each caller's existing nonzero-harness handling rather than adding new manager or workflow transitions.
+- [x] Prove manager invocation failure writes manager result/error artifacts and ends the run durably instead of escaping before persistence; if Lite-to-Full fallback is existing behavior, keep it and make both launch failures auditable.
+- [x] Prove worker and lifecycle launch failures finalize their existing artifacts and set `run.json.status=failed`; they must not record plan progress or successful turns.
+- [x] Add regression coverage for `errno.E2BIG`, missing executable, and a child that closes stdin early. Assert no raw prompt, full argv, or traceback is stored in the concise launch diagnostic.
+- [x] Update `ARCHITECTURE.md` at the harness adapter and subprocess execution sections. Record the completed behavior in `DEVLOG.md`; leave `README.md` unchanged unless a user-facing contract actually changes.
 
 **Dependencies:**
 

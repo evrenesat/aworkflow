@@ -1,6 +1,7 @@
 from aflow._test_support import *  # noqa: F401,F403
 from contextlib import nullcontext
 from dataclasses import replace
+import errno
 import hashlib
 from typing import Mapping
 from aflow.api import AnalyzeRequest, analyze_runs
@@ -1507,6 +1508,71 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert completed.returncode == 23
             assert completed.stderr == 'child closed stdin\n'
 
+    def test_run_process_normalizes_popen_launch_failure(self) -> None:
+        prompt = 'launch-sentinel-not-an-argv-value'
+        invocation = HarnessInvocation(
+            label='codex',
+            argv=('codex', 'exec', '-'),
+            env={},
+            prompt_mode='stdin',
+            system_prompt='',
+            user_prompt=prompt,
+            effective_prompt=prompt,
+            stdin_text=prompt,
+        )
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+
+        class FakeBanner:
+            def update(self, state: ControllerState) -> None:
+                pass
+
+        with patch(
+            'aflow.workflow.subprocess.Popen',
+            side_effect=OSError(errno.E2BIG, 'Argument list too long'),
+        ):
+            completed = _run_process(
+                invocation,
+                Path('/repo'),
+                FakeBanner(),  # type: ignore[arg-type]
+                state,
+            )
+
+        assert completed.returncode == 126
+        assert completed.stdout == ''
+        assert "harness 'codex'" in completed.stderr
+        assert f'errno {errno.E2BIG}' in completed.stderr
+        assert 'Argument list too long' in completed.stderr
+        assert prompt not in completed.stderr
+        assert repr(list(invocation.argv)) not in completed.stderr
+        assert 'Traceback' not in completed.stderr
+
+    def test_injected_runner_normalizes_missing_and_denied_launch_failures(self) -> None:
+        invocation = CodexAdapter().build_invocation(
+            repo_root=Path('/repo'),
+            model='gpt-5.4',
+            system_prompt='SYSTEM',
+            user_prompt='launch-sentinel-not-an-argv-value',
+        )
+
+        for launch_error, expected_returncode in (
+            (FileNotFoundError(errno.ENOENT, 'No such file or directory'), 127),
+            (OSError(errno.EACCES, 'Permission denied'), 126),
+        ):
+            with self.subTest(expected_returncode=expected_returncode):
+                def runner(argv, **kwargs):
+                    raise launch_error
+
+                completed = _run_injected_runner(runner, invocation, Path('/repo'))
+
+                assert completed.returncode == expected_returncode
+                assert completed.stdout == ''
+                assert "harness 'codex'" in completed.stderr
+                assert f'errno {launch_error.errno}' in completed.stderr
+                assert launch_error.strerror in completed.stderr
+                assert invocation.user_prompt not in completed.stderr
+                assert repr(list(invocation.argv)) not in completed.stderr
+                assert 'Traceback' not in completed.stderr
+
     def test_prompt_rendering_supports_inline_and_file_uri_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -2706,6 +2772,107 @@ class WorkflowArtifactTests(unittest.TestCase):
             assert result_json['stderr'] == 'err'
             assert (turn_dir / 'stdout.txt').read_text(encoding='utf-8') == 'bad'
             assert (turn_dir / 'stderr.txt').read_text(encoding='utf-8') == 'err'
+
+    def test_missing_harness_executable_finalizes_worker_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+
+            def runner(argv, **kwargs):
+                raise FileNotFoundError(errno.ENOENT, 'No such file or directory')
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _make_simple_wf_config(),
+                    'simple',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = ctx.value.run_dir
+            assert run_dir is not None
+            run_json = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            turn_result = json.loads(
+                (run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8')
+            )
+            assert turn_result['status'] == 'harness-failed'
+            assert turn_result['returncode'] == 127
+            assert 'harness \'codex\'' in turn_result['stderr']
+            assert 'Traceback' not in turn_result['stderr']
+
+    def test_manager_launch_failure_persists_result_before_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={'impl': WorkflowStepConfig(
+                    role='worker',
+                    prompts=('p',),
+                    go=(GoTransition(to='END'),),
+                )},
+                first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'worker': 'codex.worker',
+                    'manager_full': 'codex.manager',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'worker': HarnessProfileConfig(model='worker'),
+                    'manager': HarnessProfileConfig(model='manager'),
+                })},
+                workflows={'managed': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role='manager_full',
+                    full_role='manager_full',
+                ),
+            )
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return subprocess.CompletedProcess(argv, 1, '', 'worker failed')
+                raise OSError(errno.E2BIG, 'Argument list too long')
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config,
+                    'managed',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert calls == 2
+            run_dir = ctx.value.run_dir
+            assert run_dir is not None
+            run_json = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            manager_dir = run_dir / 'manager' / 'decision-001'
+            assert (manager_dir / 'result.json').is_file()
+            assert (manager_dir / 'stderr.txt').read_text(encoding='utf-8')
+            manager_result = json.loads((manager_dir / 'result.json').read_text(encoding='utf-8'))
+            assert manager_result['status'] == 'invalid'
+            assert manager_result['error'] == 'manager harness exited with code 126'
+            manager_stderr = (manager_dir / 'stderr.txt').read_text(encoding='utf-8')
+            assert "harness 'codex'" in manager_stderr
+            assert 'Argument list too long' in manager_stderr
+            assert 'Traceback' not in manager_stderr
+            turn_result = json.loads(
+                (run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8')
+            )
+            assert turn_result['status'] == 'harness-failed'
+            assert turn_result['returncode'] == 1
 
     def test_harness_recovery_retries_same_step_after_delay_and_records_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7575,6 +7742,34 @@ class StopMarkerTests(unittest.TestCase):
 
 class LifecycleBootstrapTests(unittest.TestCase):
     """Runtime tests for the team-lead repo-init bootstrap handoff."""
+
+    def test_bootstrap_launch_failure_finishes_run_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            wf_config = _make_branch_only_wf_config(main_branch='main')
+
+            def runner(argv, **kwargs):
+                raise FileNotFoundError(errno.ENOENT, 'No such file or directory')
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config,
+                    'branch_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = ctx.value.run_dir
+            assert run_dir is not None
+            run_json = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            assert 'lifecycle bootstrap' in run_json['failure_reason']
+            assert 'exit code 127' in run_json['failure_reason']
+            assert 'Traceback' not in run_json['failure_reason']
 
     def test_init_repo_handoff_invoked_for_no_git_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

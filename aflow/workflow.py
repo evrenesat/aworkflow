@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -1288,21 +1289,42 @@ def _format_failure(
     )
 
 
+def _normalize_process_launch_error(
+    invocation: HarnessInvocation,
+    error: OSError,
+) -> subprocess.CompletedProcess[str]:
+    """Represent a harness process-creation error as a normal failed result."""
+    returncode = 127 if (
+        isinstance(error, FileNotFoundError) or error.errno == errno.ENOENT
+    ) else 126
+    errno_text = str(error.errno) if error.errno is not None else "unknown"
+    message = error.strerror or "process creation failed"
+    return subprocess.CompletedProcess(
+        list(invocation.argv),
+        returncode,
+        "",
+        f"harness '{invocation.label}' failed to start (errno {errno_text}): {message}",
+    )
+
+
 def _run_process(
     invocation: HarnessInvocation,
     repo_root: Path,
     banner: BannerRenderer,
     state: ControllerState,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.Popen(
-        list(invocation.argv),
-        cwd=str(repo_root),
-        env={**os.environ, **invocation.env},
-        stdin=subprocess.PIPE if invocation.stdin_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            list(invocation.argv),
+            cwd=str(repo_root),
+            env={**os.environ, **invocation.env},
+            stdin=subprocess.PIPE if invocation.stdin_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return _normalize_process_launch_error(invocation, exc)
 
     banner.update(state)
 
@@ -1397,7 +1419,10 @@ def _run_injected_runner(
     }
     if invocation.stdin_text is not None:
         kwargs["input"] = invocation.stdin_text
-    return runner(list(invocation.argv), **kwargs)
+    try:
+        return runner(list(invocation.argv), **kwargs)
+    except OSError as exc:
+        return _normalize_process_launch_error(invocation, exc)
 
 
 def _workflow_requires_git_tracking(

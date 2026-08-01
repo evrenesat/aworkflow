@@ -220,7 +220,7 @@ The core engine. `run_workflow()` executes the turn loop:
    c. Resolve the step's role through the selected team and global role map to get the concrete harness selector.
    d. Render prompt templates with path placeholders.
    e. Build a `HarnessInvocation` via the adapter, using `execution_repo_root` as the subprocess cwd.
-   f. Run the agent CLI as a subprocess, streaming stdout/stderr.
+   f. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
    g. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
    h. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
    i. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
@@ -286,7 +286,7 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | Harness    | CLI binary  | Prompt mode                    | Effort support |
 |------------|-------------|--------------------------------|----------------|
 | `claude`   | `claude`    | `--system-prompt` flag         | Yes            |
-| `codex`    | `codex`     | system prefixed into user prompt | Yes          |
+| `codex`    | `codex`     | stdin via `exec -`              | Yes          |
 | `copilot`  | `copilot`   | system prefixed into user prompt | Yes          |
 | `gemini`   | `gemini`    | system prefixed into user prompt | No           |
 | `kiro`     | `kiro-cli`  | system prefixed into user prompt | No           |
@@ -295,6 +295,16 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
 
 All harnesses run in non-interactive, auto-approve mode with full tool access.
+
+Codex uses the documented `codex exec ... -` form: the complete effective
+prompt is sent through stdin and is never added to argv. The subprocess
+boundary drains stdout and stderr while feeding stdin, and the equivalent
+injected-runner boundary supplies the same `input` value. If process creation
+raises `OSError`, either boundary returns an empty-output, prompt-free
+`CompletedProcess` with a concise harness/errno/OS-message diagnostic; missing
+executables use return code 127 and other launch failures use 126. Manager,
+worker, recovery, and lifecycle callers then use their existing nonzero-result
+handling.
 
 ### `run_state.py`
 Data classes for runtime state:
