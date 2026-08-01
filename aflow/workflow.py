@@ -1294,21 +1294,11 @@ def _run_process(
     banner: BannerRenderer,
     state: ControllerState,
 ) -> subprocess.CompletedProcess[str]:
-    argv = list(invocation.argv)
-    stdin_payload: str | None = None
-    if invocation.prompt_mode == "stdin":
-        stdin_payload = invocation.effective_prompt
-        # Adapters retain the logical prompt argument for injected runners and
-        # durable invocation artifacts.  Real subprocesses use the harness's
-        # stdin sentinel so large prompts never hit the OS argv-size limit.
-        if argv and argv[-1] == stdin_payload:
-            argv[-1] = "-"
-
     proc = subprocess.Popen(
-        argv,
+        list(invocation.argv),
         cwd=str(repo_root),
         env={**os.environ, **invocation.env},
-        stdin=subprocess.PIPE if stdin_payload is not None else None,
+        stdin=subprocess.PIPE if invocation.stdin_text is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1341,15 +1331,34 @@ def _run_process(
     t_out.start()
     t_err.start()
 
-    if stdin_payload is not None:
+    stdin_errors: list[BrokenPipeError] = []
+    t_in: threading.Thread | None = None
+    stdin_text = invocation.stdin_text
+    if stdin_text is not None:
         assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_payload)
-        except BrokenPipeError:
-            # Preserve the child return code and stderr as the harness failure.
-            pass
-        finally:
-            proc.stdin.close()
+
+        def _record_broken_pipe(exc: BrokenPipeError) -> None:
+            try:
+                proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
+            except subprocess.TimeoutExpired:
+                stdin_errors.append(exc)
+
+        def _write_stdin() -> None:
+            try:
+                proc.stdin.write(stdin_text)
+            except BrokenPipeError as exc:
+                # A child which exits while its input is being written has
+                # already closed the pipe.  If it is still alive, preserve the
+                # error rather than hiding an unexpected transport failure.
+                _record_broken_pipe(exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except BrokenPipeError as exc:
+                    _record_broken_pipe(exc)
+
+        t_in = threading.Thread(target=_write_stdin, daemon=True)
+        t_in.start()
 
     while True:
         try:
@@ -1358,8 +1367,13 @@ def _run_process(
         except subprocess.TimeoutExpired:
             pass
 
+    if t_in is not None:
+        t_in.join()
     t_out.join()
     t_err.join()
+
+    if stdin_errors:
+        raise stdin_errors[0]
 
     return subprocess.CompletedProcess(
         proc.args,
@@ -1367,6 +1381,23 @@ def _run_process(
         "".join(stdout_chunks),
         "".join(stderr_chunks),
     )
+
+
+def _run_injected_runner(
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    invocation: HarnessInvocation,
+    repo_root: Path,
+) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, object] = {
+        "cwd": str(repo_root),
+        "env": {**os.environ, **invocation.env},
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    }
+    if invocation.stdin_text is not None:
+        kwargs["input"] = invocation.stdin_text
+    return runner(list(invocation.argv), **kwargs)
 
 
 def _workflow_requires_git_tracking(
@@ -2272,14 +2303,7 @@ def _execute_init_repo_handoff(
 
     if runner is None:
         return _run_process(invocation, primary_root, banner, state)
-    return runner(
-        list(invocation.argv),
-        cwd=str(primary_root),
-        env={**os.environ, **invocation.env},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    return _run_injected_runner(runner, invocation, primary_root)
 
 
 def _resolve_team_lead_profile(
@@ -2356,14 +2380,7 @@ def _run_team_lead_recovery_handoff(
     if runner is None:
         completed = _run_process(invocation, repo_root, banner, state)
     else:
-        completed = runner(
-            list(invocation.argv),
-            cwd=str(repo_root),
-            env={**os.environ, **invocation.env},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        completed = _run_injected_runner(runner, invocation, repo_root)
     if completed.returncode != 0:
         evidence = build_recovery_evidence(
             stdout=completed.stdout,
@@ -2702,14 +2719,7 @@ def _execute_merge_handoff(
 
     if runner is None:
         return _run_process(invocation, primary_root, banner, state)
-    return runner(
-        list(invocation.argv),
-        cwd=str(primary_root),
-        env={**os.environ, **invocation.env},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    return _run_injected_runner(runner, invocation, primary_root)
 
 
 def _perform_merge_teardown(
@@ -4786,10 +4796,7 @@ def run_workflow(
             if runner is None:
                 completed = _run_process(manager_invocation, execution_repo_root, banner, state)
             else:
-                completed = runner(
-                    list(manager_invocation.argv), cwd=str(execution_repo_root),
-                    env={**os.environ, **manager_invocation.env}, capture_output=True, text=True, check=False,
-                )
+                completed = _run_injected_runner(runner, manager_invocation, execution_repo_root)
             stdout, stderr = completed.stdout, completed.stderr
             if completed.returncode != 0:
                 raise ManagerDecisionError(f"manager harness exited with code {completed.returncode}")
@@ -5173,11 +5180,7 @@ def run_workflow(
             if runner is None:
                 completed = _run_process(invocation, execution_repo_root, banner, state)
             else:
-                completed = runner(
-                    list(invocation.argv), cwd=str(execution_repo_root),
-                    env={**os.environ, **invocation.env},
-                    capture_output=True, text=True, check=False,
-                )
+                completed = _run_injected_runner(runner, invocation, execution_repo_root)
             stdout, stderr = completed.stdout, completed.stderr
             if completed.returncode != 0:
                 error = f"repartition Full harness exited with code {completed.returncode}"
@@ -7028,14 +7031,7 @@ def run_workflow(
             completed = _run_process(invocation, execution_repo_root, banner, state)
         else:
             assert runner is not None
-            completed = runner(
-                list(invocation.argv),
-                cwd=str(execution_repo_root),
-                env={**os.environ, **invocation.env},
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            completed = _run_injected_runner(runner, invocation, execution_repo_root)
 
         stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
         if stop_reason is not None:

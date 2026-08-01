@@ -23,9 +23,22 @@ from aflow.run_state import (
 )
 from aflow.runlog import create_run_paths, write_run_metadata
 from aflow.workflow import (
+    _run_injected_runner,
     _pending_matches_scope_and_plan,
     _reconcile_repartition_plan_copies,
 )
+
+
+def _runner_prompt(argv, kwargs) -> str:
+    prompt = kwargs.get("input")
+    return prompt if isinstance(prompt, str) else " ".join(argv)
+
+
+def _runner_invocation_text(argv, kwargs) -> str:
+    prompt = kwargs.get("input")
+    if not isinstance(prompt, str):
+        return " ".join(argv)
+    return f"{' '.join(argv)} {prompt}"
 
 
 def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
@@ -457,7 +470,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             persisted_before_invocation: list[bool] = []
 
             def first_resumed_runner(argv, **kwargs):
-                invocation = " ".join(argv)
+                invocation = _runner_invocation_text(argv, kwargs)
                 invocations.append(invocation)
                 successors = [
                     path
@@ -519,7 +532,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             chained_invocations: list[str] = []
 
             def chained_runner(argv, **kwargs):
-                chained_invocations.append(" ".join(argv))
+                chained_invocations.append(_runner_invocation_text(argv, kwargs))
                 return subprocess.CompletedProcess(
                     argv,
                     1,
@@ -632,7 +645,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 invocations: list[str] = []
 
                 def runner(argv, **kwargs):
-                    invocations.append(" ".join(argv))
+                    invocations.append(_runner_invocation_text(argv, kwargs))
                     return subprocess.CompletedProcess(
                         argv,
                         1,
@@ -715,7 +728,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             invocations: list[str] = []
 
             def runner(argv, **kwargs):
-                invocations.append(" ".join(argv))
+                invocations.append(_runner_invocation_text(argv, kwargs))
                 successors = [
                     path
                     for path in (repo_root / ".aflow" / "runs").iterdir()
@@ -928,7 +941,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             invocations: list[str] = []
 
             def corrected_runner(argv, **kwargs):
-                invocations.append(" ".join(argv))
+                invocations.append(_runner_invocation_text(argv, kwargs))
                 _write_plan(Path(kwargs["cwd"]) / "plan.md", _COMPLETE_PLAN)
                 return subprocess.CompletedProcess(argv, 0, "complete", "")
 
@@ -1033,10 +1046,10 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 )
                 return paths
 
-            invocations: list[tuple[str, ...]] = []
+            invocations: list[str] = []
 
             def runner(argv, **kwargs):
-                invocations.append(tuple(argv))
+                invocations.append(_runner_invocation_text(argv, kwargs))
                 _write_plan(plan_path, _COMPLETE_PLAN)
                 return subprocess.CompletedProcess(argv, 0, "ok", "")
 
@@ -1059,7 +1072,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
 
             assert result.turns_completed == 1
             assert len(invocations) == 1
-            invocation_text = " ".join(invocations[0])
+            invocation_text = invocations[0]
             assert "strong" in invocation_text
             assert "focus on boundary behavior" in invocation_text
             payload = json.loads(
@@ -1203,10 +1216,10 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 created_paths.append(paths)
                 return paths
 
-            invocations: list[tuple[str, ...]] = []
+            invocations: list[str] = []
 
             def runner(argv, **kwargs):
-                invocations.append(tuple(argv))
+                invocations.append(_runner_invocation_text(argv, kwargs))
                 if len(invocations) == 1:
                     (created_paths[0].run_dir / "overrides.toml").write_text(
                         'team = "strong"\nnotes = ["second turn only"]\n',
@@ -1234,8 +1247,8 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 )
 
             assert result.turns_completed == 2
-            first = " ".join(invocations[0])
-            second = " ".join(invocations[1])
+            first = invocations[0]
+            second = invocations[1]
             assert "second turn only" not in first
             assert "strong" not in first
             assert "second turn only" in second
@@ -1386,19 +1399,26 @@ class WorkflowRuntimeTests(unittest.TestCase):
             script = root / 'read_prompt.py'
             script.write_text(
                 "import sys\n"
+                "import hashlib\n"
+                "sys.stdout.write('o' * 131072)\n"
+                "sys.stdout.flush()\n"
+                "sys.stderr.write('e' * 131072)\n"
+                "sys.stderr.flush()\n"
                 "payload = sys.stdin.read()\n"
-                "print(f'{sys.argv[-1] == \"-\"}:{len(payload)}')\n",
+                "digest = hashlib.sha256(payload.encode()).hexdigest()\n"
+                "print(f'\\n{sys.argv[-1] == \"-\"}:{len(payload)}:{digest}')\n",
                 encoding='utf-8',
             )
             prompt = 'x' * 200_000
             invocation = HarnessInvocation(
                 label='codex',
-                argv=(sys.executable, str(script), prompt),
+                argv=(sys.executable, str(script), '-'),
                 env={},
                 prompt_mode='stdin',
                 system_prompt='',
                 user_prompt=prompt,
                 effective_prompt=prompt,
+                stdin_text=prompt,
             )
             state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
 
@@ -1414,10 +1434,78 @@ class WorkflowRuntimeTests(unittest.TestCase):
             )
 
             assert completed.returncode == 0
-            assert completed.stdout == 'True:200000\n'
-            assert completed.stderr == ''
+            expected_digest = hashlib.sha256(prompt.encode()).hexdigest()
+            assert completed.stdout.endswith(f'\nTrue:200000:{expected_digest}\n')
+            assert completed.stdout.startswith('o' * 131072)
+            assert completed.stderr == 'e' * 131072
             assert completed.args[-1] == '-'
             assert prompt not in completed.args
+
+    def test_injected_runner_receives_stdin_without_prompt_in_argv(self) -> None:
+        invocation = CodexAdapter().build_invocation(
+            repo_root=Path('/repo'),
+            model='gpt-5.4',
+            system_prompt='SYSTEM',
+            user_prompt='USER',
+        )
+        captured: dict[str, object] = {}
+
+        def runner(argv, **kwargs):
+            captured['argv'] = argv
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+        completed = _run_injected_runner(runner, invocation, Path('/repo'))
+
+        assert completed.stdout == 'ok'
+        assert captured['argv'][-1] == '-'
+        assert captured['input'] == 'SYSTEM\n\nUSER'
+        assert captured['cwd'] == '/repo'
+        assert captured['capture_output'] is True
+        assert captured['text'] is True
+        assert captured['check'] is False
+
+        non_stdin_invocation = ClaudeAdapter().build_invocation(
+            repo_root=Path('/repo'),
+            model='deepseek-pro',
+            system_prompt='SYSTEM',
+            user_prompt='USER',
+        )
+        captured.clear()
+        _run_injected_runner(runner, non_stdin_invocation, Path('/repo'))
+        assert 'input' not in captured
+
+    def test_run_process_preserves_result_when_child_closes_stdin_early(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = root / 'close_stdin.py'
+            script.write_text(
+                "import sys\n"
+                "print('child closed stdin', file=sys.stderr)\n"
+                "raise SystemExit(23)\n",
+                encoding='utf-8',
+            )
+            prompt = 'x' * 200_000
+            invocation = HarnessInvocation(
+                label='codex',
+                argv=(sys.executable, str(script), '-'),
+                env={},
+                prompt_mode='stdin',
+                system_prompt='',
+                user_prompt=prompt,
+                effective_prompt=prompt,
+                stdin_text=prompt,
+            )
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+
+            class FakeBanner:
+                def update(self, state: ControllerState) -> None:
+                    pass
+
+            completed = _run_process(invocation, root, FakeBanner(), state)
+
+            assert completed.returncode == 23
+            assert completed.stderr == 'child closed stdin\n'
 
     def test_prompt_rendering_supports_inline_and_file_uri_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1830,7 +1918,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             captured_active_paths: list[str] = []
 
             def capturing_runner(argv, **kwargs):
-                prompt_text = ' '.join(argv)
+                prompt_text = _runner_prompt(argv, kwargs)
                 import re
                 match = re.search('Active: (\\S+)', prompt_text)
                 if match:
@@ -1854,7 +1942,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
 
             def capturing_runner(argv, **kwargs):
                 turn_counter[0] += 1
-                prompt_text = ' '.join(argv)
+                prompt_text = _runner_prompt(argv, kwargs)
                 import re as re_mod
                 match = re_mod.search('Active: (\\S+)', prompt_text)
                 if match:
@@ -1883,7 +1971,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
 
             def capturing_runner(argv, **kwargs):
                 turn_counter[0] += 1
-                prompt_text = ' '.join(argv)
+                prompt_text = _runner_prompt(argv, kwargs)
                 import re as re_mod
                 match = re_mod.search('Active: (\\S+)', prompt_text)
                 if match:
@@ -3636,6 +3724,9 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert run_json['end_reason'] == 'done'
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['end_reason'] == 'done'
+            argv_json = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'argv.json').read_text(encoding='utf-8'))
+            assert argv_json['argv'][-1] == '-'
+            assert 'Work from' not in json.dumps(argv_json)
 
     def test_kiro_workflow_invokes_chat_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5509,7 +5600,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             captured_prompt: list[str] = []
 
             def resumed_runner(argv, **kwargs):
-                captured_prompt.append(' '.join(argv))
+                captured_prompt.append(_runner_invocation_text(argv, kwargs))
                 return subprocess.CompletedProcess(
                     argv, 1, 'failed', 'resumed run failed'
                 )
@@ -5628,7 +5719,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             prompts: list[str] = []
 
             def runner(argv, **kwargs):
-                prompt = ' '.join(argv)
+                prompt = _runner_prompt(argv, kwargs)
                 prompts.append(prompt)
                 if len(prompts) == 1:
                     execution_plan = (
@@ -5764,7 +5855,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             next_scope_captured_before_worker: list[bool] = []
 
             def runner(argv, **kwargs):
-                captured_prompt.append(' '.join(argv))
+                captured_prompt.append(_runner_invocation_text(argv, kwargs))
                 run_dir = next((repo_root / '.aflow' / 'runs').iterdir())
                 payload = json.loads((run_dir / 'run.json').read_text())
                 resumed_scope = payload['active_implementation_scope']
@@ -6009,7 +6100,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             def runner(argv, **kwargs):
                 model = argv[argv.index('--model') + 1]
                 calls.append(model)
-                prompts.append(argv[-1])
+                prompts.append(_runner_prompt(argv, kwargs))
                 if model.startswith('manager-'):
                     action = (
                         'upgrade_next_implementation'
@@ -6161,7 +6252,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         argv, 1, 'recovery failed', ''
                     )
-                prompt = ' '.join(argv)
+                prompt = _runner_prompt(argv, kwargs)
                 import re as _re
                 match = _re.search(r'Active: (\S+)', prompt)
                 assert match is not None
@@ -6375,7 +6466,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             calls: list[tuple[str, str]] = []
 
             def runner(argv, **kwargs):
-                calls.append((argv[argv.index('--model') + 1], ' '.join(argv)))
+                calls.append((argv[argv.index('--model') + 1], _runner_invocation_text(argv, kwargs)))
                 return subprocess.CompletedProcess(argv, 0, 'reviewed', '')
 
             result = run_workflow(
@@ -8252,7 +8343,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 nonlocal proposal_calls, validation_calls, worker_calls, decision_calls
-                prompt = argv[-1]
+                prompt = _runner_prompt(argv, kwargs)
                 model = argv[argv.index("--model") + 1]
                 if model == "default":
                     call_kinds.append("worker")
@@ -8538,7 +8629,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 nonlocal decision_calls, high_worker_calls
-                prompt = argv[-1]
+                prompt = _runner_prompt(argv, kwargs)
                 model = argv[argv.index("--model") + 1]
                 if model == "worker-default":
                     call_kinds.append("worker-default")
@@ -8715,7 +8806,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _write_plan(plan_path, _VALID_PLAN)
 
                     def runner(argv, **kwargs):
-                        prompt = argv[-1]
+                        prompt = _runner_prompt(argv, kwargs)
                         model = argv[argv.index("--model") + 1]
                         if model == "default":
                             return subprocess.CompletedProcess(
@@ -8988,7 +9079,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                             "`aflow/manager.py`."
                         ])
                     return decision(notes=["Focus verification on the upgrade regression."])
-                worker_prompts.append(argv[-1])
+                worker_prompts.append(_runner_prompt(argv, kwargs))
                 if len(worker_prompts) == 2:
                     _write_plan(plan_path, _COMPLETE_PLAN)
                 return subprocess.CompletedProcess(argv, 0, "worker output", "")
@@ -9091,7 +9182,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     if model.startswith("manager-"):
                         manager_calls += 1
                         context = json.loads(
-                            argv[-1].split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                            _runner_prompt(argv, kwargs).split("MANAGER_CONTEXT_JSON:\n", 1)[1]
                         )
                         if manager_calls == 1:
                             assert context["trigger"] == "harness_recovery"
@@ -9117,7 +9208,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         }), "")
 
                     worker_models.append(model)
-                    worker_prompts.append(argv[-1])
+                    worker_prompts.append(_runner_prompt(argv, kwargs))
                     if len(worker_models) == 1:
                         return subprocess.CompletedProcess(
                             argv, 1, "", "throttled\n"
@@ -9167,7 +9258,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         argv, 0, "AFLOW_STOP: first turn needs owner input\n", ""
                     )
                 context = json.loads(
-                    argv[-1].split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                    _runner_prompt(argv, kwargs).split("MANAGER_CONTEXT_JSON:\n", 1)[1]
                 )
                 assert context["trigger"] == "explicit_stop"
                 assert context["manager_note_scope"]["constraints_complete"] is True
@@ -9277,7 +9368,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 model = argv[argv.index("--model") + 1]
                 cwd = Path(kwargs["cwd"])
                 if model.startswith("manager-"):
-                    context = json.loads(argv[-1].split("MANAGER_CONTEXT_JSON:\n", 1)[1])
+                    context = json.loads(_runner_prompt(argv, kwargs).split("MANAGER_CONTEXT_JSON:\n", 1)[1])
                     number = context["decision_number"]
                     assert isinstance(number, int)
                     manager_models.append(model)
@@ -9288,11 +9379,11 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         return decision(action="upgrade_next_implementation", notes=[compatible_note])
                     return decision(action="continue", notes=[])
 
-                worker_prompts.append(argv[-1])
+                worker_prompts.append(_runner_prompt(argv, kwargs))
                 if model == "worker-default":
                     dirty_path.write_bytes(dirty_bytes)
                     return subprocess.CompletedProcess(argv, 0, "implementation attempt", "")
-                if invalid_note in argv[-1]:
+                if invalid_note in _runner_prompt(argv, kwargs):
                     return subprocess.CompletedProcess(argv, 0, "AFLOW_STOP: refused narrowed scope", "")
                 assert model == "worker-high"
                 _write_plan(cwd / "plan.md", _COMPLETE_PLAN)
@@ -9622,7 +9713,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
 
             def runner(argv, **kwargs):
-                if 'high' in ' '.join(argv):
+                if 'high' in _runner_invocation_text(argv, kwargs):
                     return subprocess.CompletedProcess(argv, 0, json.dumps({
                         'schema_version': 1, 'action': 'stop', 'reason': 'Cap reached.',
                         'next_step_notes': [],
@@ -9894,7 +9985,7 @@ def _run_upgrade_resume_scenario(
         nonlocal reviewer_calls
         model = argv[argv.index("--model") + 1]
         if model.startswith("manager-"):
-            prompt = argv[-1]
+            prompt = _runner_prompt(argv, kwargs)
             context = json.loads(prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1])
             manager_numbers.append(context["decision_number"])
             action = (
@@ -9917,7 +10008,7 @@ def _run_upgrade_resume_scenario(
             }), "")
 
         workflow_models.append(model)
-        workflow_prompts.append(argv[-1])
+        workflow_prompts.append(_runner_prompt(argv, kwargs))
         if model == "reviewer-default":
             reviewer_calls += 1
             replacement = Path(kwargs["cwd"]) / f"plan-resume-{interruption}-{reviewer_calls}.md"

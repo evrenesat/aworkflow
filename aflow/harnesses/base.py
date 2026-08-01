@@ -15,6 +15,7 @@ class HarnessInvocation:
     user_prompt: str
     effective_prompt: str
     final_output_argv: tuple[str, ...] | None = None
+    stdin_text: str | None = None
 
     def for_final_output(self) -> HarnessInvocation:
         if self.final_output_argv is None:

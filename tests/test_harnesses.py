@@ -1,4 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
+from dataclasses import replace
 from aflow.harnesses.reasonix import ReasonixAdapter
 
 class AdaptersTests(unittest.TestCase):
@@ -58,9 +59,17 @@ class AdaptersTests(unittest.TestCase):
     def test_codex_without_effort(self) -> None:
         adapter = CodexAdapter()
         invocation = adapter.build_invocation(repo_root=Path('/repo'), model='gpt-5.4', system_prompt='SYSTEM', user_prompt='USER')
-        assert invocation.argv == ('codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '-C', '/repo', '--model', 'gpt-5.4', 'SYSTEM\n\nUSER')
+        assert invocation.argv == ('codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '-C', '/repo', '--model', 'gpt-5.4', '-')
         assert invocation.prompt_mode == 'stdin'
         assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
+        assert invocation.stdin_text == invocation.effective_prompt
+        assert invocation.for_final_output().stdin_text == invocation.effective_prompt
+        final_invocation = replace(
+            invocation,
+            final_output_argv=(*invocation.argv, '--final-output'),
+        ).for_final_output()
+        assert final_invocation.argv[-1] == '--final-output'
+        assert final_invocation.stdin_text == invocation.effective_prompt
 
     def test_codex_with_effort(self) -> None:
         adapter = CodexAdapter()
@@ -68,20 +77,23 @@ class AdaptersTests(unittest.TestCase):
         argv = invocation.argv
         assert '-c' in argv
         assert 'model_reasoning_effort=\'high\'' in argv
-        prompt_index = argv.index('SYSTEM\n\nUSER')
-        assert argv[prompt_index - 2] == '-c'
-        assert argv[-1] == 'SYSTEM\n\nUSER'
+        effort_index = argv.index('model_reasoning_effort=\'high\'')
+        assert argv[effort_index - 1] == '-c'
+        assert argv[-1] == '-'
+        assert invocation.stdin_text == 'SYSTEM\n\nUSER'
 
-    def test_codex_effort_preserves_prompt_as_final_element(self) -> None:
+    def test_codex_effort_preserves_prompt_as_stdin(self) -> None:
         adapter = CodexAdapter()
         invocation = adapter.build_invocation(repo_root=Path('/repo'), model='gpt-5.4', system_prompt='PROMPT', user_prompt='INSTRUCTIONS', effort='low')
-        assert invocation.argv[-1] == 'PROMPT\n\nINSTRUCTIONS'
+        assert invocation.argv[-1] == '-'
+        assert invocation.stdin_text == 'PROMPT\n\nINSTRUCTIONS'
 
     def test_codex_without_model_omits_model_flag(self) -> None:
         adapter = CodexAdapter()
         invocation = adapter.build_invocation(repo_root=Path('/repo'), model=None, system_prompt='SYSTEM', user_prompt='USER')
         assert '--model' not in invocation.argv
-        assert invocation.argv[-1] == 'SYSTEM\n\nUSER'
+        assert invocation.argv[-1] == '-'
+        assert invocation.stdin_text == 'SYSTEM\n\nUSER'
 
     def test_copilot_without_effort(self) -> None:
         adapter = CopilotAdapter()
