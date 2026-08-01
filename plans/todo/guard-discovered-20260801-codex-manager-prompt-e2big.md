@@ -18,11 +18,21 @@ The immediate trigger is a resumed pending manager boundary whose effective prom
 - Plan Branch: `aflow-guard-discovered-20260801-codex-manager-prompt-e2b-20260801-223957`
 - Pre-Handoff Base HEAD: `afb55b387269832adb1d57ab49251692b3d0e1c3`
 - Last Reviewed Checkpoint: `cp2 v01`
+- Last Reviewed HEAD: `992ff0298776580699c871d10894752e9247b6af`
 
 ## Review Log
 
 - 2026-08-01: Approved Checkpoint 1 through `cp1 v01` using the current-worktree fallback from `afb55b3`; Codex stdin transport, injected-runner parity, large-prompt streaming, and prompt-free argv artifacts passed focused verification. The 10 lifecycle failures in the combined harness/runtime files reproduce unchanged at the pre-handoff base and remain outside this checkpoint.
 - 2026-08-01: Approved Checkpoint 2 through `cp2 v01`; default and injected launch errors normalize to bounded nonzero results, and manager, worker, and lifecycle fixtures persist terminal failure evidence. Focused runtime tests, the app-server suite, compilation, and diff hygiene passed. The same 10 pre-existing lifecycle failures remain in the combined harness/runtime files, while the root-level pytest command also encounters the unchanged nested app-server environment collection boundary; the server-local suite passes independently.
+- 2026-08-01: `aflow-review-final` approved the completed handoff without a follow-up fix plan. The final review covered 0 new commits since the latest checkpoint approval and 2 total implementation commits since `afb55b3`; Codex stdin delivery, prompt-free argv artifacts, launch-error normalization, and durable manager, worker, recovery, and lifecycle routing were re-inspected. Focused tests, the app-server suite, compilation, and diff hygiene passed; the combined suite's same 10 failures reproduced unchanged at the pre-handoff base, and the root collection boundary remained unchanged.
+
+## aflow-review-final
+
+- Status: approved
+- Reviewed Through: `cp2 v01`
+- Reviewed Range: `afb55b387269832adb1d57ab49251692b3d0e1c3..992ff0298776580699c871d10894752e9247b6af`
+- New Commits Since Last Review: `0`
+- Total Implementation Commits Since Pre-Handoff Base HEAD: `2`
 
 ## Done Means
 
