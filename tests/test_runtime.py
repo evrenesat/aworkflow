@@ -9412,6 +9412,301 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert "Keep changes scoped" not in worker_prompts[1]
             assert "Focus verification on the upgrade regression." in worker_prompts[1]
 
+    def test_manager_note_correction_accepts_incident_as_one_decision(self) -> None:
+        from aflow.api import CollectingObserver, ManagerDecidedEvent, ManagerStartedEvent
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+            worker_prompts: list[str] = []
+            observer = CollectingObserver()
+
+            def decision(notes: list[str]) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "continue",
+                    "reason": "The bounded repair remains actionable.",
+                    "next_step_notes": notes,
+                    "stop_report": None,
+                }), "")
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                prompt = _runner_prompt(argv, kwargs)
+                calls.append(model)
+                if model == "default":
+                    worker_prompts.append(prompt)
+                    if len(worker_prompts) == 1:
+                        return subprocess.CompletedProcess(
+                            argv, 0,
+                            "AFLOW_SCOPE_PRESSURE: decision 11 needs supervision",
+                            "",
+                        )
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, "completed", "")
+                if "MANAGER_NOTE_CORRECTION_JSON:\n" in prompt:
+                    payload = json.loads(
+                        prompt.split("MANAGER_NOTE_CORRECTION_JSON:\n", 1)[1]
+                    )
+                    assert payload["decision_number"] == 1
+                    assert payload["level"] == "full"
+                    assert payload["original_decision"]["action"] == "continue"
+                    return decision([
+                        "The defect is an incorrect retry boundary; the focused "
+                        "regression must show one accepted manager decision."
+                    ])
+                if calls.count("manager-full") == 1:
+                    return decision(["Use the v04 repair plan for the next step."])
+                return decision([])
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                _pressure_workflow_config(role="worker"),
+                "managed",
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                observer=observer,
+            )
+
+            decision_dir = result.run_dir / "manager" / "decision-001"
+            root_result = json.loads((decision_dir / "result.json").read_text())
+            correction_dir = decision_dir / "note-authority-correction"
+            run_json = json.loads((result.run_dir / "run.json").read_text())
+            started = [event for event in observer.events if isinstance(event, ManagerStartedEvent)]
+            decided = [event for event in observer.events if isinstance(event, ManagerDecidedEvent)]
+
+            assert result.turns_completed == 2
+            assert calls[:4] == [
+                "default", "manager-full", "manager-full", "default",
+            ]
+            assert len(worker_prompts) == 2
+            assert "incorrect retry boundary" in worker_prompts[1]
+            assert root_result["status"] == "accepted"
+            assert root_result["attempt_count"] == 2
+            assert root_result["correction_attempted"] is True
+            assert root_result["original_violation"]["category"] == "plan_selection"
+            assert (decision_dir / "stdout.txt").read_text().find("Use the v04") >= 0
+            assert (correction_dir / "stdout.txt").read_text().find(
+                "incorrect retry boundary"
+            ) >= 0
+            assert len(run_json["manager_history"]) == 2
+            assert run_json["manager_history"][0]["decision_number"] == 1
+            assert [event.decision_number for event in started].count(1) == 1
+            assert [event.decision_number for event in decided].count(1) == 1
+
+    def test_manager_note_correction_failures_do_not_retry_or_launch_worker(self) -> None:
+        cases = {
+            "invalid-json": subprocess.CompletedProcess([], 0, "not JSON", ""),
+            "launch-exception": OSError(errno.ENOENT, "manager missing"),
+            "nonzero": subprocess.CompletedProcess([], 7, "", "launch failed"),
+            "second-authority": subprocess.CompletedProcess([], 0, json.dumps({
+                "schema_version": 1,
+                "action": "continue",
+                "reason": "The bounded repair remains actionable.",
+                "next_step_notes": ["Follow plans/in-progress/other.md."],
+                "stop_report": None,
+            }), ""),
+            "changed-reason": subprocess.CompletedProcess([], 0, json.dumps({
+                "schema_version": 1,
+                "action": "continue",
+                "reason": "A changed reason is forbidden.",
+                "next_step_notes": ["Verify the regression evidence."],
+                "stop_report": None,
+            }), ""),
+        }
+        for name, correction_response in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                repo_root = Path(tmpdir)
+                plan_path = repo_root / "plan.md"
+                _write_plan(plan_path, _VALID_PLAN)
+                calls: list[str] = []
+
+                def runner(argv, **kwargs):
+                    model = argv[argv.index("--model") + 1]
+                    prompt = _runner_prompt(argv, kwargs)
+                    calls.append(model)
+                    if model == "default":
+                        return subprocess.CompletedProcess(
+                            argv, 0, "AFLOW_SCOPE_PRESSURE: correction required", ""
+                        )
+                    if "MANAGER_NOTE_CORRECTION_JSON:\n" in prompt:
+                        if isinstance(correction_response, OSError):
+                            raise correction_response
+                        return correction_response
+                    return subprocess.CompletedProcess([], 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "The bounded repair remains actionable.",
+                        "next_step_notes": ["Use the v04 repair plan."],
+                        "stop_report": None,
+                    }), "")
+
+                with pytest.raises(WorkflowError) as raised:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root, plan_path=plan_path, max_turns=2
+                        ),
+                        _pressure_workflow_config(role="worker"),
+                        "managed",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+                run_dir = raised.value.run_dir
+                assert run_dir is not None
+                root_result = json.loads(
+                    (run_dir / "manager" / "decision-001" / "result.json").read_text()
+                )
+                run_json = json.loads((run_dir / "run.json").read_text())
+                assert calls == ["default", "manager-full", "manager-full"]
+                assert root_result["status"] == "invalid"
+                assert root_result["attempt_count"] == 2
+                assert root_result["correction"]["status"] == "invalid"
+                assert len(run_json["manager_history"]) == 1
+                assert run_json["manager_history"][0]["action"] == "invalid"
+                assert not (run_dir / "manager" / "decision-002").exists()
+
+    def test_noncorrectable_full_note_authority_error_never_corrects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "default":
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_SCOPE_PRESSURE: full authority check", ""
+                    )
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "continue",
+                    "reason": "The bounded repair remains actionable.",
+                    "next_step_notes": ["The implementation must change the parser."],
+                    "stop_report": None,
+                }), "")
+
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _pressure_workflow_config(role="worker"),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            assert calls == ["default", "manager-full"]
+            assert not (
+                run_dir / "manager" / "decision-001" / "note-authority-correction"
+            ).exists()
+
+    def test_manager_note_correction_rejects_mutation_before_second_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "default":
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_SCOPE_PRESSURE: correction required", ""
+                    )
+                _write_plan(plan_path, _VALID_PLAN + "\nmanager mutation\n")
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "continue",
+                    "reason": "The bounded repair remains actionable.",
+                    "next_step_notes": ["Use the v04 repair plan."],
+                    "stop_report": None,
+                }), "")
+
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    _pressure_workflow_config(role="worker"),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            root_result = json.loads(
+                (run_dir / "manager" / "decision-001" / "result.json").read_text()
+            )
+            assert calls == ["default", "manager-full"]
+            assert root_result["status"] == "mutation-detected"
+            assert not (
+                run_dir / "manager" / "decision-001" / "note-authority-correction"
+            ).exists()
+
+    def test_manager_note_correction_rejects_scope_identity_drift_before_call(self) -> None:
+        from aflow.manager_context import build_manager_note_scope as real_scope
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+            scope_calls = 0
+
+            def drifting_scope(**kwargs):
+                nonlocal scope_calls
+                scope_calls += 1
+                result = real_scope(**kwargs)
+                if scope_calls >= 2:
+                    result = {**result, "active_plan_identity": "drifted::checkpoint-9"}
+                return result
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "default":
+                    return subprocess.CompletedProcess(
+                        argv, 0, "AFLOW_SCOPE_PRESSURE: correction required", ""
+                    )
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "continue",
+                    "reason": "The bounded repair remains actionable.",
+                    "next_step_notes": ["Use the v04 repair plan."],
+                    "stop_report": None,
+                }), "")
+
+            with patch("aflow.workflow.build_manager_note_scope", side_effect=drifting_scope):
+                with pytest.raises(WorkflowError) as raised:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root, plan_path=plan_path, max_turns=2
+                        ),
+                        _pressure_workflow_config(role="worker"),
+                        "managed",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            root_result = json.loads(
+                (run_dir / "manager" / "decision-001" / "result.json").read_text()
+            )
+            assert calls == ["default", "manager-full"]
+            assert "identity or note scope drifted" in root_result["error"]
+            assert not (
+                run_dir / "manager" / "decision-001" / "note-authority-correction"
+            ).exists()
+
     def test_manager_harness_recovery_same_plan_retry_notes_use_current_scope(self) -> None:
         for action, expected_retry_model in (
             ("retry_current_step", "primary"),

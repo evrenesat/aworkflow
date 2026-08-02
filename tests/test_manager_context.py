@@ -15,6 +15,11 @@ from aflow.manager_context import (
     summarize_review_rejection,
     scoped_reviewer_rejection_count,
 )
+from aflow.manager import (
+    ManagerDecisionV1,
+    ManagerNoteAuthorityError,
+    build_manager_note_correction_prompts,
+)
 from aflow.stop_marker import detect_stop_marker
 from aflow.repartition import create_envelope, write_envelope_atomic
 
@@ -22,6 +27,53 @@ from aflow.repartition import create_envelope, write_envelope_atomic
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def test_note_correction_context_preserves_boundary_and_lite_redaction() -> None:
+    proposed_scope = {
+        "active_plan_identity": "plans/in-progress/repair.md::checkpoint-2",
+        "constraints_complete": True,
+        "allowed_paths": ["aflow/workflow.py"],
+    }
+    context = {
+        "decision_number": 11,
+        "level": "lite",
+        "trigger": "review_rejected",
+        "active_plan_content": None,
+        "manager_note_scope": proposed_scope,
+        "retry_manager_note_scope": None,
+        "controller_state": {
+            "eligible_actions": ["continue", "stop"],
+            "proposed_next_step": "implement",
+        },
+    }
+    original = ManagerDecisionV1(
+        schema_version=1,
+        action="continue",
+        reason="The bounded repair remains actionable.",
+        next_step_notes=("Use the v04 repair plan.",),
+    )
+    violation = ManagerNoteAuthorityError(
+        "next_step_notes may not replace or select an active plan",
+        category="plan_selection",
+    )
+
+    _, user_prompt = build_manager_note_correction_prompts(
+        context, original_decision=original, violation=violation
+    )
+    payload = json.loads(
+        user_prompt.split("MANAGER_NOTE_CORRECTION_JSON:\n", 1)[1]
+    )
+
+    assert payload["decision_number"] == 11
+    assert payload["level"] == "lite"
+    assert payload["trigger"] == "review_rejected"
+    assert payload["eligible_actions"] == ["continue", "escalate_to_full", "stop"]
+    assert payload["proposed_transition"] == "implement"
+    assert payload["manager_note_scope"] == proposed_scope
+    assert payload["target_plan_identity"] == proposed_scope["active_plan_identity"]
+    assert "active_plan_content" not in payload
+    assert "Secret implementation plan" not in user_prompt
 
 
 def _snapshot(*, unchecked_steps: int = 1) -> dict[str, object]:

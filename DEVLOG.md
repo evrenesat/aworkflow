@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-08-02 — Correct manager plan-selection notes at one boundary
+
+- An otherwise valid manager response whose only authority defect is
+  plan-selection wording now receives one same-profile correction sub-attempt
+  before persistence; only advisory notes may change.
+- Original and corrected traces remain under one decision directory, while
+  routing, history, observer events, and turn accounting retain one logical
+  manager decision. Mutation, boundary drift, immutable-field changes, launch
+  failure, invalid JSON, and a second authority failure stop without retry.
+- Verification passed: focused context (`1` test), focused runtime (`6` tests,
+  `5` subtests), manager/context (`74` tests), broader manager runtime (`26`
+  tests, `7` subtests), and documentation (`20` tests), plus compilation and
+  diff hygiene.
+
 ## 2026-08-02 — Bind pending repartition resume identity and paths
 
 - Non-reset explicit and AUTO resume now require the restored active scope,

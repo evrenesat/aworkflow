@@ -30,6 +30,9 @@ from .config import (
 from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
+    ManagerNoteAuthorityError,
+    build_manager_note_correction_prompts,
+    build_manager_note_correction_result,
     build_manager_prompts,
     build_repartition_prompts,
     eligible_implementation_upgrade,
@@ -38,6 +41,7 @@ from .manager import (
     resolve_manager_role,
     validate_manager_decision,
     validate_manager_note_authority,
+    validate_manager_note_correction,
 )
 from .manager_context import (
     build_manager_context,
@@ -71,7 +75,7 @@ from .recovery import (
     TeamLeadRecoveryDecisionError,
 )
 from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
-from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
+from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
@@ -90,6 +94,16 @@ from aflow.api.events import (
 
 PROCESS_POLL_INTERVAL_SECONDS = 0.05
 BANNER_REFRESH_INTERVAL_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class ManagerCallOutcome:
+    """The durable result of one logical manager decision boundary."""
+
+    decision: ManagerDecisionV1 | None
+    context: dict[str, object]
+    error: str | None
+    correction_consumed: bool = False
 
 _REVIEW_SKILL_NAMES = frozenset({
     "aflow-review-squash",
@@ -4733,8 +4747,8 @@ def run_workflow(
         proposed_target_plan: Path | None,
         retry_target_plan: Path | None,
         context_run_dir: Path | None = None,
-    ) -> tuple[ManagerDecisionV1 | None, dict[str, object], str | None]:
-        """Run and durably record one manager attempt without altering turn accounting."""
+    ) -> ManagerCallOutcome:
+        """Run and durably record one logical manager decision boundary."""
         decision_number = state.manager_decision_number + 1
         manager_plan_path = (
             Path(boundary.active_plan_path)
@@ -4833,7 +4847,12 @@ def run_workflow(
             "level": level, "trigger": boundary.trigger, "status": "invalid",
         }
         parsed: ManagerDecisionV1 | None = None
+        original_candidate: ManagerDecisionV1 | None = None
+        note_violation: ManagerNoteAuthorityError | None = None
         error: str | None = None
+        role_resolution = None
+        manager_profile = None
+        manager_adapter = None
         try:
             role_resolution = resolve_manager_role(
                 workflow_config, level=level, baseline_team=baseline_team_name  # type: ignore[arg-type]
@@ -4864,6 +4883,7 @@ def run_workflow(
                 eligible_actions=eligible,
                 proposed_transition=boundary.proposed_transition,
             )
+            original_candidate = candidate
             if candidate.next_step_notes:
                 note_scope = (
                     (
@@ -4883,6 +4903,11 @@ def run_workflow(
                 )
             parsed = candidate
             result_payload.update({"status": "accepted", **parsed.to_dict()})
+        except ManagerNoteAuthorityError as exc:
+            parsed = None
+            note_violation = exc
+            error = str(exc)
+            result_payload["error"] = error
         except (ManagerDecisionError, ValueError, WorkflowError) as exc:
             parsed = None
             error = str(exc)
@@ -4891,6 +4916,7 @@ def run_workflow(
         fingerprint_after = _manager_repo_fingerprint()
         if fingerprint_after != fingerprint_before:
             parsed = None
+            note_violation = None
             error = "manager mutated repository or plan state"
             result_payload.update({"status": "mutation-detected", "error": error})
         artifacts = write_manager_artifacts(
@@ -4905,6 +4931,159 @@ def run_workflow(
                 "active_plan_content": captured_active_plan,
             },
         )
+        correction_consumed = False
+        if (
+            note_violation is not None
+            and note_violation.correctable
+            and original_candidate is not None
+            and fingerprint_after == fingerprint_before
+        ):
+            correction_consumed = True
+            correction_status = "invalid"
+            correction_stdout = ""
+            correction_stderr = ""
+            correction_error: str | None = None
+            correction_result: dict[str, object] = {"status": "invalid"}
+            correction_system_prompt = ""
+            correction_user_prompt = ""
+            correction_invoked = False
+            captured_proposed_identity = (
+                proposed_note_scope.get("active_plan_identity")
+                if proposed_note_scope is not None else None
+            )
+            captured_retry_identity = (
+                retry_note_scope.get("active_plan_identity")
+                if retry_note_scope is not None else None
+            )
+            current_proposed_scope = note_scope_for(proposed_target_plan)
+            current_retry_scope = note_scope_for(retry_target_plan)
+            if retry_target_plan == proposed_target_plan:
+                current_retry_scope = None
+            current_proposed_identity = (
+                current_proposed_scope.get("active_plan_identity")
+                if current_proposed_scope is not None else None
+            )
+            current_retry_identity = (
+                current_retry_scope.get("active_plan_identity")
+                if current_retry_scope is not None else None
+            )
+            boundary_drifted = (
+                current_proposed_scope != proposed_note_scope
+                or current_retry_scope != retry_note_scope
+                or current_proposed_identity != captured_proposed_identity
+                or current_retry_identity != captured_retry_identity
+            )
+            try:
+                if boundary_drifted:
+                    raise ManagerDecisionError(
+                        "manager target plan identity or note scope drifted before correction"
+                    )
+                correction_system_prompt, correction_user_prompt = (
+                    build_manager_note_correction_prompts(
+                        context,
+                        original_decision=original_candidate,
+                        violation=note_violation,
+                    )
+                )
+                correction_invoked = True
+                if manager_profile is None or manager_adapter is None:
+                    raise ManagerDecisionError(
+                        "manager correction cannot reuse unresolved manager profile"
+                    )
+                correction_invocation = manager_adapter.build_invocation(
+                    repo_root=execution_repo_root,
+                    model=manager_profile.model,
+                    system_prompt=correction_system_prompt,
+                    user_prompt=correction_user_prompt,
+                    effort=manager_profile.effort,
+                ).for_final_output()
+                correction_result["invocation"] = {
+                    "label": correction_invocation.label,
+                    "argv": list(correction_invocation.argv),
+                }
+                if runner is None:
+                    correction_completed = _run_process(
+                        correction_invocation, execution_repo_root, banner, state
+                    )
+                else:
+                    correction_completed = _run_injected_runner(
+                        runner, correction_invocation, execution_repo_root
+                    )
+                correction_stdout = correction_completed.stdout
+                correction_stderr = correction_completed.stderr
+                if correction_completed.returncode != 0:
+                    raise ManagerDecisionError(
+                        "manager note correction harness exited with code "
+                        f"{correction_completed.returncode}"
+                    )
+                corrected = validate_manager_decision(
+                    parse_manager_decision(correction_stdout),
+                    level=level,  # type: ignore[arg-type]
+                    eligible_actions=eligible,
+                    proposed_transition=boundary.proposed_transition,
+                )
+                selected_scope = (
+                    (
+                        retry_note_scope
+                        if retry_note_scope is not None
+                        else proposed_note_scope
+                    )
+                    if corrected.action in {
+                        "retry_current_step", "switch_to_backup_and_retry"
+                    }
+                    else proposed_note_scope
+                )
+                if corrected.next_step_notes:
+                    validate_manager_note_authority(
+                        corrected.next_step_notes, scope=selected_scope
+                    )
+                corrected = validate_manager_note_correction(
+                    original_candidate, corrected
+                )
+                if _manager_repo_fingerprint() != fingerprint_before:
+                    raise ManagerDecisionError(
+                        "manager note correction mutated repository or plan state"
+                    )
+                parsed = corrected
+                error = None
+                correction_status = "accepted"
+                correction_result.update({"status": "accepted", **corrected.to_dict()})
+            except (ManagerDecisionError, ValueError, WorkflowError) as exc:
+                parsed = None
+                correction_error = str(exc)
+                error = correction_error
+                correction_result.update({"status": "invalid", "error": correction_error})
+
+            if correction_invoked:
+                correction_paths = write_manager_note_correction_artifacts(
+                    run_paths,
+                    decision_number=decision_number,
+                    system_prompt=correction_system_prompt,
+                    user_prompt=correction_user_prompt,
+                    stdout=correction_stdout,
+                    stderr=correction_stderr,
+                    result=correction_result,
+                )
+                result_payload = build_manager_note_correction_result(
+                    result_payload,
+                    original_violation=note_violation,
+                    correction_artifact_path=str(
+                        correction_paths.directory.relative_to(run_paths.run_dir)
+                    ),
+                    correction_status=correction_status,
+                    final_decision=parsed,
+                    error=correction_error,
+                )
+            else:
+                result_payload.update({
+                    "status": "invalid",
+                    "error": correction_error
+                    or "manager boundary drift prevented note correction",
+                })
+            artifacts.result.write_text(
+                json.dumps(result_payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         state.manager_decision_number = decision_number
         state.manager_history.append(ManagerDecisionSummary(
             decision_number=decision_number, level=level, trigger=boundary.trigger,
@@ -4919,7 +5098,12 @@ def run_workflow(
             report_path="manager-report.md" if action == "stop" else None,
             artifact_paths=artifact_paths,
         ))
-        return parsed, context, error
+        return ManagerCallOutcome(
+            decision=parsed,
+            context=context,
+            error=error,
+            correction_consumed=correction_consumed,
+        )
 
     def _persist_repartition(pending: PendingRepartitionV1) -> None:
         state.pending_repartition = pending
@@ -5919,7 +6103,7 @@ def run_workflow(
             state.semantic_stall_count = int(signals.get("semantic_stall_count", 0) or 0)
             state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
         level = _manager_level_for_boundary(selection_context)
-        decision, context, error = _run_manager_call(
+        outcome = _run_manager_call(
             level=level,
             boundary=boundary,
             proposed_target_plan=proposed_target_plan,
@@ -5930,9 +6114,15 @@ def run_workflow(
             ),
             context_run_dir=context_run_dir,
         )
-        if decision is None and level == "lite" and error != "manager mutated repository or plan state":
+        decision, context, error = outcome.decision, outcome.context, outcome.error
+        if (
+            decision is None
+            and level == "lite"
+            and not outcome.correction_consumed
+            and error != "manager mutated repository or plan state"
+        ):
             boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_invalid", "evidence": error})
-            decision, context, error = _run_manager_call(
+            outcome = _run_manager_call(
                 level="full",
                 boundary=boundary,
                 proposed_target_plan=proposed_target_plan,
@@ -5943,9 +6133,10 @@ def run_workflow(
                 ),
                 context_run_dir=context_run_dir,
             )
+            decision, context, error = outcome.decision, outcome.context, outcome.error
         elif decision is not None and decision.action == "escalate_to_full":
             boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_escalation", "evidence": decision.reason})
-            decision, context, error = _run_manager_call(
+            outcome = _run_manager_call(
                 level="full",
                 boundary=boundary,
                 proposed_target_plan=proposed_target_plan,
@@ -5956,6 +6147,7 @@ def run_workflow(
                 ),
                 context_run_dir=context_run_dir,
             )
+            decision, context, error = outcome.decision, outcome.context, outcome.error
         if decision is None:
             _fail_manager_gate(
                 context,
@@ -6137,12 +6329,13 @@ def run_workflow(
                 asdict(record) for record in state.repartition_history
             ],
         )
-        decision, context, error = _run_manager_call(
+        outcome = _run_manager_call(
             level="full",
             boundary=boundary,
             proposed_target_plan=None,
             retry_target_plan=None,
         )
+        decision, context, error = outcome.decision, outcome.context, outcome.error
         report = _write_manager_report(
             context,
             reason=reason if decision is not None else (error or reason),
@@ -6251,12 +6444,13 @@ def run_workflow(
                     asdict(record) for record in state.repartition_history
                 ],
             )
-            decision, context, error = _run_manager_call(
+            outcome = _run_manager_call(
                 level="full",
                 boundary=boundary,
                 proposed_target_plan=target_plan_path,
                 retry_target_plan=None,
             )
+            decision, context, error = outcome.decision, outcome.context, outcome.error
             if decision is None:
                 _fail_manager_gate(
                     context,

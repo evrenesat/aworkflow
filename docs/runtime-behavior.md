@@ -228,6 +228,14 @@ characters per note. If an otherwise valid non-terminal decision returns more
 notes, the controller retains the first eight instead of spending a Full call
 solely on surplus advice. Invalid note types, empty notes, overlong notes, and
 notes forbidden for the selected action remain protocol errors.
+One narrow exception preserves the same fail-closed authority: when an
+otherwise valid response fails only because its notes select or reference a
+plan, the same manager profile receives one compact correction request before
+the logical decision is persisted. It must return the complete schema with
+`schema_version`, `action`, `reason`, and `stop_report` unchanged; only
+`next_step_notes` may differ. The controller rechecks the original target,
+scope, eligible actions, and repository fingerprint. A failed correction is
+terminal and cannot trigger another correction or Lite-to-Full escalation.
 
 At the first reviewer rejection in an open implementation scope, Lite decides
 from the cause: it can keep the same worker for a bounded repair, select one
@@ -453,7 +461,10 @@ Saved data includes:
 - manager decisions under `manager/decision-NNN/`, each with immutable
   `boundary.json` inputs, exact context, system/user prompts, stdout, stderr,
   and parsed result. Historical analysis rebuilds the context from the boundary
-  inputs and reports any stored-context drift.
+  inputs and reports any stored-context drift. When note-authority correction
+  runs, its exact prompts and streams live additively under
+  `note-authority-correction/`; the root `result.json` links that attempt and
+  remains the canonical accepted-or-invalid result for one decision number.
 - `manager-report.md` for a manager stop, manager protocol/mutation failure,
   explicit workflow stop, or another terminal incident after run creation
 

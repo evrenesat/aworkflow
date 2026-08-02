@@ -115,6 +115,14 @@ selection, and worker-mandate language are rejected locally. Before any worker
 launch, an invalid persisted note is marked, receives exactly one Full
 `pending_notes_invalid` correction, and either has corrected/empty notes made
 durable or stops; legacy notes without the marker remain readable.
+A current response whose only defect is plan-selection wording receives one
+separate correction sub-attempt before decision persistence. The controller
+reuses the captured decision number, level, model/profile, eligible actions,
+target identity, note scope, boundary, and repository fingerprint; only
+`next_step_notes` may change. Both harness responses remain durable under one
+decision directory, while history, events, routing, and turn accounting see
+one logical decision. Drift, mutation, a changed non-note field, or any second
+failure stops at that boundary without Lite escalation or another correction.
 Boundary schema versioning preserves the legacy shape for old artifacts while
 new boundaries snapshot structured plan state. Resume rebases run-local scope
 turn numbering and carries prior rejection progress explicitly. Legacy scopes
