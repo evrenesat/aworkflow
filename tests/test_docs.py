@@ -5,7 +5,7 @@ class SkillDocsTests(unittest.TestCase):
     def test_skill_files_do_not_contain_workflow_placeholders(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         placeholders = ('{ORIGINAL_PLAN_PATH}', '{ACTIVE_PLAN_PATH}', '{NEW_PLAN_PATH}')
-        for skill_name in ('aflow-plan', 'aflow-execute-plan', 'aflow-execute-checkpoint', 'aflow-review-squash', 'aflow-review-checkpoint', 'aflow-review-final', 'aflow-merge', 'aflow-harness-recovery-lead', 'aflow-assistant'):
+        for skill_name in ('aflow-plan', 'aflow-execute-plan', 'aflow-execute-checkpoint', 'aflow-review-squash', 'aflow-review-checkpoint', 'aflow-review-final', 'aflow-merge', 'aflow-harness-recovery-lead', 'aflow-guard-development-run', 'aflow-assistant'):
             skill_path = repo_root / 'aflow' / 'bundled_skills' / skill_name / 'SKILL.md'
             text = skill_path.read_text(encoding='utf-8')
             for placeholder in placeholders:
@@ -22,6 +22,7 @@ class SkillDocsTests(unittest.TestCase):
             'aflow-review-final',
             'aflow-merge',
             'aflow-harness-recovery-lead',
+            'aflow-guard-development-run',
             'aflow-assistant',
         ):
             skill_path = repo_root / 'aflow' / 'bundled_skills' / skill_name / 'SKILL.md'
@@ -51,6 +52,20 @@ class SkillDocsTests(unittest.TestCase):
         assert '--all' in text
         assert 'Do not assume the original `aflow` repo checkout exists' in text
         assert '## Bundled Engine Map First' in text
+
+    def test_guard_skill_is_self_contained_and_same_task_only(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        skill_root = repo_root / 'aflow' / 'bundled_skills' / 'aflow-guard-development-run'
+        assert (skill_root / 'SKILL.md').exists()
+        assert (skill_root / 'agents' / 'openai.yaml').exists()
+        assert (skill_root / 'references' / 'aflow-defect-plan.md').exists()
+        assert (skill_root / 'scripts' / 'aflow_guard_snapshot.py').exists()
+
+        text = (skill_root / 'SKILL.md').read_text(encoding='utf-8')
+        assert 'Never create a secondary task' in text
+        assert 'create_thread' not in text
+        assert 'send_message_to_thread' not in text
+        assert '--guard-thread-id <same-task-id>' in text
 
     def test_final_review_skill_is_distinct_and_no_squash(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

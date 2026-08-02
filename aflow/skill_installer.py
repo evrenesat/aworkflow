@@ -30,6 +30,7 @@ BUNDLED_SKILL_METADATA = (
     BundledSkillMetadata(name="aflow-harness-recovery-lead", default=True),
     BundledSkillMetadata(name="aflow-manager", default=True),
     BundledSkillMetadata(name="aflow-repartition-checkpoint", default=True),
+    BundledSkillMetadata(name="aflow-guard-development-run", default=True),
     BundledSkillMetadata(name="aflow-assistant", default=False),
 )
 

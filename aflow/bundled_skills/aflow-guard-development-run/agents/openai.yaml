@@ -1,0 +1,4 @@
+interface:
+  display_name: "Guard AFlow Run"
+  short_description: "Same-task supervision for any AFlow run"
+  default_prompt: "Use $aflow-guard-development-run to guard this AFlow run every ten minutes in this task and collect evidence for improving AFlow."

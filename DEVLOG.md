@@ -14,6 +14,13 @@
   one accepted post-turn decision, launches checkpoint review, and retains the
   implementation change and worktree without a false stop or cleanup.
 
+## 2026-08-02 — Bundle same-task AFlow guard
+
+- Moved `aflow-guard-development-run` into AFlow's canonical bundled-skill
+  inventory and made it a default install for supported harnesses.
+- Guard heartbeats and actionable reports now stay in the task that requested
+  supervision; the bundled helper retains pinned-run and provenance checks.
+
 ## 2026-08-02 — Bind pending repartition resume identity and paths
 
 - Non-reset explicit and AUTO resume now require the restored active scope,
