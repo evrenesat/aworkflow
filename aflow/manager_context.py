@@ -15,7 +15,12 @@ import re
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from .analyzer import analyze_progress_tail, extract_text_signals, snapshot_signature
+from .analyzer import (
+    analyze_progress_tail,
+    classify_turn_text_signals,
+    extract_text_signals,
+    snapshot_signature,
+)
 from .plan import PlanParseError, load_plan_tolerant
 from .repartition import parse_envelope_bytes
 from .scope_pressure import has_scope_pressure
@@ -124,6 +129,7 @@ class ManagerContextV2:
     controller_state: dict[str, Any]
     active_plan_content: str | None = None
     original_plan_content: str | None = None
+    plan_content_disclosure: dict[str, str] | None = None
     envelope: dict[str, Any] | None = None
     active_scope_rejection_ledger: tuple[dict[str, Any], ...] = ()
     implementation_attempts: dict[str, Any] | None = None
@@ -793,7 +799,11 @@ def build_manager_context(
         "proposed_transition": boundary.get("proposed_transition", finished.get("chosen_transition")),
         "recovery": finished.get("recovery_action"),
         "conditions": finished.get("conditions"), "detected_stop": extract_stop_markers(stdout) + extract_stop_markers(stderr),
-        "diagnostics": {"signals": sorted(set(extract_text_signals("\n".join((stdout, stderr))))), "stdout_excerpt": _bounded(stdout), "stderr_excerpt": _bounded(stderr)},
+        "diagnostics": {
+            "signals": sorted(set(extract_text_signals("\n".join((stdout, stderr))))),
+            "stdout_excerpt": _bounded(stdout),
+            "stderr_excerpt": _bounded(stderr),
+        },
         "raw_artifacts": raw_artifacts,
     }
     manager_records = _manager_records(run_dir, before_decision_number=decision_number)
@@ -857,6 +867,18 @@ def build_manager_context(
         # Exact schema-v1 output preserved for selector-2 and selector-absent.
         return json.loads(json.dumps(context.to_dict(), sort_keys=True))
     # --- Schema v2 additions ---
+    signal_evidence = classify_turn_text_signals(
+        stdout,
+        stderr,
+        finished.get("status"),
+        finished.get("returncode"),
+    )
+    context.finished_turn["diagnostics"]["signals"] = sorted(
+        {item.name for item in signal_evidence}
+    )
+    context.finished_turn["diagnostics"]["signal_provenance"] = [
+        asdict(item) for item in signal_evidence
+    ]
     if level == "lite":
         # Lite retains compact routing evidence, never verbatim reviewer output.
         reviewer_turn_numbers = {
@@ -1089,6 +1111,18 @@ def build_manager_context(
         controller_state=context.controller_state,
         active_plan_content=context.active_plan_content,
         original_plan_content=original_plan_content,
+        plan_content_disclosure={
+            "active_plan_content": (
+                "intentionally_omitted"
+                if level == "lite"
+                else "included" if context.active_plan_content else "unavailable"
+            ),
+            "original_plan_content": (
+                "intentionally_omitted"
+                if level == "lite"
+                else "included" if original_plan_content else "unavailable"
+            ),
+        },
         envelope=envelope,
         active_scope_rejection_ledger=tuple(active_rejections),
         implementation_attempts=scoped_attempts,

@@ -24,6 +24,22 @@ from aflow.stop_marker import detect_stop_marker
 from aflow.repartition import create_envelope, write_envelope_atomic
 
 
+INCIDENT_SIGNAL_TEXT = "\n".join(
+    (
+        "Plan Branch: main; the current checkout is aflow-feature and requires me to stop and escalate",
+        "Need your direction on one point",
+        "the original plan file is missing after the turn",
+        "merge verification cannot be completed safely",
+    )
+)
+INCIDENT_SIGNAL_NAMES = [
+    "branch_mismatch_review_block",
+    "dirty_merge_verification",
+    "needs_human_direction",
+    "original_plan_missing",
+]
+
+
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -87,22 +103,34 @@ def _snapshot(*, unchecked_steps: int = 1) -> dict[str, object]:
     }
 
 
-def _write_turn(run_dir: Path, number: int, *, step: str, role: str, stdout: str, before: dict[str, object] | None = None, after: dict[str, object] | None = None) -> None:
+def _write_turn(
+    run_dir: Path,
+    number: int,
+    *,
+    step: str,
+    role: str,
+    stdout: str,
+    stderr: str = "diagnostic only",
+    status: str = "completed",
+    returncode: int | None = 0,
+    before: dict[str, object] | None = None,
+    after: dict[str, object] | None = None,
+) -> None:
     turn_dir = run_dir / "turns" / f"turn-{number:03d}"
     turn_dir.mkdir(parents=True)
     _write_json(turn_dir / "result.json", {
         "turn_number": number,
         "step_name": step,
         "step_role": role,
-        "status": "completed",
-        "returncode": 0,
+        "status": status,
+        "returncode": returncode,
         "selector": "codex.nano",
         "snapshot_before": before or _snapshot(),
         "snapshot_after": after or _snapshot(),
         "chosen_transition": "next",
     })
     (turn_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
-    (turn_dir / "stderr.txt").write_text("diagnostic only", encoding="utf-8")
+    (turn_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
 
 
 def _run(tmp_path: Path) -> tuple[Path, Path]:
@@ -581,7 +609,14 @@ def test_rejection_summaries_normalize_bound_and_extract_summary(tmp_path: Path)
 def test_schema_v1_preserved_for_selector_2_boundary(tmp_path: Path) -> None:
     """Selector-2 boundaries must produce byte-for-byte identical schema-v1."""
     run_dir, _ = _run(tmp_path)
-    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout="output",
+        stderr=INCIDENT_SIGNAL_TEXT,
+    )
 
     context_v1 = build_manager_context(run_dir)
     context_v2_boundary = build_manager_context(
@@ -593,6 +628,9 @@ def test_schema_v1_preserved_for_selector_2_boundary(tmp_path: Path) -> None:
     assert context_v2_boundary["schema_version"] == 1
     # Same output (ignoring run_extract ordering which is already sort_keys=True)
     assert context_v1 == context_v2_boundary
+    diagnostics = context_v1["finished_turn"]["diagnostics"]
+    assert diagnostics["signals"] == INCIDENT_SIGNAL_NAMES
+    assert "signal_provenance" not in diagnostics
 
 
 def test_schema_v2_produced_for_selector_3_boundary(tmp_path: Path) -> None:
@@ -660,6 +698,90 @@ def test_schema_v2_lite_context_omits_plan_content(tmp_path: Path) -> None:
 
     assert context["active_plan_content"] is None
     assert context["original_plan_content"] is None
+    assert context["plan_content_disclosure"] == {
+        "active_plan_content": "intentionally_omitted",
+        "original_plan_content": "intentionally_omitted",
+    }
+    assert "Secret implementation plan" not in json.dumps(context)
+    assert "private instruction" not in json.dumps(context)
+
+
+def test_schema_v2_classifies_diagnostics_by_stream_and_turn_outcome(
+    tmp_path: Path,
+) -> None:
+    run_dir, _ = _run(tmp_path)
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout="completed successfully",
+        stderr=INCIDENT_SIGNAL_TEXT + "x" * DIAGNOSTIC_LIMIT,
+    )
+
+    successful = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={"context_schema_version": 3},
+    )
+
+    diagnostics = successful["finished_turn"]["diagnostics"]
+    assert diagnostics["signals"] == []
+    assert diagnostics["signal_provenance"] == []
+    assert diagnostics["stderr_excerpt"].endswith(
+        "\n[diagnostic excerpt truncated]"
+    )
+    assert successful["finished_turn"]["raw_artifacts"][1]["byte_size"] > (
+        DIAGNOSTIC_LIMIT
+    )
+
+    _write_turn(
+        run_dir,
+        2,
+        step="implement",
+        role="implementer",
+        stdout=INCIDENT_SIGNAL_TEXT,
+        stderr="diagnostic only",
+    )
+    semantic = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={"context_schema_version": 3},
+    )["finished_turn"]["diagnostics"]
+    assert semantic["signals"] == INCIDENT_SIGNAL_NAMES
+    assert semantic["signal_provenance"] == [
+        {
+            "name": name,
+            "source": "semantic_stdout",
+            "trust_class": "semantic_output",
+        }
+        for name in INCIDENT_SIGNAL_NAMES
+    ]
+
+    _write_turn(
+        run_dir,
+        3,
+        step="implement",
+        role="implementer",
+        stdout="failed",
+        stderr=INCIDENT_SIGNAL_TEXT,
+        status="failed",
+        returncode=1,
+    )
+    failed = build_manager_context(
+        run_dir,
+        level="lite",
+        boundary={"context_schema_version": 3},
+    )["finished_turn"]["diagnostics"]
+    assert failed["signals"] == INCIDENT_SIGNAL_NAMES
+    assert failed["signal_provenance"] == [
+        {
+            "name": name,
+            "source": "failure_stderr",
+            "trust_class": "failure_diagnostic",
+        }
+        for name in INCIDENT_SIGNAL_NAMES
+    ]
 
 
 def test_lite_context_has_bounded_controller_owned_note_scope(tmp_path: Path) -> None:
@@ -824,6 +946,30 @@ def test_schema_v2_full_includes_active_plan_content(tmp_path: Path) -> None:
 
     assert context["active_plan_content"] is not None
     assert "Secret implementation plan" in context["active_plan_content"]
+    assert context["original_plan_content"] is not None
+    assert context["plan_content_disclosure"] == {
+        "active_plan_content": "included",
+        "original_plan_content": "included",
+    }
+
+
+def test_schema_v2_full_marks_missing_plan_bodies_unavailable(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="output")
+    plan.unlink()
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary={"context_schema_version": 3},
+    )
+
+    assert not context["active_plan_content"]
+    assert context["original_plan_content"] is None
+    assert context["plan_content_disclosure"] == {
+        "active_plan_content": "unavailable",
+        "original_plan_content": "unavailable",
+    }
 
 
 def test_schema_v2_full_uses_validated_immutable_envelope_payload(tmp_path: Path) -> None:

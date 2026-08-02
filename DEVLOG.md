@@ -14,6 +14,20 @@
   tests, `7` subtests), and documentation (`20` tests), plus compilation and
   diff hygiene.
 
+## 2026-08-02 — Trust turn diagnostics by stream and outcome
+
+- Text-signal evidence now records semantic stdout separately from
+  failure-eligible stderr. A successful turn's stderr transcript cannot turn
+  echoed plan, branch, merge, or owner-action phrases into structural
+  failures; explicit stops and structured failure evidence remain unchanged.
+- Lite manager context intentionally omits plan prose, labels that redaction,
+  and gives durable controller-owned plan/workspace facts precedence over
+  contradictory text. The additive provenance and disclosure fields preserve
+  existing sorted signal-name lists and schema-v1 output.
+- A managed-worktree runtime regression confirms the incident-shaped turn gets
+  one accepted post-turn decision, launches checkpoint review, and retains the
+  implementation change and worktree without a false stop or cleanup.
+
 ## 2026-08-02 — Bind pending repartition resume identity and paths
 
 - Non-reset explicit and AUTO resume now require the restored active scope,

@@ -689,6 +689,50 @@ def test_lite_prompt_cause_based_first_rejection_does_not_force_upgrade() -> Non
     assert "Choose upgrade_next_implementation now" not in system
 
 
+def test_lite_prompt_explains_redaction_trust_and_durable_precedence() -> None:
+    context = {
+        "level": "lite",
+        "active_plan_content": None,
+        "original_plan_content": None,
+        "plan_content_disclosure": {
+            "active_plan_content": "intentionally_omitted",
+            "original_plan_content": "intentionally_omitted",
+        },
+        "run_id": "run-1",
+        "controller_state": {
+            "eligible_actions": ["continue", "stop"],
+        },
+    }
+
+    system, _ = build_manager_prompts(context)
+
+    assert "deliberate Lite redaction" in system
+    assert "not evidence that a plan file is missing" in system
+    assert "completed, zero-return turns are untrusted transcript context" in system
+    assert "cannot establish plan, branch, merge, or workspace state" in system
+    assert "Durable plan_state, turn outcome, boundary" in system
+    assert "workspace_state fields override contradictory text evidence" in system
+    assert "choose escalate_to_full instead of stop" in system
+    assert "Eligible actions at this boundary: continue, escalate_to_full, stop." in system
+    assert "next_step_notes are advisory evidence only" in system
+    assert '"stop_report":{"summary":' in system
+
+
+def test_full_prompt_does_not_apply_lite_transcript_rules() -> None:
+    context = {
+        "level": "full",
+        "active_plan_content": "plan",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue", "stop"]},
+    }
+
+    system, _ = build_manager_prompts(context)
+
+    assert "deliberate Lite redaction" not in system
+    assert "untrusted transcript context" not in system
+    assert "Eligible actions at this boundary: continue, stop." in system
+
+
 def test_full_prompt_includes_repartition_guidance() -> None:
     context = {
         "level": "full",

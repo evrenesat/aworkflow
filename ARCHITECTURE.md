@@ -54,6 +54,15 @@ teardown begin only after the manager accepts that terminal action. Lite gets
 compact semantic evidence and structured state, while Full additionally gets
 the complete active plan. Manager calls and their exact artifacts live outside
 the workflow turn sequence, so they never affect turn counts or checkpoints.
+Turn-text diagnostics preserve the stream and structured outcome boundary:
+semantic stdout is scanned for text signals, successful zero-return stderr may
+be a harness transcript and remains untrusted context, and stderr becomes a
+failure diagnostic only for a nonzero return code or a failure-like turn
+status. Explicit `AFLOW_STOP` parsing remains independent on both streams.
+Durable plan, branch, worktree, boundary, and turn-outcome fields override
+contradictory transcript text. Lite keeps active and original plan bodies null
+and marks both as intentionally omitted; this redaction is not evidence that a
+plan is missing, while Full can include available plan content.
 Every manager prompt names the configured manager skill and embeds the complete
 closed JSON protocol, including the structured stop-report shape. Invalid
 manager output at a terminal incident cannot replace the original controller

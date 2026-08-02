@@ -4,6 +4,7 @@ from dataclasses import replace
 import errno
 import hashlib
 from typing import Mapping
+from aflow.analyzer import extract_text_signals
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
 from aflow.api.events import ExecutionEventType
@@ -9889,6 +9890,178 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert calls == ["default", "manager-full"]
             assert "Owner input is required." in str(raised.value)
             assert "NameError" not in str(raised.value)
+
+    def test_manager_successful_transcript_stderr_routes_managed_worktree_to_review(
+        self,
+    ) -> None:
+        class ReviewLaunched(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch="main")
+            worktree_root = root / "worktrees"
+            worktree_root.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+
+            workflow = WorkflowConfig(
+                steps={
+                    "implement_plan": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(
+                                to="review_cp_implementation",
+                                preserve_active_plan=True,
+                            ),
+                        ),
+                    ),
+                    "review_cp_implementation": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement_plan"),),
+                    ),
+                },
+                first_step="implement_plan",
+                setup=("worktree", "branch"),
+                teardown=(),
+                main_branch="main",
+            )
+            wf_config = WorkflowUserConfig(
+                aflow=AflowSection(
+                    team_lead="worker",
+                    worktree_root=str(worktree_root),
+                ),
+                roles={
+                    "worker": "codex.worker",
+                    "reviewer": "codex.reviewer",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+            incident_stderr = (
+                "Prompt transcript: Plan Branch is feature/expected, but the "
+                "current checkout is feature/actual.\n"
+                "Plan transcript: Need your direction on one point.\n"
+                "Test transcript: the original plan file is missing after the turn.\n"
+                "Diff transcript: merge verification cannot be completed safely.\n"
+            )
+            assert set(extract_text_signals(incident_stderr)) == {
+                "branch_mismatch_review_block",
+                "dirty_merge_verification",
+                "needs_human_direction",
+                "original_plan_missing",
+            }
+            manager_prompts: list[str] = []
+            manager_contexts: list[dict[str, object]] = []
+            review_cwds: list[Path] = []
+            failed_events: list[object] = []
+
+            class RecordingObserver:
+                def on_event(self, event: object) -> None:
+                    if event.event_type == ExecutionEventType.RUN_FAILED:  # type: ignore[attr-defined]
+                        failed_events.append(event)
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                cwd = Path(kwargs["cwd"])
+                if model == "worker":
+                    (cwd / "accepted.txt").write_text(
+                        "accepted implementation\n",
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        "Implementation completed successfully.\n",
+                        incident_stderr,
+                    )
+                if model == "manager-lite":
+                    prompt = _runner_prompt(argv, kwargs)
+                    manager_prompts.append(prompt)
+                    manager_contexts.append(json.loads(
+                        prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                    ))
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "Durable state supports the proposed review.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+                assert model == "reviewer"
+                review_cwds.append(cwd)
+                raise ReviewLaunched
+
+            with pytest.raises(ReviewLaunched):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    observer=RecordingObserver(),  # type: ignore[arg-type]
+                )
+
+            assert len(manager_prompts) == 1
+            assert len(manager_contexts) == 1
+            context = manager_contexts[0]
+            diagnostics = context["finished_turn"]["diagnostics"]  # type: ignore[index]
+            assert diagnostics["signals"] == []
+            assert diagnostics["signal_provenance"] == []
+            assert context["plan_content_disclosure"] == {
+                "active_plan_content": "intentionally_omitted",
+                "original_plan_content": "intentionally_omitted",
+            }
+            assert context["active_plan_content"] is None
+            assert context["original_plan_content"] is None
+            assert context["controller_state"]["proposed_next_step"] == (  # type: ignore[index]
+                "review_cp_implementation"
+            )
+            assert "untrusted transcript context" in manager_prompts[0]
+            assert "Durable plan_state" in manager_prompts[0]
+
+            run_dirs = list((repo_root / ".aflow" / "runs").iterdir())
+            assert len(run_dirs) == 1
+            run_dir = run_dirs[0]
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            worktree_path = Path(run_json["worktree_path"])
+            workspace = context["controller_state"]["workspace_state"]  # type: ignore[index]
+            assert context["plan_state"]["active_plan_path"] == str(plan_path)  # type: ignore[index]
+            assert workspace["branch"] == run_json["feature_branch"]
+            assert workspace["dirty_worktree"] == "?? accepted.txt"
+            assert review_cwds == [worktree_path]
+            assert worktree_path.is_dir()
+            assert (worktree_path / "accepted.txt").read_text(encoding="utf-8") == (
+                "accepted implementation\n"
+            )
+            assert run_json["worktree_path"] == run_json["execution_repo_root"]
+            assert "resumed_from_run_id" not in run_json
+            assert len(list((run_dir / "manager").glob("decision-*"))) == 1
+            assert not (run_dir / "manager-report.md").exists()
+            assert failed_events == []
 
     def test_rejected_repair_upgrade_keeps_dirty_work_and_corrects_scope_notes(self) -> None:
         """Reproduce Decision 22 without allowing its note to reach a worker."""
