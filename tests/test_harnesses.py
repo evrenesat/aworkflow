@@ -636,17 +636,20 @@ class GitBannerTests(unittest.TestCase):
         assert "Files" not in text
 
     def test_build_banner_uses_title_case_plan_stem(self) -> None:
+        from io import StringIO
+        from rich.console import Console
+
         state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        panel = build_banner(
+        banner = build_banner(
             config_max_turns=10,
             config_plan_path=Path("/fake/config-plan.md"),
             original_plan_path=Path("/fake/workflow-visualization_show-and_exclusions.md"),
             state=state,
         )
-        assert panel is not None
-        title = panel.title
-        title_text = title.plain if hasattr(title, "plain") else str(title)
-        assert title_text == "Workflow Visualization Show And Exclusions"
+        assert banner is not None
+        output = StringIO()
+        Console(file=output, force_terminal=False).print(banner)
+        assert output.getvalue().splitlines()[0] == "Workflow Visualization Show And Exclusions"
 
     def test_build_banner_omits_issue_row_when_count_is_zero(self) -> None:
         from rich.console import Console
@@ -773,6 +776,171 @@ class GitBannerTests(unittest.TestCase):
         assert "plan" in text
         assert "review" in text
         assert "ship" in text
+
+    def test_build_banner_maximal_state_is_complete_ordered_and_borderless(self) -> None:
+        from rich.console import Console
+        from rich.panel import Panel
+        from aflow.config import GoTransition
+        from aflow.git_status import GitSummary
+        from aflow.run_state import (
+            ActiveImplementationScope,
+            CheckpointRepartitionRecord,
+            FrozenRunIdentity,
+            ManagerDecisionSummary,
+            OverrideResult,
+            PendingManagerNotes,
+            PendingRepartitionV1,
+            PendingTeamOverride,
+            ReviewRejectionRecord,
+        )
+        import aflow.status as status_mod
+
+        now = datetime.now(timezone.utc)
+        steps = {
+            "skipped-step": WorkflowStepConfig(
+                role="role-skipped", go=(GoTransition(to="active-step", when="condition-skipped"),)
+            ),
+            "excluded-step": WorkflowStepConfig(
+                role="role-excluded", go=(GoTransition(to="END", when="condition-excluded"),)
+            ),
+            "active-step": WorkflowStepConfig(
+                role="role-active", go=(GoTransition(to="END", when="condition-active"),)
+            ),
+            "inactive-step": WorkflowStepConfig(role="role-inactive"),
+        }
+        source = status_mod.WorkflowGraphSource(
+            declared_steps=steps,
+            executable_steps={
+                "skipped-step": steps["skipped-step"],
+                "active-step": steps["active-step"],
+                "inactive-step": steps["inactive-step"],
+            },
+            excluded_step_names=("excluded-step",),
+        )
+        scope = ActiveImplementationScope(
+            "scope-sentinel", "/plans/original-sentinel.md", 2, "checkpoint-sentinel", 1,
+            current_partition_generation_id="generation-current-sentinel",
+            current_partition_id="partition-current-sentinel",
+        )
+        rejection = ReviewRejectionRecord(
+            scope_id="scope-sentinel", rejection_number=7, source_run_id="run-source-sentinel",
+            review_turn_number=8, review_step_name="review-step-sentinel", reviewer_selector="reviewer-sentinel",
+            checkpoint_index=2, checkpoint_name="checkpoint-sentinel", reviewed_implementation_turn_number=6,
+            reviewed_worker_team="team-reviewed-sentinel", reviewed_worker_selector="worker-reviewed-sentinel",
+            review_summary="review-summary-sentinel", repair_plan_summary="repair-summary-sentinel",
+            review_stdout_artifact_path="review-artifact-sentinel.txt", repair_plan_path="repair-plan-sentinel.md",
+        )
+        turn_history = [
+            TurnRecord(
+                turn_number=1, step_name="review-step-sentinel", step_role="reviewer-sentinel",
+                resolved_harness_name="harness-review-sentinel", resolved_model_display="model-review-sentinel",
+                active_plan_path="active-plan-review-sentinel.md", chosen_transition="active-step",
+                chosen_transition_condition="condition-turn-sentinel", issues_summary_path="issues-turn-sentinel.md",
+                outcome="completed", started_at=now, finished_at=now,
+                stdout_artifact_path="stdout-review-sentinel.txt", stderr_artifact_path="stderr-review-sentinel.txt",
+            ),
+            TurnRecord(
+                turn_number=2, step_name="active-step", step_role="role-active",
+                resolved_harness_name="harness-active-sentinel", resolved_model_display="model-active-sentinel",
+                active_plan_path="active-plan-worker-sentinel.md", outcome="running", started_at=now,
+                triggering_rejection_number=7,
+            ),
+        ]
+        state = ControllerState(
+            last_snapshot=PlanSnapshot("checkpoint-sentinel", 2, 1, False, 4, 2),
+            run_id="run-current-sentinel", resumed_from_run_id="run-resumed-sentinel",
+            turns_completed=1, issues_accumulated=3, issues_summary_path="issues-summary-sentinel.md",
+            run_started_at=now, active_turn=2, current_turn_started_at=now,
+            status_message="completed", end_reason="done", selected_start_step="active-step",
+            turn_history=turn_history, manager_history=[ManagerDecisionSummary(
+                decision_number=9, level="full", trigger="trigger-manager-sentinel",
+                action="action-manager-sentinel", reason="manager-reason-sentinel",
+                artifact_path="manager-artifact-sentinel.md",
+            )],
+            active_implementation_scope=scope, review_rejection_history=[rejection],
+            pending_manager_notes=PendingManagerNotes("manager-target-sentinel", ("private-note",), 9),
+            pending_step_team_override=PendingTeamOverride(
+                target_step="override-target-sentinel", role="override-role-sentinel",
+                source_team="override-source-sentinel", target_team="override-team-sentinel",
+                selector="override-selector-sentinel", checkpoint_identity="checkpoint-sentinel", decision_number=9,
+            ),
+            pending_repartition=PendingRepartitionV1(
+                schema_version=1, decision_number=10, scope_id="scope-sentinel",
+                stage="repartition-stage-sentinel", envelope_sha256="envelope-hash-sentinel",
+                source_plan_sha256="source-plan-hash-sentinel", failed_stage="failed-stage-sentinel",
+            ),
+            repartition_history=[CheckpointRepartitionRecord(
+                schema_version=1, decision_number=10, scope_id="scope-sentinel",
+                generation_id="generation-sentinel", envelope_sha256="envelope-history-sentinel",
+                envelope_artifact_sha256="envelope-artifact-hash-sentinel", source_plan_sha256="source-history-sentinel",
+                proposal_sha256="proposal-hash-sentinel", candidate_plan_sha256="candidate-hash-sentinel",
+                partition_ids=("partition-one-sentinel", "partition-two-sentinel"),
+                child_summaries=("child-one-sentinel", "child-two-sentinel"),
+                current_disposition="disposition-sentinel", resolved_target_step="target-step-sentinel",
+                resolved_target_role="target-role-sentinel", current_partition_id="partition-current-sentinel",
+                scope_pressure_reason="pressure-history-sentinel", envelope_artifact_path="envelope-sentinel.json",
+                proposal_artifact_path="proposal-sentinel.json", candidate_artifact_path="candidate-sentinel.md",
+                mechanical_validation_artifact_path="mechanical-sentinel.json",
+                semantic_verdict_artifact_path="verdict-sentinel.json",
+            )],
+            scope_pressure_reason="pressure-sentinel", last_manager_report_path="manager-report-sentinel.md",
+            frozen_run_identity=FrozenRunIdentity(
+                workflow_name="workflow-sentinel", config_path="config-sentinel.toml",
+                config_fingerprint="fingerprint-sentinel-123456",
+            ),
+            override_result=OverrideResult(
+                status="rejected", digest="digest-sentinel", message="override-message-sentinel",
+                source_text='notes = ["private-note"]',
+            ),
+            effective_max_turns=9, override_file_present=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generated_plan = Path(tmpdir) / "generated-plan-sentinel.md"
+            generated_plan.write_text("generated", encoding="utf-8")
+            banner = build_banner(
+                workflow_name="workflow-sentinel", current_step_name="active-step", workflow_graph_source=source,
+                config_harness="harness-config-sentinel", config_model="model-config-sentinel",
+                config_effort="effort-config-sentinel", config_max_turns=12,
+                config_plan_path=Path("config-plan-sentinel.md"), original_plan_path=Path("original-plan-sentinel.md"),
+                active_plan_path=Path("active-plan-sentinel.md"), new_plan_path=generated_plan,
+                config_banner_files_limit=2, state=state,
+                git_summary=GitSummary(
+                    modified_count=2, added_count=1, removed_count=1, lines_added=12, lines_removed=4,
+                    commit_count=3, changed_paths=("git-one-sentinel", "git-two-sentinel", "git-three-sentinel"),
+                ),
+            )
+        assert banner is not None
+        assert not isinstance(banner, Panel)
+        assert not any(isinstance(item, Panel) for item in getattr(banner, "renderables", ()))
+
+        for width in (42, 140):
+            console = Console(record=True, width=width, force_terminal=False)
+            console.print(banner)
+            text = console.export_text()
+            assert not any(glyph in text for glyph in "╭╮╰╯┌┐└┘")
+            assert text.index("Current checkpoint review history") < text.index("Turn history")
+            assert text.index("Turn history") < text.index("Workflow graph")
+            assert text.index("Workflow graph") < text.index("Summary")
+            for label in ("[active]", "[inactive]", "[excluded]", "[skipped]"):
+                assert label in text
+            assert "git-one-sentinel" in text
+            assert "git-two-sentinel" in text
+            assert "git-three-sentinel" not in text
+
+        console = Console(record=True, width=140, force_terminal=False)
+        console.print(banner)
+        text = console.export_text()
+        for sentinel in (
+            "run-current-sentinel", "run-resumed-sentinel", "checkpoint-sentinel", "review-summary-sentinel",
+            "review-artifact-sentinel.txt", "repair-plan-sentinel.md", "active-plan-worker-sentinel.md",
+            "condition-turn-sentinel", "stdout-review-sentinel.txt", "stderr-review-sentinel.txt",
+            "workflow-sentinel", "original-plan-sentinel.md", "generated-plan-sentinel.md",
+            "generation-sentinel", "child-one-sentinel", "child-two-sentinel",
+            "manager-report-sentinel.md", "issues-summary-sentinel.md", "override-message-sentinel",
+            "fingerprint-", "pressure-sentinel", "git-one-sentinel", "git-two-sentinel",
+        ):
+            assert text.count(sentinel) == 1, sentinel
+        assert text.count("repair-summary-sentinel") == 2
 
     def test_turn_panels_render_transition_and_active_plan(self) -> None:
         from rich.console import Console

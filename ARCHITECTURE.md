@@ -357,11 +357,22 @@ Git snapshot helpers used by the banner and CLI. Provides three public data clas
 All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
 
 ### `status.py`
-Rich-based live banner rendered to stderr during a run. Shows elapsed time, run id, resumed-from run id when present, workflow/step name, harness, model, checkpoint progress, turn count, issues, plan paths, git summary (if available), schema/frozen-config identity, safe override diagnostics, and status.
+Rich-based live banner rendered to stderr during a run. The live dashboard is
+a borderless, deterministic single-column document ordered as the plan title,
+current-scope review history, chronological turns, workflow graph, and summary
+status. It shows elapsed time, run id, resumed-from run id when present,
+workflow/step name, harness, model, checkpoint progress, turn count, issues,
+plan paths, git summary (if available), schema/frozen-config identity, safe
+override diagnostics, and status.
 When the active implementation scope has rejected reviews, it also shows every
 current-scope rejection before the chronological turn cards and labels the next
 worker as a re-implementation with its compact rejection reason.
-The module also owns the shared workflow-graph and role/team render helpers used by both the live banner and `aflow show`, so classification rules stay identical across the two views.
+Workflow steps carry explicit plain-text active, inactive, excluded, or skipped
+labels; color is only additional reinforcement. Controller-owned values use
+literal `Text` renderables so Rich markup-like content remains unchanged. The
+module also owns the shared workflow-graph classification helpers used by both
+the live banner and `aflow show`; only the live branch is flattened, while
+`build_workflow_show()` retains its panel-based presentation.
 
 `BannerRenderer` owns a background daemon thread that waits for the first
 `refresh_interval_seconds` deadline and then performs one explicit

@@ -42,6 +42,12 @@ _UNSET = object()
 _WORKFLOW_TERMINAL_TARGET = "END"
 WorkflowStepVisualKind = Literal["active", "inactive", "excluded", "skipped"]
 WorkflowTransitionTargetKind = Literal["active", "inactive", "excluded", "skipped", "terminal"]
+_WORKFLOW_STEP_STATE_LABELS: dict[WorkflowStepVisualKind, str] = {
+    "active": "[active]",
+    "inactive": "[inactive]",
+    "excluded": "[excluded]",
+    "skipped": "[skipped]",
+}
 
 
 @dataclass(frozen=True)
@@ -257,6 +263,25 @@ def _turn_outcome_style(outcome: str, *, current: bool = False) -> str:
     return "cyan"
 
 
+def _literal_text(value: object, *, style: str | None = None) -> Text:
+    """Render controller-owned values without allowing Rich markup parsing."""
+    return Text(str(value), style=style)
+
+
+def _labeled_text(label: str, value: object) -> Text:
+    text = Text(label, style="bold cyan")
+    text.append(": ")
+    if isinstance(value, Text):
+        text.append(value.plain)
+    else:
+        text.append(str(value))
+    return text
+
+
+def _add_labeled_row(table: Table, label: str, value: object) -> None:
+    table.add_row(_literal_text(label, style="bold cyan"), _literal_text(value))
+
+
 def _active_scope_rejections(state: ControllerState) -> tuple[ReviewRejectionRecord, ...]:
     scope = state.active_implementation_scope
     if scope is None:
@@ -267,59 +292,65 @@ def _active_scope_rejections(state: ControllerState) -> tuple[ReviewRejectionRec
     ))
 
 
-def _render_review_rejection_history(state: ControllerState) -> Panel | None:
+def _render_review_rejection_history(state: ControllerState) -> Group | None:
     records = _active_scope_rejections(state)
     if not records:
         return None
-    body = Table.grid(padding=(0, 1))
-    body.add_column()
+    items: list[object] = [Text("Current checkpoint review history", style="bold yellow")]
     current_run_id = state.run_id
     for record in records:
+        items.append(Text(""))
         label = f"Rejection {record.rejection_number} · review turn {record.review_turn_number}"
         if current_run_id is not None and record.source_run_id != current_run_id:
             label += f" · run {record.source_run_id}"
-        body.add_row(Text(label, style="bold yellow"))
+        items.append(Text(label, style="bold yellow"))
         worker = f"turn {record.reviewed_implementation_turn_number}"
         if record.reviewed_worker_team:
             worker += f" · {record.reviewed_worker_team}"
         if record.reviewed_worker_selector:
             worker += f" · {record.reviewed_worker_selector}"
-        body.add_row(Text(f"Reviewed worker: {worker}"))
-        body.add_row(Text("Review: ") + Text(record.review_summary))
+        items.append(_labeled_text("Reviewed worker", worker))
+        items.append(_labeled_text("Review", record.review_summary))
         if record.repair_plan_summary:
-            body.add_row(Text("Required fixes: ") + Text(record.repair_plan_summary))
-        body.add_row(Text(f"Details: {record.review_stdout_artifact_path}"))
+            items.append(_labeled_text("Required fixes", record.repair_plan_summary))
+        items.append(_labeled_text("Details", record.review_stdout_artifact_path))
         if record.repair_plan_path:
-            body.add_row(Text(f"Fix plan: {record.repair_plan_path}"))
-    return Panel(body, title="Current checkpoint review history", border_style="yellow", padding=(0, 1))
+            items.append(_labeled_text("Fix plan", record.repair_plan_path))
+    return Group(*items)
 
 
 def _render_turn_history(state: ControllerState) -> Group | Text | None:
     if not state.turn_history:
         return None
-    panels: list[Panel] = []
+    sections: list[object] = [Text("Turn history", style="bold cyan")]
     for record in state.turn_history:
         is_current = (
             state.current_turn_started_at is not None
             and record.turn_number == state.active_turn
             and record.outcome == "running"
         )
-        border_style = _turn_outcome_style(record.outcome, current=is_current)
+        sections.append(Text(""))
+        sections.append(
+            Text(
+                f"Turn {record.turn_number:03d}",
+                style=_turn_outcome_style(record.outcome, current=is_current),
+            )
+        )
         body = Table.grid(padding=(0, 1))
         body.add_column(style="bold cyan", no_wrap=True)
         body.add_column()
-        body.add_row("Step", record.step_name)
+        _add_labeled_row(body, "Step", record.step_name)
         if record.step_role is not None or record.resolved_selector is not None:
             role_value = record.step_role or "-"
             if record.resolved_selector is not None:
-                body.add_row("Role/Selector", f"{role_value} -> {record.resolved_selector}")
+                _add_labeled_row(body, "Role/Selector", f"{role_value} -> {record.resolved_selector}")
             else:
-                body.add_row("Role", role_value)
-        body.add_row("Harness/Model", record.resolved_model_display)
+                _add_labeled_row(body, "Role", role_value)
+        _add_labeled_row(body, "Harness/Model", record.resolved_model_display)
         if record.active_plan_path is not None:
-            body.add_row("Active Plan", record.active_plan_path)
-        body.add_row("Duration", _duration_display(record.started_at, record.finished_at))
-        body.add_row("Outcome", record.outcome)
+            _add_labeled_row(body, "Active Plan", record.active_plan_path)
+        _add_labeled_row(body, "Duration", _duration_display(record.started_at, record.finished_at))
+        _add_labeled_row(body, "Outcome", record.outcome)
         if record.triggering_rejection_number is not None:
             active_scope = state.active_implementation_scope
             rejection = next((
@@ -327,32 +358,27 @@ def _render_turn_history(state: ControllerState) -> Group | Text | None:
                 if item.rejection_number == record.triggering_rejection_number
             ), None)
             if active_scope is not None and rejection is not None:
-                body.add_row(
+                _add_labeled_row(
+                    body,
                     "Re-implementation",
-                    Text(f"after rejection {record.triggering_rejection_number}"),
+                    f"after rejection {record.triggering_rejection_number}",
                 )
-                body.add_row(
+                _add_labeled_row(
+                    body,
                     "Why rejected",
-                    Text(rejection.repair_plan_summary or rejection.review_summary),
+                    rejection.repair_plan_summary or rejection.review_summary,
                 )
         transition_text = _turn_transition_text(record)
         if transition_text is not None:
-            body.add_row("Transition", transition_text)
+            body.add_row(_literal_text("Transition", style="bold cyan"), transition_text)
         if record.issues_summary_path is not None:
-            body.add_row("Issues", record.issues_summary_path)
+            _add_labeled_row(body, "Issues", record.issues_summary_path)
         if record.stdout_artifact_path is not None:
-            body.add_row("Stdout", record.stdout_artifact_path)
+            _add_labeled_row(body, "Stdout", record.stdout_artifact_path)
         if record.stderr_artifact_path is not None:
-            body.add_row("Stderr", record.stderr_artifact_path)
-        panels.append(
-            Panel(
-                body,
-                title=f"Turn {record.turn_number:03d}",
-                border_style=border_style,
-                padding=(0, 1),
-            )
-        )
-    return Group(*panels)
+            _add_labeled_row(body, "Stderr", record.stderr_artifact_path)
+        sections.append(body)
+    return Group(*sections)
 
 
 def _render_workflow_graph(
@@ -362,6 +388,7 @@ def _render_workflow_graph(
     current_step_name: str | None,
     state: ControllerState,
     source: WorkflowGraphSource | None = None,
+    live_dashboard: bool = False,
 ) -> Group | Text | None:
     source = source or _resolve_workflow_graph_source(
         workflow_name=workflow_name,
@@ -393,33 +420,67 @@ def _render_workflow_graph(
     for step_name, step in source.declared_steps.items():
         kind = _workflow_step_kind(step_name=step_name, context=context)
         step_style = _workflow_step_style(kind)
-        body = Text()
-        body.append(step_name, style=step_style)
-        body.append("\n")
-        body.append(step.role, style="dim")
-        graph_items.append(
-            Panel(
-                body,
-                border_style=step_style,
-                padding=(0, 1),
+        if live_dashboard:
+            step_line = Text()
+            step_line.append(step_name, style=step_style)
+            step_line.append(f" {_WORKFLOW_STEP_STATE_LABELS[kind]}", style=step_style)
+            graph_items.append(step_line)
+            role_line = Text("Role: ", style="bold cyan")
+            role_line.append(step.role, style="dim")
+            graph_items.append(role_line)
+        else:
+            body = Text()
+            body.append(step_name, style=step_style)
+            body.append("\n")
+            body.append(step.role, style="dim")
+            graph_items.append(
+                Panel(
+                    body,
+                    border_style=step_style,
+                    padding=(0, 1),
+                )
             )
-        )
-        arrows = Text()
-        for transition in step.go:
-            target_kind = _workflow_transition_target_kind(
-                target_name=transition.to,
-                context=context,
-            )
-            transition_style = _workflow_transition_style(
-                source_kind=kind,
-                target_kind=target_kind,
-            )
-            arrows.append("  ├─go→ ", style=transition_style)
-            arrows.append(transition.to, style=f"bold {transition_style}" if transition_style != "white" else "bold")
-            if transition.when is not None:
-                arrows.append(f" [{transition.when}]", style=transition_style)
-            arrows.append("\n")
-        graph_items.append(arrows)
+        if live_dashboard:
+            for transition in step.go:
+                target_kind = _workflow_transition_target_kind(
+                    target_name=transition.to,
+                    context=context,
+                )
+                transition_style = _workflow_transition_style(
+                    source_kind=kind,
+                    target_kind=target_kind,
+                )
+                arrows = Text()
+                arrows.append("  ├─go→ ", style=transition_style)
+                arrows.append(
+                    transition.to,
+                    style=f"bold {transition_style}" if transition_style != "white" else "bold",
+                )
+                if transition.when is not None:
+                    arrows.append(f" [{transition.when}]", style=transition_style)
+                graph_items.append(arrows)
+        else:
+            arrows = Text()
+            for transition in step.go:
+                target_kind = _workflow_transition_target_kind(
+                    target_name=transition.to,
+                    context=context,
+                )
+                transition_style = _workflow_transition_style(
+                    source_kind=kind,
+                    target_kind=target_kind,
+                )
+                arrows.append("  ├─go→ ", style=transition_style)
+                arrows.append(
+                    transition.to,
+                    style=f"bold {transition_style}" if transition_style != "white" else "bold",
+                )
+                if transition.when is not None:
+                    arrows.append(f" [{transition.when}]", style=transition_style)
+                arrows.append("\n")
+            graph_items.append(arrows)
+    if live_dashboard:
+        return Group(*graph_items)
     return Align.right(Group(*graph_items))
 
 
@@ -512,7 +573,7 @@ def _render_roles_teams_section(
             default_team_name=default_team_name,
         ),
     )
-    return Panel(body, title=title, border_style="blue")
+    return Panel(body, border_style="blue", title=title)
 
 
 def _render_workflow_show_section(
@@ -596,111 +657,112 @@ def _build_summary_table(
     banner_files_limit: int,
 ) -> Table:
     table = Table.grid(padding=(0, 1))
-    table.add_column(style="bold cyan")
+    table.add_column(style="bold cyan", no_wrap=True)
     table.add_column()
 
-    table.add_row("Elapsed", _elapsed(state.run_started_at))
+    _add_labeled_row(table, "Elapsed", _elapsed(state.run_started_at))
 
     if state.run_id is not None:
-        table.add_row("Run ID", state.run_id)
+        _add_labeled_row(table, "Run ID", state.run_id)
     if state.resumed_from_run_id is not None:
-        table.add_row("Resumed From", state.resumed_from_run_id)
+        _add_labeled_row(table, "Resumed From", state.resumed_from_run_id)
 
     if workflow_name is not None:
-        table.add_row("Workflow", workflow_name)
+        _add_labeled_row(table, "Workflow", workflow_name)
     if state.frozen_run_identity is not None:
-        table.add_row("State Schema", str(RUN_STATE_SCHEMA_VERSION))
-        table.add_row(
+        _add_labeled_row(table, "State Schema", RUN_STATE_SCHEMA_VERSION)
+        _add_labeled_row(
+            table,
             "Frozen Config",
             state.frozen_run_identity.config_fingerprint[:12],
         )
-    table.add_row(
+    _add_labeled_row(
+        table,
         "Override File",
         "present" if state.override_file_present else "absent",
     )
     if state.override_result is not None:
         result = state.override_result
-        table.add_row("Last Override", f"{result.status}: {result.message}")
+        _add_labeled_row(table, "Last Override", f"{result.status}: {result.message}")
         if result.status == "rejected":
-            table.add_row("Override Action", "correct overrides.toml and resume")
+            _add_labeled_row(table, "Override Action", "correct overrides.toml and resume")
 
-    table.add_row("Checkpoint", _checkpoint_display(state.last_snapshot))
+    _add_labeled_row(table, "Checkpoint", _checkpoint_display(state.last_snapshot))
     name = state.last_snapshot.current_checkpoint_name or "-"
-    table.add_row("Name", name)
-    table.add_row(
+    _add_labeled_row(table, "Name", name)
+    _add_labeled_row(
+        table,
         "Turn",
         f"{state.active_turn}/{state.effective_max_turns or config_max_turns}",
     )
 
     if original_plan_path is not None:
-        table.add_row("Original Plan", original_plan_path.name)
+        _add_labeled_row(table, "Original Plan", original_plan_path.name)
     if new_plan_path is not None and new_plan_path.is_file() and new_plan_path != active_plan_path:
-        table.add_row("Generated Plan", new_plan_path.name)
+        _add_labeled_row(table, "Generated Plan", new_plan_path.name)
 
     if workflow_name is None:
-        table.add_row("Plan", str(config_plan_path))
+        _add_labeled_row(table, "Plan", config_plan_path)
 
     if state.issues_summary_path is not None:
-        table.add_row("Issues", state.issues_summary_path)
+        _add_labeled_row(table, "Issues", state.issues_summary_path)
 
     if state.manager_history:
         manager = state.manager_history[-1]
-        table.add_row("Manager", f"{manager.level} / {manager.trigger} / {manager.action}")
+        _add_labeled_row(table, "Manager", f"{manager.level} / {manager.trigger} / {manager.action}")
     if state.pending_manager_notes is not None:
-        table.add_row("Manager Notes", f"pending for {state.pending_manager_notes.target_step}")
+        _add_labeled_row(table, "Manager Notes", f"pending for {state.pending_manager_notes.target_step}")
     if state.pending_step_team_override is not None:
         override = state.pending_step_team_override
-        table.add_row("Manager Upgrade", f"{override.target_step}: {override.target_team}")
+        _add_labeled_row(table, "Manager Upgrade", f"{override.target_step}: {override.target_team}")
     if state.last_manager_report_path is not None:
-        table.add_row("Manager Report", state.last_manager_report_path)
+        _add_labeled_row(table, "Manager Report", state.last_manager_report_path)
     if state.scope_pressure_reason is not None:
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Scope Pressure",
-            Text(state.scope_pressure_reason),
+            state.scope_pressure_reason,
         )
     if state.pending_repartition is not None:
         pending = state.pending_repartition
-        pending_text = Text(pending.stage)
+        pending_text = _literal_text(pending.stage)
         if pending.failed_stage is not None:
             pending_text.append(f" / failed: {pending.failed_stage}")
-        table.add_row("Repartition", pending_text)
+        _add_labeled_row(table, "Repartition", pending_text)
     if state.repartition_history:
         latest = state.repartition_history[-1]
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Latest Split",
-            Text(
-                f"{latest.generation_id} / {len(latest.partition_ids)} parts / "
-                f"{latest.current_disposition}"
-            ),
+            f"{latest.generation_id} / {len(latest.partition_ids)} parts / "
+            f"{latest.current_disposition}",
         )
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Split Children",
-            Text(" | ".join(latest.child_summaries)),
+            " | ".join(latest.child_summaries),
         )
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Split Target",
-            Text(
-                f"{latest.resolved_target_step} ({latest.resolved_target_role}) / "
-                f"current {latest.current_partition_id}"
-            ),
+            f"{latest.resolved_target_step} ({latest.resolved_target_role}) / "
+            f"current {latest.current_partition_id}",
         )
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Split Hashes",
-            Text(
-                f"envelope {latest.envelope_sha256[:12]} / "
-                f"proposal {latest.proposal_sha256[:12]} / "
-                f"candidate {latest.candidate_plan_sha256[:12]}"
-            ),
+            f"envelope {latest.envelope_sha256[:12]} / "
+            f"proposal {latest.proposal_sha256[:12]} / "
+            f"candidate {latest.candidate_plan_sha256[:12]}",
         )
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Split Evidence",
-            Text(
-                f"{latest.envelope_artifact_path} / "
-                f"{latest.proposal_artifact_path} / "
-                f"{latest.candidate_artifact_path} / "
-                f"{latest.mechanical_validation_artifact_path} / "
-                f"{latest.semantic_verdict_artifact_path}"
-            ),
+            f"{latest.envelope_artifact_path} / "
+            f"{latest.proposal_artifact_path} / "
+            f"{latest.candidate_artifact_path} / "
+            f"{latest.mechanical_validation_artifact_path} / "
+            f"{latest.semantic_verdict_artifact_path}",
         )
     scope = state.active_implementation_scope
     if (
@@ -708,21 +770,19 @@ def _build_summary_table(
         and scope.current_partition_generation_id is not None
         and scope.current_partition_id is not None
     ):
-        table.add_row(
+        _add_labeled_row(
+            table,
             "Current Partition",
-            Text(
-                f"{scope.current_partition_id} / "
-                f"{scope.current_partition_generation_id}"
-            ),
+            f"{scope.current_partition_id} / {scope.current_partition_generation_id}",
         )
 
     if git_summary is not None:
-        table.add_row("Git", _git_row(git_summary))
+        _add_labeled_row(table, "Git", _git_row(git_summary))
         files_text = _files_row(git_summary.changed_paths, limit=banner_files_limit)
         if files_text is not None:
-            table.add_row("Files", files_text)
+            _add_labeled_row(table, "Files", files_text)
 
-    table.add_row("Status", _status_display(state))
+    _add_labeled_row(table, "Status", _status_display(state))
     return table
 
 
@@ -743,7 +803,7 @@ def build_banner(
     config_banner_files_limit: int = 10,
     state: ControllerState,
     git_summary: GitSummary | None = None,
-) -> Panel | None:
+) -> Group | Text | None:
     if not _RICH_AVAILABLE:
         return None
     source = workflow_graph_source or _resolve_workflow_graph_source(
@@ -772,20 +832,19 @@ def build_banner(
         current_step_name=current_step_name,
         state=state,
         source=source,
+        live_dashboard=True,
     )
-    left_items: list[object] = []
-    if rejection_history is not None:
-        left_items.append(rejection_history)
-    if turn_history is not None:
-        left_items.append(turn_history)
-    left_items.append(summary)
-    root = Table.grid(expand=True)
-    root.add_column(ratio=3)
-    root.add_column(ratio=2)
-    root.add_row(Group(*left_items), workflow_graph or Text(""))
+    sections: list[object] = []
     title_source = original_plan_path or config_plan_path
-    title = Text(_plan_title(title_source), style="bold magenta")
-    return Panel(root, title=title, border_style="blue")
+    sections.append(Text(_plan_title(title_source), style="bold magenta"))
+    if rejection_history is not None:
+        sections.extend((Text(""), rejection_history))
+    if turn_history is not None:
+        sections.extend((Text(""), turn_history))
+    if workflow_graph is not None:
+        sections.extend((Text(""), Text("Workflow graph", style="bold cyan"), workflow_graph))
+    sections.extend((Text(""), Text("Summary", style="bold cyan"), summary))
+    return Group(*sections)
 
 
 class BannerRenderer:
@@ -861,7 +920,7 @@ class BannerRenderer:
             if config_effort is not _UNSET:
                 self._config_effort = config_effort
 
-    def _build(self, state: ControllerState, git_summary: GitSummary | None = None) -> Panel | None:
+    def _build(self, state: ControllerState, git_summary: GitSummary | None = None) -> Group | Text | None:
         return build_banner(
             workflow_name=self._workflow_name,
             current_step_name=self._current_step_name,

@@ -370,13 +370,16 @@ The interactive prompt accepts `y` or `yes`; any other input exits with code `1`
 
 ## Live Status
 
-While a step is running, `aflow` shows a Rich status panel on stderr. Rich's
-automatic refresh is disabled; AFlow owns one render loop that waits three
-seconds before its first periodic repaint and then repaints at most once every
-three seconds. Ordinary state and banner-context updates coalesce into that
-next repaint, while Git statistics retain their independent 10-second polling
-cadence. Lifecycle paints are explicit so the final manager report remains
-visible exactly once after the banner stops.
+While a step is running, `aflow` shows a borderless, single-column Rich status
+document on stderr. The live document is ordered as the plan title, current
+checkpoint review history when present, chronological turn history, workflow
+graph, and summary/status. Rich's automatic refresh is disabled; AFlow owns
+one render loop that waits three seconds before its first periodic repaint and
+then repaints at most once every three seconds. Ordinary state and
+banner-context updates coalesce into that next repaint, while Git statistics
+retain their independent 10-second polling cadence. Lifecycle paints are
+explicit so the final manager report remains visible exactly once after the
+banner stops.
 
 Fields include:
 
@@ -393,11 +396,16 @@ Fields include:
 - issues link when issues exist
 - current run status
 
-For an active scope with rejected reviews, the banner displays the complete
-chronological rejection history before turn cards. A re-implementation card
+For an active scope with rejected reviews, the document displays the complete
+chronological rejection history before turn history. A re-implementation row
 names its exact rejection ordinal and shows the repair summary when available,
-otherwise the reviewer summary. Full reviewer stdout remains linked from the
-record; text is rendered literally rather than as Rich markup.
+otherwise the reviewer summary. Workflow steps include explicit
+`[active]`, `[inactive]`, `[excluded]`, or `[skipped]` labels so exported text
+does not depend on color. Full reviewer stdout remains linked from the record;
+controller-owned text is rendered literally rather than as Rich markup.
+
+The separate `aflow show` workflow-inspection output remains panel-based; this
+flattening applies only to the live dashboard.
 
 The git summary is based on a baseline captured at workflow start, so pre-existing dirty state is excluded. If git is unavailable, git rows are omitted and the workflow still runs.
 

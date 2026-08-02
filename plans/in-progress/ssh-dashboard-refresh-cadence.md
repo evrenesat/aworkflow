@@ -12,9 +12,11 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 - Plan Branch: `aflow-ssh-dashboard-refresh-cadence-20260801-214511`
 - Pre-Handoff Base HEAD: `c9616c50d93106024ebdfd79b892c174136fb0de`
-- Last Reviewed Checkpoint: `cp1 v02`
+- Last Reviewed Checkpoint: `cp3 v02`
 - Review Log:
   - `cp1 v02`: approved the fresh pause snapshot repair; pause joins the render thread, installs the newest coalesced state and context without an eager refresh, and relies on `Live.stop()` for the single lifecycle repaint.
+  - `2026-08-01`: Checkpoint 3 reviewed via current-worktree fallback because no `cp3 vNN` commit boundary exists. Outcome: changes requested. Unsupported CSI sequences can be ignored as one chunk but decoded as navigation when split immediately before an ASCII navigation final byte; focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp04-v01.md`.
+  - `cp3 v02`: approved the chunk-invariant decoder repair; unsupported `ESC [ 2 G` and `ESC [ 9 j` sequences are discarded atomically across every split, pending escape input is bounded at 64 bytes with recovery, and the 36 viewport plus 22 banner/status test baseline passes.
 
 ## Done Means
 
@@ -122,7 +124,7 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 - Stop and report if correct final/report ordering requires workflow, manager, or CLI control-flow changes in this checkpoint.
 - Stop and report if unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 2: Flatten the dashboard without losing displayed information
+### [x] Checkpoint 2: Flatten the dashboard without losing displayed information
 
 **Goal:**
 
@@ -144,11 +146,11 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 **Steps:**
 
-- [ ] Refactor the live-only render helpers to return borderless `Group`/`Table.grid`/`Text` sections and make `build_banner()` return the single-column document rather than an outer `Panel`.
-- [ ] Preserve all prior rows and paths, and add explicit workflow-state labels wherever the old border/color carried meaning not present in exported text.
-- [ ] Add a maximal fixture covering resumed identity, override state, checkpoint/turn fields, rejection and reimplementation history, manager/repartition state, Git/files, issues, workflow transitions, and final status; assert every sentinel appears once in exported text.
-- [ ] Add structural assertions that the live document contains no `Panel`/box-border glyphs and that section ordering is stable at narrow and wide console widths.
-- [ ] Update live-status/architecture documentation and devlog; explicitly state that `build_workflow_show()` remains unchanged because this request targets the live dashboard only.
+- [x] Refactor the live-only render helpers to return borderless `Group`/`Table.grid`/`Text` sections and make `build_banner()` return the single-column document rather than an outer `Panel`.
+- [x] Preserve all prior rows and paths, and add explicit workflow-state labels wherever the old border/color carried meaning not present in exported text.
+- [x] Add a maximal fixture covering resumed identity, override state, checkpoint/turn fields, rejection and reimplementation history, manager/repartition state, Git/files, issues, workflow transitions, and final status; assert every sentinel appears once in exported text.
+- [x] Add structural assertions that the live document contains no `Panel`/box-border glyphs and that section ordering is stable at narrow and wide console widths.
+- [x] Update live-status/architecture documentation and devlog; explicitly state that `build_workflow_show()` remains unchanged because this request targets the live dashboard only.
 
 **Dependencies:**
 
@@ -176,7 +178,7 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 - Stop and report if flattening would require changing the separate workflow-show command.
 - Stop and report if unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 3: Add a pure scrollable viewport model and Rich renderable
+### [x] Checkpoint 3: Add a pure scrollable viewport model and Rich renderable
 
 **Goal:**
 
@@ -197,10 +199,10 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 **Steps:**
 
-- [ ] Add a small viewport state/model with `offset`, `follow_tail`, content-height/viewport-height clamping, line/page/top/bottom actions, and explicit bottom-follow semantics.
-- [ ] Add a Rich renderable that preserves segment styles, slices only complete rendered lines, pads/crops to the current terminal body height, and appends a one-line controls/position footer.
-- [ ] Add an incremental key decoder for `k`/Up, `j`/Down, `b`/PageUp, `f`/Space/PageDown, `g`/Home, and `G`/End; ignore `q`, Escape alone, malformed/unknown sequences, and unrelated UTF-8 safely.
-- [ ] Unit-test short/long content, narrow widths, every navigation action, appended content in follow/manual modes, resize up/down, offset clamping, footer position, style preservation, and split escape sequences.
+- [x] Add a small viewport state/model with `offset`, `follow_tail`, content-height/viewport-height clamping, line/page/top/bottom actions, and explicit bottom-follow semantics.
+- [x] Add a Rich renderable that preserves segment styles, slices only complete rendered lines, pads/crops to the current terminal body height, and appends a one-line controls/position footer.
+- [x] Add an incremental key decoder for `k`/Up, `j`/Down, `b`/PageUp, `f`/Space/PageDown, `g`/Home, and `G`/End; ignore `q`, Escape alone, malformed/unknown sequences, and unrelated UTF-8 safely.
+- [x] Unit-test short/long content, narrow widths, every navigation action, appended content in follow/manual modes, resize up/down, offset clamping, footer position, style preservation, and split escape sequences.
 
 **Dependencies:**
 

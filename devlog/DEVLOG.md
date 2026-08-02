@@ -1,3 +1,19 @@
+## 2026-08-01 — Borderless live dashboard document
+
+### What changed
+
+- Flattened the live dashboard into a borderless single-column Rich document
+  ordered as title, review history, turns, workflow graph, and summary.
+- Preserved all existing conditional rows, artifact paths, file limits, and
+  literal controller-owned text while adding explicit workflow state labels.
+- Added maximal-state and narrow/wide rendering regressions; `build_workflow_show()`
+  remains unchanged and panel-based.
+
+### Why
+
+- Linear exported text is easier to copy over SSH and remains understandable
+  when color or panel borders are unavailable.
+
 ## 2026-08-01 — AFlow-owned live banner cadence
 
 ### What changed
