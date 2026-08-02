@@ -4884,6 +4884,157 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
             assert call_count[0] == 1
 
+    def test_worktree_startup_ignores_failed_aflow_run_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            _run_git_in_test(['config', 'core.excludesFile', '/dev/null'], cwd=repo_root)
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plans' / 'in-progress' / 'plan.md'
+            plan_path.parent.mkdir(parents=True)
+            _write_plan(plan_path, _VALID_PLAN)
+            prior_run_json = repo_root / '.aflow' / 'runs' / 'failed-run' / 'run.json'
+            prior_run_json.parent.mkdir(parents=True)
+            prior_run_json.write_text('{"status": "failed"}\n', encoding='utf-8')
+            wf_config = _make_worktree_no_merge_wf_config(
+                worktree_root=str(worktree_root),
+            )
+            runner_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal runner_calls
+                runner_calls += 1
+                cwd = Path(kwargs['cwd'])
+                _write_plan(cwd / plan_path.relative_to(repo_root), _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                wf_config, 'wt_wf', config_dir=repo_root,
+                adapter=CodexAdapter(), runner=runner,
+            )
+
+            assert runner_calls == 1
+            assert prior_run_json.exists()
+
+    def test_worktree_startup_rejects_unrelated_dirty_status_before_creation(self) -> None:
+        for dirty_path in (
+            '.aflow-copy/file',
+            'src/.aflow/file',
+            'notes.txt',
+            'foo -> .aflow/runs/x',
+        ):
+            with self.subTest(dirty_path=dirty_path), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                repo_root = root / 'repo'
+                repo_root.mkdir()
+                _make_lifecycle_git_repo(repo_root, branch='main')
+                _run_git_in_test(['config', 'core.excludesFile', '/dev/null'], cwd=repo_root)
+                worktree_root = root / 'worktrees'
+                worktree_root.mkdir()
+                plan_path = repo_root / 'plans' / 'in-progress' / 'plan.md'
+                plan_path.parent.mkdir(parents=True)
+                _write_plan(plan_path, _VALID_PLAN)
+                candidate = repo_root / dirty_path
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text('unrelated\n', encoding='utf-8')
+                wf_config = _make_worktree_no_merge_wf_config(
+                    worktree_root=str(worktree_root),
+                )
+                runner_calls = 0
+
+                def runner(argv, **kwargs):
+                    nonlocal runner_calls
+                    runner_calls += 1
+                    return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+                with pytest.raises(WorkflowError) as ctx:
+                    run_workflow(
+                        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                        wf_config, 'wt_wf', config_dir=repo_root,
+                        adapter=CodexAdapter(), runner=runner,
+                    )
+
+                assert dirty_path in str(ctx.value)
+                assert runner_calls == 0
+                rc, worktrees, _ = _run_git_in_test(
+                    ['worktree', 'list', '--porcelain'],
+                    cwd=repo_root,
+                )
+                assert rc == 0
+                assert str(worktree_root) not in worktrees
+
+    def test_worktree_merge_status_preserves_owned_path_boundaries(self) -> None:
+        from aflow.workflow import (
+            _collect_merge_dirty_paths,
+            _is_ignored_merge_status_line,
+        )
+
+        primary_root = Path('/repo')
+        original_plan_path = primary_root / 'plans' / 'in-progress' / 'plan.md'
+        cases = (
+            ('?? .aflow/runs/old/run.json', True),
+            ('?? plans/backups/plan.md', True),
+            ('?? .aflow-copy/file', False),
+            ('?? src/.aflow/file', False),
+            (' M .aflow/runs/tracked.json', False),
+            ('R  notes.txt -> .aflow/runs/new.json', False),
+            ('R  .aflow/runs/old.json -> .aflow/runs/new.json', False),
+            ('C  plans/backups/old.md -> .aflow/runs/copy.json', False),
+            (' M plans/in-progress/plan.md', True),
+            ('?? plans/in-progress/plan.md', True),
+            ('R  notes.txt -> plans/in-progress/plan.md', False),
+            ('R  plans/in-progress/plan.md -> notes.txt', False),
+            ('C  notes.txt -> plans/in-progress/plan.md', False),
+            ('C  plans/in-progress/plan.md -> notes.txt', False),
+            ('R  "notes -> old.txt" -> plans/in-progress/plan.md', False),
+            ('C  plans/in-progress/plan.md -> "notes -> copy.txt"', False),
+            ('R  notes.txt -> plans/in-progress/plan.md -> .aflow/run.json', False),
+        )
+        for line, expected in cases:
+            with self.subTest(line=line):
+                assert _is_ignored_merge_status_line(
+                    line,
+                    primary_root=primary_root,
+                    original_plan_path=original_plan_path,
+                ) is expected
+
+        status = "\n".join(
+            (
+                '?? .aflow/runs/old/run.json',
+                '?? plans/backups/plan.md',
+                ' M plans/in-progress/plan.md',
+                'R  notes.txt -> plans/in-progress/plan.md',
+                'C  plans/in-progress/plan.md -> notes-copy.txt',
+                'R  "notes -> old.txt" -> plans/in-progress/plan.md',
+                'C  plans/in-progress/plan.md -> "notes -> copy.txt"',
+            )
+        )
+        with patch('aflow.workflow._run_git', return_value=(0, status, '')):
+            assert _collect_merge_dirty_paths(
+                primary_root,
+                original_plan_path=original_plan_path,
+            ) == [
+                'notes.txt',
+                'plans/in-progress/plan.md',
+                'plans/in-progress/plan.md',
+                'notes-copy.txt',
+                'notes -> old.txt',
+                'plans/in-progress/plan.md',
+                'plans/in-progress/plan.md',
+                'notes -> copy.txt',
+            ]
+
+        malformed_status = 'R  notes.txt -> plans/in-progress/plan.md -> .aflow/run.json'
+        with patch('aflow.workflow._run_git', return_value=(0, malformed_status, '')):
+            assert _collect_merge_dirty_paths(
+                primary_root,
+                original_plan_path=original_plan_path,
+            ) == ['notes.txt -> plans/in-progress/plan.md -> .aflow/run.json']
+
     def test_preflight_branch_only_refreshes_base_head_after_branch_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

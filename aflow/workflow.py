@@ -49,7 +49,13 @@ from .manager_context import (
     summarize_repair_plan,
     summarize_review_rejection,
 )
-from .git_status import classify_dirtiness_by_prefix, RepoState, probe_repo_state
+from .git_status import (
+    classify_dirtiness_by_prefix,
+    is_lifecycle_owned_path,
+    porcelain_status_paths,
+    RepoState,
+    probe_repo_state,
+)
 from .harnesses import get_adapter
 from .harnesses.base import HarnessAdapter, HarnessInvocation
 from .plan import (
@@ -1631,7 +1637,10 @@ def _lifecycle_preflight_git(
 
     if effective_status.strip():
         if uses_worktree:
-            _, non_plan_paths = classify_dirtiness_by_prefix(effective_status)
+            _, non_plan_paths = classify_dirtiness_by_prefix(
+                effective_status,
+                ignore_lifecycle_owned=True,
+            )
             if non_plan_paths:
                 raise WorkflowError(
                     f"lifecycle preflight: primary checkout at '{primary_root}' has non-plan dirtiness: "
@@ -2127,11 +2136,11 @@ def _collect_merge_dirty_paths(
             original_plan_path=original_plan_path,
         ):
             continue
-        path = line[3:] if len(line) >= 4 and line[2] == " " else line[2:]
-        path = path.strip().strip('"')
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        dirty_paths.append(path)
+        paths = porcelain_status_paths(line)
+        if paths is None:
+            dirty_paths.append(line[3:] if len(line) >= 4 else line)
+        else:
+            dirty_paths.extend(paths)
     return dirty_paths
 
 
@@ -2611,16 +2620,12 @@ def _is_ignored_merge_status_line(
     if len(line) < 3:
         return False
     xy = line[:2]
-    path = line[3:] if len(line) >= 4 and line[2] == " " else line[2:]
-    path = path.strip()
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
-    path = path.strip('"')
-    if xy == "??" and (
-        path == ".aflow"
-        or path.startswith(".aflow/")
-        or path == "plans/backups"
-        or path.startswith("plans/backups/")
+    paths = porcelain_status_paths(line)
+    if paths is None:
+        return False
+    if xy == "??" and len(paths) == 1 and is_lifecycle_owned_path(
+        paths[0],
+        additional_roots=("plans/backups",),
     ):
         return True
     if original_plan_path is None:
@@ -2629,7 +2634,7 @@ def _is_ignored_merge_status_line(
         rel = original_plan_path.resolve().relative_to(primary_root.resolve()).as_posix()
     except ValueError:
         return False
-    return path == rel
+    return len(paths) == 1 and paths[0] == rel
 
 
 def _rm_worktree_safe(primary_root: Path, worktree_path: Path) -> None:

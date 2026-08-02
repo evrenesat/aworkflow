@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Collection
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -84,6 +86,107 @@ class WorktreeProbe:
     added_count: int
     removed_count: int
     sample_paths: tuple[str, ...]
+
+
+AFLOW_OWNED_PATH_ROOTS = (".aflow",)
+
+
+def _porcelain_path_field(line: str) -> str | None:
+    if len(line) < 4 or line[2] != " ":
+        return None
+    return line[3:]
+
+
+def _decode_porcelain_path_atom(atom: str) -> str | None:
+    if not atom:
+        return None
+    if not atom.startswith('"'):
+        return atom if '"' not in atom else None
+    if not atom.endswith('"'):
+        return None
+
+    escaped = False
+    for index, char in enumerate(atom[1:], start=1):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"' and index != len(atom) - 1:
+            return None
+    if escaped:
+        return None
+
+    try:
+        decoded = ast.literal_eval(atom)
+    except (SyntaxError, ValueError):
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+
+def _rename_copy_atoms(path_field: str) -> tuple[str, str] | None:
+    separators: list[int] = []
+    in_quotes = False
+    escaped = False
+    index = 0
+    while index < len(path_field):
+        char = path_field[index]
+        if escaped:
+            escaped = False
+        elif in_quotes and char == "\\":
+            escaped = True
+        elif char == '"':
+            in_quotes = not in_quotes
+        elif not in_quotes and path_field.startswith(" -> ", index):
+            separators.append(index)
+            index += len(" -> ") - 1
+        index += 1
+
+    if in_quotes or escaped or len(separators) != 1:
+        return None
+    separator = separators[0]
+    return path_field[:separator], path_field[separator + len(" -> "):]
+
+
+def porcelain_status_paths(line: str) -> tuple[str, ...] | None:
+    """Return every repo-relative path from one porcelain-v1 status record."""
+    path_field = _porcelain_path_field(line)
+    if path_field is None:
+        return None
+
+    xy = line[:2]
+    if "R" not in xy and "C" not in xy:
+        path = _decode_porcelain_path_atom(path_field)
+        return (path,) if path is not None else None
+
+    atoms = _rename_copy_atoms(path_field)
+    if atoms is None:
+        return None
+    source = _decode_porcelain_path_atom(atoms[0])
+    destination = _decode_porcelain_path_atom(atoms[1])
+    if source is None or destination is None:
+        return None
+    return source, destination
+
+
+def porcelain_status_path(line: str) -> str | None:
+    """Return the destination repo-relative path from a porcelain-v1 record."""
+    paths = porcelain_status_paths(line)
+    return paths[-1] if paths else None
+
+
+def is_lifecycle_owned_path(
+    path: str,
+    *,
+    additional_roots: Collection[str] = (),
+) -> bool:
+    """Return whether a repo-relative POSIX path belongs to aflow lifecycle state."""
+    for root in (*AFLOW_OWNED_PATH_ROOTS, *additional_roots):
+        normalized_root = root.rstrip("/")
+        if path == normalized_root or path.startswith(f"{normalized_root}/"):
+            return True
+    return False
 
 
 def probe_worktree(repo_root: Path) -> WorktreeProbe | None:
@@ -194,24 +297,34 @@ def capture_baseline(repo_root: Path) -> GitBaseline | None:
 def classify_dirtiness_by_prefix(
     porcelain_output: str,
     prefix: str = "plans/",
+    *,
+    ignore_lifecycle_owned: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Classify repo-relative paths from git porcelain output by prefix.
 
     Returns (paths_under_prefix, paths_outside_prefix).
     Both lists contain repo-relative paths from the porcelain output.
+    When requested, aflow-owned lifecycle paths are omitted from both lists.
     """
     plan_paths: list[str] = []
     non_plan_paths: list[str] = []
 
     for line in porcelain_output.splitlines():
-        if len(line) < 3:
+        if not line:
             continue
-        path = line[3:].lstrip()
+        paths = porcelain_status_paths(line)
+        if paths is None:
+            path_field = _porcelain_path_field(line)
+            non_plan_paths.append(path_field if path_field is not None else line)
+            continue
 
-        if path.startswith(prefix):
-            plan_paths.append(path)
-        else:
-            non_plan_paths.append(path)
+        for path in paths:
+            if ignore_lifecycle_owned and is_lifecycle_owned_path(path):
+                continue
+            if path.startswith(prefix):
+                plan_paths.append(path)
+            else:
+                non_plan_paths.append(path)
 
     return plan_paths, non_plan_paths
 

@@ -1,3 +1,12 @@
+# 2026-08-02 — Lifecycle-owned startup state boundary
+
+- Centralized repository-relative lifecycle ownership matching around the exact
+  `.aflow` root and its descendants, and reused it for worktree startup and
+  merge-teardown dirtiness decisions.
+- Fresh worktree runs now tolerate prior `.aflow/runs/` artifacts without
+  changing Git ignore files; deceptive paths such as `.aflow-copy/` and nested
+  `src/.aflow/` paths remain blocking unrelated dirt.
+
 # 2026-08-02 — Provider-neutral planning backend cutover
 
 ### What changed

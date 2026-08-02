@@ -101,6 +101,73 @@ class LibraryStartupTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_prepare_startup_ignores_owned_aflow_dirt_for_worktree(self) -> None:
+        subprocess.run(
+            ['git', 'init', '-b', 'main'], cwd=self.repo_root,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'user.email', 'test@test.com'], cwd=self.repo_root,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'user.name', 'Test'], cwd=self.repo_root,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'core.excludesFile', '/dev/null'], cwd=self.repo_root,
+            check=True, capture_output=True,
+        )
+        readme_path = self.repo_root / 'README.md'
+        readme_path.write_text('test\n', encoding='utf-8')
+        subprocess.run(
+            ['git', 'add', 'README.md'], cwd=self.repo_root,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'commit', '-m', 'init'], cwd=self.repo_root,
+            check=True, capture_output=True,
+        )
+        config_path = _write_config(
+            self.home_dir,
+            (
+                '[aflow]\ndefault_workflow = "test"\nteam_lead = "architect"\n\n'
+                '[workflow.test]\nsetup = ["worktree", "branch"]\n'
+                'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n\n'
+                '[workflow.test.steps.step1]\nrole = "architect"\n'
+                'prompts = ["p"]\ngo = [{to = "END"}]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                '[roles]\narchitect = "opencode.default"\n\n'
+                '[prompts]\np = "do it"\n'
+            ),
+        )
+        workflow_config = load_workflow_config(config_path)
+        plan_path = self.repo_root / 'plans' / 'in-progress' / 'plan.md'
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text(
+            '# Plan\n\n### [ ] Checkpoint 1: Test\n- [ ] step one\n',
+            encoding='utf-8',
+        )
+        failed_run = self.repo_root / '.aflow' / 'runs' / 'failed' / 'run.json'
+        failed_run.parent.mkdir(parents=True)
+        failed_run.write_text('{"status": "failed"}\n', encoding='utf-8')
+
+        result = prepare_startup(
+            StartupRequest(
+                repo_root=self.repo_root,
+                plan_path=plan_path,
+                config_path=config_path,
+                workflow_config=workflow_config,
+                workflow_name='test',
+                start_step=None,
+                max_turns=None,
+                team=None,
+                extra_instructions=(),
+            )
+        )
+
+        self.assertIsInstance(result, PreparedRun)
+
     def test_prepare_startup_requires_valid_workflow(self) -> None:
         config_text = (
             '[aflow]\ndefault_workflow = "test"\n\n'

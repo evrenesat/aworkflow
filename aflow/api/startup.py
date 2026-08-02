@@ -268,7 +268,10 @@ def _check_worktree_dirtiness(
             check=False,
         )
         if status_result.returncode == 0:
-            _, non_plan_paths = classify_dirtiness_by_prefix(status_result.stdout)
+            _, non_plan_paths = classify_dirtiness_by_prefix(
+                status_result.stdout,
+                ignore_lifecycle_owned=True,
+            )
             if non_plan_paths:
                 raise StartupError(
                     f"Worktree has non-plan dirtiness that must be cleaned before running a worktree workflow. "
