@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,24 @@ HIGHLIGHT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^.*original plan file is missing after the turn.*$", re.MULTILINE),
     re.compile(r"^.*merge verification cannot be completed safely.*$", re.MULTILINE),
 )
+
+FAILURE_LIKE_TURN_STATUSES = frozenset(
+    {
+        "failed",
+        "harness-failed",
+        "plan-invalid",
+        "recovery-failed",
+        "retry-scheduled",
+        "transition-failed",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _TextSignalEvidence:
+    name: str
+    source: str
+    trust_class: str
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -57,6 +76,24 @@ def extract_text_signals(text: str) -> list[str]:
         if pattern.search(text):
             found.append(name)
     return found
+
+
+def classify_turn_text_signals(
+    stdout: str,
+    stderr: str,
+    status: str | None,
+    returncode: int | None,
+) -> list[_TextSignalEvidence]:
+    evidence = {
+        _TextSignalEvidence(name=name, source="semantic_stdout", trust_class="semantic_output")
+        for name in extract_text_signals(stdout)
+    }
+    if returncode not in (None, 0) or status in FAILURE_LIKE_TURN_STATUSES:
+        evidence.update(
+            _TextSignalEvidence(name=name, source="failure_stderr", trust_class="failure_diagnostic")
+            for name in extract_text_signals(stderr)
+        )
+    return sorted(evidence, key=lambda item: (item.name, item.source))
 
 
 def snapshot_signature(snapshot: dict[str, Any] | None) -> tuple[Any, ...] | None:
@@ -281,7 +318,13 @@ def analyze_turn(turn: dict[str, Any]) -> dict[str, Any]:
     stderr_text = read_turn_stream(turn_dir, turn, filename="stderr.txt", inline_key="stderr")
     combined_text = "\n".join(part for part in (stdout_text, stderr_text) if part)
 
-    signals = set(extract_text_signals(combined_text))
+    signal_evidence = classify_turn_text_signals(
+        stdout_text,
+        stderr_text,
+        turn.get("status"),
+        turn.get("returncode"),
+    )
+    signals = {item.name for item in signal_evidence}
     if turn.get("status") == "plan-invalid":
         signals.add("plan_invalid")
         if "inconsistent checkpoint state" in str(turn.get("error", "")).lower():
@@ -323,6 +366,7 @@ def analyze_turn(turn: dict[str, Any]) -> dict[str, Any]:
         "recovery": recovery,
         "returncode": turn.get("returncode"),
         "selector": turn.get("selector"),
+        "signal_provenance": [asdict(item) for item in signal_evidence],
         "signals": sorted(signals),
         "snapshot_changed": snapshot_changed,
         "snapshot_unchanged": snapshot_unchanged,
@@ -413,6 +457,7 @@ def compact_turn(turn: dict[str, Any]) -> dict[str, Any]:
         "recovery": turn["recovery"],
         "returncode": turn["returncode"],
         "selector": turn["selector"],
+        "signal_provenance": turn["signal_provenance"],
         "signals": turn["signals"],
         "started_at": turn["started_at"],
         "status": turn["status"],

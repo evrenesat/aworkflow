@@ -9,6 +9,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from aflow.analyzer import analyze_turn, classify_turn_text_signals, extract_text_signals
+
+
+INCIDENT_SIGNAL_TEXT = "\n".join(
+    (
+        "Plan Branch: main; the current checkout is aflow-feature and requires me to stop and escalate",
+        "Need your direction on one point",
+        "the original plan file is missing after the turn",
+        "merge verification cannot be completed safely",
+    )
+)
+
+INCIDENT_SIGNAL_NAMES = [
+    "branch_mismatch_review_block",
+    "dirty_merge_verification",
+    "needs_human_direction",
+    "original_plan_missing",
+]
+
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,6 +88,163 @@ class AflowAssistantAnalyzerTests(unittest.TestCase):
             text=True,
         )
         return json.loads(result.stdout)
+
+    def _analyze_turn(
+        self,
+        root: Path,
+        *,
+        status: str | None = "completed",
+        returncode: int | None = 0,
+        stdout: str = "",
+        stderr: str = "",
+        **extra: object,
+    ) -> dict[str, object]:
+        turn_dir = root / "turn"
+        turn_dir.mkdir(parents=True, exist_ok=True)
+        (turn_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
+        (turn_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
+        turn = {
+            "_turn_dir": turn_dir,
+            "status": status,
+            "returncode": returncode,
+            **extra,
+        }
+        return analyze_turn(turn)
+
+    def test_text_signal_classifier_preserves_single_text_contract(self) -> None:
+        assert extract_text_signals(INCIDENT_SIGNAL_TEXT) == [
+            "branch_mismatch_review_block",
+            "needs_human_direction",
+            "original_plan_missing",
+            "dirty_merge_verification",
+        ]
+
+    def test_successful_transcript_stderr_does_not_emit_text_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            run_dir = repo_root / ".aflow" / "runs" / "20260802T001252Z-transcript"
+            _write_json(
+                run_dir / "run.json",
+                {
+                    "status": "running",
+                    "workflow_name": "medium",
+                    "turns_completed": 1,
+                    "current_step_name": "review_cp_implementation",
+                },
+            )
+            _write_turn(
+                run_dir,
+                1,
+                result={
+                    "turn_number": 1,
+                    "step_name": "implement_plan",
+                    "status": "completed",
+                    "returncode": 0,
+                    "chosen_transition": "review_cp_implementation",
+                    "snapshot_before": _snapshot(),
+                    "snapshot_after": _snapshot(),
+                },
+                stderr=INCIDENT_SIGNAL_TEXT,
+            )
+            payload = self._run_aflow_analyze(
+                "20260802T001252Z-transcript",
+                "--repo-root",
+                str(repo_root),
+            )
+
+        assert payload["run"]["failure"]["signals"] == []
+        assert payload["run"]["focus_turns"][0]["signals"] == []
+        assert payload["run"]["focus_turns"][0]["signal_provenance"] == []
+
+    def test_successful_semantic_stdout_emits_exact_signal_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            turn = self._analyze_turn(Path(tmpdir), stdout=INCIDENT_SIGNAL_TEXT)
+
+        assert turn["signals"] == INCIDENT_SIGNAL_NAMES
+        assert turn["signal_provenance"] == [
+            {"name": name, "source": "semantic_stdout", "trust_class": "semantic_output"}
+            for name in INCIDENT_SIGNAL_NAMES
+        ]
+
+    def test_nonzero_stderr_emits_failure_diagnostic_provenance(self) -> None:
+        evidence = classify_turn_text_signals("", INCIDENT_SIGNAL_TEXT, "completed", 1)
+
+        assert [item.name for item in evidence] == INCIDENT_SIGNAL_NAMES
+        assert [
+            {"name": item.name, "source": item.source, "trust_class": item.trust_class}
+            for item in evidence
+        ] == [
+            {"name": name, "source": "failure_stderr", "trust_class": "failure_diagnostic"}
+            for name in INCIDENT_SIGNAL_NAMES
+        ]
+
+    def test_each_failure_like_status_unlocks_stderr_without_nonzero_returncode(self) -> None:
+        for status in (
+            "failed",
+            "harness-failed",
+            "recovery-failed",
+            "plan-invalid",
+            "retry-scheduled",
+            "transition-failed",
+        ):
+            for returncode in (0, None):
+                with self.subTest(status=status, returncode=returncode):
+                    evidence = classify_turn_text_signals("", INCIDENT_SIGNAL_TEXT, status, returncode)
+                    assert [item.name for item in evidence] == INCIDENT_SIGNAL_NAMES
+                    assert all(item.source == "failure_stderr" for item in evidence)
+                    assert all(item.trust_class == "failure_diagnostic" for item in evidence)
+
+    def test_unknown_or_missing_status_does_not_unlock_stderr(self) -> None:
+        for status in ("unknown", None):
+            for returncode in (0, None):
+                with self.subTest(status=status, returncode=returncode):
+                    assert classify_turn_text_signals("", INCIDENT_SIGNAL_TEXT, status, returncode) == []
+
+    def test_text_signal_provenance_deduplicates_by_name_and_source(self) -> None:
+        evidence = classify_turn_text_signals(
+            INCIDENT_SIGNAL_TEXT + "\n" + INCIDENT_SIGNAL_TEXT,
+            INCIDENT_SIGNAL_TEXT,
+            "failed",
+            1,
+        )
+
+        assert [(item.name, item.source) for item in evidence] == sorted(
+            (name, source)
+            for name in INCIDENT_SIGNAL_NAMES
+            for source in ("failure_stderr", "semantic_stdout")
+        )
+
+    def test_structured_and_explicit_stop_signals_remain_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            turn = self._analyze_turn(
+                Path(tmpdir),
+                status="plan-invalid",
+                returncode=2,
+                stderr="AFLOW_STOP: halt for owner direction",
+                error="Inconsistent checkpoint state",
+                recovery_source="deterministic",
+                recovery_action="fail_immediately",
+                recovery_from_team="team-a",
+                recovery_to_team="team-a",
+            )
+
+        assert turn["aflow_stop_messages"] == ["halt for owner direction"]
+        assert turn["signal_provenance"] == []
+        assert turn["signals"] == [
+            "harness_recovery_deterministic",
+            "harness_recovery_fail_immediately",
+            "harness_recovery_present",
+            "inconsistent_checkpoint_state",
+            "nonzero_returncode",
+            "plan_invalid",
+        ]
+
+    def test_retry_scheduled_structured_signals_remain_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            turn = self._analyze_turn(Path(tmpdir), status="retry-scheduled", returncode=None)
+
+        assert turn["signals"] == ["inconsistent_checkpoint_state", "retry_scheduled"]
+        assert turn["signal_provenance"] == []
 
     def test_analyzer_defaults_to_latest_substantive_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
