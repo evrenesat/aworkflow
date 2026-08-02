@@ -1,5 +1,12 @@
 # DEVLOG
 
+## 2026-08-02
+
+- Standardized p100 self-hosted development on an editable uv tool installation:
+  run `uv tool install -e . --force` from the intended AFlow checkout, then invoke
+  `aflow` directly. `uv run aflow` is not a supported development launcher;
+  `uv run` remains available for tests and other project-scoped checks.
+
 ## 2026-08-01 — Codex prompt stdin transport
 
 - Checkpoint 1 moves Codex effective prompts from argv into stdin while keeping
