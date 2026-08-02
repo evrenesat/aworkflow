@@ -1,8 +1,128 @@
 from aflow._test_support import *  # noqa: F401,F403
 import hashlib
+from typing import Mapping
+from unittest.mock import Mock
 from aflow.api.models import PreparedRun
-from aflow.config import ManagerConfig
+from aflow.config import ErrorHandlingConfig, ManagerConfig
+from aflow.repartition import create_envelope, derive_generation_id, write_envelope_atomic
 from aflow.status import BannerRenderer as RealBannerRenderer
+from aflow.workflow import _freeze_run_identity
+
+
+def _complete_pending_repartition_fixture(
+    run_dir: Path,
+    *,
+    write_artifacts: bool = True,
+    scope: Mapping[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, bytes]]:
+    attempt_rel = "manager/decision-001/repartition/attempt-001"
+    prefix = f"{attempt_rel}/"
+    artifacts = {
+        f"{prefix}proposal.json": b"proposal-artifact\n",
+        f"{prefix}candidate-plan.md": b"# candidate\n",
+        f"{prefix}mechanical-validation.json": b"mechanical-artifact\n",
+        f"{prefix}semantic-verdict.json": b"semantic-artifact\n",
+    }
+    if write_artifacts:
+        for relative, content in artifacts.items():
+            artifact_path = run_dir / relative
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(content)
+    proposal_path = f"{prefix}proposal.json"
+    candidate_path = f"{prefix}candidate-plan.md"
+    pending = {
+        "schema_version": 1,
+        "decision_number": 1,
+        "scope_id": (
+            str(scope["scope_id"]) if scope is not None else "saved-scope"
+        ),
+        "stage": "semantically_validated",
+        "envelope_sha256": (
+            str(scope["envelope_canonical_sha256"])
+            if scope is not None
+            else "e" * 64
+        ),
+        "source_plan_sha256": (
+            str(scope["source_plan_sha256"])
+            if scope is not None
+            else "s" * 64
+        ),
+        "attempt_count": 1,
+        "generation_id": (
+            derive_generation_id(
+                scope_id=str(scope["scope_id"]),
+                decision_number=1,
+                envelope_sha256=str(scope["envelope_canonical_sha256"]),
+                source_plan_sha256=str(scope["source_plan_sha256"]),
+            )
+            if scope is not None
+            else "generation-1"
+        ),
+        "partition_ids": ["partition-1"],
+        "child_summaries": ["Child 1: narrow goal"],
+        "proposal_sha256": hashlib.sha256(artifacts[proposal_path]).hexdigest(),
+        "candidate_plan_sha256": hashlib.sha256(artifacts[candidate_path]).hexdigest(),
+        "current_disposition": "implement_current_partition",
+        "resolved_target_step": "implement_plan",
+        "resolved_target_role": "worker",
+        "latest_attempt_path": attempt_rel,
+        "proposal_artifact_path": proposal_path,
+        "candidate_artifact_path": candidate_path,
+        "mechanical_validation_artifact_path": (
+            f"{prefix}mechanical-validation.json"
+        ),
+        "semantic_verdict_artifact_path": f"{prefix}semantic-verdict.json",
+        "failed_stage": None,
+        "failure_reason": None,
+    }
+    return pending, artifacts
+
+
+def _pending_scope_fixture(
+    run_dir: Path,
+    original_plan_path: Path,
+) -> dict[str, object]:
+    scope_id = f"{original_plan_path}::checkpoint-1::first"
+    plan_text = original_plan_path.read_text(encoding="utf-8")
+    envelope = create_envelope(
+        scope_id=scope_id,
+        original_plan_path=original_plan_path,
+        plan_text=plan_text,
+        checkpoint_index=1,
+        repo_root=original_plan_path.parent.parent.parent,
+    )
+    artifact_path = write_envelope_atomic(
+        envelope,
+        run_dir / "scopes" / envelope.scope_digest,
+    )
+    artifact_bytes = artifact_path.read_bytes()
+    return {
+        "scope_id": scope_id,
+        "original_plan_path": str(original_plan_path),
+        "checkpoint_index": 1,
+        "checkpoint_name": "Checkpoint 1: First",
+        "opened_turn_number": 1,
+        "awaiting_review": False,
+        "carried_reviewer_rejection_count": 0,
+        "envelope_artifact_path": artifact_path.resolve()
+        .relative_to(run_dir.resolve())
+        .as_posix(),
+        "envelope_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "envelope_canonical_sha256": envelope.canonical_envelope_sha256,
+        "source_plan_sha256": hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
+    }
+
+
+def _bound_pending_repartition_fixture(
+    run_dir: Path,
+    original_plan_path: Path,
+) -> tuple[dict[str, object], dict[str, bytes], dict[str, object]]:
+    scope = _pending_scope_fixture(run_dir, original_plan_path)
+    pending, artifacts = _complete_pending_repartition_fixture(
+        run_dir,
+        scope=scope,
+    )
+    return pending, artifacts, scope
 
 
 def test_cli_analysis_adds_safe_controller_state_without_notes(
@@ -196,6 +316,1886 @@ def test_manager_report_remains_visible_once_after_real_banner_and_cli(
 
 class WorkflowCliTests(unittest.TestCase):
 
+    def _new_temp_path(self) -> Path:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        return Path(temp_dir.name)
+
+    def _resume_bootstrap_fixture(self, tmp_path: Path) -> tuple[Path, Path, object, dict[str, object]]:
+        repo_root = tmp_path.resolve()
+        plan_path = repo_root / "plans" / "in-progress" / "saved-plan.md"
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+        step = WorkflowStepConfig(
+            role="worker",
+            prompts=("p",),
+            go=(GoTransition(to="END", when="DONE"),),
+        )
+        workflow_spec = WorkflowConfig(
+            declared_steps={"implement_plan": step},
+            steps={"implement_plan": step},
+            first_step="implement_plan",
+            team="base",
+            setup=("worktree", "branch"),
+            teardown=("merge", "rm_worktree"),
+        )
+        workflow_config = type(
+            "WorkflowConfig",
+            (),
+            {
+                "workflows": {"saved_workflow": workflow_spec},
+                "aflow": AflowSection(default_workflow="saved_workflow"),
+                "harnesses": {
+                    "codex": WorkflowHarnessConfig(
+                        profiles={"worker": HarnessProfileConfig(model="worker")}
+                    )
+                },
+                "roles": {"worker": "codex.worker"},
+                "teams": {
+                    "base": TeamConfig(roles={"worker": "codex.worker"})
+                },
+                "manager": ManagerConfig(),
+                "error_handling": ErrorHandlingConfig(),
+            },
+        )()
+        run_dir = repo_root / ".aflow" / "runs" / "saved-run"
+        prev_run = {
+            "repo_root": str(repo_root),
+            "workflow_name": "saved_workflow",
+            "plan_path": str(plan_path),
+            "original_plan_path": str(plan_path),
+            "team": "base",
+            "selected_start_step": "implement_plan",
+            "max_turns": 15,
+            "effective_max_turns": 15,
+            "extra_instructions": ["keep the patch focused"],
+            "lifecycle_setup": ["worktree", "branch"],
+            "lifecycle_teardown": ["merge", "rm_worktree"],
+            "feature_branch": "feature/saved-run",
+            "worktree_path": str(repo_root / "worktree"),
+            "main_branch": "main",
+            "status": "failed",
+            "last_snapshot": {"is_complete": False},
+        }
+        return repo_root, run_dir, workflow_config, prev_run
+
+    def _modern_resume_fixture(
+        self,
+        tmp_path: Path,
+    ) -> tuple[Path, Path, Path, object, dict[str, object]]:
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(
+            tmp_path
+        )
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("", encoding="utf-8")
+        identity = _freeze_run_identity(
+            "saved_workflow",
+            workflow_config,
+            config_dir=config_path,
+        )
+        modern_run = dict(prev_run)
+        modern_run.update(
+            {
+                "schema_version": 1,
+                "frozen_config": {
+                    "workflow_name": identity.workflow_name,
+                    "config_path": identity.config_path,
+                    "config_fingerprint": identity.config_fingerprint,
+                },
+            }
+        )
+        return repo_root, run_dir, config_path, workflow_config, modern_run
+
+    def _invoke_resume_command(
+        self,
+        tmp_path: Path,
+        prev_run: dict[str, object],
+        run_dir: Path,
+        workflow_config: object,
+        *,
+        reset_scope: bool = False,
+        auto: bool = False,
+        startup_result: PreparedRun | None = None,
+    ) -> tuple[int, str, Mock, Mock, Mock, Mock, object | None]:
+        import aflow.cli as cli_module
+
+        repo_root = tmp_path.resolve()
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("", encoding="utf-8")
+        if startup_result is None:
+            startup_result = PreparedRun(
+                workflow_name="saved_workflow",
+                repo_root=repo_root,
+                plan_path=Path(prev_run["original_plan_path"]),
+                config_path=config_path,
+                max_turns=15,
+                team="base",
+                extra_instructions=("keep the patch focused",),
+                start_step="implement_plan",
+            )
+        startup = Mock(return_value=startup_result)
+        execute = Mock(
+            return_value=type(
+                "RunResult",
+                (),
+                {"turns_completed": 0, "end_reason": "done"},
+            )()
+        )
+        stderr = io.StringIO()
+        resolve_run_id = Mock(
+            return_value=(Path(run_dir.name), "shell_last_run_id_file" if auto else "explicit_run_id")
+        )
+        load_run_json = Mock(return_value=prev_run)
+        argv = ["run", "--resume"]
+        if not auto:
+            argv.append(run_dir.name)
+        if reset_scope:
+            argv.append("--resume-reset-scope")
+
+        with patch.object(
+            cli_module,
+            "_bootstrap_config_files",
+            return_value=(config_path, ()),
+        ), patch.object(
+            cli_module,
+            "_resolve_repo_root",
+            return_value=repo_root,
+        ), patch.object(
+            cli_module,
+            "load_workflow_config",
+            return_value=workflow_config,
+        ), patch.object(
+            cli_module,
+            "validate_workflow_config",
+            return_value=[],
+        ), patch.object(
+            cli_module,
+            "resolve_run_id",
+            resolve_run_id,
+        ), patch.object(
+            cli_module,
+            "load_run_json",
+            load_run_json,
+        ), patch.object(
+            cli_module,
+            "_handle_startup_questions",
+            startup,
+        ), patch.object(
+            cli_module,
+            "execute_workflow",
+            execute,
+        ), patch.object(cli_module, "BannerRenderer"):
+            with redirect_stderr(stderr):
+                status = cli_module.main(argv)
+
+        captured_resume = None
+        if execute.call_args is not None:
+            captured_resume = execute.call_args.kwargs.get("resume")
+        return (
+            status,
+            stderr.getvalue(),
+            startup,
+            execute,
+            resolve_run_id,
+            load_run_json,
+            captured_resume,
+        )
+
+    def test_resume_bootstrap_reconstructs_omitted_identity_from_exact_run(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            result = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=None,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
+        assert result.resolved_run_id == Path(run_dir.name)
+        assert result.plan_path == Path(prev_run["original_plan_path"])
+        assert result.workflow_name == "saved_workflow"
+        assert result.team == "base"
+        assert result.start_step == "implement_plan"
+        assert result.max_turns == 15
+        assert result.extra_instructions == ("keep the patch focused",)
+        assert result.frozen_run_identity is None
+
+    def test_resume_bootstrap_accepts_exact_modern_frozen_identity(self) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, config_path, workflow_config, modern_run = (
+            self._modern_resume_fixture(tmp_path)
+        )
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=modern_run):
+            result = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                config_path=config_path,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
+        assert result.frozen_run_identity is not None
+        assert result.frozen_run_identity.config_path == str(config_path.resolve())
+        assert result.frozen_run_identity.config_fingerprint == modern_run[
+            "frozen_config"
+        ]["config_fingerprint"]
+
+    def test_resume_bootstrap_rejects_frozen_identity_path_and_fingerprint_drift(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        for drift in ("config_path", "config_fingerprint"):
+            with self.subTest(drift=drift):
+                tmp_path = self._new_temp_path()
+                (
+                    repo_root,
+                    run_dir,
+                    config_path,
+                    workflow_config,
+                    modern_run,
+                ) = self._modern_resume_fixture(tmp_path)
+                modern_run = dict(modern_run)
+                frozen_config = dict(modern_run["frozen_config"])
+                if drift == "config_path":
+                    current_config_path = repo_root / "other-aflow.toml"
+                    frozen_config["config_path"] = str(config_path.resolve())
+                else:
+                    current_config_path = config_path
+                    frozen_config["config_fingerprint"] = "different-fingerprint"
+                modern_run["frozen_config"] = frozen_config
+
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch("aflow.cli.load_run_json", return_value=modern_run):
+                    with pytest.raises(ValueError, match="frozen configuration mismatch"):
+                        cli_module._bootstrap_resume_invocation(
+                            repo_root=repo_root,
+                            config_path=current_config_path,
+                            workflow_config=workflow_config,
+                            requested_run_id=run_dir.name,
+                            workflow_arg=None,
+                            plan_file_arg=None,
+                            team_arg=None,
+                            start_step_arg=None,
+                            max_turns_arg=None,
+                            extra_instructions_arg=(),
+                            extra_instructions_provided=False,
+                        )
+
+    def test_modern_resume_requires_complete_frozen_identity_before_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            (None, "expected a mapping"),
+            ({"workflow_name": "saved_workflow"}, "frozen_config.config_path"),
+            (
+                {
+                    "workflow_name": "saved_workflow",
+                    "config_path": "/tmp/config",
+                    "config_fingerprint": "",
+                },
+                "frozen_config.config_fingerprint",
+            ),
+        )
+        for frozen_config, message in cases:
+            with self.subTest(message=message):
+                tmp_path = self._new_temp_path()
+                (
+                    repo_root,
+                    run_dir,
+                    config_path,
+                    workflow_config,
+                    modern_run,
+                ) = self._modern_resume_fixture(tmp_path)
+                modern_run = dict(modern_run)
+                modern_run["frozen_config"] = frozen_config
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch("aflow.cli.load_run_json", return_value=modern_run):
+                    with pytest.raises(ValueError, match=message):
+                        cli_module._bootstrap_resume_invocation(
+                            repo_root=repo_root,
+                            config_path=config_path,
+                            workflow_config=workflow_config,
+                            requested_run_id=run_dir.name,
+                            workflow_arg=None,
+                            plan_file_arg=None,
+                            team_arg=None,
+                            start_step_arg=None,
+                            max_turns_arg=None,
+                            extra_instructions_arg=(),
+                            extra_instructions_provided=False,
+                        )
+
+    def test_modern_plan_free_resume_rejects_identity_drift_before_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        for drift in ("config_path", "config_fingerprint"):
+            with self.subTest(drift=drift):
+                tmp_path = self._new_temp_path()
+                (
+                    repo_root,
+                    run_dir,
+                    config_path,
+                    workflow_config,
+                    modern_run,
+                ) = self._modern_resume_fixture(tmp_path)
+                current_config_path = (
+                    repo_root / "other-aflow.toml"
+                    if drift == "config_path"
+                    else config_path
+                )
+                current_config_path.write_text("", encoding="utf-8")
+                if drift == "config_fingerprint":
+                    modern_run = dict(modern_run)
+                    modern_run["frozen_config"] = dict(modern_run["frozen_config"])
+                    modern_run["frozen_config"]["config_fingerprint"] = "drifted"
+                startup = Mock()
+                stderr = io.StringIO()
+                with patch.object(
+                    cli_module,
+                    "_bootstrap_config_files",
+                    return_value=(current_config_path, ()),
+                ), patch.object(
+                    cli_module,
+                    "_resolve_repo_root",
+                    return_value=repo_root,
+                ), patch.object(
+                    cli_module,
+                    "load_workflow_config",
+                    return_value=workflow_config,
+                ), patch.object(
+                    cli_module,
+                    "validate_workflow_config",
+                    return_value=[],
+                ), patch.object(
+                    cli_module,
+                    "resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch.object(
+                    cli_module,
+                    "load_run_json",
+                    return_value=modern_run,
+                ), patch.object(
+                    cli_module,
+                    "_handle_startup_questions",
+                    startup,
+                ), redirect_stderr(stderr):
+                    status = cli_module.main(["run", "--resume", run_dir.name])
+
+                assert status == 1
+                assert "frozen configuration mismatch" in stderr.getvalue()
+                startup.assert_not_called()
+                assert not (repo_root / ".aflow" / "runs").exists()
+
+    def test_modern_plan_free_resume_rejects_malformed_identity_before_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            None,
+            {"workflow_name": "saved_workflow"},
+            {
+                "workflow_name": "saved_workflow",
+                "config_path": "/tmp/config",
+                "config_fingerprint": "",
+            },
+        )
+        for frozen_config in cases:
+            with self.subTest(frozen_config=frozen_config):
+                tmp_path = self._new_temp_path()
+                (
+                    repo_root,
+                    run_dir,
+                    config_path,
+                    workflow_config,
+                    modern_run,
+                ) = self._modern_resume_fixture(tmp_path)
+                modern_run = dict(modern_run)
+                modern_run["frozen_config"] = frozen_config
+                startup = Mock()
+                execute = Mock()
+                stderr = io.StringIO()
+                with patch.object(
+                    cli_module,
+                    "_bootstrap_config_files",
+                    return_value=(config_path, ()),
+                ), patch.object(
+                    cli_module,
+                    "_resolve_repo_root",
+                    return_value=repo_root,
+                ), patch.object(
+                    cli_module,
+                    "load_workflow_config",
+                    return_value=workflow_config,
+                ), patch.object(
+                    cli_module,
+                    "validate_workflow_config",
+                    return_value=[],
+                ), patch.object(
+                    cli_module,
+                    "resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch.object(
+                    cli_module,
+                    "load_run_json",
+                    return_value=modern_run,
+                ), patch.object(
+                    cli_module,
+                    "_handle_startup_questions",
+                    startup,
+                ), patch.object(
+                    cli_module,
+                    "execute_workflow",
+                    execute,
+                ), redirect_stderr(stderr):
+                    status = cli_module.main(["run", "--resume", run_dir.name])
+
+                assert status == 1
+                assert "invalid frozen_config" in stderr.getvalue()
+                startup.assert_not_called()
+                execute.assert_not_called()
+                assert not (repo_root / ".aflow" / "runs").exists()
+
+    def test_plan_free_resume_bootstrap_rejects_malformed_saved_metadata(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            ("original_plan_path", 17, "invalid original_plan_path"),
+            ("extra_instructions", "not-a-list", "invalid extra_instructions"),
+            ("max_turns", True, "invalid max_turns"),
+            ("selected_start_step", "missing_step", "invalid selected_start_step"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+                prev_run = dict(prev_run)
+                prev_run[field] = value
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                    with pytest.raises(ValueError, match=message):
+                        cli_module._bootstrap_resume_invocation(
+                            repo_root=repo_root,
+                            workflow_config=workflow_config,
+                            requested_run_id=run_dir.name,
+                            workflow_arg=None,
+                            plan_file_arg=None,
+                            team_arg=None,
+                            start_step_arg=None,
+                            max_turns_arg=None,
+                            extra_instructions_arg=(),
+                            extra_instructions_provided=False,
+                        )
+
+    def test_resume_bootstrap_accepts_compatible_repeated_identity(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            result = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg="saved_workflow",
+                plan_file_arg=str(Path(prev_run["plan_path"])),
+                team_arg="base",
+                start_step_arg="1",
+                max_turns_arg=15,
+                extra_instructions_arg=("keep the patch focused",),
+                extra_instructions_provided=True,
+            )
+
+        assert result.workflow_name == "saved_workflow"
+        assert result.start_step == "implement_plan"
+
+    def test_resume_bootstrap_accepts_explicit_empty_extra_instructions_when_saved_empty(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        prev_run = dict(prev_run)
+        prev_run["extra_instructions"] = []
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            result = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=True,
+            )
+
+        assert result.extra_instructions == ()
+
+    def test_resume_bootstrap_rejects_explicit_empty_extra_instructions_when_saved_nonempty(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            with pytest.raises(ValueError, match="resume extra-instructions mismatch"):
+                cli_module._bootstrap_resume_invocation(
+                    repo_root=repo_root,
+                    workflow_config=workflow_config,
+                    requested_run_id=run_dir.name,
+                    workflow_arg=None,
+                    plan_file_arg=None,
+                    team_arg=None,
+                    start_step_arg=None,
+                    max_turns_arg=None,
+                    extra_instructions_arg=(),
+                    extra_instructions_provided=True,
+                )
+
+    def test_plan_free_resume_explicit_empty_extra_instructions_reaches_bootstrap_conflict(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        config_path = repo_root / "aflow.toml"
+        stderr = io.StringIO()
+        startup = Mock()
+        with patch.object(
+            cli_module,
+            "_bootstrap_config_files",
+            return_value=(config_path, ()),
+        ), patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), patch.object(
+            cli_module,
+            "load_workflow_config",
+            return_value=workflow_config,
+        ), patch.object(cli_module, "validate_workflow_config", return_value=[]), patch.object(
+            cli_module,
+            "resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch.object(cli_module, "load_run_json", return_value=prev_run) as load_run_json, patch.object(
+            cli_module,
+            "_handle_startup_questions",
+            startup,
+        ), redirect_stderr(stderr):
+            status = cli_module.main(["run", "--resume", run_dir.name, "--"])
+
+        assert status == 1
+        assert "resume extra-instructions mismatch" in stderr.getvalue()
+        load_run_json.assert_called_once_with(run_dir)
+        startup.assert_not_called()
+
+    def test_resume_explicit_and_auto_reject_path_shaped_ids_before_loading_or_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        repo_root = self._new_temp_path().resolve()
+        config_path = repo_root / "aflow.toml"
+        workflow_config = type(
+            "WorkflowConfig",
+            (),
+            {"workflows": {}, "harnesses": {}},
+        )()
+        invalid_ids = (
+            "../saved-run",
+            "nested/saved-run",
+            str(repo_root / "saved-run"),
+            ".",
+            "..",
+        )
+        for source in ("explicit_run_id", "shell_last_run_id_file"):
+            for invalid_id in invalid_ids:
+                with self.subTest(source=source, run_id=invalid_id):
+                    requested_run_id = invalid_id if source == "explicit_run_id" else None
+                    argv = ["run", "--resume"]
+                    if requested_run_id is not None:
+                        argv.append(requested_run_id)
+                    stderr = io.StringIO()
+                    startup = Mock()
+                    controller = Mock()
+                    with patch.object(
+                        cli_module,
+                        "_bootstrap_config_files",
+                        return_value=(config_path, ()),
+                    ), patch.object(
+                        cli_module,
+                        "_resolve_repo_root",
+                        return_value=repo_root,
+                    ), patch.object(
+                        cli_module,
+                        "load_workflow_config",
+                        return_value=workflow_config,
+                    ), patch.object(
+                        cli_module,
+                        "validate_workflow_config",
+                        return_value=[],
+                    ), patch.object(
+                        cli_module,
+                        "resolve_run_id",
+                        return_value=(Path(invalid_id), source),
+                    ) as resolve_run_id, patch.object(
+                        cli_module,
+                        "load_run_json",
+                    ) as load_run_json, patch.object(
+                        cli_module,
+                        "_handle_startup_questions",
+                        startup,
+                    ), patch.object(cli_module, "execute_workflow", controller), redirect_stderr(
+                        stderr
+                    ):
+                        status = cli_module.main(argv)
+
+                    assert status == 1
+                    assert "error: invalid resume run id" in stderr.getvalue()
+                    resolve_run_id.assert_called_once_with(requested_run_id, repo_root)
+                    load_run_json.assert_not_called()
+                    startup.assert_not_called()
+                    controller.assert_not_called()
+
+    def test_plan_free_resume_bootstrap_rejects_missing_saved_plan_before_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        prev_run = dict(prev_run)
+        prev_run["original_plan_path"] = str(repo_root / "missing-plan.md")
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run), \
+             patch.object(cli_module, "_bootstrap_config_files", return_value=(repo_root / "aflow.toml", ())), \
+             patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), \
+             patch.object(cli_module, "load_workflow_config", return_value=workflow_config), \
+             patch.object(cli_module, "validate_workflow_config", return_value=[]), \
+             patch.object(cli_module, "_handle_startup_questions") as startup:
+            status = cli_module.main(["run", "--resume", run_dir.name])
+
+        assert status == 1
+        startup.assert_not_called()
+
+    def test_plan_free_resume_rejects_missing_run_metadata_before_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+        from unittest.mock import Mock
+
+        tmp_path = self._new_temp_path()
+        repo_root = tmp_path.resolve()
+        run_dir = repo_root / ".aflow" / "runs" / "missing-metadata"
+        config_path = repo_root / "aflow.toml"
+        workflow_config = type(
+            "WorkflowConfig",
+            (),
+            {"workflows": {}, "harnesses": {}},
+        )()
+        startup = Mock()
+        stderr = io.StringIO()
+        with patch.object(
+            cli_module,
+            "_bootstrap_config_files",
+            return_value=(config_path, ()),
+        ), patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), patch.object(
+            cli_module,
+            "load_workflow_config",
+            return_value=workflow_config,
+        ), patch.object(cli_module, "validate_workflow_config", return_value=[]), patch.object(
+            cli_module,
+            "resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch.object(cli_module, "load_run_json", return_value=None), patch.object(
+            cli_module,
+            "_handle_startup_questions",
+            startup,
+        ), redirect_stderr(stderr):
+            status = cli_module.main(["run", "--resume", run_dir.name])
+
+        assert status == 1
+        assert "does not contain readable or valid run metadata" in stderr.getvalue()
+        startup.assert_not_called()
+
+    def test_plan_free_resume_rejects_complete_context_metadata_before_startup(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            (
+                "missing main branch",
+                lambda run: run.pop("main_branch"),
+                "worktree resume metadata",
+            ),
+            (
+                "invalid lifecycle teardown",
+                lambda run: run.__setitem__("lifecycle_teardown", "merge"),
+                "lifecycle resume metadata",
+            ),
+            (
+                "unsafe scope envelope reference",
+                lambda run: run.__setitem__(
+                    "active_implementation_scope",
+                    {
+                        "scope_id": "saved-scope",
+                        "original_plan_path": "saved-plan.md",
+                        "checkpoint_index": 1,
+                        "checkpoint_name": "Checkpoint 1: Saved",
+                        "opened_turn_number": 1,
+                        "envelope_artifact_path": "../../outside-envelope.json",
+                        "envelope_artifact_sha256": "a" * 64,
+                        "envelope_canonical_sha256": "b" * 64,
+                    },
+                ),
+                "invalid scope envelope reference",
+            ),
+        )
+
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(original_run)
+                mutate(prev_run)
+                config_path = repo_root / "aflow.toml"
+                config_path.write_text("", encoding="utf-8")
+                stderr = io.StringIO()
+                startup = Mock()
+                execute = Mock()
+
+                with patch.object(
+                    cli_module,
+                    "_bootstrap_config_files",
+                    return_value=(config_path, ()),
+                ), patch.object(
+                    cli_module,
+                    "_resolve_repo_root",
+                    return_value=repo_root,
+                ), patch.object(
+                    cli_module,
+                    "load_workflow_config",
+                    return_value=workflow_config,
+                ), patch.object(
+                    cli_module,
+                    "validate_workflow_config",
+                    return_value=[],
+                ), patch.object(
+                    cli_module,
+                    "resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch.object(
+                    cli_module,
+                    "load_run_json",
+                    return_value=prev_run,
+                ), patch.object(
+                    cli_module,
+                    "_handle_startup_questions",
+                    startup,
+                ), patch.object(
+                    cli_module,
+                    "execute_workflow",
+                    execute,
+                ), redirect_stderr(stderr):
+                    status = cli_module.main(["run", "--resume", run_dir.name])
+
+                assert status == 1
+                assert expected in stderr.getvalue()
+                startup.assert_not_called()
+                execute.assert_not_called()
+                assert not (repo_root / ".aflow" / "runs").exists()
+
+    def test_resume_rejects_present_pending_repartition_before_startup(self) -> None:
+        cases = (
+            ("scalar", lambda pending: "not-a-transaction", "pending_repartition"),
+            (
+                "tolerant decoder drop",
+                lambda pending: {"schema_version": 1},
+                "pending_repartition",
+            ),
+            (
+                "missing generation identity",
+                lambda pending: pending.pop("generation_id"),
+                "generation_id",
+            ),
+            (
+                "missing routing identity",
+                lambda pending: pending.__setitem__("resolved_target_role", None),
+                "resolved_target_role",
+            ),
+        )
+        for name, mutate, expected_field in cases:
+            with self.subTest(case=name):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(original_run)
+                pending, _artifacts, scope = _bound_pending_repartition_fixture(
+                    run_dir,
+                    Path(original_run["original_plan_path"]),
+                )
+                prev_run["active_implementation_scope"] = scope
+                prev_run["manager_decision_number"] = pending["decision_number"]
+                if name in {"scalar", "tolerant decoder drop"}:
+                    prev_run["pending_repartition"] = mutate(pending)
+                else:
+                    mutate(pending)
+                    prev_run["pending_repartition"] = pending
+
+                status, stderr, startup, execute, _resolve, _load, _resume = (
+                    self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                    )
+                )
+
+                assert status == 1
+                assert expected_field in stderr
+                startup.assert_not_called()
+                execute.assert_not_called()
+                assert sorted(
+                    path.name for path in (repo_root / ".aflow" / "runs").iterdir()
+                ) == [run_dir.name]
+
+    def test_resume_rejects_pending_identity_without_restored_authority(self) -> None:
+        cases = (
+            (
+                "absent active scope",
+                lambda pending, scope, run: run.pop("active_implementation_scope"),
+                "active_implementation_scope",
+            ),
+            (
+                "legacy scope authority",
+                lambda pending, scope, run: (
+                    scope.pop("envelope_artifact_path"),
+                    scope.pop("envelope_artifact_sha256"),
+                    scope.pop("envelope_canonical_sha256"),
+                ),
+                "active_implementation_scope",
+            ),
+            (
+                "partial scope authority",
+                lambda pending, scope, run: scope.__setitem__(
+                    "envelope_artifact_sha256", None
+                ),
+                "invalid scope envelope reference",
+            ),
+            (
+                "scope mismatch",
+                lambda pending, scope, run: pending.__setitem__(
+                    "scope_id", "different-scope"
+                ),
+                "scope_id",
+            ),
+            (
+                "envelope identity mismatch",
+                lambda pending, scope, run: pending.__setitem__(
+                    "envelope_sha256", "0" * 64
+                ),
+                "envelope_sha256",
+            ),
+            (
+                "malformed envelope digest",
+                lambda pending, scope, run: pending.__setitem__(
+                    "envelope_sha256", "E" * 64
+                ),
+                "envelope_sha256",
+            ),
+            (
+                "malformed source digest",
+                lambda pending, scope, run: pending.__setitem__(
+                    "source_plan_sha256", "z" * 64
+                ),
+                "source_plan_sha256",
+            ),
+            (
+                "forged generation identity",
+                lambda pending, scope, run: pending.__setitem__(
+                    "generation_id", "gen-forged"
+                ),
+                "generation_id",
+            ),
+            (
+                "manager decision mismatch",
+                lambda pending, scope, run: pending.__setitem__(
+                    "decision_number", 2
+                ),
+                "decision_number",
+            ),
+            (
+                "missing manager decision boundary",
+                lambda pending, scope, run: run.pop("manager_decision_number"),
+                "decision_number",
+            ),
+            (
+                "missing workflow target",
+                lambda pending, scope, run: pending.__setitem__(
+                    "resolved_target_step", "missing-step"
+                ),
+                "resolved_target_step",
+            ),
+            (
+                "workflow role mismatch",
+                lambda pending, scope, run: pending.__setitem__(
+                    "resolved_target_role", "reviewer"
+                ),
+                "resolved_target_role",
+            ),
+        )
+        for auto in (False, True):
+            for name, mutate, expected in cases:
+                with self.subTest(auto=auto, case=name):
+                    tmp_path = self._new_temp_path()
+                    repo_root, run_dir, workflow_config, original_run = (
+                        self._resume_bootstrap_fixture(tmp_path)
+                    )
+                    pending, _artifacts, scope = _bound_pending_repartition_fixture(
+                        run_dir,
+                        Path(original_run["original_plan_path"]),
+                    )
+                    prev_run = dict(original_run)
+                    prev_run["active_implementation_scope"] = scope
+                    prev_run["manager_decision_number"] = pending["decision_number"]
+                    prev_run["pending_repartition"] = pending
+                    mutate(pending, scope, prev_run)
+
+                    status, stderr, startup, execute, _resolve, _load, _resume = (
+                        self._invoke_resume_command(
+                            tmp_path,
+                            prev_run,
+                            run_dir,
+                            workflow_config,
+                            auto=auto,
+                        )
+                    )
+
+                    assert status == 1
+                    assert expected in stderr
+                    startup.assert_not_called()
+                    execute.assert_not_called()
+                    assert sorted(
+                        path.name
+                        for path in (repo_root / ".aflow" / "runs").iterdir()
+                    ) == [run_dir.name]
+
+    def test_resume_rejects_each_missing_pending_repartition_artifact(self) -> None:
+        artifact_fields = (
+            "proposal_artifact_path",
+            "candidate_artifact_path",
+            "mechanical_validation_artifact_path",
+            "semantic_verdict_artifact_path",
+        )
+        for field in artifact_fields:
+            with self.subTest(field=field):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                pending, _artifacts, scope = _bound_pending_repartition_fixture(
+                    run_dir,
+                    Path(original_run["original_plan_path"]),
+                )
+                pending.pop(field)
+                prev_run = dict(original_run)
+                prev_run["active_implementation_scope"] = scope
+                prev_run["manager_decision_number"] = pending["decision_number"]
+                prev_run["pending_repartition"] = pending
+
+                status, stderr, startup, execute, _resolve, _load, _resume = (
+                    self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                    )
+                )
+
+                assert status == 1
+                assert field in stderr
+                startup.assert_not_called()
+                execute.assert_not_called()
+                assert sorted(
+                    path.name for path in (repo_root / ".aflow" / "runs").iterdir()
+                ) == [run_dir.name]
+
+    def test_resume_rejects_unsafe_missing_wrong_kind_and_unreadable_pending_artifacts(
+        self,
+    ) -> None:
+        for case in ("unsafe", "symlink", "missing", "wrong_kind", "unreadable"):
+            with self.subTest(case=case):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                pending, _artifacts, scope = _bound_pending_repartition_fixture(
+                    run_dir,
+                    Path(original_run["original_plan_path"]),
+                )
+                proposal_path = run_dir / pending["proposal_artifact_path"]
+                if case == "unsafe":
+                    pending["proposal_artifact_path"] = "../../outside-proposal.json"
+                elif case == "symlink":
+                    outside = repo_root / "outside-proposal.json"
+                    outside.write_bytes(b"outside")
+                    proposal_path.unlink()
+                    proposal_path.symlink_to(outside)
+                elif case == "missing":
+                    proposal_path.unlink()
+                elif case == "wrong_kind":
+                    pending["proposal_artifact_path"] = pending["latest_attempt_path"]
+                prev_run = dict(original_run)
+                prev_run["active_implementation_scope"] = scope
+                prev_run["manager_decision_number"] = pending["decision_number"]
+                prev_run["pending_repartition"] = pending
+
+                if case == "unreadable":
+                    real_read_bytes = Path.read_bytes
+
+                    def deny_proposal(path: Path) -> bytes:
+                        if path == proposal_path:
+                            raise PermissionError("denied for resume test")
+                        return real_read_bytes(path)
+
+                    with patch.object(Path, "read_bytes", deny_proposal):
+                        result = self._invoke_resume_command(
+                            tmp_path,
+                            prev_run,
+                            run_dir,
+                            workflow_config,
+                        )
+                else:
+                    result = self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                    )
+                status, stderr, startup, execute, _resolve, _load, _resume = result
+
+                assert status == 1
+                assert "proposal_artifact_path" in stderr
+                startup.assert_not_called()
+                execute.assert_not_called()
+                assert sorted(
+                    path.name for path in (repo_root / ".aflow" / "runs").iterdir()
+                ) == [run_dir.name]
+
+    def test_resume_rejects_noncanonical_pending_artifact_paths(self) -> None:
+        cases = (
+            (
+                "missing latest attempt path",
+                lambda pending, run_dir: pending.__setitem__(
+                    "latest_attempt_path", None
+                ),
+                "latest_attempt_path",
+            ),
+            (
+                "redundant path spelling",
+                lambda pending, run_dir: pending.__setitem__(
+                    "candidate_artifact_path",
+                    pending["candidate_artifact_path"].replace(
+                        "/candidate-plan.md", "/./candidate-plan.md"
+                    ),
+                ),
+                "candidate_artifact_path",
+            ),
+            (
+                "internal symlink alias",
+                lambda pending, run_dir: (
+                    (run_dir / pending["candidate_artifact_path"])
+                    .with_name("candidate-alias.md")
+                    .symlink_to(run_dir / pending["candidate_artifact_path"]),
+                    pending.__setitem__(
+                        "candidate_artifact_path",
+                        str(
+                            (run_dir / pending["candidate_artifact_path"])
+                            .with_name("candidate-alias.md")
+                            .relative_to(run_dir)
+                        ).replace("\\", "/"),
+                    ),
+                ),
+                "candidate_artifact_path",
+            ),
+        )
+        for auto in (False, True):
+            for name, mutate, expected in cases:
+                with self.subTest(auto=auto, case=name):
+                    tmp_path = self._new_temp_path()
+                    repo_root, run_dir, workflow_config, original_run = (
+                        self._resume_bootstrap_fixture(tmp_path)
+                    )
+                    pending, _artifacts, scope = _bound_pending_repartition_fixture(
+                        run_dir,
+                        Path(original_run["original_plan_path"]),
+                    )
+                    prev_run = dict(original_run)
+                    prev_run["active_implementation_scope"] = scope
+                    prev_run["manager_decision_number"] = pending["decision_number"]
+                    prev_run["pending_repartition"] = pending
+                    mutate(pending, run_dir)
+
+                    status, stderr, startup, execute, _resolve, _load, _resume = (
+                        self._invoke_resume_command(
+                            tmp_path,
+                            prev_run,
+                            run_dir,
+                            workflow_config,
+                            auto=auto,
+                        )
+                    )
+
+                    assert status == 1
+                    assert expected in stderr
+                    startup.assert_not_called()
+                    execute.assert_not_called()
+                    assert sorted(
+                        path.name
+                        for path in (repo_root / ".aflow" / "runs").iterdir()
+                    ) == [run_dir.name]
+
+    def test_complete_pending_repartition_resume_binds_exact_bytes_before_startup(
+        self,
+    ) -> None:
+        for auto in (False, True):
+            with self.subTest(auto=auto):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                pending, artifacts, scope = _bound_pending_repartition_fixture(
+                    run_dir,
+                    Path(original_run["original_plan_path"]),
+                )
+                prev_run = dict(original_run)
+                prev_run["active_implementation_scope"] = scope
+                prev_run["manager_decision_number"] = pending["decision_number"]
+                prev_run["pending_repartition"] = pending
+
+                status, stderr, startup, execute, resolve, load, resume = (
+                    self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                        auto=auto,
+                    )
+                )
+
+                assert status == 0, stderr
+                startup.assert_called_once()
+                execute.assert_called_once()
+                resolve.assert_called_once_with(
+                    None if auto else run_dir.name,
+                    repo_root,
+                )
+                load.assert_called_once_with(run_dir)
+                assert isinstance(resume, ResumeContext)
+                assert resume.pending_repartition is not None
+                assert dict(resume.repartition_artifact_bytes) == artifacts
+
+    def test_resume_absent_or_null_pending_repartition_remains_empty(self) -> None:
+        for raw_value in ("absent", None):
+            with self.subTest(raw_value=raw_value):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(original_run)
+                if raw_value != "absent":
+                    prev_run["pending_repartition"] = raw_value
+
+                status, stderr, startup, execute, _resolve, _load, resume = (
+                    self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                    )
+                )
+
+                assert status == 0, stderr
+                startup.assert_called_once()
+                execute.assert_called_once()
+                assert isinstance(resume, ResumeContext)
+                assert resume.pending_repartition is None
+                assert resume.repartition_artifact_bytes == {}
+
+    def test_resume_surfaces_authoritative_pending_repartition_stage_errors_before_startup(
+        self,
+    ) -> None:
+        for stage, expected in (
+            (
+                "decided",
+                "must be reconciled before a harness can start",
+            ),
+            (
+                "failed",
+                "without explicit scope reset",
+            ),
+        ):
+            with self.subTest(stage=stage):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                pending, _artifacts, scope = _bound_pending_repartition_fixture(
+                    run_dir,
+                    Path(original_run["original_plan_path"]),
+                )
+                pending["stage"] = stage
+                if stage == "failed":
+                    pending["failed_stage"] = "semantic"
+                    pending["failure_reason"] = "synthetic failure"
+                else:
+                    pending["failed_stage"] = None
+                    pending["failure_reason"] = None
+                prev_run = dict(original_run)
+                prev_run["active_implementation_scope"] = scope
+                prev_run["manager_decision_number"] = pending["decision_number"]
+                prev_run["pending_repartition"] = pending
+
+                status, stderr, startup, execute, _resolve, _load, _resume = (
+                    self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                    )
+                )
+
+                assert status == 1
+                assert expected in stderr
+                startup.assert_not_called()
+                execute.assert_not_called()
+                assert sorted(
+                    path.name for path in (repo_root / ".aflow" / "runs").iterdir()
+                ) == [run_dir.name]
+
+    def test_resume_reset_scope_ignores_malformed_pending_repartition_without_reading_it(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, original_run = (
+            self._resume_bootstrap_fixture(tmp_path)
+        )
+        outside = repo_root / "outside-pending.json"
+        outside.write_bytes(b"must not be read")
+        prev_run = dict(original_run)
+        prev_run["pending_repartition"] = {
+            "schema_version": 1,
+            "stage": "semantically_validated",
+            "latest_attempt_path": "../../outside-pending.json",
+            "proposal_artifact_path": "../../outside-pending.json",
+        }
+        original_manager_resume_fields = cli_module.manager_resume_fields
+        decoder_payloads: list[object] = []
+
+        def observe_decoder(payload: object) -> dict[str, object]:
+            decoder_payloads.append(payload)
+            return original_manager_resume_fields(payload)
+
+        with patch.object(
+            cli_module,
+            "manager_resume_fields",
+            side_effect=observe_decoder,
+        ), patch.object(
+            cli_module,
+            "load_scope_envelope_for_resume",
+            side_effect=AssertionError("reset scope must not load envelope paths"),
+        ), patch.object(
+            cli_module,
+            "derive_generation_id",
+            side_effect=AssertionError("reset scope must not derive pending identity"),
+        ):
+            status, stderr, startup, execute, _resolve, _load, resume = (
+                self._invoke_resume_command(
+                    tmp_path,
+                    prev_run,
+                    run_dir,
+                    workflow_config,
+                    reset_scope=True,
+                )
+            )
+
+        assert status == 0, stderr
+        startup.assert_called_once()
+        execute.assert_called_once()
+        assert decoder_payloads
+        assert "pending_repartition" not in decoder_payloads[0]
+        assert isinstance(resume, ResumeContext)
+        assert resume.pending_repartition is None
+        assert resume.repartition_artifact_bytes == {}
+        assert outside.read_bytes() == b"must not be read"
+
+    def test_resume_reset_scope_still_rejects_non_scoped_metadata(self) -> None:
+        cases = (
+            (
+                "missing worktree metadata",
+                lambda run: run.pop("feature_branch"),
+                "no recorded feature branch",
+            ),
+            (
+                "malformed lifecycle metadata",
+                lambda run: run.__setitem__("lifecycle_setup", "worktree"),
+                "not recorded as a worktree lifecycle run",
+            ),
+            (
+                "mismatched frozen identity",
+                lambda run: run.update(
+                    {
+                        "schema_version": 1,
+                        "frozen_config": {
+                            "workflow_name": "other_workflow",
+                            "config_path": str(Path(run["repo_root"]) / "aflow.toml"),
+                            "config_fingerprint": "0" * 64,
+                        },
+                    }
+                ),
+                "frozen configuration mismatch",
+            ),
+            (
+                "incomplete frozen identity",
+                lambda run: run.update(
+                    {
+                        "schema_version": 1,
+                        "frozen_config": {
+                            "workflow_name": "saved_workflow",
+                            "config_path": str(Path(run["repo_root"]) / "aflow.toml"),
+                        },
+                    }
+                ),
+                "invalid frozen_config",
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, original_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(original_run)
+                prev_run["pending_repartition"] = {
+                    "latest_attempt_path": "../../outside-pending.json",
+                    "proposal_artifact_path": "../../outside-pending.json",
+                }
+                mutate(prev_run)
+
+                status, stderr, startup, execute, _resolve, _load, _resume = (
+                    self._invoke_resume_command(
+                        tmp_path,
+                        prev_run,
+                        run_dir,
+                        workflow_config,
+                        reset_scope=True,
+                    )
+                )
+
+                assert status == 1
+                assert expected in stderr
+                startup.assert_not_called()
+                execute.assert_not_called()
+
+    def test_fresh_run_without_plan_still_requires_plan_file(self) -> None:
+        import aflow.cli as cli_module
+
+        repo_root = self._new_temp_path()
+        config_path = repo_root / "aflow.toml"
+        workflow_config = type("WorkflowConfig", (), {"workflows": {}, "harnesses": {}})()
+        stderr = io.StringIO()
+        with patch.object(cli_module, "_bootstrap_config_files", return_value=(config_path, ())), \
+             patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), \
+             patch.object(cli_module, "load_workflow_config", return_value=workflow_config), \
+             redirect_stderr(stderr):
+            status = cli_module.main(["run"])
+
+        assert status == 1
+        assert stderr.getvalue().strip() == "error: plan_file is required"
+
+    def test_resume_bootstrap_rejects_conflicting_repeated_identity(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            (
+                {"plan_file_arg": "/different/plan.md"},
+                "resume plan mismatch",
+            ),
+            ({"workflow_arg": "other_workflow"}, "resume workflow mismatch"),
+            ({"team_arg": "other-team"}, "resume team mismatch"),
+            ({"max_turns_arg": 30}, "resume max-turns mismatch"),
+            (
+                {"extra_instructions_arg": ("override",)},
+                "resume extra-instructions mismatch",
+            ),
+        )
+        for kwargs, message in cases:
+            with self.subTest(message=message):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+                arguments: dict[str, object] = {
+                    "workflow_arg": None,
+                    "plan_file_arg": None,
+                    "team_arg": None,
+                    "start_step_arg": None,
+                    "max_turns_arg": None,
+                    "extra_instructions_arg": (),
+                    "extra_instructions_provided": False,
+                }
+                if "extra_instructions_arg" in kwargs:
+                    arguments["extra_instructions_provided"] = True
+                arguments.update(kwargs)
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(Path(run_dir.name), "explicit_run_id"),
+                ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                    with pytest.raises(ValueError, match=message):
+                        cli_module._bootstrap_resume_invocation(
+                            repo_root=repo_root,
+                            workflow_config=workflow_config,
+                            requested_run_id=run_dir.name,
+                            **arguments,
+                        )
+
+    def test_resume_bootstrap_accepts_legacy_plan_path_metadata(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        prev_run = dict(prev_run)
+        prev_run.pop("original_plan_path")
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=prev_run):
+            result = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
+        assert result.plan_path == Path(prev_run["plan_path"])
+
+    def test_plan_free_resume_bootstrap_runs_before_startup_and_detector_uses_same_run(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("", encoding="utf-8")
+        workflow_config.aflow = type(
+            "AflowConfig",
+            (),
+            {"default_workflow": "different_default", "banner_files_limit": 10},
+        )()
+        prepared = PreparedRun(
+            workflow_name="saved_workflow",
+            repo_root=repo_root,
+            plan_path=Path(prev_run["original_plan_path"]),
+            config_path=config_path,
+            max_turns=15,
+            team="base",
+            extra_instructions=("keep the patch focused",),
+            start_step="implement_plan",
+        )
+        detector_kwargs: dict[str, object] = {}
+        captured: dict[str, object] = {}
+        real_bootstrap = cli_module._bootstrap_resume_invocation
+        real_detect = cli_module._detect_resume_candidate
+
+        def detect(**kwargs: object) -> object:
+            detector_kwargs.update(kwargs)
+            return real_detect(**kwargs)
+
+        def bootstrap(**kwargs: object) -> object:
+            result = real_bootstrap(**kwargs)
+            captured["bootstrap"] = result
+            return result
+
+        def execute(prepared_run, *, banner, resume, observer):
+            captured["resume"] = resume
+            return result
+
+        result = type("RunResult", (), {"turns_completed": 0, "end_reason": "done"})()
+        with patch.object(cli_module, "_bootstrap_config_files", return_value=(config_path, ())), \
+             patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), \
+             patch.object(cli_module, "load_workflow_config", return_value=workflow_config), \
+             patch.object(cli_module, "validate_workflow_config", return_value=[]), \
+             patch.object(cli_module, "resolve_run_id", return_value=(Path(run_dir.name), "explicit_run_id")) as resolve_run_id, \
+             patch.object(cli_module, "load_run_json", return_value=prev_run) as load_run_json, \
+             patch.object(cli_module, "_handle_startup_questions", return_value=prepared) as startup, \
+             patch.object(cli_module, "_bootstrap_resume_invocation", side_effect=bootstrap), \
+             patch.object(cli_module, "_detect_resume_candidate", side_effect=detect), \
+             patch.object(cli_module, "BannerRenderer"), \
+             patch.object(cli_module, "execute_workflow", side_effect=execute):
+            status = cli_module.main(["run", "--resume", run_dir.name])
+
+        assert status == 0
+        startup.assert_called_once()
+        request = startup.call_args.args[0]
+        assert request.plan_path == Path(prev_run["original_plan_path"])
+        assert request.workflow_name == "saved_workflow"
+        assert request.max_turns == 15
+        assert request.team == "base"
+        assert request.start_step == "implement_plan"
+        assert request.extra_instructions == ("keep the patch focused",)
+        assert detector_kwargs["resume_bootstrap"].run_dir == run_dir
+        assert captured["resume"] is captured["bootstrap"].resume_context
+        assert captured["resume"].main_branch == "main"
+        resolve_run_id.assert_called_once_with(run_dir.name, repo_root)
+        load_run_json.assert_called_once_with(run_dir)
+
+    def test_plan_free_auto_resume_uses_same_resolved_run_without_reselecting(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("", encoding="utf-8")
+        workflow_config.aflow = type(
+            "AflowConfig",
+            (),
+            {"default_workflow": "different_default", "banner_files_limit": 10},
+        )()
+        prepared = PreparedRun(
+            workflow_name="saved_workflow",
+            repo_root=repo_root,
+            plan_path=Path(prev_run["original_plan_path"]),
+            config_path=config_path,
+            max_turns=15,
+            team="base",
+            extra_instructions=("keep the patch focused",),
+            start_step="implement_plan",
+        )
+        detector_kwargs: dict[str, object] = {}
+        captured: dict[str, object] = {}
+        real_bootstrap = cli_module._bootstrap_resume_invocation
+        real_detect = cli_module._detect_resume_candidate
+
+        def detect(**kwargs: object) -> object:
+            detector_kwargs.update(kwargs)
+            return real_detect(**kwargs)
+
+        def bootstrap(**kwargs: object) -> object:
+            result = real_bootstrap(**kwargs)
+            captured["bootstrap"] = result
+            return result
+
+        def execute(prepared_run, *, banner, resume, observer):
+            captured["resume"] = resume
+            return result
+
+        result = type("RunResult", (), {"turns_completed": 0, "end_reason": "done"})()
+        with patch.object(cli_module, "_bootstrap_config_files", return_value=(config_path, ())), \
+             patch.object(cli_module, "_resolve_repo_root", return_value=repo_root), \
+             patch.object(cli_module, "load_workflow_config", return_value=workflow_config), \
+             patch.object(cli_module, "validate_workflow_config", return_value=[]), \
+             patch.object(cli_module, "resolve_run_id", return_value=(Path(run_dir.name), "shell_last_run_id_file")) as resolve_run_id, \
+             patch.object(cli_module, "load_run_json", return_value=prev_run) as load_run_json, \
+             patch.object(cli_module, "_handle_startup_questions", return_value=prepared), \
+             patch.object(cli_module, "_bootstrap_resume_invocation", side_effect=bootstrap), \
+             patch.object(cli_module, "_detect_resume_candidate", side_effect=detect), \
+             patch.object(cli_module, "BannerRenderer"), \
+             patch.object(cli_module, "execute_workflow", side_effect=execute):
+            status = cli_module.main(["run", "--resume"])
+
+        assert status == 0
+        assert detector_kwargs["resume_bootstrap"].run_dir == run_dir
+        assert captured["resume"] is captured["bootstrap"].resume_context
+        resolve_run_id.assert_called_once_with(None, repo_root)
+        load_run_json.assert_called_once_with(run_dir)
+
+    def test_plan_free_resume_carries_pending_finalized_turn_to_executor(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("", encoding="utf-8")
+        frozen_identity = _freeze_run_identity(
+            "saved_workflow",
+            workflow_config,
+            config_dir=config_path,
+        )
+        repair_path = repo_root / "plans" / "in-progress" / "repair-plan.md"
+        repair_path.write_text(_VALID_PLAN, encoding="utf-8")
+        workflow_config.aflow = type(
+            "AflowConfig",
+            (),
+            {"default_workflow": "different_default", "banner_files_limit": 10},
+        )()
+
+        snapshot = {
+            "current_checkpoint_index": 2,
+            "current_checkpoint_name": "Checkpoint 2: Repair",
+            "current_checkpoint_unchecked_step_count": 4,
+            "is_complete": False,
+            "total_checkpoint_count": 2,
+            "unchecked_checkpoint_count": 1,
+        }
+        result_payload = {
+            "turn_number": 2,
+            "status": "completed",
+            "step_name": "review_cp_implementation",
+            "step_role": "reviewer",
+            "selector": "codex.reviewer",
+            "returncode": 0,
+            "active_plan_path": str(prev_run["original_plan_path"]),
+            "new_plan_path": str(repair_path),
+            "snapshot_before": snapshot,
+            "snapshot_after": snapshot,
+            "conditions": {
+                "DONE": False,
+                "NEW_PLAN_EXISTS": True,
+                "MAX_TURNS_REACHED": False,
+            },
+            "chosen_transition": "implement_plan",
+            "chosen_transition_condition": "NEW_PLAN_EXISTS || !DONE",
+        }
+        turn_dir = run_dir / "turns" / "turn-002"
+        turn_dir.mkdir(parents=True)
+        result_path = turn_dir / "result.json"
+        result_path.write_text(json.dumps(result_payload), encoding="utf-8")
+        result_bytes = result_path.read_bytes()
+        (turn_dir / "stdout.txt").write_text("review rejected", encoding="utf-8")
+        (turn_dir / "stderr.txt").write_text("", encoding="utf-8")
+
+        durable_run = dict(prev_run)
+        durable_run.update(
+            {
+                "status": "running",
+                "active_turn": 2,
+                "turns_completed": 1,
+                "current_step_name": "review_cp_implementation",
+                "active_plan_path": str(prev_run["original_plan_path"]),
+                "last_snapshot": snapshot,
+                "schema_version": 1,
+                "frozen_config": {
+                    "workflow_name": frozen_identity.workflow_name,
+                    "config_path": frozen_identity.config_path,
+                    "config_fingerprint": frozen_identity.config_fingerprint,
+                },
+                "pending_manager_notes": {
+                    "target_step": "review_cp_implementation",
+                    "notes": ["stale manager note"],
+                    "decision_number": 1,
+                },
+                "pending_step_team_override": {
+                    "target_step": "review_cp_implementation",
+                    "role": "reviewer",
+                    "source_team": "base",
+                    "target_team": "base",
+                    "selector": "codex.reviewer",
+                    "decision_number": 1,
+                },
+                "pending_boundary_decision": {
+                    "finalized_turn_number": 1,
+                    "decision_number": 1,
+                    "action": "continue",
+                    "proposed_action": "transition",
+                    "proposed_transition": "review_cp_implementation",
+                    "resolved_next_step": "review_cp_implementation",
+                    "consumed": True,
+                },
+            }
+        )
+        (run_dir / "run.json").write_text(
+            json.dumps(durable_run),
+            encoding="utf-8",
+        )
+
+        prepared = PreparedRun(
+            workflow_name="saved_workflow",
+            repo_root=repo_root,
+            plan_path=Path(prev_run["original_plan_path"]),
+            config_path=config_path,
+            max_turns=15,
+            team="base",
+            extra_instructions=("keep the patch focused",),
+            start_step="implement_plan",
+        )
+        captured: dict[str, object] = {}
+
+        def execute(prepared_run, *, banner, resume, observer):
+            captured["prepared_run"] = prepared_run
+            captured["resume"] = resume
+            captured["banner"] = banner
+            captured["observer"] = observer
+            return type("RunResult", (), {"turns_completed": 0, "end_reason": "done"})()
+
+        with patch.object(
+            cli_module,
+            "_bootstrap_config_files",
+            return_value=(config_path, ()),
+        ), patch.object(
+            cli_module,
+            "_resolve_repo_root",
+            return_value=repo_root,
+        ), patch.object(
+            cli_module,
+            "load_workflow_config",
+            return_value=workflow_config,
+        ), patch.object(
+            cli_module,
+            "validate_workflow_config",
+            return_value=[],
+        ), patch.object(
+            cli_module,
+            "resolve_run_id",
+            wraps=cli_module.resolve_run_id,
+        ) as resolve_run_id, patch.object(
+            cli_module,
+            "load_run_json",
+            wraps=cli_module.load_run_json,
+        ) as load_run_json, patch.object(
+            cli_module,
+            "_handle_startup_questions",
+            return_value=prepared,
+        ) as startup, patch.object(
+            cli_module,
+            "BannerRenderer",
+        ), patch.object(
+            cli_module,
+            "execute_workflow",
+            side_effect=execute,
+        ) as execute_workflow:
+            status = cli_module.main(["run", "--resume", run_dir.name])
+
+        assert status == 0
+        startup.assert_called_once()
+        request = startup.call_args.args[0]
+        assert request.plan_path == Path(prev_run["original_plan_path"])
+        assert request.workflow_name == "saved_workflow"
+        assert request.max_turns == 15
+        assert request.team == "base"
+        assert request.start_step == "implement_plan"
+        assert request.extra_instructions == ("keep the patch focused",)
+        assert request.resume_requested is True
+        resolve_run_id.assert_called_once_with(run_dir.name, repo_root)
+        load_run_json.assert_called_once_with(run_dir)
+        execute_workflow.assert_called_once()
+        assert captured["prepared_run"] is prepared
+
+        resume = captured["resume"]
+        assert isinstance(resume, ResumeContext)
+        assert resume.resumed_from_run_id == run_dir.name
+        assert resume.feature_branch == "feature/saved-run"
+        assert resume.worktree_path == repo_root / "worktree"
+        assert resume.main_branch == "main"
+        assert resume.setup == ("worktree", "branch")
+        assert resume.teardown == ("merge", "rm_worktree")
+        assert resume.active_plan_path == repair_path
+        assert resume.frozen_run_identity is not None
+        assert resume.frozen_run_identity.workflow_name == "saved_workflow"
+        assert resume.frozen_run_identity.config_path == str(config_path)
+        assert (
+            resume.frozen_run_identity.config_fingerprint
+            == frozen_identity.config_fingerprint
+        )
+        assert resume.pending_manager_notes is None
+        assert resume.pending_step_team_override is None
+        assert resume.pending_boundary_decision is None
+
+        pending = resume.pending_finalized_turn
+        assert pending is not None
+        assert pending.source_run_dir == run_dir
+        assert pending.turn_number == 2
+        assert pending.step_name == "review_cp_implementation"
+        assert pending.step_role == "reviewer"
+        assert pending.selector == "codex.reviewer"
+        assert pending.active_plan_path == Path(prev_run["original_plan_path"])
+        assert pending.new_plan_path == repair_path
+        assert pending.conditions == {
+            "DONE": False,
+            "NEW_PLAN_EXISTS": True,
+            "MAX_TURNS_REACHED": False,
+        }
+        assert pending.chosen_transition == "implement_plan"
+        assert pending.chosen_transition_condition == "NEW_PLAN_EXISTS || !DONE"
+        assert pending.snapshot_after.current_checkpoint_name == "Checkpoint 2: Repair"
+        assert pending.snapshot_after.current_checkpoint_index == 2
+        assert pending.snapshot_after.unchecked_checkpoint_count == 1
+        assert pending.snapshot_after.current_checkpoint_unchecked_step_count == 4
+        assert pending.snapshot_after.total_checkpoint_count == 2
+        assert pending.snapshot_after.is_complete is False
+        assert result_path.read_bytes() == result_bytes
+        assert sorted(path.name for path in run_dir.parent.iterdir()) == [run_dir.name]
+
     def test_prog_name_is_aflow(self) -> None:
         parser = build_parser()
         assert parser.prog == 'aflow'
@@ -287,6 +2287,10 @@ class WorkflowCliTests(unittest.TestCase):
         ])
         assert args.resume == '20260101T000000Z-abc123'
         assert args.resume_reset_scope is True
+
+    def test_run_parser_resume_without_id_selects_auto(self) -> None:
+        args = build_parser().parse_args(['run', '--resume'])
+        assert args.resume == 'AUTO'
 
     def test_resume_reset_scope_requires_explicit_run_id(self) -> None:
         stderr = io.StringIO()
@@ -2255,16 +4259,12 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             plan_path = repo_root / "plan.md"
             plan_path.write_text(_VALID_PLAN, encoding="utf-8")
             run_dir = repo_root / ".aflow" / "runs" / "prior-run"
-            attempt = (
-                run_dir / "manager" / "decision-001"
-                / "repartition" / "attempt-001"
+            pending, artifacts, scope = _bound_pending_repartition_fixture(
+                run_dir,
+                plan_path,
             )
-            attempt.mkdir(parents=True)
-            candidate_rel = (
-                "manager/decision-001/repartition/attempt-001/candidate-plan.md"
-            )
-            candidate_bytes = b"# validated candidate\n"
-            (run_dir / candidate_rel).write_bytes(candidate_bytes)
+            candidate_rel = pending["candidate_artifact_path"]
+            candidate_bytes = artifacts[candidate_rel]
             prev_run = {
                 "repo_root": str(repo_root),
                 "workflow_name": "test_workflow",
@@ -2280,21 +4280,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "main_branch": "main",
                 "status": "failed",
                 "last_snapshot": {"is_complete": False},
-                "pending_repartition": {
-                    "schema_version": 1,
-                    "decision_number": 1,
-                    "scope_id": "scope",
-                    "stage": "semantically_validated",
-                    "envelope_sha256": "e" * 64,
-                    "source_plan_sha256": "s" * 64,
-                    "candidate_plan_sha256": hashlib.sha256(
-                        candidate_bytes
-                    ).hexdigest(),
-                    "latest_attempt_path": (
-                        "manager/decision-001/repartition/attempt-001"
-                    ),
-                    "candidate_artifact_path": candidate_rel,
-                },
+                "manager_decision_number": pending["decision_number"],
+                "active_implementation_scope": scope,
+                "pending_repartition": pending,
             }
             with patch(
                 "aflow.cli.resolve_run_id",
@@ -2303,7 +4291,16 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 result = cli_module._detect_resume_candidate(
                     repo_root=repo_root,
                     workflow_config=type(
-                        "obj", (object,), {"setup": ("worktree", "branch")}
+                        "obj",
+                        (object,),
+                        {
+                            "setup": ("worktree", "branch"),
+                            "steps": {
+                                "implement_plan": type(
+                                    "Step", (), {"role": "worker"}
+                                )()
+                            },
+                        },
                     )(),
                     workflow_name="test_workflow",
                     plan_path=plan_path,
@@ -2317,6 +4314,141 @@ class WorkflowStartupFlowTests(unittest.TestCase):
 
             assert result is not None
             assert result.repartition_artifact_bytes[candidate_rel] == candidate_bytes
+            for relative, content in artifacts.items():
+                assert result.repartition_artifact_bytes[relative] == content
+
+    def test_resume_restores_pending_artifacts_after_source_pruning(self) -> None:
+        import aflow.cli as cli_module
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+            config_path = repo_root / "aflow.toml"
+            config_path.write_text("", encoding="utf-8")
+            run_dir = repo_root / ".aflow" / "runs" / "prior-run"
+            pending, artifacts, scope = _bound_pending_repartition_fixture(
+                run_dir,
+                plan_path,
+            )
+            prev_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": None,
+                "selected_start_step": None,
+                "max_turns": 1,
+                "extra_instructions": [],
+                "lifecycle_setup": ["worktree", "branch"],
+                "lifecycle_teardown": ["merge", "rm_worktree"],
+                "feature_branch": "feature/repartition",
+                "worktree_path": str(repo_root),
+                "main_branch": "main",
+                "status": "failed",
+                "last_snapshot": {"is_complete": False},
+                "manager_decision_number": pending["decision_number"],
+                "active_implementation_scope": scope,
+                "pending_repartition": pending,
+            }
+            workflow_config = type(
+                "WorkflowConfig",
+                (),
+                {
+                    "workflows": {
+                        "test_workflow": WorkflowConfig(
+                            declared_steps={
+                                "implement_plan": WorkflowStepConfig(
+                                    role="worker",
+                                    prompts=("p",),
+                                    go=(GoTransition(to="END", when="DONE"),),
+                                )
+                            },
+                            steps={
+                                "implement_plan": WorkflowStepConfig(
+                                    role="worker",
+                                    prompts=("p",),
+                                    go=(GoTransition(to="END", when="DONE"),),
+                                )
+                            },
+                            first_step="implement_plan",
+                            setup=("worktree", "branch"),
+                            teardown=("merge", "rm_worktree"),
+                        )
+                    },
+                    "aflow": AflowSection(default_workflow="test_workflow"),
+                    "harnesses": {},
+                    "roles": {},
+                    "teams": {},
+                    "prompts": {"p": "Work from {ACTIVE_PLAN_PATH}."},
+                    "manager": ManagerConfig(),
+                    "error_handling": ErrorHandlingConfig(),
+                },
+            )()
+
+            with patch(
+                "aflow.cli.resolve_run_id",
+                return_value=(run_dir, "explicit_run_id"),
+            ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                resume = cli_module._detect_resume_candidate(
+                    repo_root=repo_root,
+                    workflow_config=workflow_config.workflows["test_workflow"],
+                    workflow_name="test_workflow",
+                    plan_path=plan_path,
+                    team=None,
+                    selected_start_step=None,
+                    max_turns=1,
+                    extra_instructions=(),
+                    requested_run_id=run_dir.name,
+                    require_resume=True,
+                )
+
+            assert resume is not None
+            assert resume.pending_repartition is not None
+            resume = replace(
+                resume,
+                worktree_path=repo_root,
+                setup=(),
+                teardown=(),
+                pending_repartition=replace(
+                    resume.pending_repartition,
+                    stage="proposed",
+                ),
+            )
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ), pytest.raises(
+                WorkflowError,
+                match="pending repartition proposal/validation transaction",
+            ):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    "test_workflow",
+                    config_dir=config_path,
+                    adapter=CodexAdapter(),
+                    resume=resume,
+                )
+
+            restored_runs = [
+                path
+                for path in (repo_root / ".aflow" / "runs").iterdir()
+                if path.is_dir()
+            ]
+            assert len(restored_runs) == 1
+            restored_run = restored_runs[0]
+            assert not run_dir.exists()
+            for relative, content in artifacts.items():
+                assert (restored_run / relative).read_bytes() == content
+            assert (restored_run / pending["candidate_artifact_path"]).read_bytes() == (
+                artifacts[pending["candidate_artifact_path"]]
+            )
 
     def test_resume_recomputes_active_scope_rejections_from_turn_artifacts(self) -> None:
         import aflow.cli as cli_module

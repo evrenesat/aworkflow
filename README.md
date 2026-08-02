@@ -94,10 +94,11 @@ primary checkout.
 
 ```bash
 aflow analyze <run-id>
-aflow run --resume <run-id> --plan path/to/plan.md
+aflow run --resume <run-id>
 ```
 
-Resume reuses a compatible unfinished worktree run. Detailed compatibility,
+Resume reuses a compatible unfinished worktree run and reconstructs its saved
+plan and invocation identity when no plan is supplied. Detailed compatibility,
 recovery, supervision, and next-turn override rules are documented separately.
 
 ## Local development
