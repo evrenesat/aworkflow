@@ -1,18 +1,18 @@
 import { useEffect, useState } from 'react'
 import type { ProjectInfo } from './types'
 import { ProjectPicker } from './components/ProjectPicker'
-import { ThreadPanel } from './components/ThreadPanel'
+import { SessionPanel } from './components/SessionPanel'
 import { PlanPanel } from './components/PlanPanel'
 import { ExecutionPanel } from './components/ExecutionPanel'
 import * as api from './api'
 
-type View = 'threads' | 'plans' | 'execution'
+type View = 'sessions' | 'plans' | 'execution'
 
 export function App() {
   const [authToken, setAuthTokenState] = useState('')
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [selectedProject, setSelectedProject] = useState<ProjectInfo | null>(null)
-  const [currentView, setCurrentView] = useState<View>('threads')
+  const [currentView, setCurrentView] = useState<View>('sessions')
   const [executionPlanPath, setExecutionPlanPath] = useState<string | null>(null)
   const [savingPlan, setSavingPlan] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -36,13 +36,13 @@ export function App() {
     setIsAuthenticated(false)
     setAuthTokenState('')
     setSelectedProject(null)
-    setCurrentView('threads')
+    setCurrentView('sessions')
     setExecutionPlanPath(null)
   }
 
   function handleSelectProject(project: ProjectInfo) {
     setSelectedProject(project)
-    setCurrentView('threads')
+    setCurrentView('sessions')
   }
 
   async function handleSavePlanDraft(content: string) {
@@ -117,7 +117,7 @@ export function App() {
       >
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>aflow</h1>
-          <div className="text-xs text-dim truncate">Projects and Codex threads</div>
+          <div className="text-xs text-dim truncate">Projects and planning sessions</div>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={handleLogout}>
           Logout
@@ -151,18 +151,18 @@ export function App() {
                       {selectedProject.current_path}
                     </div>
                   </div>
-                  <div className="text-xs text-dim">{selectedProject.linked_thread_count} linked threads</div>
+                  <div className="text-xs text-dim">{selectedProject.linked_session_count} linked sessions</div>
                 </div>
 
                 <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
                   <button
                     className="btn btn-secondary btn-sm"
-                    onClick={() => setCurrentView('threads')}
+                    onClick={() => setCurrentView('sessions')}
                     style={{
-                      borderBottom: currentView === 'threads' ? '2px solid var(--color-primary)' : undefined,
+                      borderBottom: currentView === 'sessions' ? '2px solid var(--color-primary)' : undefined,
                     }}
                   >
-                    Threads
+                    Sessions
                   </button>
                   <button
                     className="btn btn-secondary btn-sm"
@@ -177,7 +177,7 @@ export function App() {
               </div>
 
               <div style={{ minHeight: 0, flex: 1 }}>
-                {currentView === 'threads' && <ThreadPanel project={selectedProject} onSavePlanDraft={handleSavePlanDraft} />}
+                {currentView === 'sessions' && <SessionPanel project={selectedProject} onSavePlanDraft={handleSavePlanDraft} />}
                 {currentView === 'plans' && <PlanPanel project={selectedProject} onStartExecution={handleStartExecution} />}
                 {currentView === 'execution' && executionPlanPath && (
                   <ExecutionPanel project={selectedProject} planPath={executionPlanPath} onClose={handleCloseExecution} />
@@ -189,7 +189,7 @@ export function App() {
               <div style={{ maxWidth: '28rem' }}>
                 <div style={{ fontSize: '1.125rem', fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>Select a project</div>
                 <div className="text-sm text-dim">
-                  The project list is on the left. When you pick one, the thread list and plan tools appear here.
+                  The project list is on the left. When you pick one, planning sessions and plan tools appear here.
                 </div>
               </div>
             </div>
