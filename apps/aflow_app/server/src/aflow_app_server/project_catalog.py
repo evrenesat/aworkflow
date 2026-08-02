@@ -1,13 +1,14 @@
-"""Project discovery and Codex thread association."""
+"""Project discovery and provider-neutral planning-session association."""
 
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 import subprocess
 from pathlib import Path
 
-from .codex_thread_gateway import CodexThreadGateway, CodexThreadGatewayError
 from .models import ProjectInfo
+from .planning.models import Session
 from .project_overrides import ProjectOverrideRecord, ProjectOverridesStore
 
 
@@ -49,7 +50,7 @@ class ProjectCatalogError(Exception):
 
 
 class ProjectCatalog:
-    """Discover local projects, Codex thread projects, and persisted overrides."""
+    """Discover local projects, planning-session projects, and persisted overrides."""
 
     def __init__(
         self,
@@ -64,20 +65,22 @@ class ProjectCatalog:
             legacy_registry_path=legacy_registry_path,
         )
 
-    def list_projects(self, thread_gateway: CodexThreadGateway | None = None) -> list[ProjectInfo]:
+    def list_projects(self, sessions: Iterable[Session] | None = None) -> list[ProjectInfo]:
         """Return the merged project catalog."""
         local_paths = self._discover_local_git_roots()
-        thread_counts = self._collect_thread_counts(thread_gateway)
+        session_counts = self._collect_session_counts(sessions)
 
         for local_path in local_paths:
             self._store.ensure_current_project(local_path, display_name=local_path.name)
 
-        for thread_path in thread_counts:
-            if self._store.resolve_current_path(thread_path) is None and self._store.resolve_historical_alias(thread_path) is None:
-                self._store.ensure_project(thread_path, display_name=thread_path.name)
+        for session_path in session_counts:
+            if self._store.resolve_current_path(session_path) is None and self._store.resolve_historical_alias(session_path) is None:
+                self._store.ensure_project(session_path, display_name=session_path.name)
 
         records = self._store.list_records()
-        linked_thread_counts = self._collect_linked_thread_counts(records, thread_counts)
+        linked_session_counts = self._collect_linked_session_counts(
+            records, session_counts
+        )
 
         projects_by_path: dict[Path, ProjectInfo] = {}
         for record in records:
@@ -86,7 +89,7 @@ class ProjectCatalog:
                 record,
                 current_path=canonical_path,
                 local_paths=local_paths,
-                thread_counts=linked_thread_counts,
+                session_counts=linked_session_counts,
             )
             existing = projects_by_path.get(canonical_path)
             if existing is None:
@@ -100,9 +103,11 @@ class ProjectCatalog:
             key=lambda project: (project.display_name.casefold(), str(project.current_path)),
         )
 
-    def get_project(self, project_id: str, thread_gateway: CodexThreadGateway | None = None) -> ProjectInfo | None:
+    def get_project(
+        self, project_id: str, sessions: Iterable[Session] | None = None
+    ) -> ProjectInfo | None:
         """Fetch one project by id."""
-        for project in self.list_projects(thread_gateway=thread_gateway):
+        for project in self.list_projects(sessions=sessions):
             if project.id == project_id:
                 return project
         return None
@@ -119,7 +124,7 @@ class ProjectCatalog:
             record,
             current_path=canonical_path,
             local_paths=local_paths,
-            thread_counts={},
+            session_counts={},
         )
 
     def update_project(
@@ -150,7 +155,7 @@ class ProjectCatalog:
         return self._to_project_info(
             record,
             local_paths={normalized} if (normalized / ".git").exists() else set(),
-            thread_counts={},
+            session_counts={},
         )
 
     def remove_project(self, project_id: str) -> bool:
@@ -160,14 +165,14 @@ class ProjectCatalog:
     def resolve_project_for_path(
         self,
         path: Path | str,
-        thread_gateway: CodexThreadGateway | None = None,
+        sessions: Iterable[Session] | None = None,
         *,
         projects: list[ProjectInfo] | None = None,
     ) -> ProjectInfo | None:
-        """Resolve a path to a project, preferring historical aliases for moved threads."""
+        """Resolve a path, preferring historical aliases for moved sessions."""
         normalized, _ = _canonicalize_git_root(path)
         return self._resolve_project_from_projects(
-            projects if projects is not None else self.list_projects(thread_gateway=thread_gateway),
+            projects if projects is not None else self.list_projects(sessions=sessions),
             normalized,
         )
 
@@ -177,12 +182,12 @@ class ProjectCatalog:
         path: Path | str,
         *,
         projects: list[ProjectInfo] | None = None,
-        thread_gateway: CodexThreadGateway | None = None,
+        sessions: Iterable[Session] | None = None,
     ) -> bool:
         """Check whether a path belongs to a project, using alias precedence when needed."""
         owner = self.resolve_project_for_path(
             path,
-            thread_gateway=thread_gateway,
+            sessions=sessions,
             projects=projects,
         )
         return owner is not None and owner.id == project.id
@@ -200,41 +205,29 @@ class ProjectCatalog:
             local_roots.add(canonical_root)
         return local_roots
 
-    def _collect_thread_counts(self, thread_gateway: CodexThreadGateway | None) -> dict[Path, int]:
-        """Count threads by cwd so the catalog can surface thread-only projects."""
-        if thread_gateway is None:
+    def _collect_session_counts(self, sessions: Iterable[Session] | None) -> dict[Path, int]:
+        """Count provider sessions by cwd so session-only projects stay visible."""
+        if sessions is None:
             return {}
 
         counts: dict[Path, int] = defaultdict(int)
-        cursor: str | None = None
-
-        while True:
-            try:
-                page = thread_gateway.list_threads(cursor=cursor)
-            except CodexThreadGatewayError:
-                # Treat Codex thread enumeration as optional enrichment.
-                return dict(counts)
-            for thread in page.threads:
-                cwd = getattr(thread, "cwd", None)
-                if not cwd:
-                    continue
-                canonical_root, _ = _canonicalize_git_root(cwd)
-                counts[canonical_root] += 1
-            if not page.next_cursor:
-                break
-            cursor = page.next_cursor
+        for session in sessions:
+            if not session.cwd:
+                continue
+            canonical_root, _ = _canonicalize_git_root(session.cwd)
+            counts[canonical_root] += 1
 
         return dict(counts)
 
-    def _collect_linked_thread_counts(
+    def _collect_linked_session_counts(
         self,
         records: list[ProjectOverrideRecord],
-        thread_counts: dict[Path, int],
+        session_counts: dict[Path, int],
     ) -> dict[Path, int]:
-        """Attribute each stored thread cwd to a single project record."""
+        """Attribute each stored session cwd to a single project record."""
         linked_counts: dict[Path, int] = defaultdict(int)
-        for thread_path, count in thread_counts.items():
-            record = self._resolve_record_for_path(records, thread_path)
+        for session_path, count in session_counts.items():
+            record = self._resolve_record_for_path(records, session_path)
             if record is None:
                 continue
             canonical_path, _ = _canonicalize_git_root(record.current_path)
@@ -277,20 +270,20 @@ class ProjectCatalog:
         *,
         current_path: Path | None = None,
         local_paths: set[Path],
-        thread_counts: dict[Path, int],
+        session_counts: dict[Path, int],
     ) -> ProjectInfo:
         """Convert a persisted record into a response model."""
         current_path = current_path or record.current_path
-        thread_count = thread_counts.get(current_path, 0)
+        session_count = session_counts.get(current_path, 0)
 
         is_git_root = current_path in local_paths or (current_path / ".git").exists()
-        saw_thread = thread_count > 0
-        if is_git_root and saw_thread:
-            detection_source = "local_git_root+codex_thread_cwd"
+        saw_session = session_count > 0
+        if is_git_root and saw_session:
+            detection_source = "local_git_root+planning_session_cwd"
         elif is_git_root:
             detection_source = "local_git_root"
-        elif saw_thread:
-            detection_source = "codex_thread_cwd"
+        elif saw_session:
+            detection_source = "planning_session_cwd"
         else:
             detection_source = "override"
 
@@ -300,7 +293,7 @@ class ProjectCatalog:
             current_path=current_path,
             historical_aliases=tuple(record.historical_aliases),
             detection_source=detection_source,
-            linked_thread_count=thread_count,
+            linked_thread_count=session_count,
             is_git_root=is_git_root,
             registered_at=record.registered_at,
         )

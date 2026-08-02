@@ -133,7 +133,7 @@ class Turn(PlanningModel):
 
 class Session(PlanningModel):
     key: SessionKey
-    project_id: str = Field(min_length=1)
+    project_id: str | None = Field(default=None, min_length=1)
     cwd: str
     title: str | None = None
     preview: str = ""
@@ -175,3 +175,11 @@ class StartTurnRequest(PlanningModel):
 class ApprovalDecision(PlanningModel):
     approval_id: str = Field(min_length=1)
     decision: Literal["accept", "decline", "cancel"]
+
+
+class PendingApproval(PlanningModel):
+    approval_id: str = Field(min_length=1)
+    key: SessionKey
+    turn_id: str = Field(min_length=1)
+    kind: Literal["command", "file_change"]
+    reason: str | None = None

@@ -21,12 +21,11 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .aflow_service import AflowService
-from .codex_app_server_client import CodexAppServerClient
-from .codex_thread_gateway import CodexThreadGateway
 import aflow_app_server.codex_routes as codex_routes_module
 from .config import ServerConfig
 from .models import ExecutionRequest, ExecutionStatus
 from .planning import PlanningService, ProviderRegistry
+from .planning.providers import CodexProvider
 from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
 from .plan_store import PlanStore
@@ -163,31 +162,6 @@ async def verify_token(
     return provided_token
 
 
-def get_codex_backend(config: ServerConfig = Depends(get_config)) -> CodexAppServerClient:
-    """Get or create a Codex thread gateway instance."""
-    if not config.codex_app_server_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Codex app-server not configured",
-        )
-
-    return CodexAppServerClient(
-        server_url=config.codex_app_server_url,
-        auth_token=config.codex_app_server_token,
-    )
-
-
-def _get_codex_thread_gateway(config: ServerConfig) -> CodexThreadGateway | None:
-    """Return a thread gateway when Codex is configured, otherwise None."""
-    if not config.codex_app_server_url:
-        return None
-
-    return CodexAppServerClient(
-        server_url=config.codex_app_server_url,
-        auth_token=config.codex_app_server_token,
-    )
-
-
 def get_plan_store_factory(project_catalog: ProjectCatalog = Depends(get_project_catalog)):
     """Factory for creating plan stores."""
     def _get_plan_store(project_id: str) -> PlanStore:
@@ -255,12 +229,27 @@ async def lifespan(app: FastAPI):
         _config.transcription_url,
         _config.transcription_token,
     )
+    providers = []
+    for provider in _config.planning_providers:
+        if not provider.enabled:
+            continue
+        if provider.kind == "codex":
+            providers.append(
+                CodexProvider(
+                    provider.id,
+                    provider.display_name,
+                    server_url=provider.server_url,
+                    server_token=provider.server_token,
+                    operation_timeout_seconds=_config.planning_operation_timeout_seconds,
+                    execution_policy=_config.planning_execution_policy,
+                )
+            )
+        else:
+            providers.append(
+                UnavailablePlanningProvider(provider.id, provider.display_name)
+            )
     _planning_registry = ProviderRegistry(
-        (
-            UnavailablePlanningProvider(provider.id, provider.display_name)
-            for provider in _config.planning_providers
-            if provider.enabled
-        ),
+        providers,
         operation_timeout_seconds=_config.planning_operation_timeout_seconds,
     )
     await _planning_registry.start()
@@ -305,6 +294,7 @@ async def block_local_plugin_probe(request: Request, call_next):
 # Override codex_routes dependencies using FastAPI's dependency override system
 app.dependency_overrides[codex_routes_module._get_config] = get_config
 app.dependency_overrides[codex_routes_module._get_project_catalog] = get_project_catalog
+app.dependency_overrides[codex_routes_module._get_planning_service] = get_planning_service
 
 # Include Codex routes with auth
 app.include_router(codex_routes_module.router, dependencies=[Depends(verify_token)])
@@ -339,10 +329,12 @@ class StartupResponse(BaseModel):
 async def list_projects(
     _: str = Depends(verify_token),
     project_catalog: ProjectCatalog = Depends(get_project_catalog),
-    config: ServerConfig = Depends(get_config),
 ) -> list[dict[str, Any]]:
     """List all discovered projects."""
-    projects = project_catalog.list_projects(thread_gateway=_get_codex_thread_gateway(config))
+    sessions = ()
+    if _planning_service is not None:
+        sessions, _ = await _planning_service.list_sessions()
+    projects = project_catalog.list_projects(sessions=sessions)
     return [project.to_dict() for project in projects]
 
 
@@ -351,13 +343,12 @@ async def get_project(
     project_id: str,
     _: str = Depends(verify_token),
     project_catalog: ProjectCatalog = Depends(get_project_catalog),
-    config: ServerConfig = Depends(get_config),
 ) -> dict[str, Any]:
     """Get a specific project."""
-    project = project_catalog.get_project(
-        project_id,
-        thread_gateway=_get_codex_thread_gateway(config),
-    )
+    sessions = ()
+    if _planning_service is not None:
+        sessions, _ = await _planning_service.list_sessions()
+    project = project_catalog.get_project(project_id, sessions=sessions)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project.to_dict()

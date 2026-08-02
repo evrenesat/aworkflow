@@ -1,20 +1,23 @@
-"""API routes for Codex thread management and plan drafts."""
+"""Temporary legacy thread routes backed by the provider-neutral planning service."""
 
 from __future__ import annotations
 
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .codex_app_server_client import CodexAppServerClient
-from .codex_thread_gateway import (
-    CodexThreadGateway,
-    CodexThreadGatewayError,
-    UserInput,
+from .planning import (
+    AuthorizedProjectContext,
+    PlanningService,
+    ProviderOperationError,
+    Session,
+    SessionKey,
+    StartSessionRequest,
+    Turn,
 )
-from .config import ServerConfig
+from .planning.models import StartTurnRequest as PlanningStartTurnRequest
 from .project_catalog import ProjectCatalog
 from .plan_store import PlanStore, PlanStoreError
 
@@ -22,7 +25,11 @@ from .plan_store import PlanStore, PlanStoreError
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["projects"])
 
 
-class StartThreadRequest(BaseModel):
+class LegacyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class StartThreadRequest(LegacyRequest):
     cwd: str | None = None
     model: str | None = None
     model_provider: str | None = None
@@ -31,31 +38,27 @@ class StartThreadRequest(BaseModel):
     experimental_raw_events: bool = False
     persist_extended_history: bool = False
 
-
-class ResumeThreadRequest(BaseModel):
-    cwd: str | None = None
-    model: str | None = None
-    model_provider: str | None = None
-    service_tier: str | None = None
-    approval_policy: str | None = None
-    persist_extended_history: bool = False
+    @model_validator(mode="after")
+    def reject_route_owned_values(self) -> StartThreadRequest:
+        if self.cwd is not None:
+            raise ValueError("cwd is selected by the project route")
+        return self
 
 
-class ForkThreadRequest(BaseModel):
-    cwd: str | None = None
-    model: str | None = None
-    model_provider: str | None = None
-    service_tier: str | None = None
-    approval_policy: str | None = None
-    persist_extended_history: bool = False
+class ResumeThreadRequest(StartThreadRequest):
+    pass
 
 
-class SetThreadNameRequest(BaseModel):
+class ForkThreadRequest(StartThreadRequest):
+    pass
+
+
+class SetThreadNameRequest(LegacyRequest):
     name: str = Field(min_length=1)
 
 
-class StartTurnRequest(BaseModel):
-    input: list[UserInput]
+class StartTurnRequest(LegacyRequest):
+    input: list[dict[str, Any]] = Field(min_length=1)
     cwd: str | None = None
     approval_policy: str | None = None
     model: str | None = None
@@ -63,6 +66,15 @@ class StartTurnRequest(BaseModel):
     effort: str | None = None
     summary: str | None = None
     personality: str | None = None
+
+    @model_validator(mode="after")
+    def reject_route_owned_values(self) -> StartTurnRequest:
+        if self.cwd is not None:
+            raise ValueError("cwd is selected by the project route")
+        for item in self.input:
+            if item.get("type") != "text" or not isinstance(item.get("text"), str):
+                raise ValueError("only text input is supported by this compatibility route")
+        return self
 
 
 class SaveDraftRequest(BaseModel):
@@ -75,149 +87,125 @@ class PromotePlanRequest(BaseModel):
     target_name: str | None = None
 
 
-def _get_config() -> ServerConfig:
-    """Get config - to be overridden by main app."""
+def _get_config():
+    """Compatibility dependency overridden by the main application."""
     raise RuntimeError("Config dependency not initialized")
 
 
 def _get_project_catalog() -> ProjectCatalog:
-    """Get project catalog - to be overridden by main app."""
     raise RuntimeError("Project catalog dependency not initialized")
 
 
-def get_codex_backend(config: ServerConfig = Depends(_get_config)) -> CodexThreadGateway:
-    """Get or create a Codex thread gateway instance."""
-    if not config.codex_app_server_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Codex app-server not configured",
-        )
-
-    return CodexAppServerClient(
-        server_url=config.codex_app_server_url,
-        auth_token=config.codex_app_server_token,
-    )
+def _get_planning_service() -> PlanningService:
+    raise RuntimeError("Planning service dependency not initialized")
 
 
-def get_plan_store_for_project(
-    project_id: str,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> PlanStore:
-    """Get a plan store for a project."""
-    project = project_catalog.get_project_fast(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-    return PlanStore(project.current_path)
+def _key(thread_id: str) -> SessionKey:
+    return SessionKey(provider_id="codex", provider_session_id=thread_id)
 
 
-def _codex_error_to_http_error(error: CodexThreadGatewayError) -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        detail=f"Codex app-server error: {error}",
-    )
+def _provider_error(error: ProviderOperationError) -> HTTPException:
+    code = error.error.code.value
+    status_code = {
+        "invalid_request": status.HTTP_400_BAD_REQUEST,
+        "session_not_found": status.HTTP_404_NOT_FOUND,
+        "conflict": status.HTTP_409_CONFLICT,
+        "capability_unsupported": status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "provider_timeout": status.HTTP_504_GATEWAY_TIMEOUT,
+    }.get(code, status.HTTP_502_BAD_GATEWAY)
+    return HTTPException(status_code=status_code, detail=error.error.message)
 
 
-def _codex_backend_status(ready: bool, *, error: str | None = None) -> dict[str, str | None]:
-    if ready:
-        return {"state": "ready", "message": None, "detail": None}
+def _legacy_status(session: Session) -> Any:
+    if session.status.value == "idle":
+        return {"type": "active", "activeFlags": []}
+    return {"type": session.status.value, "activeFlags": []}
 
-    lowered_error = (error or "").lower()
-    if "not initialized" in lowered_error:
-        message = "Codex app-server is not initialized yet."
-        state = "uninitialized"
-    elif "not configured" in lowered_error:
-        message = "Codex app-server is not configured."
-        state = "not_configured"
-    else:
-        message = "Codex app-server is unavailable."
-        state = "error"
 
+def _legacy_turn(turn: Turn) -> dict[str, Any]:
+    status_value = {
+        "running": "inProgress",
+        "waiting_for_approval": "inProgress",
+        "interrupted": "failed",
+    }.get(turn.status.value, turn.status.value)
     return {
-        "state": state,
-        "message": message,
-        "detail": error,
+        "id": turn.turn_id,
+        "status": status_value,
+        "items": list(turn.items),
+        "error": turn.error.model_dump(mode="json") if turn.error else None,
     }
 
 
-def _list_all_threads_for_project(
-    backend: CodexThreadGateway,
-    *,
-    search_term: str | None,
-    limit: int | None,
-    cursor: str | None,
-    source_kinds: list[str] | None,
-    archived: bool | None,
-    ) -> list[Any]:
-    """Fetch every matching thread page so ownership filtering stays correct."""
-    threads: list[Any] = []
-    current_cursor = cursor
-    while True:
-        page = backend.list_threads(
-            search_term=search_term,
-            limit=limit,
-            cursor=current_cursor,
-            source_kinds=source_kinds,
-            archived=archived,
-        )
-        threads.extend(page.threads)
-        if not page.next_cursor:
-            break
-        current_cursor = page.next_cursor
-    return threads
+def _legacy_thread(session: Session, *, summary: bool = False) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "id": session.provider_session_id,
+        "preview": session.preview.strip()[:120],
+        "updated_at": session.updated_at.isoformat() if session.updated_at else now,
+        "cwd": session.cwd,
+        "source": "codex",
+        "name": session.title,
+        "status": _legacy_status(session),
+    }
+    if summary:
+        return payload
+    payload.update(
+        {
+            "ephemeral": False,
+            "model_provider": "openai",
+            "created_at": session.created_at.isoformat() if session.created_at else now,
+            "path": None,
+            "cli_version": "",
+            "agent_nickname": None,
+            "agent_role": None,
+            "git_info": None,
+            "turns": [_legacy_turn(turn) for turn in session.turns],
+        }
+    )
+    return payload
 
 
-def _project_lookup_paths(project: Any, requested_cwd: str | None = None) -> list[str]:
-    """Return the concrete cwd filters to use when listing one project's threads."""
-    if requested_cwd:
-        return [requested_cwd]
-
-    paths: list[str] = []
-    seen: set[Path] = set()
-    candidates = [project.current_path, *getattr(project, "historical_aliases", ())]
-    for candidate in candidates:
-        normalized = Path(candidate).expanduser().absolute()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        paths.append(str(normalized))
-    return paths
+def _legacy_mutation(session: Session) -> dict[str, Any]:
+    return {
+        "thread": _legacy_thread(session),
+        "model": session.model,
+        "model_provider": "openai",
+        "service_tier": None,
+        "cwd": session.cwd,
+        "approval_policy": "never",
+        "approvals_reviewer": {},
+        "sandbox": {"type": "danger-full-access"},
+        "reasoning_effort": session.reasoning_level,
+    }
 
 
-def _list_threads_for_project_paths(
-    backend: CodexThreadGateway,
-    *,
+def _lookup_paths(project: Any) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(path) for path in (project.current_path, *project.historical_aliases)))
+
+
+def _ensure_owned(
+    project: Any, session: Session, project_catalog: ProjectCatalog
+) -> None:
+    projects = project_catalog.list_projects()
+    if not session.cwd or not project_catalog.project_owns_path(
+        project, session.cwd, projects=projects
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+
+async def _require_owned_session(
     project: Any,
-    requested_cwd: str | None,
-    search_term: str | None,
-    limit: int | None,
-    cursor: str | None,
-    source_kinds: list[str] | None,
-    archived: bool | None,
-) -> list[Any]:
-    """List threads by querying only the current project path and stored aliases."""
-    threads_by_id: dict[str, Any] = {}
-    remaining = limit
-
-    for path in _project_lookup_paths(project, requested_cwd):
-        page = backend.list_threads(
-            cwd=path,
-            search_term=search_term,
-            limit=remaining,
-            cursor=cursor,
-            source_kinds=source_kinds,
-            archived=archived,
-        )
-        for thread in page.threads:
-            threads_by_id[getattr(thread, "id")] = thread
-            if remaining is not None:
-                remaining = max(0, limit - len(threads_by_id))
-                if remaining == 0:
-                    return list(threads_by_id.values())
-
-    return list(threads_by_id.values())
+    thread_id: str,
+    project_catalog: ProjectCatalog,
+    planning_service: PlanningService,
+    *,
+    include_turns: bool = False,
+) -> Session:
+    session = await planning_service.read_session(
+        _key(thread_id), include_turns=include_turns
+    )
+    _ensure_owned(project, session, project_catalog)
+    return session
 
 
 @router.get("/threads")
@@ -230,37 +218,52 @@ async def list_threads(
     source_kinds: list[str] | None = None,
     archived: bool | None = None,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, Any]:
-    """List available Codex threads."""
     project = project_catalog.get_project(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    paths = _lookup_paths(project)
+    if cwd is not None and cwd not in paths:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cwd is not owned by project")
+    if source_kinds and "codex" not in source_kinds and "app-server" not in source_kinds:
+        return {"threads": [], "next_cursor": None, "backend_status": _backend_status(True)}
+    sessions_by_id: dict[str, Session] = {}
     try:
-        threads = _list_threads_for_project_paths(
-            backend,
-            project=project,
-            requested_cwd=cwd,
-            search_term=search_term,
-            limit=limit,
-            cursor=cursor,
-            source_kinds=source_kinds,
-            archived=archived,
-        )
+        for path in ((cwd,) if cwd is not None else paths):
+            sessions, _ = await planning_service.list_sessions(
+                provider_id="codex", cwd=path, archived=archived
+            )
+            for session in sessions:
+                if search_term and search_term.casefold() not in (
+                    f"{session.title or ''} {session.preview}".casefold()
+                ):
+                    continue
+                sessions_by_id[session.provider_session_id] = session
+        sessions = list(sessions_by_id.values())
+        if limit is not None:
+            sessions = sessions[:limit]
         return {
-            "threads": [thread.to_summary_dict() for thread in threads],
+            "threads": [_legacy_thread(session, summary=True) for session in sessions],
             "next_cursor": None,
-            "backend_status": _codex_backend_status(True),
+            "backend_status": _backend_status(True),
         }
-    except CodexThreadGatewayError as error:
+    except ProviderOperationError as error:
         return {
             "threads": [],
             "next_cursor": None,
-            "backend_status": _codex_backend_status(False, error=str(error)),
+            "backend_status": _backend_status(False, error.error.message),
         }
+
+
+def _backend_status(ready: bool, message: str | None = None) -> dict[str, str | None]:
+    if ready:
+        return {"state": "ready", "message": None, "detail": None}
+    return {
+        "state": "error",
+        "message": message or "Planning provider is unavailable.",
+        "detail": None,
+    }
 
 
 @router.get("/threads/{thread_id}")
@@ -269,20 +272,22 @@ async def read_thread(
     thread_id: str,
     include_turns: bool = True,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, Any]:
-    """Read a specific Codex thread."""
     project = project_catalog.get_project_fast(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     try:
-        thread = backend.read_thread(thread_id, include_turns=include_turns)
-        return thread.to_dict()
-    except CodexThreadGatewayError as error:
-        raise _codex_error_to_http_error(error) from error
+        session = await _require_owned_session(
+            project,
+            thread_id,
+            project_catalog,
+            planning_service,
+            include_turns=include_turns,
+        )
+        return _legacy_thread(session)
+    except ProviderOperationError as error:
+        raise _provider_error(error) from error
 
 
 @router.post("/threads")
@@ -290,28 +295,20 @@ async def start_thread(
     project_id: str,
     request: StartThreadRequest,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, Any]:
-    """Start a new Codex thread."""
     project = project_catalog.get_project_fast(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     try:
-        result = backend.start_thread(
-            cwd=request.cwd or str(project.current_path),
-            model=request.model,
-            model_provider=request.model_provider,
-            service_tier=request.service_tier,
-            approval_policy=request.approval_policy,
-            experimental_raw_events=request.experimental_raw_events,
-            persist_extended_history=request.persist_extended_history,
+        session = await planning_service.start_session(
+            AuthorizedProjectContext(project_id=project.id, cwd=str(project.current_path)),
+            StartSessionRequest(model=request.model),
+            provider_id="codex",
         )
-        return result.to_dict()
-    except CodexThreadGatewayError as error:
-        raise _codex_error_to_http_error(error) from error
+        return _legacy_mutation(session)
+    except ProviderOperationError as error:
+        raise _provider_error(error) from error
 
 
 @router.post("/threads/{thread_id}/resume")
@@ -320,28 +317,21 @@ async def resume_thread(
     thread_id: str,
     request: ResumeThreadRequest,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, Any]:
-    """Resume an existing Codex thread."""
     project = project_catalog.get_project_fast(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     try:
-        result = backend.resume_thread(
-            thread_id,
-            cwd=request.cwd or str(project.current_path),
-            model=request.model,
-            model_provider=request.model_provider,
-            service_tier=request.service_tier,
-            approval_policy=request.approval_policy,
-            persist_extended_history=request.persist_extended_history,
+        await _require_owned_session(
+            project, thread_id, project_catalog, planning_service
         )
-        return result.to_dict()
-    except CodexThreadGatewayError as error:
-        raise _codex_error_to_http_error(error) from error
+        session = await planning_service.resume_session(
+            _key(thread_id), cwd=str(project.current_path)
+        )
+        return _legacy_mutation(session)
+    except ProviderOperationError as error:
+        raise _provider_error(error) from error
 
 
 @router.post("/threads/{thread_id}/fork")
@@ -350,28 +340,21 @@ async def fork_thread(
     thread_id: str,
     request: ForkThreadRequest,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, Any]:
-    """Fork an existing Codex thread."""
     project = project_catalog.get_project_fast(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     try:
-        result = backend.fork_thread(
-            thread_id,
-            cwd=request.cwd or str(project.current_path),
-            model=request.model,
-            model_provider=request.model_provider,
-            service_tier=request.service_tier,
-            approval_policy=request.approval_policy,
-            persist_extended_history=request.persist_extended_history,
+        await _require_owned_session(
+            project, thread_id, project_catalog, planning_service
         )
-        return result.to_dict()
-    except CodexThreadGatewayError as error:
-        raise _codex_error_to_http_error(error) from error
+        session = await planning_service.fork_session(
+            _key(thread_id), cwd=str(project.current_path)
+        )
+        return _legacy_mutation(session)
+    except ProviderOperationError as error:
+        raise _provider_error(error) from error
 
 
 @router.patch("/threads/{thread_id}/name")
@@ -380,20 +363,19 @@ async def set_thread_name(
     thread_id: str,
     request: SetThreadNameRequest,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, str]:
-    """Set a thread's display name."""
     project = project_catalog.get_project_fast(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     try:
-        backend.set_thread_name(thread_id, request.name)
+        await _require_owned_session(
+            project, thread_id, project_catalog, planning_service
+        )
+        await planning_service.set_session_name(_key(thread_id), request.name)
         return {"status": "ok"}
-    except CodexThreadGatewayError as error:
-        raise _codex_error_to_http_error(error) from error
+    except ProviderOperationError as error:
+        raise _provider_error(error) from error
 
 
 @router.post("/threads/{thread_id}/turns")
@@ -402,30 +384,28 @@ async def start_turn(
     thread_id: str,
     request: StartTurnRequest,
     project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-    backend: CodexThreadGateway = Depends(get_codex_backend),
+    planning_service: PlanningService = Depends(_get_planning_service),
 ) -> dict[str, Any]:
-    """Send a user turn into an existing thread."""
     project = project_catalog.get_project_fast(project_id)
     if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    text = "\n".join(str(item["text"]) for item in request.input)
     try:
-        turn = backend.start_turn(
-            thread_id,
-            request.input,
-            cwd=request.cwd or str(project.current_path),
-            approval_policy=request.approval_policy,
-            model=request.model,
-            service_tier=request.service_tier,
-            effort=request.effort,
-            summary=request.summary,
-            personality=request.personality,
+        await _require_owned_session(
+            project, thread_id, project_catalog, planning_service
         )
-        return turn.to_dict()
-    except CodexThreadGatewayError as error:
-        raise _codex_error_to_http_error(error) from error
+        turn = await planning_service.start_turn(
+            _key(thread_id),
+            PlanningStartTurnRequest(
+                text=text,
+                model=request.model,
+                reasoning_level=request.effort,
+                reasoning_summary=request.summary,
+            ),
+        )
+        return _legacy_turn(turn)
+    except ProviderOperationError as error:
+        raise _provider_error(error) from error
 
 
 @router.post("/plans/drafts", status_code=status.HTTP_201_CREATED)

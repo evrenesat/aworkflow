@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from .models import (
     ApprovalDecision,
+    PendingApproval,
     PlanningError,
     ProviderCapabilities,
     ProviderReadiness,
@@ -64,6 +65,13 @@ class PlanningProvider(ABC):
     @abstractmethod
     async def readiness(self) -> ProviderReadiness:
         """Report current provider readiness using the safe app contract."""
+
+    async def list_models(self) -> tuple[str, ...]:
+        raise NotImplementedError
+
+    @property
+    def pending_approvals(self) -> tuple[PendingApproval, ...]:
+        return ()
 
     @abstractmethod
     async def list_sessions(
