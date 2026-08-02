@@ -659,6 +659,29 @@ def test_prompts_preserve_only_the_supplied_context_level() -> None:
     assert json.loads(user.removeprefix("MANAGER_CONTEXT_JSON:\n")) == context
 
 
+def test_prompt_disambiguates_accepted_end_from_terminal_stop() -> None:
+    context = {
+        "level": "full",
+        "run_id": "run-1",
+        "controller_state": {
+            "eligible_actions": ["continue", "stop"],
+            "proposed_next_step": "END",
+        },
+    }
+
+    system, _ = build_manager_prompts(context)
+
+    assert (
+        "continue accepts the controller's proposed transition; when that "
+        "transition is END, continue approves terminal completion"
+    ) in system
+    assert "Stop always fails the run" in system
+    assert "never to approve or summarize successful completion" in system
+    assert "The proposed transition is END" in system
+    assert "choose continue with empty next_step_notes" in system
+    assert "stop_report must describe the unresolved failure or blocker" in system
+
+
 def test_lite_prompt_cause_based_first_rejection_does_not_force_upgrade() -> None:
     context = {
         "level": "lite",

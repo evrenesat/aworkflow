@@ -1,3 +1,11 @@
+# 2026-08-03 — Terminal manager action semantics
+
+- Clarified the authoritative manager protocol so `continue` accepts the
+  controller's proposed transition, including successful `END`, while `stop`
+  always records a failed run.
+- Required stop reports to describe unresolved blockers and added regression
+  coverage for approved terminal transitions.
+
 # 2026-08-02 — Lifecycle-owned startup state boundary
 
 - Centralized repository-relative lifecycle ownership matching around the exact

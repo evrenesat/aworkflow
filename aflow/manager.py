@@ -496,6 +496,7 @@ def build_manager_prompts(
     if level == "lite":
         eligible_actions.add("escalate_to_full")
     eligible_text = ", ".join(sorted(eligible_actions)) or "none"
+    proposed_transition = controller.get("proposed_next_step")
     reviewer_rejections = int(controller.get("reviewer_rejection_count", 0) or 0)
     eligible_upgrade = (
         controller.get("eligible_upgrade")
@@ -561,6 +562,24 @@ def build_manager_prompts(
             else ()
         ),
         f"Eligible actions at this boundary: {eligible_text}.",
+        (
+            "Action semantics are exact: continue accepts the controller's proposed "
+            "transition; when that transition is END, continue approves terminal "
+            "completion."
+        ),
+        (
+            "Stop always fails the run. Use stop only for an unresolved blocker, "
+            "never to approve or summarize successful completion."
+        ),
+        *(
+            (
+                "The proposed transition is END. If the durable evidence supports "
+                "completion, choose continue with empty next_step_notes; choose stop "
+                "only when unresolved evidence requires the run to fail.",
+            )
+            if proposed_transition == "END"
+            else ()
+        ),
         *(
             (
                 "When Full, repartition_current_checkpoint splits the current "
@@ -580,7 +599,7 @@ def build_manager_prompts(
         ),
         "For stop, escalate_to_full, and accepted END, next_step_notes must be [].",
         "For every non-stop action, stop_report must be null.",
-        "For stop, stop_report must be an object with exactly summary, root_cause, evidence, attempts, workspace_state, and next_actions; evidence and next_actions must be non-empty arrays of non-empty strings and the other fields must be non-empty strings.",
+        "For stop, stop_report must describe the unresolved failure or blocker and must be an object with exactly summary, root_cause, evidence, attempts, workspace_state, and next_actions; evidence and next_actions must be non-empty arrays of non-empty strings and the other fields must be non-empty strings.",
         f"Non-stop response shape: {normal_shape}",
         f"Stop response shape: {stop_shape}",
         "No Markdown fences or explanatory text.",

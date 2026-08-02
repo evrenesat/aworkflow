@@ -64,8 +64,14 @@ when exposed), and `stop`.
   remains durable."
 - For `stop`, provide a `stop_report` object with non-empty `summary`,
   `root_cause`, `evidence`, `attempts`, `workspace_state`, and `next_actions`.
-  `evidence` and `next_actions` must be lists.
+  `evidence` and `next_actions` must be lists, and the report must describe
+  the unresolved failure or blocker rather than successful completion.
 - For every other action, set `stop_report` to `null`.
+- Action semantics are exact: `continue` accepts the controller's proposed
+  transition. When that transition is `END`, use `continue` with empty
+  `next_step_notes` to approve terminal completion.
+- `stop` always fails the run. Never use it to approve or summarize successful
+  completion.
 - Never invent a workflow step, role, team, selector, transition, or upgrade
   route. The controller validates all routing and decides the concrete target.
 - An eligible implementation upgrade advances exactly one configured edge from
