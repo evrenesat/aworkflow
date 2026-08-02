@@ -377,9 +377,34 @@ graph, and summary/status. Rich's automatic refresh is disabled; AFlow owns
 one render loop that waits three seconds before its first periodic repaint and
 then repaints at most once every three seconds. Ordinary state and
 banner-context updates coalesce into that next repaint, while Git statistics
-retain their independent 10-second polling cadence. Lifecycle paints are
-explicit so the final manager report remains visible exactly once after the
-banner stops.
+retain their independent 10-second polling cadence. Input and resize wakes are
+drained as scheduler work, so they cannot bypass a due Git poll; coincident
+work is rendered once. Lifecycle paints are explicit so the final manager
+report remains visible exactly once after the banner stops.
+
+When Rich, the dashboard console, and POSIX stdin are all usable TTYs, the
+live document runs in an in-process alternate-screen viewport. `k`/Up and
+`j`/Down move one line; `b`/PageUp and `f`/Space/PageDown move one page;
+`g`/Home jumps to the top; and `G`/End jumps to the bottom and resumes
+follow-tail mode. Manual positions remain stable while new content arrives.
+The footer shows the current range and whether follow-tail or manual mode is
+active. Terminal-size changes are detected by the input reader and cause one
+renderer-owned redraw; unknown keys, `q`, Escape, and malformed sequences are
+ignored. Unsupported or failed terminal setup falls back to the normal
+borderless live display without raw input or alternate-screen control.
+
+The dashboard input reader is the sole owner of the TTY after startup
+questions complete. It uses POSIX cbreak mode with canonical input and echo
+disabled while preserving `ISIG`, and restores the saved attributes
+idempotently on pause, stop, failure, interruption cleanup, or interpreter
+exit. Renderer-owned cleanup also stops Rich, exits the alternate screen,
+shows the cursor, and closes the session after a background failure or
+interpreter exit; the saved last document is used for one best-effort
+scrollback snapshot. The renderer joins input and refresh threads before
+stopping `Live`. Interactive pause/stop exits the alternate screen and prints
+one complete borderless dashboard snapshot to normal scrollback before any
+manager or terminal report; non-interactive fallback does not print a
+duplicate snapshot.
 
 Harness execution does not compete with dashboard input. All configured
 adapters deliver their effective prompt through argv or a prompt flag, and the

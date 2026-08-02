@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+import errno
+import os
+import pty
 import pytest
+import subprocess
+import sys
+import termios
+import time
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from rich.console import Console
 from rich.segment import Segment
 from rich.style import Style
@@ -25,6 +36,27 @@ def _segment_lines(segments: list[Segment]) -> list[list[Segment]]:
 
 def _line_text(line: list[Segment]) -> str:
     return "".join(segment.text for segment in line if not segment.control)
+
+
+def _drain_pty(fd: int, *, timeout: float = 0.5) -> bytes:
+    os.set_blocking(fd, False)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            time.sleep(0.01)
+            continue
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
+        if chunk:
+            output.extend(chunk)
+            continue
+        time.sleep(0.01)
+    return bytes(output)
 
 
 def test_model_defaults_to_follow_tail_and_clamps_dimensions() -> None:
@@ -290,3 +322,237 @@ def test_decoder_bounds_unterminated_escape_sequences_and_recovers() -> None:
     assert decoder.feed(oversized) == ()
     assert decoder.pending == b""
     assert decoder.feed(b"j") == (ViewportAction.LINE_DOWN,)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_terminal_input_session_uses_cbreak_preserves_isig_and_restores_attributes() -> None:
+    from aflow.terminal_viewport import TerminalInputSession
+
+    master_fd, slave_fd = pty.openpty()
+
+    class PtyInput:
+        def fileno(self) -> int:
+            return slave_fd
+
+        def isatty(self) -> bool:
+            return os.isatty(slave_fd)
+
+    class FakeConsole:
+        is_terminal = True
+        size = SimpleNamespace(width=80, height=24)
+
+    before = termios.tcgetattr(slave_fd)
+    session = TerminalInputSession(FakeConsole(), input_stream=PtyInput())
+    try:
+        session.start()
+        during = termios.tcgetattr(slave_fd)
+        assert not during[3] & termios.ICANON
+        assert not during[3] & termios.ECHO
+        assert during[3] & termios.ISIG
+
+        os.write(master_fd, b"\x1b[A")
+        deadline = time.monotonic() + 1.0
+        events: tuple[object, ...] = ()
+        while time.monotonic() < deadline and not events:
+            events = session.drain_events()
+            time.sleep(0.01)
+        assert events == (ViewportAction.LINE_UP,)
+    finally:
+        session.close()
+        session.close()
+        after = termios.tcgetattr(slave_fd)
+        os.close(master_fd)
+        os.close(slave_fd)
+
+    assert after == before
+    assert session.is_restored
+    assert session.thread is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_terminal_input_session_enqueues_only_real_size_changes() -> None:
+    from aflow.terminal_viewport import TerminalInputSession, ViewportEvent
+
+    master_fd, slave_fd = pty.openpty()
+
+    class PtyInput:
+        def fileno(self) -> int:
+            return slave_fd
+
+        def isatty(self) -> bool:
+            return True
+
+    class MutableConsole:
+        is_terminal = True
+        size = SimpleNamespace(width=80, height=24)
+
+    console = MutableConsole()
+    session = TerminalInputSession(console, input_stream=PtyInput())
+    session._SELECT_TIMEOUT_SECONDS = 0.01
+    try:
+        session.start()
+        time.sleep(0.03)
+        assert session.drain_events() == ()
+        console.size = SimpleNamespace(width=100, height=30)
+        deadline = time.monotonic() + 1.0
+        events: tuple[object, ...] = ()
+        while time.monotonic() < deadline and not events:
+            events = session.drain_events()
+            time.sleep(0.01)
+        assert events == (ViewportEvent.RESIZE,)
+        time.sleep(0.03)
+        assert session.drain_events() == ()
+    finally:
+        session.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_terminal_input_session_restores_attributes_after_setup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aflow.terminal_viewport import TerminalInputSession
+
+    master_fd, slave_fd = pty.openpty()
+
+    class PtyInput:
+        def fileno(self) -> int:
+            return slave_fd
+
+        def isatty(self) -> bool:
+            return True
+
+    class FakeConsole:
+        is_terminal = True
+        size = SimpleNamespace(width=80, height=24)
+
+    def fail_cbreak(fd: int) -> None:
+        del fd
+        raise OSError("synthetic cbreak failure")
+
+    before = termios.tcgetattr(slave_fd)
+    monkeypatch.setattr("aflow.terminal_viewport.tty.setcbreak", fail_cbreak)
+    session = TerminalInputSession(FakeConsole(), input_stream=PtyInput())
+    with pytest.raises(OSError, match="synthetic cbreak failure"):
+        session.start()
+    after = termios.tcgetattr(slave_fd)
+
+    session.close()
+    os.close(master_fd)
+    os.close(slave_fd)
+
+    assert after == before
+    assert session.is_restored
+    assert session.thread is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_termios() -> None:
+    from aflow.plan import PlanSnapshot
+    from aflow.run_state import ControllerState
+    import aflow.status as status_mod
+    from aflow.terminal_viewport import TerminalInputSession
+
+    master_fd, slave_fd = pty.openpty()
+    inspect_fd = os.dup(slave_fd)
+    slave_file = os.fdopen(os.dup(slave_fd), "w", buffering=1)
+
+    class PtyInput:
+        def fileno(self) -> int:
+            return slave_fd
+
+        def isatty(self) -> bool:
+            return True
+
+    class PtySession(TerminalInputSession):
+        def __init__(self, console: object, *, wake_event: object) -> None:
+            super().__init__(console, input_stream=PtyInput(), wake_event=wake_event)
+
+    before = termios.tcgetattr(inspect_fd)
+    console = Console(file=slave_file, force_terminal=True, width=80)
+    state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+    renderer = status_mod.BannerRenderer(
+        config_max_turns=10,
+        config_plan_path=Path("/fake/plan.md"),
+        console=console,
+        refresh_interval_seconds=60.0,
+        git_poll_interval_seconds=9999.0,
+    )
+    renderer._build = lambda _state, git_summary=None: Text("normal snapshot")  # type: ignore[method-assign]
+    try:
+        with patch.object(status_mod, "TerminalInputSession", PtySession):
+            renderer.start(state)
+            renderer.stop(state)
+        slave_file.flush()
+        output = _drain_pty(master_fd)
+        after = termios.tcgetattr(inspect_fd)
+    finally:
+        renderer.stop(state)
+        slave_file.close()
+        os.close(inspect_fd)
+        os.close(master_fd)
+        os.close(slave_fd)
+
+    assert after == before
+    assert b"\x1b[?1049h" in output
+    assert b"\x1b[?1049l" in output
+    assert b"\x1b[?25l" in output
+    assert b"\x1b[?25h" in output
+    assert output.index(b"\x1b[?1049h") < output.index(b"\x1b[?1049l")
+    assert output.index(b"\x1b[?25l") < output.index(b"\x1b[?25h")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_termios() -> None:
+    master_fd, slave_fd = pty.openpty()
+    inspect_fd = os.dup(slave_fd)
+    before = termios.tcgetattr(inspect_fd)
+    script = textwrap.dedent(
+        """
+        import sys
+        import time
+        from pathlib import Path
+
+        from rich.console import Console
+        from rich.text import Text
+
+        from aflow.plan import PlanSnapshot
+        from aflow.run_state import ControllerState
+        from aflow.status import BannerRenderer
+
+        console = Console(file=sys.stderr, force_terminal=True, width=80)
+        renderer = BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            console=console,
+            refresh_interval_seconds=60.0,
+            git_poll_interval_seconds=9999.0,
+        )
+        renderer._build = lambda _state, git_summary=None: Text("atexit snapshot")
+        renderer.start(ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False)))
+        time.sleep(0.05)
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=os.getcwd(),
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        assert process.wait(timeout=5.0) == 0
+        output = _drain_pty(master_fd)
+        after = termios.tcgetattr(inspect_fd)
+    finally:
+        os.close(inspect_fd)
+        os.close(master_fd)
+
+    assert after == before
+    assert b"\x1b[?1049h" in output
+    assert b"\x1b[?1049l" in output
+    assert b"\x1b[?25l" in output
+    assert b"\x1b[?25h" in output
+    assert output.index(b"\x1b[?1049h") < output.index(b"\x1b[?1049l")
+    assert output.index(b"\x1b[?25l") < output.index(b"\x1b[?25h")

@@ -386,7 +386,24 @@ the live banner and `aflow show`; only the live branch is flattened, while
 `update(...)`/`set_context(...)` calls only replace the newest state/context
 for the next tick. Git collection remains independently due every
 `git_poll_interval_seconds` (default 10 s), while lifecycle paints are kept
-explicit and bounded so manager reports can follow the stopped banner.
+explicit and bounded so manager reports can follow the stopped banner. Input
+wakes are drained within the same scheduler cycle, before due Git collection,
+so continuous navigation cannot starve Git and coincident work causes one
+repaint.
+On a supported POSIX TTY, `BannerRenderer` also creates one
+`TerminalInputSession` and one `ScrollableViewport`. The session owns cbreak
+input and a bounded `select()` reader, but only enqueues decoded navigation or
+resize work; the render thread applies all queued work and is the only
+background caller of `Live.update()`/`Live.refresh()`. Interactive `Live`
+instances use `screen=True`, `auto_refresh=False`, and cropped viewport output;
+all other consoles retain the borderless, non-interactive fallback. `k`/Up,
+`j`/Down, `b`/PageUp, `f`/Space/PageDown, `g`/Home, and `G`/End provide
+line/page/top/bottom navigation, with bottom restoring follow-tail. Pause and
+stop join the input and render threads, stop `Live`, restore terminal
+attributes, and then print one full borderless snapshot to normal scrollback
+only when alternate-screen mode was active. Background renderer failures and
+interpreter exit use the same idempotent renderer-owned cleanup, including
+Rich cursor/alternate-screen restoration and the session's termios restore.
 During a live run, real harness children receive closed stdin because every
 configured adapter already places its effective prompt in argv or a CLI flag;
 the dashboard/controller therefore has exclusive ownership of terminal input.

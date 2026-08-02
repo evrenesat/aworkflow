@@ -1,3 +1,30 @@
+# 2026-08-02 — In-process dashboard TTY viewport
+
+### What changed
+
+- Added a POSIX cbreak input session with bounded `select()` polling,
+  chunk-safe navigation decoding, resize wakes, idempotent restoration, and
+  an emergency `atexit` restore.
+- Integrated the session with the existing single AFlow render loop. Supported
+  TTYs use a cropped alternate-screen `ScrollableViewport`; other consoles
+  retain the borderless fallback.
+- Added final-snapshot/report-ordering, render-thread ownership, PTY flag,
+  resize, setup-failure, and start/resume lifecycle regressions.
+
+### Why
+
+- A renderer-owned viewport keeps long SSH/Screen dashboards copyable and
+  navigable without a pager process or competing terminal readers, while
+  preserving cleanup and manager-report ordering.
+
+# 2026-08-02 — Dashboard deadline and emergency cleanup repair
+
+- Kept navigation/resize wakes inside the scheduler cycle so an independently
+  due Git poll is serviced before one coincident repaint.
+- Routed background render failures and interpreter exit through idempotent
+  renderer-owned cleanup that stops Rich, restores the cursor/alternate screen
+  and termios, and preserves one last complete snapshot.
+
 # 2026-08-02 — Dashboard terminal input ownership
 
 - Closed real harness subprocess stdin with `subprocess.DEVNULL` after

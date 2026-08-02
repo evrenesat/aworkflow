@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,14 @@ try:
 except ImportError:
     Console = object  # type: ignore[assignment,misc]
     Live = object  # type: ignore[assignment,misc]
+
+if _RICH_AVAILABLE:
+    from .terminal_viewport import (
+        ScrollableViewport,
+        TerminalInputSession,
+        ViewportAction,
+        ViewportEvent,
+    )
 
 _STDERR_CONSOLE: Console | None = None
 if _RICH_AVAILABLE:
@@ -894,7 +903,20 @@ class BannerRenderer:
         self._state: ControllerState | None = None
         self._git_summary: GitSummary | None = None
         self._stop_event = threading.Event()
+        self._render_wake = threading.Event()
         self._refresh_thread: threading.Thread | None = None
+        self._input_session: TerminalInputSession | None = None
+        self._viewport: ScrollableViewport | None = None
+        self._interactive = False
+        self._last_panel: Group | Text | None = None
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_complete = threading.Event()
+        self._cleanup_complete.set()
+        self._cleanup_in_progress = False
+        self._cleanup_owner: threading.Thread | None = None
+        self._startup_complete = False
+        self._emergency_cleanup_registered = False
+        self._emergency_cleanup_callback: object | None = None
 
     def set_context(
         self,
@@ -942,39 +964,71 @@ class BannerRenderer:
     def _refresh_loop(self) -> None:
         from .git_status import capture_baseline, summarize_since_baseline
 
-        baseline = None
-        if self._repo_root is not None:
-            baseline = capture_baseline(self._repo_root)
+        try:
+            baseline = None
+            if self._repo_root is not None:
+                baseline = capture_baseline(self._repo_root)
 
-        next_refresh_at = time.monotonic() + self._refresh_interval_seconds
-        next_git_poll_at = None
-        if self._repo_root is not None and baseline is not None:
-            next_git_poll_at = time.monotonic() + self._git_poll_interval_seconds
+            next_refresh_at = time.monotonic() + self._refresh_interval_seconds
+            next_git_poll_at = None
+            if self._repo_root is not None and baseline is not None:
+                next_git_poll_at = time.monotonic() + self._git_poll_interval_seconds
 
-        while True:
-            now = time.monotonic()
-            deadlines = [next_refresh_at]
-            if next_git_poll_at is not None:
-                deadlines.append(next_git_poll_at)
-            timeout = max(0.0, min(deadlines) - now)
-            if self._stop_event.wait(timeout=timeout):
-                return
+            while True:
+                now = time.monotonic()
+                deadlines = [next_refresh_at]
+                if next_git_poll_at is not None:
+                    deadlines.append(next_git_poll_at)
+                timeout = max(0.0, min(deadlines) - now)
 
-            now = time.monotonic()
-            if next_git_poll_at is not None and now >= next_git_poll_at:
-                summary = summarize_since_baseline(self._repo_root, baseline)
-                with self._lock:
+                input_session = self._input_session
+                events: tuple[ViewportAction | ViewportEvent, ...] = ()
+                if input_session is not None:
+                    woke = self._render_wake.wait(timeout=timeout)
                     if self._stop_event.is_set():
                         return
-                    self._git_summary = summary
-                next_git_poll_at = time.monotonic() + self._git_poll_interval_seconds
+                    if woke:
+                        events = input_session.drain_events()
+                elif self._stop_event.wait(timeout=timeout):
+                    return
+
                 now = time.monotonic()
+                if next_git_poll_at is not None and now >= next_git_poll_at:
+                    if self._stop_event.is_set():
+                        return
+                    summary = summarize_since_baseline(self._repo_root, baseline)
+                    if self._stop_event.is_set():
+                        return
+                    with self._lock:
+                        if self._stop_event.is_set():
+                            return
+                        self._git_summary = summary
+                    next_git_poll_at = time.monotonic() + self._git_poll_interval_seconds
+                    now = time.monotonic()
 
-            if now >= next_refresh_at and not self._stop_event.is_set():
-                self._refresh_live()
-                next_refresh_at = time.monotonic() + self._refresh_interval_seconds
+                interaction_due = bool(events)
+                periodic_due = now >= next_refresh_at
+                if (interaction_due or periodic_due) and not self._stop_event.is_set():
+                    self._refresh_live(events)
+                    next_refresh_at = time.monotonic() + self._refresh_interval_seconds
+        except Exception:
+            # A background renderer failure must not strand a raw terminal,
+            # Rich Live instance, or reader thread.  Once startup commits, the
+            # renderer-owned path also leaves the last successfully built
+            # document in scrollback.
+            with self._lock:
+                startup_complete = self._startup_complete
+            self._cleanup_interactive(
+                state=None,
+                render_final=False,
+                print_snapshot=startup_complete,
+                suppress_errors=True,
+            )
 
-    def _refresh_live(self) -> None:
+    def _refresh_live(
+        self,
+        events: tuple[ViewportAction | ViewportEvent, ...] = (),
+    ) -> None:
         with self._lock:
             if self._stop_event.is_set():
                 return
@@ -986,11 +1040,22 @@ class BannerRenderer:
             panel = self._build(state, git_summary)
             if panel is None or self._stop_event.is_set():
                 return
-            live.update(panel, refresh=False)
+            self._last_panel = panel
+            viewport = self._viewport
+            if viewport is not None:
+                for event in events:
+                    if isinstance(event, ViewportAction):
+                        viewport.apply(event)
+                viewport.renderable = panel
+                renderable = viewport
+            else:
+                renderable = panel
+            live.update(renderable, refresh=False)
             live.refresh()
 
     def _start_refresh_thread(self) -> None:
         self._stop_event.clear()
+        self._render_wake.clear()
         t = threading.Thread(target=self._refresh_loop, daemon=True, name="aflow-banner-refresh")
         self._refresh_thread = t
         t.start()
@@ -998,9 +1063,131 @@ class BannerRenderer:
     def _stop_refresh_thread(self) -> None:
         with self._lock:
             self._stop_event.set()
-        if self._refresh_thread is not None:
-            self._refresh_thread.join()
+        self._render_wake.set()
+        thread = self._refresh_thread
+        if thread is not None:
+            if thread is not threading.current_thread():
+                try:
+                    started = thread.is_alive()
+                except RuntimeError:
+                    started = False
+                if started:
+                    thread.join()
             self._refresh_thread = None
+
+    def _new_input_session(self) -> TerminalInputSession | None:
+        session: TerminalInputSession | None = None
+        try:
+            session = TerminalInputSession(
+                self._console,
+                wake_event=self._render_wake,
+            )
+            session.start()
+            return session
+        except Exception:
+            if session is not None:
+                try:
+                    if not getattr(session, "is_restored", False):
+                        session.close()
+                except Exception:
+                    pass
+            return None
+
+    def _close_unattached_start_attempt(
+        self,
+        *,
+        live: Live | None,
+        input_session: TerminalInputSession | None,
+    ) -> None:
+        """Release resources that were acquired before renderer attachment."""
+
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
+        if input_session is not None:
+            try:
+                input_session.close()
+            except Exception:
+                pass
+
+    def _start_live_attempt(
+        self,
+        panel: Group | Text,
+        *,
+        input_session: TerminalInputSession | None,
+        interactive: bool,
+    ) -> None:
+        """Start one fully transactional interactive or fallback attempt."""
+
+        viewport = ScrollableViewport(panel) if interactive else None
+        renderable = viewport if viewport is not None else panel
+        live_kwargs = {
+            "console": self._console,
+            "auto_refresh": False,
+            "screen": interactive,
+            "vertical_overflow": "crop" if interactive else "visible",
+        }
+        live: Live | None = None
+        attached = False
+        try:
+            live = Live(renderable, **live_kwargs)
+            live.start()
+            with self._lock:
+                self._live = live
+                self._input_session = input_session
+                self._viewport = viewport
+                self._interactive = interactive
+                self._last_panel = panel
+                self._startup_complete = False
+            attached = True
+            if interactive:
+                self._register_emergency_cleanup()
+            self._start_refresh_thread()
+            with self._lock:
+                if self._live is live:
+                    self._startup_complete = True
+        except BaseException:
+            if attached:
+                self._cleanup_interactive(
+                    state=None,
+                    render_final=False,
+                    print_snapshot=False,
+                    suppress_errors=True,
+                )
+            else:
+                self._close_unattached_start_attempt(
+                    live=live,
+                    input_session=input_session,
+                )
+            raise
+
+    def _start_live(self, panel: Group | Text) -> None:
+        input_session = self._new_input_session()
+        if input_session is None:
+            self._start_live_attempt(
+                panel,
+                input_session=None,
+                interactive=False,
+            )
+            return
+
+        try:
+            self._start_live_attempt(
+                panel,
+                input_session=input_session,
+                interactive=True,
+            )
+        except Exception as interactive_error:
+            try:
+                self._start_live_attempt(
+                    panel,
+                    input_session=None,
+                    interactive=False,
+                )
+            except BaseException as fallback_error:
+                raise fallback_error from interactive_error
 
     def start(self, state: ControllerState) -> None:
         if not _RICH_AVAILABLE:
@@ -1010,11 +1197,7 @@ class BannerRenderer:
             panel = self._build(state)
         if panel is None:
             return
-        live = Live(panel, console=self._console, auto_refresh=False, vertical_overflow="visible")
-        live.start()
-        with self._lock:
-            self._live = live
-        self._start_refresh_thread()
+        self._start_live(panel)
 
     def update(self, state: ControllerState) -> None:
         if not _RICH_AVAILABLE:
@@ -1028,21 +1211,14 @@ class BannerRenderer:
         with self._lock:
             if self._live is None:
                 return
-        self._stop_refresh_thread()
-        with self._lock:
-            live = self._live
             state = self._state
-            git_summary = self._git_summary
-            panel = (
-                self._build(state, git_summary)
-                if live is not None and state is not None
-                else None
+        if state is not None:
+            self._cleanup_interactive(
+                state=state,
+                render_final=True,
+                print_snapshot=True,
+                suppress_errors=True,
             )
-            self._live = None
-        if live is not None:
-            if panel is not None:
-                live.update(panel, refresh=False)
-            live.stop()
 
     def resume(self, state: ControllerState) -> None:
         if not _RICH_AVAILABLE:
@@ -1052,24 +1228,160 @@ class BannerRenderer:
             panel = self._build(state, self._git_summary)
         if panel is None:
             return
-        live = Live(panel, console=self._console, auto_refresh=False, vertical_overflow="visible")
-        live.start()
-        with self._lock:
-            self._live = live
-        self._start_refresh_thread()
+        self._start_live(panel)
 
     def stop(self, state: ControllerState) -> None:
         if not _RICH_AVAILABLE:
             return
-        self._stop_refresh_thread()
+        self._cleanup_interactive(
+            state=state,
+            render_final=True,
+            print_snapshot=True,
+            suppress_errors=True,
+        )
+
+    def _register_emergency_cleanup(self) -> None:
         with self._lock:
-            live = self._live
-            self._live = None
-            self._state = state
-            git_summary = self._git_summary
-            panel = self._build(state, git_summary) if live is not None else None
-        if live is None:
+            if self._emergency_cleanup_registered:
+                return
+            callback = self._emergency_cleanup
+            self._emergency_cleanup_callback = callback
+            self._emergency_cleanup_registered = True
+        atexit.register(callback)
+
+    def _unregister_emergency_cleanup(self) -> None:
+        with self._lock:
+            if not self._emergency_cleanup_registered:
+                return
+            callback = self._emergency_cleanup_callback
+            self._emergency_cleanup_callback = None
+            self._emergency_cleanup_registered = False
+        if callback is not None:
+            try:
+                atexit.unregister(callback)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+    def _emergency_cleanup(self) -> None:
+        self._cleanup_interactive(
+            state=None,
+            render_final=False,
+            print_snapshot=True,
+            suppress_errors=True,
+        )
+
+    def _cleanup_interactive(
+        self,
+        *,
+        state: ControllerState | None,
+        render_final: bool,
+        print_snapshot: bool,
+        suppress_errors: bool,
+    ) -> None:
+        """Stop every renderer-owned resource exactly once.
+
+        Cleanup ownership is elected under ``_cleanup_lock``, but the owner
+        releases that lock before stopping or joining the render thread.  A
+        render-thread failure that races with an external owner therefore
+        returns immediately instead of waiting on the same gate that the
+        external owner holds while it joins the thread.
+        """
+
+        current_thread = threading.current_thread()
+        wait_for_cleanup: threading.Event | None = None
+        owns_cleanup = False
+        with self._cleanup_lock:
+            if self._cleanup_in_progress:
+                if self._cleanup_owner is current_thread:
+                    return
+                if self._refresh_thread is current_thread:
+                    return
+                wait_for_cleanup = self._cleanup_complete
+            else:
+                # Publish ownership before inspecting renderer state.  The
+                # render thread may hold ``_lock`` inside a Rich call and
+                # needs to observe this handoff from its exception path.
+                self._cleanup_in_progress = True
+                self._cleanup_owner = current_thread
+                self._cleanup_complete.clear()
+                owns_cleanup = True
+
+        if wait_for_cleanup is not None:
+            wait_for_cleanup.wait()
             return
-        if panel is not None:
-            live.update(panel, refresh=False)
-        live.stop()
+        if not owns_cleanup:
+            self._unregister_emergency_cleanup()
+            return
+
+        try:
+            input_session = self._input_session
+            errors: list[Exception] = []
+            if input_session is not None:
+                try:
+                    input_session.stop_reader()
+                except Exception as exc:
+                    errors.append(exc)
+            try:
+                self._stop_refresh_thread()
+            except Exception as exc:
+                errors.append(exc)
+
+            with self._lock:
+                live = self._live
+                viewport = self._viewport
+                interactive = self._interactive and input_session is not None
+                if state is not None:
+                    self._state = state
+                panel = self._last_panel
+                if live is not None and state is not None:
+                    try:
+                        built_panel = self._build(state, self._git_summary)
+                    except Exception as exc:
+                        errors.append(exc)
+                    else:
+                        if built_panel is not None:
+                            panel = built_panel
+                            self._last_panel = built_panel
+                self._live = None
+                self._viewport = None
+                self._input_session = None
+                self._interactive = False
+                self._startup_complete = False
+
+            if live is not None:
+                if render_final and panel is not None:
+                    try:
+                        if interactive and viewport is not None:
+                            viewport.renderable = panel
+                            live.update(viewport, refresh=False)
+                            live.refresh()
+                        else:
+                            live.update(panel, refresh=False)
+                    except Exception as exc:
+                        errors.append(exc)
+                try:
+                    live.stop()
+                except Exception as exc:
+                    errors.append(exc)
+
+            if input_session is not None:
+                try:
+                    input_session.close()
+                except Exception as exc:
+                    errors.append(exc)
+
+            self._unregister_emergency_cleanup()
+
+            if interactive and print_snapshot and panel is not None:
+                try:
+                    self._console.print(panel)
+                except Exception as exc:
+                    errors.append(exc)
+
+            if errors and not suppress_errors:
+                raise errors[0]
+        finally:
+            with self._cleanup_lock:
+                self._cleanup_in_progress = False
+                self._cleanup_owner = None
+                self._cleanup_complete.set()

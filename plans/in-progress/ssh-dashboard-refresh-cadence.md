@@ -12,12 +12,15 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 - Plan Branch: `aflow-ssh-dashboard-refresh-cadence-20260801-214511`
 - Pre-Handoff Base HEAD: `c9616c50d93106024ebdfd79b892c174136fb0de`
-- Last Reviewed Checkpoint: `cp4 v01`
+- Last Reviewed Checkpoint: `cp5 v01`
 - Review Log:
   - `cp1 v02`: approved the fresh pause snapshot repair; pause joins the render thread, installs the newest coalesced state and context without an eager refresh, and relies on `Live.stop()` for the single lifecycle repaint.
   - `2026-08-01`: Checkpoint 3 reviewed via current-worktree fallback because no `cp3 vNN` commit boundary exists. Outcome: changes requested. Unsupported CSI sequences can be ignored as one chunk but decoded as navigation when split immediately before an ASCII navigation final byte; focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp04-v01.md`.
   - `cp3 v02`: approved the chunk-invariant decoder repair; unsupported `ESC [ 2 G` and `ESC [ 9 j` sequences are discarded atomically across every split, pending escape input is bounded at 64 bytes with recovery, and the 36 viewport plus 22 banner/status test baseline passes.
   - `cp4 v01`: approved via current-worktree fallback because no Checkpoint 4 commit boundary existed; real harness children receive `stdin=subprocess.DEVNULL`, the EOF/capture regression and all 27 adapter tests pass, and the 10 combined-suite lifecycle failures are outside this checkpoint's real-subprocess path.
+  - `2026-08-02`: Checkpoint 5 reviewed via current-worktree fallback from `cp4 v01`; changes requested because repeated navigation/resize wakes can indefinitely bypass an already-due Git poll, background render failure leaves the interactive Live/session attached, and session-only `atexit` cleanup restores termios without exiting the alternate screen or showing the cursor. The same 12 lifecycle failures reproduce at `cp4 v01`, so they are unrelated baseline failures. Focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp01-v01.md`.
+  - `2026-08-02`: The Checkpoint 5 `cp01-v01` repair was reviewed from the current worktree; changes remain requested because overlapping normal cleanup and a background Rich failure deadlock while each waits on the other, and refresh-thread startup failure leaves a started interactive Live/session attached. All focused checks pass, and the combined suite remains at 421 passed with the same 12 unrelated lifecycle failures. Focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp01-v02.md`.
+  - `cp5 v01`: approved the deadlock-free cleanup ownership handoff and transactional startup repair; coordinated Rich-failure cleanup and both render-thread startup rollback paths terminate without stranded resources or duplicate snapshots. All focused checks pass, and the combined suite reports 424 passed with only the same 12 unrelated lifecycle baseline failures.
 
 ## Done Means
 
@@ -280,7 +283,7 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 - Stop and report if closing stdin changes an adapter's tested invocation/result behavior.
 - Stop and report if unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 5: Integrate safe in-process TTY scrolling with the live renderer
+### [x] Checkpoint 5: Integrate safe in-process TTY scrolling with the live renderer
 
 **Goal:**
 
@@ -302,14 +305,14 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 **Steps:**
 
-- [ ] Add a POSIX terminal-input session that saves attributes, enters cbreak with `ISIG`, incrementally decodes bytes, detects real size changes, enqueues work, and restores attributes idempotently on close/atexit.
-- [ ] Integrate capability detection into start/resume. If any interactive setup step fails, restore any partial state and continue with normal borderless `Live`; never fail the workflow solely because scrolling is unavailable.
-- [ ] Extend the renderer loop to wake for queued interaction/resize work, apply all pending viewport actions, build once, refresh once, and advance the periodic deadline. Keep ordinary state/context updates coalescing-only and Git deadlines independent.
-- [ ] Make pause/stop ordering explicit: stop input, stop render thread, paint the latest/final viewport once, stop `Live`, restore terminal/alternate screen, then print one complete borderless document to normal scrollback only for sessions that used the alternate screen. Resume creates a fresh session/thread/`Live` instance.
-- [ ] Add fake-session/fake-`Live` tests proving supported versus fallback constructor policies, no Rich calls from the input thread, immediate-but-single action redraw, resize redraw/clamping, follow-tail/manual behavior during live updates, start/resume parity, and no calls after pause/stop.
-- [ ] Add Linux PTY tests for cbreak flags (`ICANON`/`ECHO` off, `ISIG` on), arrow/page byte decoding, alternate-screen enter/exit, cursor/attribute restoration after normal close and injected start failure, and idempotent cleanup. Avoid assertions on unrelated Rich escape-code ordering.
-- [ ] Extend the real CLI regression to assert one final borderless dashboard snapshot precedes one manager report and terminal cleanup codes do not swallow report text.
-- [ ] Update runtime/architecture docs with controls, follow-tail/manual rules, TTY fallback, final snapshot, resize behavior, stdin ownership, and cleanup guarantees; add a concise devlog entry. Leave README unchanged because it links to the detailed runtime guide.
+- [x] Add a POSIX terminal-input session that saves attributes, enters cbreak with `ISIG`, incrementally decodes bytes, detects real size changes, enqueues work, and restores attributes idempotently on close/atexit.
+- [x] Integrate capability detection into start/resume. If any interactive setup step fails, restore any partial state and continue with normal borderless `Live`; never fail the workflow solely because scrolling is unavailable.
+- [x] Extend the renderer loop to wake for queued interaction/resize work, apply all pending viewport actions, build once, refresh once, and advance the periodic deadline. Keep ordinary state/context updates coalescing-only and Git deadlines independent.
+- [x] Make pause/stop ordering explicit: stop input, stop render thread, paint the latest/final viewport once, stop `Live`, restore terminal/alternate screen, then print one complete borderless document to normal scrollback only for sessions that used the alternate screen. Resume creates a fresh session/thread/`Live` instance.
+- [x] Add fake-session/fake-`Live` tests proving supported versus fallback constructor policies, no Rich calls from the input thread, immediate-but-single action redraw, resize redraw/clamping, follow-tail/manual behavior during live updates, start/resume parity, and no calls after pause/stop.
+- [x] Add Linux PTY tests for cbreak flags (`ICANON`/`ECHO` off, `ISIG` on), arrow/page byte decoding, alternate-screen enter/exit, cursor/attribute restoration after normal close and injected start failure, and idempotent cleanup. Avoid assertions on unrelated Rich escape-code ordering.
+- [x] Extend the real CLI regression to assert one final borderless dashboard snapshot precedes one manager report and terminal cleanup codes do not swallow report text.
+- [x] Update runtime/architecture docs with controls, follow-tail/manual rules, TTY fallback, final snapshot, resize behavior, stdin ownership, and cleanup guarantees; add a concise devlog entry. Leave README unchanged because it links to the detailed runtime guide.
 
 **Dependencies:**
 

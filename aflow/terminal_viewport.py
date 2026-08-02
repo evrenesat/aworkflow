@@ -1,12 +1,19 @@
-"""Pure scrolling state and Rich rendering for the live dashboard.
+"""Viewport models/rendering plus the dashboard's POSIX input session.
 
-This module deliberately has no terminal, thread, or workflow concerns.  A
-future renderer can feed :class:`ViewportAction` values to
-:class:`ViewportModel` and render the model through :class:`ScrollableViewport`.
+The viewport and decoder types are terminal-independent and contain no
+workflow concerns.  :class:`TerminalInputSession` is the deliberate exception:
+it owns cbreak terminal attributes and a bounded input-reader thread so the
+renderer can receive typed viewport work without rendering from the reader.
 """
 
 from __future__ import annotations
 
+import atexit
+import os
+import select
+import sys
+import threading
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable
@@ -29,6 +36,16 @@ except ImportError:  # pragma: no cover - exercised by Rich-unavailable imports
     Text = Any  # type: ignore[assignment,misc]
     _RICH_AVAILABLE = False
 
+if os.name == "posix":
+    import termios
+    import tty
+
+    _POSIX_TERMINAL_AVAILABLE = True
+else:  # pragma: no cover - exercised only on non-POSIX hosts
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+    _POSIX_TERMINAL_AVAILABLE = False
+
 
 class ViewportAction(Enum):
     """A navigation intent understood by the pure viewport model."""
@@ -47,6 +64,15 @@ class ViewportAction(Enum):
 
 
 NavigationAction = ViewportAction
+
+
+class ViewportEvent(Enum):
+    """Non-navigation work that the input session can request."""
+
+    RESIZE = "resize"
+
+
+ViewportInput = ViewportAction | ViewportEvent
 
 
 @dataclass
@@ -269,6 +295,191 @@ class IncrementalKeyDecoder:
 
 
 KeyDecoder = IncrementalKeyDecoder
+
+
+class TerminalInputSession:
+    """Own a supported POSIX terminal's input mode and input reader.
+
+    The reader deliberately has no rendering or workflow callback.  It only
+    decodes navigation bytes, observes terminal-size changes during bounded
+    ``select`` waits, and places typed work items on a queue for the renderer.
+    """
+
+    _SELECT_TIMEOUT_SECONDS = 0.1
+
+    def __init__(
+        self,
+        console: Console,
+        *,
+        input_stream: Any | None = None,
+        wake_event: threading.Event | None = None,
+    ) -> None:
+        self.console = console
+        self.input_stream = input_stream if input_stream is not None else sys.stdin
+        self.wake_event = wake_event or threading.Event()
+        self._events: deque[ViewportInput] = deque()
+        self._events_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._decoder = IncrementalKeyDecoder()
+        self._thread: threading.Thread | None = None
+        self._fd: int | None = None
+        self._saved_attributes: list[Any] | None = None
+        self._restored = False
+        self._started = False
+        self._atexit_registered = False
+        self._last_size: tuple[int, int] | None = None
+
+    @property
+    def thread(self) -> threading.Thread | None:
+        return self._thread
+
+    @property
+    def fd(self) -> int | None:
+        return self._fd
+
+    @property
+    def saved_attributes(self) -> list[Any] | None:
+        return self._saved_attributes
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
+    @property
+    def is_restored(self) -> bool:
+        return self._restored
+
+    def _validate_capabilities(self) -> tuple[int, list[Any]]:
+        if not _POSIX_TERMINAL_AVAILABLE or not _RICH_AVAILABLE:
+            raise RuntimeError("interactive viewport requires POSIX and Rich")
+        if not self.console.is_terminal:
+            raise RuntimeError("dashboard console is not a terminal")
+        if not self.input_stream.isatty():
+            raise RuntimeError("dashboard input is not a TTY")
+        fd = self.input_stream.fileno()
+        if not isinstance(fd, int) or fd < 0:
+            raise RuntimeError("dashboard input has no valid file descriptor")
+        attributes = termios.tcgetattr(fd)
+        return fd, attributes
+
+    def start(self) -> None:
+        """Enter cbreak mode and start the daemon input reader."""
+
+        if self._started:
+            return
+        fd, attributes = self._validate_capabilities()
+        self._fd = fd
+        self._saved_attributes = attributes
+        self._last_size = self._console_size()
+        try:
+            # tty.setcbreak keeps signal processing enabled on supported
+            # Python versions.  Re-assert ISIG after it so the contract stays
+            # explicit even on older implementations.
+            tty.setcbreak(fd)
+            cbreak_attributes = termios.tcgetattr(fd)
+            cbreak_attributes[3] |= termios.ISIG
+            termios.tcsetattr(fd, termios.TCSANOW, cbreak_attributes)
+            self._started = True
+            atexit.register(self.close)
+            self._atexit_registered = True
+            thread = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name="aflow-dashboard-input",
+            )
+            self._thread = thread
+            thread.start()
+        except Exception:
+            self.close()
+            raise
+
+    def _console_size(self) -> tuple[int, int] | None:
+        try:
+            size = self.console.size
+            return (int(size.width), int(size.height))
+        except Exception:
+            return None
+
+    def _enqueue(self, event: ViewportInput) -> None:
+        with self._events_lock:
+            self._events.append(event)
+        self.wake_event.set()
+
+    def drain_events(self) -> tuple[ViewportInput, ...]:
+        """Return all queued work and clear the wake when the queue is empty."""
+
+        with self._events_lock:
+            events = tuple(self._events)
+            self._events.clear()
+            if not self._events:
+                self.wake_event.clear()
+        return events
+
+    def stop_reader(self) -> None:
+        """Stop and join only the reader; leave terminal restoration separate."""
+
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._thread = None
+
+    def restore(self) -> None:
+        """Restore saved terminal attributes exactly once."""
+
+        if self._restored:
+            return
+        self._restored = True
+        if self._fd is not None and self._saved_attributes is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attributes)
+            except Exception:
+                # A detached terminal can disappear during interpreter cleanup.
+                # There is no useful recovery in that case, but cleanup stays
+                # idempotent and never masks the workflow's original outcome.
+                pass
+        if self._atexit_registered:
+            atexit.unregister(self.close)
+            self._atexit_registered = False
+
+    def close(self) -> None:
+        """Stop the reader and restore terminal attributes idempotently."""
+
+        self.stop_reader()
+        self.restore()
+        self._started = False
+
+    def _run(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        while not self._stop_event.is_set():
+            try:
+                readable, _, _ = select.select(
+                    [fd],
+                    [],
+                    [],
+                    self._SELECT_TIMEOUT_SECONDS,
+                )
+            except (OSError, ValueError):
+                return
+            if self._stop_event.is_set():
+                return
+            if readable:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                for action in self._decoder.feed(data):
+                    self._enqueue(action)
+                continue
+
+            current_size = self._console_size()
+            if current_size is not None and current_size != self._last_size:
+                self._last_size = current_size
+                self._enqueue(ViewportEvent.RESIZE)
 
 
 class ScrollableViewport:

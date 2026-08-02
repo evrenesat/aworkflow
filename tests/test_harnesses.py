@@ -1424,6 +1424,802 @@ class GitBannerTests(unittest.TestCase):
         assert resumed_live.refresh_calls == 1
         assert build.call_count == 4
 
+    def test_banner_renderer_interactive_viewport_owns_actions_on_render_thread(self) -> None:
+        import aflow.status as status_mod
+        import threading
+        import time
+        from unittest.mock import patch
+
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self) -> None:
+                self.printed: list[object] = []
+
+            def print(self, renderable: object) -> None:
+                self.printed.append(renderable)
+
+        class FakeInputSession:
+            instances: list["FakeInputSession"] = []
+
+            def __init__(self, console: object, *, wake_event: threading.Event) -> None:
+                del console
+                self.wake_event = wake_event
+                self.events: list[object] = []
+                self.events_lock = threading.Lock()
+                self.input_thread_id: int | None = None
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def emit_from_input_thread(self, event: object) -> None:
+                def enqueue() -> None:
+                    self.input_thread_id = threading.get_ident()
+                    with self.events_lock:
+                        self.events.append(event)
+                    self.wake_event.set()
+
+                thread = threading.Thread(target=enqueue)
+                thread.start()
+                thread.join()
+
+            def drain_events(self) -> tuple[object, ...]:
+                with self.events_lock:
+                    events = tuple(self.events)
+                    self.events.clear()
+                self.wake_event.clear()
+                return events
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                self.initial_panel = panel
+                self.kwargs = kwargs
+                self.calls: list[tuple[str, int]] = []
+                self.update_calls: list[tuple[object, bool]] = []
+                self.refresh_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.calls.append(("start", threading.get_ident()))
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                self.calls.append(("update", threading.get_ident()))
+                self.update_calls.append((panel, refresh))
+
+            def refresh(self) -> None:
+                self.calls.append(("refresh", threading.get_ident()))
+                self.refresh_calls += 1
+
+            def stop(self) -> None:
+                self.calls.append(("stop", threading.get_ident()))
+
+        console = FakeConsole()
+        initial_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        latest_state = ControllerState(last_snapshot=PlanSnapshot("latest", 1, 1, False))
+        final_state = ControllerState(last_snapshot=PlanSnapshot("final", 2, 2, False))
+        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
+             patch.object(status_mod, "TerminalInputSession", FakeInputSession), \
+             patch.object(status_mod, "Live", FakeLive):
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                console=console,
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            with patch.object(
+                renderer,
+                "_build",
+                side_effect=lambda state, git_summary=None: (state, git_summary),
+            ):
+                renderer.start(initial_state)
+                live = FakeLive.instances[-1]
+                session = FakeInputSession.instances[-1]
+                assert live.kwargs == {
+                    "console": console,
+                    "auto_refresh": False,
+                    "screen": True,
+                    "vertical_overflow": "crop",
+                }
+                renderer.update(latest_state)
+                session.emit_from_input_thread(status_mod.ViewportAction.LINE_DOWN)
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and not live.update_calls:
+                    time.sleep(0.01)
+                assert len(live.update_calls) == 1
+                assert live.refresh_calls == 1
+                assert session.input_thread_id is not None
+                render_threads = {
+                    thread_id
+                    for name, thread_id in live.calls
+                    if name in {"update", "refresh"}
+                }
+                assert session.input_thread_id not in render_threads
+                renderer.pause()
+                resumed_state = ControllerState(
+                    last_snapshot=PlanSnapshot("resumed", 2, 2, False),
+                )
+                renderer.resume(resumed_state)
+                resumed_live = FakeLive.instances[-1]
+                resumed_session = FakeInputSession.instances[-1]
+                assert resumed_live.kwargs["screen"] is True
+                assert resumed_live.kwargs["vertical_overflow"] == "crop"
+                assert resumed_session is not session
+                renderer.stop(final_state)
+                renderer.stop(final_state)
+
+        assert [name for name, _ in live.calls] == [
+            "start", "update", "refresh", "update", "refresh", "stop",
+        ]
+        assert [name for name, _ in resumed_live.calls] == [
+            "start", "update", "refresh", "stop",
+        ]
+        assert live.kwargs["screen"] is True
+        assert session.stop_reader_calls >= 1
+        assert session.close_calls == 1
+        assert resumed_session.close_calls == 1
+        assert len(console.printed) == 2
+
+    def test_banner_renderer_interaction_wakes_do_not_starve_git_or_duplicate_repaint(self) -> None:
+        import aflow.git_status as git_status_mod
+        import aflow.status as status_mod
+        from unittest.mock import MagicMock, patch
+
+        class ContinuousWake:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, *, timeout: float) -> bool:
+                del timeout
+                self.calls += 1
+                clock[0] += 1.0
+                return True
+
+        class StopAfterWakes:
+            def is_set(self) -> bool:
+                return wake.calls >= 7
+
+        class InputSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def drain_events(self) -> tuple[object, ...]:
+                self.calls += 1
+                if self.calls % 2:
+                    return (status_mod.ViewportAction.LINE_DOWN,)
+                return (status_mod.ViewportEvent.RESIZE,)
+
+        class FakeLive:
+            def __init__(self) -> None:
+                self.update_calls: list[tuple[object, bool]] = []
+                self.refresh_calls = 0
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                self.update_calls.append((panel, refresh))
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+
+        clock = [0.0]
+        wake = ContinuousWake()
+        poll_times: list[float] = []
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        live = FakeLive()
+        renderer = status_mod.BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            repo_root=Path("/fake/repo"),
+            refresh_interval_seconds=3.0,
+            git_poll_interval_seconds=2.0,
+        )
+        renderer._live = live
+        renderer._input_session = InputSession()
+        renderer._render_wake = wake
+        renderer._stop_event = StopAfterWakes()
+        renderer.update(state)
+        build = MagicMock(side_effect=lambda _state, git_summary=None: (clock[0], git_summary))
+
+        def summarize(_repo_root: Path, _baseline: object) -> object:
+            poll_times.append(clock[0])
+            return f"git-{clock[0]:.0f}"
+
+        with patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(renderer, "_build", build), \
+             patch.object(git_status_mod, "capture_baseline", return_value=object()), \
+             patch.object(git_status_mod, "summarize_since_baseline", side_effect=summarize):
+            renderer._refresh_loop()
+
+        assert poll_times == [2.0, 4.0, 6.0]
+        assert len(live.update_calls) == 6
+        assert live.refresh_calls == 6
+        assert all(refresh is False for _, refresh in live.update_calls)
+        assert live.update_calls[1][0] == (2.0, "git-2")
+        assert live.update_calls[3][0] == (4.0, "git-4")
+        assert live.update_calls[5][0] == (6.0, "git-6")
+
+    def test_banner_renderer_background_failure_detaches_and_cleans_up_idempotently(self) -> None:
+        import aflow.status as status_mod
+        import threading
+        import time
+        from unittest.mock import patch
+
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self) -> None:
+                self.printed: list[object] = []
+
+            def print(self, renderable: object) -> None:
+                self.printed.append(renderable)
+
+        class FakeSession:
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: threading.Event) -> None:
+                del console
+                self.wake_event = wake_event
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+
+            def drain_events(self) -> tuple[object, ...]:
+                self.wake_event.clear()
+                return (status_mod.ViewportAction.LINE_DOWN,)
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FailingLive:
+            instances: list["FailingLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                del kwargs
+                self.panel = panel
+                self.update_calls = 0
+                self.refresh_calls = 0
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+                self.update_calls += 1
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+                raise RuntimeError("synthetic refresh failure")
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        console = FakeConsole()
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", FailingLive):
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                console=console,
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            with patch.object(renderer, "_build", return_value="last-document"):
+                renderer.start(state)
+                refresh_thread = renderer._refresh_thread
+                assert refresh_thread is not None
+                FakeSession.instances[0].wake_event.set()
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and renderer._live is not None:
+                    time.sleep(0.01)
+                renderer.stop(state)
+
+        session = FakeSession.instances[0]
+        live = FailingLive.instances[0]
+        assert refresh_thread.is_alive() is False
+        assert renderer._refresh_thread is None
+        assert renderer._live is None
+        assert renderer._input_session is None
+        assert renderer._viewport is None
+        assert renderer._interactive is False
+        assert live.update_calls == 1
+        assert live.refresh_calls == 1
+        assert live.stop_calls == 1
+        assert session.stop_reader_calls == 1
+        assert session.close_calls == 1
+        assert console.printed == ["last-document"]
+
+    def test_banner_renderer_failed_interactive_start_closes_session_before_fallback(self) -> None:
+        import aflow.status as status_mod
+        from unittest.mock import patch
+
+        class FakeSession:
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: object) -> None:
+                del console, wake_event
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                self.panel = panel
+                self.kwargs = kwargs
+                self.start_calls = 0
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.start_calls += 1
+                if self.kwargs["screen"]:
+                    raise RuntimeError("synthetic interactive start failure")
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+
+            def refresh(self) -> None:
+                return
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", FakeLive):
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            with patch.object(renderer, "_build", return_value="panel"):
+                renderer.start(state)
+                renderer.stop(state)
+
+        session = FakeSession.instances[0]
+        interactive_live, fallback_live = FakeLive.instances
+        assert interactive_live.kwargs["screen"] is True
+        assert interactive_live.stop_calls == 1
+        assert session.stop_reader_calls == 0
+        assert session.close_calls == 1
+        assert fallback_live.kwargs["screen"] is False
+        assert fallback_live.kwargs["vertical_overflow"] == "visible"
+        assert fallback_live.stop_calls == 1
+
+    def test_banner_renderer_concurrent_cleanup_handoff_does_not_deadlock_rich_failure(self) -> None:
+        import aflow.status as status_mod
+        import threading
+        import time
+        from unittest.mock import patch
+
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self) -> None:
+                self.printed: list[object] = []
+
+            def print(self, renderable: object) -> None:
+                self.printed.append(renderable)
+
+        class FakeSession:
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: threading.Event) -> None:
+                del console
+                self.wake_event = wake_event
+                self.stop_reader_started = threading.Event()
+                self.release_stop_reader = threading.Event()
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def stop_reader(self) -> None:
+                self.stop_reader_started.set()
+                assert self.release_stop_reader.wait(timeout=1.0)
+                self.stop_reader_calls += 1
+
+            def drain_events(self) -> tuple[object, ...]:
+                self.wake_event.clear()
+                return (status_mod.ViewportAction.LINE_DOWN,)
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class CoordinatedLive:
+            instances: list["CoordinatedLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                del kwargs
+                self.panel = panel
+                self.update_calls = 0
+                self.refresh_calls = 0
+                self.refresh_entered = threading.Event()
+                self.release_refresh = threading.Event()
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+                self.update_calls += 1
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+                if self.refresh_calls == 1:
+                    self.refresh_entered.set()
+                    assert self.release_refresh.wait(timeout=1.0)
+                    raise RuntimeError("synthetic coordinated refresh failure")
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        console = FakeConsole()
+        renderer = status_mod.BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            console=console,
+            refresh_interval_seconds=60.0,
+            git_poll_interval_seconds=9999.0,
+        )
+        stop_thread: threading.Thread | None = None
+        refresh_thread: threading.Thread | None = None
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", CoordinatedLive), \
+             patch.object(renderer, "_build", return_value="final-snapshot"):
+            renderer.start(state)
+            session = FakeSession.instances[0]
+            live = CoordinatedLive.instances[0]
+            refresh_thread = renderer._refresh_thread
+            assert refresh_thread is not None
+
+            session.wake_event.set()
+            assert live.refresh_entered.wait(timeout=1.0)
+            stop_thread = threading.Thread(target=renderer.stop, args=(state,), daemon=True)
+            stop_thread.start()
+            assert session.stop_reader_started.wait(timeout=1.0)
+            assert renderer._cleanup_in_progress is True
+
+            live.release_refresh.set()
+            session.release_stop_reader.set()
+            stop_thread.join(timeout=1.0)
+            refresh_thread.join(timeout=1.0)
+
+        assert stop_thread is not None and stop_thread.is_alive() is False
+        assert refresh_thread is not None and refresh_thread.is_alive() is False
+        renderer.stop(state)
+        assert renderer._live is None
+        assert renderer._input_session is None
+        assert renderer._viewport is None
+        assert renderer._refresh_thread is None
+        assert renderer._interactive is False
+        assert renderer._emergency_cleanup_registered is False
+        assert renderer._cleanup_in_progress is False
+        assert live.stop_calls == 1
+        assert session.close_calls == 1
+        assert console.printed == ["final-snapshot"]
+
+    def test_banner_renderer_failed_render_thread_start_restores_interactive_before_fallback(self) -> None:
+        import aflow.status as status_mod
+        import threading
+        from unittest.mock import patch
+
+        lifecycle_events: list[str] = []
+
+        class FakeConsole:
+            is_terminal = True
+
+            def print(self, renderable: object) -> None:
+                del renderable
+
+        class FakeSession:
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: object) -> None:
+                del console, wake_event
+                self.events: list[str] = []
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                lifecycle_events.append("session.start")
+                self.events.append("session.start")
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+                lifecycle_events.append("session.stop_reader")
+                self.events.append("session.stop_reader")
+
+            def close(self) -> None:
+                self.close_calls += 1
+                lifecycle_events.append("session.close")
+                self.events.append("session.close")
+
+        class FakeThread:
+            instances: list["FakeThread"] = []
+
+            def __init__(self, *, target: object, daemon: bool, name: str) -> None:
+                del target, daemon, name
+                self.started = False
+                self.join_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.started = True
+                if len(self.instances) == 1:
+                    raise RuntimeError("synthetic interactive render-thread start failure")
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self) -> None:
+                self.join_calls += 1
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                self.panel = panel
+                self.kwargs = kwargs
+                self.events: list[str] = []
+                self.start_calls = 0
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.start_calls += 1
+                lifecycle_events.append(
+                    "interactive.live.start" if self.kwargs["screen"] else "fallback.live.start"
+                )
+                self.events.append("live.start")
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+
+            def refresh(self) -> None:
+                return
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                lifecycle_events.append(
+                    "interactive.live.stop" if self.kwargs["screen"] else "fallback.live.stop"
+                )
+                self.events.append("live.stop")
+
+        atexit_events: list[str] = []
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", FakeLive), \
+             patch.object(status_mod.threading, "Thread", FakeThread), \
+             patch.object(status_mod.atexit, "register", side_effect=lambda callback: (atexit_events.append("register"), lifecycle_events.append("atexit.register"))), \
+             patch.object(status_mod.atexit, "unregister", side_effect=lambda callback: (atexit_events.append("unregister"), lifecycle_events.append("atexit.unregister"))):
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                console=FakeConsole(),
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            with patch.object(renderer, "_build", return_value="panel"):
+                renderer.start(state)
+
+                interactive_live, fallback_live = FakeLive.instances
+                session = FakeSession.instances[0]
+                assert interactive_live.stop_calls == 1
+                assert session.close_calls == 1
+                assert atexit_events == ["register", "unregister"]
+                assert lifecycle_events.index("interactive.live.stop") < lifecycle_events.index("fallback.live.start")
+                assert lifecycle_events.index("session.close") < lifecycle_events.index("fallback.live.start")
+                assert lifecycle_events.index("atexit.unregister") < lifecycle_events.index("fallback.live.start")
+                assert renderer._emergency_cleanup_registered is False
+                assert renderer._input_session is None
+                assert renderer._viewport is None
+                assert renderer._interactive is False
+                assert renderer._live is fallback_live
+                assert atexit_events.index("unregister") < len(atexit_events)
+                assert fallback_live.start_calls == 1
+
+                renderer.stop(state)
+
+        assert FakeLive.instances[0].events == ["live.start", "live.stop"]
+        assert FakeLive.instances[1].stop_calls == 1
+        assert session.stop_reader_calls == 1
+        assert renderer._live is None
+        assert renderer._refresh_thread is None
+
+    def test_banner_renderer_failed_render_thread_start_unwinds_both_attempts(self) -> None:
+        import aflow.status as status_mod
+        from unittest.mock import patch
+
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self) -> None:
+                self.printed: list[object] = []
+
+            def print(self, renderable: object) -> None:
+                self.printed.append(renderable)
+
+        class FakeSession:
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: object) -> None:
+                del console, wake_event
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FakeThread:
+            instances: list["FakeThread"] = []
+
+            def __init__(self, *, target: object, daemon: bool, name: str) -> None:
+                del target, daemon, name
+                self.instances.append(self)
+
+            def start(self) -> None:
+                raise RuntimeError("synthetic render-thread start failure")
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self) -> None:
+                raise AssertionError("unstarted render thread must not be joined")
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                self.panel = panel
+                self.kwargs = kwargs
+                self.start_calls = 0
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                self.start_calls += 1
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        atexit_events: list[str] = []
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        console = FakeConsole()
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", FakeLive), \
+             patch.object(status_mod.threading, "Thread", FakeThread), \
+             patch.object(status_mod.atexit, "register", side_effect=lambda callback: atexit_events.append("register")), \
+             patch.object(status_mod.atexit, "unregister", side_effect=lambda callback: atexit_events.append("unregister")):
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                console=console,
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            with patch.object(renderer, "_build", return_value="never-printed"):
+                with pytest.raises(RuntimeError, match="render-thread start failure"):
+                    renderer.start(state)
+
+        assert len(FakeLive.instances) == 2
+        assert FakeLive.instances[0].kwargs["screen"] is True
+        assert FakeLive.instances[1].kwargs["screen"] is False
+        assert [live.stop_calls for live in FakeLive.instances] == [1, 1]
+        assert FakeSession.instances[0].stop_reader_calls == 1
+        assert FakeSession.instances[0].close_calls == 1
+        assert atexit_events == ["register", "unregister"]
+        assert renderer._live is None
+        assert renderer._input_session is None
+        assert renderer._viewport is None
+        assert renderer._refresh_thread is None
+        assert renderer._interactive is False
+        assert renderer._startup_complete is False
+        assert renderer._emergency_cleanup_registered is False
+        assert renderer._emergency_cleanup_callback is None
+        assert renderer._cleanup_in_progress is False
+        assert console.printed == []
+
+    def test_banner_renderer_falls_back_when_interactive_setup_fails(self) -> None:
+        import aflow.status as status_mod
+        from unittest.mock import patch
+
+        class FailingSession:
+            def __init__(self, console: object, *, wake_event: object) -> None:
+                del console, wake_event
+                self.closed = False
+
+            def start(self) -> None:
+                raise OSError("synthetic terminal setup failure")
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeConsole:
+            is_terminal = True
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                self.panel = panel
+                self.kwargs = kwargs
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+
+            def refresh(self) -> None:
+                return
+
+            def stop(self) -> None:
+                return
+
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
+             patch.object(status_mod, "TerminalInputSession", FailingSession), \
+             patch.object(status_mod, "Live", FakeLive):
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                console=FakeConsole(),
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            with patch.object(renderer, "_build", return_value=state):
+                renderer.start(state)
+                renderer.stop(state)
+
+        assert len(FakeLive.instances) == 1
+        assert FakeLive.instances[0].kwargs["screen"] is False
+        assert FakeLive.instances[0].kwargs["vertical_overflow"] == "visible"
+
     def test_banner_renderer_stop_cancels_due_refresh_after_git_poll(self) -> None:
         import aflow.git_status as git_status_mod
         import aflow.status as status_mod
