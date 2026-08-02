@@ -185,6 +185,62 @@ initial user request explicitly authorizes that recovery policy and the reset
 preserves agreed meaning and accepted work. It still receives only one attempt
 for the incident fingerprint.
 
+## Recover a safe transient environment failure
+
+terminal_transient_environment is narrower than terminal_failed. Use it only
+when the bounded terminal artifact tail proves the known
+missing_reasonix_bubblewrap fingerprint: a Reasonix sandbox requires
+bubblewrap or bwrap, and the executable is absent or unavailable. Pass that
+kind explicitly to the snapshot helper; it never infers a remediation from a
+generic failure.
+
+A prerequisite remediation is allowed once for that unchanged incident only
+when the original guard authority covers it and the guarded host policy permits
+the exact additive change. Confirm the host, package source, package name, and
+post-install executable before changing anything. For this fingerprint, that
+means the trusted host package manager's bubblewrap package and a verified
+bwrap inside the guarded execution environment. Do not update unrelated
+packages, alter sandbox policy, change Reasonix configuration, or retry a
+different failure fingerprint. Mark the recovery attempt before remediation.
+
+If the predecessor is not resumable, a replacement is permitted only when all
+of these are true:
+
+- the predecessor is terminal failed, has turns_completed equal to zero, no
+  active controller, no feature branch, no worktree path, and no continuation
+  parent;
+- its original plan exists, and run.json has complete frozen configuration,
+  workflow, team, selected start step, effective turn budget, and extra
+  instructions;
+- the exact replacement command is reconstructed from those durable fields,
+  with explicit plan, workflow, team, start-step, and max-turns flags; include
+  saved extra instructions after the option separator;
+- the frozen configuration of the newly created run exactly equals the
+  predecessor's frozen configuration, and the original plan, workflow, team,
+  start step, turn budget, and extra instructions also exactly match;
+- no matching predecessor or successor controller is active before launch, and
+  the successor snapshot proves exactly one logical controller immediately
+  after launch.
+
+This is a zero-turn, no-mutation replacement, not a resume, not a scope reset,
+and not a fresh choice of flags. If any field is absent, differs, or requires
+interpretation, pause and write a fix plan instead.
+
+Persist the linkage only after the successor's own snapshot proves one
+controller. Record the predecessor state with the
+--replacement-successor-run-id option using the same helper hash and same-task
+routing IDs. The helper stores predecessor ID, successor ID, predecessor
+fingerprint, and timestamp atomically in guardian state. Then repin the
+existing heartbeat to the successor run ID, preserving every other automation
+field. Re-check the prompt, both routing IDs, the successor's frozen
+configuration, and exactly-one-controller evidence before leaving the
+automation active.
+
+If the harness adapter does not emit enough durable data to make this
+comparison or replacement mechanical, or if the recovery policy cannot safely
+express the environment remediation, promote that gap to an AFlow fix plan and
+pause. Do not paper over it with guessed flags or a second controller.
+
 ## Capture evidence for improving AFlow
 
 Distinguish an AFlow defect from a project implementation failure. AFlow defects

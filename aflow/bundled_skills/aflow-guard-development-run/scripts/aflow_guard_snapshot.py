@@ -767,9 +767,23 @@ def collect_snapshot(
     if routing:
         state["routing"] = routing
     if replacement_successor_run_id:
+        if (
+            run.get("status") != "failed"
+            or run.get("turns_completed") != 0
+            or run.get("feature_branch") is not None
+            or run.get("worktree_path") is not None
+            or run.get("resumed_from_run_id")
+        ):
+            raise ValueError("predecessor is not eligible for replacement linkage")
         successor_path = repo / ".aflow" / "runs" / replacement_successor_run_id / "run.json"
         if not successor_path.is_file():
             raise ValueError("replacement successor run.json is missing")
+        previous_successor = state.get("replacement_successor")
+        if (
+            isinstance(previous_successor, dict)
+            and previous_successor.get("successor_run_id") != replacement_successor_run_id
+        ):
+            raise ValueError("replacement successor is already recorded")
         state["replacement_successor"] = {
             "predecessor_run_id": run_id,
             "successor_run_id": replacement_successor_run_id,

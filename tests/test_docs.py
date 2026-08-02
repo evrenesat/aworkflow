@@ -66,6 +66,9 @@ class SkillDocsTests(unittest.TestCase):
         assert 'create_thread' not in text
         assert 'send_message_to_thread' not in text
         assert '--guard-thread-id <same-task-id>' in text
+        assert 'terminal_transient_environment' in text
+        assert 'zero-turn, no-mutation replacement' in text
+        assert '--replacement-successor-run-id option' in text
 
     def test_final_review_skill_is_distinct_and_no_squash(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
