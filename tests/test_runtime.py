@@ -1356,6 +1356,8 @@ class WorkflowRuntimeTests(unittest.TestCase):
             script = root / 'emit_output.py'
             script.write_text(
                 "import sys\n"
+                "if sys.stdin.read() != '':\n"
+                "    raise SystemExit('stdin was not closed')\n"
                 "print('visible stdout')\n"
                 "print('visible stderr', file=sys.stderr)\n",
                 encoding='utf-8',

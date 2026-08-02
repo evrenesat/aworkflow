@@ -381,6 +381,12 @@ retain their independent 10-second polling cadence. Lifecycle paints are
 explicit so the final manager report remains visible exactly once after the
 banner stops.
 
+Harness execution does not compete with dashboard input. All configured
+adapters deliver their effective prompt through argv or a prompt flag, and the
+real subprocess path starts each child with `stdin=subprocess.DEVNULL`. Child
+stdout/stderr remain captured and drained as before; injected runner callables
+and adapter invocation construction are unchanged.
+
 Fields include:
 
 - elapsed time

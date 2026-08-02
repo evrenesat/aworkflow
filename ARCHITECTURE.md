@@ -15,7 +15,7 @@ flowchart TD
     PromptRender["workflow.py — render_step_prompts()"]
     Role["workflow.py — resolve_role_selector()"]
     Adapter["harnesses/ — build CLI invocation"]
-    Subprocess["workflow.py — _run_process() via subprocess.Popen"]
+    Subprocess["workflow.py — _run_process() via subprocess.Popen (stdin=DEVNULL)"]
     PlanReload["plan.py — reload plan, compute post-snapshot"]
     Transition["workflow.py — evaluate_condition() + proposed transition"]
     Manager["workflow.py — optional manager gate"]
@@ -295,6 +295,11 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
 
 All harnesses run in non-interactive, auto-approve mode with full tool access.
+Their effective prompts are delivered through argv or explicit prompt flags, so
+`workflow._run_process()` starts real children with `stdin=subprocess.DEVNULL`.
+This leaves the controller/dashboard as the sole owner of interactive terminal
+input while preserving the existing stdout/stderr pipes, return codes, and
+prompt metadata. Injected runner callables are unchanged.
 
 Codex uses the documented `codex exec ... -` form: the complete effective
 prompt is sent through stdin and is never added to argv. The subprocess
@@ -382,6 +387,9 @@ the live banner and `aflow show`; only the live branch is flattened, while
 for the next tick. Git collection remains independently due every
 `git_poll_interval_seconds` (default 10 s), while lifecycle paints are kept
 explicit and bounded so manager reports can follow the stopped banner.
+During a live run, real harness children receive closed stdin because every
+configured adapter already places its effective prompt in argv or a CLI flag;
+the dashboard/controller therefore has exclusive ownership of terminal input.
 
 ### `skill_installer.py`
 Discovers the nine default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).

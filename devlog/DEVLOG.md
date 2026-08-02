@@ -1,3 +1,12 @@
+# 2026-08-02 — Dashboard terminal input ownership
+
+- Closed real harness subprocess stdin with `subprocess.DEVNULL` after
+  verifying all configured adapters deliver prompts through argv or CLI flags.
+- Added a runtime regression proving a child sees immediate EOF while stdout,
+  stderr, return status, and banner updates remain unchanged.
+- Documented that the controller/dashboard exclusively owns terminal input;
+  injected runners and harness invocation construction are unchanged.
+
 ## 2026-08-01 — Borderless live dashboard document
 
 ### What changed

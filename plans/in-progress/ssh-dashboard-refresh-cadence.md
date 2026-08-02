@@ -12,11 +12,12 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 - Plan Branch: `aflow-ssh-dashboard-refresh-cadence-20260801-214511`
 - Pre-Handoff Base HEAD: `c9616c50d93106024ebdfd79b892c174136fb0de`
-- Last Reviewed Checkpoint: `cp3 v02`
+- Last Reviewed Checkpoint: `cp4 v01`
 - Review Log:
   - `cp1 v02`: approved the fresh pause snapshot repair; pause joins the render thread, installs the newest coalesced state and context without an eager refresh, and relies on `Live.stop()` for the single lifecycle repaint.
   - `2026-08-01`: Checkpoint 3 reviewed via current-worktree fallback because no `cp3 vNN` commit boundary exists. Outcome: changes requested. Unsupported CSI sequences can be ignored as one chunk but decoded as navigation when split immediately before an ASCII navigation final byte; focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp04-v01.md`.
   - `cp3 v02`: approved the chunk-invariant decoder repair; unsupported `ESC [ 2 G` and `ESC [ 9 j` sequences are discarded atomically across every split, pending escape input is bounded at 64 bytes with recovery, and the 36 viewport plus 22 banner/status test baseline passes.
+  - `cp4 v01`: approved via current-worktree fallback because no Checkpoint 4 commit boundary existed; real harness children receive `stdin=subprocess.DEVNULL`, the EOF/capture regression and all 27 adapter tests pass, and the 10 combined-suite lifecycle failures are outside this checkpoint's real-subprocess path.
 
 ## Done Means
 
@@ -228,7 +229,7 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 - Stop and report if the footer or slicing path drops/truncates source lines beyond the selected viewport.
 - Stop and report if unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 4: Give dashboard input exclusive ownership during harness execution
+### [x] Checkpoint 4: Give dashboard input exclusive ownership during harness execution
 
 **Goal:**
 
@@ -249,9 +250,9 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
 
 **Steps:**
 
-- [ ] Add `stdin=subprocess.DEVNULL` to `_run_process()` and document why the controller/dashboard, not captured harnesses, owns the terminal after startup.
-- [ ] Extend the subprocess regression with a child that reads stdin and proves immediate EOF while stdout/stderr capture and banner updates remain unchanged.
-- [ ] Run existing adapter tests to prove prompt argv/flag construction is unchanged, and update architecture/devlog with this terminal-ownership boundary.
+- [x] Add `stdin=subprocess.DEVNULL` to `_run_process()` and document why the controller/dashboard, not captured harnesses, owns the terminal after startup.
+- [x] Extend the subprocess regression with a child that reads stdin and proves immediate EOF while stdout/stderr capture and banner updates remain unchanged.
+- [x] Run existing adapter tests to prove prompt argv/flag construction is unchanged, and update architecture/devlog with this terminal-ownership boundary.
 
 **Dependencies:**
 

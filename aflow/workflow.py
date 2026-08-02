@@ -1318,7 +1318,13 @@ def _run_process(
             list(invocation.argv),
             cwd=str(repo_root),
             env={**os.environ, **invocation.env},
-            stdin=subprocess.PIPE if invocation.stdin_text is not None else None,
+            # Pipe explicit prompt text; otherwise close child stdin so the
+            # dashboard retains exclusive ownership of terminal input.
+            stdin=(
+                subprocess.PIPE
+                if invocation.stdin_text is not None
+                else subprocess.DEVNULL
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
