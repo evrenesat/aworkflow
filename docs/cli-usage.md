@@ -8,8 +8,8 @@ Positional forms:
 aflow run path/to/plan.md
 aflow run workflow_name path/to/plan.md
 aflow run path/to/plan.md workflow_name
-aflow run --resume path/to/plan.md
-aflow run --resume 20260407T120000Z-abc123 path/to/plan.md
+aflow run --resume
+aflow run --resume 20260407T120000Z-abc123
 aflow run --start-step implement_plan path/to/plan.md
 aflow run -ss 2 path/to/plan.md
 aflow run --team 7teen path/to/plan.md
@@ -44,6 +44,9 @@ Important flags:
 - `--team` / `-t` selects a team and overrides any team set in the workflow config.
 - `--max-turns` / `-mt` overrides `[aflow].max_turns` for that invocation.
 - `--resume [RUN_ID]` forces resume mode.
+- A plan is optional in resume mode. When omitted, the selected run's saved
+  original plan and invocation identity are reused; repeated values must match
+  that durable identity.
 - `--resume-reset-scope` requires an explicit `--resume RUN_ID` and starts the
   reused worktree from a fresh checkpoint scope on the invocation's plan.
 - `--start-step` / `-ss` starts from a workflow step name or 1-based step index.
@@ -74,6 +77,21 @@ Worktree workflows have two resume paths:
 
 - Plain `aflow run` can offer an interactive auto-resume prompt when a compatible prior run is found.
 - `aflow run --resume [RUN_ID]` makes resume mandatory. With no `RUN_ID`, `aflow` must resolve a previous run from shell-local state or fail. With a `RUN_ID`, it resumes that exact run or fails.
+
+Resume resolves and validates the selected run before startup preparation. Its
+`original_plan_path` is authoritative, with `plan_path` accepted only for
+legacy metadata, and the saved plan must still be readable. A caller may repeat
+the plan, workflow, team, start step, max-turns, or extra instructions only
+when the value is compatible with the saved invocation; conflicting values
+fail without creating a new run. Fresh `aflow run` invocations still require a
+plan.
+
+Modern schema-versioned run metadata also records a frozen configuration
+identity. Resume requires its workflow name, canonical configuration path, and
+fingerprint to match the currently resolved workflow, roles, teams, harness
+profiles, manager policy, and error-handling configuration. This check happens
+before startup questions or new run state. Schema-less legacy metadata without
+`frozen_config` remains resumable under the older scalar and lifecycle checks.
 
 Lookup order for a previous run is:
 

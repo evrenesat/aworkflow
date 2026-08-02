@@ -24,6 +24,7 @@ from aflow.run_state import (
 )
 from aflow.runlog import create_run_paths, write_run_metadata
 from aflow.workflow import (
+    _freeze_run_identity,
     _run_injected_runner,
     _pending_matches_scope_and_plan,
     _reconcile_repartition_plan_copies,
@@ -176,6 +177,112 @@ def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
 
 
 class WorkflowRuntimeTests(unittest.TestCase):
+
+    def test_resume_identity_drift_fails_before_event_or_new_run_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _resume_override_workflow_config()
+            identity = _freeze_run_identity(
+                "resume_override",
+                workflow_config,
+                config_dir=repo_root,
+            )
+            resume = ResumeContext(
+                resumed_from_run_id="predecessor",
+                feature_branch="feature/resume-identity",
+                worktree_path=repo_root,
+                main_branch="main",
+                setup=(),
+                teardown=(),
+                frozen_run_identity=replace(
+                    identity,
+                    config_fingerprint="different-fingerprint",
+                ),
+            )
+            events: list[object] = []
+
+            class Observer:
+                def on_event(self, event: object) -> None:
+                    events.append(event)
+
+            with pytest.raises(WorkflowError, match="resume frozen configuration mismatch"):
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    "resume_override",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                        argv, 0, "", ""
+                    ),
+                    resume=resume,
+                    observer=Observer(),
+                )
+
+            assert events == []
+            assert not (repo_root / ".aflow" / "runs").exists()
+
+    def test_matching_resume_identity_reaches_existing_resume_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            worktree_path = repo_root / "worktree"
+            worktree_path.mkdir()
+            workflow_config = _resume_override_workflow_config()
+            identity = _freeze_run_identity(
+                "resume_override",
+                workflow_config,
+                config_dir=repo_root,
+            )
+            resume = ResumeContext(
+                resumed_from_run_id="predecessor",
+                feature_branch="feature/resume-identity",
+                worktree_path=worktree_path,
+                main_branch="main",
+                setup=(),
+                teardown=(),
+                frozen_run_identity=identity,
+            )
+            events: list[object] = []
+
+            class Observer:
+                def on_event(self, event: object) -> None:
+                    events.append(event)
+
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                _write_plan(worktree_path / "plan.md", _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "complete", "")
+
+            with patch(
+                "aflow.workflow._validate_worktree_resume_context",
+                return_value=None,
+            ) as validate_resume:
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    "resume_override",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    resume=resume,
+                    observer=Observer(),
+                )
+
+            validate_resume.assert_called_once()
+            assert result.run_dir.is_dir()
+            assert type(events[0]).__name__ == "RunStartedEvent"
 
     def test_repartition_route_requires_generation_candidate_and_partition(self) -> None:
         state = ControllerState(

@@ -129,6 +129,21 @@ def _freeze_run_identity(
     )
 
 
+def _frozen_identity_mismatch(
+    saved: FrozenRunIdentity,
+    current: FrozenRunIdentity,
+) -> str | None:
+    """Describe the persisted identity fields that differ from current config."""
+    differences = [
+        f"{field} saved '{getattr(saved, field)}' but current '{getattr(current, field)}'"
+        for field in ("workflow_name", "config_path", "config_fingerprint")
+        if getattr(saved, field) != getattr(current, field)
+    ]
+    if not differences:
+        return None
+    return "; ".join(differences)
+
+
 def _target_plan_identity(plan_path: Path, snapshot: PlanSnapshot | None = None) -> str:
     """Identify the exact active-plan checkpoint targeted by one-hop state."""
     resolved_snapshot = snapshot
@@ -2854,6 +2869,22 @@ def run_workflow(
     if wf.first_step is None:
         raise WorkflowError(f"workflow '{workflow_name}' has no steps")
 
+    current_frozen_identity = _freeze_run_identity(
+        workflow_name,
+        workflow_config,
+        config_dir=config_dir,
+    )
+    if resume is not None and resume.frozen_run_identity is not None:
+        identity_mismatch = _frozen_identity_mismatch(
+            resume.frozen_run_identity,
+            current_frozen_identity,
+        )
+        if identity_mismatch is not None:
+            raise WorkflowError(
+                "resume frozen configuration mismatch: "
+                f"{identity_mismatch}"
+            )
+
     _emit_event(observer, RunStartedEvent.create(
         workflow_name=workflow_name,
         repo_root=config.repo_root,
@@ -2917,11 +2948,7 @@ def run_workflow(
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
-    state.frozen_run_identity = _freeze_run_identity(
-        workflow_name,
-        workflow_config,
-        config_dir=config_dir,
-    )
+    state.frozen_run_identity = current_frozen_identity
     state.effective_max_turns = (
         resume.effective_max_turns
         if resume is not None and resume.effective_max_turns is not None

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 from typing import Any, Mapping
@@ -35,19 +38,72 @@ from .plan import PlanParseError, PlanSnapshot, load_plan, load_plan_tolerant
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
+    ActiveImplementationScope,
     FrozenRunIdentity,
     PendingFinalizedTurn,
+    PendingRepartitionV1,
+    RUN_STATE_SCHEMA_VERSION,
     ResumeContext,
     WorkflowEndReason,
     describe_end_reason,
     manager_resume_fields,
     resolve_resume_override,
 )
+
+
+_MISSING_RESUME_FIELD = object()
+_PENDING_REPARTITION_STAGES = frozenset({
+    "decided",
+    "proposed",
+    "mechanically_validated",
+    "semantically_validated",
+    "execution_plan_applied",
+    "primary_plan_applied",
+    "applied",
+    "failed",
+})
+_PENDING_REPARTITION_PROPOSED_STAGES = frozenset({
+    "proposed",
+    "mechanically_validated",
+    "semantically_validated",
+    "execution_plan_applied",
+    "primary_plan_applied",
+    "applied",
+})
+_PENDING_REPARTITION_MECHANICAL_STAGES = frozenset({
+    "mechanically_validated",
+    "semantically_validated",
+    "execution_plan_applied",
+    "primary_plan_applied",
+    "applied",
+})
+_PENDING_REPARTITION_SEMANTIC_STAGES = frozenset({
+    "semantically_validated",
+    "execution_plan_applied",
+    "primary_plan_applied",
+    "applied",
+})
+_PENDING_REPARTITION_BLOCKED_STAGES = frozenset({
+    "decided",
+    "proposed",
+    "mechanically_validated",
+})
+_PENDING_REPARTITION_ARTIFACT_FIELDS = (
+    ("proposal_artifact_path", "file"),
+    ("candidate_artifact_path", "file"),
+    ("mechanical_validation_artifact_path", "file"),
+    ("semantic_verdict_artifact_path", "file"),
+)
 from .workflow import (
     WorkflowError,
+    _freeze_run_identity,
+    _frozen_identity_mismatch,
+    _scope_envelope_reference,
+    _validate_scope_envelope_bytes,
     load_scope_envelope_for_resume,
     move_completed_plan_to_done,
 )
+from .repartition import derive_generation_id
 from .runlog import load_run_json
 from .analyzer import resolve_run_id
 from .status import BannerRenderer, WorkflowGraphSource, build_workflow_show
@@ -59,7 +115,7 @@ Flags:
   --start-step/-ss STEP     Start from this step name or 1-based index (default: first).
   --team/-t TEAM_NAME       Override workflow team.
   --max-turns/-mt N         Maximum turns (default from config).
-  --resume [RUN_ID]         Resume the last resumable run for this shell, or the explicit RUN_ID.
+  --resume [RUN_ID]         Resume a saved run; plan and identity are optional when omitted.
 
 Positional arguments:
   [workflow_name] [plan_file]   Either form works:
@@ -79,6 +135,24 @@ Examples:
   aflow run -mt 10 -ss 2 ralph plan.md
   aflow run plan.md -- keep edits small and update docs if behavior changes
 """
+
+
+@dataclass(frozen=True)
+class ResumeBootstrap:
+    """Validated durable identity used to prepare one exact resume request."""
+
+    resolved_run_id: Path
+    run_dir: Path
+    run_json: dict[str, object]
+    plan_path: Path
+    workflow_name: str
+    team: str | None
+    start_step: str | None
+    max_turns: int
+    extra_instructions: tuple[str, ...]
+    resume_context: ResumeContext
+    frozen_run_identity: FrozenRunIdentity | None = None
+
 
 INSTALL_SKILLS_HELP = """\
 Auto mode: omit DESTINATION to install the default bundled skills into each supported harness skill
@@ -146,6 +220,957 @@ def _is_terminal_integration_resume(
     )
 
 
+def _resume_plan_path(
+    prev_run: Mapping[str, object],
+    repo_root: Path,
+) -> Path | None:
+    """Return the saved original plan path, including the legacy fallback."""
+    field_name = "original_plan_path" if "original_plan_path" in prev_run else "plan_path"
+    value = prev_run.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = repo_root / path
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _resume_max_turns(prev_run: Mapping[str, object]) -> int | None:
+    """Return the saved invocation max-turns value, with legacy fallback."""
+    value = prev_run.get("max_turns")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if "max_turns" in prev_run:
+        return None
+    effective_value = prev_run.get("effective_max_turns")
+    if (
+        isinstance(effective_value, int)
+        and not isinstance(effective_value, bool)
+        and effective_value > 0
+    ):
+        return effective_value
+    return None
+
+
+def _resume_metadata_error(run_id: Path, field: str, detail: str) -> ValueError:
+    return ValueError(f"error: run '{run_id.name}' has invalid {field}: {detail}.")
+
+
+def _pending_repartition_error(
+    run_id: str | Path,
+    field: str,
+    detail: str,
+) -> ValueError:
+    run_id_path = run_id if isinstance(run_id, Path) else Path(str(run_id))
+    return _resume_metadata_error(
+        run_id_path,
+        f"pending_repartition.{field}",
+        detail,
+    )
+
+
+def _validate_pending_repartition_resume_state(
+    *,
+    raw_pending_repartition: object,
+    pending_repartition: PendingRepartitionV1 | None,
+    run_dir: Path,
+    run_id: str | Path,
+    reset_scope: bool,
+    active_scope: ActiveImplementationScope | None = None,
+    manager_decision_number: int | None = None,
+    workflow_steps: Mapping[str, object] | None = None,
+    scope_envelope_bytes: bytes | None = None,
+) -> tuple[PendingRepartitionV1 | None, dict[str, bytes]]:
+    """Strictly validate and bind one pending repartition transaction.
+
+    ``manager_resume_fields`` intentionally remains tolerant for status and
+    analysis consumers.  Resume bootstrap is the mandatory boundary where a
+    present transaction must either be complete enough to use or fail before
+    startup and before the source run can be pruned.
+    """
+    if reset_scope:
+        # The checkpoint-scoped transaction is deliberately opaque to reset.
+        # In particular, do not inspect its shape or open any referenced path.
+        return None, {}
+
+    if raw_pending_repartition is _MISSING_RESUME_FIELD or raw_pending_repartition is None:
+        return None, {}
+
+    if not isinstance(raw_pending_repartition, Mapping):
+        raise _pending_repartition_error(
+            run_id,
+            "pending_repartition",
+            "expected a mapping or null",
+        )
+    allowed_fields = {
+        "schema_version",
+        "decision_number",
+        "scope_id",
+        "stage",
+        "envelope_sha256",
+        "source_plan_sha256",
+        "attempt_count",
+        "generation_id",
+        "partition_ids",
+        "child_summaries",
+        "proposal_sha256",
+        "candidate_plan_sha256",
+        "current_disposition",
+        "resolved_target_step",
+        "resolved_target_role",
+        "latest_attempt_path",
+        "proposal_artifact_path",
+        "candidate_artifact_path",
+        "mechanical_validation_artifact_path",
+        "semantic_verdict_artifact_path",
+        "failed_stage",
+        "failure_reason",
+    }
+    unknown_fields = sorted(
+        str(field)
+        for field in raw_pending_repartition
+        if field not in allowed_fields
+    )
+    if unknown_fields:
+        raise _pending_repartition_error(
+            run_id,
+            "pending_repartition",
+            f"unexpected field(s): {', '.join(unknown_fields)}",
+        )
+
+    def required_int(field: str, *, minimum: int | None = None) -> int:
+        value = raw_pending_repartition.get(field, _MISSING_RESUME_FIELD)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or (minimum is not None and value < minimum)
+        ):
+            expectation = "an integer"
+            if minimum is not None:
+                expectation += f" >= {minimum}"
+            raise _pending_repartition_error(run_id, field, f"expected {expectation}")
+        return value
+
+    def optional_int(field: str, *, default: int) -> int:
+        if field not in raw_pending_repartition:
+            return default
+        return required_int(field, minimum=0)
+
+    def required_text(field: str) -> str:
+        value = raw_pending_repartition.get(field, _MISSING_RESUME_FIELD)
+        if not isinstance(value, str) or not value.strip():
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "expected a non-empty string",
+            )
+        return value
+
+    def optional_text(field: str) -> str | None:
+        if field not in raw_pending_repartition:
+            return None
+        value = raw_pending_repartition[field]
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "expected null or a non-empty string",
+            )
+        return value
+
+    def text_sequence(field: str) -> tuple[str, ...]:
+        if field not in raw_pending_repartition:
+            return ()
+        value = raw_pending_repartition[field]
+        if not isinstance(value, (list, tuple)):
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "expected a list of non-empty strings",
+            )
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "expected a list of non-empty strings",
+            )
+        return tuple(value)
+
+    schema_version = required_int("schema_version")
+    if schema_version != 1:
+        raise _pending_repartition_error(
+            run_id,
+            "schema_version",
+            "expected integer 1",
+        )
+    decision_number = required_int("decision_number", minimum=1)
+    scope_id = required_text("scope_id")
+    stage = required_text("stage")
+    if stage not in _PENDING_REPARTITION_STAGES:
+        raise _pending_repartition_error(
+            run_id,
+            "stage",
+            f"unknown stage '{stage}'",
+        )
+    envelope_sha256 = required_text("envelope_sha256")
+    source_plan_sha256 = required_text("source_plan_sha256")
+    generation_id = required_text("generation_id")
+    attempt_count = optional_int("attempt_count", default=0)
+    partition_ids = text_sequence("partition_ids")
+    child_summaries = text_sequence("child_summaries")
+    proposal_sha256 = optional_text("proposal_sha256")
+    candidate_plan_sha256 = optional_text("candidate_plan_sha256")
+    current_disposition = optional_text("current_disposition")
+    resolved_target_step = optional_text("resolved_target_step")
+    resolved_target_role = optional_text("resolved_target_role")
+    latest_attempt_path = optional_text("latest_attempt_path")
+    failed_stage = optional_text("failed_stage")
+    failure_reason = optional_text("failure_reason")
+    artifact_values = {
+        field: optional_text(field)
+        for field, _kind in _PENDING_REPARTITION_ARTIFACT_FIELDS
+    }
+
+    if not isinstance(pending_repartition, PendingRepartitionV1):
+        raise _pending_repartition_error(
+            run_id,
+            "pending_repartition",
+            "present metadata did not decode as PendingRepartitionV1",
+        )
+
+    expected_decoded_values = {
+        "schema_version": schema_version,
+        "decision_number": decision_number,
+        "scope_id": scope_id,
+        "stage": stage,
+        "envelope_sha256": envelope_sha256,
+        "source_plan_sha256": source_plan_sha256,
+        "attempt_count": attempt_count,
+        "generation_id": generation_id,
+        "partition_ids": partition_ids,
+        "child_summaries": child_summaries,
+        "proposal_sha256": proposal_sha256,
+        "candidate_plan_sha256": candidate_plan_sha256,
+        "current_disposition": current_disposition,
+        "resolved_target_step": resolved_target_step,
+        "resolved_target_role": resolved_target_role,
+        "latest_attempt_path": latest_attempt_path,
+        "proposal_artifact_path": artifact_values["proposal_artifact_path"],
+        "candidate_artifact_path": artifact_values["candidate_artifact_path"],
+        "mechanical_validation_artifact_path": artifact_values[
+            "mechanical_validation_artifact_path"
+        ],
+        "semantic_verdict_artifact_path": artifact_values[
+            "semantic_verdict_artifact_path"
+        ],
+        "failed_stage": failed_stage,
+        "failure_reason": failure_reason,
+    }
+    for field, expected in expected_decoded_values.items():
+        if getattr(pending_repartition, field) != expected:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "tolerant decoder did not preserve the raw value",
+            )
+
+    if stage in _PENDING_REPARTITION_PROPOSED_STAGES:
+        if attempt_count < 1:
+            raise _pending_repartition_error(
+                run_id,
+                "attempt_count",
+                "is required to be a positive integer from the proposed stage onward",
+            )
+        if not child_summaries:
+            raise _pending_repartition_error(
+                run_id,
+                "child_summaries",
+                "must be non-empty from the proposed stage onward",
+            )
+        for field in (
+            "proposal_sha256",
+            "current_disposition",
+            "resolved_target_step",
+            "resolved_target_role",
+            "proposal_artifact_path",
+            "latest_attempt_path",
+        ):
+            if getattr(pending_repartition, field) is None:
+                raise _pending_repartition_error(
+                    run_id,
+                    field,
+                    "is required from the proposed stage onward",
+                )
+
+    if stage in _PENDING_REPARTITION_MECHANICAL_STAGES:
+        if not partition_ids:
+            raise _pending_repartition_error(
+                run_id,
+                "partition_ids",
+                "must be non-empty from the mechanically_validated stage onward",
+            )
+        if len(child_summaries) != len(partition_ids):
+            raise _pending_repartition_error(
+                run_id,
+                "partition_ids",
+                "must have the same cardinality as child_summaries",
+            )
+        for field in (
+            "candidate_plan_sha256",
+            "candidate_artifact_path",
+            "mechanical_validation_artifact_path",
+        ):
+            if getattr(pending_repartition, field) is None:
+                raise _pending_repartition_error(
+                    run_id,
+                    field,
+                    "is required from the mechanically_validated stage onward",
+                )
+
+    if stage in _PENDING_REPARTITION_SEMANTIC_STAGES:
+        if pending_repartition.semantic_verdict_artifact_path is None:
+            raise _pending_repartition_error(
+                run_id,
+                "semantic_verdict_artifact_path",
+                "is required from the semantically_validated stage onward",
+            )
+
+    if stage == "failed":
+        if failed_stage is None:
+            raise _pending_repartition_error(
+                run_id,
+                "failed_stage",
+                "is required for a failed transaction",
+            )
+        if failure_reason is None:
+            raise _pending_repartition_error(
+                run_id,
+                "failure_reason",
+                "is required for a failed transaction",
+            )
+        if latest_attempt_path is not None and attempt_count < 1:
+            raise _pending_repartition_error(
+                run_id,
+                "attempt_count",
+                "must be positive when failed metadata carries an attempt path",
+            )
+    elif failed_stage is not None or failure_reason is not None:
+        raise _pending_repartition_error(
+            run_id,
+            "failed_stage",
+            "and failure_reason must be null outside the failed stage",
+        )
+
+    if not isinstance(active_scope, ActiveImplementationScope):
+        raise _pending_repartition_error(
+            run_id,
+            "active_implementation_scope",
+            "a modern active parent scope is required for a pending transaction",
+        )
+    try:
+        scope_reference = _scope_envelope_reference(active_scope)
+    except WorkflowError as exc:
+        raise _pending_repartition_error(
+            run_id,
+            "active_implementation_scope",
+            exc.summary,
+        ) from exc
+    if scope_reference is None:
+        raise _pending_repartition_error(
+            run_id,
+            "active_implementation_scope",
+            "a complete scope envelope reference is required for a pending transaction",
+        )
+    if scope_envelope_bytes is None:
+        raise _pending_repartition_error(
+            run_id,
+            "active_implementation_scope",
+            "the scope envelope must be validated before pending transaction use",
+        )
+    try:
+        _validate_scope_envelope_bytes(active_scope, scope_envelope_bytes)
+    except WorkflowError as exc:
+        raise _pending_repartition_error(
+            run_id,
+            "active_implementation_scope",
+            exc.summary,
+        ) from exc
+
+    if pending_repartition.scope_id != active_scope.scope_id:
+        raise _pending_repartition_error(
+            run_id,
+            "scope_id",
+            "does not match the restored active implementation scope",
+        )
+
+    def required_sha256(field: str, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "expected a lowercase 64-character SHA-256 hex string",
+            )
+        return value
+
+    envelope_sha256 = required_sha256("envelope_sha256", envelope_sha256)
+    source_plan_sha256 = required_sha256("source_plan_sha256", source_plan_sha256)
+    for field, value in (
+        ("proposal_sha256", proposal_sha256),
+        ("candidate_plan_sha256", candidate_plan_sha256),
+    ):
+        if value is not None:
+            required_sha256(field, value)
+
+    if envelope_sha256 != active_scope.envelope_canonical_sha256:
+        raise _pending_repartition_error(
+            run_id,
+            "envelope_sha256",
+            "does not match the restored active scope envelope identity",
+        )
+    if (
+        not isinstance(manager_decision_number, int)
+        or isinstance(manager_decision_number, bool)
+        or manager_decision_number < 1
+    ):
+        raise _pending_repartition_error(
+            run_id,
+            "decision_number",
+            "does not have a positive restored manager decision boundary",
+        )
+    if pending_repartition.decision_number != manager_decision_number:
+        raise _pending_repartition_error(
+            run_id,
+            "decision_number",
+            "does not match the restored manager decision boundary",
+        )
+    try:
+        expected_generation_id = derive_generation_id(
+            scope_id=pending_repartition.scope_id,
+            decision_number=pending_repartition.decision_number,
+            envelope_sha256=envelope_sha256,
+            source_plan_sha256=source_plan_sha256,
+        )
+    except ValueError as exc:
+        raise _pending_repartition_error(
+            run_id,
+            "generation_id",
+            f"cannot derive producer identity: {exc}",
+        ) from exc
+    if pending_repartition.generation_id != expected_generation_id:
+        raise _pending_repartition_error(
+            run_id,
+            "generation_id",
+            "does not match the producer-derived repartition identity",
+        )
+
+    if stage in _PENDING_REPARTITION_PROPOSED_STAGES:
+        steps = workflow_steps if isinstance(workflow_steps, Mapping) else {}
+        target_step = steps.get(pending_repartition.resolved_target_step)
+        if target_step is None:
+            raise _pending_repartition_error(
+                run_id,
+                "resolved_target_step",
+                "does not identify an executable step in the restored workflow",
+            )
+        target_role = getattr(target_step, "role", None)
+        if target_role != pending_repartition.resolved_target_role:
+            raise _pending_repartition_error(
+                run_id,
+                "resolved_target_role",
+                "does not match the executable step role in the restored workflow",
+            )
+
+    run_root = run_dir.resolve()
+    artifact_bytes: dict[str, bytes] = {}
+    resolved_artifacts: dict[str, Path] = {}
+    artifact_owners: dict[Path, str] = {}
+
+    def resolve_path(field: str, raw_path: str, *, kind: str) -> tuple[Path, str]:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "expected a non-empty repository-relative POSIX path",
+            )
+        if (
+            raw_path != raw_path.strip()
+            or "\\" in raw_path
+            or (len(raw_path) >= 2 and raw_path[1] == ":" and raw_path[0].isalpha())
+        ):
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "must be a canonical repository-relative POSIX path",
+            )
+        try:
+            posix_candidate = PurePosixPath(raw_path)
+            if (
+                posix_candidate.is_absolute()
+                or ".." in posix_candidate.parts
+                or posix_candidate.as_posix() != raw_path
+            ):
+                raise ValueError("absolute or traversal path")
+            candidate = Path(*posix_candidate.parts)
+            resolved = (run_root / candidate).resolve()
+            relative = resolved.relative_to(run_root).as_posix()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "must resolve beneath the source run directory",
+            ) from exc
+        if not relative or relative == ".":
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "must name a path below the source run directory",
+            )
+        if relative != raw_path:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "must resolve to its own canonical path; symlink aliases are not allowed",
+            )
+        if kind == "directory":
+            if not resolved.is_dir():
+                raise _pending_repartition_error(
+                    run_id,
+                    field,
+                    f"expected directory '{raw_path}'",
+                )
+        elif not resolved.is_file():
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                f"expected file '{raw_path}'",
+            )
+        return resolved, relative
+
+    def read_file(field: str, path: Path, relative: str) -> bytes:
+        try:
+            data = path.read_bytes()
+        except (OSError, ValueError) as exc:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                f"cannot read '{relative}': {exc}",
+            ) from exc
+        existing = artifact_bytes.get(relative, _MISSING_RESUME_FIELD)
+        if existing is not _MISSING_RESUME_FIELD and existing != data:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                f"changed while binding artifact '{relative}'",
+            )
+        artifact_bytes[relative] = data
+        return data
+
+    attempt_root: Path | None = None
+    if latest_attempt_path is not None:
+        attempt_root, _attempt_relative = resolve_path(
+            "latest_attempt_path",
+            latest_attempt_path,
+            kind="directory",
+        )
+
+    for field, _kind in _PENDING_REPARTITION_ARTIFACT_FIELDS:
+        raw_path = getattr(pending_repartition, field)
+        if raw_path is None:
+            continue
+        resolved, relative = resolve_path(field, raw_path, kind="file")
+        previous_owner = artifact_owners.get(resolved)
+        if previous_owner is not None and previous_owner != field:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                f"resolves to the same file as {previous_owner}",
+            )
+        artifact_owners[resolved] = field
+        resolved_artifacts[field] = resolved
+        read_file(field, resolved, relative)
+
+    for field, _kind in _PENDING_REPARTITION_ARTIFACT_FIELDS:
+        raw_path = getattr(pending_repartition, field)
+        if raw_path is None:
+            continue
+        if raw_path not in artifact_bytes:
+            raise _pending_repartition_error(
+                run_id,
+                field,
+                "must be bound under its identical canonical path key",
+            )
+
+    if attempt_root is not None:
+        try:
+            attempt_entries = sorted(attempt_root.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise _pending_repartition_error(
+                run_id,
+                "latest_attempt_path",
+                f"cannot enumerate '{latest_attempt_path}': {exc}",
+            ) from exc
+        # Repartition attempts have a fixed, flat artifact layout.  Carry the
+        # direct files for evidence retention; individual references below are
+        # still authoritative and are read even when they are nested.
+        for attempt_entry in attempt_entries:
+            try:
+                canonical_entry = attempt_entry.resolve()
+                entry_raw_relative = attempt_entry.relative_to(run_root).as_posix()
+                entry_relative = canonical_entry.relative_to(run_root).as_posix()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise _pending_repartition_error(
+                    run_id,
+                    "latest_attempt_path",
+                    f"contains an unsafe artifact path '{attempt_entry.name}'",
+                ) from exc
+            if attempt_entry.is_symlink() or entry_relative != entry_raw_relative:
+                raise _pending_repartition_error(
+                    run_id,
+                    "latest_attempt_path",
+                    f"contains a non-canonical symlink alias '{entry_raw_relative}'",
+                )
+            if attempt_entry.is_dir():
+                continue
+            if not attempt_entry.is_file():
+                raise _pending_repartition_error(
+                    run_id,
+                    "latest_attempt_path",
+                    f"contains non-file artifact '{attempt_entry.name}'",
+                )
+            read_file("latest_attempt_path", canonical_entry, entry_relative)
+
+    for path_field, digest_field in (
+        ("proposal_artifact_path", "proposal_sha256"),
+        ("candidate_artifact_path", "candidate_plan_sha256"),
+    ):
+        digest = getattr(pending_repartition, digest_field)
+        artifact_path = resolved_artifacts.get(path_field)
+        if digest is not None and artifact_path is None:
+            raise _pending_repartition_error(
+                run_id,
+                digest_field,
+                f"requires {path_field} to be present",
+            )
+        if digest is not None and artifact_path is not None:
+            relative = artifact_path.relative_to(run_root).as_posix()
+            observed = hashlib.sha256(artifact_bytes[relative]).hexdigest()
+            if observed != digest:
+                raise _pending_repartition_error(
+                    run_id,
+                    digest_field,
+                    f"does not match {path_field} bytes (expected {digest}, observed {observed})",
+                )
+
+    if stage in _PENDING_REPARTITION_BLOCKED_STAGES:
+        raise ValueError(
+            f"error: run '{Path(str(run_id)).name}' has pending repartition "
+            "proposal/validation transaction that must be reconciled before "
+            f"a harness can start (stage={stage})."
+        )
+    if stage == "failed":
+        raise ValueError(
+            f"error: run '{Path(str(run_id)).name}' cannot resume a failed "
+            "repartition transaction without explicit scope reset."
+        )
+
+    return pending_repartition, artifact_bytes
+
+
+def _decode_frozen_run_identity(
+    prev_run: Mapping[str, object],
+    run_id: Path,
+) -> FrozenRunIdentity | None:
+    """Decode the persisted configuration identity without legacy guessing."""
+    if "schema_version" not in prev_run:
+        return None
+
+    schema_version = prev_run.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != RUN_STATE_SCHEMA_VERSION
+    ):
+        raise _resume_metadata_error(
+            run_id,
+            "schema_version",
+            f"expected integer {RUN_STATE_SCHEMA_VERSION}",
+        )
+
+    frozen_value = prev_run.get("frozen_config")
+    if not isinstance(frozen_value, Mapping):
+        raise _resume_metadata_error(
+            run_id,
+            "frozen_config",
+            "expected a mapping for schema-versioned metadata",
+        )
+
+    values: dict[str, str] = {}
+    for field_name in ("workflow_name", "config_path", "config_fingerprint"):
+        value = frozen_value.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise _resume_metadata_error(
+                run_id,
+                f"frozen_config.{field_name}",
+                "expected a non-empty string",
+            )
+        values[field_name] = value
+
+    return FrozenRunIdentity(**values)
+
+
+def _validate_resume_run_id(resolved_run_id: Path) -> str:
+    """Return one safe run-ID component, rejecting path-shaped identifiers."""
+    run_id = str(resolved_run_id)
+    if (
+        not run_id
+        or resolved_run_id.is_absolute()
+        or run_id in {".", ".."}
+        or resolved_run_id.name != run_id
+    ):
+        raise ValueError(f"error: invalid resume run id '{run_id}'.")
+    return run_id
+
+
+def _bootstrap_resume_invocation(
+    *,
+    repo_root: Path,
+    config_path: Path | None = None,
+    workflow_config: Any,
+    requested_run_id: str | None,
+    workflow_arg: str | None,
+    plan_file_arg: str | None,
+    team_arg: str | None,
+    start_step_arg: str | None,
+    max_turns_arg: int | None,
+    extra_instructions_arg: tuple[str, ...],
+    extra_instructions_provided: bool,
+    reset_scope: bool = False,
+) -> ResumeBootstrap:
+    """Resolve one durable run and reconstruct omitted resume identity read-only."""
+    resolved_run_id, _source = resolve_run_id(requested_run_id, repo_root)
+    if resolved_run_id is None:
+        raise ValueError(
+            "error: no previous run could be resolved for resume from the current shell context. "
+            "Pass --resume RUN_ID to select a specific run."
+        )
+
+    run_id = _validate_resume_run_id(resolved_run_id)
+    runs_root = (repo_root / ".aflow" / "runs").resolve()
+    run_dir = runs_root / run_id
+    prev_run = load_run_json(run_dir)
+    if not isinstance(prev_run, dict):
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' does not contain readable or valid run metadata."
+        )
+
+    plan_path = _resume_plan_path(prev_run, repo_root)
+    plan_field = (
+        "original_plan_path" if "original_plan_path" in prev_run else "plan_path"
+    )
+    if plan_path is None:
+        raise _resume_metadata_error(
+            resolved_run_id,
+            plan_field,
+            "expected a non-empty string",
+        )
+    try:
+        if not plan_path.is_file():
+            raise OSError("file does not exist")
+        plan_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise _resume_metadata_error(
+            resolved_run_id,
+            plan_field,
+            f"saved plan '{plan_path}' is not readable ({exc})",
+        ) from exc
+
+    workflow_name = prev_run.get("workflow_name")
+    if not isinstance(workflow_name, str) or not workflow_name.strip():
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "workflow_name",
+            "expected a non-empty string",
+        )
+    if workflow_name not in workflow_config.workflows:
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' references unknown saved workflow "
+            f"'{workflow_name}'."
+        )
+    workflow_spec = workflow_config.workflows[workflow_name]
+
+    frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
+    if frozen_run_identity is not None:
+        current_identity = _freeze_run_identity(
+            workflow_name,
+            workflow_config,
+            config_dir=config_path or (repo_root / "aflow.toml"),
+        )
+        mismatch = _frozen_identity_mismatch(frozen_run_identity, current_identity)
+        if mismatch is not None:
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' frozen configuration mismatch: "
+                f"{mismatch}."
+            )
+
+    team_value = prev_run.get("team")
+    if team_value is not None and (
+        not isinstance(team_value, str) or not team_value.strip()
+    ):
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "team",
+            "expected null or a non-empty string",
+        )
+    saved_team = team_value if isinstance(team_value, str) else None
+
+    start_step_value = prev_run.get("selected_start_step")
+    if start_step_value is not None and (
+        not isinstance(start_step_value, str) or not start_step_value.strip()
+    ):
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "selected_start_step",
+            "expected null or a non-empty string",
+        )
+    saved_start_step = (
+        start_step_value if isinstance(start_step_value, str) else None
+    )
+    if saved_start_step is not None and saved_start_step not in workflow_spec.steps:
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "selected_start_step",
+            f"'{saved_start_step}' is not a configured step of workflow '{workflow_name}'",
+        )
+
+    max_turns = _resume_max_turns(prev_run)
+    if max_turns is None:
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "max_turns",
+            "expected a positive integer",
+        )
+    if "effective_max_turns" in prev_run:
+        effective_max_turns = prev_run.get("effective_max_turns")
+        if effective_max_turns is not None and (
+            not isinstance(effective_max_turns, int)
+            or isinstance(effective_max_turns, bool)
+            or effective_max_turns < 1
+        ):
+            raise _resume_metadata_error(
+                resolved_run_id,
+                "effective_max_turns",
+                "expected null or a positive integer",
+            )
+
+    extra_value = prev_run.get("extra_instructions")
+    if not isinstance(extra_value, list) or not all(
+        isinstance(item, str) for item in extra_value
+    ):
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "extra_instructions",
+            "expected a list of strings",
+        )
+    saved_extra = tuple(extra_value)
+
+    if workflow_arg is not None and workflow_arg != workflow_name:
+        raise ValueError(
+            f"error: resume workflow mismatch: requested '{workflow_arg}', "
+            f"but run '{resolved_run_id.name}' saved '{workflow_name}'."
+        )
+    if plan_file_arg is not None:
+        requested_plan = Path(plan_file_arg).expanduser()
+        if not requested_plan.is_absolute():
+            requested_plan = Path.cwd() / requested_plan
+        if requested_plan.resolve() != plan_path:
+            raise ValueError(
+                f"error: resume plan mismatch: requested '{requested_plan.resolve()}', "
+                f"but run '{resolved_run_id.name}' saved '{plan_path}'."
+            )
+
+    effective_saved_team = (
+        saved_team if "team" in prev_run else workflow_spec.team
+    )
+    if team_arg is not None and team_arg != effective_saved_team:
+        raise ValueError(
+            f"error: resume team mismatch: requested '{team_arg}', "
+            f"but run '{resolved_run_id.name}' saved '{effective_saved_team}'."
+        )
+
+    if start_step_arg is not None:
+        resolved_start_step, start_step_error = _resolve_numeric_start_step(
+            start_step_arg,
+            workflow_spec,
+        )
+        if start_step_error is not None:
+            raise ValueError(start_step_error)
+        if saved_start_step is None or resolved_start_step != saved_start_step:
+            raise ValueError(
+                f"error: resume start-step mismatch: requested '{start_step_arg}', "
+                f"but run '{resolved_run_id.name}' saved '{saved_start_step}'."
+            )
+
+    if max_turns_arg is not None and max_turns_arg != max_turns:
+        raise ValueError(
+            f"error: resume max-turns mismatch: requested {max_turns_arg}, "
+            f"but run '{resolved_run_id.name}' saved {max_turns}."
+        )
+    if extra_instructions_provided and extra_instructions_arg != saved_extra:
+        raise ValueError(
+            f"error: resume extra-instructions mismatch: requested "
+            f"{list(extra_instructions_arg)!r}, but run '{resolved_run_id.name}' "
+            f"saved {list(saved_extra)!r}."
+        )
+
+    mismatch_reason = _resume_candidate_mismatch_reason(
+        prev_run,
+        workflow_spec,
+        repo_root,
+        workflow_name,
+        plan_path,
+        effective_saved_team,
+        saved_start_step,
+        max_turns,
+        saved_extra,
+    )
+    if mismatch_reason is not None:
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' is not resumable: "
+            f"{mismatch_reason}."
+        )
+
+    resume_context = _reconstruct_resume_context(
+        resolved_run_id=resolved_run_id,
+        run_dir=run_dir,
+        prev_run=prev_run,
+        plan_path=plan_path,
+        frozen_run_identity=frozen_run_identity,
+        reset_scope=reset_scope,
+        require_resume=True,
+        workflow_steps=workflow_spec.steps,
+    )
+    assert resume_context is not None
+
+    return ResumeBootstrap(
+        resolved_run_id=resolved_run_id,
+        run_dir=run_dir,
+        run_json=prev_run,
+        plan_path=plan_path,
+        workflow_name=workflow_name,
+        team=saved_team,
+        start_step=saved_start_step,
+        max_turns=max_turns,
+        extra_instructions=saved_extra,
+        resume_context=resume_context,
+        frozen_run_identity=frozen_run_identity,
+    )
+
+
 def _resume_candidate_mismatch_reason(
     prev_run: dict[str, object],
     current_workflow_config: Any,
@@ -207,8 +1232,8 @@ def _resume_candidate_mismatch_reason(
     if not isinstance(prev_workflow_name, str) or prev_workflow_name != current_workflow_name:
         return "its workflow name does not match this invocation"
 
-    prev_plan_path = prev_run.get("plan_path")
-    if not isinstance(prev_plan_path, str) or Path(prev_plan_path).resolve() != current_plan_path:
+    prev_plan_path = _resume_plan_path(prev_run, current_repo_root)
+    if prev_plan_path is None or prev_plan_path != current_plan_path.resolve():
         return "its plan path does not match this invocation"
 
     prev_team = prev_run.get("team")
@@ -224,8 +1249,8 @@ def _resume_candidate_mismatch_reason(
     if prev_selected_start_step != current_selected_start_step:
         return "its selected start step does not match this invocation"
 
-    prev_max_turns = prev_run.get("max_turns")
-    if not isinstance(prev_max_turns, int) or prev_max_turns != current_max_turns:
+    prev_max_turns = _resume_max_turns(prev_run)
+    if prev_max_turns is None or prev_max_turns != current_max_turns:
         return "its max-turns value does not match this invocation"
 
     prev_extra_instructions = prev_run.get("extra_instructions")
@@ -416,7 +1441,12 @@ def _manager_resume_fields_for_scope(
     run_dir: Path | None = None,
 ) -> dict[str, object]:
     """Restore manager history while optionally discarding one checkpoint scope."""
-    fields = manager_resume_fields(prev_run)
+    decoder_payload = prev_run
+    if reset_scope and "pending_repartition" in prev_run:
+        # Reset scope must not interpret the checkpoint-scoped transaction.
+        decoder_payload = dict(prev_run)
+        decoder_payload.pop("pending_repartition", None)
+    fields = manager_resume_fields(decoder_payload)
     if reset_scope:
         fields.update({
             "semantic_stall_count": 0,
@@ -438,75 +1468,43 @@ def _manager_resume_fields_for_scope(
     return fields
 
 
-def _detect_resume_candidate(
-    repo_root: Path,
-    workflow_config: Any,
-    workflow_name: str,
+def _reconstruct_resume_context(
+    *,
+    resolved_run_id: Path,
+    run_dir: Path,
+    prev_run: Mapping[str, object],
     plan_path: Path,
-    team: str | None,
-    selected_start_step: str | None,
-    max_turns: int | None,
-    extra_instructions: tuple[str, ...],
-    requested_run_id: str | None = None,
-    require_resume: bool = False,
-    reset_scope: bool = False,
+    frozen_run_identity: FrozenRunIdentity | None,
+    reset_scope: bool,
+    require_resume: bool,
+    workflow_steps: Mapping[str, object] | None = None,
 ) -> ResumeContext | None:
-    """Detect if there's a valid resume candidate and prompt the user.
-
-    Returns ResumeContext if the user accepts resume, None otherwise.
-    """
-    resolved_run_id, _source = resolve_run_id(requested_run_id, repo_root)
-    if resolved_run_id is None:
-        if require_resume:
-            raise ValueError(
-                "error: no previous run could be resolved for resume from the current shell context. "
-                "Pass --resume RUN_ID to select a specific run."
-            )
-        return None
-
-    runs_root = repo_root / ".aflow" / "runs"
-    run_dir = runs_root / resolved_run_id.name
-    prev_run = load_run_json(run_dir)
-    if prev_run is None:
-        if require_resume:
-            raise ValueError(f"error: run '{resolved_run_id.name}' does not contain readable run metadata.")
-        return None
-
-    reason = _resume_candidate_mismatch_reason(
-        prev_run,
-        workflow_config,
-        repo_root,
-        workflow_name,
-        plan_path,
-        team,
-        selected_start_step,
-        max_turns,
-        extra_instructions,
-    )
-    if reason is not None:
-        if require_resume:
-            raise ValueError(f"error: run '{resolved_run_id.name}' is not resumable: {reason}.")
-        return None
-
+    """Decode all durable resume state from one already-loaded run payload."""
+    run_id = resolved_run_id.name
     feature_branch = prev_run.get("feature_branch")
     worktree_path = prev_run.get("worktree_path")
     main_branch = prev_run.get("main_branch")
     lifecycle_setup = prev_run.get("lifecycle_setup")
     lifecycle_teardown = prev_run.get("lifecycle_teardown")
-    active_plan_path = prev_run.get("active_plan_path")
-    terminal_integration_only = _is_terminal_integration_resume(prev_run)
-
-    if not isinstance(feature_branch, str) or not isinstance(worktree_path, str) or not isinstance(main_branch, str):
+    if (
+        not isinstance(feature_branch, str)
+        or not isinstance(worktree_path, str)
+        or not isinstance(main_branch, str)
+    ):
         if require_resume:
-            raise ValueError(f"error: run '{resolved_run_id.name}' is missing worktree resume metadata.")
+            raise ValueError(
+                f"error: run '{run_id}' is missing worktree resume metadata."
+            )
         return None
     if not isinstance(lifecycle_setup, list) or not isinstance(lifecycle_teardown, list):
         if require_resume:
-            raise ValueError(f"error: run '{resolved_run_id.name}' is missing lifecycle resume metadata.")
+            raise ValueError(
+                f"error: run '{run_id}' is missing lifecycle resume metadata."
+            )
         return None
 
-    if not require_resume and not _prompt_resume(resolved_run_id.name, feature_branch, worktree_path):
-        return None
+    active_plan_path = prev_run.get("active_plan_path")
+    terminal_integration_only = _is_terminal_integration_resume(prev_run)
 
     pending_finalized_turn = (
         None
@@ -518,56 +1516,6 @@ def _detect_resume_candidate(
         reset_scope=reset_scope,
         run_dir=run_dir,
     )
-    if pending_finalized_turn is not None:
-        # Any prior boundary belongs to an earlier finalized turn. The
-        # recovered turn must receive a fresh manager decision before routing.
-        manager_fields["pending_manager_notes"] = None
-        manager_fields["pending_step_team_override"] = None
-        manager_fields["pending_boundary_decision"] = None
-    recovered_active_plan = (
-        str(plan_path)
-        if terminal_integration_only
-        else active_plan_path
-    )
-    if (
-        pending_finalized_turn is not None
-        and pending_finalized_turn.conditions["NEW_PLAN_EXISTS"]
-    ):
-        recovered_active_plan = str(pending_finalized_turn.new_plan_path)
-
-    frozen_run_identity = None
-    frozen_value = prev_run.get("frozen_config")
-    if isinstance(frozen_value, Mapping):
-        workflow_value = frozen_value.get("workflow_name")
-        config_path_value = frozen_value.get("config_path")
-        fingerprint_value = frozen_value.get("config_fingerprint")
-        if all(
-            isinstance(value, str)
-            for value in (
-                workflow_value,
-                config_path_value,
-                fingerprint_value,
-            )
-        ):
-            frozen_run_identity = FrozenRunIdentity(
-                workflow_name=workflow_value,
-                config_path=config_path_value,
-                config_fingerprint=fingerprint_value,
-            )
-
-    override_value = prev_run.get("override_result")
-    override_resolution = resolve_resume_override(
-        run_dir,
-        override_value if isinstance(override_value, Mapping) else None,
-    )
-    pending_override_notes = prev_run.get("pending_override_notes")
-    if not isinstance(pending_override_notes, list) or not all(
-        isinstance(note, str) for note in pending_override_notes
-    ):
-        pending_override_notes = []
-    effective_max_turns = prev_run.get("effective_max_turns")
-    if not isinstance(effective_max_turns, int) or effective_max_turns < 1:
-        effective_max_turns = None
     scope_envelope_source_path: str | None = None
     scope_envelope_bytes: bytes | None = None
     active_scope = manager_fields.get("active_implementation_scope")
@@ -583,45 +1531,68 @@ def _detect_resume_candidate(
             )
         except WorkflowError as exc:
             raise ValueError(
-                f"error: run '{resolved_run_id.name}' has invalid scope envelope "
-                f"reference: {exc.summary}"
+                f"error: run '{run_id}' has invalid scope envelope reference: "
+                f"{exc.summary}"
             ) from exc
         if scope_envelope_bytes is not None:
             scope_envelope_source_path = str(
                 run_dir / active_scope.envelope_artifact_path
             )
+    pending_repartition, repartition_artifact_bytes = (
+        _validate_pending_repartition_resume_state(
+            raw_pending_repartition=prev_run.get(
+                "pending_repartition",
+                _MISSING_RESUME_FIELD,
+            ),
+            pending_repartition=manager_fields.get("pending_repartition"),
+            run_dir=run_dir,
+            run_id=run_id,
+            reset_scope=reset_scope,
+            active_scope=(
+                active_scope
+                if isinstance(active_scope, ActiveImplementationScope)
+                else None
+            ),
+            manager_decision_number=manager_fields.get("manager_decision_number"),
+            workflow_steps=workflow_steps,
+            scope_envelope_bytes=scope_envelope_bytes,
+        )
+    )
+    manager_fields["pending_repartition"] = pending_repartition
+    if pending_finalized_turn is not None:
+        # Any prior boundary belongs to an earlier finalized turn. The
+        # recovered turn must receive a fresh manager decision before routing.
+        manager_fields["pending_manager_notes"] = None
+        manager_fields["pending_step_team_override"] = None
+        manager_fields["pending_boundary_decision"] = None
 
-    repartition_artifact_bytes: dict[str, bytes] = {}
-    pending_repartition = manager_fields.get("pending_repartition")
-    latest_attempt_path = getattr(pending_repartition, "latest_attempt_path", None)
-    if not reset_scope and isinstance(latest_attempt_path, str):
-        attempt_root = (run_dir / latest_attempt_path).resolve()
-        try:
-            attempt_root.relative_to(run_dir.resolve())
-        except ValueError as exc:
-            raise ValueError(
-                f"error: run '{resolved_run_id.name}' has an unsafe pending "
-                "repartition artifact path."
-            ) from exc
-        if not attempt_root.is_dir():
-            raise ValueError(
-                f"error: run '{resolved_run_id.name}' is missing pending "
-                f"repartition artifacts at '{latest_attempt_path}'."
-            )
-        for artifact_path in sorted(attempt_root.rglob("*")):
-            if not artifact_path.is_file():
-                continue
-            relative = artifact_path.resolve().relative_to(run_dir.resolve()).as_posix()
-            try:
-                repartition_artifact_bytes[relative] = artifact_path.read_bytes()
-            except OSError as exc:
-                raise ValueError(
-                    f"error: run '{resolved_run_id.name}' cannot read pending "
-                    f"repartition artifact '{relative}': {exc}"
-                ) from exc
+    recovered_active_plan = (
+        str(plan_path)
+        if terminal_integration_only
+        else active_plan_path
+    )
+    if (
+        pending_finalized_turn is not None
+        and pending_finalized_turn.conditions["NEW_PLAN_EXISTS"]
+    ):
+        recovered_active_plan = str(pending_finalized_turn.new_plan_path)
+
+    override_value = prev_run.get("override_result")
+    override_resolution = resolve_resume_override(
+        run_dir,
+        override_value if isinstance(override_value, Mapping) else None,
+    )
+    pending_override_notes = prev_run.get("pending_override_notes")
+    if not isinstance(pending_override_notes, list) or not all(
+        isinstance(note, str) for note in pending_override_notes
+    ):
+        pending_override_notes = []
+    effective_max_turns = prev_run.get("effective_max_turns")
+    if not isinstance(effective_max_turns, int) or isinstance(effective_max_turns, bool) or effective_max_turns < 1:
+        effective_max_turns = None
 
     return ResumeContext(
-        resumed_from_run_id=resolved_run_id.name,
+        resumed_from_run_id=run_id,
         feature_branch=feature_branch,
         worktree_path=Path(worktree_path),
         main_branch=main_branch,
@@ -656,6 +1627,118 @@ def _detect_resume_candidate(
         scope_envelope_source_path=scope_envelope_source_path,
         repartition_artifact_bytes=repartition_artifact_bytes,
         **manager_fields,
+    )
+
+
+def _detect_resume_candidate(
+    repo_root: Path,
+    workflow_config: Any,
+    workflow_name: str,
+    plan_path: Path,
+    team: str | None,
+    selected_start_step: str | None,
+    max_turns: int | None,
+    extra_instructions: tuple[str, ...],
+    requested_run_id: str | None = None,
+    require_resume: bool = False,
+    reset_scope: bool = False,
+    resume_bootstrap: ResumeBootstrap | None = None,
+) -> ResumeContext | None:
+    """Detect if there's a valid resume candidate and prompt the user.
+
+    Returns ResumeContext if the user accepts resume, None otherwise.
+    """
+    if resume_bootstrap is not None:
+        resolved_run_id = resume_bootstrap.resolved_run_id
+        run_dir = resume_bootstrap.run_dir
+        prev_run = resume_bootstrap.run_json
+        frozen_run_identity = resume_bootstrap.frozen_run_identity
+    else:
+        resolved_run_id, _source = resolve_run_id(requested_run_id, repo_root)
+        if resolved_run_id is None:
+            if require_resume:
+                raise ValueError(
+                    "error: no previous run could be resolved for resume from the current shell context. "
+                    "Pass --resume RUN_ID to select a specific run."
+                )
+            return None
+
+        runs_root = repo_root / ".aflow" / "runs"
+        run_dir = runs_root / resolved_run_id.name
+        prev_run = load_run_json(run_dir)
+        if not isinstance(prev_run, dict):
+            if require_resume:
+                raise ValueError(
+                    f"error: run '{resolved_run_id.name}' does not contain readable or valid run metadata."
+                )
+            return None
+        try:
+            frozen_run_identity = _decode_frozen_run_identity(
+                prev_run,
+                resolved_run_id,
+            )
+        except ValueError:
+            if require_resume:
+                raise
+            return None
+
+    reason = _resume_candidate_mismatch_reason(
+        prev_run,
+        workflow_config,
+        repo_root,
+        workflow_name,
+        plan_path,
+        team,
+        selected_start_step,
+        max_turns,
+        extra_instructions,
+    )
+    if reason is not None:
+        if require_resume:
+            raise ValueError(f"error: run '{resolved_run_id.name}' is not resumable: {reason}.")
+        return None
+
+    if resume_bootstrap is not None:
+        return resume_bootstrap.resume_context
+
+    feature_branch = prev_run.get("feature_branch")
+    worktree_path = prev_run.get("worktree_path")
+    main_branch = prev_run.get("main_branch")
+    lifecycle_setup = prev_run.get("lifecycle_setup")
+    lifecycle_teardown = prev_run.get("lifecycle_teardown")
+    if (
+        not isinstance(feature_branch, str)
+        or not isinstance(worktree_path, str)
+        or not isinstance(main_branch, str)
+    ):
+        if require_resume:
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' is missing worktree resume metadata."
+            )
+        return None
+    if not isinstance(lifecycle_setup, list) or not isinstance(lifecycle_teardown, list):
+        if require_resume:
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' is missing lifecycle resume metadata."
+            )
+        return None
+
+    if not require_resume and not _prompt_resume(
+        resolved_run_id.name,
+        feature_branch,
+        worktree_path,
+    ):
+        return None
+
+    return _reconstruct_resume_context(
+        resolved_run_id=resolved_run_id,
+        run_dir=run_dir,
+        prev_run=prev_run,
+        plan_path=plan_path,
+        frozen_run_identity=frozen_run_identity,
+        reset_scope=reset_scope,
+        require_resume=require_resume,
+        workflow_steps=getattr(workflow_config, "steps", None),
     )
 
 
@@ -734,7 +1817,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        description="Run an aflow workflow from a plan file.",
+        description="Run an aflow workflow from a plan file or resume a saved run.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=RUN_HELP,
     )
@@ -1399,15 +2482,23 @@ def main(argv: list[str] | None = None) -> int:
         workflow_arg, plan_file_arg, extra_instructions = _resolve_run_arguments(
             args.plan, args.workflow, args.run_args, workflow_config
         )
+        extra_instructions_provided = (
+            "--" in args.run_args or bool(extra_instructions)
+        )
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 1
 
-    if plan_file_arg is None:
+    requested_resume_run_id: str | None = None
+    require_resume = False
+    if args.resume is not None:
+        require_resume = True
+        if args.resume != "AUTO":
+            requested_resume_run_id = args.resume
+
+    if not require_resume and plan_file_arg is None:
         print("error: plan_file is required", file=sys.stderr)
         return 1
-
-    plan_path = Path(plan_file_arg).expanduser().resolve()
 
     placeholders = find_placeholders(workflow_config)
     if placeholders:
@@ -1427,14 +2518,43 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    resume_bootstrap: ResumeBootstrap | None = None
+    if require_resume:
+        try:
+            resume_bootstrap = _bootstrap_resume_invocation(
+                repo_root=repo_root,
+                config_path=config_path,
+                workflow_config=workflow_config,
+                requested_run_id=requested_resume_run_id,
+                workflow_arg=workflow_arg,
+                plan_file_arg=plan_file_arg,
+                team_arg=args.team,
+                start_step_arg=args.start_step,
+                max_turns_arg=args.max_turns,
+                extra_instructions_arg=extra_instructions,
+                extra_instructions_provided=extra_instructions_provided,
+                reset_scope=args.resume_reset_scope,
+            )
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        workflow_arg = resume_bootstrap.workflow_name
+        plan_file_arg = str(resume_bootstrap.plan_path)
+        startup_start_step = resume_bootstrap.start_step
+        startup_max_turns = resume_bootstrap.max_turns
+        startup_team = resume_bootstrap.team
+        extra_instructions = resume_bootstrap.extra_instructions
+    else:
+        startup_start_step = args.start_step
+        startup_max_turns = args.max_turns
+        startup_team = args.team
+
+    if plan_file_arg is None:
+        print("error: plan_file is required", file=sys.stderr)
+        return 1
+
+    plan_path = Path(plan_file_arg).expanduser().resolve()
     startup_workflow_name = workflow_arg or workflow_config.aflow.default_workflow
-    startup_start_step = args.start_step
-    requested_resume_run_id: str | None = None
-    require_resume = False
-    if args.resume is not None:
-        require_resume = True
-        if args.resume != "AUTO":
-            requested_resume_run_id = args.resume
 
     startup_request = StartupRequest(
         repo_root=repo_root,
@@ -1443,8 +2563,8 @@ def main(argv: list[str] | None = None) -> int:
         workflow_config=workflow_config,
         workflow_name=startup_workflow_name,
         start_step=startup_start_step,
-        max_turns=args.max_turns,
-        team=args.team,
+        max_turns=startup_max_turns,
+        team=startup_team,
         extra_instructions=extra_instructions,
         resume_requested=require_resume,
     )
@@ -1466,6 +2586,7 @@ def main(argv: list[str] | None = None) -> int:
             requested_run_id=requested_resume_run_id,
             require_resume=require_resume,
             reset_scope=args.resume_reset_scope,
+            resume_bootstrap=resume_bootstrap,
         )
     except ValueError as exc:
         print(exc, file=sys.stderr)
