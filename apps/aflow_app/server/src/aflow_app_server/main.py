@@ -26,6 +26,8 @@ from .codex_thread_gateway import CodexThreadGateway
 import aflow_app_server.codex_routes as codex_routes_module
 from .config import ServerConfig
 from .models import ExecutionRequest, ExecutionStatus
+from .planning import PlanningService, ProviderRegistry
+from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
 from .plan_store import PlanStore
 from .transcription import TranscriptionClient, TranscriptionError, create_transcription_client
@@ -36,6 +38,8 @@ _config: ServerConfig | None = None
 _project_catalog: ProjectCatalog | None = None
 _service: AflowService | None = None
 _transcription_client: TranscriptionClient | None = None
+_planning_registry: ProviderRegistry | None = None
+_planning_service: PlanningService | None = None
 _seen_plugin_probe_fingerprints: set[str] = set()
 
 
@@ -134,6 +138,13 @@ def get_transcription_client() -> TranscriptionClient:
     return _transcription_client
 
 
+def get_planning_service() -> PlanningService:
+    """Get the application-lifespan provider-neutral planning service."""
+    if _planning_service is None:
+        raise RuntimeError("Server not initialized")
+    return _planning_service
+
+
 security = HTTPBearer(auto_error=False)
 
 
@@ -227,6 +238,7 @@ def _build_uvicorn_log_config() -> dict[str, Any]:
 async def lifespan(app: FastAPI):
     """Initialize server state on startup."""
     global _config, _project_catalog, _service, _transcription_client
+    global _planning_registry, _planning_service
 
     _config = ServerConfig.from_env()
     errors = _config.validate()
@@ -243,14 +255,33 @@ async def lifespan(app: FastAPI):
         _config.transcription_url,
         _config.transcription_token,
     )
+    _planning_registry = ProviderRegistry(
+        (
+            UnavailablePlanningProvider(provider.id, provider.display_name)
+            for provider in _config.planning_providers
+            if provider.enabled
+        ),
+        operation_timeout_seconds=_config.planning_operation_timeout_seconds,
+    )
+    await _planning_registry.start()
+    _planning_service = PlanningService(
+        _planning_registry,
+        default_provider_id=_config.default_planning_provider_id,
+    )
+    app.state.planning_service = _planning_service
 
-    yield
-
-    # Cleanup
-    _config = None
-    _project_catalog = None
-    _service = None
-    _transcription_client = None
+    try:
+        yield
+    finally:
+        await _planning_registry.close()
+        # Cleanup
+        app.state.planning_service = None
+        _planning_service = None
+        _planning_registry = None
+        _config = None
+        _project_catalog = None
+        _service = None
+        _transcription_client = None
 
 
 app = FastAPI(
