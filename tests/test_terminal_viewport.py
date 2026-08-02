@@ -446,6 +446,157 @@ def test_terminal_input_session_restores_attributes_after_setup_failure(monkeypa
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_terminal_input_session_close_restores_after_interrupted_reader_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.terminal_viewport import TerminalInputSession
+
+    class FakeConsole:
+        is_terminal = True
+
+    session = TerminalInputSession(FakeConsole(), input_stream=object())
+    session._fd = 17
+    session._saved_attributes = ["saved"]
+    session._started = True
+    session._atexit_registered = True
+    session._thread = object()
+    stop_calls = 0
+    restore_calls = 0
+    unregister_calls = 0
+
+    def stop_reader() -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            raise KeyboardInterrupt("reader stop interrupt")
+        session._thread = None
+
+    def tcsetattr(fd: int, action: int, attributes: object) -> None:
+        del fd, action, attributes
+        nonlocal restore_calls
+        restore_calls += 1
+
+    def unregister(callback: object) -> None:
+        del callback
+        nonlocal unregister_calls
+        unregister_calls += 1
+
+    monkeypatch.setattr(session, "stop_reader", stop_reader)
+    monkeypatch.setattr("aflow.terminal_viewport.termios.tcsetattr", tcsetattr)
+    monkeypatch.setattr("aflow.terminal_viewport.atexit.unregister", unregister)
+
+    with pytest.raises(KeyboardInterrupt, match="reader stop interrupt"):
+        session.close()
+
+    assert restore_calls == 1
+    assert unregister_calls == 1
+    assert stop_calls == 2
+    assert session.is_restored
+    assert session.thread is None
+    assert session._atexit_registered is False
+    assert session.is_started is False
+    assert session.is_settled
+
+    session.close()
+    assert restore_calls == 1
+    assert unregister_calls == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_terminal_input_session_close_retries_interrupted_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.terminal_viewport import TerminalInputSession
+
+    class FakeConsole:
+        is_terminal = True
+
+    session = TerminalInputSession(FakeConsole(), input_stream=object())
+    session._fd = 23
+    session._saved_attributes = ["saved"]
+    session._started = True
+    session._atexit_registered = True
+    restore_calls = 0
+    unregister_calls = 0
+
+    def tcsetattr(fd: int, action: int, attributes: object) -> None:
+        del fd, action, attributes
+        nonlocal restore_calls
+        restore_calls += 1
+        if restore_calls == 1:
+            raise KeyboardInterrupt("termios interrupt")
+
+    def unregister(callback: object) -> None:
+        del callback
+        nonlocal unregister_calls
+        unregister_calls += 1
+
+    monkeypatch.setattr("aflow.terminal_viewport.termios.tcsetattr", tcsetattr)
+    monkeypatch.setattr("aflow.terminal_viewport.atexit.unregister", unregister)
+
+    with pytest.raises(KeyboardInterrupt, match="termios interrupt"):
+        session.close()
+
+    assert restore_calls == 2
+    assert unregister_calls == 1
+    assert session.is_restored
+    assert session._atexit_registered is False
+    assert session.is_started is False
+    assert session.is_settled
+
+    session.close()
+    assert restore_calls == 2
+    assert unregister_calls == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
+def test_terminal_input_session_close_retries_interrupted_callback_unregister(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aflow.terminal_viewport import TerminalInputSession
+
+    class FakeConsole:
+        is_terminal = True
+
+    session = TerminalInputSession(FakeConsole(), input_stream=object())
+    session._fd = 29
+    session._saved_attributes = ["saved"]
+    session._started = True
+    session._atexit_registered = True
+    restore_calls = 0
+    unregister_calls = 0
+
+    def tcsetattr(fd: int, action: int, attributes: object) -> None:
+        del fd, action, attributes
+        nonlocal restore_calls
+        restore_calls += 1
+
+    def unregister(callback: object) -> None:
+        del callback
+        nonlocal unregister_calls
+        unregister_calls += 1
+        if unregister_calls == 1:
+            raise KeyboardInterrupt("unregister interrupt")
+
+    monkeypatch.setattr("aflow.terminal_viewport.termios.tcsetattr", tcsetattr)
+    monkeypatch.setattr("aflow.terminal_viewport.atexit.unregister", unregister)
+
+    with pytest.raises(KeyboardInterrupt, match="unregister interrupt"):
+        session.close()
+
+    assert restore_calls == 1
+    assert unregister_calls == 2
+    assert session.is_restored
+    assert session._atexit_registered is False
+    assert session.is_started is False
+    assert session.is_settled
+
+    session.close()
+    assert restore_calls == 1
+    assert unregister_calls == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
 def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_termios() -> None:
     from aflow.plan import PlanSnapshot
     from aflow.run_state import ControllerState

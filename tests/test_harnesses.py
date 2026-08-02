@@ -1747,6 +1747,360 @@ class GitBannerTests(unittest.TestCase):
         assert session.close_calls == 1
         assert console.printed == ["last-document"]
 
+    def test_banner_renderer_base_exception_finishes_cleanup_before_propagating(self) -> None:
+        import aflow.status as status_mod
+        from unittest.mock import patch
+
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self) -> None:
+                self.printed: list[object] = []
+                self.controls: list[str] = []
+
+            def print(self, renderable: object) -> None:
+                self.printed.append(renderable)
+
+            def show_cursor(self, visible: bool) -> None:
+                assert visible is True
+                self.controls.append("show_cursor")
+
+            def set_alt_screen(self, enabled: bool) -> None:
+                assert enabled is False
+                self.controls.append("leave_alt_screen")
+
+        class FakeSession:
+            def __init__(self, failure: str) -> None:
+                self.failure = failure
+                self.interrupt = KeyboardInterrupt(f"{failure} interrupt")
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self._thread: object | None = object()
+                self._restored = False
+                self._atexit_registered = True
+                self._started = True
+
+            @property
+            def thread(self) -> object | None:
+                return self._thread
+
+            @property
+            def is_restored(self) -> bool:
+                return self._restored
+
+            @property
+            def is_started(self) -> bool:
+                return self._started
+
+            @property
+            def is_settled(self) -> bool:
+                return (
+                    self._thread is None
+                    and self._restored
+                    and not self._atexit_registered
+                    and not self._started
+                )
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+                if self.failure == "session_reader" and self.stop_reader_calls == 1:
+                    raise self.interrupt
+                self._thread = None
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.failure == "session_restore" and self.close_calls == 1:
+                    raise self.interrupt
+                if self.failure == "session_unregister" and self.close_calls == 1:
+                    self._thread = None
+                    self._restored = True
+                    raise self.interrupt
+                self._thread = None
+                self._restored = True
+                self._atexit_registered = False
+                self._started = False
+
+        class FakeViewport:
+            renderable: object | None = None
+
+        class FakeLive:
+            def __init__(self, failure: str) -> None:
+                self.failure = failure
+                self.interrupt = KeyboardInterrupt(f"{failure} interrupt")
+                self.update_calls = 0
+                self.refresh_calls = 0
+                self.stop_calls = 0
+
+            def update(self, panel: object, *, refresh: bool = False) -> None:
+                del panel, refresh
+                self.update_calls += 1
+                if self.failure == "live_update":
+                    raise self.interrupt
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+                if self.failure == "live_refresh":
+                    raise self.interrupt
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                if self.failure == "live_stop":
+                    raise self.interrupt
+
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+        for failure in (
+            "live_update",
+            "live_refresh",
+            "live_stop",
+            "session_reader",
+            "session_restore",
+            "session_unregister",
+        ):
+            console = FakeConsole()
+            session = FakeSession(failure)
+            live = FakeLive(failure)
+            renderer = status_mod.BannerRenderer(
+                config_max_turns=10,
+                config_plan_path=Path("/fake/plan.md"),
+                console=console,
+                refresh_interval_seconds=60.0,
+                git_poll_interval_seconds=9999.0,
+            )
+            viewport = FakeViewport()
+            renderer._live = live
+            renderer._input_session = session
+            renderer._viewport = viewport
+            renderer._interactive = True
+            renderer._last_panel = "last-panel"
+            renderer._emergency_cleanup_registered = True
+            renderer._emergency_cleanup_callback = object()
+
+            with patch.object(renderer, "_build", return_value="final-panel"), \
+                 patch.object(status_mod.atexit, "unregister") as unregister:
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    renderer.stop(state)
+
+                renderer.stop(state)
+                renderer._emergency_cleanup()
+
+            expected_interrupt = (
+                live.interrupt if failure.startswith("live_") else session.interrupt
+            )
+            assert raised.exception is expected_interrupt
+            assert live.update_calls == 1
+            assert live.refresh_calls == (0 if failure == "live_update" else 1)
+            assert live.stop_calls == 1
+            assert session.stop_reader_calls == (2 if failure == "session_reader" else 1)
+            assert session.close_calls == (2 if failure in {"session_restore", "session_unregister"} else 1)
+            assert unregister.call_count == 1
+            assert console.printed == ["final-panel"]
+            assert session.thread is None
+            assert session.is_restored
+            assert session._atexit_registered is False
+            assert session.is_started is False
+            assert session.is_settled
+            assert renderer._live is None
+            assert renderer._viewport is None
+            assert renderer._input_session is None
+            assert renderer._interactive is False
+            assert renderer._emergency_cleanup_registered is False
+            assert renderer._cleanup_in_progress is False
+            if failure == "live_stop":
+                assert console.controls == ["show_cursor", "leave_alt_screen"]
+            else:
+                assert console.controls == []
+
+    def test_banner_renderer_interrupted_start_unwinds_without_fallback(self) -> None:
+        import aflow.status as status_mod
+        from unittest.mock import patch
+
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self) -> None:
+                self.controls: list[str] = []
+
+            def show_cursor(self, visible: bool) -> None:
+                assert visible is True
+                self.controls.append("show_cursor")
+
+            def set_alt_screen(self, enabled: bool) -> None:
+                assert enabled is False
+                self.controls.append("leave_alt_screen")
+
+        class FakeSession:
+            thread = None
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: object) -> None:
+                del console, wake_event
+                self.stop_reader_calls = 0
+                self.close_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def stop_reader(self) -> None:
+                self.stop_reader_calls += 1
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                del panel
+                self.kwargs = kwargs
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+                raise KeyboardInterrupt("cleanup interrupt")
+
+        console = FakeConsole()
+        renderer = status_mod.BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            console=console,
+            refresh_interval_seconds=60.0,
+            git_poll_interval_seconds=9999.0,
+        )
+        startup_interrupt = KeyboardInterrupt("startup interrupt")
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+
+        def fail_refresh_thread() -> None:
+            raise startup_interrupt
+
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", FakeLive), \
+             patch.object(status_mod.atexit, "register"), \
+             patch.object(status_mod.atexit, "unregister"), \
+             patch.object(renderer, "_build", return_value="panel"), \
+             patch.object(renderer, "_start_refresh_thread", side_effect=fail_refresh_thread):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                renderer.start(state)
+
+        assert raised.exception is startup_interrupt
+        assert len(FakeLive.instances) == 1
+        assert FakeLive.instances[0].kwargs["screen"] is True
+        session = FakeSession.instances[0]
+        assert session.stop_reader_calls == 1
+        assert session.close_calls == 1
+        assert FakeLive.instances[0].stop_calls == 1
+        assert console.controls == ["show_cursor", "leave_alt_screen"]
+        assert renderer._live is None
+        assert renderer._input_session is None
+        assert renderer._viewport is None
+        assert renderer._interactive is False
+        assert renderer._cleanup_in_progress is False
+
+    def test_banner_renderer_unattached_start_retries_interrupted_session_close(self) -> None:
+        import aflow.status as status_mod
+        from unittest.mock import patch
+
+        startup_interrupt = KeyboardInterrupt("startup interrupt")
+        close_interrupt = KeyboardInterrupt("session close interrupt")
+
+        class FakeConsole:
+            is_terminal = True
+
+        class FakeSession:
+            instances: list["FakeSession"] = []
+
+            def __init__(self, console: object, *, wake_event: object) -> None:
+                del console, wake_event
+                self.close_calls = 0
+                self._thread: object | None = object()
+                self._restored = False
+                self._atexit_registered = True
+                self._started = True
+                self.instances.append(self)
+
+            @property
+            def thread(self) -> object | None:
+                return self._thread
+
+            @property
+            def is_restored(self) -> bool:
+                return self._restored
+
+            @property
+            def is_started(self) -> bool:
+                return self._started
+
+            @property
+            def is_settled(self) -> bool:
+                return (
+                    self._thread is None
+                    and self._restored
+                    and not self._atexit_registered
+                    and not self._started
+                )
+
+            def start(self) -> None:
+                return
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise close_interrupt
+                self._thread = None
+                self._restored = True
+                self._atexit_registered = False
+                self._started = False
+
+        class FakeLive:
+            instances: list["FakeLive"] = []
+
+            def __init__(self, panel: object, **kwargs: object) -> None:
+                del panel
+                self.kwargs = kwargs
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                raise startup_interrupt
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        renderer = status_mod.BannerRenderer(
+            config_max_turns=10,
+            config_plan_path=Path("/fake/plan.md"),
+            console=FakeConsole(),
+            refresh_interval_seconds=60.0,
+            git_poll_interval_seconds=9999.0,
+        )
+        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
+
+        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
+             patch.object(status_mod, "Live", FakeLive), \
+             patch.object(renderer, "_build", return_value="panel"):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                renderer.start(state)
+
+        session = FakeSession.instances[0]
+        live = FakeLive.instances[0]
+        assert raised.exception is startup_interrupt
+        assert session.close_calls == 2
+        assert session.thread is None
+        assert session.is_restored
+        assert session.is_started is False
+        assert session.is_settled
+        assert live.stop_calls == 1
+        assert len(FakeLive.instances) == 1
+        assert renderer._live is None
+        assert renderer._input_session is None
+        assert renderer._viewport is None
+        assert renderer._interactive is False
+        assert renderer._cleanup_in_progress is False
+
     def test_banner_renderer_failed_interactive_start_closes_session_before_fallback(self) -> None:
         import aflow.status as status_mod
         from unittest.mock import patch

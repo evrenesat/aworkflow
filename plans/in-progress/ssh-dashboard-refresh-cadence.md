@@ -21,6 +21,15 @@ This handoff changes AFlow itself. It does not change workflow routing, public C
   - `2026-08-02`: Checkpoint 5 reviewed via current-worktree fallback from `cp4 v01`; changes requested because repeated navigation/resize wakes can indefinitely bypass an already-due Git poll, background render failure leaves the interactive Live/session attached, and session-only `atexit` cleanup restores termios without exiting the alternate screen or showing the cursor. The same 12 lifecycle failures reproduce at `cp4 v01`, so they are unrelated baseline failures. Focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp01-v01.md`.
   - `2026-08-02`: The Checkpoint 5 `cp01-v01` repair was reviewed from the current worktree; changes remain requested because overlapping normal cleanup and a background Rich failure deadlock while each waits on the other, and refresh-thread startup failure leaves a started interactive Live/session attached. All focused checks pass, and the combined suite remains at 421 passed with the same 12 unrelated lifecycle failures. Focused repairs are in `plans/in-progress/ssh-dashboard-refresh-cadence-cp01-v02.md`.
   - `cp5 v01`: approved the deadlock-free cleanup ownership handoff and transactional startup repair; coordinated Rich-failure cleanup and both render-thread startup rollback paths terminate without stranded resources or duplicate snapshots. All focused checks pass, and the combined suite reports 424 passed with only the same 12 unrelated lifecycle baseline failures.
+  - `2026-08-02`: `aflow-review-final` approved the completed handoff through `cp5 v01` plus final repair `cp01-v04`. The review began with `0` new commits since `cp5 v01` and `5` total commits since the pre-handoff base, then accepted the interruption-safe teardown repair as the sixth implementation commit. Attached and unattached cleanup now settle reader shutdown, termios restoration, and callback unregistration before propagating the first `BaseException`; regression coverage exercises `Live.refresh()`, renderer/session-close retry, and interrupted `tcsetattr()`. Focused checks pass, and the combined suite reports 430 passed with the same 12 unrelated lifecycle baseline failures.
+
+## aflow-review-final
+
+- Status: approved
+- Reviewed Through: `cp5 v01 + final repair cp01-v04`
+- New Commits Since Last Review At Review Start: `0`
+- Total Implementation Commits Since Pre-Handoff Base HEAD After Approval: `6`
+- Approval Commit: `fix/aflow-ssh-dashboard-refresh-cadence-20260801-214511: settle interrupted TTY teardown`
 
 ## Done Means
 

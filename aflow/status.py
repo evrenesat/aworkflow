@@ -1092,25 +1092,50 @@ class BannerRenderer:
                 except Exception:
                     pass
             return None
+        except BaseException as exc:
+            if session is not None:
+                try:
+                    if not getattr(session, "is_restored", False):
+                        session.close()
+                except BaseException as cleanup_error:
+                    raise exc from cleanup_error
+            raise
 
     def _close_unattached_start_attempt(
         self,
         *,
         live: Live | None,
         input_session: TerminalInputSession | None,
+        interactive: bool,
     ) -> None:
         """Release resources that were acquired before renderer attachment."""
 
+        pending_base: BaseException | None = None
+
+        def attempt(operation: object) -> BaseException | None:
+            nonlocal pending_base
+            try:
+                operation()  # type: ignore[operator]
+            except Exception:
+                return None
+            except BaseException as exc:
+                if pending_base is None:
+                    pending_base = exc
+                return exc
+            return None
+
         if live is not None:
-            try:
-                live.stop()
-            except Exception:
-                pass
+            live_stop_interrupted = attempt(live.stop) is not None
+            if live_stop_interrupted and interactive:
+                attempt(lambda: self._console.show_cursor(True))
+                attempt(lambda: self._console.set_alt_screen(False))
         if input_session is not None:
-            try:
-                input_session.close()
-            except Exception:
-                pass
+            close_interrupted = attempt(input_session.close) is not None
+            if close_interrupted and not getattr(input_session, "is_settled", False):
+                attempt(input_session.close)
+
+        if pending_base is not None:
+            raise pending_base
 
     def _start_live_attempt(
         self,
@@ -1148,19 +1173,30 @@ class BannerRenderer:
             with self._lock:
                 if self._live is live:
                     self._startup_complete = True
-        except BaseException:
+        except BaseException as exc:
             if attached:
-                self._cleanup_interactive(
-                    state=None,
-                    render_final=False,
-                    print_snapshot=False,
-                    suppress_errors=True,
-                )
+                try:
+                    self._cleanup_interactive(
+                        state=None,
+                        render_final=False,
+                        print_snapshot=False,
+                        suppress_errors=True,
+                    )
+                except BaseException as cleanup_error:
+                    if isinstance(exc, Exception):
+                        raise cleanup_error from exc
+                    raise exc from cleanup_error
             else:
-                self._close_unattached_start_attempt(
-                    live=live,
-                    input_session=input_session,
-                )
+                try:
+                    self._close_unattached_start_attempt(
+                        live=live,
+                        input_session=input_session,
+                        interactive=interactive,
+                    )
+                except BaseException as cleanup_error:
+                    if isinstance(exc, Exception):
+                        raise cleanup_error from exc
+                    raise exc from cleanup_error
             raise
 
     def _start_live(self, panel: Group | Text) -> None:
@@ -1254,13 +1290,23 @@ class BannerRenderer:
             if not self._emergency_cleanup_registered:
                 return
             callback = self._emergency_cleanup_callback
-            self._emergency_cleanup_callback = None
-            self._emergency_cleanup_registered = False
+        settled = callback is None
         if callback is not None:
             try:
                 atexit.unregister(callback)  # type: ignore[arg-type]
             except Exception:
-                pass
+                settled = True
+            except BaseException:
+                # Keep ownership published so the cleanup transaction can
+                # retry after an interrupted unregister attempt.
+                raise
+            else:
+                settled = True
+        if settled:
+            with self._lock:
+                if self._emergency_cleanup_callback is callback:
+                    self._emergency_cleanup_callback = None
+                    self._emergency_cleanup_registered = False
 
     def _emergency_cleanup(self) -> None:
         self._cleanup_interactive(
@@ -1316,15 +1362,31 @@ class BannerRenderer:
         try:
             input_session = self._input_session
             errors: list[Exception] = []
-            if input_session is not None:
+            pending_base: BaseException | None = None
+
+            def attempt(operation: object) -> BaseException | None:
+                nonlocal pending_base
                 try:
-                    input_session.stop_reader()
+                    operation()  # type: ignore[operator]
                 except Exception as exc:
                     errors.append(exc)
-            try:
-                self._stop_refresh_thread()
-            except Exception as exc:
-                errors.append(exc)
+                    return None
+                except BaseException as exc:
+                    if pending_base is None:
+                        pending_base = exc
+                    return exc
+                return None
+
+            if input_session is not None:
+                stop_reader_interrupted = attempt(input_session.stop_reader) is not None
+                if stop_reader_interrupted:
+                    # A signal can interrupt join() before it clears the
+                    # renderer-owned thread reference.  Retry once while the
+                    # cleanup owner still has exclusive teardown ownership.
+                    attempt(input_session.stop_reader)
+            refresh_thread_interrupted = attempt(self._stop_refresh_thread) is not None
+            if refresh_thread_interrupted:
+                attempt(self._stop_refresh_thread)
 
             with self._lock:
                 live = self._live
@@ -1338,46 +1400,62 @@ class BannerRenderer:
                         built_panel = self._build(state, self._git_summary)
                     except Exception as exc:
                         errors.append(exc)
+                    except BaseException as exc:
+                        if pending_base is None:
+                            pending_base = exc
                     else:
                         if built_panel is not None:
                             panel = built_panel
                             self._last_panel = built_panel
-                self._live = None
-                self._viewport = None
-                self._input_session = None
-                self._interactive = False
-                self._startup_complete = False
 
             if live is not None:
                 if render_final and panel is not None:
-                    try:
+                    def render_final_panel() -> None:
                         if interactive and viewport is not None:
                             viewport.renderable = panel
                             live.update(viewport, refresh=False)
                             live.refresh()
                         else:
                             live.update(panel, refresh=False)
-                    except Exception as exc:
-                        errors.append(exc)
-                try:
-                    live.stop()
-                except Exception as exc:
-                    errors.append(exc)
+
+                    attempt(render_final_panel)
+                live_stop_interrupted = attempt(live.stop) is not None
+                if live_stop_interrupted and interactive:
+                    # Rich marks Live stopped near the beginning of stop().
+                    # If an interrupt lands before its own finally block, use
+                    # only public Console controls for the narrow recovery.
+                    attempt(lambda: self._console.show_cursor(True))
+                    attempt(lambda: self._console.set_alt_screen(False))
 
             if input_session is not None:
-                try:
-                    input_session.close()
-                except Exception as exc:
-                    errors.append(exc)
+                close_interrupted = attempt(input_session.close) is not None
+                if close_interrupted and not getattr(input_session, "is_settled", False):
+                    attempt(input_session.close)
 
-            self._unregister_emergency_cleanup()
+            unregister_interrupted = attempt(self._unregister_emergency_cleanup) is not None
+            if unregister_interrupted and self._emergency_cleanup_registered:
+                attempt(self._unregister_emergency_cleanup)
 
             if interactive and print_snapshot and panel is not None:
-                try:
-                    self._console.print(panel)
-                except Exception as exc:
-                    errors.append(exc)
+                attempt(lambda: self._console.print(panel))
 
+            # Keep ownership visible until Live and terminal restoration have
+            # both been attempted.  Cleanup callers are gated above, so they
+            # cannot observe a detached-but-unrestored renderer.
+            with self._lock:
+                owns_live = self._live is live
+                if owns_live:
+                    self._live = None
+                if self._viewport is viewport:
+                    self._viewport = None
+                if self._input_session is input_session:
+                    self._input_session = None
+                if owns_live or live is None:
+                    self._interactive = False
+                    self._startup_complete = False
+
+            if pending_base is not None:
+                raise pending_base
             if errors and not suppress_errors:
                 raise errors[0]
         finally:

@@ -349,6 +349,15 @@ class TerminalInputSession:
     def is_restored(self) -> bool:
         return self._restored
 
+    @property
+    def is_settled(self) -> bool:
+        return (
+            self._thread is None
+            and self._restored
+            and not self._atexit_registered
+            and not self._started
+        )
+
     def _validate_capabilities(self) -> tuple[int, list[Any]]:
         if not _POSIX_TERMINAL_AVAILABLE or not _RICH_AVAILABLE:
             raise RuntimeError("interactive viewport requires POSIX and Rich")
@@ -389,8 +398,13 @@ class TerminalInputSession:
             )
             self._thread = thread
             thread.start()
-        except Exception:
-            self.close()
+        except BaseException as exc:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                if isinstance(exc, Exception):
+                    raise cleanup_error from exc
+                raise exc from cleanup_error
             raise
 
     def _console_size(self) -> tuple[int, int] | None:
@@ -427,27 +441,73 @@ class TerminalInputSession:
     def restore(self) -> None:
         """Restore saved terminal attributes exactly once."""
 
-        if self._restored:
-            return
-        self._restored = True
-        if self._fd is not None and self._saved_attributes is not None:
-            try:
-                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attributes)
-            except Exception:
-                # A detached terminal can disappear during interpreter cleanup.
-                # There is no useful recovery in that case, but cleanup stays
-                # idempotent and never masks the workflow's original outcome.
-                pass
+        if not self._restored:
+            if self._fd is not None and self._saved_attributes is not None:
+                try:
+                    termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attributes)
+                except Exception:
+                    # A detached terminal can disappear during interpreter
+                    # cleanup.  There is no useful recovery in that case, but
+                    # cleanup stays idempotent and never masks the workflow's
+                    # original outcome.
+                    pass
+                except BaseException:
+                    # Leave ``_restored`` false so a later close can retry a
+                    # restore interrupted by KeyboardInterrupt/SystemExit.
+                    raise
+            self._restored = True
         if self._atexit_registered:
-            atexit.unregister(self.close)
-            self._atexit_registered = False
+            try:
+                atexit.unregister(self.close)
+            except Exception:
+                # Registration is cleanup-only state; a detached interpreter
+                # may reject unregistering it, but the terminal restore above
+                # is settled and the session remains idempotent.
+                self._atexit_registered = False
+            except BaseException:
+                # Keep the registration marker so a later close can retry the
+                # callback unregistration after an interrupted attempt.
+                raise
+            else:
+                self._atexit_registered = False
 
     def close(self) -> None:
         """Stop the reader and restore terminal attributes idempotently."""
 
-        self.stop_reader()
-        self.restore()
+        errors: list[Exception] = []
+        pending_base: BaseException | None = None
+        try:
+            self.stop_reader()
+        except Exception as exc:
+            errors.append(exc)
+        except BaseException as exc:
+            pending_base = exc
+            if self._thread is not None:
+                try:
+                    self.stop_reader()
+                except Exception as retry_error:
+                    errors.append(retry_error)
+                except BaseException:
+                    pass
+        try:
+            self.restore()
+        except Exception as exc:
+            errors.append(exc)
+        except BaseException as exc:
+            if pending_base is None:
+                pending_base = exc
+            if not self._restored or self._atexit_registered:
+                try:
+                    self.restore()
+                except Exception as retry_error:
+                    errors.append(retry_error)
+                except BaseException:
+                    pass
         self._started = False
+        if pending_base is not None:
+            raise pending_base
+        if errors:
+            raise errors[0]
 
     def _run(self) -> None:
         fd = self._fd
