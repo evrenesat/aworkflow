@@ -432,10 +432,10 @@ configured adapter already places its effective prompt in argv or a CLI flag;
 the dashboard/controller therefore has exclusive ownership of terminal input.
 
 ### `skill_installer.py`
-Discovers the nine default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
+Discovers the twelve default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead` and the same-task `aflow-guard-development-run`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
 
 ### `bundled_skills/`
-Nine default Markdown-based skill definitions plus one optional shipped skill installed into harness skill directories:
+Twelve default skill definitions plus one optional shipped skill installed into harness skill directories:
 
 | Skill                       | Purpose                                                        |
 |-----------------------------|----------------------------------------------------------------|
@@ -448,6 +448,9 @@ Nine default Markdown-based skill definitions plus one optional shipped skill in
 | `aflow-merge`               | Local-only merge handoff; preserves commits, resolves conflicts, emits `AFLOW_STOP:` for irrecoverable states |
 | `aflow-init-repo`           | Pre-lifecycle bootstrap; initializes a local repo and creates the initial commit from the plan preamble       |
 | `aflow-harness-recovery-lead` | Team-lead fallback for harness recovery; returns a strict machine-readable recovery decision |
+| `aflow-manager`             | Read-only Lite/Full interstep supervision                    |
+| `aflow-repartition-checkpoint` | Scope-preserving checkpoint split proposal and validation  |
+| `aflow-guard-development-run` | Same-task heartbeat guard for one exact AFlow run           |
 | `aflow-assistant`           | Optional evidence-first debugging and setup helper              |
 
 ### `api/`
@@ -559,6 +562,11 @@ aflow/
     aflow-review-checkpoint/ SKILL.md
     aflow-review-final/      SKILL.md
     aflow-merge/             SKILL.md
+    aflow-guard-development-run/
+      SKILL.md
+      agents/                openai.yaml
+      references/            aflow-defect-plan.md
+      scripts/               aflow_guard_snapshot.py
 tests/
   test_aflow.py        # workflow engine tests
   test_skill_install.py # skill installer tests

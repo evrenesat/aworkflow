@@ -40,11 +40,13 @@ aflow run path/to/plan.md
 `aflow install-skills` copies the default bundled skills, including
 `aflow-harness-recovery-lead`, the read-only `aflow-manager`, and the strict
 read-only `aflow-repartition-checkpoint`, into every detected supported harness
-skill directory. The optional `aflow-assistant` skill is not installed unless
-you ask for it. Keep the legacy recovery skill installed even when using manager
-supervision: manager-disabled configurations retain that recovery path. Manager
-and repartition prompts also carry their complete JSON contracts inline, so a
-missing static skill does not weaken protocol validation.
+skill directory. The default `aflow-guard-development-run` skill attaches one
+heartbeat to the task that requested supervision; it does not create a second
+task for scheduled beats. The optional `aflow-assistant` skill is not installed
+unless you ask for it. Keep the legacy recovery skill installed even when using
+manager supervision: manager-disabled configurations retain that recovery path.
+Manager and repartition prompts also carry their complete JSON contracts inline,
+so a missing static skill does not weaken protocol validation.
 
 Auto mode:
 
@@ -90,6 +92,7 @@ Default skills:
 - `aflow-harness-recovery-lead` - team-lead fallback for harness recovery decisions.
 - `aflow-manager` - read-only Lite/Full interstep supervision.
 - `aflow-repartition-checkpoint` - strict Full proposal and independent semantic validation for scope-preserving splits.
+- `aflow-guard-development-run` - same-task heartbeat supervision and bounded recovery for an exact AFlow run.
 
 Optional skills:
 
