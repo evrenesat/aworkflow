@@ -4,6 +4,7 @@ from dataclasses import replace
 import errno
 import hashlib
 from typing import Mapping
+from aflow.analyzer import extract_text_signals
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
 from aflow.api.events import ExecutionEventType
@@ -9661,11 +9662,18 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 ),
             )
             incident_stderr = (
-                "Prompt transcript: branch_mismatch_review_block\n"
-                "Plan transcript: dirty_merge_verification\n"
-                "Test transcript: needs_human_direction\n"
-                "Diff transcript: original_plan_missing\n"
+                "Prompt transcript: Plan Branch is feature/expected, but the "
+                "current checkout is feature/actual.\n"
+                "Plan transcript: Need your direction on one point.\n"
+                "Test transcript: the original plan file is missing after the turn.\n"
+                "Diff transcript: merge verification cannot be completed safely.\n"
             )
+            assert set(extract_text_signals(incident_stderr)) == {
+                "branch_mismatch_review_block",
+                "dirty_merge_verification",
+                "needs_human_direction",
+                "original_plan_missing",
+            }
             manager_prompts: list[str] = []
             manager_contexts: list[dict[str, object]] = []
             review_cwds: list[Path] = []
