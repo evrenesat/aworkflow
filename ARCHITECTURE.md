@@ -15,7 +15,7 @@ flowchart TD
     PromptRender["workflow.py — render_step_prompts()"]
     Role["workflow.py — resolve_role_selector()"]
     Adapter["harnesses/ — build CLI invocation"]
-    Subprocess["workflow.py — _run_process() via subprocess.Popen"]
+    Subprocess["workflow.py — _run_process() via subprocess.Popen (stdin=DEVNULL)"]
     PlanReload["plan.py — reload plan, compute post-snapshot"]
     Transition["workflow.py — evaluate_condition() + proposed transition"]
     Manager["workflow.py — optional manager gate"]
@@ -220,7 +220,7 @@ The core engine. `run_workflow()` executes the turn loop:
    c. Resolve the step's role through the selected team and global role map to get the concrete harness selector.
    d. Render prompt templates with path placeholders.
    e. Build a `HarnessInvocation` via the adapter, using `execution_repo_root` as the subprocess cwd.
-   f. Run the agent CLI as a subprocess, streaming stdout/stderr.
+   f. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
    g. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
    h. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
    i. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
@@ -286,7 +286,7 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | Harness    | CLI binary  | Prompt mode                    | Effort support |
 |------------|-------------|--------------------------------|----------------|
 | `claude`   | `claude`    | `--system-prompt` flag         | Yes            |
-| `codex`    | `codex`     | system prefixed into user prompt | Yes          |
+| `codex`    | `codex`     | stdin via `exec -`              | Yes          |
 | `copilot`  | `copilot`   | system prefixed into user prompt | Yes          |
 | `gemini`   | `gemini`    | system prefixed into user prompt | No           |
 | `kiro`     | `kiro-cli`  | system prefixed into user prompt | No           |
@@ -295,6 +295,21 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
 
 All harnesses run in non-interactive, auto-approve mode with full tool access.
+Their effective prompts are delivered through argv or explicit prompt flags, so
+`workflow._run_process()` starts real children with `stdin=subprocess.DEVNULL`.
+This leaves the controller/dashboard as the sole owner of interactive terminal
+input while preserving the existing stdout/stderr pipes, return codes, and
+prompt metadata. Injected runner callables are unchanged.
+
+Codex uses the documented `codex exec ... -` form: the complete effective
+prompt is sent through stdin and is never added to argv. The subprocess
+boundary drains stdout and stderr while feeding stdin, and the equivalent
+injected-runner boundary supplies the same `input` value. If process creation
+raises `OSError`, either boundary returns an empty-output, prompt-free
+`CompletedProcess` with a concise harness/errno/OS-message diagnostic; missing
+executables use return code 127 and other launch failures use 126. Manager,
+worker, recovery, and lifecycle callers then use their existing nonzero-result
+handling.
 
 ### `run_state.py`
 Data classes for runtime state:
@@ -347,19 +362,57 @@ Git snapshot helpers used by the banner and CLI. Provides three public data clas
 All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
 
 ### `status.py`
-Rich-based live banner rendered to stderr during a run. Shows elapsed time, run id, resumed-from run id when present, workflow/step name, harness, model, checkpoint progress, turn count, issues, plan paths, git summary (if available), schema/frozen-config identity, safe override diagnostics, and status.
+Rich-based live banner rendered to stderr during a run. The live dashboard is
+a borderless, deterministic single-column document ordered as the plan title,
+current-scope review history, chronological turns, workflow graph, and summary
+status. It shows elapsed time, run id, resumed-from run id when present,
+workflow/step name, harness, model, checkpoint progress, turn count, issues,
+plan paths, git summary (if available), schema/frozen-config identity, safe
+override diagnostics, and status.
 When the active implementation scope has rejected reviews, it also shows every
 current-scope rejection before the chronological turn cards and labels the next
 worker as a re-implementation with its compact rejection reason.
-The module also owns the shared workflow-graph and role/team render helpers used by both the live banner and `aflow show`, so classification rules stay identical across the two views.
+Workflow steps carry explicit plain-text active, inactive, excluded, or skipped
+labels; color is only additional reinforcement. Controller-owned values use
+literal `Text` renderables so Rich markup-like content remains unchanged. The
+module also owns the shared workflow-graph classification helpers used by both
+the live banner and `aflow show`; only the live branch is flattened, while
+`build_workflow_show()` retains its panel-based presentation.
 
-`BannerRenderer` owns a background daemon thread that rebuilds and pushes the panel every `refresh_interval_seconds` (default 1 s) and polls for a new `GitSummary` every `git_poll_interval_seconds` (default 10 s). This keeps the elapsed timer alive between step transitions without requiring external pushes. `set_context(...)` is used to update mutable banner fields instead of directly writing private attributes.
+`BannerRenderer` owns a background daemon thread that waits for the first
+`refresh_interval_seconds` deadline and then performs one explicit
+`Live.update(..., refresh=False)` plus `Live.refresh()` per periodic repaint
+(default 3 s). Rich automatic refresh is disabled, and ordinary
+`update(...)`/`set_context(...)` calls only replace the newest state/context
+for the next tick. Git collection remains independently due every
+`git_poll_interval_seconds` (default 10 s), while lifecycle paints are kept
+explicit and bounded so manager reports can follow the stopped banner. Input
+wakes are drained within the same scheduler cycle, before due Git collection,
+so continuous navigation cannot starve Git and coincident work causes one
+repaint.
+On a supported POSIX TTY, `BannerRenderer` also creates one
+`TerminalInputSession` and one `ScrollableViewport`. The session owns cbreak
+input and a bounded `select()` reader, but only enqueues decoded navigation or
+resize work; the render thread applies all queued work and is the only
+background caller of `Live.update()`/`Live.refresh()`. Interactive `Live`
+instances use `screen=True`, `auto_refresh=False`, and cropped viewport output;
+all other consoles retain the borderless, non-interactive fallback. `k`/Up,
+`j`/Down, `b`/PageUp, `f`/Space/PageDown, `g`/Home, and `G`/End provide
+line/page/top/bottom navigation, with bottom restoring follow-tail. Pause and
+stop join the input and render threads, stop `Live`, restore terminal
+attributes, and then print one full borderless snapshot to normal scrollback
+only when alternate-screen mode was active. Background renderer failures and
+interpreter exit use the same idempotent renderer-owned cleanup, including
+Rich cursor/alternate-screen restoration and the session's termios restore.
+During a live run, real harness children receive closed stdin because every
+configured adapter already places its effective prompt in argv or a CLI flag;
+the dashboard/controller therefore has exclusive ownership of terminal input.
 
 ### `skill_installer.py`
-Discovers the nine default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
+Discovers the twelve default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead` and the same-task `aflow-guard-development-run`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
 
 ### `bundled_skills/`
-Nine default Markdown-based skill definitions plus one optional shipped skill installed into harness skill directories:
+Twelve default skill definitions plus one optional shipped skill installed into harness skill directories:
 
 | Skill                       | Purpose                                                        |
 |-----------------------------|----------------------------------------------------------------|
@@ -372,6 +425,9 @@ Nine default Markdown-based skill definitions plus one optional shipped skill in
 | `aflow-merge`               | Local-only merge handoff; preserves commits, resolves conflicts, emits `AFLOW_STOP:` for irrecoverable states |
 | `aflow-init-repo`           | Pre-lifecycle bootstrap; initializes a local repo and creates the initial commit from the plan preamble       |
 | `aflow-harness-recovery-lead` | Team-lead fallback for harness recovery; returns a strict machine-readable recovery decision |
+| `aflow-manager`             | Read-only Lite/Full interstep supervision                    |
+| `aflow-repartition-checkpoint` | Scope-preserving checkpoint split proposal and validation  |
+| `aflow-guard-development-run` | Same-task heartbeat guard for one exact AFlow run           |
 | `aflow-assistant`           | Optional evidence-first debugging and setup helper              |
 
 ### `api/`
@@ -459,7 +515,7 @@ aflow/
   run_state.py         # runtime data classes
   repartition.py       # immutable envelopes, strict split protocol, validation
   runlog.py            # run/turn artifact persistence
-  status.py            # Rich live banner with background refresh thread
+  status.py            # Rich live banner with AFlow-owned refresh thread
   git_status.py        # git snapshot helpers (probe, baseline, summary)
   skill_installer.py   # bundled skill installer
   aflow.toml           # global config, harness profiles, roles, teams, prompts
@@ -483,6 +539,11 @@ aflow/
     aflow-review-checkpoint/ SKILL.md
     aflow-review-final/      SKILL.md
     aflow-merge/             SKILL.md
+    aflow-guard-development-run/
+      SKILL.md
+      agents/                openai.yaml
+      references/            aflow-defect-plan.md
+      scripts/               aflow_guard_snapshot.py
 tests/
   test_aflow.py        # workflow engine tests
   test_skill_install.py # skill installer tests
