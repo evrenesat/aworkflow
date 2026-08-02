@@ -293,7 +293,7 @@ class ProjectCatalog:
             current_path=current_path,
             historical_aliases=tuple(record.historical_aliases),
             detection_source=detection_source,
-            linked_thread_count=session_count,
+            linked_session_count=session_count,
             is_git_root=is_git_root,
             registered_at=record.registered_at,
         )

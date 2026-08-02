@@ -19,7 +19,6 @@ from .planning import (
 )
 from .planning.models import StartTurnRequest as PlanningStartTurnRequest
 from .project_catalog import ProjectCatalog
-from .plan_store import PlanStore, PlanStoreError
 
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["projects"])
@@ -75,16 +74,6 @@ class StartTurnRequest(LegacyRequest):
             if item.get("type") != "text" or not isinstance(item.get("text"), str):
                 raise ValueError("only text input is supported by this compatibility route")
         return self
-
-
-class SaveDraftRequest(BaseModel):
-    name: str
-    content: str
-
-
-class PromotePlanRequest(BaseModel):
-    draft_name: str
-    target_name: str | None = None
 
 
 def _get_config():
@@ -208,7 +197,7 @@ async def _require_owned_session(
     return session
 
 
-@router.get("/threads")
+@router.get("/threads", deprecated=True)
 async def list_threads(
     project_id: str,
     cwd: str | None = None,
@@ -266,7 +255,7 @@ def _backend_status(ready: bool, message: str | None = None) -> dict[str, str | 
     }
 
 
-@router.get("/threads/{thread_id}")
+@router.get("/threads/{thread_id}", deprecated=True)
 async def read_thread(
     project_id: str,
     thread_id: str,
@@ -289,8 +278,7 @@ async def read_thread(
     except ProviderOperationError as error:
         raise _provider_error(error) from error
 
-
-@router.post("/threads")
+@router.post("/threads", deprecated=True)
 async def start_thread(
     project_id: str,
     request: StartThreadRequest,
@@ -311,7 +299,7 @@ async def start_thread(
         raise _provider_error(error) from error
 
 
-@router.post("/threads/{thread_id}/resume")
+@router.post("/threads/{thread_id}/resume", deprecated=True)
 async def resume_thread(
     project_id: str,
     thread_id: str,
@@ -334,7 +322,7 @@ async def resume_thread(
         raise _provider_error(error) from error
 
 
-@router.post("/threads/{thread_id}/fork")
+@router.post("/threads/{thread_id}/fork", deprecated=True)
 async def fork_thread(
     project_id: str,
     thread_id: str,
@@ -357,7 +345,7 @@ async def fork_thread(
         raise _provider_error(error) from error
 
 
-@router.patch("/threads/{thread_id}/name")
+@router.patch("/threads/{thread_id}/name", deprecated=True)
 async def set_thread_name(
     project_id: str,
     thread_id: str,
@@ -378,7 +366,7 @@ async def set_thread_name(
         raise _provider_error(error) from error
 
 
-@router.post("/threads/{thread_id}/turns")
+@router.post("/threads/{thread_id}/turns", deprecated=True)
 async def start_turn(
     project_id: str,
     thread_id: str,
@@ -406,142 +394,3 @@ async def start_turn(
         return _legacy_turn(turn)
     except ProviderOperationError as error:
         raise _provider_error(error) from error
-
-
-@router.post("/plans/drafts", status_code=status.HTTP_201_CREATED)
-async def save_draft(
-    project_id: str,
-    request: SaveDraftRequest,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> dict[str, Any]:
-    """Save a plan as a draft."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    store = PlanStore(project.current_path)
-    try:
-        path = store.save_draft(request.name, request.content)
-        return {
-            "name": request.name,
-            "path": str(path),
-            "status": "draft",
-        }
-    except PlanStoreError as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
-        ) from error
-
-
-@router.get("/plans/drafts")
-async def list_drafts(
-    project_id: str,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> list[str]:
-    """List all draft plans for a repository."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    store = PlanStore(project.current_path)
-    return store.list_drafts()
-
-
-@router.get("/plans/drafts/{name}")
-async def load_draft(
-    project_id: str,
-    name: str,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> dict[str, str]:
-    """Load a draft plan."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    store = PlanStore(project.current_path)
-    try:
-        content = store.load_draft(name)
-        return {"name": name, "content": content}
-    except PlanStoreError as error:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
-        ) from error
-
-
-@router.delete("/plans/drafts/{name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_draft(
-    project_id: str,
-    name: str,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> None:
-    """Delete a draft plan."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    store = PlanStore(project.current_path)
-    if not store.delete_draft(name):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Draft not found",
-        )
-
-
-@router.post("/plans/promote")
-async def promote_plan(
-    project_id: str,
-    request: PromotePlanRequest,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> dict[str, Any]:
-    """Promote a draft plan to in-progress status."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    store = PlanStore(project.current_path)
-    try:
-        path = store.promote_to_in_progress(request.draft_name, request.target_name)
-        return {
-            "name": path.stem,
-            "path": str(path),
-            "status": "in_progress",
-        }
-    except PlanStoreError as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
-        ) from error
-
-
-@router.get("/plans/in-progress")
-async def list_in_progress(
-    project_id: str,
-    project_catalog: ProjectCatalog = Depends(_get_project_catalog),
-) -> list[str]:
-    """List all in-progress plans for a repository."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    store = PlanStore(project.current_path)
-    return store.list_in_progress()

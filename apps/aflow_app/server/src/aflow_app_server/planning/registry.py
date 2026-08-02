@@ -56,6 +56,13 @@ class ProviderRegistry:
                 )
             ) from exc
 
+    def resolve_for_dispatch(self, provider_id: str) -> PlanningProvider:
+        """Resolve a provider only when its application startup succeeded."""
+        provider = self.get(provider_id)
+        if startup_error := self._startup_errors.get(provider_id):
+            raise ProviderOperationError(startup_error)
+        return provider
+
     async def start(self) -> None:
         results = await asyncio.gather(
             *(self._start_provider(provider) for provider in self._providers.values())
@@ -80,6 +87,11 @@ class ProviderRegistry:
             )
             self._log_failure(provider.provider_id, "start", "timeout", exc)
             return provider.provider_id, error
+        except ProviderOperationError as exc:
+            self._log_failure(
+                provider.provider_id, "start", "provider_failure", exc
+            )
+            return provider.provider_id, exc.error
         except Exception as exc:
             error = self._safe_error(
                 provider.provider_id,
@@ -161,9 +173,7 @@ class ProviderRegistry:
     ) -> tuple[tuple[Session, ...], tuple[ProviderReadiness, ...]]:
         """List sessions while isolating failures when enumerating all providers."""
         if provider_id is not None:
-            provider = self.get(provider_id)
-            if startup_error := self._startup_errors.get(provider.provider_id):
-                raise ProviderOperationError(startup_error)
+            provider = self.resolve_for_dispatch(provider_id)
             try:
                 page = await asyncio.wait_for(
                     provider.list_sessions(cwd=cwd, archived=archived), timeout=self._timeout
@@ -309,7 +319,14 @@ class UnavailablePlanningProvider(PlanningProvider):
         return ProviderCapabilities()
 
     async def start(self) -> None:
-        return None
+        raise ProviderOperationError(
+            PlanningError(
+                code=PlanningErrorCode.PROVIDER_UNAVAILABLE,
+                message="Planning provider adapter is not available.",
+                provider_id=self.provider_id,
+                retryable=False,
+            )
+        )
 
     async def close(self) -> None:
         return None

@@ -22,6 +22,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .aflow_service import AflowService
 import aflow_app_server.codex_routes as codex_routes_module
+import aflow_app_server.planning_routes as planning_routes_module
 from .config import ServerConfig
 from .models import ExecutionRequest, ExecutionStatus
 from .planning import AttachmentStore, PlanningService, ProviderRegistry
@@ -307,9 +308,12 @@ async def block_local_plugin_probe(request: Request, call_next):
 app.dependency_overrides[codex_routes_module._get_config] = get_config
 app.dependency_overrides[codex_routes_module._get_project_catalog] = get_project_catalog
 app.dependency_overrides[codex_routes_module._get_planning_service] = get_planning_service
+app.dependency_overrides[planning_routes_module._get_project_catalog] = get_project_catalog
+app.dependency_overrides[planning_routes_module._get_planning_service] = get_planning_service
 
 # Include Codex routes with auth
 app.include_router(codex_routes_module.router, dependencies=[Depends(verify_token)])
+app.include_router(planning_routes_module.router, dependencies=[Depends(verify_token)])
 
 
 # Request/Response models

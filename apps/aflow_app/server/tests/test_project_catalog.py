@@ -44,9 +44,9 @@ def _init_git_repo(path: Path) -> Path:
     return path
 
 
-def _make_session(session_id: str, cwd: Path) -> Session:
+def _make_session(session_id: str, cwd: Path, provider_id: str = "codex") -> Session:
     return Session(
-        key=SessionKey(provider_id="codex", provider_session_id=session_id),
+        key=SessionKey(provider_id=provider_id, provider_session_id=session_id),
         project_id=None,
         preview="preview",
         created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
@@ -88,10 +88,28 @@ def test_merges_thread_cwds_into_catalog(tmp_path: Path) -> None:
     by_path = {project.current_path: project for project in projects}
 
     assert by_path[alpha].linked_thread_count == 1
+    assert by_path[alpha].linked_session_count == 1
     assert by_path[alpha].detection_source == "local_git_root+planning_session_cwd"
     assert by_path[thread_only].linked_thread_count == 1
     assert by_path[thread_only].detection_source == "planning_session_cwd"
     assert by_path[thread_only].is_git_root is False
+
+
+def test_linked_session_count_aggregates_provider_qualified_sessions(
+    tmp_path: Path,
+) -> None:
+    project = _make_git_repo(tmp_path / "code" / "project")
+    sessions = [
+        _make_session("shared-id", project, "codex"),
+        _make_session("shared-id", project, "other"),
+    ]
+
+    result = ProjectCatalog(
+        tmp_path / "code", tmp_path / "project_overrides.json"
+    ).list_projects(sessions=sessions)[0]
+
+    assert result.linked_session_count == 2
+    assert result.linked_thread_count == 2
 
 
 def test_catalog_without_provider_enrichment_remains_available(tmp_path: Path) -> None:

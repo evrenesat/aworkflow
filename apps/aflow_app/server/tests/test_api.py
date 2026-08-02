@@ -813,6 +813,22 @@ class TestPlanDraftEndpoints:
         assert draft_path.exists()
         assert draft_path.read_text() == content
 
+    def test_save_draft_ignores_unrelated_payload_fields(
+        self,
+        client_with_config: TestClient,
+        test_config: ServerConfig,
+    ) -> None:
+        project_path = _create_git_project(test_config.projects_home, "draft-extra")
+        project_id = _project_id_for_path(client_with_config, project_path)
+
+        response = client_with_config.post(
+            f"/api/projects/{project_id}/plans/drafts",
+            json={"name": "test-plan", "content": "content", "harmless": True},
+        )
+
+        assert response.status_code == 201
+        assert (project_path / "plans" / "drafts" / "test-plan.md").read_text() == "content"
+
     def test_list_drafts(
         self,
         client_with_config: TestClient,
@@ -914,6 +930,26 @@ class TestPlanDraftEndpoints:
         in_progress_path = project_path / "plans" / "in-progress" / "test-plan.md"
         assert in_progress_path.exists()
         assert in_progress_path.read_text() == content
+
+    def test_promote_plan_ignores_unrelated_payload_fields(
+        self,
+        client_with_config: TestClient,
+        test_config: ServerConfig,
+    ) -> None:
+        project_path = _create_git_project(test_config.projects_home, "promote-extra")
+        project_id = _project_id_for_path(client_with_config, project_path)
+        client_with_config.post(
+            f"/api/projects/{project_id}/plans/drafts",
+            json={"name": "test-plan", "content": "content"},
+        )
+
+        response = client_with_config.post(
+            f"/api/projects/{project_id}/plans/promote",
+            json={"draft_name": "test-plan", "harmless": True},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "in_progress"
 
     def test_list_in_progress(
         self,
