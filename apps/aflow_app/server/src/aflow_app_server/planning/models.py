@@ -54,6 +54,9 @@ class PlanningErrorCode(str, Enum):
     SESSION_NOT_FOUND = "session_not_found"
     CAPABILITY_UNSUPPORTED = "capability_unsupported"
     CONFLICT = "conflict"
+    ATTACHMENT_NOT_FOUND = "attachment_not_found"
+    ATTACHMENT_LIMIT_EXCEEDED = "attachment_limit_exceeded"
+    ATTACHMENT_IN_USE = "attachment_in_use"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -75,6 +78,8 @@ class ProviderCapabilities(PlanningModel):
     reasoning_levels: tuple[str, ...] = ()
     reasoning_summaries: tuple[str, ...] = ()
     attachments: bool = False
+    attachment_kinds: tuple[AttachmentKind, ...] = ()
+    output_schema: bool = False
     fork: bool = False
     archive: bool = False
     approvals: bool = False
@@ -120,6 +125,16 @@ class Attachment(PlanningModel):
     kind: AttachmentKind
     media_type: str | None = None
     size_bytes: int = Field(ge=0)
+    created_at: datetime | None = None
+
+    @field_validator("attachment_id")
+    @classmethod
+    def validate_attachment_id(cls, value: str) -> str:
+        if value in {".", ".."} or any(
+            character not in _URL_SEGMENT_CHARACTERS for character in value
+        ):
+            raise ValueError("attachment_id must be a URL-safe path segment")
+        return value
 
 
 class Turn(PlanningModel):
@@ -129,6 +144,7 @@ class Turn(PlanningModel):
     error: PlanningError | None = None
     created_at: datetime | None = None
     completed_at: datetime | None = None
+    attachment_ids: tuple[str, ...] = ()
 
 
 class Session(PlanningModel):
@@ -140,6 +156,7 @@ class Session(PlanningModel):
     status: SessionStatus = SessionStatus.UNKNOWN
     model: str | None = None
     reasoning_level: str | None = None
+    archived: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
     turns: tuple[Turn, ...] = ()

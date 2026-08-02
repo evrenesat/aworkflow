@@ -87,6 +87,21 @@ def test_config_rejects_unknown_execution_policy(tmp_path: Path) -> None:
     assert "planning_execution_policy must be 'full_access'" in config.validate()
 
 
+def test_config_requires_nonzero_attachment_limits(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        attachment_max_file_size_bytes=0,
+        attachment_max_count_per_turn=0,
+        attachment_max_total_size_bytes_per_turn=0,
+    )
+
+    assert config.validate() == [
+        "attachment_max_file_size_bytes must be greater than zero",
+        "attachment_max_count_per_turn must be greater than zero",
+        "attachment_max_total_size_bytes_per_turn must be greater than zero",
+    ]
+
+
 def test_new_file_values_override_legacy_environment_aliases(
     tmp_path: Path, monkeypatch
 ) -> None:

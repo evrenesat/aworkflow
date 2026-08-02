@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -37,6 +38,7 @@ def test_config(tmp_path: Path, test_token: str) -> ServerConfig:
         transcription_token=None,
         projects_home=tmp_path / "code",
         project_overrides_path=tmp_path / "project_overrides.json",
+        attachment_root=tmp_path / "attachments",
     )
 
 
@@ -76,6 +78,46 @@ def _project_id_for_path(client: TestClient, project_path: Path) -> str:
         if project["current_path"] == str(project_path):
             return project["id"]
     raise AssertionError(f"Project not found for path: {project_path}")
+
+
+def test_lifespan_owns_shared_attachment_store_for_codex(
+    test_config: ServerConfig,
+) -> None:
+    from aflow_app_server import main as main_module
+    from aflow_app_server.planning import AttachmentKind
+    from aflow_app_server.planning.providers import CodexProvider
+
+    async def check() -> None:
+        with (
+            patch.object(ServerConfig, "from_env", return_value=test_config),
+            patch.object(CodexProvider, "start", new=AsyncMock()),
+            patch.object(CodexProvider, "close", new=AsyncMock()),
+        ):
+            async with main_module.lifespan(app):
+                service = main_module.get_planning_service()
+                provider = service.registry.get("codex")
+                store = service.attachment_store
+
+                assert store is not None
+                assert store.root == test_config.attachment_root.resolve()
+                assert store._max_file_size == test_config.attachment_max_file_size_bytes
+                assert store._max_count == test_config.attachment_max_count_per_turn
+                assert (
+                    store._max_total_size
+                    == test_config.attachment_max_total_size_bytes_per_turn
+                )
+                assert provider._attachment_store is store
+                assert provider.capabilities.attachments is True
+                assert provider.capabilities.attachment_kinds == (
+                    AttachmentKind.FILE,
+                    AttachmentKind.IMAGE,
+                )
+                assert app.state.attachment_store is store
+
+        assert app.state.planning_service is None
+        assert app.state.attachment_store is None
+
+    asyncio.run(check())
 
 
 @pytest.fixture

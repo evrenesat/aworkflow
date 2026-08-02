@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .attachment_store import AttachmentStore
 from .models import (
     ApprovalDecision,
     PendingApproval,
@@ -19,9 +20,16 @@ from .registry import ProviderRegistry
 class PlanningService:
     """Provider-neutral facade used by current and future HTTP routes."""
 
-    def __init__(self, registry: ProviderRegistry, *, default_provider_id: str | None) -> None:
+    def __init__(
+        self,
+        registry: ProviderRegistry,
+        *,
+        default_provider_id: str | None,
+        attachment_store: AttachmentStore | None = None,
+    ) -> None:
         self.registry = registry
         self.default_provider_id = default_provider_id
+        self.attachment_store = attachment_store
 
     async def provider_statuses(self) -> tuple[ProviderReadiness, ...]:
         return await self.registry.readiness()
@@ -71,8 +79,16 @@ class PlanningService:
     async def fork_session(self, key: SessionKey, *, cwd: str) -> Session:
         return await self._provider(key.provider_id).fork_session(key, cwd=cwd)
 
-    async def start_turn(self, key: SessionKey, request: StartTurnRequest) -> Turn:
-        return await self._provider(key.provider_id).start_turn(key, request)
+    async def start_turn(
+        self,
+        key: SessionKey,
+        request: StartTurnRequest,
+        *,
+        context: AuthorizedProjectContext | None = None,
+    ) -> Turn:
+        return await self._provider(key.provider_id).start_turn(
+            key, request, context=context
+        )
 
     async def set_session_name(self, key: SessionKey, name: str) -> None:
         await self._provider(key.provider_id).set_session_name(key, name)

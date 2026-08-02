@@ -24,7 +24,7 @@ from .aflow_service import AflowService
 import aflow_app_server.codex_routes as codex_routes_module
 from .config import ServerConfig
 from .models import ExecutionRequest, ExecutionStatus
-from .planning import PlanningService, ProviderRegistry
+from .planning import AttachmentStore, PlanningService, ProviderRegistry
 from .planning.providers import CodexProvider
 from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
@@ -229,6 +229,14 @@ async def lifespan(app: FastAPI):
         _config.transcription_url,
         _config.transcription_token,
     )
+    attachment_store = AttachmentStore(
+        _config.attachment_root,
+        max_file_size_bytes=_config.attachment_max_file_size_bytes,
+        max_count_per_turn=_config.attachment_max_count_per_turn,
+        max_total_size_bytes_per_turn=(
+            _config.attachment_max_total_size_bytes_per_turn
+        ),
+    )
     providers = []
     for provider in _config.planning_providers:
         if not provider.enabled:
@@ -242,6 +250,7 @@ async def lifespan(app: FastAPI):
                     server_token=provider.server_token,
                     operation_timeout_seconds=_config.planning_operation_timeout_seconds,
                     execution_policy=_config.planning_execution_policy,
+                    attachment_store=attachment_store,
                 )
             )
         else:
@@ -256,8 +265,10 @@ async def lifespan(app: FastAPI):
     _planning_service = PlanningService(
         _planning_registry,
         default_provider_id=_config.default_planning_provider_id,
+        attachment_store=attachment_store,
     )
     app.state.planning_service = _planning_service
+    app.state.attachment_store = attachment_store
 
     try:
         yield
@@ -265,6 +276,7 @@ async def lifespan(app: FastAPI):
         await _planning_registry.close()
         # Cleanup
         app.state.planning_service = None
+        app.state.attachment_store = None
         _planning_service = None
         _planning_registry = None
         _config = None

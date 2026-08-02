@@ -105,7 +105,13 @@ class PlanningProvider(ABC):
     async def fork_session(self, key: SessionKey, *, cwd: str) -> Session:
         raise NotImplementedError
 
-    async def start_turn(self, key: SessionKey, request: StartTurnRequest) -> Turn:
+    async def start_turn(
+        self,
+        key: SessionKey,
+        request: StartTurnRequest,
+        *,
+        context: AuthorizedProjectContext | None = None,
+    ) -> Turn:
         raise NotImplementedError
 
     async def set_session_name(self, key: SessionKey, name: str) -> None:

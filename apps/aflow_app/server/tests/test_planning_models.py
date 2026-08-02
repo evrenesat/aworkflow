@@ -14,6 +14,7 @@ from aflow_app_server.planning import (
     Session,
     SessionKey,
     StartSessionRequest,
+    StartTurnRequest,
 )
 
 
@@ -59,6 +60,24 @@ def test_start_session_request_rejects_route_owned_project_fields() -> None:
         StartSessionRequest.model_validate({"project_id": "project-one"})
     with pytest.raises(ValidationError):
         StartSessionRequest.model_validate({"unexpected": True})
+
+
+def test_turn_controls_are_provider_neutral_and_reject_sandbox_overrides() -> None:
+    request = StartTurnRequest(
+        text="plan",
+        attachment_ids=("att_one",),
+        model="model-one",
+        reasoning_level="high",
+        reasoning_summary="concise",
+        output_schema={"type": "object"},
+    )
+
+    assert request.reasoning_level == "high"
+    assert request.attachment_ids == ("att_one",)
+    with pytest.raises(ValidationError):
+        StartTurnRequest.model_validate(
+            {"text": "plan", "sandbox": "danger-full-access"}
+        )
 
 
 class CapturingProvider(PlanningProvider):

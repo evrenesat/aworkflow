@@ -55,6 +55,9 @@ class ServerConfig:
     attachment_root: Path = field(
         default_factory=lambda: Path("~/.config/aflow/attachments").expanduser()
     )
+    attachment_max_file_size_bytes: int = 25 * 1024 * 1024
+    attachment_max_count_per_turn: int = 10
+    attachment_max_total_size_bytes_per_turn: int = 50 * 1024 * 1024
     planning_operation_timeout_seconds: float = 30.0
     planning_execution_policy: str = "full_access"
 
@@ -193,6 +196,26 @@ class ServerConfig:
                     planning_section.get("attachment_root", str(config_dir / "attachments")),
                 )
             ).expanduser(),
+            attachment_max_file_size_bytes=int(
+                os.environ.get(
+                    "AFLOW_PLANNING_ATTACHMENT_MAX_FILE_SIZE_BYTES",
+                    planning_section.get("attachment_max_file_size_bytes", 25 * 1024 * 1024),
+                )
+            ),
+            attachment_max_count_per_turn=int(
+                os.environ.get(
+                    "AFLOW_PLANNING_ATTACHMENT_MAX_COUNT_PER_TURN",
+                    planning_section.get("attachment_max_count_per_turn", 10),
+                )
+            ),
+            attachment_max_total_size_bytes_per_turn=int(
+                os.environ.get(
+                    "AFLOW_PLANNING_ATTACHMENT_MAX_TOTAL_SIZE_BYTES_PER_TURN",
+                    planning_section.get(
+                        "attachment_max_total_size_bytes_per_turn", 50 * 1024 * 1024
+                    ),
+                )
+            ),
             planning_operation_timeout_seconds=float(
                 os.environ.get(
                     "AFLOW_PLANNING_OPERATION_TIMEOUT_SECONDS",
@@ -257,6 +280,14 @@ class ServerConfig:
             )
         if self.planning_operation_timeout_seconds <= 0:
             errors.append("planning_operation_timeout_seconds must be greater than zero")
+        if self.attachment_max_file_size_bytes <= 0:
+            errors.append("attachment_max_file_size_bytes must be greater than zero")
+        if self.attachment_max_count_per_turn <= 0:
+            errors.append("attachment_max_count_per_turn must be greater than zero")
+        if self.attachment_max_total_size_bytes_per_turn <= 0:
+            errors.append(
+                "attachment_max_total_size_bytes_per_turn must be greater than zero"
+            )
         if self.planning_execution_policy != "full_access":
             errors.append("planning_execution_policy must be 'full_access'")
         return errors

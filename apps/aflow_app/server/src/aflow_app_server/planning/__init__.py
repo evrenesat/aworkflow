@@ -1,5 +1,12 @@
 """Provider-neutral planning session domain and service boundary."""
 
+from .attachment_store import (
+    AttachmentLease,
+    AttachmentNamespace,
+    AttachmentStore,
+    StoredAttachment,
+)
+
 from .models import (
     Attachment,
     AttachmentKind,
@@ -25,6 +32,9 @@ from .service import PlanningService
 __all__ = [
     "Attachment",
     "AttachmentKind",
+    "AttachmentLease",
+    "AttachmentNamespace",
+    "AttachmentStore",
     "AuthorizedProjectContext",
     "PlanningError",
     "PlanningErrorCode",
@@ -42,6 +52,7 @@ __all__ = [
     "SessionStatus",
     "StartSessionRequest",
     "StartTurnRequest",
+    "StoredAttachment",
     "Turn",
     "TurnStatus",
 ]
