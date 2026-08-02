@@ -71,6 +71,16 @@ class ManagerDecisionPaths:
 
 
 @dataclass(frozen=True)
+class ManagerNoteCorrectionPaths:
+    directory: Path
+    system_prompt: Path
+    user_prompt: Path
+    stdout: Path
+    stderr: Path
+    result: Path
+
+
+@dataclass(frozen=True)
 class RepartitionAttemptPaths:
     directory: Path
     source_plan: Path
@@ -168,6 +178,40 @@ def write_manager_artifacts(
     _write_json(artifact_paths.result, dict(result or {}))
     if boundary is not None:
         _write_json(artifact_paths.boundary, dict(boundary))
+    return artifact_paths
+
+
+def write_manager_note_correction_artifacts(
+    paths: RunPaths,
+    *,
+    decision_number: int,
+    system_prompt: str,
+    user_prompt: str,
+    stdout: str = "",
+    stderr: str = "",
+    result: Mapping[str, Any] | None = None,
+) -> ManagerNoteCorrectionPaths:
+    """Add one immutable note-correction attempt beneath an existing decision."""
+    decision_directory = manager_decision_paths(paths, decision_number).directory
+    if not decision_directory.is_dir():
+        raise FileNotFoundError(
+            f"manager decision directory does not exist: {decision_directory}"
+        )
+    directory = decision_directory / "note-authority-correction"
+    directory.mkdir(parents=False, exist_ok=False)
+    artifact_paths = ManagerNoteCorrectionPaths(
+        directory=directory,
+        system_prompt=directory / "system-prompt.txt",
+        user_prompt=directory / "user-prompt.txt",
+        stdout=directory / "stdout.txt",
+        stderr=directory / "stderr.txt",
+        result=directory / "result.json",
+    )
+    artifact_paths.system_prompt.write_text(system_prompt, encoding="utf-8")
+    artifact_paths.user_prompt.write_text(user_prompt, encoding="utf-8")
+    artifact_paths.stdout.write_text(stdout, encoding="utf-8")
+    artifact_paths.stderr.write_text(stderr, encoding="utf-8")
+    _write_json(artifact_paths.result, dict(result or {}))
     return artifact_paths
 
 

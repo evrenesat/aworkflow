@@ -16,6 +16,11 @@ from .config import WorkflowUserConfig
 
 
 ManagerLevel = Literal["lite", "full"]
+ManagerNoteAuthorityCategory = Literal[
+    "plan_selection",
+    "file_scope",
+    "mandatory_implementation",
+]
 ManagerAction = Literal[
     "continue",
     "retry_current_step",
@@ -91,6 +96,24 @@ _SINGLE_JSON_FENCE = re.compile(
 
 class ManagerDecisionError(ValueError):
     """Raised when manager output is not a legal closed-protocol decision."""
+
+
+class ManagerNoteAuthorityError(ManagerDecisionError):
+    """A machine-classified manager note violation with unchanged legacy text."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: ManagerNoteAuthorityCategory,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+
+    @property
+    def correctable(self) -> bool:
+        """Only plan-selection wording is eligible for one correction attempt."""
+        return self.category == "plan_selection"
 
 
 @dataclass(frozen=True)
@@ -258,6 +281,7 @@ def validate_manager_note_authority(
     narrow the active plan. Plans and mandatory implementation requirements
     remain controller-owned regardless of the scope summary.
     """
+    plan_selection_violation: ManagerNoteAuthorityError | None = None
     for note in notes:
         normalized = _normalize_authority_text(note)
         if (
@@ -267,12 +291,23 @@ def validate_manager_note_authority(
                 and _PLAN_SELECTION_RE.search(normalized)
             )
         ):
-            _raise_note_authority_error(scope, "replace or select an active plan")
+            plan_selection_violation = plan_selection_violation or (
+                _note_authority_error(
+                    scope,
+                    "replace or select an active plan",
+                    category="plan_selection",
+                )
+            )
         if any(rule.search(normalized) for rule in _SCOPE_AUTHORITY_RULES):
             _validate_file_scope_claim(note, scope)
-            continue
         if _IMPLEMENTATION_REQUIREMENT_RE.search(normalized):
-            _raise_note_authority_error(scope, "impose a mandatory implementation requirement")
+            _raise_note_authority_error(
+                scope,
+                "impose a mandatory implementation requirement",
+                category="mandatory_implementation",
+            )
+    if plan_selection_violation is not None:
+        raise plan_selection_violation
     return notes
 
 
@@ -284,10 +319,24 @@ def _normalize_authority_text(note: str) -> str:
 def _raise_note_authority_error(
     scope: Mapping[str, Any] | None,
     detail: str,
+    *,
+    category: ManagerNoteAuthorityCategory,
 ) -> None:
+    raise _note_authority_error(scope, detail, category=category)
+
+
+def _note_authority_error(
+    scope: Mapping[str, Any] | None,
+    detail: str,
+    *,
+    category: ManagerNoteAuthorityCategory,
+) -> ManagerNoteAuthorityError:
     identity = scope.get("active_plan_identity") if isinstance(scope, Mapping) else None
     suffix = f" for active plan {identity}" if isinstance(identity, str) else ""
-    raise ManagerDecisionError(f"next_step_notes may not {detail}{suffix}")
+    return ManagerNoteAuthorityError(
+        f"next_step_notes may not {detail}{suffix}",
+        category=category,
+    )
 
 
 def _normalized_scope_paths(
@@ -359,7 +408,11 @@ def _validate_file_scope_claim(
         or not asserted_paths
         or asserted_paths != authoritative_paths
     ):
-        _raise_note_authority_error(scope, "assert file or scope authority")
+        _raise_note_authority_error(
+            scope,
+            "assert file or scope authority",
+            category="file_scope",
+        )
 
 
 def resolve_manager_role(
@@ -481,6 +534,11 @@ def build_manager_prompts(
         "next_step_notes are advisory evidence only: do not introduce file allowlists, "
         "prohibitions, plan replacement, scope limits, or mandatory implementation requirements. "
         "Any unavoidable file constraint must exactly restate manager_note_scope.",
+        "When referring to a plan, never use 'use', 'follow', 'switch to', 'replace', "
+        "'adopt', or 'work from' to select it. Describe the defect, required observable "
+        "behavior, and verification evidence instead, such as: 'The defect is an incorrect "
+        "retry boundary'; 'The accepted response produces one logical manager decision'; "
+        "or 'The focused regression test passes and the original response remains durable.'",
         *(
             (
                 "When Lite, evaluate the rejection cause before choosing an action:",
@@ -523,6 +581,126 @@ def build_manager_prompts(
         + "\n"
     )
     return system_prompt, user_prompt
+
+
+def build_manager_note_correction_prompts(
+    context: Mapping[str, Any],
+    *,
+    original_decision: ManagerDecisionV1,
+    violation: ManagerNoteAuthorityError,
+) -> tuple[str, str]:
+    """Build one compact correction request from the immutable call boundary."""
+    if not violation.correctable:
+        raise ValueError("only plan_selection note violations are correctable")
+    level = context.get("level")
+    if level not in {"lite", "full"}:
+        raise ValueError("manager context must declare level 'lite' or 'full'")
+    controller = (
+        context.get("controller_state")
+        if isinstance(context.get("controller_state"), Mapping)
+        else {}
+    )
+    retry_action = original_decision.action in {
+        "retry_current_step",
+        "switch_to_backup_and_retry",
+    }
+    selected_scope = (
+        context.get("retry_manager_note_scope")
+        if retry_action and isinstance(context.get("retry_manager_note_scope"), Mapping)
+        else context.get("manager_note_scope")
+    )
+    note_scope = dict(selected_scope) if isinstance(selected_scope, Mapping) else None
+    target_plan_identity = (
+        note_scope.get("active_plan_identity")
+        if isinstance(note_scope, Mapping)
+        else None
+    )
+    eligible_actions = [
+        action
+        for action in controller.get("eligible_actions", ())
+        if isinstance(action, str) and action
+    ]
+    if level == "lite" and "escalate_to_full" not in eligible_actions:
+        eligible_actions.append("escalate_to_full")
+    payload = {
+        "decision_number": context.get("decision_number"),
+        "level": level,
+        "trigger": context.get("trigger"),
+        "eligible_actions": sorted(eligible_actions),
+        "proposed_transition": controller.get("proposed_next_step"),
+        "manager_note_scope": note_scope,
+        "target_plan_identity": target_plan_identity,
+        "original_decision": original_decision.to_dict(),
+        "violation": {
+            "category": violation.category,
+            "message": str(violation),
+        },
+    }
+    system_prompt = "\n".join((
+        "You are correcting one AFlow manager response at the same immutable decision boundary.",
+        "Return the same complete JSON schema: schema_version, action, reason, next_step_notes, and stop_report.",
+        "Preserve schema_version, action, reason, and stop_report exactly; only rewrite or remove next_step_notes.",
+        "Plan authority belongs to the controller. In next_step_notes, do not use 'use', 'follow', 'switch to', 'replace', 'adopt', or 'work from' when those verbs select or reference a plan.",
+        "Compliant notes describe behavior and evidence, for example: 'The defect is an incorrect retry boundary.'",
+        "A compliant observable requirement is: 'The accepted response produces one logical manager decision.'",
+        "Compliant verification evidence is: 'The focused regression test passes and the original response remains durable.'",
+        "Do not add Markdown fences or explanatory text.",
+    ))
+    user_prompt = (
+        "MANAGER_NOTE_CORRECTION_JSON:\n"
+        + json.dumps(payload, indent=2, sort_keys=True)
+        + "\n"
+    )
+    return system_prompt, user_prompt
+
+
+def build_manager_note_correction_result(
+    base_result: Mapping[str, Any],
+    *,
+    original_violation: ManagerNoteAuthorityError,
+    correction_artifact_path: str,
+    correction_status: str,
+    final_decision: ManagerDecisionV1 | None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Render the canonical one-decision result after a correction sub-attempt."""
+    result = dict(base_result)
+    result.update({
+        "attempt_count": 2,
+        "correction_attempted": True,
+        "original_violation": {
+            "category": original_violation.category,
+            "message": str(original_violation),
+        },
+        "correction": {
+            "artifact_path": correction_artifact_path,
+            "status": correction_status,
+        },
+    })
+    if final_decision is None:
+        result["status"] = "invalid"
+        result["error"] = error or "manager note correction failed"
+        for key in _DECISION_KEYS:
+            result.pop(key, None)
+        result["action"] = "invalid"
+        result["reason"] = result["error"]
+    else:
+        result.update({"status": "accepted", **final_decision.to_dict()})
+        result.pop("error", None)
+    return result
+
+
+def validate_manager_note_correction(
+    original_decision: ManagerDecisionV1,
+    corrected_decision: ManagerDecisionV1,
+) -> ManagerDecisionV1:
+    """Reject any correction that changes a non-note decision field."""
+    for field in ("schema_version", "action", "reason", "stop_report"):
+        if getattr(corrected_decision, field) != getattr(original_decision, field):
+            raise ManagerDecisionError(
+                f"manager note correction changed immutable field '{field}'"
+            )
+    return corrected_decision
 
 
 def build_repartition_prompts(

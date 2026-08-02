@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -15,7 +16,10 @@ from aflow.config import (
 from aflow.manager import (
     MAX_MANAGER_NOTES,
     ManagerDecisionError,
+    ManagerNoteAuthorityError,
     ManagerStopReport,
+    build_manager_note_correction_prompts,
+    build_manager_note_correction_result,
     build_manager_prompts,
     build_repartition_prompts,
     eligible_implementation_upgrade,
@@ -24,6 +28,7 @@ from aflow.manager import (
     resolve_manager_role,
     validate_manager_decision,
     validate_manager_note_authority,
+    validate_manager_note_correction,
 )
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
@@ -45,6 +50,7 @@ from aflow.runlog import (
     create_repartition_attempt_paths,
     create_run_paths,
     write_manager_artifacts,
+    write_manager_note_correction_artifacts,
     write_repartition_artifact,
     write_run_metadata,
 )
@@ -249,6 +255,282 @@ def test_note_authority_rejects_restrictive_paraphrases_but_allows_advice() -> N
         "The defect is in a.py; focus the verification on tests/test_a.py.",
         "Ensure the regression test is exercised.",
     )
+
+
+def test_note_authority_errors_have_structured_category_and_correctability() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["a.py", "b.py"],
+        "prohibited_paths": ["c.py"],
+        "constraints_complete": True,
+    }
+    cases = (
+        ("Follow the repair plan.", "plan_selection", True),
+        ("Restrict edits to a.py.", "file_scope", False),
+        (
+            "The implementation must add a second manager call.",
+            "mandatory_implementation",
+            False,
+        ),
+    )
+    for note, category, correctable in cases:
+        with pytest.raises(ManagerNoteAuthorityError) as raised:
+            validate_manager_note_authority((note,), scope=scope)
+        assert raised.value.category == category
+        assert raised.value.correctable is correctable
+
+    with pytest.raises(ManagerDecisionError) as parser_error:
+        parse_manager_decision("not-json")
+    assert not isinstance(parser_error.value, ManagerNoteAuthorityError)
+
+
+def test_note_authority_structuring_preserves_legacy_messages() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["a.py", "b.py"],
+        "prohibited_paths": [],
+        "constraints_complete": True,
+    }
+    expected = (
+        ("Use the repair plan.", "next_step_notes may not replace or select an active plan for active plan plan.md::checkpoint-1"),
+        ("Limit work to a.py.", "next_step_notes may not assert file or scope authority for active plan plan.md::checkpoint-1"),
+        ("Ensure the worker adds a test.", "next_step_notes may not impose a mandatory implementation requirement for active plan plan.md::checkpoint-1"),
+    )
+    for note, message in expected:
+        with pytest.raises(ManagerNoteAuthorityError) as raised:
+            validate_manager_note_authority((note,), scope=scope)
+        assert str(raised.value) == message
+
+
+def test_note_authority_mixed_violations_are_not_correctable() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["a.py", "b.py"],
+        "prohibited_paths": [],
+        "constraints_complete": True,
+    }
+    mixed_cases = (
+        (("Follow the repair plan and restrict edits to a.py.",), "file_scope"),
+        (("Follow the repair plan.", "Restrict edits to a.py."), "file_scope"),
+        (("Restrict edits to a.py.", "Follow the repair plan."), "file_scope"),
+        (
+            (
+                "Follow the repair plan.",
+                "The implementation must add another manager call.",
+            ),
+            "mandatory_implementation",
+        ),
+        (
+            (
+                "The implementation must add another manager call.",
+                "Follow the repair plan.",
+            ),
+            "mandatory_implementation",
+        ),
+    )
+    for notes, category in mixed_cases:
+        with pytest.raises(ManagerNoteAuthorityError) as raised:
+            validate_manager_note_authority(notes, scope=scope)
+        assert raised.value.category == category
+        assert raised.value.correctable is False
+
+
+def test_note_authority_legal_scope_does_not_hide_mandatory_requirement() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["a.py", "b.py"],
+        "prohibited_paths": [],
+        "constraints_complete": True,
+    }
+
+    with pytest.raises(ManagerNoteAuthorityError) as raised:
+        validate_manager_note_authority(
+            (
+                "The implementation must add another manager call; restrict edits "
+                "to a.py and b.py.",
+            ),
+            scope=scope,
+        )
+    assert raised.value.category == "mandatory_implementation"
+    assert raised.value.correctable is False
+
+
+def test_note_authority_plan_selection_only_keeps_correction_contract() -> None:
+    scope = {
+        "active_plan_identity": "plan.md::checkpoint-1",
+        "allowed_paths": ["a.py", "b.py"],
+        "prohibited_paths": [],
+        "constraints_complete": True,
+    }
+
+    with pytest.raises(ManagerNoteAuthorityError) as raised:
+        validate_manager_note_authority(("Follow the repair plan.",), scope=scope)
+    assert raised.value.category == "plan_selection"
+    assert raised.value.correctable is True
+    assert str(raised.value) == (
+        "next_step_notes may not replace or select an active plan for active plan "
+        "plan.md::checkpoint-1"
+    )
+
+
+def test_note_correction_prompt_is_compact_and_preserves_decision_fields() -> None:
+    context = {
+        "decision_number": 11,
+        "level": "lite",
+        "trigger": "reviewer_rejection",
+        "active_plan_content": "SECRET PLAN PROSE",
+        "manager_note_scope": {
+            "active_plan_identity": "plans/main.md::checkpoint-1",
+            "allowed_paths": ["a.py"],
+            "prohibited_paths": [],
+            "constraints_complete": True,
+        },
+        "controller_state": {
+            "eligible_actions": ["continue", "stop"],
+            "proposed_next_step": "implement",
+            "mutable_workspace_state": "excluded",
+        },
+    }
+    original = parse_manager_decision(_decision(
+        reason="Keep the accepted action.",
+        next_step_notes=["Follow the repair plan."],
+    ))
+    violation = ManagerNoteAuthorityError(
+        "next_step_notes may not replace or select an active plan",
+        category="plan_selection",
+    )
+
+    system, user = build_manager_note_correction_prompts(
+        context,
+        original_decision=original,
+        violation=violation,
+    )
+    payload = json.loads(user.removeprefix("MANAGER_NOTE_CORRECTION_JSON:\n"))
+
+    assert payload["decision_number"] == 11
+    assert payload["level"] == "lite"
+    assert payload["trigger"] == "reviewer_rejection"
+    assert payload["eligible_actions"] == ["continue", "escalate_to_full", "stop"]
+    assert payload["proposed_transition"] == "implement"
+    assert payload["target_plan_identity"] == "plans/main.md::checkpoint-1"
+    assert payload["original_decision"] == json.loads(json.dumps(original.to_dict()))
+    assert payload["violation"]["category"] == "plan_selection"
+    assert "SECRET PLAN PROSE" not in user
+    assert "mutable_workspace_state" not in user
+    for verb in ("use", "follow", "switch to", "replace", "adopt", "work from"):
+        assert f"'{verb}'" in system
+    assert "Preserve schema_version, action, reason, and stop_report exactly" in system
+    assert "only rewrite or remove next_step_notes" in system
+    assert "observable requirement" in system
+    assert "verification evidence" in system
+
+    immutable = original.to_dict()
+    rewritten = {**immutable, "next_step_notes": ["The focused regression test passes."]}
+    assert {key: rewritten[key] for key in ("schema_version", "action", "reason", "stop_report")} == {
+        key: immutable[key] for key in ("schema_version", "action", "reason", "stop_report")
+    }
+
+
+def test_note_correction_prompt_rejects_noncorrectable_categories() -> None:
+    with pytest.raises(ValueError, match="only plan_selection"):
+        build_manager_note_correction_prompts(
+            {"level": "full", "controller_state": {}},
+            original_decision=parse_manager_decision(_decision()),
+            violation=ManagerNoteAuthorityError(
+                "next_step_notes may not assert file or scope authority",
+                category="file_scope",
+            ),
+        )
+
+
+def test_note_correction_rejects_changes_to_immutable_decision_fields() -> None:
+    original = parse_manager_decision(_decision(
+        reason="Immutable reason.",
+        next_step_notes=["Follow the repair plan."],
+    ))
+    corrected = replace(
+        original,
+        next_step_notes=("The focused regression test passes.",),
+    )
+    assert validate_manager_note_correction(original, corrected) == corrected
+
+    mutations = {
+        "schema_version": replace(corrected, schema_version=2),
+        "action": replace(corrected, action="retry_current_step"),
+        "reason": replace(corrected, reason="Changed reason."),
+        "stop_report": replace(
+            corrected,
+            stop_report=ManagerStopReport(
+                summary="x",
+                root_cause="x",
+                evidence=("x",),
+                attempts="x",
+                workspace_state="x",
+                next_actions=("x",),
+            ),
+        ),
+    }
+    for field, mutation in mutations.items():
+        with pytest.raises(ManagerDecisionError, match=field):
+            validate_manager_note_correction(original, mutation)
+
+
+def test_note_correction_root_result_keeps_one_decision_legacy_contract() -> None:
+    violation = ManagerNoteAuthorityError(
+        "next_step_notes may not replace or select an active plan",
+        category="plan_selection",
+    )
+    corrected = parse_manager_decision(_decision(
+        reason="Immutable reason.",
+        next_step_notes=["The focused regression test passes."],
+    ))
+    base = {
+        "decision_number": 11,
+        "level": "full",
+        "trigger": "reviewer_rejection",
+        "status": "invalid",
+        "error": str(violation),
+    }
+
+    accepted = build_manager_note_correction_result(
+        base,
+        original_violation=violation,
+        correction_artifact_path=(
+            "manager/decision-011/note-authority-correction"
+        ),
+        correction_status="accepted",
+        final_decision=corrected,
+    )
+    assert accepted["decision_number"] == 11
+    assert accepted["status"] == "accepted"
+    assert accepted["action"] == "continue"
+    assert accepted["reason"] == "Immutable reason."
+    assert accepted["attempt_count"] == 2
+    assert accepted["correction_attempted"] is True
+    assert accepted["original_violation"] == {
+        "category": "plan_selection",
+        "message": str(violation),
+    }
+    assert accepted["correction"] == {
+        "artifact_path": "manager/decision-011/note-authority-correction",
+        "status": "accepted",
+    }
+
+    invalid = build_manager_note_correction_result(
+        base,
+        original_violation=violation,
+        correction_artifact_path=(
+            "manager/decision-011/note-authority-correction"
+        ),
+        correction_status="invalid",
+        final_decision=None,
+        error="correction changed action",
+    )
+    assert invalid["decision_number"] == 11
+    assert invalid["status"] == "invalid"
+    assert invalid["action"] == "invalid"
+    assert invalid["reason"] == "correction changed action"
+    assert invalid["attempt_count"] == 2
 
 
 def test_stop_protocol_and_report_rendering_are_self_contained() -> None:
@@ -497,7 +779,7 @@ def test_pending_repartition_and_attempt_artifacts_round_trip(tmp_path: Path) ->
     assert json.loads(attempt.result.read_text(encoding="utf-8"))["status"] == "accepted"
 
 
-def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
+def test_manager_and_note_correction_artifacts_round_trip_payload(tmp_path: Path) -> None:
     paths = create_run_paths(ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"))
     artifact = write_manager_artifacts(
         paths,
@@ -510,6 +792,34 @@ def test_manager_artifacts_and_state_round_trip_payload(tmp_path: Path) -> None:
     )
     assert artifact.context.relative_to(paths.run_dir).as_posix() == "manager/decision-001/context.json"
     assert json.loads(artifact.result.read_text(encoding="utf-8"))["action"] == "continue"
+
+    correction = write_manager_note_correction_artifacts(
+        paths,
+        decision_number=1,
+        system_prompt="correction system",
+        user_prompt="correction user",
+        stdout="corrected stdout",
+        stderr="corrected stderr",
+        result={"status": "accepted"},
+    )
+    assert correction.directory.relative_to(paths.run_dir).as_posix() == (
+        "manager/decision-001/note-authority-correction"
+    )
+    assert correction.system_prompt.read_text(encoding="utf-8") == "correction system"
+    assert correction.user_prompt.read_text(encoding="utf-8") == "correction user"
+    assert correction.stdout.read_text(encoding="utf-8") == "corrected stdout"
+    assert correction.stderr.read_text(encoding="utf-8") == "corrected stderr"
+    assert json.loads(correction.result.read_text(encoding="utf-8")) == {
+        "status": "accepted"
+    }
+    assert artifact.stdout.read_text(encoding="utf-8") == "{}"
+    with pytest.raises(FileExistsError):
+        write_manager_note_correction_artifacts(
+            paths,
+            decision_number=1,
+            system_prompt="overwrite",
+            user_prompt="overwrite",
+        )
 
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
     state.manager_decision_number = 1

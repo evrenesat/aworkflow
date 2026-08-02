@@ -56,6 +56,12 @@ when exposed), and `stop`.
   plan replacement, scope limits, or mandatory implementation requirements;
   the active plan and controller own that authority. If a file constraint is
   unavoidable, it must exactly restate `manager_note_scope`.
+- When referring to a plan, never use `use`, `follow`, `switch to`, `replace`,
+  `adopt`, or `work from` to select it. Describe only the defect, observable
+  behavior, and verification evidence: for example, "The defect is an incorrect
+  retry boundary," "The accepted response produces one logical manager
+  decision," or "The focused regression test passes and the original response
+  remains durable."
 - For `stop`, provide a `stop_report` object with non-empty `summary`,
   `root_cause`, `evidence`, `attempts`, `workspace_state`, and `next_actions`.
   `evidence` and `next_actions` must be lists.
