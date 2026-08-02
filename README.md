@@ -111,7 +111,9 @@ uv run pytest -q
 ```
 
 The optional remote management app lives in `apps/aflow_app/` and is not
-included in the published wheel.
+included in the published wheel. Its server requires Python 3.12+ and exposes a
+provider-neutral planning-session API; Codex integration is implemented through
+`codex-app-server-sdk` behind that boundary.
 
 ## Documentation
 

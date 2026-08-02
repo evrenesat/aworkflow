@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -37,10 +38,16 @@ def test_config(tmp_path: Path, test_token: str) -> ServerConfig:
         transcription_token=None,
         projects_home=tmp_path / "code",
         project_overrides_path=tmp_path / "project_overrides.json",
+        attachment_root=tmp_path / "attachments",
     )
 
 
-def _set_server_state(config: ServerConfig, *, service: object | None = None) -> None:
+def _set_server_state(
+    config: ServerConfig,
+    *,
+    service: object | None = None,
+    planning_service: object | None = None,
+) -> None:
     """Install the shared server state used by tests."""
     from aflow_app_server import main as main_module
     from aflow_app_server.aflow_service import AflowService
@@ -52,6 +59,7 @@ def _set_server_state(config: ServerConfig, *, service: object | None = None) ->
         legacy_registry_path=config.repo_registry_path,
     )
     main_module._service = service if service is not None else AflowService()
+    main_module._planning_service = planning_service
 
 
 def _create_git_project(projects_home: Path, name: str = "test_repo") -> Path:
@@ -72,6 +80,46 @@ def _project_id_for_path(client: TestClient, project_path: Path) -> str:
     raise AssertionError(f"Project not found for path: {project_path}")
 
 
+def test_lifespan_owns_shared_attachment_store_for_codex(
+    test_config: ServerConfig,
+) -> None:
+    from aflow_app_server import main as main_module
+    from aflow_app_server.planning import AttachmentKind
+    from aflow_app_server.planning.providers import CodexProvider
+
+    async def check() -> None:
+        with (
+            patch.object(ServerConfig, "from_env", return_value=test_config),
+            patch.object(CodexProvider, "start", new=AsyncMock()),
+            patch.object(CodexProvider, "close", new=AsyncMock()),
+        ):
+            async with main_module.lifespan(app):
+                service = main_module.get_planning_service()
+                provider = service.registry.get("codex")
+                store = service.attachment_store
+
+                assert store is not None
+                assert store.root == test_config.attachment_root.resolve()
+                assert store._max_file_size == test_config.attachment_max_file_size_bytes
+                assert store._max_count == test_config.attachment_max_count_per_turn
+                assert (
+                    store._max_total_size
+                    == test_config.attachment_max_total_size_bytes_per_turn
+                )
+                assert provider._attachment_store is store
+                assert provider.capabilities.attachments is True
+                assert provider.capabilities.attachment_kinds == (
+                    AttachmentKind.FILE,
+                    AttachmentKind.IMAGE,
+                )
+                assert app.state.attachment_store is store
+
+        assert app.state.planning_service is None
+        assert app.state.attachment_store is None
+
+    asyncio.run(check())
+
+
 @pytest.fixture
 def client_with_config(test_config: ServerConfig, test_token: str) -> TestClient:
     """Create a test client with proper config injection."""
@@ -87,6 +135,7 @@ def client_with_config(test_config: ServerConfig, test_token: str) -> TestClient
         main_module._config = None
         main_module._project_catalog = None
         main_module._service = None
+        main_module._planning_service = None
 
 
 class TestHealthEndpoint:
@@ -501,508 +550,6 @@ class TestExecutionEndpoints:
         """Test getting non-existent execution."""
         response = client_with_config.get("/api/executions/nonexistent")
         assert response.status_code == 404
-
-
-
-class TestCodexEndpoints:
-    """Tests for Codex thread endpoints."""
-
-    def test_list_threads_not_configured(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test listing threads when Codex is not configured."""
-        project_path = _create_git_project(test_config.projects_home, "thread-project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-        response = client_with_config.get(f"/api/projects/{project_id}/threads")
-        assert response.status_code == 503
-        assert "not configured" in response.json()["detail"]
-
-    def test_list_threads_with_mock_backend(
-        self, client_with_config: TestClient, test_config: ServerConfig
-    ) -> None:
-        """Test listing threads with a mocked backend."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.models import CodexThread, CodexTurn
-        from datetime import datetime, timezone
-
-        project_path = _create_git_project(test_config.projects_home, "thread-project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-        _set_server_state(
-            ServerConfig(
-                bind_host=test_config.bind_host,
-                bind_port=test_config.bind_port,
-                auth_token=test_config.auth_token,
-                repo_registry_path=test_config.repo_registry_path,
-                codex_app_server_url="ws://localhost:9000",
-                codex_app_server_token="test-codex-token",
-                transcription_url=None,
-                transcription_token=None,
-                projects_home=test_config.projects_home,
-                project_overrides_path=test_config.project_overrides_path,
-            )
-        )
-
-        mock_thread = CodexThread(
-            id="thread-1",
-            preview="preview text",
-            ephemeral=False,
-            model_provider="openai",
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            status={"type": "active", "activeFlags": []},
-            path=None,
-            cwd=str(project_path),
-            cli_version="1.2.3",
-            source="app-server",
-            agent_nickname=None,
-            agent_role=None,
-            git_info=None,
-            name="Test Thread",
-            turns=[CodexTurn(id="turn-1", status="completed", items=[], error=None)],
-        )
-
-        with patch("aflow_app_server.codex_routes.CodexAppServerClient") as mock_backend_class:
-            mock_backend = MagicMock()
-            mock_backend.list_threads.return_value = type(
-                "Page",
-                (),
-                {"threads": [mock_thread], "next_cursor": None},
-            )()
-            mock_backend_class.return_value = mock_backend
-
-            response = client_with_config.get(f"/api/projects/{project_id}/threads")
-            assert response.status_code == 200
-            data = response.json()
-            assert data["next_cursor"] is None
-            assert len(data["threads"]) == 1
-            assert data["threads"][0]["id"] == "thread-1"
-            assert data["threads"][0]["status"]["type"] == "active"
-            assert data["threads"][0]["cwd"] == str(project_path)
-            assert data["threads"][0]["name"] == "Test Thread"
-            assert "turns" not in data["threads"][0]
-            assert "git_info" not in data["threads"][0]
-            mock_backend.list_threads.assert_called_once_with(
-                cwd=str(project_path),
-                search_term=None,
-                limit=None,
-                cursor=None,
-                source_kinds=None,
-                archived=None,
-            )
-
-    def test_list_projects_includes_thread_only_project_when_codex_is_configured(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test that project listing surfaces thread-only projects through Codex."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.codex_thread_gateway import CodexThreadPage
-        from aflow_app_server.models import CodexThread
-        from datetime import datetime, timezone
-
-        thread_only_path = test_config.projects_home.parent / "thread-only"
-        thread_only_path.mkdir(parents=True, exist_ok=True)
-
-        config = ServerConfig(
-            bind_host=test_config.bind_host,
-            bind_port=test_config.bind_port,
-            auth_token=test_config.auth_token,
-            repo_registry_path=test_config.repo_registry_path,
-            codex_app_server_url="ws://localhost:9000",
-            codex_app_server_token="test-codex-token",
-            transcription_url=None,
-            transcription_token=None,
-            projects_home=test_config.projects_home,
-            project_overrides_path=test_config.project_overrides_path,
-        )
-
-        thread = CodexThread(
-            id="thread-1",
-            preview="preview text",
-            ephemeral=False,
-            model_provider="openai",
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            status={"type": "active", "activeFlags": []},
-            path=None,
-            cwd=str(thread_only_path),
-            cli_version="1.2.3",
-            source="app-server",
-            agent_nickname=None,
-            agent_role=None,
-            git_info=None,
-            name="Thread-only project",
-            turns=[],
-        )
-
-        fake_backend = MagicMock()
-        fake_backend.list_threads.return_value = CodexThreadPage(threads=[thread], next_cursor=None)
-        _set_server_state(config)
-
-        try:
-            with patch("aflow_app_server.main.CodexAppServerClient", return_value=fake_backend):
-                response = client_with_config.get("/api/projects")
-                assert response.status_code == 200
-                projects = response.json()
-                project = next(item for item in projects if item["current_path"] == str(thread_only_path))
-                assert project["linked_thread_count"] == 1
-                assert project["detection_source"] == "codex_thread_cwd"
-
-                detail = client_with_config.get(f"/api/projects/{project['id']}")
-                assert detail.status_code == 200
-                assert detail.json()["id"] == project["id"]
-                assert detail.json()["linked_thread_count"] == 1
-                assert detail.json()["detection_source"] == "codex_thread_cwd"
-        finally:
-            main_module._config = None
-            main_module._project_catalog = None
-            main_module._service = None
-
-    def test_list_projects_ignores_codex_gateway_failure(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test that project listing stays available if Codex thread listing fails."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.codex_thread_gateway import CodexThreadGatewayError
-
-        project_path = _create_git_project(test_config.projects_home, "local-only")
-        project_id = _project_id_for_path(client_with_config, project_path)
-
-        config = ServerConfig(
-            bind_host=test_config.bind_host,
-            bind_port=test_config.bind_port,
-            auth_token=test_config.auth_token,
-            repo_registry_path=test_config.repo_registry_path,
-            codex_app_server_url="ws://localhost:9000",
-            codex_app_server_token="test-codex-token",
-            transcription_url=None,
-            transcription_token=None,
-            projects_home=test_config.projects_home,
-            project_overrides_path=test_config.project_overrides_path,
-        )
-
-        class FailingBackend:
-            def list_threads(self, **kwargs):
-                raise CodexThreadGatewayError("Not initialized")
-
-        _set_server_state(config)
-
-        try:
-            with patch("aflow_app_server.main.CodexAppServerClient", return_value=FailingBackend()):
-                response = client_with_config.get("/api/projects")
-                assert response.status_code == 200
-                projects = response.json()
-                project = next(item for item in projects if item["id"] == project_id)
-                assert project["current_path"] == str(project_path)
-                assert project["linked_thread_count"] == 0
-                assert project["detection_source"] == "local_git_root"
-        finally:
-            main_module._config = None
-            main_module._project_catalog = None
-            main_module._service = None
-
-    def test_list_threads_gracefully_handles_uninitialized_codex_backend(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test that thread listing degrades instead of surfacing a 502."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.codex_thread_gateway import CodexThreadGatewayError
-
-        project_path = _create_git_project(test_config.projects_home, "thread-project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-
-        config = ServerConfig(
-            bind_host=test_config.bind_host,
-            bind_port=test_config.bind_port,
-            auth_token=test_config.auth_token,
-            repo_registry_path=test_config.repo_registry_path,
-            codex_app_server_url="ws://localhost:9000",
-            codex_app_server_token="test-codex-token",
-            transcription_url=None,
-            transcription_token=None,
-            projects_home=test_config.projects_home,
-            project_overrides_path=test_config.project_overrides_path,
-        )
-
-        class FailingBackend:
-            def list_threads(self, **kwargs):
-                raise CodexThreadGatewayError("Not initialized")
-
-        _set_server_state(config)
-
-        try:
-            with patch("aflow_app_server.codex_routes.CodexAppServerClient", return_value=FailingBackend()):
-                response = client_with_config.get(f"/api/projects/{project_id}/threads")
-                assert response.status_code == 200
-                payload = response.json()
-                assert payload["threads"] == []
-                assert payload["next_cursor"] is None
-                assert payload["backend_status"]["state"] == "uninitialized"
-                assert payload["backend_status"]["message"] == "Codex app-server is not initialized yet."
-                assert payload["backend_status"]["detail"] == "Not initialized"
-        finally:
-            main_module._config = None
-            main_module._project_catalog = None
-            main_module._service = None
-
-    def test_list_threads_keeps_legacy_cwd_visible_after_project_move(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test that moved projects still return threads stored under the old cwd."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.codex_thread_gateway import CodexThreadPage
-        from aflow_app_server.models import CodexThread
-        from datetime import datetime, timezone
-
-        config = ServerConfig(
-            bind_host=test_config.bind_host,
-            bind_port=test_config.bind_port,
-            auth_token=test_config.auth_token,
-            repo_registry_path=test_config.repo_registry_path,
-            codex_app_server_url="ws://localhost:9000",
-            codex_app_server_token="test-codex-token",
-            transcription_url=None,
-            transcription_token=None,
-            projects_home=test_config.projects_home,
-            project_overrides_path=test_config.project_overrides_path,
-        )
-
-        old_path = _create_git_project(test_config.projects_home, "moved-project")
-        project_id = _project_id_for_path(client_with_config, old_path)
-        new_path = test_config.projects_home / "moved-project-renamed"
-        old_path.rename(new_path)
-
-        move_response = client_with_config.patch(
-            f"/api/projects/{project_id}",
-            json={"current_path": str(new_path)},
-        )
-        assert move_response.status_code == 200
-
-        _set_server_state(config)
-
-        mock_thread = CodexThread(
-            id="thread-1",
-            preview="preview text",
-            ephemeral=False,
-            model_provider="openai",
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            status={"type": "active", "activeFlags": []},
-            path=None,
-            cwd=str(old_path),
-            cli_version="1.2.3",
-            source="app-server",
-            agent_nickname=None,
-            agent_role=None,
-            git_info=None,
-            name="Moved thread",
-            turns=[],
-        )
-
-        fake_backend = MagicMock()
-        fake_backend.list_threads.return_value = CodexThreadPage(threads=[mock_thread], next_cursor=None)
-
-        try:
-            with patch("aflow_app_server.codex_routes.CodexAppServerClient", return_value=fake_backend):
-                response = client_with_config.get(f"/api/projects/{project_id}/threads")
-                assert response.status_code == 200
-                data = response.json()
-                assert data["next_cursor"] is None
-                assert len(data["threads"]) == 1
-                assert data["threads"][0]["id"] == "thread-1"
-                assert data["threads"][0]["cwd"] == str(old_path)
-                queried_cwds = [call.kwargs["cwd"] for call in fake_backend.list_threads.call_args_list]
-                assert str(new_path) in queried_cwds
-                assert str(old_path) in queried_cwds
-        finally:
-            main_module._config = None
-            main_module._project_catalog = None
-            main_module._service = None
-
-    def test_read_thread_with_mock_backend(
-        self, client_with_config: TestClient, test_config: ServerConfig
-    ) -> None:
-        """Test reading a thread with a mocked backend."""
-        from aflow_app_server.codex_thread_gateway import CodexThreadPage
-        from aflow_app_server.models import CodexThread, CodexTurn
-        from datetime import datetime, timezone
-
-        project_path = _create_git_project(test_config.projects_home, "thread-project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-        _set_server_state(
-            ServerConfig(
-                bind_host=test_config.bind_host,
-                bind_port=test_config.bind_port,
-                auth_token=test_config.auth_token,
-                repo_registry_path=test_config.repo_registry_path,
-                codex_app_server_url="ws://localhost:9000",
-                codex_app_server_token="test-codex-token",
-                transcription_url=None,
-                transcription_token=None,
-                projects_home=test_config.projects_home,
-                project_overrides_path=test_config.project_overrides_path,
-            )
-        )
-        mock_thread = CodexThread(
-            id="thread-1",
-            preview="preview text",
-            ephemeral=False,
-            model_provider="openai",
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            status={"type": "active", "activeFlags": []},
-            path=None,
-            cwd=str(project_path),
-            cli_version="1.2.3",
-            source="app-server",
-            agent_nickname=None,
-            agent_role=None,
-            git_info=None,
-            name="Test Thread",
-            turns=[CodexTurn(id="turn-1", status="completed", items=[], error=None)],
-        )
-
-        with patch("aflow_app_server.codex_routes.CodexAppServerClient") as mock_backend_class:
-            mock_backend = MagicMock()
-            mock_backend.list_threads.return_value = CodexThreadPage(threads=[], next_cursor=None)
-            mock_backend.read_thread.return_value = mock_thread
-            mock_backend_class.return_value = mock_backend
-
-            response = client_with_config.get(f"/api/projects/{project_id}/threads/thread-1")
-
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["id"] == "thread-1"
-        assert payload["turns"][0]["id"] == "turn-1"
-
-    def test_start_turn_forwards_user_input_shape(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test that turn start forwards protocol-valid user input items."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.codex_thread_gateway import CodexThreadPage
-        from aflow_app_server.models import CodexTurn
-        from aflow_app_server.codex_thread_gateway import UserInputText
-
-        project_path = _create_git_project(test_config.projects_home, "thread-project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-        _set_server_state(
-            ServerConfig(
-                bind_host=test_config.bind_host,
-                bind_port=test_config.bind_port,
-                auth_token=test_config.auth_token,
-                repo_registry_path=test_config.repo_registry_path,
-                codex_app_server_url="ws://localhost:9000",
-                codex_app_server_token="test-codex-token",
-                transcription_url=None,
-                transcription_token=None,
-                projects_home=test_config.projects_home,
-                project_overrides_path=test_config.project_overrides_path,
-            )
-        )
-
-        with patch("aflow_app_server.codex_routes.CodexAppServerClient") as mock_backend_class:
-            mock_backend = MagicMock()
-            mock_backend.list_threads.return_value = CodexThreadPage(threads=[], next_cursor=None)
-            mock_backend.start_turn.return_value = CodexTurn(
-                id="turn-1",
-                status="inProgress",
-                items=[],
-                error=None,
-            )
-            mock_backend_class.return_value = mock_backend
-
-            response = client_with_config.post(
-                f"/api/projects/{project_id}/threads/thread-1/turns",
-                json={
-                    "input": [
-                        {"type": "text", "text": "hello", "text_elements": []},
-                    ],
-                    "approval_policy": "never",
-                    "model": "o3",
-                    "service_tier": "default",
-                    "effort": "high",
-                    "summary": "short",
-                    "personality": "concise",
-                },
-            )
-
-        assert response.status_code == 200
-        assert response.json()["status"] == "inProgress"
-        mock_backend.start_turn.assert_called_once()
-        args, kwargs = mock_backend.start_turn.call_args
-        assert args == (
-            "thread-1",
-            [UserInputText(type="text", text="hello", text_elements=[])],
-        )
-        assert kwargs == {
-            "cwd": str(project_path),
-            "approval_policy": "never",
-            "model": "o3",
-            "service_tier": "default",
-            "effort": "high",
-            "summary": "short",
-            "personality": "concise",
-        }
-
-    def test_start_turn_rejects_invalid_user_input_item(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test that malformed turn input is rejected before the gateway runs."""
-        from aflow_app_server import main as main_module
-        from aflow_app_server.codex_thread_gateway import CodexThreadPage
-
-        project_path = _create_git_project(test_config.projects_home, "thread-project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-        _set_server_state(
-            ServerConfig(
-                bind_host=test_config.bind_host,
-                bind_port=test_config.bind_port,
-                auth_token=test_config.auth_token,
-                repo_registry_path=test_config.repo_registry_path,
-                codex_app_server_url="ws://localhost:9000",
-                codex_app_server_token="test-codex-token",
-                transcription_url=None,
-                transcription_token=None,
-                projects_home=test_config.projects_home,
-                project_overrides_path=test_config.project_overrides_path,
-            )
-        )
-
-        with patch("aflow_app_server.codex_routes.CodexAppServerClient") as mock_backend_class:
-            mock_backend = MagicMock()
-            mock_backend.list_threads.return_value = CodexThreadPage(threads=[], next_cursor=None)
-            mock_backend_class.return_value = mock_backend
-
-            response = client_with_config.post(
-                f"/api/projects/{project_id}/threads/thread-1/turns",
-                json={
-                    "input": [
-                        {"type": "text"},
-                    ],
-                    "approval_policy": "never",
-                    "model": "o3",
-                    "service_tier": "default",
-                },
-            )
-
-        assert response.status_code == 422
-        mock_backend.start_turn.assert_not_called()
-
-
 class TestPlanDraftEndpoints:
     """Tests for plan draft management endpoints."""
 
@@ -1030,6 +577,22 @@ class TestPlanDraftEndpoints:
         draft_path = project_path / "plans" / "drafts" / "test-plan.md"
         assert draft_path.exists()
         assert draft_path.read_text() == content
+
+    def test_save_draft_ignores_unrelated_payload_fields(
+        self,
+        client_with_config: TestClient,
+        test_config: ServerConfig,
+    ) -> None:
+        project_path = _create_git_project(test_config.projects_home, "draft-extra")
+        project_id = _project_id_for_path(client_with_config, project_path)
+
+        response = client_with_config.post(
+            f"/api/projects/{project_id}/plans/drafts",
+            json={"name": "test-plan", "content": "content", "harmless": True},
+        )
+
+        assert response.status_code == 201
+        assert (project_path / "plans" / "drafts" / "test-plan.md").read_text() == "content"
 
     def test_list_drafts(
         self,
@@ -1132,6 +695,26 @@ class TestPlanDraftEndpoints:
         in_progress_path = project_path / "plans" / "in-progress" / "test-plan.md"
         assert in_progress_path.exists()
         assert in_progress_path.read_text() == content
+
+    def test_promote_plan_ignores_unrelated_payload_fields(
+        self,
+        client_with_config: TestClient,
+        test_config: ServerConfig,
+    ) -> None:
+        project_path = _create_git_project(test_config.projects_home, "promote-extra")
+        project_id = _project_id_for_path(client_with_config, project_path)
+        client_with_config.post(
+            f"/api/projects/{project_id}/plans/drafts",
+            json={"name": "test-plan", "content": "content"},
+        )
+
+        response = client_with_config.post(
+            f"/api/projects/{project_id}/plans/promote",
+            json={"draft_name": "test-plan", "harmless": True},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "in_progress"
 
     def test_list_in_progress(
         self,

@@ -7,9 +7,11 @@ It is designed for authenticated desktop-hosted local/LAN use, not direct intern
 ## Capabilities
 
 - Discover local git projects under a configured projects home.
-- Link Codex threads to projects by current path and historical aliases.
-- Start, resume, fork, rename, and send turns to Codex app-server threads.
-- Save Codex-generated plans as drafts.
+- Associate provider-qualified planning sessions with projects by current path and historical aliases.
+- Discover planning providers and their readiness, models, reasoning controls, and optional capabilities.
+- Start, resume, fork, rename, archive, and send turns to planning sessions when the selected provider supports those actions.
+- Review pending approvals, interrupt active turns, and stage file or image attachments when supported.
+- Save plans from planning-session turns as drafts.
 - Load, delete, and promote drafts into executable in-progress plans.
 - Start AFlow executions from in-progress plans.
 - Stream execution events over Server-Sent Events.
@@ -22,10 +24,13 @@ apps/aflow_app/
 ├── server/                    # FastAPI backend
 │   ├── src/aflow_app_server/
 │   │   ├── config.py          # server configuration
-│   │   ├── project_catalog.py # project discovery and Codex thread association
+│   │   ├── project_catalog.py # project discovery and planning-session association
 │   │   ├── project_overrides.py # persistent names, moved paths, aliases
 │   │   ├── aflow_service.py   # aflow library integration
-│   │   ├── codex_routes.py    # Codex thread and plan-draft routes
+│   │   ├── planning_routes.py # provider-neutral planning and plan-draft routes
+│   │   ├── planning/          # service, provider registry, models, attachments
+│   │   │   └── providers/
+│   │   │       └── codex.py   # SDK-backed Codex provider adapter
 │   │   ├── plan_store.py      # draft and in-progress plan files
 │   │   ├── transcription.py   # optional audio transcription
 │   │   └── main.py            # FastAPI app and static frontend serving
@@ -54,12 +59,22 @@ Configuration is loaded from environment variables and `~/.config/aflow/config.t
 | `AFLOW_APP_PROJECTS_HOME` | `project_catalog.projects_home` or `projects.projects_home` | `~/code` | Root scanned recursively for git repositories. |
 | `AFLOW_APP_PROJECT_OVERRIDES_PATH` | `project_catalog.project_overrides_path` or `projects.project_overrides_path` | `<config_dir>/project_overrides.json` | Persistent project metadata store. |
 | `AFLOW_APP_WEB_DIST` | - | `apps/aflow_app/web/dist` | Override directory for built frontend assets. |
-| `AFLOW_CODEX_APP_SERVER_URL` | `codex_app_server.server_url` | - | Codex app-server websocket URL. |
-| `AFLOW_CODEX_APP_SERVER_TOKEN` | `codex_app_server.server_token` | - | Codex app-server token. |
-| `AFLOW_CODEX_URL` | `codex.url` | - | Backward-compatible Codex URL alias. |
-| `AFLOW_CODEX_TOKEN` | `codex.token` | - | Backward-compatible Codex token alias. |
+| `AFLOW_PLANNING_PROVIDERS` | `planning.providers` | default Codex provider | JSON provider list; replaces the file provider list when set. |
+| `AFLOW_PLANNING_DEFAULT_PROVIDER` | `planning.default_provider_id` | `codex` when present | Provider used when a new-session request omits `provider_id`. |
+| `AFLOW_PLANNING_CODEX_URL` | Codex entry in `planning.providers` | - | Preferred environment override for the Codex provider endpoint. |
+| `AFLOW_PLANNING_CODEX_TOKEN` | Codex entry in `planning.providers` | - | Preferred environment override for the Codex provider token. |
+| `AFLOW_PLANNING_OPERATION_TIMEOUT_SECONDS` | `planning.operation_timeout_seconds` | `30` | Timeout for bounded provider operations. |
+| `AFLOW_PLANNING_EXECUTION_POLICY` | `planning.execution_policy` | `full_access` | Server-owned execution policy; currently only `full_access` is valid. |
+| `AFLOW_PLANNING_ATTACHMENT_ROOT` | `planning.attachment_root` | `<config_dir>/attachments` | Shared attachment storage root outside project repositories. |
+| `AFLOW_PLANNING_ATTACHMENT_MAX_FILE_SIZE_BYTES` | `planning.attachment_max_file_size_bytes` | `26214400` | Maximum size of one attachment. |
+| `AFLOW_PLANNING_ATTACHMENT_MAX_COUNT_PER_TURN` | `planning.attachment_max_count_per_turn` | `10` | Maximum attachment references in one turn. |
+| `AFLOW_PLANNING_ATTACHMENT_MAX_TOTAL_SIZE_BYTES_PER_TURN` | `planning.attachment_max_total_size_bytes_per_turn` | `52428800` | Maximum total attachment bytes referenced by one turn. |
+| `AFLOW_CODEX_APP_SERVER_URL`, `AFLOW_CODEX_URL` | `codex_app_server.server_url`, `codex.url` | - | Legacy compatibility inputs for the default Codex entry. |
+| `AFLOW_CODEX_APP_SERVER_TOKEN`, `AFLOW_CODEX_TOKEN` | `codex_app_server.server_token`, `codex.token` | - | Legacy compatibility inputs for the default Codex entry. |
 | `AFLOW_TRANSCRIPTION_URL` | `transcription.server_url` | - | Optional transcription service URL. |
 | `AFLOW_TRANSCRIPTION_TOKEN` | `transcription.server_token` | - | Optional transcription service token. |
+
+Provider ids must be unique path-safe slugs, and the default must name an enabled provider. New planning environment values override new planning file values; provider-neutral configuration takes precedence over the legacy Codex compatibility reads. Attachment limits must be positive. Attachment storage is rejected if it overlaps an authorized project repository.
 
 Example:
 
@@ -73,9 +88,18 @@ auth_token = "your-secret-token"
 projects_home = "~/code"
 project_overrides_path = "~/.config/aflow/project_overrides.json"
 
-[codex_app_server]
+[planning]
+default_provider_id = "codex"
+attachment_root = "~/.config/aflow/attachments"
+operation_timeout_seconds = 30
+execution_policy = "full_access"
+
+[[planning.providers]]
+id = "codex"
+kind = "codex"
+display_name = "Codex"
 server_url = "ws://localhost:8080"
-server_token = "codex-token"
+server_token = "provider-token"
 
 [transcription]
 server_url = "https://api.openai.com/v1"
@@ -147,7 +171,7 @@ Execution event streams also accept `?token=<token>` because browser `EventSourc
 The project catalog merges three sources:
 
 - local git roots discovered under `projects_home`
-- Codex thread working directories, when Codex app-server is configured
+- working directories reported by configured planning providers
 - persisted overrides in `project_overrides.json`
 
 Project records have stable IDs. Display names, current paths, and aliases are stored in the overrides file.
@@ -156,15 +180,16 @@ Important behaviors:
 
 - Linked git worktrees are canonicalized back to their primary checkout when git can identify the common directory.
 - Moving a project path keeps the old path as a historical alias.
-- Historical aliases are used before current-path matching so old Codex threads remain linked after a project move.
-- Codex thread enumeration is optional enrichment. If Codex app-server is unavailable, local projects still list normally.
+- Historical aliases are used before current-path matching so existing planning sessions remain linked after a project move.
+- Planning-session enumeration is failure-isolated. An unavailable provider does not hide local projects or sessions from healthy providers.
+- Project paths are server-authoritative. Starting a session uses the selected project's current path; clients cannot choose an arbitrary working directory. Resume and fork operations also move provider activity to that current path after ownership is checked against the current path and historical aliases.
 - The older repo registry file (`repos.json`) is migrated into `project_overrides.json` when the overrides file does not yet exist.
 
 Project detection source values:
 
 - `local_git_root`
-- `codex_thread_cwd`
-- `local_git_root+codex_thread_cwd`
+- `planning_session_cwd`
+- `local_git_root+planning_session_cwd`
 - `override`
 
 ## Plans
@@ -187,33 +212,31 @@ Draft behavior:
 
 Plan listing parses each plan with AFlow's normal plan parser. Invalid plan files are silently omitted from the plan list rather than shown as broken entries.
 
-The frontend shows a `Save plan draft` action on thread turns only when the rendered turn text looks like plan Markdown. The current heuristic requires at least one `# ...` heading and at least one `## ...` heading. Saving from a thread uses an automatic name like `plan-YYYY-MM-DDTHH-MM-SS`.
+The frontend shows a `Save plan draft` action on session turns only when the rendered turn text looks like plan Markdown. The current heuristic requires at least one `# ...` heading and at least one `## ...` heading. Saving from a session uses an automatic name like `plan-YYYY-MM-DDTHH-MM-SS`.
 
-## Codex Threads
+Draft storage and workflow execution remain app-owned project features. They are not owned by, or stored in, a planning provider.
 
-Codex routes are project-scoped under `/api/projects/{project_id}/threads`.
+## Planning Sessions
 
-Thread listing queries the selected project's current path and historical aliases, deduplicates by thread id, and returns `backend_status`:
+Planning is exposed through a provider-neutral API. Each session is identified by the pair `provider_id` and `provider_session_id`; provider-local ids are never treated as globally unique. Provider discovery reports readiness plus capabilities such as models, reasoning levels and summaries, fork, archive, approvals, interruption, output schemas, and supported attachment kinds. A failed or disabled provider reports bounded status without suppressing healthy providers.
 
-- `ready`
-- `not_configured`
-- `uninitialized`
-- `error`
+Session collection routes are project-scoped. The server lists provider sessions and keeps only those whose reported working directory belongs to the project's current path or a historical alias. Active and archived sessions are separate views, sorted by `updated_at` with provider-qualified identity as the deterministic tie-breaker. Existing sessions therefore remain discoverable across project moves and across devices.
 
-If listing fails because Codex app-server is unavailable, the API returns an empty thread list plus the backend status instead of failing the whole project view.
+Starting a session accepts an optional provider id, model, and provider-advertised reasoning level. The configured default provider is used when no provider is supplied. The server supplies the project's current path; session and turn requests do not accept path or execution-policy overrides. Resume and fork similarly use the server-authorized current project path.
 
-Starting, resuming, forking, and sending turns default `cwd` to the selected project's current path unless the request supplies one.
+Frontend controls are derived from the selected provider's advertised capabilities:
 
-The thread APIs expose Codex options such as model, model provider, service tier, approval policy, reasoning effort, summaries, personality, and extended-history persistence when supported by the connected Codex app-server.
+- model and reasoning selectors show provider-advertised values while preserving a historical session model for display;
+- active and archived list modes make both Archive and Unarchive reachable;
+- pending command or file-change approvals can be accepted, declined, or cancelled;
+- an active turn can be interrupted when the provider advertises interruption;
+- file upload controls appear only for advertised `file` or `image` kinds, and failed uploads are not silently submitted with a turn.
 
-Frontend thread behavior:
+Attachments are multipart uploads staged in the shared aflow-managed attachment store and scoped to the exact project/provider/session namespace. A turn references uploaded `attachment_id` values; cross-session, missing, duplicate, deleted, over-count, and over-size references are rejected before provider work starts. Attachments survive archive/unarchive, explicit deletion is blocked while an attachment is leased by an in-flight turn, and the client may list or delete staged items.
 
-- Threads are sorted by `updated_at`, newest first.
-- Selecting a project automatically selects the newest matched thread when one exists.
-- If the selected thread's `cwd` differs from the project's current path, the UI marks it as stale and offers `Resume here` and `Fork here`. Both actions run the next Codex operation in the project's current path.
-- Sending a turn supports Cmd/Ctrl+Enter.
-- After sending a turn, the UI polls the thread every second for up to 15 seconds. Terminal statuses are `completed`, `failed`, `cancelled`, `canceled`, and `aborted`.
-- If the poll does not observe a terminal status in time, the UI reports a timeout even though the underlying Codex turn may still finish later.
+Codex is the first concrete provider. Its adapter uses `codex-app-server-sdk` for session lifecycle, turns, models, approvals, interruption, and archive operations. Because the SDK turn helper is text-first, Codex file and image attachments are not presented as native SDK transport: the adapter appends a deterministic, id-sorted manifest containing the staged paths and untrusted metadata to the user's unchanged text.
+
+Sending a turn supports Cmd/Ctrl+Enter. The UI polls the selected session while work is active, refreshes approvals when supported, and treats `completed`, `failed`, and `interrupted` turns as terminal.
 
 ## Executions
 
@@ -265,15 +288,29 @@ Projects:
 - `PATCH /api/projects/{project_id}`
 - `GET /api/projects/{project_id}/plans`
 
-Codex threads:
+Planning providers:
 
-- `GET /api/projects/{project_id}/threads`
-- `GET /api/projects/{project_id}/threads/{thread_id}`
-- `POST /api/projects/{project_id}/threads`
-- `POST /api/projects/{project_id}/threads/{thread_id}/resume`
-- `POST /api/projects/{project_id}/threads/{thread_id}/fork`
-- `PATCH /api/projects/{project_id}/threads/{thread_id}/name`
-- `POST /api/projects/{project_id}/threads/{thread_id}/turns`
+- `GET /api/planning/providers`
+- `GET /api/planning/providers/{provider_id}/models`
+- `GET /api/planning/providers/{provider_id}/reasoning-options`
+
+Planning sessions:
+
+- `GET /api/projects/{project_id}/planning/sessions?archived={boolean}`
+- `POST /api/projects/{project_id}/planning/sessions`
+- `GET /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/resume`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/fork`
+- `PATCH /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/archive`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/unarchive`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/turns`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/turns/{turn_id}/interrupt`
+- `GET /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/approvals`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/approvals/{approval_id}`
+- `GET /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/attachments`
+- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/attachments`
+- `DELETE /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/attachments/{attachment_id}`
 
 Plan drafts:
 

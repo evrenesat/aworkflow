@@ -1,12 +1,19 @@
 import type {
+  Attachment,
+  AttachmentKind,
   ExecutionEvent,
   ExecutionStatus,
+  PendingApproval,
   PlanInfo,
+  PlanningSession,
+  PlanningSessionPage,
   ProjectInfo,
-  ProjectThread,
-  ProjectThreadPage,
-  ThreadMutationResult,
-  ThreadUserInput,
+  ProviderModels,
+  ProviderReadiness,
+  ReasoningOptions,
+  SessionKey,
+  StartTurnRequest,
+  PlanningTurn,
 } from './types'
 
 const API_BASE = '/api'
@@ -42,9 +49,9 @@ export function clearAuthToken() {
   }
 }
 
-function getHeaders(): HeadersInit {
+function getHeaders(includeJson = true): HeadersInit {
   const headers: HeadersInit = {
-    'Content-Type': 'application/json',
+    ...(includeJson ? { 'Content-Type': 'application/json' } : {}),
   }
   const token = getAuthToken()
   if (token) {
@@ -54,10 +61,11 @@ function getHeaders(): HeadersInit {
 }
 
 async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> {
+  const includeJson = !(options.body instanceof FormData)
   const response = await fetch(url, {
     ...options,
     headers: {
-      ...getHeaders(),
+      ...getHeaders(includeJson),
       ...options.headers,
     },
   })
@@ -67,7 +75,8 @@ async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> 
     let message = text
     try {
       const json = JSON.parse(text)
-      message = json.detail || json.message || text
+      const detail = json.detail || json.message
+      message = typeof detail === 'string' ? detail : detail?.message || text
     } catch {
       // Use text as-is
     }
@@ -119,108 +128,130 @@ export async function listProjectPlans(projectId: string): Promise<PlanInfo[]> {
   return fetchJson<PlanInfo[]>(`${API_BASE}/projects/${projectId}/plans`)
 }
 
-export async function listProjectThreads(
-  projectId: string,
-  request: {
-    cwd?: string
-    search_term?: string
-    limit?: number
-    cursor?: string
-    source_kinds?: string[]
-    archived?: boolean
-  } = {}
-): Promise<ProjectThreadPage> {
-  const query = buildQuery(request)
-  return fetchJson<ProjectThreadPage>(`${API_BASE}/projects/${projectId}/threads${query}`)
+function sessionPath(projectId: string, key: SessionKey): string {
+  return `${API_BASE}/projects/${projectId}/planning/providers/${encodeURIComponent(key.provider_id)}/sessions/${encodeURIComponent(key.provider_session_id)}`
 }
 
-export async function getProjectThread(
+export async function listPlanningProviders(): Promise<ProviderReadiness[]> {
+  const response = await fetchJson<{ providers: ProviderReadiness[] }>(`${API_BASE}/planning/providers`)
+  return response.providers
+}
+
+export async function listProviderModels(providerId: string): Promise<ProviderModels> {
+  return fetchJson<ProviderModels>(`${API_BASE}/planning/providers/${encodeURIComponent(providerId)}/models`)
+}
+
+export async function listReasoningOptions(providerId: string): Promise<ReasoningOptions> {
+  return fetchJson<ReasoningOptions>(`${API_BASE}/planning/providers/${encodeURIComponent(providerId)}/reasoning-options`)
+}
+
+export async function listProjectSessions(
   projectId: string,
-  threadId: string,
+  request: { archived?: boolean } = {}
+): Promise<PlanningSessionPage> {
+  return fetchJson<PlanningSessionPage>(
+    `${API_BASE}/projects/${projectId}/planning/sessions${buildQuery(request)}`
+  )
+}
+
+export async function getProjectSession(
+  projectId: string,
+  key: SessionKey,
   includeTurns = true
-): Promise<ProjectThread> {
-  const query = buildQuery({ include_turns: includeTurns })
-  return fetchJson<ProjectThread>(`${API_BASE}/projects/${projectId}/threads/${threadId}${query}`)
+): Promise<PlanningSession> {
+  return fetchJson<PlanningSession>(`${sessionPath(projectId, key)}${buildQuery({ include_turns: includeTurns })}`)
 }
 
-export async function startProjectThread(
+export async function startProjectSession(
   projectId: string,
-  request: {
-    cwd?: string
-    model?: string
-    model_provider?: string
-    service_tier?: string
-    approval_policy?: string
-    experimental_raw_events?: boolean
-    persist_extended_history?: boolean
-  } = {}
-): Promise<ThreadMutationResult> {
-  return fetchJson<ThreadMutationResult>(`${API_BASE}/projects/${projectId}/threads`, {
+  request: { provider_id?: string; model?: string; reasoning_level?: string } = {}
+): Promise<PlanningSession> {
+  return fetchJson<PlanningSession>(`${API_BASE}/projects/${projectId}/planning/sessions`, {
     method: 'POST',
     body: JSON.stringify(request),
   })
 }
 
-export async function resumeProjectThread(
-  projectId: string,
-  threadId: string,
-  request: {
-    cwd?: string
-    model?: string
-    model_provider?: string
-    service_tier?: string
-    approval_policy?: string
-    persist_extended_history?: boolean
-  } = {}
-): Promise<ThreadMutationResult> {
-  return fetchJson<ThreadMutationResult>(`${API_BASE}/projects/${projectId}/threads/${threadId}/resume`, {
+export async function resumeProjectSession(projectId: string, key: SessionKey): Promise<PlanningSession> {
+  return fetchJson<PlanningSession>(`${sessionPath(projectId, key)}/resume`, {
     method: 'POST',
-    body: JSON.stringify(request),
   })
 }
 
-export async function forkProjectThread(
-  projectId: string,
-  threadId: string,
-  request: {
-    cwd?: string
-    model?: string
-    model_provider?: string
-    service_tier?: string
-    approval_policy?: string
-    persist_extended_history?: boolean
-  } = {}
-): Promise<ThreadMutationResult> {
-  return fetchJson<ThreadMutationResult>(`${API_BASE}/projects/${projectId}/threads/${threadId}/fork`, {
+export async function forkProjectSession(projectId: string, key: SessionKey): Promise<PlanningSession> {
+  return fetchJson<PlanningSession>(`${sessionPath(projectId, key)}/fork`, {
     method: 'POST',
-    body: JSON.stringify(request),
   })
 }
 
-export async function setProjectThreadName(projectId: string, threadId: string, name: string): Promise<void> {
-  return fetchJson<void>(`${API_BASE}/projects/${projectId}/threads/${threadId}/name`, {
+export async function setProjectSessionName(projectId: string, key: SessionKey, name: string): Promise<void> {
+  return fetchJson<void>(sessionPath(projectId, key), {
     method: 'PATCH',
     body: JSON.stringify({ name }),
   })
 }
 
-export async function startProjectTurn(
+export async function setProjectSessionArchived(
   projectId: string,
-  threadId: string,
-  request: {
-    input: ThreadUserInput[]
-    cwd?: string
-    approval_policy?: string
-    model?: string
-    service_tier?: string
-    effort?: string
-    summary?: string
-    personality?: string
-  }
-): Promise<Record<string, unknown>> {
-  return fetchJson<Record<string, unknown>>(`${API_BASE}/projects/${projectId}/threads/${threadId}/turns`, {
+  key: SessionKey,
+  archived: boolean
+): Promise<{ archived: boolean }> {
+  return fetchJson<{ archived: boolean }>(`${sessionPath(projectId, key)}/${archived ? 'archive' : 'unarchive'}`, {
+    method: 'POST',
+  })
+}
+
+export async function startProjectTurn(projectId: string, key: SessionKey, request: StartTurnRequest): Promise<PlanningTurn> {
+  return fetchJson<PlanningTurn>(`${sessionPath(projectId, key)}/turns`, {
     method: 'POST',
     body: JSON.stringify(request),
+  })
+}
+
+export async function interruptProjectTurn(projectId: string, key: SessionKey, turnId: string): Promise<void> {
+  return fetchJson<void>(`${sessionPath(projectId, key)}/turns/${encodeURIComponent(turnId)}/interrupt`, { method: 'POST' })
+}
+
+export async function listPendingApprovals(projectId: string, key: SessionKey): Promise<PendingApproval[]> {
+  const response = await fetchJson<{ approvals: PendingApproval[] }>(`${sessionPath(projectId, key)}/approvals`)
+  return response.approvals
+}
+
+export async function respondToApproval(
+  projectId: string,
+  key: SessionKey,
+  approvalId: string,
+  decision: 'accept' | 'decline' | 'cancel'
+): Promise<void> {
+  return fetchJson<void>(`${sessionPath(projectId, key)}/approvals/${encodeURIComponent(approvalId)}`, {
+    method: 'POST',
+    body: JSON.stringify({ decision }),
+  })
+}
+
+export async function listAttachments(projectId: string, key: SessionKey): Promise<Attachment[]> {
+  const response = await fetchJson<{ attachments: Attachment[] }>(`${sessionPath(projectId, key)}/attachments`)
+  return response.attachments
+}
+
+export async function uploadAttachment(
+  projectId: string,
+  key: SessionKey,
+  file: File,
+  kind: AttachmentKind
+): Promise<Attachment> {
+  const body = new FormData()
+  body.append('file', file)
+  body.append('kind', kind)
+  return fetchJson<Attachment>(`${sessionPath(projectId, key)}/attachments`, {
+    method: 'POST',
+    body,
+  })
+}
+
+export async function deleteAttachment(projectId: string, key: SessionKey, attachmentId: string): Promise<void> {
+  return fetchJson<void>(`${sessionPath(projectId, key)}/attachments/${encodeURIComponent(attachmentId)}`, {
+    method: 'DELETE',
   })
 }
 

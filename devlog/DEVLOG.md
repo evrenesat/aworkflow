@@ -1,3 +1,32 @@
+# 2026-08-02 — Provider-neutral planning backend cutover
+
+### What changed
+
+- Split planning-session transport from the aflow management app behind
+  provider-neutral models, capabilities, errors, registry lifecycle, service,
+  and canonical project-scoped routes.
+- Replaced the handwritten Codex websocket boundary with a long-lived
+  `codex-app-server-sdk` provider. Existing Codex sessions remain discoverable
+  through current project paths and stored historical aliases.
+- Added shared aflow-managed attachment staging outside repositories, with
+  validated namespaces and limits. Codex file/image turns use deterministic
+  provider-side manifest augmentation because the SDK text helpers do not offer
+  native attachment parity.
+- Updated the web client to use provider-qualified session identity,
+  capability-driven controls, active and archived sessions, approvals,
+  interruption, and uploads. Removed the temporary `/threads` routes and the
+  legacy linked-thread project count after the web cutover.
+
+### Why
+
+- The management app owns projects, plan drafts, and workflow UX; provider
+  implementations own transport details. Keeping those responsibilities
+  separate prevents Codex protocol vocabulary and identifiers from defining the
+  app contract and permits provider failures to remain isolated.
+- The server subproject now requires Python 3.12 because the adopted SDK
+  requires it. The root `aworkflow` package retains its independent Python 3.11
+  baseline.
+
 # 2026-08-02 — In-process dashboard TTY viewport
 
 ### What changed

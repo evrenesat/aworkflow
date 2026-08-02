@@ -53,7 +53,7 @@ export function ProjectPicker({ selectedProjectId, onSelectProject }: ProjectPic
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 'var(--spacing-md)', minWidth: 0 }}>
         <div>
           <h2 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Projects</h2>
-          <div className="text-sm text-dim">Detected under your configured projects root and from Codex threads.</div>
+          <div className="text-sm text-dim">Detected under your configured projects root and from planning sessions.</div>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={() => void loadProjects()}>
           Refresh
@@ -86,7 +86,7 @@ export function ProjectPicker({ selectedProjectId, onSelectProject }: ProjectPic
                 >
                   <div className="content-button-row">
                     <div style={{ fontWeight: 600, overflowWrap: 'anywhere', wordBreak: 'break-word', minWidth: 0 }}>{project.display_name}</div>
-                    <span className="text-xs text-dim">{project.linked_thread_count} threads</span>
+                    <span className="text-xs text-dim">{project.linked_session_count} sessions</span>
                   </div>
                   <div className="text-sm text-dim" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
                     {project.current_path}

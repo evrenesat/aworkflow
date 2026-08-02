@@ -1,315 +1,116 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from './api'
 
-function mockOkJson<T>(value: T) {
-  ;(global.fetch as any).mockResolvedValueOnce({
-    ok: true,
-    json: async () => value,
-  })
+function mockOkJson<T>(value: T, status = 200) {
+  vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status, json: async () => value } as Response)
 }
 
-describe('API Client', () => {
+const key = { provider_id: 'codex', provider_session_id: 'session-1' }
+
+describe('provider-neutral API client', () => {
   beforeEach(() => {
     global.fetch = vi.fn()
     api.clearAuthToken()
   })
 
-  describe('Auth Token Management', () => {
-    it('sets and clears the auth token', () => {
-      api.setAuthToken('test-token')
-      expect(api.getAuthToken()).toBe('test-token')
-
-      api.clearAuthToken()
-      expect(api.getAuthToken()).toBeNull()
-    })
+  it('manages auth and lists projects with authorization', async () => {
+    api.setAuthToken('test-token')
+    mockOkJson([{ id: 'project-1', display_name: 'Alpha', linked_session_count: 2 }])
+    expect((await api.listProjects())[0].linked_session_count).toBe(2)
+    expect(global.fetch).toHaveBeenCalledWith('/api/projects', expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+    }))
+    api.clearAuthToken()
+    expect(api.getAuthToken()).toBeNull()
   })
 
-  describe('Project operations', () => {
-    it('lists projects with auth headers', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson([{ id: 'project-1', display_name: 'Alpha', current_path: '/tmp/alpha' }])
+  it('uses canonical provider-qualified session routes without cwd payloads', async () => {
+    mockOkJson({ sessions: [], providers: [], next_cursor: null })
+    await api.listProjectSessions('project-1', { archived: false })
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/sessions?archived=false', expect.any(Object)
+    )
 
-      const projects = await api.listProjects()
+    mockOkJson({ key, turns: [] })
+    await api.getProjectSession('project-1', key)
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/providers/codex/sessions/session-1?include_turns=true', expect.any(Object)
+    )
 
-      expect(projects[0].display_name).toBe('Alpha')
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects',
-        expect.objectContaining({
-          headers: expect.objectContaining({
-            Authorization: 'Bearer test-token',
-          }),
-        })
-      )
-    })
+    mockOkJson({ key, turns: [] }, 201)
+    await api.startProjectSession('project-1', { provider_id: 'codex', model: 'gpt-5' })
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/sessions',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ provider_id: 'codex', model: 'gpt-5' }) })
+    )
 
-    it('updates a project override', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson({ id: 'project-1', display_name: 'Renamed', current_path: '/tmp/renamed' })
-
-      const project = await api.updateProject('project-1', {
-        display_name: 'Renamed',
-        current_path: '/tmp/renamed',
-      })
-
-      expect(project.current_path).toBe('/tmp/renamed')
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1',
-        expect.objectContaining({
-          method: 'PATCH',
-          body: JSON.stringify({
-            display_name: 'Renamed',
-            current_path: '/tmp/renamed',
-          }),
-        })
-      )
-    })
+    mockOkJson({ key, turns: [] })
+    await api.resumeProjectSession('project-1', key)
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/providers/codex/sessions/session-1/resume',
+      expect.objectContaining({ method: 'POST' })
+    )
   })
 
-  describe('Thread operations', () => {
-    it('lists project threads with snake_case query params', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson({
-        threads: [],
-        next_cursor: null,
-        backend_status: {
-          state: 'ready',
-          message: null,
-          detail: null,
-        },
-      })
-
-      const page = await api.listProjectThreads('project-1', {
-        search_term: 'hello',
-        limit: 5,
-        source_kinds: ['app-server'],
-      })
-
-      expect(page.backend_status?.state).toBe('ready')
-
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/threads?search_term=hello&limit=5&source_kinds=app-server',
-        expect.objectContaining({
-          headers: expect.objectContaining({
-            Authorization: 'Bearer test-token',
-          }),
-        })
-      )
+  it('sends provider-neutral turn controls and actions', async () => {
+    mockOkJson({ turn_id: 'turn-1', status: 'running', items: [] }, 201)
+    await api.startProjectTurn('project-1', key, {
+      text: 'hello', attachment_ids: ['attachment-1'], model: 'gpt-5',
+      reasoning_level: 'high', reasoning_summary: 'concise',
     })
-
-    it('reads a project thread with turns by default', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson({
-        id: 'thread-1',
-        preview: 'preview',
-        ephemeral: false,
-        model_provider: 'openai',
-        created_at: '2024-01-01T00:00:00Z',
-        updated_at: '2024-01-01T00:00:00Z',
-        status: {},
-        path: null,
-        cwd: '/tmp/project',
-        cli_version: '1',
-        source: 'app-server',
-        agent_nickname: null,
-        agent_role: null,
-        git_info: null,
-        name: 'Thread',
-        turns: [],
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/providers/codex/sessions/session-1/turns',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          text: 'hello', attachment_ids: ['attachment-1'], model: 'gpt-5',
+          reasoning_level: 'high', reasoning_summary: 'concise',
+        }),
       })
+    )
 
-      await api.getProjectThread('project-1', 'thread-1')
+    mockOkJson({ status: 'interrupted' })
+    await api.interruptProjectTurn('project-1', key, 'turn-1')
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/providers/codex/sessions/session-1/turns/turn-1/interrupt',
+      expect.objectContaining({ method: 'POST' })
+    )
 
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/threads/thread-1?include_turns=true',
-        expect.objectContaining({
-          headers: expect.objectContaining({
-            Authorization: 'Bearer test-token',
-          }),
-        })
-      )
-    })
-
-    it('starts a turn with the official user input shape', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson({
-        id: 'turn-1',
-        status: 'inProgress',
-        items: [],
-        error: null,
-      })
-
-      await api.startProjectTurn('project-1', 'thread-1', {
-        input: [
-          {
-            type: 'text',
-            text: 'hello',
-            text_elements: [],
-          },
-        ],
-        cwd: '/tmp/project',
-      })
-
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/threads/thread-1/turns',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            input: [
-              {
-                type: 'text',
-                text: 'hello',
-                text_elements: [],
-              },
-            ],
-            cwd: '/tmp/project',
-          }),
-        })
-      )
-    })
-
-    it('starts, resumes, and forks with cwd overrides', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson({
-        thread: { id: 'thread-1', preview: '', ephemeral: false, model_provider: 'openai', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z', status: {}, path: null, cwd: '/tmp/project', cli_version: '1', source: 'app-server', agent_nickname: null, agent_role: null, git_info: null, name: null, turns: [] },
-        model: null,
-        model_provider: null,
-        service_tier: null,
-        cwd: '/tmp/project',
-        approval_policy: null,
-        approvals_reviewer: {},
-        sandbox: {},
-        reasoning_effort: null,
-      })
-
-      await api.startProjectThread('project-1', { cwd: '/tmp/project' })
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/threads',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            cwd: '/tmp/project',
-          }),
-        })
-      )
-
-      mockOkJson({
-        thread: { id: 'thread-2', preview: '', ephemeral: false, model_provider: 'openai', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z', status: {}, path: null, cwd: '/tmp/project', cli_version: '1', source: 'app-server', agent_nickname: null, agent_role: null, git_info: null, name: null, turns: [] },
-        model: null,
-        model_provider: null,
-        service_tier: null,
-        cwd: '/tmp/project',
-        approval_policy: null,
-        approvals_reviewer: {},
-        sandbox: {},
-        reasoning_effort: null,
-      })
-
-      await api.resumeProjectThread('project-1', 'thread-1', { cwd: '/tmp/project' })
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/threads/thread-1/resume',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            cwd: '/tmp/project',
-          }),
-        })
-      )
-
-      mockOkJson({
-        thread: { id: 'thread-3', preview: '', ephemeral: false, model_provider: 'openai', created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z', status: {}, path: null, cwd: '/tmp/project', cli_version: '1', source: 'app-server', agent_nickname: null, agent_role: null, git_info: null, name: null, turns: [] },
-        model: null,
-        model_provider: null,
-        service_tier: null,
-        cwd: '/tmp/project',
-        approval_policy: null,
-        approvals_reviewer: {},
-        sandbox: {},
-        reasoning_effort: null,
-      })
-
-      await api.forkProjectThread('project-1', 'thread-1', { cwd: '/tmp/project' })
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/threads/thread-1/fork',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            cwd: '/tmp/project',
-          }),
-        })
-      )
-    })
+    mockOkJson({ status: 'recorded' })
+    await api.respondToApproval('project-1', key, 'approval-1', 'accept')
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/projects/project-1/planning/providers/codex/sessions/session-1/approvals/approval-1',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ decision: 'accept' }) })
+    )
   })
 
-  describe('Plan draft operations', () => {
-    it('saves, loads, promotes, and deletes drafts with the corrected contract', async () => {
-      api.setAuthToken('test-token')
+  it('uploads multipart attachments without a JSON content type', async () => {
+    api.setAuthToken('test-token')
+    mockOkJson({ attachment_id: 'a-1', filename: 'diagram.png', kind: 'image', size_bytes: 3 }, 201)
+    await api.uploadAttachment('project-1', key, new File(['abc'], 'diagram.png', { type: 'image/png' }), 'image')
 
-      mockOkJson({ name: 'plan-a', path: '/tmp/plan-a.md', status: 'draft' })
-      await api.savePlanDraft('project-1', { name: 'plan-a', content: '# Plan' })
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/plans/drafts',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({ name: 'plan-a', content: '# Plan' }),
-        })
-      )
-
-      mockOkJson({ name: 'plan-a', content: '# Plan' })
-      await api.loadPlanDraft('project-1', 'plan-a')
-      expect(global.fetch).toHaveBeenCalledWith('/api/projects/project-1/plans/drafts/plan-a', expect.any(Object))
-
-      mockOkJson({ name: 'plan-a', path: '/tmp/plan-a.md', status: 'in_progress' })
-      await api.promotePlanDraft('project-1', { draft_name: 'plan-a', target_name: 'plan-a' })
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/plans/promote',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({ draft_name: 'plan-a', target_name: 'plan-a' }),
-        })
-      )
-
-      mockOkJson(undefined)
-      await api.deletePlanDraft('project-1', 'plan-a')
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/projects/project-1/plans/drafts/plan-a',
-        expect.objectContaining({
-          method: 'DELETE',
-        })
-      )
-    })
+    const [, options] = vi.mocked(global.fetch).mock.calls.at(-1)!
+    expect(options.body).toBeInstanceOf(FormData)
+    expect(options.headers.Authorization).toBe('Bearer test-token')
+    expect(options.headers['Content-Type']).toBeUndefined()
   })
 
-  describe('Execution operations', () => {
-    it('starts execution against a project id', async () => {
-      api.setAuthToken('test-token')
-      mockOkJson({ run_id: 'run-1' })
-
-      await api.startExecution({ project_id: 'project-1', plan_path: 'plans/in-progress/demo.md' })
-
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/executions',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({
-            project_id: 'project-1',
-            plan_path: 'plans/in-progress/demo.md',
-          }),
-        })
-      )
-    })
+  it('surfaces bounded provider error messages', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      text: async () => JSON.stringify({ detail: { code: 'provider_unavailable', message: 'Planning provider is unavailable.' } }),
+    } as Response)
+    await expect(api.listProjectSessions('project-1')).rejects.toThrow('Planning provider is unavailable.')
   })
 
-  describe('Error handling', () => {
-    it('throws ApiError on failed request', async () => {
-      api.setAuthToken('test-token')
+  it('keeps plan draft and execution routes unchanged', async () => {
+    mockOkJson({ name: 'plan-a', path: '/tmp/plan-a.md', status: 'draft' }, 201)
+    await api.savePlanDraft('project-1', { name: 'plan-a', content: '# Plan' })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/drafts', expect.objectContaining({ method: 'POST' }))
 
-      ;(global.fetch as any).mockResolvedValueOnce({
-        ok: false,
-        status: 401,
-        text: async () => JSON.stringify({ detail: 'Unauthorized' }),
-      })
-
-      await expect(api.listProjects()).rejects.toThrow('Unauthorized')
-    })
+    mockOkJson({ run_id: 'run-1' })
+    await api.startExecution({ project_id: 'project-1', plan_path: 'plans/in-progress/demo.md' })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/executions', expect.objectContaining({ method: 'POST' }))
   })
 })

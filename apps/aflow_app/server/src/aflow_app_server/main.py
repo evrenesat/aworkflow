@@ -20,12 +20,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+import aflow_app_server.planning_routes as planning_routes_module
 from .aflow_service import AflowService
-from .codex_app_server_client import CodexAppServerClient
-from .codex_thread_gateway import CodexThreadGateway
-import aflow_app_server.codex_routes as codex_routes_module
 from .config import ServerConfig
 from .models import ExecutionRequest, ExecutionStatus
+from .planning import AttachmentStore, PlanningService, ProviderRegistry
+from .planning.providers import CodexProvider
+from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
 from .plan_store import PlanStore
 from .transcription import TranscriptionClient, TranscriptionError, create_transcription_client
@@ -36,6 +37,8 @@ _config: ServerConfig | None = None
 _project_catalog: ProjectCatalog | None = None
 _service: AflowService | None = None
 _transcription_client: TranscriptionClient | None = None
+_planning_registry: ProviderRegistry | None = None
+_planning_service: PlanningService | None = None
 _seen_plugin_probe_fingerprints: set[str] = set()
 
 
@@ -134,6 +137,13 @@ def get_transcription_client() -> TranscriptionClient:
     return _transcription_client
 
 
+def get_planning_service() -> PlanningService:
+    """Get the application-lifespan provider-neutral planning service."""
+    if _planning_service is None:
+        raise RuntimeError("Server not initialized")
+    return _planning_service
+
+
 security = HTTPBearer(auto_error=False)
 
 
@@ -150,31 +160,6 @@ async def verify_token(
             detail="Invalid authentication token",
         )
     return provided_token
-
-
-def get_codex_backend(config: ServerConfig = Depends(get_config)) -> CodexAppServerClient:
-    """Get or create a Codex thread gateway instance."""
-    if not config.codex_app_server_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Codex app-server not configured",
-        )
-
-    return CodexAppServerClient(
-        server_url=config.codex_app_server_url,
-        auth_token=config.codex_app_server_token,
-    )
-
-
-def _get_codex_thread_gateway(config: ServerConfig) -> CodexThreadGateway | None:
-    """Return a thread gateway when Codex is configured, otherwise None."""
-    if not config.codex_app_server_url:
-        return None
-
-    return CodexAppServerClient(
-        server_url=config.codex_app_server_url,
-        auth_token=config.codex_app_server_token,
-    )
 
 
 def get_plan_store_factory(project_catalog: ProjectCatalog = Depends(get_project_catalog)):
@@ -227,6 +212,7 @@ def _build_uvicorn_log_config() -> dict[str, Any]:
 async def lifespan(app: FastAPI):
     """Initialize server state on startup."""
     global _config, _project_catalog, _service, _transcription_client
+    global _planning_registry, _planning_service
 
     _config = ServerConfig.from_env()
     errors = _config.validate()
@@ -243,14 +229,60 @@ async def lifespan(app: FastAPI):
         _config.transcription_url,
         _config.transcription_token,
     )
+    attachment_store = AttachmentStore(
+        _config.attachment_root,
+        max_file_size_bytes=_config.attachment_max_file_size_bytes,
+        max_count_per_turn=_config.attachment_max_count_per_turn,
+        max_total_size_bytes_per_turn=(
+            _config.attachment_max_total_size_bytes_per_turn
+        ),
+    )
+    providers = []
+    for provider in _config.planning_providers:
+        if not provider.enabled:
+            continue
+        if provider.kind == "codex":
+            providers.append(
+                CodexProvider(
+                    provider.id,
+                    provider.display_name,
+                    server_url=provider.server_url,
+                    server_token=provider.server_token,
+                    operation_timeout_seconds=_config.planning_operation_timeout_seconds,
+                    execution_policy=_config.planning_execution_policy,
+                    attachment_store=attachment_store,
+                )
+            )
+        else:
+            providers.append(
+                UnavailablePlanningProvider(provider.id, provider.display_name)
+            )
+    _planning_registry = ProviderRegistry(
+        providers,
+        operation_timeout_seconds=_config.planning_operation_timeout_seconds,
+    )
+    await _planning_registry.start()
+    _planning_service = PlanningService(
+        _planning_registry,
+        default_provider_id=_config.default_planning_provider_id,
+        attachment_store=attachment_store,
+    )
+    app.state.planning_service = _planning_service
+    app.state.attachment_store = attachment_store
 
-    yield
-
-    # Cleanup
-    _config = None
-    _project_catalog = None
-    _service = None
-    _transcription_client = None
+    try:
+        yield
+    finally:
+        await _planning_registry.close()
+        # Cleanup
+        app.state.planning_service = None
+        app.state.attachment_store = None
+        _planning_service = None
+        _planning_registry = None
+        _config = None
+        _project_catalog = None
+        _service = None
+        _transcription_client = None
 
 
 app = FastAPI(
@@ -271,12 +303,10 @@ async def block_local_plugin_probe(request: Request, call_next):
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     return await call_next(request)
 
-# Override codex_routes dependencies using FastAPI's dependency override system
-app.dependency_overrides[codex_routes_module._get_config] = get_config
-app.dependency_overrides[codex_routes_module._get_project_catalog] = get_project_catalog
+app.dependency_overrides[planning_routes_module._get_project_catalog] = get_project_catalog
+app.dependency_overrides[planning_routes_module._get_planning_service] = get_planning_service
 
-# Include Codex routes with auth
-app.include_router(codex_routes_module.router, dependencies=[Depends(verify_token)])
+app.include_router(planning_routes_module.router, dependencies=[Depends(verify_token)])
 
 
 # Request/Response models
@@ -308,10 +338,12 @@ class StartupResponse(BaseModel):
 async def list_projects(
     _: str = Depends(verify_token),
     project_catalog: ProjectCatalog = Depends(get_project_catalog),
-    config: ServerConfig = Depends(get_config),
 ) -> list[dict[str, Any]]:
     """List all discovered projects."""
-    projects = project_catalog.list_projects(thread_gateway=_get_codex_thread_gateway(config))
+    sessions = ()
+    if _planning_service is not None:
+        sessions, _ = await _planning_service.list_sessions()
+    projects = project_catalog.list_projects(sessions=sessions)
     return [project.to_dict() for project in projects]
 
 
@@ -320,13 +352,12 @@ async def get_project(
     project_id: str,
     _: str = Depends(verify_token),
     project_catalog: ProjectCatalog = Depends(get_project_catalog),
-    config: ServerConfig = Depends(get_config),
 ) -> dict[str, Any]:
     """Get a specific project."""
-    project = project_catalog.get_project(
-        project_id,
-        thread_gateway=_get_codex_thread_gateway(config),
-    )
+    sessions = ()
+    if _planning_service is not None:
+        sessions, _ = await _planning_service.list_sessions()
+    project = project_catalog.get_project(project_id, sessions=sessions)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project.to_dict()
