@@ -545,7 +545,7 @@ plans/                 # user plan files and backups
 apps/                  # separate subprojects (not in published wheel)
   aflow_app/           # remote management app
     server/            # FastAPI backend using aflow library
-    web/               # React frontend (future)
+    web/               # React frontend
 .aflow/
   runs/                # per-run logs (gitignored)
 ```
@@ -564,150 +564,74 @@ apps/                  # separate subprojects (not in published wheel)
 
 ## Remote App (Separate Subproject)
 
-The `apps/aflow_app/` directory contains a separate remote management application that uses `aflow` as a library. This app is not included in the published `aworkflow` wheel.
+The `apps/aflow_app/` directory contains a mobile-first remote management
+application that imports `aflow` as a library. It is not included in the
+published `aworkflow` wheel.
 
 ### Server (`apps/aflow_app/server/`)
 
-A FastAPI-based backend that provides:
-- Repository registry for managing multiple local repos
-- Plan listing from `plans/drafts/` and `plans/in-progress/`
-- Workflow execution through the `aflow.api` library
-- Server-Sent Events (SSE) for streaming execution progress
-- Token-based authentication for all state-changing operations
+The Python 3.12+ FastAPI server owns project identity, plan drafts, workflow
+execution, and the application-facing planning-session API. Its main boundaries
+are:
 
-The server imports `aflow` as a library and uses:
-- `prepare_startup()` for startup preparation
-- `execute_workflow()` for workflow execution
-- `ExecutionObserver` for streaming events over SSE
+- `main.py` owns application-lifespan state: configuration, the project
+  catalog, one long-lived planning provider registry, the planning service, and
+  the shared attachment store.
+- `project_catalog.py` discovers local projects and associates provider
+  sessions by current working directory and stored historical aliases. Project
+  paths remain server-authoritative.
+- `planning/models.py`, `provider.py`, `registry.py`, and `service.py`
+  define the provider-neutral session, capability, error, lifecycle, and
+  operation contracts. Session identity is always the pair
+  `(provider_id, provider_session_id)`.
+- `planning_routes.py` exposes provider discovery and project-scoped session
+  routes under
+  `/api/projects/{project_id}/planning/providers/{provider_id}/sessions`.
+  The same router retains the existing project plan-draft URLs, which are not
+  provider operations.
+- `planning/providers/codex.py` is the concrete Codex adapter. It uses the
+  public `codex-app-server-sdk` API for session lifecycle, turns, model
+  discovery, archive state, approvals, and interruption. Codex protocol models
+  and errors are normalized before they reach the app boundary.
+- `planning/attachment_store.py` stores uploaded bytes beneath shared
+  aflow-managed configuration storage, outside project repositories. It
+  validates provider-qualified namespaces, limits, containment, and in-flight
+  leases. The Codex adapter supplies staged file/image metadata to turns through
+  deterministic prompt augmentation because the SDK helpers do not provide
+  equivalent native rich-attachment input.
 
-Configuration is loaded from environment variables or `~/.config/aflow-app/config.toml`.
+Provider capabilities drive available models, reasoning values, attachment
+kinds, and optional operations. A provider failure is reported through bounded,
+provider-neutral readiness/error models and does not suppress healthy providers.
+The default execution policy is configured server-side as full access; it is
+not selected by browser requests.
+
+The server also provides repository/project discovery, plan persistence,
+workflow execution through `aflow.api`, SSE execution events, token
+authentication, and optional audio transcription. Configuration is loaded from
+environment variables and `~/.config/aflow/config.toml`.
 
 ### Web Client (`apps/aflow_app/web/`)
 
-A mobile-first React frontend (future checkpoint) that will provide:
-- Repository selection and management
-- Plan browsing and execution
-- Live execution status updates via SSE
-- Codex thread integration (future)
-- Audio transcription support (future)
+The React client uses only provider-neutral project and planning-session
+vocabulary. It supports provider selection, capability-derived model and
+reasoning controls, separate active/archived session lists, resume/fork/archive
+operations, approvals, interruption, attachment upload/delete, plan drafts, and
+workflow execution. React keys and API requests carry `provider_id` and
+`provider_session_id` separately.
 
-### Design Principles
+### Control Flow
 
-- The server uses `aflow` as a library, not as a CLI subprocess
-- All execution state flows through structured library events, not terminal scraping
-- The app is designed for authenticated local/LAN use, not internet-facing deployment
-- The server and web client are separate packages from the root `aworkflow` wheel
-
-
-## Remote App Server
-
-The `apps/aflow_app/server/` subproject provides a FastAPI-based remote management server for aflow workflows. It is a separate package that imports `aflow` as a library and is not included in the published `aworkflow` wheel.
-
-### Architecture
-
-The server exposes authenticated REST APIs for:
-- Repository registry management (add, list, update, remove repos)
-- Plan file discovery (list drafts and in-progress plans)
-- Workflow execution (start runs, stream events via SSE)
-- Codex thread management through the official Codex app-server protocol
-- Plan draft persistence (save, load, promote drafts to in-progress)
-
-### Key Components
-
-**`main.py`** — FastAPI application with lifespan management for global state (`ServerConfig`, `RepoRegistry`, `AflowService`). Uses dependency injection to provide these services to route handlers. Includes Codex routes with authentication.
-
-**`config.py`** — Server configuration loading from environment variables and `~/.config/aflow-app/config.toml`. Supports:
-- Server bind settings (`bind_host`, `bind_port`)
-- Authentication (`auth_token`)
-- Repository registry path
-- Codex app-server settings (`codex_app_server_url`, `codex_app_server_token`)
-- Transcription settings (`transcription_url`, `transcription_token`)
-
-**`repo_registry.py`** — JSON-backed repository registry with validation. Stores repo metadata (id, name, path, git root status, registration timestamp). Validates that registered paths exist and are git roots or explicit user-chosen repo roots.
-
-**`aflow_service.py`** — Service layer that wraps `aflow.api` library calls. Provides:
-- Plan listing (scans `plans/drafts/` and `plans/in-progress/`)
-- Startup preparation (calls `aflow.api.startup.prepare_startup()`)
-- Async workflow execution (calls `aflow.api.runner.execute_workflow()` in thread pool)
-- Event streaming (collects `ExecutionEvent` objects into asyncio queues for SSE)
-
-**`codex_backend.py`** — Compatibility exports for Codex thread gateway code.
-
-**`codex_thread_gateway.py`** — Thread-centric Codex gateway interface. Defines:
-- `CodexThreadGateway` protocol with `list_threads()`, `read_thread()`, `start_thread()`, `resume_thread()`, `fork_thread()`, `set_thread_name()`, `start_turn()`
-- Normalized thread, turn, and mutation-result models for the rest of the server
-
-**`codex_app_server_client.py`** — Websocket JSON-RPC client for the official Codex app-server thread protocol. It normalizes generated `thread/*` and `turn/start` payloads into the server-local thread models.
-
-**`codex_routes.py`** — FastAPI router for Codex and plan draft endpoints:
-- `GET /api/codex/threads` — List available Codex threads
-- `GET /api/codex/threads/{thread_id}` — Read a thread
-- `POST /api/codex/threads` — Start a thread
-- `POST /api/codex/threads/{thread_id}/resume` — Resume a thread
-- `POST /api/codex/threads/{thread_id}/fork` — Fork a thread
-- `PATCH /api/codex/threads/{thread_id}/name` — Rename a thread
-- `POST /api/codex/threads/{thread_id}/turns` — Send a user turn
-- `POST /api/codex/repos/{repo_id}/plans/drafts` — Save plan draft
-- `GET /api/codex/repos/{repo_id}/plans/drafts` — List drafts
-- `GET /api/codex/repos/{repo_id}/plans/drafts/{name}` — Load draft
-- `DELETE /api/codex/repos/{repo_id}/plans/drafts/{name}` — Delete draft
-- `POST /api/codex/repos/{repo_id}/plans/promote` — Promote draft to in-progress
-- `GET /api/codex/repos/{repo_id}/plans/in-progress` — List in-progress plans
-
-**`plan_store.py`** — Plan draft and promotion management for a repository. Handles:
-- Saving drafts under `<repo>/plans/drafts/`
-- Promoting approved drafts to `<repo>/plans/in-progress/`
-- Preserving content verbatim during save/load/promote operations
-
-**`transcription.py`** — Audio transcription client for browser-recorded audio clips. Provides:
-- `TranscriptionClient` protocol for pluggable transcription backends
-- `OpenAICompatibleTranscriptionClient` for OpenAI Whisper-compatible APIs
-- Graceful degradation when transcription is not configured
-- Automatic cleanup of uploaded audio files after transcription
-
-**`models.py`** — API models for server endpoints:
-- `RepoInfo` — Repository metadata
-- `PlanInfo` — Plan file metadata with checkpoint counts
-- `ExecutionRequest` — Workflow execution request parameters
-- `ExecutionStatus` — Workflow execution status
-- `PlanStatus` — Enum for draft vs in-progress
-
-### Authentication
-
-All state-changing and Codex thread endpoints require bearer token authentication via `Authorization: Bearer <token>` header. The token is configured via `AFLOW_APP_TOKEN` environment variable or `server.auth_token` in config file.
-
-### Dependency Injection
-
-The server uses FastAPI's dependency injection system with global state managed in the lifespan context. Codex routes use dependency override to access the global `ServerConfig` and `RepoRegistry` instances.
-
-### External Integration
-
-**Codex Server:** The server now speaks the official app-server thread protocol. The websocket client normalizes `thread/list`, `thread/read`, `thread/start`, `thread/resume`, `thread/fork`, `thread/setName`, and `turn/start` responses into the server's internal models. When a project moves or is renamed, the app must preserve the association in app-managed metadata and continue work with `cwd` overrides on `thread/resume` or `thread/fork`, because the protocol supports `gitInfo` updates but not in-place `cwd` mutation.
-
-**Plan Drafts:** Draft plans are stored in the repository's `plans/drafts/` directory. Promoted plans are written to `plans/in-progress/`. The server does not modify the aflow library's plan parsing or execution logic.
-
-### Testing
-
-The server includes comprehensive tests:
-- `test_transcription.py` — Tests for audio transcription client with mocked HTTP responses
-- `test_codex_backend.py` — Tests for the websocket Codex app-server client
-- `test_codex_thread_gateway.py` — Tests for the normalized thread gateway interface
-- `test_plan_store.py` — Tests for plan draft management
-- `test_api.py` — Integration tests for all API endpoints including transcription
-- `test_repo_registry.py` — Tests for repository registry
-
-### Deployment
-
-The server is designed for desktop-hosted, LAN-accessed use with token authentication. It is not intended for internet-exposed deployment without additional security measures.
-
-Run the server with:
-```bash
-uv run --project apps/aflow_app/server aflow-app-server
+```text
+browser -> canonical planning routes -> project authorization -> planning service
+                                                     |
+                                                     v
+                         provider registry -> Codex SDK-backed provider
+                                                     |
+                                                     v
+                         provider session backend / external attachment store
 ```
 
-Or configure and run via uvicorn:
-```bash
-export AFLOW_APP_TOKEN="your-secret-token"
-export AFLOW_CODEX_APP_SERVER_URL="ws://localhost:9000"
-uvicorn aflow_app_server.main:app --host 127.0.0.1 --port 8765
-```
+All state-changing routes require bearer-token authentication. The app is
+designed for authenticated local or LAN deployment, not direct internet
+exposure.

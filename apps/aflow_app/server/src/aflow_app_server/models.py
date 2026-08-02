@@ -59,11 +59,6 @@ class ProjectInfo:
         """Backward-compatible alias for the current path."""
         return self.current_path
 
-    @property
-    def linked_thread_count(self) -> int:
-        """Deprecated compatibility alias for the pre-planning web client."""
-        return self.linked_session_count
-
     def to_dict(self) -> dict[str, Any]:
         aliases = [str(alias) for alias in self.historical_aliases]
         payload = {
@@ -73,7 +68,6 @@ class ProjectInfo:
             "historical_aliases": aliases,
             "detection_source": self.detection_source,
             "linked_session_count": self.linked_session_count,
-            "linked_thread_count": self.linked_session_count,
             "is_git_root": self.is_git_root,
             "registered_at": self.registered_at.isoformat(),
         }

@@ -2,7 +2,7 @@
 
 A mobile-first remote management interface for AFlow workflows.
 
-The remote app provides project discovery, provider-neutral planning-session reuse across devices, plan draft save/load/promote workflows, execution monitoring via SSE, and optional audio transcription. Planning sessions expose provider selection, provider-advertised model and reasoning controls, archive and interruption actions, approvals, and attachment uploads when supported. It is a separate subproject from the main `aworkflow` package and is not included in the published wheel.
+The remote app provides project discovery, provider-neutral planning-session reuse across devices, plan draft save/load/promote workflows, execution monitoring via SSE, and optional audio transcription. Planning sessions expose provider selection, provider-advertised model and reasoning controls, archive and interruption actions, approvals, and attachment uploads when supported. Codex is implemented behind this boundary with `codex-app-server-sdk`; staged file and image metadata is supplied through deterministic turn instructions rather than claimed as native SDK attachment support. It is a separate subproject from the main `aworkflow` package and is not included in the published wheel.
 
 Full documentation lives in [../../docs/remote-app.md](../../docs/remote-app.md).
 
@@ -23,6 +23,10 @@ cd apps/aflow_app/server
 uv sync
 AFLOW_APP_TOKEN=secret uv run aflow-app-server
 ```
+
+The server requires Python 3.12 or newer. Uploaded planning attachments are
+stored under shared aflow-managed configuration storage outside project
+repositories.
 
 Open `http://127.0.0.1:8765/`.
 

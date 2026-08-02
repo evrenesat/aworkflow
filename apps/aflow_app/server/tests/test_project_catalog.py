@@ -68,31 +68,30 @@ def test_discovers_local_git_roots_and_stabilizes_ids(tmp_path: Path) -> None:
     first_snapshot = catalog.list_projects()
     assert [project.current_path for project in first_snapshot] == [alpha, bravo]
     assert all(project.detection_source == "local_git_root" for project in first_snapshot)
-    assert all(project.linked_thread_count == 0 for project in first_snapshot)
+    assert all(project.linked_session_count == 0 for project in first_snapshot)
 
     first_ids = {project.current_path: project.id for project in first_snapshot}
     second_snapshot = ProjectCatalog(projects_home, store_path).list_projects()
     assert {project.current_path: project.id for project in second_snapshot} == first_ids
 
 
-def test_merges_thread_cwds_into_catalog(tmp_path: Path) -> None:
+def test_merges_session_cwds_into_catalog(tmp_path: Path) -> None:
     projects_home = tmp_path / "code"
     alpha = _make_git_repo(projects_home / "alpha")
-    thread_only = tmp_path / "outside" / "thread-only"
-    thread_only.mkdir(parents=True)
+    session_only = tmp_path / "outside" / "session-only"
+    session_only.mkdir(parents=True)
 
-    sessions = [_make_session("thread-1", alpha), _make_session("thread-2", thread_only)]
+    sessions = [_make_session("session-1", alpha), _make_session("session-2", session_only)]
     catalog = ProjectCatalog(projects_home, tmp_path / "project_overrides.json")
 
     projects = catalog.list_projects(sessions=sessions)
     by_path = {project.current_path: project for project in projects}
 
-    assert by_path[alpha].linked_thread_count == 1
     assert by_path[alpha].linked_session_count == 1
     assert by_path[alpha].detection_source == "local_git_root+planning_session_cwd"
-    assert by_path[thread_only].linked_thread_count == 1
-    assert by_path[thread_only].detection_source == "planning_session_cwd"
-    assert by_path[thread_only].is_git_root is False
+    assert by_path[session_only].linked_session_count == 1
+    assert by_path[session_only].detection_source == "planning_session_cwd"
+    assert by_path[session_only].is_git_root is False
 
 
 def test_linked_session_count_aggregates_provider_qualified_sessions(
@@ -109,7 +108,6 @@ def test_linked_session_count_aggregates_provider_qualified_sessions(
     ).list_projects(sessions=sessions)[0]
 
     assert result.linked_session_count == 2
-    assert result.linked_thread_count == 2
 
 
 def test_catalog_without_provider_enrichment_remains_available(tmp_path: Path) -> None:
@@ -121,15 +119,15 @@ def test_catalog_without_provider_enrichment_remains_available(tmp_path: Path) -
     projects = catalog.list_projects(sessions=None)
 
     assert [project.current_path for project in projects] == [alpha]
-    assert projects[0].linked_thread_count == 0
+    assert projects[0].linked_session_count == 0
     assert projects[0].detection_source == "local_git_root"
 
 
-def test_moved_projects_keep_old_threads_visible(tmp_path: Path) -> None:
+def test_moved_projects_keep_old_sessions_visible(tmp_path: Path) -> None:
     projects_home = tmp_path / "code"
     old_path = _make_git_repo(projects_home / "legacy")
     new_path = projects_home / "renamed"
-    session = _make_session("thread-1", old_path)
+    session = _make_session("session-1", old_path)
 
     catalog = ProjectCatalog(projects_home, tmp_path / "project_overrides.json")
     initial = catalog.list_projects(sessions=[session])
@@ -147,7 +145,7 @@ def test_moved_projects_keep_old_threads_visible(tmp_path: Path) -> None:
     project_by_id = {project.id: project for project in refreshed}[project.id]
     assert project_by_id.current_path == new_path
     assert old_path in project_by_id.historical_aliases
-    assert project_by_id.linked_thread_count == 1
+    assert project_by_id.linked_session_count == 1
 
     by_alias = ProjectCatalog(projects_home, tmp_path / "project_overrides.json").resolve_project_for_path(
         old_path,
@@ -189,7 +187,7 @@ def test_reused_historical_path_creates_a_distinct_project(tmp_path: Path) -> No
     assert legacy_path in by_path[renamed_path].historical_aliases
 
 
-def test_reused_historical_path_prefers_alias_owner_for_threads(tmp_path: Path) -> None:
+def test_reused_historical_path_prefers_alias_owner_for_sessions(tmp_path: Path) -> None:
     projects_home = tmp_path / "code"
     legacy_path = _make_git_repo(projects_home / "legacy")
     store_path = tmp_path / "project_overrides.json"
@@ -208,7 +206,7 @@ def test_reused_historical_path_prefers_alias_owner_for_threads(tmp_path: Path) 
     assert updated is not None
 
     _make_git_repo(legacy_path)
-    session = _make_session("thread-1", legacy_path)
+    session = _make_session("session-1", legacy_path)
     refreshed_catalog = ProjectCatalog(projects_home, store_path)
 
     resolved = refreshed_catalog.resolve_project_for_path(legacy_path, sessions=[session])
@@ -219,8 +217,8 @@ def test_reused_historical_path_prefers_alias_owner_for_threads(tmp_path: Path) 
         project.current_path: project
         for project in refreshed_catalog.list_projects(sessions=[session])
     }
-    assert projects[renamed_path].linked_thread_count == 1
-    assert projects[legacy_path].linked_thread_count == 0
+    assert projects[renamed_path].linked_session_count == 1
+    assert projects[legacy_path].linked_session_count == 0
 
 
 def test_project_ownership_helper_prefers_alias_owner(tmp_path: Path) -> None:
@@ -242,7 +240,7 @@ def test_project_ownership_helper_prefers_alias_owner(tmp_path: Path) -> None:
     assert updated is not None
 
     _make_git_repo(legacy_path)
-    session = _make_session("thread-1", legacy_path)
+    session = _make_session("session-1", legacy_path)
     refreshed_catalog = ProjectCatalog(projects_home, store_path)
     projects = refreshed_catalog.list_projects(sessions=[session])
     by_path = {project.current_path: project for project in projects}
@@ -265,12 +263,12 @@ def test_worktree_projects_collapse_to_primary_checkout(tmp_path: Path) -> None:
     worktree = projects_home / "worktrees" / "alpha-feature"
     _run_git(["worktree", "add", str(worktree)], cwd=primary)
 
-    sessions = [_make_session("thread-1", worktree)]
+    sessions = [_make_session("session-1", worktree)]
     catalog = ProjectCatalog(projects_home, tmp_path / "project_overrides.json")
 
     projects = catalog.list_projects(sessions=sessions)
     assert [project.current_path for project in projects] == [primary]
-    assert projects[0].linked_thread_count == 1
+    assert projects[0].linked_session_count == 1
     assert projects[0].detection_source == "local_git_root+planning_session_cwd"
 
     resolved = catalog.resolve_project_for_path(worktree, sessions=sessions)

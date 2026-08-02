@@ -468,9 +468,7 @@ def test_unsupported_attachments_fail_before_session_or_store_access(
     service.attachment_store.delete.assert_not_called()
 
 
-def test_project_payload_has_canonical_and_deprecated_equal_counts(
-    planning_client,
-) -> None:
+def test_project_payload_has_only_canonical_session_count(planning_client) -> None:
     client, service, _, path = planning_client
     service.list_sessions = AsyncMock(
         return_value=((_session(path),), (_readiness("codex"),))
@@ -479,4 +477,4 @@ def test_project_payload_has_canonical_and_deprecated_equal_counts(
     payload = client.get("/api/projects").json()[0]
 
     assert payload["linked_session_count"] == 1
-    assert payload["linked_thread_count"] == payload["linked_session_count"]
+    assert "linked_thread_count" not in payload
