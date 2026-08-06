@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import os
 import shutil
 import subprocess
@@ -91,6 +90,19 @@ class WorktreeProbe:
 AFLOW_OWNED_PATH_ROOTS = (".aflow",)
 
 
+_GIT_C_STYLE_ESCAPE_BYTES = {
+    "a": 0x07,
+    "b": 0x08,
+    "t": 0x09,
+    "n": 0x0A,
+    "v": 0x0B,
+    "f": 0x0C,
+    "r": 0x0D,
+    '"': 0x22,
+    "\\": 0x5C,
+}
+
+
 def _porcelain_path_field(line: str) -> str | None:
     if len(line) < 4 or line[2] != " ":
         return None
@@ -105,24 +117,40 @@ def _decode_porcelain_path_atom(atom: str) -> str | None:
     if not atom.endswith('"'):
         return None
 
-    escaped = False
-    for index, char in enumerate(atom[1:], start=1):
-        if escaped:
-            escaped = False
+    encoded_path = bytearray()
+    contents = atom[1:-1]
+    index = 0
+    while index < len(contents):
+        char = contents[index]
+        if char != "\\":
+            try:
+                encoded_path.extend(os.fsencode(char))
+            except UnicodeEncodeError:
+                return None
+            index += 1
             continue
-        if char == "\\":
-            escaped = True
-            continue
-        if char == '"' and index != len(atom) - 1:
-            return None
-    if escaped:
-        return None
 
-    try:
-        decoded = ast.literal_eval(atom)
-    except (SyntaxError, ValueError):
-        return None
-    return decoded if isinstance(decoded, str) else None
+        index += 1
+        if index >= len(contents):
+            return None
+        escape = contents[index]
+        escaped_byte = _GIT_C_STYLE_ESCAPE_BYTES.get(escape)
+        if escaped_byte is not None:
+            encoded_path.append(escaped_byte)
+            index += 1
+            continue
+
+        if escape not in "01234567":
+            return None
+        octal_escape = contents[index:index + 3]
+        if len(octal_escape) != 3 or any(
+            digit not in "01234567" for digit in octal_escape
+        ):
+            return None
+        encoded_path.append(int(octal_escape, 8))
+        index += 3
+
+    return os.fsdecode(bytes(encoded_path))
 
 
 def _rename_copy_atoms(path_field: str) -> tuple[str, str] | None:
