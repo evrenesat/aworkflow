@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .runlog import resolve_last_run_id
 from .stop_marker import extract_stop_markers
@@ -493,6 +493,69 @@ def _manager_summary(run_json: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_environment_preflight(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    required = (
+        "classification",
+        "reason_code",
+        "harness",
+        "invocation_kind",
+        "required_executable",
+        "remediation",
+    )
+    if any(
+        not isinstance(value.get(field), str)
+        or not str(value.get(field)).strip()
+        or "/" in str(value.get(field))
+        or "\\" in str(value.get(field))
+        for field in required
+    ):
+        return None
+    if value.get("classification") != "harness_environment_preflight":
+        return None
+    checked = value.get("checked_command")
+    if (
+        not isinstance(checked, list)
+        or not checked
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or "/" in item
+            or "\\" in item
+            for item in checked
+        )
+    ):
+        return None
+    diagnostics = value.get("safe_diagnostics", {})
+    if not isinstance(diagnostics, Mapping):
+        return None
+    safe_diagnostics = {
+        str(key): str(item)
+        for key, item in diagnostics.items()
+        if isinstance(key, str)
+        and key.isidentifier()
+        and isinstance(item, str)
+        and item.strip()
+        and "/" not in item
+        and "\\" not in item
+    }
+    result: dict[str, object] = {
+        field: value[field]
+        for field in required
+    }
+    result["schema_version"] = 1
+    result["checked_command"] = list(checked)
+    result["safe_diagnostics"] = safe_diagnostics
+    for field in ("step_name", "turn_number", "manager_level", "lifecycle_phase"):
+        item = value.get(field)
+        if isinstance(item, str) and item.strip() and "/" not in item and "\\" not in item:
+            result[field] = item
+        elif field == "turn_number" and isinstance(item, int) and item > 0:
+            result[field] = item
+    return result
+
+
 def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str, Any]], base: Path | None) -> dict[str, Any]:
     signals: set[str] = set()
     notes: list[str] = []
@@ -506,6 +569,19 @@ def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str,
         for item in recovery_history_raw
         if (normalized := _normalize_recovery_payload(item)) is not None
     ] if isinstance(recovery_history_raw, list) else []
+
+    environment_preflight = _normalize_environment_preflight(
+        run_json.get("environment_preflight")
+    )
+    if environment_preflight is not None:
+        signals.add("environment_preflight")
+        notes.append(
+            "environment preflight blocked: "
+            f"{environment_preflight['reason_code']} "
+            f"({environment_preflight['harness']}, "
+            f"{environment_preflight['invocation_kind']}); "
+            f"remediation: {environment_preflight['remediation']}"
+        )
 
     if run_json.get("failure_reason"):
         signals.add("workflow_failure")
@@ -577,8 +653,10 @@ def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str,
         "aflow_stop_messages": aflow_stop_messages,
         "current_step_name": run_json.get("current_step_name"),
         "failure": {
+            "failure_kind": run_json.get("failure_kind"),
             "failure_reason": run_json.get("failure_reason"),
             "failure_reason_highlights": summarize_reason_text(run_json.get("failure_reason")),
+            "environment_preflight": environment_preflight,
             "merge_failure_reason": run_json.get("merge_failure_reason"),
             "merge_failure_reason_highlights": summarize_reason_text(run_json.get("merge_failure_reason")),
             "signals": sorted(signals),
@@ -629,7 +707,9 @@ def summarize_run_compact(run_dir: Path, run_json: dict[str, Any], turns: list[d
     return {
         "current_step_name": detailed["current_step_name"],
         "failure": {
+            "failure_kind": detailed["failure"]["failure_kind"],
             "failure_reason": detailed["failure"]["failure_reason"],
+            "environment_preflight": detailed["failure"]["environment_preflight"],
             "merge_failure_reason": detailed["failure"]["merge_failure_reason"],
             "signals": detailed["failure"]["signals"],
         },

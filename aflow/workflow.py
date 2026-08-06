@@ -57,6 +57,14 @@ from .git_status import (
     probe_repo_state,
 )
 from .harnesses import get_adapter
+from .harnesses.preflight import (
+    HarnessEnvironmentBlocker,
+    HarnessPreflightContext,
+    HarnessPreflightProbe,
+    NoOpHarnessPreflightProbe,
+    OSHarnessPreflightProbe,
+    evaluate_harness_environment,
+)
 from .harnesses.base import HarnessAdapter, HarnessInvocation
 from .plan import (
     ParsedPlan,
@@ -599,11 +607,86 @@ class StartupBaseHeadRefreshResult:
 
 
 class WorkflowError(RuntimeError):
-    def __init__(self, summary: str, *, run_dir: Path | None = None) -> None:
+    def __init__(self, summary: str, *, run_dir: Path | None = None, failure_kind: str | None = None) -> None:
         super().__init__(summary)
         self.summary = summary
         self.run_dir = run_dir
+        self.failure_kind = failure_kind
 
+
+class HarnessEnvironmentPreflightError(RuntimeError):
+    """A validated blocker for one exact model-backed invocation."""
+
+    def __init__(
+        self,
+        blocker: HarnessEnvironmentBlocker,
+        *,
+        invocation_kind: str,
+        workflow_turn: int | None = None,
+        step_name: str | None = None,
+        turn_number: int | None = None,
+        manager_level: str | None = None,
+        lifecycle_phase: str | None = None,
+    ) -> None:
+        self.blocker = blocker
+        self.invocation_kind = invocation_kind
+        self.workflow_turn = workflow_turn
+        self.step_name = step_name
+        self.turn_number = turn_number
+        self.manager_level = manager_level
+        self.lifecycle_phase = lifecycle_phase
+        super().__init__(
+            f"{blocker.reason_code}: {blocker.required_executable} "
+            f"required for {blocker.harness} ({invocation_kind})"
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        payload = self.blocker.to_dict(invocation_kind=self.invocation_kind)
+        if self.step_name is not None:
+            payload["step_name"] = self.step_name
+        if self.turn_number is not None:
+            payload["turn_number"] = self.turn_number
+        if self.manager_level is not None:
+            payload["manager_level"] = self.manager_level
+        if self.lifecycle_phase is not None:
+            payload["lifecycle_phase"] = self.lifecycle_phase
+        return payload
+
+
+def _preflight_invocation(
+    invocation: HarnessInvocation,
+    adapter: HarnessAdapter,
+    probe: HarnessPreflightProbe,
+    *,
+    invocation_kind: str,
+    cwd: Path,
+    workflow_turn: int | None = None,
+    step_name: str | None = None,
+    turn_number: int | None = None,
+    manager_level: str | None = None,
+    lifecycle_phase: str | None = None,
+) -> None:
+    result = evaluate_harness_environment(
+        HarnessPreflightContext(
+            invocation_kind=invocation_kind,
+            cwd=cwd,
+            env={**os.environ, **invocation.env},
+            invocation=invocation,
+        ),
+        adapter,
+        probe,
+    )
+    if result.status == "blocked":
+        assert result.blocker is not None
+        raise HarnessEnvironmentPreflightError(
+            result.blocker,
+            invocation_kind=invocation_kind,
+            workflow_turn=workflow_turn,
+            step_name=step_name,
+            turn_number=turn_number,
+            manager_level=manager_level,
+            lifecycle_phase=lifecycle_phase,
+        )
 
 @dataclass(frozen=True)
 class ResolvedProfile:
@@ -2344,6 +2427,7 @@ def _execute_init_repo_handoff(
     team_name: str | None,
     adapter: HarnessAdapter | None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None,
+    preflight_probe: HarnessPreflightProbe,
     main_branch: str,
     readme_title: str,
     readme_body: str,
@@ -2370,6 +2454,14 @@ def _execute_init_repo_handoff(
         effort=resolved.effort,
     )
 
+    _preflight_invocation(
+        invocation,
+        init_adapter,
+        preflight_probe,
+        invocation_kind="lifecycle_bootstrap",
+        cwd=primary_root,
+        lifecycle_phase="bootstrap",
+    )
     if runner is None:
         return _run_process(invocation, primary_root, banner, state)
     return _run_injected_runner(runner, invocation, primary_root)
@@ -2400,6 +2492,7 @@ def _run_team_lead_recovery_handoff(
     team_name: str | None,
     adapter: HarnessAdapter | None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None,
+    preflight_probe: HarnessPreflightProbe,
     banner: BannerRenderer,
     state: ControllerState,
     step_path: str,
@@ -2445,6 +2538,15 @@ def _run_team_lead_recovery_handoff(
         system_prompt="",
         user_prompt=user_prompt,
         effort=resolved.effort,
+    )
+    _preflight_invocation(
+        invocation,
+        lead_adapter,
+        preflight_probe,
+        invocation_kind="team_lead_recovery",
+        cwd=repo_root,
+        step_name=step_path,
+        turn_number=state.turns_completed + 1,
     )
     if runner is None:
         completed = _run_process(invocation, repo_root, banner, state)
@@ -2741,6 +2843,7 @@ def _execute_merge_handoff(
     team_name: str | None,
     adapter: HarnessAdapter | None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None,
+    preflight_probe: HarnessPreflightProbe,
     config_dir: Path,
     working_dir: Path,
     original_plan_path: Path,
@@ -2782,6 +2885,14 @@ def _execute_merge_handoff(
         effort=resolved.effort,
     )
 
+    _preflight_invocation(
+        invocation,
+        merge_adapter,
+        preflight_probe,
+        invocation_kind="lifecycle_merge",
+        cwd=primary_root,
+        lifecycle_phase="merge",
+    )
     if runner is None:
         return _run_process(invocation, primary_root, banner, state)
     return _run_injected_runner(runner, invocation, primary_root)
@@ -2796,6 +2907,7 @@ def _perform_merge_teardown(
     team_name: str | None,
     adapter: HarnessAdapter | None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None,
+    preflight_probe: HarnessPreflightProbe,
     config_dir: Path,
     working_dir: Path,
     original_plan_path: Path,
@@ -2819,6 +2931,7 @@ def _perform_merge_teardown(
             wf,
             workflow_config,
             team_name=team_name,
+            preflight_probe=preflight_probe,
             adapter=adapter,
             runner=runner,
             config_dir=config_dir,
@@ -2829,6 +2942,9 @@ def _perform_merge_teardown(
             banner=banner,
             state=state,
         )
+    except HarnessEnvironmentPreflightError:
+        _restore_primary_plan_after_merge(prepared_primary_plan)
+        raise
     except WorkflowError as exc:
         _restore_primary_plan_after_merge(prepared_primary_plan)
         return "failed", exc.summary
@@ -2883,6 +2999,7 @@ def run_workflow(
     working_dir: Path | None = None,
     adapter: HarnessAdapter | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    preflight_probe: HarnessPreflightProbe | None = None,
     banner: BannerRenderer | None = None,
     resume: ResumeContext | None = None,
     observer: ExecutionObserver | None = None,
@@ -2998,6 +3115,12 @@ def run_workflow(
         resumed_from_run_id=resumed_from_run_id,
     )
 
+    resolved_preflight_probe: HarnessPreflightProbe = (
+        preflight_probe
+        if preflight_probe is not None
+        else (OSHarnessPreflightProbe() if runner is None else NoOpHarnessPreflightProbe())
+    )
+
     if banner is None:
         workflow_graph_source = WorkflowGraphSource(
             declared_steps=dict(wf.declared_steps),
@@ -3078,12 +3201,81 @@ def run_workflow(
             )
             write_run_metadata(
                 run_paths, config, state, status="failed", failure_reason=summary,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
-            active_plan_path=active_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
+                workflow_name=workflow_name, original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
             )
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
+    def _handle_environment_preflight_failure(
+        error: HarnessEnvironmentPreflightError,
+    ) -> None:
+        state.current_turn_started_at = None
+        blocker = error.blocker
+        summary = (
+            "environment preflight blocked: "
+            f"{blocker.reason_code} ({blocker.harness}, {error.invocation_kind}); "
+            f"required executable: {blocker.required_executable}; "
+            f"remediation: {blocker.remediation}"
+        )
+        state.status_message = summary
+        write_run_metadata(
+            run_paths, config, state, status="failed", failure_reason=summary,
+            failure_kind="environment_preflight",
+            environment_preflight=error.to_payload(),
+            merge_status=(
+                "failed" if error.invocation_kind == "lifecycle_merge" else None
+            ),
+            merge_failure_reason=(
+                summary if error.invocation_kind == "lifecycle_merge" else None
+            ),
+            execution_context=exec_ctx,
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            workflow_name=workflow_name, original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path, new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+        print(f"aflow: {summary}", file=sys.stderr)
+        banner.stop(state)
+        _emit_event(observer, RunFailedEvent.create(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            failure_reason=summary,
+            final_snapshot=state.last_snapshot,
+            issues_accumulated=state.issues_accumulated,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        ))
+        raise WorkflowError(
+            summary,
+            run_dir=run_paths.run_dir,
+            failure_kind="environment_preflight",
+        ) from error
+
+    def _preflight_or_fail(
+        invocation: HarnessInvocation,
+        invocation_adapter: HarnessAdapter,
+        *,
+        invocation_kind: str,
+        cwd: Path,
+        workflow_turn: int | None = None,
+        step_name: str | None = None,
+        turn_number: int | None = None,
+        manager_level: str | None = None,
+        lifecycle_phase: str | None = None,
+    ) -> None:
+        try:
+            _preflight_invocation(
+                invocation, invocation_adapter, resolved_preflight_probe,
+                invocation_kind=invocation_kind, cwd=cwd,
+                workflow_turn=workflow_turn, step_name=step_name,
+                turn_number=turn_number, manager_level=manager_level,
+                lifecycle_phase=lifecycle_phase,
+            )
+        except HarnessEnvironmentPreflightError as error:
+            _handle_environment_preflight_failure(error)
     original_snapshot = parsed_plan.snapshot
 
     def _abort_startup_base_head_refresh(reason: str) -> None:
@@ -3410,6 +3602,7 @@ def run_workflow(
                     adapter=adapter,
                     runner=runner,
                     main_branch=lifecycle_plan.main_branch,
+                    preflight_probe=resolved_preflight_probe,
                     readme_title=readme_title,
                     readme_body=readme_body,
                     banner=banner,
@@ -3455,6 +3648,8 @@ def run_workflow(
                     effective_startup_base_head_refresh_sha if should_refresh_pre_handoff_base_head else None
                 ),
             )
+        except HarnessEnvironmentPreflightError as exc:
+            _handle_environment_preflight_failure(exc)
         except WorkflowError as exc:
             state.status_message = "failed"
             banner.stop(state)
@@ -3986,6 +4181,7 @@ def run_workflow(
                     team_name=active_team_name,
                     adapter=adapter,
                     runner=runner,
+                    preflight_probe=resolved_preflight_probe,
                     banner=banner,
                     state=state,
                     step_path=f"harness recovery for {step_path}",
@@ -4005,6 +4201,8 @@ def run_workflow(
                     matched_terms=(),
                     backup_team=backup_team,
                 )
+            except HarnessEnvironmentPreflightError as exc:
+                _handle_environment_preflight_failure(exc)
             except TeamLeadRecoveryDecisionError as exc:
                 state.status_message = "failed"
                 _record_issue("recovery-failed", str(exc), turn_dir=turn_dir)
@@ -4174,6 +4372,7 @@ def run_workflow(
                 decision = _run_team_lead_recovery_handoff(
                     recovery_repo_root,
                     workflow_config,
+                    preflight_probe=resolved_preflight_probe,
                     team_name=active_team_name,
                     adapter=adapter,
                     runner=runner,
@@ -4196,6 +4395,8 @@ def run_workflow(
                     matched_terms=matched_terms,
                     backup_team=backup_team,
                 )
+            except HarnessEnvironmentPreflightError as exc:
+                _handle_environment_preflight_failure(exc)
             except TeamLeadRecoveryDecisionError as exc:
                 state.status_message = "failed"
                 _record_issue("recovery-failed", str(exc), turn_dir=turn_dir)
@@ -4841,10 +5042,6 @@ def run_workflow(
             }.items()
         }
         target_team = boundary.implementation_upgrade.get("target_team") if boundary.implementation_upgrade else boundary.actual_team
-        _emit_event(observer, ManagerStartedEvent.create(
-            decision_number=decision_number, level=level, trigger=boundary.trigger,
-            target_step=boundary.proposed_transition, target_team=target_team, artifact_paths=artifact_paths,
-        ))
         stdout = ""
         stderr = ""
         result_payload: dict[str, object] = {
@@ -4871,6 +5068,20 @@ def run_workflow(
                 user_prompt=user_prompt,
                 effort=manager_profile.effort,
             ).for_final_output()
+            _preflight_or_fail(
+                manager_invocation,
+                manager_adapter,
+                invocation_kind="manager",
+                cwd=execution_repo_root,
+                step_name=current_step_name,
+                turn_number=state.turns_completed + 1,
+                manager_level=level,
+            )
+            _emit_event(observer, ManagerStartedEvent.create(
+                decision_number=decision_number, level=level, trigger=boundary.trigger,
+                target_step=boundary.proposed_transition, target_team=target_team,
+                artifact_paths=artifact_paths,
+            ))
             result_payload["invocation"] = {
                 "label": manager_invocation.label,
                 "argv": list(manager_invocation.argv),
@@ -4914,6 +5125,8 @@ def run_workflow(
             error = str(exc)
             result_payload["error"] = error
         except (ManagerDecisionError, ValueError, WorkflowError) as exc:
+            if isinstance(exc, WorkflowError) and exc.failure_kind == "environment_preflight":
+                raise
             parsed = None
             error = str(exc)
             result_payload["error"] = error
@@ -4943,7 +5156,7 @@ def run_workflow(
             and original_candidate is not None
             and fingerprint_after == fingerprint_before
         ):
-            correction_consumed = True
+            correction_consumed = False
             correction_status = "invalid"
             correction_stdout = ""
             correction_stderr = ""
@@ -5002,6 +5215,16 @@ def run_workflow(
                     user_prompt=correction_user_prompt,
                     effort=manager_profile.effort,
                 ).for_final_output()
+                _preflight_or_fail(
+                    correction_invocation,
+                    manager_adapter,
+                    invocation_kind="manager_note_correction",
+                    cwd=execution_repo_root,
+                    step_name=current_step_name,
+                    turn_number=state.turns_completed + 1,
+                    manager_level=level,
+                )
+                correction_consumed = True
                 correction_result["invocation"] = {
                     "label": correction_invocation.label,
                     "argv": list(correction_invocation.argv),
@@ -5054,6 +5277,8 @@ def run_workflow(
                 correction_status = "accepted"
                 correction_result.update({"status": "accepted", **corrected.to_dict()})
             except (ManagerDecisionError, ValueError, WorkflowError) as exc:
+                if isinstance(exc, WorkflowError) and exc.failure_kind == "environment_preflight":
+                    raise
                 parsed = None
                 correction_error = str(exc)
                 error = correction_error
@@ -5398,32 +5623,75 @@ def run_workflow(
                 },
             ))
 
+    def _build_repartition_invocation(
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> HarnessInvocation:
+        role_resolution = resolve_manager_role(
+            workflow_config, level="full", baseline_team=baseline_team_name,
+        )
+        profile = resolve_profile(
+            role_resolution.selector, workflow_config,
+            step_path="manager.repartition",
+        )
+        call_adapter = adapter or get_adapter(profile.harness_name)
+        return call_adapter.build_invocation(
+            repo_root=execution_repo_root,
+            model=profile.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            effort=profile.effort,
+        ).for_final_output()
+
+    def _prepare_repartition_invocation(
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> HarnessInvocation:
+        invocation = _build_repartition_invocation(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        role_resolution = resolve_manager_role(
+            workflow_config, level="full", baseline_team=baseline_team_name,
+        )
+        profile = resolve_profile(
+            role_resolution.selector, workflow_config,
+            step_path="manager.repartition",
+        )
+        call_adapter = adapter or get_adapter(profile.harness_name)
+        _preflight_or_fail(
+            invocation,
+            call_adapter,
+            invocation_kind="checkpoint_repartition",
+            cwd=execution_repo_root,
+            step_name=current_step_name,
+            turn_number=state.turns_completed + 1,
+            manager_level="full",
+        )
+        return invocation
+
     def _invoke_repartition_full(
         *,
         system_prompt: str,
         user_prompt: str,
+        prepared_invocation: HarnessInvocation | None = None,
     ) -> tuple[str, str, str | None]:
-        """Invoke the configured Full role without manager/turn accounting."""
+        '''Invoke the configured Full role without manager/turn accounting.'''
         stdout = ""
         stderr = ""
         error: str | None = None
         fingerprint_before = _protected_repartition_fingerprint()
         try:
-            role_resolution = resolve_manager_role(
-                workflow_config, level="full", baseline_team=baseline_team_name,
+            invocation = (
+                prepared_invocation
+                if prepared_invocation is not None
+                else _prepare_repartition_invocation(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
             )
-            profile = resolve_profile(
-                role_resolution.selector, workflow_config,
-                step_path="manager.repartition",
-            )
-            call_adapter = adapter or get_adapter(profile.harness_name)
-            invocation = call_adapter.build_invocation(
-                repo_root=execution_repo_root,
-                model=profile.model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                effort=profile.effort,
-            ).for_final_output()
             if runner is None:
                 completed = _run_process(invocation, execution_repo_root, banner, state)
             else:
@@ -5431,7 +5699,11 @@ def run_workflow(
             stdout, stderr = completed.stdout, completed.stderr
             if completed.returncode != 0:
                 error = f"repartition Full harness exited with code {completed.returncode}"
-        except (ValueError, WorkflowError) as exc:
+        except WorkflowError as exc:
+            if exc.failure_kind == "environment_preflight":
+                raise
+            error = str(exc)
+        except ValueError as exc:
             error = str(exc)
         if _protected_repartition_fingerprint() != fingerprint_before:
             error = (
@@ -5594,6 +5866,16 @@ def run_workflow(
         correction_findings: tuple[str, ...] = ()
         rejected_proposal_sha256: str | None = None
         for attempt_number in (1, 2):
+            propose_system, propose_user = build_repartition_prompts(
+                base_payload,
+                mode="propose",
+                skill_name=workflow_config.manager.repartition_skill,
+                correction_findings=correction_findings,
+            )
+            prepared_invocation = _prepare_repartition_invocation(
+                system_prompt=propose_system,
+                user_prompt=propose_user,
+            )
             attempt_paths = create_repartition_attempt_paths(
                 run_paths,
                 decision_number=state.manager_decision_number,
@@ -5603,16 +5885,12 @@ def run_workflow(
             write_repartition_artifact(attempt_paths.source_plan, source_plan_text)
             write_repartition_artifact(attempt_paths.envelope, envelope_bytes)
             write_repartition_artifact(attempt_paths.evidence, evidence_payload)
-            propose_system, propose_user = build_repartition_prompts(
-                base_payload,
-                mode="propose",
-                skill_name=workflow_config.manager.repartition_skill,
-                correction_findings=correction_findings,
-            )
             write_repartition_artifact(attempt_paths.propose_system_prompt, propose_system)
             write_repartition_artifact(attempt_paths.propose_user_prompt, propose_user)
             propose_stdout, propose_stderr, call_error = _invoke_repartition_full(
-                system_prompt=propose_system, user_prompt=propose_user,
+                system_prompt=propose_system,
+                user_prompt=propose_user,
+                prepared_invocation=prepared_invocation,
             )
             write_repartition_artifact(attempt_paths.propose_stdout, propose_stdout)
             write_repartition_artifact(attempt_paths.propose_stderr, propose_stderr)
@@ -6509,22 +6787,27 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
             )
 
-        merge_status, merge_failure_reason = _perform_merge_teardown(
-            exec_ctx,
-            wf,
-            workflow_config,
-            repo_root=config.repo_root,
-            team_name=baseline_team_name,
-            adapter=adapter,
-            runner=runner,
-            config_dir=config_dir,
-            working_dir=working_dir,
-            original_plan_path=original_plan_path,
-            active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path,
-            banner=banner,
-            state=state,
-        )
+        state.end_reason = "transition_end"
+        try:
+            merge_status, merge_failure_reason = _perform_merge_teardown(
+                exec_ctx,
+                wf,
+                workflow_config,
+                repo_root=config.repo_root,
+                team_name=baseline_team_name,
+                adapter=adapter,
+                runner=runner,
+                preflight_probe=resolved_preflight_probe,
+                config_dir=config_dir,
+                working_dir=working_dir,
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                banner=banner,
+                state=state,
+            )
+        except HarnessEnvironmentPreflightError as exc:
+            _handle_environment_preflight_failure(exc)
         if merge_status == "failed":
             state.status_message = "failed"
             current_step = wf.steps.get(current_step_name)
@@ -6655,12 +6938,6 @@ def run_workflow(
                 "transition no longer matches configuration",
                 run_dir=run_paths.run_dir,
             )
-        if replayed_boundary.chosen_transition == "END":
-            raise WorkflowError(
-                "cannot yet resume a finalized terminal turn before its "
-                "manager boundary",
-                run_dir=run_paths.run_dir,
-            )
 
         state.last_snapshot = replayed_boundary.snapshot_after
         state.turns_completed = 0
@@ -6725,6 +7002,115 @@ def run_workflow(
                 f"turns/turn-{replayed_boundary.turn_number:03d}"
             ),
         )
+        if current_step_name == "END":
+            state.end_reason = "transition_end"
+            merge_status: str | None = None
+            merge_failure_reason: str | None = None
+            if exec_ctx is not None and "merge" in exec_ctx.teardown:
+                try:
+                    merge_status, merge_failure_reason = _perform_merge_teardown(
+                        exec_ctx,
+                        wf,
+                        workflow_config,
+                        repo_root=config.repo_root,
+                        team_name=baseline_team_name,
+                        adapter=adapter,
+                        runner=runner,
+                        preflight_probe=resolved_preflight_probe,
+                        config_dir=config_dir,
+                        working_dir=working_dir,
+                        original_plan_path=original_plan_path,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        banner=banner,
+                        state=state,
+                    )
+                except HarnessEnvironmentPreflightError as exc:
+                    _handle_environment_preflight_failure(exc)
+            if merge_status == "failed":
+                state.status_message = "failed"
+                report = _manager_terminal_incident(
+                    trigger="merge_failure",
+                    reason=merge_failure_reason or "merge teardown failed",
+                    current_step=replayed_boundary.step_name,
+                    current_role=replayed_boundary.step_role,
+                    active_team=baseline_team_name,
+                    active_selector=replayed_boundary.selector,
+                )
+                summary = report or _format_failure(
+                    reason=merge_failure_reason or "merge teardown failed",
+                    run_dir=run_paths.run_dir,
+                    snapshot=state.last_snapshot,
+                )
+                write_run_metadata(
+                    run_paths,
+                    config,
+                    state,
+                    status="failed",
+                    merge_status=merge_status,
+                    merge_failure_reason=merge_failure_reason,
+                    execution_context=exec_ctx,
+                    last_snapshot=state.last_snapshot,
+                    turns_completed=state.turns_completed,
+                    workflow_name=workflow_name,
+                    original_plan_path=original_plan_path,
+                    current_step_name=replayed_boundary.step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                banner.stop(state)
+                raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+            prior_original_plan_path = original_plan_path
+            finalized_original_plan_path = _finalize_original_plan_if_complete(
+                config.repo_root,
+                original_plan_path,
+                snapshot=state.last_snapshot,
+            )
+            if finalized_original_plan_path != prior_original_plan_path:
+                original_plan_path = finalized_original_plan_path
+                if active_plan_path == prior_original_plan_path:
+                    active_plan_path = original_plan_path
+            state.status_message = "completed"
+            result = ControllerRunResult(
+                run_dir=run_paths.run_dir,
+                turns_completed=state.turns_completed,
+                final_snapshot=state.last_snapshot,
+                issues_accumulated=state.issues_accumulated,
+                end_reason="transition_end",
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            )
+            write_run_metadata(
+                run_paths,
+                config,
+                state,
+                status="completed",
+                merge_status=merge_status,
+                execution_context=exec_ctx,
+                last_snapshot=state.last_snapshot,
+                turns_completed=state.turns_completed,
+                end_reason="transition_end",
+                workflow_name=workflow_name,
+                original_plan_path=original_plan_path,
+                current_step_name=replayed_boundary.step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            banner.stop(state)
+            _emit_event(observer, RunCompletedEvent.create(
+                run_dir=run_paths.run_dir,
+                turns_completed=state.turns_completed,
+                final_snapshot=state.last_snapshot,
+                end_reason="transition_end",
+                issues_accumulated=state.issues_accumulated,
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            ))
+            return result
         scope = state.active_implementation_scope
         if scope is not None:
             state.active_implementation_scope = replace(
@@ -7054,6 +7440,24 @@ def run_workflow(
                     user_prompt=user_prompt,
                     effort=resolved.effort,
                 )
+                _preflight_or_fail(
+                    invocation,
+                    step_adapter,
+                    invocation_kind="workflow_turn",
+                    cwd=execution_repo_root,
+                    workflow_turn=turn_number,
+                    step_name=current_step_name,
+                    turn_number=turn_number,
+                )
+            except WorkflowError as exc:
+                if exc.failure_kind == "environment_preflight":
+                    raise
+                _raise_pre_turn_failure(
+                    reason=exc.summary,
+                    snapshot=snapshot_before,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                )
             except Exception as exc:
                 _raise_pre_turn_failure(
                     reason=str(exc),
@@ -7218,6 +7622,24 @@ def run_workflow(
                     system_prompt="",
                     user_prompt=user_prompt,
                     effort=resolved.effort,
+                )
+                _preflight_or_fail(
+                    invocation,
+                    step_adapter,
+                    invocation_kind="workflow_turn",
+                    cwd=execution_repo_root,
+                    workflow_turn=turn_number,
+                    step_name=current_step_name,
+                    turn_number=turn_number,
+                )
+            except WorkflowError as exc:
+                if exc.failure_kind == "environment_preflight":
+                    raise
+                _raise_pre_turn_failure(
+                    reason=exc.summary,
+                    snapshot=snapshot_before,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
                 )
             except Exception as exc:
                 _raise_pre_turn_failure(
@@ -7899,22 +8321,26 @@ def run_workflow(
             merge_failure_reason: str | None = None
 
             if exec_ctx is not None and "merge" in exec_ctx.teardown:
-                merge_status, merge_failure_reason = _perform_merge_teardown(
-                    exec_ctx,
-                    wf,
-                    workflow_config,
-                    repo_root=config.repo_root,
-                    team_name=merge_team_name,
-                    adapter=adapter,
-                    runner=runner,
-                    config_dir=config_dir,
-                    working_dir=working_dir,
-                    original_plan_path=original_plan_path,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                    banner=banner,
-                    state=state,
-                )
+                try:
+                    merge_status, merge_failure_reason = _perform_merge_teardown(
+                        exec_ctx,
+                        wf,
+                        workflow_config,
+                        preflight_probe=resolved_preflight_probe,
+                        repo_root=config.repo_root,
+                        team_name=merge_team_name,
+                        adapter=adapter,
+                        runner=runner,
+                        config_dir=config_dir,
+                        working_dir=working_dir,
+                        original_plan_path=original_plan_path,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        banner=banner,
+                        state=state,
+                    )
+                except HarnessEnvironmentPreflightError as exc:
+                    _handle_environment_preflight_failure(exc)
 
             if merge_status == "failed":
                 state.status_message = "failed"

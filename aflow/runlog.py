@@ -628,6 +628,75 @@ def _turn_result_payload(
     return payload
 
 
+def _validated_environment_preflight_payload(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    required = (
+        "classification",
+        "reason_code",
+        "harness",
+        "invocation_kind",
+        "required_executable",
+        "remediation",
+    )
+    if value.get("schema_version") != 1 or value.get("classification") != "harness_environment_preflight":
+        raise ValueError("invalid environment preflight payload classification")
+    for field in required[1:]:
+        item = value.get(field)
+        if (
+            not isinstance(item, str)
+            or not item.strip()
+            or "/" in item
+            or chr(92) in item
+            or len(item) > 240
+        ):
+            raise ValueError(f"invalid environment preflight field: {field}")
+    checked = value.get("checked_command")
+    if (
+        not isinstance(checked, (list, tuple))
+        or not checked
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or "/" in item
+            or chr(92) in item
+            or len(item) > 240
+            for item in checked
+        )
+    ):
+        raise ValueError("invalid environment preflight checked_command")
+    diagnostics = value.get("safe_diagnostics", {})
+    if not isinstance(diagnostics, Mapping) or any(
+        not isinstance(key, str)
+        or not isinstance(item, str)
+        or not key.isidentifier()
+        or not item.strip()
+        or "/" in item
+        or chr(92) in item
+        for key, item in diagnostics.items()
+    ):
+        raise ValueError("invalid environment preflight safe_diagnostics")
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "classification": value["classification"],
+        "reason_code": value["reason_code"],
+        "harness": value["harness"],
+        "invocation_kind": value["invocation_kind"],
+        "required_executable": value["required_executable"],
+        "checked_command": list(checked),
+        "remediation": value["remediation"],
+        "safe_diagnostics": dict(diagnostics),
+    }
+    for field in ("step_name", "manager_level", "lifecycle_phase"):
+        item = value.get(field)
+        if isinstance(item, str) and item.strip() and "/" not in item and chr(92) not in item:
+            result[field] = item
+    turn_number = value.get("turn_number")
+    if isinstance(turn_number, int) and turn_number > 0:
+        result["turn_number"] = turn_number
+    return result
+
+
 def write_run_metadata(
     paths: RunPaths,
     config: ControllerConfig,
@@ -637,6 +706,8 @@ def write_run_metadata(
     execution_context: ExecutionContext | None = None,
     end_reason: WorkflowEndReason | None = None,
     failure_reason: str | None = None,
+    failure_kind: str | None = None,
+    environment_preflight: Mapping[str, object] | None = None,
     merge_status: str | None = None,
     merge_failure_reason: str | None = None,
     last_snapshot: PlanSnapshot | None = None,
@@ -769,14 +840,23 @@ def write_run_metadata(
         payload["recovery_match_terms"] = list(recovery.match_terms)
         payload["recovery_matched_terms"] = list(recovery.matched_terms)
         payload["recovery_delay_seconds"] = recovery.delay_seconds
-        payload["recovery_from_team"] = recovery.from_team
-        payload["recovery_to_team"] = recovery.to_team
-        payload["recovery_reason"] = recovery.reason
-        payload["recovery_consecutive_count"] = recovery.consecutive_count
-        payload["recovery_suggested_keywords"] = list(recovery.suggested_keywords)
-        payload["recovery_suggested_action"] = recovery.suggested_action
-        payload["recovery_executed"] = recovery.executed
-        payload["recovery_rejection_reason"] = recovery.rejection_reason
+    if failure_kind is not None:
+        if failure_kind != "environment_preflight":
+            raise ValueError("invalid environment preflight failure kind")
+        payload["failure_kind"] = failure_kind
+    elif isinstance(previous.get("failure_kind"), str):
+        payload["failure_kind"] = previous["failure_kind"]
+    if environment_preflight is not None:
+        payload["environment_preflight"] = _validated_environment_preflight_payload(
+            environment_preflight
+        )
+    elif isinstance(previous.get("environment_preflight"), Mapping):
+        try:
+            payload["environment_preflight"] = _validated_environment_preflight_payload(
+                previous["environment_preflight"]
+            )
+        except ValueError:
+            pass
     if state is not None and state.harness_recovery_history:
         payload.update(build_recovery_payload(state.current_harness_recovery, state.harness_recovery_history))
     if state is not None:

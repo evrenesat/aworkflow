@@ -21,6 +21,34 @@ At a high level:
 
 At run start, `aflow` prints the new run ID immediately. Resumed runs also show which prior run they came from.
 
+## Harness Environment Preflight
+
+Before a real model-backed launch, AFlow resolves the adapter invocation and
+runs a bounded local preflight with the same working directory and merged
+environment that the process would receive. The common check resolves the
+primary executable. An adapter may add a deterministic, read-only check; the
+Reasonix adapter runs reasonix doctor --json and reports
+reasonix_sandbox_bwrap_missing only when that diagnostic says
+sandbox.bash = enforce and bwrap is not executable on the same PATH.
+
+The durable classification is harness_environment_preflight. The other stable blocker is harness_executable_missing. A blocked invocation
+writes status = failed, failure_kind = environment_preflight, and an
+allow-listed environment_preflight object to run.json. It creates no
+synthetic turn, manager decision, correction, recovery, or repartition attempt.
+A zero-turn blocker leaves no turn-001; a later blocker preserves earlier
+artifacts and pending routing state. The CLI reports the required executable
+and fixed remediation, but AFlow does not install bubblewrap or any harness,
+edit configuration, authenticate, or test network, quota, provider health, or
+model availability.
+
+After manual remediation, use aflow run --resume RUN_ID to retry the same
+pending invocation. Ready results are not cached. A custom injected runner
+without an explicit preflight probe remains ready by contract; tests and library
+clients can pass a deterministic probe when they want the boundary exercised.
+Process-creation races after a successful preflight still use the existing
+126/127 launch-error normalization. The guardian remains the fallback for
+legacy runs and failures outside the safe local preflight boundary.
+
 ## Lifecycle and Worktrees
 
 For worktree flows, run artifacts stay under the primary checkout, while normal steps execute inside the linked worktree. The original plan is copied into the worktree before prompts are rendered and synced back to the primary checkout after each turn.

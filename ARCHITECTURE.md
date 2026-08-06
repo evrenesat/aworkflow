@@ -34,7 +34,8 @@ flowchart TD
     WorkflowLoop --> Role
     Role --> Adapter
     PromptRender --> Subprocess
-    Adapter --> Subprocess
+    Adapter --> Preflight
+    Preflight --> Subprocess
     Subprocess --> PlanReload
     PlanReload --> Transition
     Transition --> Manager
@@ -44,6 +45,34 @@ flowchart TD
     WorkflowLoop --> RunLog
     WorkflowLoop --> Banner
 ```
+
+## Harness Environment Preflight
+
+Every real model-backed invocation crosses one shared boundary after the
+adapter has resolved its exact argv, working directory, and merged environment,
+but before normal turn, manager, recovery, repartition, or lifecycle artifacts
+are created. The common OS probe resolves argv[0] with the invocation PATH
+and uses a five-second bounded local diagnostic budget. Adapter capabilities are
+optional, so build-only custom adapters remain compatible.
+
+The Reasonix adapter uses the resolved executable for doctor --json. Only an
+object whose sandbox.bash is exactly enforce causes the adapter to resolve
+bwrap; the stable blocker is reasonix_sandbox_bwrap_missing. A missing
+primary executable uses the generic harness_executable_missing blocker.
+Diagnostics are read-only and secret-safe. Run metadata stores only the
+allow-listed reason, harness, invocation kind, logical location, checked
+command, fixed remediation, and safe diagnostics. It never stores prompts,
+raw argv, environment, doctor output, or absolute executable/configuration
+paths.
+
+A blocker is a terminal run-level failure, not a synthetic turn or manager
+result. It preserves earlier artifacts and pending routing state, and explicit
+resume re-evaluates the pending invocation after the owner remediates the
+environment. Injected runners without an explicit probe remain ready by
+contract. Authentication, network/provider health, quota, model availability,
+arbitrary dependency health, and configuration repair remain outside this
+boundary. The guardian remains the fallback for legacy failures and
+prerequisites that cannot be verified safely by product preflight.
 
 ## Interstep Manager Boundary
 
