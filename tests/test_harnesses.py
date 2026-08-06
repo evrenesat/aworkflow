@@ -1,5 +1,16 @@
 from aflow._test_support import *  # noqa: F401,F403
 from dataclasses import replace
+from typing import Mapping
+from aflow.harnesses.base import HarnessInvocation
+from aflow.harnesses.codex import CodexAdapter
+from aflow.harnesses.preflight import (
+    HarnessDiagnosticResult,
+    HarnessEnvironmentBlocker,
+    HarnessEnvironmentPreflight,
+    HarnessPreflightContext,
+    OSHarnessPreflightProbe,
+    evaluate_harness_environment,
+)
 from aflow.harnesses.reasonix import ReasonixAdapter
 
 class AdaptersTests(unittest.TestCase):
@@ -2725,3 +2736,182 @@ class GitBannerTests(unittest.TestCase):
         assert poll_times == [110.0]
         assert renderer._stop_event.wait_calls == [3.0, 3.0, 3.0, 1.0, 2.0]
         assert build.call_count == 3
+
+
+class _FakePreflightProbe:
+    def __init__(
+        self,
+        *,
+        primary: bool = True,
+        bwrap: bool = False,
+        diagnostic: object = None,
+    ) -> None:
+        self.primary = primary
+        self.bwrap = bwrap
+        self.diagnostic = diagnostic
+        self.diagnostic_calls: list[tuple[str, ...]] = []
+
+    def resolve_executable(self, command: str, *, env: Mapping[str, str]) -> str | None:
+        if command == "bwrap":
+            return "/usr/bin/bwrap" if self.bwrap else None
+        return f"/fake/{command}" if self.primary else None
+
+    def run_diagnostic(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> object:
+        self.diagnostic_calls.append(argv)
+        return self.diagnostic
+
+
+def _preflight_invocation(label: str, command: str) -> HarnessInvocation:
+    return HarnessInvocation(
+        label=label,
+        argv=(command,),
+        env={"PATH": "/fake/bin", "TOKEN": "secret"},
+        prompt_mode="",
+        system_prompt="SYSTEM",
+        user_prompt="USER",
+        effective_prompt="SYSTEM\n\nUSER",
+    )
+
+
+def _preflight_context(invocation: HarnessInvocation) -> HarnessPreflightContext:
+    return HarnessPreflightContext(
+        invocation_kind="workflow_turn",
+        cwd=Path("/repo"),
+        env={**os.environ, **invocation.env},
+        invocation=invocation,
+    )
+
+
+class PreflightTests(unittest.TestCase):
+    def test_result_contract_requires_matching_blocker(self) -> None:
+        with self.assertRaises(ValueError):
+            HarnessEnvironmentPreflight("blocked")
+        with self.assertRaises(ValueError):
+            HarnessEnvironmentPreflight(
+                "ready",
+                HarnessEnvironmentBlocker(
+                    "harness_environment_preflight", "x", "codex", "codex",
+                    ("codex",), "remediate", {},
+                ),
+            )
+
+    def test_missing_primary_executable_is_provider_neutral(self) -> None:
+        for adapter, command in ((CodexAdapter(), "codex"), (ReasonixAdapter(), "reasonix")):
+            with self.subTest(command=command):
+                probe = _FakePreflightProbe(primary=False)
+                result = evaluate_harness_environment(
+                    _preflight_context(_preflight_invocation(command, command)),
+                    adapter,
+                    probe,
+                )
+                self.assertEqual(result.status, "blocked")
+                assert result.blocker is not None
+                self.assertEqual(result.blocker.reason_code, "harness_executable_missing")
+                self.assertEqual(result.blocker.required_executable, command)
+                self.assertEqual(probe.diagnostic_calls, [])
+
+    def test_build_only_adapter_has_no_optional_capability(self) -> None:
+        adapter = type("BuildOnlyAdapter", (), {"name": "custom", "supports_effort": False})()
+        result = evaluate_harness_environment(
+            _preflight_context(_preflight_invocation("custom", "custom")),
+            adapter,
+            _FakePreflightProbe(),
+        )
+        self.assertEqual(result.status, "ready")
+
+    def test_reasonix_enforced_sandbox_requires_bwrap(self) -> None:
+        probe = _FakePreflightProbe(
+            diagnostic=HarnessDiagnosticResult(
+                0, '{"sandbox":{"bash":"enforce"},"config":{"token":"secret"}}'
+            )
+        )
+        result = evaluate_harness_environment(
+            _preflight_context(_preflight_invocation("reasonix", "reasonix")),
+            ReasonixAdapter(),
+            probe,
+        )
+        self.assertEqual(result.status, "blocked")
+        assert result.blocker is not None
+        self.assertEqual(result.blocker.reason_code, "reasonix_sandbox_bwrap_missing")
+        self.assertEqual(result.blocker.required_executable, "bwrap")
+        self.assertEqual(result.blocker.checked_command, ("reasonix", "doctor", "--json"))
+        self.assertNotIn("secret", repr(result.blocker))
+        self.assertEqual(probe.diagnostic_calls, [("/fake/reasonix", "doctor", "--json")])
+
+    def test_reasonix_non_enforced_or_present_bwrap_is_ready(self) -> None:
+        for payload, bwrap in (
+            ('{"sandbox":{"bash":"off"}}', False),
+            ('{"sandbox":{"bash":"enforce"}}', True),
+        ):
+            with self.subTest(payload=payload, bwrap=bwrap):
+                result = evaluate_harness_environment(
+                    _preflight_context(_preflight_invocation("reasonix", "reasonix")),
+                    ReasonixAdapter(),
+                    _FakePreflightProbe(
+                        bwrap=bwrap, diagnostic=HarnessDiagnosticResult(0, payload)
+                    ),
+                )
+                self.assertEqual(result.status, "ready")
+
+    def test_reasonix_diagnostic_failures_are_compatible_ready(self) -> None:
+        for diagnostic in (
+            None,
+            HarnessDiagnosticResult(2, '{"sandbox":{"bash":"enforce"}}'),
+            HarnessDiagnosticResult(0, "not-json"),
+            HarnessDiagnosticResult(None, timed_out=True),
+            HarnessDiagnosticResult(0, "[]"),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                result = evaluate_harness_environment(
+                    _preflight_context(_preflight_invocation("reasonix", "reasonix")),
+                    ReasonixAdapter(),
+                    _FakePreflightProbe(diagnostic=diagnostic),
+                )
+                self.assertEqual(result.status, "ready")
+
+    def test_adapter_blocker_is_secret_safe(self) -> None:
+        class BlockedAdapter:
+            name = "custom"
+            supports_effort = False
+
+            def preflight_environment(self, context: object, probe: object) -> HarnessEnvironmentBlocker:
+                return HarnessEnvironmentBlocker(
+                    "harness_environment_preflight", "custom_blocker",
+                    "/private/provider", "/private/bin/tool",
+                    ("/private/bin/tool", "--check"), "fixed remediation",
+                    {"path": "/private/config", "safe": "yes"},
+                )
+
+        result = evaluate_harness_environment(
+            _preflight_context(_preflight_invocation("custom", "custom")),
+            BlockedAdapter(),
+            _FakePreflightProbe(),
+        )
+        self.assertEqual(result.status, "blocked")
+        assert result.blocker is not None
+        self.assertEqual(result.blocker.harness, "provider")
+        self.assertEqual(result.blocker.required_executable, "tool")
+        self.assertEqual(result.blocker.checked_command, ("tool", "--check"))
+        self.assertNotIn("path", result.blocker.safe_diagnostics)
+        self.assertEqual(result.blocker.safe_diagnostics["safe"], "yes")
+
+    def test_os_probe_bounds_timeout(self) -> None:
+        with patch(
+            "aflow.harnesses.preflight.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["reasonix"], 5),
+        ):
+            result = OSHarnessPreflightProbe().run_diagnostic(
+                ("reasonix", "doctor", "--json"),
+                cwd=Path("/repo"),
+                env={"PATH": "/fake"},
+                timeout_seconds=30,
+            )
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.returncode)

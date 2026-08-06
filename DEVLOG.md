@@ -9,6 +9,20 @@
 - Missing or malformed identity fields and absent original plans fail closed
   before guardian state is written.
 
+## 2026-08-07 — Add adapter-neutral harness environment preflight
+
+- Added a bounded, secret-safe executable check for real harness launches and
+  an optional adapter capability for local prerequisites.
+- Reasonix now uses `reasonix doctor --json` to detect enforced bash sandboxing
+  without guessing configuration files; missing `bwrap` is reported with fixed
+  remediation and no synthetic turn or manager artifact.
+- Workflow, manager, correction, repartition, recovery, bootstrap, and
+  agent-required merge boundaries share terminal run-level handling. Injected
+  runners remain ready by default; explicit resume re-evaluates the pending
+  invocation. AFlow reports prerequisites but does not install packages or
+  validate provider health.
+- The guardian remains the fallback for legacy and unsupported failures.
+
 ## 2026-08-06 — Make clean-END manager eligibility deterministic
 
 - Clean controller-proposed `END` boundaries now omit `stop` from Lite
@@ -20,7 +34,6 @@
 - Focused manager and runtime regressions cover Lite `stop` to Full `continue`,
   both Full-stop fallback routes, direct Full selection, and ordinary non-END
   Lite `stop` without interpreting manager prose.
-
 ## 2026-08-02 — Correct manager plan-selection notes at one boundary
 
 - An otherwise valid manager response whose only authority defect is

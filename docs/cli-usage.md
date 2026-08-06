@@ -146,6 +146,28 @@ excludes plan prose; Full includes the complete active-plan body. For a stopped
 run, read `.aflow/runs/<RUN_ID>/manager-report.md` first; it is designed to
 explain the incident without requiring raw logs.
 
+## Harness launch troubleshooting
+
+A real launch can stop before any normal turn or manager artifact when local
+environment preflight finds a prerequisite problem:
+
+| Reason code | Meaning | Owner action |
+| --- | --- | --- |
+| harness_executable_missing | The selected argv[0] is not executable on the invocation PATH. | Install the trusted package that provides it and verify it in the AFlow environment. |
+| reasonix_sandbox_bwrap_missing | Reasonix reports enforced bash sandboxing, but bwrap is not executable on that PATH. | Install the trusted host package that provides bubblewrap, then verify bwrap. |
+
+The failure is recorded at run level with no synthetic turn, manager decision,
+recovery callback, or repartition attempt. Earlier artifacts remain intact.
+After remediating the environment, explicitly resume the exact run:
+
+    aflow run --resume RUN_ID
+
+AFlow reports these conditions; it does not install packages, weaken sandbox
+settings, repair configuration, or validate authentication, network reachability,
+quota, provider health, model availability, or arbitrary dependency health.
+The guardian remains the fallback for older runs and unanticipated failures
+outside the safe preflight contract.
+
 ## Show
 
 `aflow show` prints workflow diagrams and the role/team relationships they use.
@@ -193,5 +215,5 @@ Supported harness adapters:
 | `gemini` | `gemini --prompt ... --approval-mode yolo --sandbox=false` | No |
 | `kiro` | `kiro-cli chat --no-interactive --trust-all-tools` | No |
 | `opencode` | `opencode run --format default --dir <repo-root>` | No |
-| `reasonix` | `reasonix run -dir <repo-root> [--model MODEL]` | No |
+| `reasonix` | `reasonix run --dir <repo-root> [--model MODEL]` | No |
 | `pi` | `pi --print --tools read,bash,edit,write,grep,find,ls` | Yes |

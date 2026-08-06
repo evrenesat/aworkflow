@@ -4666,6 +4666,98 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert result.pending_finalized_turn.chosen_transition == "implement_plan"
         assert result.pending_finalized_turn.new_plan_path == repair_path
 
+    def test_environment_preflight_resume_restores_blocked_workflow_step(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        prev_run = {
+            "status": "failed",
+            "failure_kind": "environment_preflight",
+            "current_step_name": "review_cp_implementation",
+            "active_turn": 1,
+            "turns_completed": 1,
+            "environment_preflight": {
+                "classification": "harness_environment_preflight",
+                "reason_code": "harness_executable_missing",
+                "harness": "reasonix",
+                "invocation_kind": "workflow_turn",
+                "required_executable": "reasonix",
+                "checked_command": ["reasonix"],
+                "remediation": "Install Reasonix.",
+                "safe_diagnostics": {},
+                "step_name": "review_cp_implementation",
+            },
+        }
+
+        assert cli_module._interrupted_resume_step(Path("unused"), prev_run) == (
+            "review_cp_implementation"
+        )
+
+    def test_environment_preflight_manager_block_restores_finalized_boundary(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            turn_dir = run_dir / "turns" / "turn-001"
+            turn_dir.mkdir(parents=True)
+            snapshot = {
+                "current_checkpoint_index": 1,
+                "current_checkpoint_name": "Checkpoint 1: Test",
+                "current_checkpoint_unchecked_step_count": 1,
+                "is_complete": False,
+                "total_checkpoint_count": 1,
+                "unchecked_checkpoint_count": 1,
+            }
+            (turn_dir / "result.json").write_text(
+                json.dumps({
+                    "turn_number": 1,
+                    "status": "running",
+                    "step_name": "implement",
+                    "step_role": "worker",
+                    "selector": "codex.worker",
+                    "returncode": 0,
+                    "active_plan_path": "/repo/plan.md",
+                    "new_plan_path": "/repo/plan-cp1.md",
+                    "snapshot_after": snapshot,
+                    "conditions": {
+                        "DONE": False,
+                        "NEW_PLAN_EXISTS": False,
+                        "MAX_TURNS_REACHED": False,
+                    },
+                    "chosen_transition": "review",
+                    "chosen_transition_condition": None,
+                }),
+                encoding="utf-8",
+            )
+            prev_run = {
+                "status": "failed",
+                "failure_kind": "environment_preflight",
+                "active_turn": 1,
+                "turns_completed": 1,
+                "current_step_name": "implement",
+                "environment_preflight": {
+                    "classification": "harness_environment_preflight",
+                    "reason_code": "harness_executable_missing",
+                    "harness": "reasonix",
+                    "invocation_kind": "manager",
+                    "required_executable": "reasonix",
+                    "checked_command": ["reasonix"],
+                    "remediation": "Install Reasonix.",
+                    "safe_diagnostics": {},
+                    "step_name": "implement",
+                },
+            }
+
+            pending = cli_module._pending_finalized_resume_turn(run_dir, prev_run)
+
+        assert pending is not None
+        assert pending.turn_number == 1
+        assert pending.step_name == "implement"
+        assert pending.chosen_transition == "review"
+
     def test_resume_prompt_declined_returns_none(self) -> None:
         import aflow.cli as cli_module
 

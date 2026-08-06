@@ -170,3 +170,40 @@ def test_status_summary_surfaces_literal_repartition_observability() -> None:
     assert "failed / failed: validate" in rendered
     assert "gen-123 / 2 parts / review_current_partition" in rendered
     assert "manager/candidate.md" in rendered
+
+from aflow.analyzer import summarize_run
+
+
+def test_analyzer_renders_safe_environment_preflight_and_ignores_malformed_payload(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "failed",
+        "failure_kind": "environment_preflight",
+        "failure_reason": "environment preflight blocked",
+        "environment_preflight": {
+            "schema_version": 1,
+            "classification": "harness_environment_preflight",
+            "reason_code": "harness_executable_missing",
+            "harness": "codex",
+            "invocation_kind": "workflow_turn",
+            "required_executable": "codex",
+            "checked_command": ["codex"],
+            "remediation": "Install the trusted package that provides the required executable.",
+            "safe_diagnostics": {},
+            "step_name": "implement",
+            "turn_number": 1,
+        },
+        "turns_completed": 0,
+    }
+    summary = summarize_run(tmp_path, payload, [], tmp_path)
+    assert summary["failure"]["failure_kind"] == "environment_preflight"
+    assert summary["failure"]["environment_preflight"]["reason_code"] == (
+        "harness_executable_missing"
+    )
+    assert "environment_preflight" in summary["failure"]["signals"]
+
+    payload["environment_preflight"] = {"raw": "/private/secret/config.toml"}
+    malformed = summarize_run(tmp_path, payload, [], tmp_path)
+    assert malformed["failure"]["environment_preflight"] is None

@@ -11500,3 +11500,239 @@ def test_manager_resume_after_consumption_retains_scope_team_without_replaying_b
     )
     assert context["controller_state"]["eligible_upgrade"]["source_team"] == "max"
     assert context["controller_state"]["eligible_upgrade"]["available"] is False
+
+from aflow.harnesses.preflight import HarnessDiagnosticResult
+
+
+def _environment_preflight_test_config() -> WorkflowUserConfig:
+    workflow = WorkflowConfig(
+        steps={
+            "first": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(GoTransition(to="second"),),
+            ),
+            "second": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(GoTransition(to="END", when="DONE"),),
+            ),
+        },
+        first_step="first",
+    )
+    return WorkflowUserConfig(
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"default": HarnessProfileConfig(model="default")}
+            )
+        },
+        roles={"worker": "codex.default"},
+        workflows={"preflight": workflow},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+class _BlockingEnvironmentProbe:
+    def __init__(self, *, block_after: int = 0) -> None:
+        self.resolve_calls = 0
+        self.block_after = block_after
+
+    def resolve_executable(self, command: str, *, env: Mapping[str, str]) -> str | None:
+        self.resolve_calls += 1
+        return None if self.resolve_calls > self.block_after else command
+
+    def run_diagnostic(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> HarnessDiagnosticResult:
+        raise AssertionError("diagnostic must not run for Codex")
+
+
+def _write_environment_preflight_plan(path: Path) -> None:
+    path.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+        encoding="utf-8",
+    )
+
+
+def test_environment_preflight_zero_turn_block_is_terminal_and_artifact_free(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    _write_environment_preflight_plan(plan_path)
+    probe = _BlockingEnvironmentProbe()
+
+    with pytest.raises(WorkflowError) as raised:
+        run_workflow(
+            ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+            _environment_preflight_test_config(),
+            "preflight",
+            config_dir=repo_root,
+            runner=lambda *args, **kwargs: pytest.fail("blocked runner was called"),
+            preflight_probe=probe,
+        )
+
+    error = raised.value
+    assert error.failure_kind == "environment_preflight"
+    assert error.run_dir is not None
+    payload = json.loads((error.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["failure_kind"] == "environment_preflight"
+    assert payload["environment_preflight"]["reason_code"] == "harness_executable_missing"
+    assert payload["environment_preflight"]["invocation_kind"] == "workflow_turn"
+    assert not list((error.run_dir / "turns").glob("turn-*"))
+
+
+def test_environment_preflight_later_block_preserves_prior_turn(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    _write_environment_preflight_plan(plan_path)
+    probe = _BlockingEnvironmentProbe(block_after=1)
+    calls: list[int] = []
+
+    def runner(argv, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(WorkflowError) as raised:
+        run_workflow(
+            ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+            _environment_preflight_test_config(),
+            "preflight",
+            config_dir=repo_root,
+            runner=runner,
+            preflight_probe=probe,
+        )
+
+    assert len(calls) == 1
+    error = raised.value
+    assert error.run_dir is not None
+    payload = json.loads((error.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert payload["turns_completed"] == 1
+    assert payload["current_step_name"] == "second"
+    assert payload["environment_preflight"]["step_name"] == "second"
+    assert (error.run_dir / "turns" / "turn-001").is_dir()
+    assert not (error.run_dir / "turns" / "turn-002").exists()
+
+
+def test_custom_runner_without_probe_keeps_existing_behavior(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    _write_environment_preflight_plan(plan_path)
+    calls: list[int] = []
+
+    def runner(argv, **kwargs):
+        calls.append(1)
+        plan_path.write_text(
+            "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    result = run_workflow(
+        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+        _environment_preflight_test_config(),
+        "preflight",
+        config_dir=repo_root,
+        runner=runner,
+    )
+
+    assert result.final_snapshot.is_complete
+    assert calls == [1, 1]
+
+def test_environment_preflight_blocks_manager_before_decision_artifact() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_root = Path(tmpdir)
+        plan_path = repo_root / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        workflow = WorkflowConfig(
+            steps={
+                "impl": WorkflowStepConfig(
+                    role="architect",
+                    prompts=("p",),
+                    go=(GoTransition(to="END", when="DONE"),),
+                )
+            },
+            first_step="impl",
+        )
+        wf_config = WorkflowUserConfig(
+            roles={
+                "architect": "codex.worker",
+                "manager_lite": "reasonix.lite",
+                "manager_full": "codex.full",
+            },
+            harnesses={
+                "codex": WorkflowHarnessConfig(
+                    profiles={
+                        "worker": HarnessProfileConfig(model="worker"),
+                        "full": HarnessProfileConfig(model="full"),
+                    }
+                ),
+                "reasonix": WorkflowHarnessConfig(
+                    profiles={"lite": HarnessProfileConfig(model="lite")}
+                ),
+            },
+            workflows={"managed": workflow},
+            prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            manager=ManagerConfig(
+                enabled=True,
+                lite_role="manager_lite",
+                full_role="manager_full",
+            ),
+        )
+
+        class ManagerProbe:
+            def resolve_executable(
+                self, command: str, *, env: Mapping[str, str]
+            ) -> str | None:
+                return None if command == "reasonix" else command
+
+            def run_diagnostic(
+                self,
+                argv: tuple[str, ...],
+                *,
+                cwd: Path,
+                env: Mapping[str, str],
+                timeout_seconds: float,
+            ) -> HarnessDiagnosticResult:
+                raise AssertionError("blocked manager must not run diagnostics")
+
+        calls: list[str] = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv[0])
+            if argv[0] != "codex":
+                pytest.fail("blocked manager runner was called")
+            _write_plan(plan_path, _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "work complete", "")
+
+        with pytest.raises(WorkflowError) as raised:
+            run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config,
+                "managed",
+                config_dir=repo_root,
+                runner=runner,
+                preflight_probe=ManagerProbe(),
+            )
+
+        assert calls == ["codex"]
+        error = raised.value
+        assert error.run_dir is not None
+        run_json = json.loads((error.run_dir / "run.json").read_text(encoding="utf-8"))
+        assert run_json["environment_preflight"]["invocation_kind"] == "manager"
+        assert run_json["active_turn"] == run_json["turns_completed"] == 1
+        assert run_json["manager_decision_number"] == 0
+        assert not list((error.run_dir / "manager").glob("decision-*"))

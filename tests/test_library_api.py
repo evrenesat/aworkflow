@@ -904,6 +904,85 @@ class LibraryRunnerTests(unittest.TestCase):
         self.assertIn(RunStartedEvent, event_types)
         self.assertTrue(any(isinstance(e, RunCompletedEvent) for e in events))
 
+    def test_execute_workflow_forwards_explicit_preflight_probe(self) -> None:
+        from aflow.api import execute_workflow
+        from aflow.harnesses.base import HarnessAdapter, HarnessInvocation
+        from aflow.workflow import WorkflowError
+
+        config_text = (
+            '[aflow]\ndefault_workflow = "test"\n\n'
+            '[workflow.test.steps.step1]\nrole = "architect"\n'
+            'prompts = ["p"]\ngo = [{to = "END"}]\n\n'
+            '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+            '[roles]\narchitect = "opencode.default"\n\n'
+            '[prompts]\np = "do it"\n'
+        )
+        config_path = _write_config(self.home_dir, config_text)
+        workflow_config = load_workflow_config(config_path)
+        plan_path = self.repo_root / "plan.md"
+        plan_path.write_text(
+            "# Plan\n\n### [ ] Checkpoint 1: Test\n- [ ] step one\n",
+            encoding="utf-8",
+        )
+        prepared = prepare_startup(
+            StartupRequest(
+                repo_root=self.repo_root,
+                plan_path=plan_path,
+                config_path=config_path,
+                workflow_config=workflow_config,
+                workflow_name="test",
+                start_step=None,
+                max_turns=1,
+                team=None,
+                extra_instructions=(),
+            )
+        )
+        self.assertIsInstance(prepared, PreparedRun)
+        assert isinstance(prepared, PreparedRun)
+
+        class FakeAdapter(HarnessAdapter):
+            name = "fake"
+            supports_effort = False
+
+            def build_invocation(
+                self,
+                *,
+                repo_root,
+                model,
+                system_prompt,
+                user_prompt,
+                effort=None,
+            ):
+                return HarnessInvocation(
+                    label=self.name,
+                    argv=("missing-fake-harness",),
+                    env={},
+                    prompt_mode="text",
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    effective_prompt=user_prompt,
+                )
+
+        class BlockingProbe:
+            def resolve_executable(self, command, *, env):
+                return None
+
+            def run_diagnostic(self, argv, *, cwd, env, timeout_seconds):
+                raise AssertionError("diagnostic should not run for a missing executable")
+
+        def unexpected_runner(*args, **kwargs):
+            self.fail("blocked runner was called")
+
+        with self.assertRaises(WorkflowError) as raised:
+            execute_workflow(
+                prepared,
+                adapter=FakeAdapter(),
+                runner=unexpected_runner,
+                preflight_probe=BlockingProbe(),
+            )
+
+        self.assertEqual(raised.exception.failure_kind, "environment_preflight")
+
     def test_execute_workflow_emits_recovery_metadata_in_events(self) -> None:
         from aflow.api import CollectingObserver, RunCompletedEvent, TurnFinishedEvent, execute_workflow
         from aflow.harnesses.base import HarnessAdapter

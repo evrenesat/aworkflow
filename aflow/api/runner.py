@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from aflow.api.models import PreparedRun
     from aflow.run_state import ControllerRunResult, RetryContext, ResumeContext
     from aflow.status import BannerRenderer
+from aflow.harnesses.preflight import HarnessPreflightProbe
 
 from aflow.config import WorkflowUserConfig
 from aflow.harnesses.base import HarnessAdapter
@@ -29,6 +30,7 @@ class RunnerConfig:
     banner: BannerRenderer | None = None
     adapter: HarnessAdapter | None = None
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None
+    preflight_probe: HarnessPreflightProbe | None = None
     resume: ResumeContext | None = None
 
 
@@ -70,6 +72,7 @@ class WorkflowRunner:
             config_dir=prepared.config_path,
             adapter=self._config.adapter,
             runner=self._config.runner,
+            preflight_probe=self._config.preflight_probe,
             banner=self._config.banner,
             resume=self._config.resume,
             observer=self._config.observer,
@@ -84,6 +87,7 @@ def execute_workflow(
     banner: BannerRenderer | None = None,
     adapter: HarnessAdapter | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    preflight_probe: HarnessPreflightProbe | None = None,
     resume: ResumeContext | None = None,
 ) -> ControllerRunResult:
     """Execute a prepared workflow with optional event observation.
@@ -94,6 +98,7 @@ def execute_workflow(
         banner: Optional banner renderer for terminal output.
         adapter: Optional harness adapter for testing.
         runner: Optional custom runner for subprocess execution.
+        preflight_probe: Optional deterministic harness environment probe.
         resume: Optional resume context for resuming a previous run.
 
     Returns:
@@ -108,6 +113,7 @@ def execute_workflow(
         banner=banner,
         adapter=adapter,
         runner=runner,
+        preflight_probe=preflight_probe,
         resume=resume,
     )
     runner_obj = WorkflowRunner(config)

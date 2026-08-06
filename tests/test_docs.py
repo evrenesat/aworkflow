@@ -315,3 +315,23 @@ class SkillDocsTests(unittest.TestCase):
         for type_name in documented_types:
             assert type_name in architecture_text, f"Public type '{type_name}' not documented in ARCHITECTURE.md"
             assert hasattr(aflow, type_name), f"Documented type '{type_name}' not found in aflow module"
+
+def test_harness_preflight_docs_are_generic_and_actionable() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    combined = "\n".join(
+        (repo_root / name).read_text(encoding="utf-8")
+        for name in (
+            "README.md",
+            "ARCHITECTURE.md",
+            "DEVLOG.md",
+            "docs/runtime-behavior.md",
+            "docs/cli-usage.md",
+        )
+    )
+    assert "harness_environment_preflight" in combined
+    assert "harness_executable_missing" in combined
+    assert "reasonix_sandbox_bwrap_missing" in combined
+    assert "does not install packages" in combined
+    assert "guardian remains the fallback" in combined
+    assert "reasonix run --dir" in combined
+    assert "reasonix run -dir" not in combined

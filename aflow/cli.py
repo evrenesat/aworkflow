@@ -1293,10 +1293,28 @@ def _interrupted_resume_step(
     prev_run: Mapping[str, object],
 ) -> str | None:
     """Return the workflow step whose durable turn never finalized."""
-    if prev_run.get("status") != "running":
+    status = prev_run.get("status")
+    current_step_name = prev_run.get("current_step_name")
+    if status == "failed" and prev_run.get("failure_kind") == "environment_preflight":
+        preflight = prev_run.get("environment_preflight")
+        if not isinstance(preflight, Mapping):
+            return None
+        invocation_kind = preflight.get("invocation_kind")
+        payload_step_name = preflight.get("step_name")
+        if (
+            invocation_kind == "workflow_turn"
+            and isinstance(current_step_name, str)
+            and current_step_name.strip()
+            and (
+                payload_step_name is None
+                or payload_step_name == current_step_name
+            )
+        ):
+            return current_step_name
+        return None
+    if status != "running":
         return None
     active_turn = prev_run.get("active_turn")
-    current_step_name = prev_run.get("current_step_name")
     if (
         not isinstance(active_turn, int)
         or isinstance(active_turn, bool)
@@ -1327,7 +1345,18 @@ def _pending_finalized_resume_turn(
     prev_run: Mapping[str, object],
 ) -> PendingFinalizedTurn | None:
     """Recover a completed harness turn whose manager boundary never ran."""
-    if prev_run.get("status") != "running":
+    preflight = prev_run.get("environment_preflight")
+    blocked_manager_boundary = (
+        prev_run.get("status") == "failed"
+        and prev_run.get("failure_kind") == "environment_preflight"
+        and isinstance(preflight, Mapping)
+        and preflight.get("invocation_kind") in {
+            "manager",
+            "manager_note_correction",
+            "checkpoint_repartition",
+        }
+    )
+    if prev_run.get("status") != "running" and not blocked_manager_boundary:
         return None
     active_turn = prev_run.get("active_turn")
     turns_completed = prev_run.get("turns_completed")
@@ -1337,7 +1366,11 @@ def _pending_finalized_resume_turn(
         or active_turn < 1
         or not isinstance(turns_completed, int)
         or isinstance(turns_completed, bool)
-        or active_turn <= turns_completed
+        or (
+            active_turn != turns_completed
+            if blocked_manager_boundary
+            else active_turn <= turns_completed
+        )
     ):
         return None
     boundary = prev_run.get("pending_boundary_decision")
@@ -1516,6 +1549,16 @@ def _reconstruct_resume_context(
         reset_scope=reset_scope,
         run_dir=run_dir,
     )
+    preflight = prev_run.get("environment_preflight")
+    if (
+        prev_run.get("failure_kind") == "environment_preflight"
+        and isinstance(preflight, Mapping)
+        and preflight.get("invocation_kind") == "checkpoint_repartition"
+        and pending_finalized_turn is not None
+    ):
+        # No repartition attempt started, so replay its finalized manager
+        # boundary instead of trying to apply the preflight-blocked transaction.
+        manager_fields["pending_repartition"] = None
     scope_envelope_source_path: str | None = None
     scope_envelope_bytes: bytes | None = None
     active_scope = manager_fields.get("active_implementation_scope")
