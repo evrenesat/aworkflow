@@ -229,12 +229,21 @@ interpretation, pause and write a fix plan instead.
 Persist the linkage only after the successor's own snapshot proves one
 controller. Record the predecessor state with the
 --replacement-successor-run-id option using the same helper hash and same-task
-routing IDs. The helper stores predecessor ID, successor ID, predecessor
-fingerprint, and timestamp atomically in guardian state. Then repin the
-existing heartbeat to the successor run ID, preserving every other automation
-field. Re-check the prompt, both routing IDs, the successor's frozen
-configuration, and exactly-one-controller evidence before leaving the
-automation active.
+routing IDs. This is a dedicated linkage operation: it must return
+replacement_linked and must not classify the active successor as an active
+predecessor controller. It derives the sole shared recovery and notification
+fingerprint as predecessor provenance; if historical evidence is ambiguous,
+supply --replacement-recovery-fingerprint with a value already present in both
+lists. Validation failure returns invalid_state and writes neither observation
+state nor linkage state.
+
+On success the helper atomically stores predecessor ID, successor ID, original
+recovery fingerprint, successor-controller evidence, and timestamp. A
+same-successor record with an unsafe observation fingerprint is migrated once
+to the original recovery fingerprint. Then repin the existing heartbeat to the
+successor run ID, preserving every other automation field. Re-check the prompt,
+both routing IDs, the successor's frozen configuration, and
+exactly-one-controller evidence before leaving the automation active.
 
 If the harness adapter does not emit enough durable data to make this
 comparison or replacement mechanical, or if the recovery policy cannot safely

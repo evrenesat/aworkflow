@@ -655,6 +655,227 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+def _replacement_recovery_fingerprint(
+    previous: dict[str, Any],
+    requested: str | None,
+) -> str:
+    recovery = {
+        value
+        for value in previous.get("recovery_fingerprints", [])
+        if isinstance(value, str) and value
+    }
+    notified = {
+        value
+        for value in previous.get("notified_fingerprints", [])
+        if isinstance(value, str) and value
+    }
+    candidates = sorted(recovery & notified)
+    if requested is not None:
+        if requested not in candidates:
+            raise ValueError(
+                "requested replacement recovery fingerprint is not durable recovery evidence"
+            )
+        return requested
+    if len(candidates) != 1:
+        raise ValueError(
+            "replacement linkage requires exactly one shared recovery and notification fingerprint"
+        )
+    return candidates[0]
+
+
+def _replacement_identity_value_is_valid(
+    run: dict[str, Any], key: str, value: Any
+) -> bool:
+    if key in {"workflow_name", "team", "selected_start_step"}:
+        return isinstance(value, str) and bool(value)
+    if key == "effective_max_turns":
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    if key == "extra_instructions":
+        return isinstance(value, list) and all(
+            isinstance(item, str) for item in value
+        )
+    if key == "frozen_config":
+        return (
+            isinstance(value, dict)
+            and isinstance(value.get("workflow_name"), str)
+            and bool(value["workflow_name"])
+            and value["workflow_name"] == run.get("workflow_name")
+            and isinstance(value.get("config_path"), str)
+            and bool(value["config_path"])
+            and isinstance(value.get("config_fingerprint"), str)
+            and bool(SHA256_PATTERN.fullmatch(value["config_fingerprint"]))
+        )
+    raise ValueError(f"unknown replacement identity field: {key}")
+
+
+def _replacement_identity_errors(
+    repo: Path,
+    predecessor: dict[str, Any],
+    successor: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    if (
+        predecessor.get("status") != "failed"
+        or predecessor.get("turns_completed") != 0
+        or predecessor.get("feature_branch") is not None
+        or predecessor.get("worktree_path") is not None
+        or predecessor.get("resumed_from_run_id")
+    ):
+        errors.append("predecessor is not an eligible zero-turn in-place replacement")
+    if successor.get("status") != "running" or successor.get("resumed_from_run_id"):
+        errors.append("successor is not a fresh running replacement")
+    if (
+        successor.get("feature_branch") is not None
+        or successor.get("worktree_path") is not None
+    ):
+        errors.append("successor changed the in-place lifecycle")
+    required_fields = (
+        "workflow_name",
+        "team",
+        "selected_start_step",
+        "effective_max_turns",
+        "extra_instructions",
+        "frozen_config",
+    )
+    for key in required_fields:
+        predecessor_valid = (
+            key in predecessor
+            and _replacement_identity_value_is_valid(
+                predecessor, key, predecessor[key]
+            )
+        )
+        successor_valid = (
+            key in successor
+            and _replacement_identity_value_is_valid(
+                successor, key, successor[key]
+            )
+        )
+        if not predecessor_valid:
+            errors.append(f"predecessor {key} is missing or invalid")
+        if not successor_valid:
+            errors.append(f"successor {key} is missing or invalid")
+        if (
+            predecessor_valid
+            and successor_valid
+            and predecessor[key] != successor[key]
+        ):
+            errors.append(f"successor {key} does not match predecessor")
+    predecessor_plan = predecessor.get("original_plan_path")
+    successor_plan = successor.get("original_plan_path")
+    predecessor_resolved = (
+        _resolved_invocation_path(predecessor_plan, str(repo))
+        if isinstance(predecessor_plan, str) and predecessor_plan
+        else None
+    )
+    successor_resolved = (
+        _resolved_invocation_path(successor_plan, str(repo))
+        if isinstance(successor_plan, str) and successor_plan
+        else None
+    )
+    if (
+        predecessor_resolved is None
+        or successor_resolved is None
+        or predecessor_resolved != successor_resolved
+    ):
+        errors.append("successor original plan does not match predecessor")
+    elif not Path(predecessor_resolved).is_file():
+        errors.append("predecessor original plan does not exist")
+    return errors
+
+
+def _collect_replacement_linkage(
+    *,
+    repo: Path,
+    predecessor_run_id: str,
+    predecessor: dict[str, Any],
+    successor_run_id: str,
+    state_path: Path,
+    previous: dict[str, Any],
+    write_state: bool,
+    helper: dict[str, Any],
+    expected_sha256: str | None,
+    report_thread_id: str | None,
+    guard_thread_id: str | None,
+    current_thread_id: str | None,
+    replacement_recovery_fingerprint: str | None,
+    process_records: list[ProcessRecord],
+) -> dict[str, Any]:
+    routing = _resolve_routing(
+        previous,
+        report_thread_id,
+        guard_thread_id,
+        current_thread_id,
+        write_state=write_state,
+    )
+    recovery_fingerprint = _replacement_recovery_fingerprint(
+        previous, replacement_recovery_fingerprint
+    )
+    successor_path = (
+        repo / ".aflow" / "runs" / successor_run_id / "run.json"
+    )
+    successor = _read_json(successor_path)
+    errors = _replacement_identity_errors(repo, predecessor, successor)
+    candidates = _matching_controller_candidates(process_records, repo, successor)
+    controllers, wrappers = _logical_controller_matches(candidates, process_records)
+    if len(controllers) != 1:
+        errors.append("replacement successor does not have exactly one controller")
+    existing = previous.get("replacement_successor")
+    if isinstance(existing, dict) and existing.get("successor_run_id") != successor_run_id:
+        errors.append("a different replacement successor is already recorded")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    observed_at = _utc_now()
+    linkage: dict[str, Any] = {
+        "predecessor_run_id": predecessor_run_id,
+        "successor_run_id": successor_run_id,
+        "predecessor_fingerprint": recovery_fingerprint,
+        "linked_at": observed_at,
+        "successor_run_json": str(successor_path),
+        "successor_controller_pids": [record.pid for record in controllers],
+        "successor_wrapper_pids": [record.pid for record in wrappers],
+        "identity_verified": True,
+    }
+    if isinstance(existing, dict):
+        old_fingerprint = existing.get("predecessor_fingerprint")
+        if isinstance(old_fingerprint, str) and old_fingerprint != recovery_fingerprint:
+            linkage["migrated_from_predecessor_fingerprint"] = old_fingerprint
+            linkage["migration_reason"] = "successor activity must not replace recovery lineage"
+
+    state = dict(previous)
+    state["schema_version"] = SCHEMA_VERSION
+    state["replacement_successor"] = linkage
+    if routing:
+        state["routing"] = routing
+    if write_state:
+        _write_state(state_path, state)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "observed_at": observed_at,
+        "repo": str(repo.resolve()),
+        "run_id": predecessor_run_id,
+        "classification": "replacement_linked",
+        "recommended_action": "repin_guard_to_successor",
+        "fingerprint": recovery_fingerprint,
+        "helper": {
+            **helper,
+            "expected_sha256": expected_sha256,
+            "matches_expected": True if expected_sha256 is not None else None,
+        },
+        "routing": {
+            **routing,
+            "current_thread_id": current_thread_id,
+            "guard_thread_matches_current": bool(routing)
+            and current_thread_id == routing["guard_thread_id"],
+        },
+        "replacement_successor": linkage,
+        "processes": {
+            "controller_count": len(controllers),
+            "controller_pids": [record.pid for record in controllers],
+            "wrapper_pids": [record.pid for record in wrappers],
+        },
+    }
+
 def collect_snapshot(
     repo: Path,
     run_id: str,
@@ -671,6 +892,7 @@ def collect_snapshot(
     current_thread_id: str | None = None,
     transient_environment_kind: str | None = None,
     replacement_successor_run_id: str | None = None,
+    replacement_recovery_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     helper = _helper_provenance()
     if (
@@ -705,6 +927,24 @@ def collect_snapshot(
     run_path = repo / ".aflow" / "runs" / run_id / "run.json"
     run = _read_json(run_path)
     records = process_records if process_records is not None else _list_processes()
+    previous = _load_state(state_path)
+    if replacement_successor_run_id:
+        return _collect_replacement_linkage(
+            repo=repo,
+            predecessor_run_id=run_id,
+            predecessor=run,
+            successor_run_id=replacement_successor_run_id,
+            state_path=state_path,
+            previous=previous,
+            write_state=write_state,
+            helper=helper,
+            expected_sha256=expected_sha256,
+            report_thread_id=report_thread_id,
+            guard_thread_id=guard_thread_id,
+            current_thread_id=current_thread_id,
+            replacement_recovery_fingerprint=replacement_recovery_fingerprint,
+            process_records=records,
+        )
     controller_candidates = _matching_controller_candidates(records, repo, run)
     controllers, controller_wrappers = _logical_controller_matches(
         controller_candidates, records
@@ -721,7 +961,6 @@ def collect_snapshot(
     fingerprint = _fingerprint(
         run_id, run, latest_turn, latest_manager, len(controllers)
     )
-    previous = _load_state(state_path)
     routing = _resolve_routing(
         previous,
         report_thread_id,
@@ -766,30 +1005,6 @@ def collect_snapshot(
     }
     if routing:
         state["routing"] = routing
-    if replacement_successor_run_id:
-        if (
-            run.get("status") != "failed"
-            or run.get("turns_completed") != 0
-            or run.get("feature_branch") is not None
-            or run.get("worktree_path") is not None
-            or run.get("resumed_from_run_id")
-        ):
-            raise ValueError("predecessor is not eligible for replacement linkage")
-        successor_path = repo / ".aflow" / "runs" / replacement_successor_run_id / "run.json"
-        if not successor_path.is_file():
-            raise ValueError("replacement successor run.json is missing")
-        previous_successor = state.get("replacement_successor")
-        if (
-            isinstance(previous_successor, dict)
-            and previous_successor.get("successor_run_id") != replacement_successor_run_id
-        ):
-            raise ValueError("replacement successor is already recorded")
-        state["replacement_successor"] = {
-            "predecessor_run_id": run_id,
-            "successor_run_id": replacement_successor_run_id,
-            "predecessor_fingerprint": fingerprint,
-            "recorded_at": observed_at,
-        }
     if write_state:
         _write_state(state_path, state)
 
@@ -1281,7 +1496,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--replacement-successor-run-id",
-        help="Persist an already verified replacement successor for this predecessor.",
+        help="Link a verified replacement successor without classifying it as a predecessor controller.",
+    )
+    parser.add_argument(
+        "--replacement-recovery-fingerprint",
+        help="The durable original recovery fingerprint; required when prior evidence is ambiguous.",
     )
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
@@ -1326,6 +1545,7 @@ def main() -> int:
             current_thread_id=os.environ.get("CODEX_THREAD_ID"),
             transient_environment_kind=args.transient_environment_kind,
             replacement_successor_run_id=args.replacement_successor_run_id,
+            replacement_recovery_fingerprint=args.replacement_recovery_fingerprint,
         )
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         print(

@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-08-07 — Preserve guard replacement lineage
+
+- Replacement linkage now retains the original recovery fingerprint, validates
+  complete predecessor/successor identity and one live successor controller,
+  and migrates unsafe same-successor linkage without rewriting observation
+  history.
+- Missing or malformed identity fields and absent original plans fail closed
+  before guardian state is written.
+
 ## 2026-08-06 — Make clean-END manager eligibility deterministic
 
 - Clean controller-proposed `END` boundaries now omit `stop` from Lite
