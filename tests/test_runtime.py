@@ -5051,6 +5051,22 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     original_plan_path=original_plan_path,
                 ) is expected
 
+        unicode_plan_path = primary_root / 'plans' / 'in-progress' / 'é.md'
+        quoted_unicode_status = r'?? "plans/in-progress/\303\251.md"'
+        assert _is_ignored_merge_status_line(
+            quoted_unicode_status,
+            primary_root=primary_root,
+            original_plan_path=unicode_plan_path,
+        ) is True
+        with patch(
+            'aflow.workflow._run_git',
+            return_value=(0, quoted_unicode_status, ''),
+        ):
+            assert _collect_merge_dirty_paths(
+                primary_root,
+                original_plan_path=unicode_plan_path,
+            ) == []
+
         status = "\n".join(
             (
                 '?? .aflow/runs/old/run.json',

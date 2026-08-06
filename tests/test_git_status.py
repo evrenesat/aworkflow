@@ -30,6 +30,7 @@ def test_aflow_lifecycle_owned_path_boundary(path: str, expected: bool) -> None:
     [
         ('?? ".aflow/runs/old/run.json"', ".aflow/runs/old/run.json"),
         ("R  old.txt -> .aflow/runs/new.json", ".aflow/runs/new.json"),
+        (r'?? "plans/in-progress/\303\251.md"', "plans/in-progress/é.md"),
         ('R  "old name.txt" -> ".aflow/runs/new name.json"', ".aflow/runs/new name.json"),
         ('?? "src/quoted\\tname.txt"', "src/quoted\tname.txt"),
     ],
