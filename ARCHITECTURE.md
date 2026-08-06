@@ -63,6 +63,13 @@ Durable plan, branch, worktree, boundary, and turn-outcome fields override
 contradictory transcript text. Lite keeps active and original plan bodies null
 and marks both as intentionally omitted; this redaction is not evidence that a
 plan is missing, while Full can include available plan content.
+At a clean controller-proposed `END`—a transition without operational failure,
+scope pressure, or max-turn terminal handling—Lite eligibility omits `stop`.
+An ineligible or invalid Lite response, including `stop`, and an explicit Lite
+escalation each lead to one Full decision from the same finalized-turn evidence
+with Full eligibility restored. Full `stop` and `stop` at every non-clean
+boundary retain the normal failure path. The controller never infers success or
+failure from manager `reason`, `stop_report`, or other free text.
 Every manager prompt names the configured manager skill and embeds the complete
 closed JSON protocol, including the structured stop-report shape. Invalid
 manager output at a terminal incident cannot replace the original controller

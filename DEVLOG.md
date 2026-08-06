@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-08-06 — Make clean-END manager eligibility deterministic
+
+- Clean controller-proposed `END` boundaries now omit `stop` from Lite
+  eligibility while preserving the existing action set for Full.
+- Ineligible or invalid Lite output and explicit Lite escalation restore Full
+  eligibility for one decision from the same finalized turn; accepted Full and
+  non-clean-boundary `stop` decisions still fail through the existing report,
+  event, and banner path.
+- Focused manager and runtime regressions cover Lite `stop` to Full `continue`,
+  both Full-stop fallback routes, direct Full selection, and ordinary non-END
+  Lite `stop` without interpreting manager prose.
+
 ## 2026-08-02 — Correct manager plan-selection notes at one boundary
 
 - An otherwise valid manager response whose only authority defect is

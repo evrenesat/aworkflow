@@ -110,6 +110,34 @@ def test_decision_protocol_rejects_unknown_fields_and_illegal_combinations() -> 
         )
 
 
+def test_stop_validation_respects_level_specific_eligibility() -> None:
+    stop = parse_manager_decision(_decision(
+        action="stop",
+        next_step_notes=[],
+        stop_report={
+            "summary": "The run remains blocked.",
+            "root_cause": "Controller evidence is unresolved.",
+            "evidence": ["The required evidence is absent."],
+            "attempts": "The boundary was inspected once.",
+            "workspace_state": "The plan remains incomplete.",
+            "next_actions": ["Resolve the controller-owned blocker."],
+        },
+    ))
+
+    with pytest.raises(ManagerDecisionError, match="not eligible"):
+        validate_manager_decision(
+            stop,
+            level="lite",
+            eligible_actions={"continue", "escalate_to_full"},
+        )
+
+    assert validate_manager_decision(
+        stop,
+        level="full",
+        eligible_actions={"continue", "stop"},
+    ) is stop
+
+
 def test_repartition_only_legal_for_full() -> None:
     decision = parse_manager_decision(_decision(action="repartition_current_checkpoint", next_step_notes=[]))
     validate_manager_decision(decision, level="full")

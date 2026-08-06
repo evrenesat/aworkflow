@@ -312,7 +312,17 @@ def test_manager_report_remains_visible_once_after_real_banner_and_cli(
     assert run_json["failure_reason"] == report
     assert run_json["last_manager_report_path"] == "manager-report.md"
     decisions = sorted((run_dir / "manager").iterdir())
-    assert len(decisions) == (2 if invalid_managers else 1)
+    assert len(decisions) == 2
+    lite_result = json.loads((decisions[0] / "result.json").read_text(encoding="utf-8"))
+    full_result = json.loads((decisions[1] / "result.json").read_text(encoding="utf-8"))
+    assert lite_result["level"] == "lite"
+    assert lite_result["status"] == "invalid"
+    assert full_result["level"] == "full"
+    assert full_result["trigger"] == "lite_invalid"
+    if not invalid_managers:
+        assert "action 'stop' is not eligible" in lite_result["error"]
+        assert full_result["status"] == "accepted"
+        assert full_result["action"] == "stop"
 
 class WorkflowCliTests(unittest.TestCase):
 

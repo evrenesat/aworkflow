@@ -177,6 +177,55 @@ def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
     )
 
 
+def _clean_end_manager_workflow_config() -> WorkflowUserConfig:
+    workflow = WorkflowConfig(
+        steps={
+            "impl": WorkflowStepConfig(
+                role="architect",
+                prompts=("p",),
+                go=(GoTransition(to="END"),),
+            ),
+        },
+        first_step="impl",
+    )
+    return WorkflowUserConfig(
+        roles={
+            "architect": "codex.worker",
+            "manager_lite": "codex.lite",
+            "manager_full": "codex.full",
+        },
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "worker": HarnessProfileConfig(model="worker"),
+            "lite": HarnessProfileConfig(model="lite"),
+            "full": HarnessProfileConfig(model="full"),
+        })},
+        workflows={"managed": workflow},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+        manager=ManagerConfig(
+            enabled=True,
+            lite_role="manager_lite",
+            full_role="manager_full",
+        ),
+    )
+
+
+def _manager_stop_decision(reason: str) -> str:
+    return json.dumps({
+        "schema_version": 1,
+        "action": "stop",
+        "reason": reason,
+        "next_step_notes": [],
+        "stop_report": {
+            "summary": "The manager stopped the run.",
+            "root_cause": "Synthetic unresolved controller evidence.",
+            "evidence": ["The manager selected stop."],
+            "attempts": "One finalized workflow turn was inspected.",
+            "workspace_state": "The synthetic workspace remains available.",
+            "next_actions": ["Inspect the durable manager artifacts."],
+        },
+    })
+
+
 class WorkflowRuntimeTests(unittest.TestCase):
 
     def test_resume_identity_drift_fails_before_event_or_new_run_state(self) -> None:
@@ -9457,34 +9506,30 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert manager_calls == 0
             assert not list((run_dir / "manager").glob("decision-*"))
 
-    def test_invalid_lite_manager_response_escalates_once_to_full(self) -> None:
+    def test_manager_clean_end_lite_stop_falls_back_once_to_full_continue(self) -> None:
+        from aflow.api import CollectingObserver
+
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
-            workflow = WorkflowConfig(
-                steps={'impl': WorkflowStepConfig(
-                    role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
-                )}, first_step='impl',
-            )
-            wf_config = WorkflowUserConfig(
-                roles={'architect': 'codex.default', 'manager_lite': 'codex.nano', 'manager_full': 'codex.high'},
-                harnesses={'codex': WorkflowHarnessConfig(profiles={
-                    'default': HarnessProfileConfig(model='default'), 'nano': HarnessProfileConfig(model='nano'), 'high': HarnessProfileConfig(model='high'),
-                })},
-                workflows={'managed': workflow}, prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
-                manager=ManagerConfig(enabled=True, lite_role='manager_lite', full_role='manager_full'),
-            )
-            calls = 0
+            calls: list[str] = []
+            observer = CollectingObserver()
 
             def runner(argv, **kwargs):
-                nonlocal calls
-                calls += 1
-                if calls == 1:
+                model = argv[argv.index('--model') + 1]
+                calls.append(model)
+                if model == 'worker':
                     _write_plan(plan_path, _COMPLETE_PLAN)
                     return subprocess.CompletedProcess(argv, 0, 'work complete', '')
-                if calls == 2:
-                    return subprocess.CompletedProcess(argv, 0, 'not JSON', '')
+                if model == 'lite':
+                    return subprocess.CompletedProcess(
+                        argv, 0,
+                        _manager_stop_decision(
+                            'Lite incorrectly tries to stop a clean END.'
+                        ),
+                        '',
+                    )
                 return subprocess.CompletedProcess(argv, 0, json.dumps({
                     'schema_version': 1, 'action': 'continue', 'reason': 'Full supervision accepts END.',
                     'next_step_notes': [], 'stop_report': None,
@@ -9492,12 +9537,192 @@ class LifecycleBootstrapTests(unittest.TestCase):
 
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
-                wf_config, 'managed', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                _clean_end_manager_workflow_config(),
+                'managed',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                observer=observer,
             )
-            assert (result.run_dir / 'manager' / 'decision-001' / 'result.json').is_file()
-            full_result = json.loads((result.run_dir / 'manager' / 'decision-002' / 'result.json').read_text(encoding='utf-8'))
+
+            assert calls == ['worker', 'lite', 'full']
+            lite_dir = result.run_dir / 'manager' / 'decision-001'
+            full_dir = result.run_dir / 'manager' / 'decision-002'
+            lite_result = json.loads((lite_dir / 'result.json').read_text(encoding='utf-8'))
+            full_result = json.loads((full_dir / 'result.json').read_text(encoding='utf-8'))
+            lite_context = json.loads((lite_dir / 'context.json').read_text(encoding='utf-8'))
+            full_context = json.loads((full_dir / 'context.json').read_text(encoding='utf-8'))
+            assert lite_result['level'] == 'lite'
+            assert lite_result['trigger'] == 'post_turn'
+            assert lite_result['status'] == 'invalid'
+            assert "action 'stop' is not eligible" in lite_result['error']
+            assert lite_result['finalized_turn_number'] == 1
+            assert lite_context['controller_state']['eligible_actions'] == ['continue']
             assert full_result['level'] == 'full'
+            assert full_result['trigger'] == 'lite_invalid'
+            assert full_result['status'] == 'accepted'
             assert full_result['action'] == 'continue'
+            assert full_result['finalized_turn_number'] == 1
+            assert full_context['controller_state']['eligible_actions'] == [
+                'continue', 'stop',
+            ]
+
+            run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert result.end_reason == 'transition_end'
+            assert run_json['status'] == 'completed'
+            assert run_json['end_reason'] == 'transition_end'
+            assert 'failure_reason' not in run_json
+            assert not (result.run_dir / 'manager-report.md').exists()
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_COMPLETED) == 1
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 0
+            manager_events = [
+                event for event in observer.events
+                if event.event_type == ExecutionEventType.MANAGER_DECIDED
+            ]
+            assert [
+                (event.level, event.action, event.report_path)  # type: ignore[attr-defined]
+                for event in manager_events
+            ] == [
+                ("lite", "invalid", None),
+                ("full", "continue", None),
+            ]
+            assert event_types.index(ExecutionEventType.TURN_FINISHED) < event_types.index(
+                ExecutionEventType.MANAGER_STARTED
+            )
+            assert event_types[-1] == ExecutionEventType.RUN_COMPLETED
+
+    def test_manager_invalid_lite_clean_end_then_full_stop_fails_once(self) -> None:
+        from aflow.api import CollectingObserver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+            observer = CollectingObserver()
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "worker":
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, "work complete", "")
+                if model == "lite":
+                    return subprocess.CompletedProcess(argv, 0, "not JSON", "")
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    _manager_stop_decision(
+                        "Full rejects the clean END after invalid Lite output."
+                    ),
+                    "",
+                )
+
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                    ),
+                    _clean_end_manager_workflow_config(),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    observer=observer,
+                )
+
+            assert calls == ["worker", "lite", "full"]
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            lite_result = json.loads((
+                run_dir / "manager" / "decision-001" / "result.json"
+            ).read_text(encoding="utf-8"))
+            full_result = json.loads((
+                run_dir / "manager" / "decision-002" / "result.json"
+            ).read_text(encoding="utf-8"))
+            full_context = json.loads((
+                run_dir / "manager" / "decision-002" / "context.json"
+            ).read_text(encoding="utf-8"))
+            assert lite_result["status"] == "invalid"
+            assert lite_result["trigger"] == "post_turn"
+            assert full_result["level"] == "full"
+            assert full_result["trigger"] == "lite_invalid"
+            assert full_result["status"] == "accepted"
+            assert full_result["action"] == "stop"
+            assert full_context["controller_state"]["eligible_actions"] == [
+                "continue", "stop",
+            ]
+            report = (run_dir / "manager-report.md").read_text(encoding="utf-8")
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            assert run_json["status"] == "failed"
+            assert run_json["failure_reason"] == report
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
+            assert event_types.count(ExecutionEventType.RUN_COMPLETED) == 0
+
+    def test_manager_direct_full_clean_end_restores_stop_eligibility(self) -> None:
+        from aflow.manager_context import build_manager_context as actual_build_context
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            calls: list[str] = []
+
+            def force_full_context(*args, **kwargs):
+                context = actual_build_context(*args, **kwargs)
+                context["controller_state"]["semantic_stall_count"] = 2
+                return context
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "worker":
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, "work complete", "")
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    _manager_stop_decision(
+                        "Direct Full rejects the clean END."
+                    ),
+                    "",
+                )
+
+            with patch(
+                "aflow.workflow.build_manager_context",
+                side_effect=force_full_context,
+            ):
+                with pytest.raises(WorkflowError) as raised:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root,
+                            plan_path=plan_path,
+                            max_turns=2,
+                        ),
+                        _clean_end_manager_workflow_config(),
+                        "managed",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+            assert calls == ["worker", "full"]
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            result = json.loads((
+                run_dir / "manager" / "decision-001" / "result.json"
+            ).read_text(encoding="utf-8"))
+            context = json.loads((
+                run_dir / "manager" / "decision-001" / "context.json"
+            ).read_text(encoding="utf-8"))
+            assert result["level"] == "full"
+            assert result["trigger"] == "post_turn"
+            assert result["status"] == "accepted"
+            assert result["action"] == "stop"
+            assert context["controller_state"]["eligible_actions"] == [
+                "continue", "stop",
+            ]
+            assert (run_dir / "manager-report.md").is_file()
 
     def test_scope_authority_note_escalates_before_another_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -10433,38 +10658,14 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert decision["status"] == "accepted"
             assert decision["invocation"]["argv"] == manager_argv
 
-    def test_manager_stop_emits_report_then_stops_banner_before_raising(self) -> None:
+    def test_manager_clean_end_lite_escalation_then_full_stop_preserves_failure_order(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
-            workflow = WorkflowConfig(
-                steps={"impl": WorkflowStepConfig(
-                    role="architect",
-                    prompts=("p",),
-                    go=(GoTransition(to="END", when="DONE"),),
-                )},
-                first_step="impl",
-            )
-            wf_config = WorkflowUserConfig(
-                roles={
-                    "architect": "codex.worker",
-                    "manager_lite": "codex.lite",
-                    "manager_full": "codex.full",
-                },
-                harnesses={"codex": WorkflowHarnessConfig(profiles={
-                    "worker": HarnessProfileConfig(model="worker"),
-                    "lite": HarnessProfileConfig(model="lite"),
-                    "full": HarnessProfileConfig(model="full"),
-                })},
-                workflows={"managed": workflow},
-                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
-                manager=ManagerConfig(
-                    enabled=True,
-                    lite_role="manager_lite",
-                    full_role="manager_full",
-                ),
-            )
+            calls: list[str] = []
             order: list[str] = []
             failed_events: list[object] = []
 
@@ -10489,23 +10690,152 @@ class LifecycleBootstrapTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 model = argv[argv.index("--model") + 1]
+                calls.append(model)
                 if model == "worker":
                     _write_plan(plan_path, _COMPLETE_PLAN)
                     return subprocess.CompletedProcess(argv, 0, "work complete", "")
-                return subprocess.CompletedProcess(argv, 0, json.dumps({
-                    "schema_version": 1,
-                    "action": "stop",
-                    "reason": "Stop after the completed turn.",
-                    "next_step_notes": [],
-                    "stop_report": {
-                        "summary": "The manager stopped the run.",
-                        "root_cause": "Synthetic terminal decision.",
-                        "evidence": ["The manager selected stop."],
-                        "attempts": "One worker turn ran.",
-                        "workspace_state": "The plan is complete.",
-                        "next_actions": ["Inspect the manager artifacts."],
-                    },
-                }), "")
+                if model == "lite":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "escalate_to_full",
+                        "reason": "Full should inspect the clean END.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    _manager_stop_decision("Full rejects the clean END."),
+                    "",
+                )
+
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                    ),
+                    _clean_end_manager_workflow_config(),
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    banner=RecordingBanner(),  # type: ignore[arg-type]
+                    observer=RecordingObserver(),  # type: ignore[arg-type]
+                )
+
+            assert calls == ["worker", "lite", "full"]
+            assert order[-2:] == ["failure_emitted", "banner_stopped"]
+            assert len(failed_events) == 1
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            lite_result = json.loads((
+                run_dir / "manager" / "decision-001" / "result.json"
+            ).read_text(encoding="utf-8"))
+            full_result = json.loads((
+                run_dir / "manager" / "decision-002" / "result.json"
+            ).read_text(encoding="utf-8"))
+            full_context = json.loads((
+                run_dir / "manager" / "decision-002" / "context.json"
+            ).read_text(encoding="utf-8"))
+            assert lite_result["status"] == "accepted"
+            assert lite_result["action"] == "escalate_to_full"
+            assert full_result["level"] == "full"
+            assert full_result["trigger"] == "lite_escalation"
+            assert full_result["status"] == "accepted"
+            assert full_result["action"] == "stop"
+            assert full_context["controller_state"]["eligible_actions"] == [
+                "continue", "stop",
+            ]
+            report = (run_dir / "manager-report.md").read_text(encoding="utf-8")
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            assert run_json["status"] == "failed"
+            assert run_json["failure_reason"] == report
+            assert failed_events[0].failure_reason == report  # type: ignore[attr-defined]
+
+    def test_manager_non_end_lite_stop_emits_report_then_stops_banner_before_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "impl": WorkflowStepConfig(
+                        role="architect",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review"),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="architect",
+                        prompts=("p",),
+                        go=(GoTransition(to="END"),),
+                    ),
+                },
+                first_step="impl",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "architect": "codex.worker",
+                    "manager_lite": "codex.lite",
+                    "manager_full": "codex.full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "lite": HarnessProfileConfig(model="lite"),
+                    "full": HarnessProfileConfig(model="full"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+            order: list[str] = []
+            failed_events: list[object] = []
+            calls: list[str] = []
+
+            class RecordingBanner:
+                def start(self, state):
+                    pass
+
+                def update(self, state):
+                    pass
+
+                def set_context(self, **kwargs):
+                    pass
+
+                def stop(self, state):
+                    order.append("banner_stopped")
+
+            class RecordingObserver:
+                def on_event(self, event):
+                    if event.event_type == ExecutionEventType.RUN_FAILED:
+                        order.append("failure_emitted")
+                        failed_events.append(event)
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                calls.append(model)
+                if model == "worker":
+                    return subprocess.CompletedProcess(argv, 0, "work remains", "")
+                context = json.loads(
+                    _runner_prompt(argv, kwargs).split(
+                        "MANAGER_CONTEXT_JSON:\n", 1
+                    )[1]
+                )
+                assert context["level"] == "lite"
+                assert context["controller_state"]["proposed_next_step"] == "review"
+                assert "stop" in context["controller_state"]["eligible_actions"]
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    _manager_stop_decision(
+                        "Stop before the proposed non-END review transition."
+                    ),
+                    "",
+                )
 
             with pytest.raises(WorkflowError) as raised:
                 run_workflow(
@@ -10518,6 +10848,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     observer=RecordingObserver(),  # type: ignore[arg-type]
                 )
 
+            assert calls == ["worker", "lite"]
             assert order[-2:] == ["failure_emitted", "banner_stopped"]
             assert len(failed_events) == 1
             report = str(raised.value)

@@ -5994,13 +5994,13 @@ def run_workflow(
                 upgrade,
                 reason="next worker has no prior attempt in an active implementation scope",
             )
-        eligible: set[str] = {"continue", "stop"}
+        base_eligible: set[str] = {"continue", "stop"}
         if safely_retryable:
-            eligible.add("retry_current_step")
+            base_eligible.add("retry_current_step")
         if operational_failure and backup_team is not None and backup_team != active_team:
-            eligible.add("switch_to_backup_and_retry")
+            base_eligible.add("switch_to_backup_and_retry")
         if upgrade.available:
-            eligible.add("upgrade_next_implementation")
+            base_eligible.add("upgrade_next_implementation")
         repartition_disposition_targets: dict[str, tuple[str, str]] = {}
         for routed_step_name, routed_step in (
             (next_step, candidate_step),
@@ -6043,11 +6043,21 @@ def run_workflow(
                         boundary_plan_text=eligible_source,
                     )
                     if eligible_drift.allowed:
-                        eligible.add("repartition_current_checkpoint")
+                        base_eligible.add("repartition_current_checkpoint")
             except (OSError, UnicodeDecodeError, ValueError, WorkflowError):
                 # Invalid authority makes repartition unavailable. Full still
                 # receives continue/upgrade/stop and may report the boundary.
                 pass
+        clean_end_boundary = (
+            proposed_action == "transition"
+            and proposed_transition == "END"
+            and not operational_failure
+            and scope_pressure_reason is None
+            and trigger != "max_turns"
+        )
+        lite_eligible = set(base_eligible)
+        if clean_end_boundary:
+            lite_eligible.discard("stop")
         boundary = FinalizedTurnBoundary(
             finalized_turn_number=(
                 state.active_turn
@@ -6068,7 +6078,7 @@ def run_workflow(
             operational_failure=operational_failure, backup_team=backup_team,
             backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
             active_implementation_scope=scope_context,
-            eligible_actions=sorted(eligible),
+            eligible_actions=sorted(lite_eligible),
             scope_pressure_reason=scope_pressure_reason,
             # Immutable controller-owned copies for deterministic v2 reconstruction.
             review_rejection_history=[asdict(r) for r in state.review_rejection_history],
@@ -6108,13 +6118,18 @@ def run_workflow(
             state.semantic_stall_count = int(signals.get("semantic_stall_count", 0) or 0)
             state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
         level = _manager_level_for_boundary(selection_context)
+        if level == "full":
+            boundary = replace(
+                boundary,
+                eligible_actions=sorted(base_eligible),
+            )
         outcome = _run_manager_call(
             level=level,
             boundary=boundary,
             proposed_target_plan=proposed_target_plan,
             retry_target_plan=(
                 active_plan_path
-                if {"retry_current_step", "switch_to_backup_and_retry"} & eligible
+                if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
                 else None
             ),
             context_run_dir=context_run_dir,
@@ -6126,28 +6141,40 @@ def run_workflow(
             and not outcome.correction_consumed
             and error != "manager mutated repository or plan state"
         ):
-            boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_invalid", "evidence": error})
+            level = "full"
+            boundary = replace(
+                boundary,
+                trigger="lite_invalid",
+                evidence=error,
+                eligible_actions=sorted(base_eligible),
+            )
             outcome = _run_manager_call(
-                level="full",
+                level=level,
                 boundary=boundary,
                 proposed_target_plan=proposed_target_plan,
                 retry_target_plan=(
                     active_plan_path
-                    if {"retry_current_step", "switch_to_backup_and_retry"} & eligible
+                    if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
                     else None
                 ),
                 context_run_dir=context_run_dir,
             )
             decision, context, error = outcome.decision, outcome.context, outcome.error
         elif decision is not None and decision.action == "escalate_to_full":
-            boundary = FinalizedTurnBoundary(**{**boundary.__dict__, "trigger": "lite_escalation", "evidence": decision.reason})
+            level = "full"
+            boundary = replace(
+                boundary,
+                trigger="lite_escalation",
+                evidence=decision.reason,
+                eligible_actions=sorted(base_eligible),
+            )
             outcome = _run_manager_call(
-                level="full",
+                level=level,
                 boundary=boundary,
                 proposed_target_plan=proposed_target_plan,
                 retry_target_plan=(
                     active_plan_path
-                    if {"retry_current_step", "switch_to_backup_and_retry"} & eligible
+                    if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
                     else None
                 ),
                 context_run_dir=context_run_dir,
