@@ -1550,14 +1550,15 @@ def _reconstruct_resume_context(
         run_dir=run_dir,
     )
     preflight = prev_run.get("environment_preflight")
-    if (
+    replay_blocked_repartition = (
         prev_run.get("failure_kind") == "environment_preflight"
         and isinstance(preflight, Mapping)
         and preflight.get("invocation_kind") == "checkpoint_repartition"
         and pending_finalized_turn is not None
-    ):
-        # No repartition attempt started, so replay its finalized manager
-        # boundary instead of trying to apply the preflight-blocked transaction.
+    )
+    if replay_blocked_repartition:
+        # The repartition harness did not start, so replay its finalized manager
+        # boundary instead of applying the incomplete transaction.
         manager_fields["pending_repartition"] = None
     scope_envelope_source_path: str | None = None
     scope_envelope_bytes: bytes | None = None
@@ -1583,9 +1584,10 @@ def _reconstruct_resume_context(
             )
     pending_repartition, repartition_artifact_bytes = (
         _validate_pending_repartition_resume_state(
-            raw_pending_repartition=prev_run.get(
-                "pending_repartition",
-                _MISSING_RESUME_FIELD,
+            raw_pending_repartition=(
+                _MISSING_RESUME_FIELD
+                if replay_blocked_repartition
+                else prev_run.get("pending_repartition", _MISSING_RESUME_FIELD)
             ),
             pending_repartition=manager_fields.get("pending_repartition"),
             run_dir=run_dir,

@@ -1561,6 +1561,90 @@ class WorkflowCliTests(unittest.TestCase):
                 assert resume.pending_repartition is not None
                 assert dict(resume.repartition_artifact_bytes) == artifacts
 
+    def test_environment_preflight_repartition_block_replays_finalized_boundary(
+        self,
+    ) -> None:
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, original_run = (
+            self._resume_bootstrap_fixture(tmp_path)
+        )
+        plan_path = Path(original_run["original_plan_path"])
+        pending, _artifacts, scope = _bound_pending_repartition_fixture(
+            run_dir,
+            plan_path,
+        )
+        turn_dir = run_dir / "turns" / "turn-001"
+        turn_dir.mkdir(parents=True)
+        snapshot = {
+            "current_checkpoint_index": 1,
+            "current_checkpoint_name": "Checkpoint 1: First",
+            "current_checkpoint_unchecked_step_count": 1,
+            "is_complete": False,
+            "total_checkpoint_count": 1,
+            "unchecked_checkpoint_count": 1,
+        }
+        (turn_dir / "result.json").write_text(
+            json.dumps({
+                "turn_number": 1,
+                "status": "running",
+                "step_name": "implement_plan",
+                "step_role": "worker",
+                "selector": "codex.worker",
+                "returncode": 0,
+                "active_plan_path": str(plan_path),
+                "new_plan_path": str(plan_path),
+                "snapshot_after": snapshot,
+                "conditions": {
+                    "DONE": False,
+                    "NEW_PLAN_EXISTS": False,
+                    "MAX_TURNS_REACHED": False,
+                },
+                "chosen_transition": "implement_plan",
+                "chosen_transition_condition": None,
+            }),
+            encoding="utf-8",
+        )
+        prev_run = dict(original_run)
+        prev_run.update({
+            "active_turn": 1,
+            "turns_completed": 1,
+            "current_step_name": "implement_plan",
+            "failure_kind": "environment_preflight",
+            "environment_preflight": {
+                "classification": "harness_environment_preflight",
+                "reason_code": "harness_executable_missing",
+                "harness": "reasonix",
+                "invocation_kind": "checkpoint_repartition",
+                "required_executable": "reasonix",
+                "checked_command": ["reasonix"],
+                "remediation": "Install Reasonix.",
+                "safe_diagnostics": {},
+                "step_name": "implement_plan",
+            },
+            "active_implementation_scope": scope,
+            "manager_decision_number": pending["decision_number"],
+            "pending_repartition": pending,
+        })
+
+        status, stderr, startup, execute, _resolve, _load, resume = (
+            self._invoke_resume_command(
+                tmp_path,
+                prev_run,
+                run_dir,
+                workflow_config,
+            )
+        )
+
+        assert status == 0, stderr
+        startup.assert_called_once()
+        execute.assert_called_once()
+        assert isinstance(resume, ResumeContext)
+        assert resume.pending_repartition is None
+        assert resume.repartition_artifact_bytes == {}
+        assert resume.pending_finalized_turn is not None
+        assert resume.pending_finalized_turn.turn_number == 1
+        assert resume.pending_finalized_turn.step_name == "implement_plan"
+
     def test_resume_absent_or_null_pending_repartition_remains_empty(self) -> None:
         for raw_value in ("absent", None):
             with self.subTest(raw_value=raw_value):
