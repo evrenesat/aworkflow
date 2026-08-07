@@ -590,9 +590,9 @@ class PendingFinalizedTurn:
 @dataclass(frozen=True)
 class ResumeContext:
     resumed_from_run_id: str
-    feature_branch: str
-    worktree_path: Path
-    main_branch: str
+    feature_branch: str | None
+    worktree_path: Path | None
+    main_branch: str | None
     setup: tuple[str, ...]
     teardown: tuple[str, ...]
     active_plan_path: Path | None = None

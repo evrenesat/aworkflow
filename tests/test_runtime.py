@@ -296,7 +296,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 feature_branch="feature/resume-identity",
                 worktree_path=worktree_path,
                 main_branch="main",
-                setup=(),
+                setup=("worktree", "branch"),
                 teardown=(),
                 frozen_run_identity=identity,
             )
@@ -5143,9 +5143,24 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 runner=runner,
             )
 
-            assert call_count[0] == 2
+            assert call_count[0] == 1
             assert result.turns_completed == 1
             assert f'`{current_head}`' in plan_path.read_text(encoding='utf-8')
+            rc, current_branch, _ = _run_git_in_test(
+                ['branch', '--show-current'], cwd=repo_root
+            )
+            assert rc == 0
+            assert current_branch == 'main'
+            rc, branches, _ = _run_git_in_test(
+                ['branch', '--list', 'aflow-*'], cwd=repo_root
+            )
+            assert rc == 0
+            feature_branch = branches.strip().lstrip('+* ').strip()
+            rc, _, _ = _run_git_in_test(
+                ['merge-base', '--is-ancestor', feature_branch, 'main'],
+                cwd=repo_root,
+            )
+            assert rc == 0
 
     def test_preflight_worktree_refreshes_primary_and_execution_plan_before_first_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5694,6 +5709,125 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             )
             assert len(captured_repo_roots) >= 1
             assert captured_repo_roots[0] == str(repo_root)
+
+    def test_branch_only_resume_reuses_primary_checkout_and_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            wf_config = _make_branch_only_wf_config(main_branch='main')
+
+            def first_runner(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 1, '', 'blocked preflight')
+
+            with pytest.raises(WorkflowError) as first_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=3,
+                    ),
+                    wf_config,
+                    'branch_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=first_runner,
+                )
+
+            first_run = json.loads(
+                (first_error.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert 'worktree_path' not in first_run
+            calls: list[Path] = []
+
+            def resumed_runner(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                calls.append(cwd)
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                _run_git_in_test(['add', str(plan_path)], cwd=cwd)
+                _run_git_in_test(['commit', '-m', 'complete after resume'], cwd=cwd)
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=3,
+                ),
+                wf_config,
+                'branch_wf',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=resumed_runner,
+                resume=ResumeContext(
+                    resumed_from_run_id=first_error.value.run_dir.name,
+                    feature_branch=first_run['feature_branch'],
+                    worktree_path=None,
+                    main_branch='main',
+                    setup=('branch',),
+                    teardown=('merge',),
+                    interrupted_step_name='impl',
+                ),
+            )
+
+            assert calls == [repo_root]
+            assert result.final_snapshot.is_complete
+            rc, current_branch, _ = _run_git_in_test(
+                ['branch', '--show-current'], cwd=repo_root
+            )
+            assert rc == 0
+            assert current_branch == 'main'
+            rc, _, _ = _run_git_in_test(
+                [
+                    'merge-base',
+                    '--is-ancestor',
+                    first_run['feature_branch'],
+                    'main',
+                ],
+                cwd=repo_root,
+            )
+            assert rc == 0
+
+    def test_no_lifecycle_resume_uses_primary_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            wf_config = _make_simple_wf_config()
+            calls: list[Path] = []
+
+            def runner(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                calls.append(cwd)
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=1,
+                ),
+                wf_config,
+                'simple',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='preflight-blocked-run',
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                    interrupted_step_name='implement_plan',
+                ),
+            )
+
+            assert calls == [repo_root]
+            assert result.final_snapshot.is_complete
 
     def test_worktree_adapter_invocation_uses_worktree_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7264,6 +7398,90 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             feature_branch = run_json2['feature_branch']
             rc, _, _ = _run_git_in_test(['merge-base', '--is-ancestor', feature_branch, 'main'], cwd=repo_root)
             assert rc == 0, 'main should contain the fast-forward merged feature branch'
+
+    def test_branch_only_failed_terminal_merge_retries_integration_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _COMPLETE_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            subprocess.run(
+                ['git', 'checkout', '-b', 'feature/terminal-integration'],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            feature_file = repo_root / 'feature.txt'
+            feature_file.write_text('feature\n', encoding='utf-8')
+            _git_commit_file(repo_root, feature_file)
+            subprocess.run(
+                ['git', 'checkout', 'main'],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            main_file = repo_root / 'main.txt'
+            main_file.write_text('main\n', encoding='utf-8')
+            _git_commit_file(repo_root, main_file)
+            wf_config = _make_branch_only_wf_config(main_branch='main')
+            calls: list[Path] = []
+
+            def runner(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                calls.append(cwd)
+                rc, out, err = _run_git_in_test(
+                    ['merge', '--no-edit', 'feature/terminal-integration'],
+                    cwd=cwd,
+                )
+                return subprocess.CompletedProcess(argv, rc, out, err)
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=3,
+                    start_step='impl',
+                ),
+                wf_config,
+                'branch_wf',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id='failed-branch-merge-run',
+                    feature_branch='feature/terminal-integration',
+                    worktree_path=None,
+                    main_branch='main',
+                    setup=('branch',),
+                    teardown=('merge',),
+                    active_plan_path=plan_path,
+                    interrupted_step_name='impl',
+                    terminal_integration_only=True,
+                ),
+            )
+
+            assert calls == [repo_root]
+            assert result.turns_completed == 0
+            payload = json.loads(
+                (result.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert payload['status'] == 'completed'
+            assert payload['merge_status'] == 'success'
+            assert payload['resumed_from_run_id'] == 'failed-branch-merge-run'
+            assert not list((result.run_dir / 'turns').iterdir())
+            rc, _, _ = _run_git_in_test(
+                [
+                    'merge-base',
+                    '--is-ancestor',
+                    'feature/terminal-integration',
+                    'main',
+                ],
+                cwd=repo_root,
+            )
+            assert rc == 0
 
     def test_resume_failed_terminal_merge_retries_integration_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

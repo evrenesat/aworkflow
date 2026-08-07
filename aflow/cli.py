@@ -1185,24 +1185,40 @@ def _resume_candidate_mismatch_reason(
     """Check if the previous run is a valid resume candidate for the current invocation.
 
     A valid candidate must:
-    - Have lifecycle_setup that includes "worktree"
-    - Have non-empty feature_branch and worktree_path
+    - Have lifecycle metadata compatible with the current workflow
+    - Have branch/worktree identity required by that lifecycle mode
     - Have status of "failed" or "running" (not "completed")
     - Have last_snapshot.is_complete == false, unless terminal merge failed
     - Not have merge_status, unless it records a failed terminal merge
     - Have lifecycle_setup that matches the current workflow's effective setup tuple
     - Match on all resolved invocation fields
     """
-    lifecycle_setup = prev_run.get("lifecycle_setup")
-    if not isinstance(lifecycle_setup, list) or "worktree" not in lifecycle_setup:
-        return "it was not recorded as a worktree lifecycle run"
+    lifecycle_setup = prev_run.get("lifecycle_setup", [])
+    lifecycle_teardown = prev_run.get("lifecycle_teardown", [])
+    if not isinstance(lifecycle_setup, list) or not all(
+        isinstance(item, str) for item in lifecycle_setup
+    ):
+        return "it has invalid lifecycle resume metadata (setup)"
+    if not isinstance(lifecycle_teardown, list) or not all(
+        isinstance(item, str) for item in lifecycle_teardown
+    ):
+        return "it has invalid lifecycle resume metadata (teardown)"
+
+    current_setup = current_workflow_config.setup or ()
+    if tuple(lifecycle_setup) != current_setup:
+        return "its lifecycle setup does not match this invocation"
 
     feature_branch = prev_run.get("feature_branch")
     worktree_path = prev_run.get("worktree_path")
-    if not isinstance(feature_branch, str) or not feature_branch:
-        return "it has no recorded feature branch"
-    if not isinstance(worktree_path, str) or not worktree_path:
-        return "it has no recorded worktree path"
+    main_branch = prev_run.get("main_branch")
+    if "branch" in lifecycle_setup:
+        if not isinstance(feature_branch, str) or not feature_branch:
+            return "it has no recorded feature branch"
+        if not isinstance(main_branch, str) or not main_branch:
+            return "it has no recorded main branch"
+    if "worktree" in lifecycle_setup:
+        if not isinstance(worktree_path, str) or not worktree_path:
+            return "it has no recorded worktree path"
 
     status = prev_run.get("status")
     if status not in ("failed", "running", "waiting_for_valid_override"):
@@ -1212,7 +1228,6 @@ def _resume_candidate_mismatch_reason(
         )
 
     last_snapshot = prev_run.get("last_snapshot")
-    lifecycle_teardown = prev_run.get("lifecycle_teardown")
     terminal_integration_only = _is_terminal_integration_resume(prev_run)
     if (
         isinstance(last_snapshot, dict)
@@ -1257,9 +1272,6 @@ def _resume_candidate_mismatch_reason(
     if not isinstance(prev_extra_instructions, list) or tuple(prev_extra_instructions) != current_extra_instructions:
         return "its extra instructions do not match this invocation"
 
-    current_setup = current_workflow_config.setup or ()
-    if tuple(lifecycle_setup) != current_setup:
-        return "its lifecycle setup does not match this invocation"
     if terminal_integration_only:
         current_teardown = getattr(current_workflow_config, "teardown", ()) or ()
         if tuple(lifecycle_teardown) != current_teardown:
@@ -1268,7 +1280,11 @@ def _resume_candidate_mismatch_reason(
     return None
 
 
-def _prompt_resume(prev_run_id: str, feature_branch: str, worktree_path: str) -> bool:
+def _prompt_resume(
+    prev_run_id: str,
+    feature_branch: str | None,
+    worktree_path: str | None,
+) -> bool:
     """Prompt the user whether to resume from the previous run.
 
     Returns True if the user accepts resume, False otherwise.
@@ -1278,9 +1294,14 @@ def _prompt_resume(prev_run_id: str, feature_branch: str, worktree_path: str) ->
         return False
 
     try:
+        if worktree_path is not None:
+            location = f"on branch '{feature_branch}' in worktree '{worktree_path}'"
+        elif feature_branch is not None:
+            location = f"on branch '{feature_branch}' in the primary checkout"
+        else:
+            location = "in the primary checkout"
         response = input(
-            f"Resume from previous run '{prev_run_id}' on branch '{feature_branch}' "
-            f"in worktree '{worktree_path}'? [Y/n]: "
+            f"Resume from previous run '{prev_run_id}' {location}? [Y/n]: "
         ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
@@ -1514,25 +1535,50 @@ def _reconstruct_resume_context(
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
-    feature_branch = prev_run.get("feature_branch")
-    worktree_path = prev_run.get("worktree_path")
-    main_branch = prev_run.get("main_branch")
-    lifecycle_setup = prev_run.get("lifecycle_setup")
-    lifecycle_teardown = prev_run.get("lifecycle_teardown")
+    raw_feature_branch = prev_run.get("feature_branch")
+    raw_worktree_path = prev_run.get("worktree_path")
+    raw_main_branch = prev_run.get("main_branch")
+    lifecycle_setup = prev_run.get("lifecycle_setup", [])
+    lifecycle_teardown = prev_run.get("lifecycle_teardown", [])
     if (
-        not isinstance(feature_branch, str)
-        or not isinstance(worktree_path, str)
-        or not isinstance(main_branch, str)
+        not isinstance(lifecycle_setup, list)
+        or not all(isinstance(item, str) for item in lifecycle_setup)
+        or not isinstance(lifecycle_teardown, list)
+        or not all(isinstance(item, str) for item in lifecycle_teardown)
     ):
         if require_resume:
             raise ValueError(
-                f"error: run '{run_id}' is missing worktree resume metadata."
+                f"error: run '{run_id}' has invalid lifecycle resume metadata."
             )
         return None
-    if not isinstance(lifecycle_setup, list) or not isinstance(lifecycle_teardown, list):
+
+    feature_branch = (
+        raw_feature_branch
+        if isinstance(raw_feature_branch, str) and raw_feature_branch
+        else None
+    )
+    worktree_path = (
+        raw_worktree_path
+        if isinstance(raw_worktree_path, str) and raw_worktree_path
+        else None
+    )
+    main_branch = (
+        raw_main_branch
+        if isinstance(raw_main_branch, str) and raw_main_branch
+        else None
+    )
+    if "branch" in lifecycle_setup and (
+        feature_branch is None or main_branch is None
+    ):
         if require_resume:
             raise ValueError(
-                f"error: run '{run_id}' is missing lifecycle resume metadata."
+                f"error: run '{run_id}' is missing branch resume metadata."
+            )
+        return None
+    if "worktree" in lifecycle_setup and worktree_path is None:
+        if require_resume:
+            raise ValueError(
+                f"error: run '{run_id}' is missing worktree resume metadata."
             )
         return None
 
@@ -1639,7 +1685,7 @@ def _reconstruct_resume_context(
     return ResumeContext(
         resumed_from_run_id=run_id,
         feature_branch=feature_branch,
-        worktree_path=Path(worktree_path),
+        worktree_path=Path(worktree_path) if worktree_path is not None else None,
         main_branch=main_branch,
         setup=tuple(lifecycle_setup),
         teardown=tuple(lifecycle_teardown),
@@ -1746,27 +1792,18 @@ def _detect_resume_candidate(
     if resume_bootstrap is not None:
         return resume_bootstrap.resume_context
 
-    feature_branch = prev_run.get("feature_branch")
-    worktree_path = prev_run.get("worktree_path")
-    main_branch = prev_run.get("main_branch")
-    lifecycle_setup = prev_run.get("lifecycle_setup")
-    lifecycle_teardown = prev_run.get("lifecycle_teardown")
-    if (
-        not isinstance(feature_branch, str)
-        or not isinstance(worktree_path, str)
-        or not isinstance(main_branch, str)
-    ):
-        if require_resume:
-            raise ValueError(
-                f"error: run '{resolved_run_id.name}' is missing worktree resume metadata."
-            )
-        return None
-    if not isinstance(lifecycle_setup, list) or not isinstance(lifecycle_teardown, list):
-        if require_resume:
-            raise ValueError(
-                f"error: run '{resolved_run_id.name}' is missing lifecycle resume metadata."
-            )
-        return None
+    raw_feature_branch = prev_run.get("feature_branch")
+    raw_worktree_path = prev_run.get("worktree_path")
+    feature_branch = (
+        raw_feature_branch
+        if isinstance(raw_feature_branch, str) and raw_feature_branch
+        else None
+    )
+    worktree_path = (
+        raw_worktree_path
+        if isinstance(raw_worktree_path, str) and raw_worktree_path
+        else None
+    )
 
     if not require_resume and not _prompt_resume(
         resolved_run_id.name,

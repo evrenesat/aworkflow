@@ -1089,7 +1089,7 @@ class WorkflowCliTests(unittest.TestCase):
             (
                 "missing main branch",
                 lambda run: run.pop("main_branch"),
-                "worktree resume metadata",
+                "no recorded main branch",
             ),
             (
                 "invalid lifecycle teardown",
@@ -1791,7 +1791,7 @@ class WorkflowCliTests(unittest.TestCase):
             (
                 "malformed lifecycle metadata",
                 lambda run: run.__setitem__("lifecycle_setup", "worktree"),
-                "not recorded as a worktree lifecycle run",
+                "invalid lifecycle resume metadata",
             ),
             (
                 "mismatched frozen identity",
@@ -4777,6 +4777,95 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert cli_module._interrupted_resume_step(Path("unused"), prev_run) == (
             "review_cp_implementation"
         )
+
+    def test_environment_preflight_resume_accepts_non_worktree_lifecycles(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir).resolve()
+            plan_path = repo_root / "plan.md"
+            plan_path.write_text(_VALID_PLAN, encoding="utf-8")
+            run_dir = repo_root / ".aflow" / "runs" / "blocked-run"
+            run_dir.mkdir(parents=True)
+            base_run = {
+                "repo_root": str(repo_root),
+                "workflow_name": "test_workflow",
+                "plan_path": str(plan_path),
+                "team": None,
+                "selected_start_step": None,
+                "max_turns": 5,
+                "extra_instructions": [],
+                "status": "failed",
+                "failure_kind": "environment_preflight",
+                "current_step_name": "implement",
+                "active_turn": 1,
+                "turns_completed": 0,
+                "last_snapshot": {"is_complete": False},
+                "environment_preflight": {
+                    "classification": "harness_environment_preflight",
+                    "reason_code": "harness_executable_missing",
+                    "harness": "reasonix",
+                    "invocation_kind": "workflow_turn",
+                    "required_executable": "reasonix",
+                    "checked_command": ["reasonix"],
+                    "remediation": "Install Reasonix.",
+                    "safe_diagnostics": {},
+                    "step_name": "implement",
+                },
+            }
+            cases = (
+                ("no_lifecycle", (), {}, None, None, None),
+                (
+                    "branch_only",
+                    ("branch",),
+                    {
+                        "lifecycle_setup": ["branch"],
+                        "lifecycle_teardown": ["merge"],
+                        "feature_branch": "feature/resume",
+                        "main_branch": "main",
+                    },
+                    "feature/resume",
+                    "main",
+                    None,
+                ),
+            )
+
+            for name, setup, lifecycle_fields, feature, main, worktree in cases:
+                with self.subTest(name=name):
+                    prev_run = dict(base_run)
+                    prev_run.update(lifecycle_fields)
+                    with patch(
+                        "aflow.cli.resolve_run_id",
+                        return_value=(run_dir, "explicit_run_id"),
+                    ), patch(
+                        "aflow.cli.load_run_json",
+                        return_value=prev_run,
+                    ):
+                        result = cli_module._detect_resume_candidate(
+                            repo_root=repo_root,
+                            workflow_config=type(
+                                "WorkflowConfig",
+                                (),
+                                {"setup": setup, "steps": {}},
+                            )(),
+                            workflow_name="test_workflow",
+                            plan_path=plan_path,
+                            team=None,
+                            selected_start_step=None,
+                            max_turns=5,
+                            extra_instructions=(),
+                            requested_run_id=run_dir.name,
+                            require_resume=True,
+                        )
+
+                    assert result is not None
+                    assert result.interrupted_step_name == "implement"
+                    assert result.setup == setup
+                    assert result.feature_branch == feature
+                    assert result.main_branch == main
+                    assert result.worktree_path == worktree
 
     def test_environment_preflight_manager_block_restores_finalized_boundary(
         self,
