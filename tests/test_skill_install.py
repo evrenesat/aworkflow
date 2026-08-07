@@ -47,6 +47,25 @@ def test_discover_bundled_skills_uses_package_resources() -> None:
         assert skill_dir.joinpath("SKILL.md").is_file()
 
 
+def test_material_code_review_is_default_and_installs_byte_for_byte(tmp_path: Path) -> None:
+    assert "material-code-review" in DEFAULT_BUNDLED_SKILL_NAMES
+    destination = tmp_path / "skills"
+
+    install_skills(
+        destination=destination,
+        yes=True,
+        stdin=_FakeStdin(True),
+        stdout=io.StringIO(),
+    )
+
+    packaged = resources.files("aflow").joinpath(
+        "bundled_skills", "material-code-review", "SKILL.md"
+    )
+    assert (
+        destination / "material-code-review" / "SKILL.md"
+    ).read_bytes() == packaged.read_bytes()
+
+
 def test_detect_auto_targets_selects_installed_executables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

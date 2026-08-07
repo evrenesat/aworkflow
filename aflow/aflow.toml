@@ -95,6 +95,14 @@ reviewer = 'claude.sonnet'
 manager_lite = 'codex.nano'
 manager_full = 'codex.high'
 
+[roles.prompts]
+reviewer = """
+Use the 'material-code-review' skill to apply its finding admission gate,
+exclusions, and proportionate-fix discipline during code review. Follow the
+workflow-specific AFlow review skill for checkpoint and plan bookkeeping,
+lifecycle actions, and conflicting output requirements.
+"""
+
 # Interstep supervision is enabled for newly bootstrapped configuration. Lite is
 # the normal path; Full is selected after the configured semantic-stall limit or
 # when the controller identifies an ambiguous terminal condition.

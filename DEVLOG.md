@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-08-07 — Add role-scoped workflow prompts and material review
+
+- Added validated global and team role prompts with team replacement, global
+  fallback, retry persistence, and frozen-run identity coverage.
+- Ordinary workflow turns now persist resolved role guidance as their system
+  prompt; manager and lifecycle invocations retain their existing prompt paths.
+- Bundled `material-code-review` as a default skill and enabled its guidance for
+  the packaged reviewer role.
+
 ## 2026-08-07 — Preserve guard replacement lineage
 
 - Replacement linkage now retains the original recovery fingerprint, validates

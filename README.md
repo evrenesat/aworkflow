@@ -45,7 +45,8 @@ aflow install-skills
 aflow show
 ```
 
-`aflow.toml` contains harness profiles, roles, teams, prompts, and controller
+Configuration is split across two TOML files: `aflow.toml` contains harness
+profiles, roles, teams, prompts, and controller
 settings. `workflows.toml` contains workflow graphs and lifecycle defaults.
 
 ## Run a plan

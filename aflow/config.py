@@ -106,6 +106,7 @@ class WorkflowHarnessConfig:
 @dataclass(frozen=True)
 class TeamConfig:
     roles: dict[str, str] = field(default_factory=dict)
+    role_prompts: dict[str, str] = field(default_factory=dict)
     backup_team: str | None = None
     upgrade_to: str | None = None
 
@@ -178,6 +179,7 @@ class WorkflowUserConfig:
     aflow: AflowSection = field(default_factory=AflowSection)
     harnesses: dict[str, WorkflowHarnessConfig] = field(default_factory=dict)
     roles: dict[str, str] = field(default_factory=dict)
+    role_prompts: dict[str, str] = field(default_factory=dict)
     teams: dict[str, TeamConfig] = field(default_factory=dict)
     manager: ManagerConfig = field(default_factory=ManagerConfig)
     error_handling: ErrorHandlingConfig = field(default_factory=ErrorHandlingConfig)
@@ -320,7 +322,7 @@ def _parse_workflow_harness(
 
 
 def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
-    reserved_keys = {"roles", "backup_team", "upgrade_to"}
+    reserved_keys = {"roles", "prompts", "backup_team", "upgrade_to"}
     inline_role_keys = [key for key in raw if key not in reserved_keys]
     roles_value = raw.get("roles")
     if roles_value is not None and inline_role_keys:
@@ -337,8 +339,16 @@ def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
             roles[role_name] = _parse_selector_value(
                 raw[role_name], path=f"{path}.{role_name}"
             )
+    role_prompts: dict[str, str] = {}
+    prompts_value = raw.get("prompts")
+    if prompts_value is not None:
+        prompts_table = _require_table(prompts_value, path=f"{path}.prompts")
+        role_prompts = _parse_role_prompt_map(
+            prompts_table, path=f"{path}.prompts"
+        )
     return TeamConfig(
         roles=roles,
+        role_prompts=role_prompts,
         backup_team=_optional_text(raw.get("backup_team"), path=f"{path}.backup_team"),
         upgrade_to=_optional_text(raw.get("upgrade_to"), path=f"{path}.upgrade_to"),
     )
@@ -386,6 +396,16 @@ def _parse_role_map(
         mapping[role_name] = _parse_selector_value(
             value, path=f"{path}.{role_name}"
         )
+    return mapping
+
+
+def _parse_role_prompt_map(
+    raw: Mapping[str, object], *, path: str
+) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for key, value in raw.items():
+        role_name = _require_text(key, path=f"{path} key")
+        mapping[role_name] = _require_text(value, path=f"{path}.{role_name}")
     return mapping
 
 
@@ -887,9 +907,21 @@ def _parse_workflow_user_config(
                 harness_table, path=f"{path}.harness.{harness_key}"
             )
     roles: dict[str, str] = {}
+    role_prompts: dict[str, str] = {}
     if "roles" in raw:
         roles_table = _require_table(raw["roles"], path=f"{path}.roles")
-        roles = _parse_role_map(roles_table, path=f"{path}.roles")
+        roles = _parse_role_map(
+            {key: value for key, value in roles_table.items() if key != "prompts"},
+            path=f"{path}.roles",
+        )
+        prompts_value = roles_table.get("prompts")
+        if prompts_value is not None:
+            prompts_table = _require_table(
+                prompts_value, path=f"{path}.roles.prompts"
+            )
+            role_prompts = _parse_role_prompt_map(
+                prompts_table, path=f"{path}.roles.prompts"
+            )
     error_handling = ErrorHandlingConfig()
     if "error_handling" in raw:
         error_handling_table = _require_table(
@@ -936,6 +968,7 @@ def _parse_workflow_user_config(
         aflow=aflow,
         harnesses=harnesses,
         roles=roles,
+        role_prompts=role_prompts,
         teams=teams,
         manager=manager,
         error_handling=error_handling,
@@ -981,6 +1014,7 @@ def load_workflow_config(
             aflow=config.aflow,
             harnesses=config.harnesses,
             roles=config.roles,
+            role_prompts=config.role_prompts,
             teams=config.teams,
             manager=config.manager,
             error_handling=config.error_handling,
@@ -1068,6 +1102,11 @@ def validate_workflow_config(
                 f"roles.{role_name} references unknown profile '{profile_name}' "
                 f"for harness '{harness_name}'"
             )
+    for role_name in config.role_prompts:
+        if role_name not in config.roles:
+            errors.append(
+                f"roles.prompts.{role_name} references unknown role '{role_name}'"
+            )
     for team_name, team_config in config.teams.items():
         for role_key, selector in team_config.roles.items():
             if role_key not in config.roles:
@@ -1088,6 +1127,12 @@ def validate_workflow_config(
                 errors.append(
                     f"teams.{team_name}.{role_key} references unknown profile '{profile_name}' "
                     f"for harness '{harness_name}'"
+                )
+        for role_key in team_config.role_prompts:
+            if role_key not in config.roles:
+                errors.append(
+                    f"teams.{team_name}.prompts.{role_key} references unknown role "
+                    f"'{role_key}'"
                 )
     def validate_team_graph(attribute: str) -> None:
         for team_name, team_config in config.teams.items():

@@ -31,6 +31,7 @@ BUNDLED_SKILL_METADATA = (
     BundledSkillMetadata(name="aflow-manager", default=True),
     BundledSkillMetadata(name="aflow-repartition-checkpoint", default=True),
     BundledSkillMetadata(name="aflow-guard-development-run", default=True),
+    BundledSkillMetadata(name="material-code-review", default=True),
     BundledSkillMetadata(name="aflow-assistant", default=False),
 )
 

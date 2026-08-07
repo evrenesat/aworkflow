@@ -1,4 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
+from aflow.workflow import resolve_role_prompt
 from aflow.run_state import load_override_request
 
 
@@ -202,6 +203,75 @@ class WorkflowConfigTests(unittest.TestCase):
             config = load_workflow_config(config_path)
             assert config.teams['primary'].backup_team == 'backup'
             assert config.teams['primary'].roles == {'architect': 'opencode.default'}
+
+    def test_parse_role_prompts_with_global_team_and_role_syntax_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = self._write_workflow_config(
+                tmpdir,
+                '[aflow]\ndefault_workflow = "simple"\n\n'
+                '[workflow.simple.steps.s]\nrole = "reviewer"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "gpt-5.4"\n\n'
+                '[roles]\nreviewer = "opencode.default"\nworker = "opencode.default"\n\n'
+                '[roles.prompts]\nreviewer = "Global review guidance."\nworker = "Global worker guidance."\n\n'
+                '[teams.legacy]\nreviewer = "opencode.default"\n\n'
+                '[teams.legacy.prompts]\nreviewer = "Team review guidance."\n\n'
+                '[teams.nested.roles]\nreviewer = "opencode.default"\n\n'
+                '[teams.nested.prompts]\nreviewer = "Nested team guidance."\n\n'
+                '[prompts]\np = "do it"\n',
+            )
+            config = load_workflow_config(config_path)
+            assert config.role_prompts == {
+                'reviewer': 'Global review guidance.',
+                'worker': 'Global worker guidance.',
+            }
+            assert config.teams['legacy'].roles == {'reviewer': 'opencode.default'}
+            assert config.teams['nested'].roles == {'reviewer': 'opencode.default'}
+            assert resolve_role_prompt('reviewer', 'legacy', config) == 'Team review guidance.'
+            assert resolve_role_prompt('reviewer', 'nested', config) == 'Nested team guidance.'
+            assert resolve_role_prompt('worker', 'legacy', config) == 'Global worker guidance.'
+
+    def test_parse_rejects_role_prompts_for_unknown_roles(self) -> None:
+        cases = (
+            ('[roles.prompts]\nunknown = "guidance"\n', 'roles.prompts.unknown'),
+            ('[teams.primary.prompts]\nunknown = "guidance"\n', 'teams.primary.prompts.unknown'),
+        )
+        for prompt_table, expected_path in cases:
+            with self.subTest(prompt_table=prompt_table):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    config_path = self._write_workflow_config(
+                        tmpdir,
+                        '[aflow]\ndefault_workflow = "simple"\n\n'
+                        '[workflow.simple.steps.s]\nrole = "reviewer"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n'
+                        '[harness.opencode.profiles.default]\nmodel = "gpt-5.4"\n\n'
+                        '[roles]\nreviewer = "opencode.default"\n\n'
+                        '[teams.primary.roles]\nreviewer = "opencode.default"\n\n'
+                        f'{prompt_table}\n'
+                        '[prompts]\np = "do it"\n',
+                    )
+                    with pytest.raises(ConfigError, match='unknown role') as ctx:
+                        load_workflow_config(config_path)
+                    assert expected_path in str(ctx.value)
+
+    def test_parse_rejects_empty_role_prompts(self) -> None:
+        cases = (
+            '[roles.prompts]\nreviewer = "   "\n',
+            '[teams.primary.prompts]\nreviewer = "   "\n',
+        )
+        for prompt_table in cases:
+            with self.subTest(prompt_table=prompt_table):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    config_path = self._write_workflow_config(
+                        tmpdir,
+                        '[aflow]\ndefault_workflow = "simple"\n\n'
+                        '[workflow.simple.steps.s]\nrole = "reviewer"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n'
+                        '[harness.opencode.profiles.default]\nmodel = "gpt-5.4"\n\n'
+                        '[roles]\nreviewer = "opencode.default"\n\n'
+                        '[teams.primary.roles]\nreviewer = "opencode.default"\n\n'
+                        f'{prompt_table}\n'
+                        '[prompts]\np = "do it"\n',
+                    )
+                    with pytest.raises(ConfigError, match='must not be empty'):
+                        load_workflow_config(config_path)
 
     def test_parse_rejects_mixed_inline_and_nested_team_roles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

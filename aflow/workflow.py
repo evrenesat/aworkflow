@@ -138,6 +138,7 @@ def _freeze_run_identity(
         "workflow_name": workflow_name,
         "workflow": asdict(workflow_config.workflows[workflow_name]),
         "roles": workflow_config.roles,
+        "role_prompts": getattr(workflow_config, "role_prompts", {}),
         "teams": {
             name: asdict(team)
             for name, team in workflow_config.teams.items()
@@ -783,6 +784,24 @@ def resolve_role_selector(
             f"workflow step references unknown team '{team_name}' in {step_path}"
         )
     return team_config.roles.get(role, selector)
+
+
+def resolve_role_prompt(
+    role: str,
+    team_name: str | None,
+    config: WorkflowUserConfig,
+    *,
+    step_path: str = "<unknown>",
+) -> str:
+    prompt = getattr(config, "role_prompts", {}).get(role, "")
+    if team_name is None:
+        return prompt
+    team_config = config.teams.get(team_name)
+    if team_config is None:
+        raise WorkflowError(
+            f"workflow step references unknown team '{team_name}' in {step_path}"
+        )
+    return getattr(team_config, "role_prompts", {}).get(role, prompt)
 
 
 def _resolve_step_runtime(
@@ -7438,6 +7457,12 @@ def run_workflow(
                 team_name=active_team_name,
                 step_path=step_path,
             )
+            system_prompt = resolve_role_prompt(
+                step.role,
+                active_team_name,
+                workflow_config,
+                step_path=step_path,
+            )
             step_adapter = adapter or get_adapter(resolved.harness_name)
             snapshot_before = retry_ctx.snapshot_before
             manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
@@ -7463,7 +7488,7 @@ def run_workflow(
                 invocation = step_adapter.build_invocation(
                     repo_root=execution_repo_root,
                     model=resolved.model,
-                    system_prompt="",
+                    system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     effort=resolved.effort,
                 )
@@ -7600,6 +7625,12 @@ def run_workflow(
                 team_name=active_team_name,
                 step_path=step_path,
             )
+            system_prompt = resolve_role_prompt(
+                step.role,
+                active_team_name,
+                workflow_config,
+                step_path=step_path,
+            )
 
             step_adapter = adapter or get_adapter(resolved.harness_name)
             snapshot_before = state.last_snapshot
@@ -7646,7 +7677,7 @@ def run_workflow(
                 invocation = step_adapter.build_invocation(
                     repo_root=execution_repo_root,
                     model=resolved.model,
-                    system_prompt="",
+                    system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     effort=resolved.effort,
                 )

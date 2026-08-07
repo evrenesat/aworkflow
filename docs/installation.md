@@ -39,7 +39,7 @@ aflow run path/to/plan.md
 
 `aflow install-skills` copies the default bundled skills, including
 `aflow-harness-recovery-lead`, the read-only `aflow-manager`, and the strict
-read-only `aflow-repartition-checkpoint`, into every detected supported harness
+read-only `aflow-repartition-checkpoint`, plus `material-code-review`, into every detected supported harness
 skill directory. The default `aflow-guard-development-run` skill attaches one
 heartbeat to the task that requested supervision; it does not create a second
 task for scheduled beats. The optional `aflow-assistant` skill is not installed
@@ -93,6 +93,7 @@ Default skills:
 - `aflow-manager` - read-only Lite/Full interstep supervision.
 - `aflow-repartition-checkpoint` - strict Full proposal and independent semantic validation for scope-preserving splits.
 - `aflow-guard-development-run` - same-task heartbeat supervision and bounded recovery for an exact AFlow run.
+- `material-code-review` - high-confidence, material-defect review guidance with a proportionate-fix gate.
 
 Optional skills:
 

@@ -111,6 +111,31 @@ merge_prompt = ["simple_merge"]
 - Team tables can also set `upgrade_to`, a separate quality/capability edge that the manager may select for exactly one next implementation attempt.
 - Backup and upgrade chains are each validated at config load: targets must exist, cannot point to themselves, and cannot form cycles.
 
+Role prompts add static system guidance without changing the existing role
+selector interface:
+
+```toml
+[roles.prompts]
+reviewer = "Use the material-code-review skill during code review."
+
+[teams.codex1.prompts]
+reviewer = "Replacement reviewer guidance for codex1."
+```
+
+For an ordinary workflow step, the active team's prompt for the step role
+replaces the global role prompt; a missing team prompt falls back to
+`[roles.prompts]`, then to an empty system prompt. Team switches, upgrades, and
+overrides therefore select both the role's model mapping and prompt on the next
+workflow invocation. Inconsistent-checkpoint retries retain the prompt for the
+applicable role and team. Manager, merge, initialization, recovery, and other
+lifecycle calls do not inherit role prompts.
+
+Prompt keys must name roles declared in `[roles]`, and values must be non-empty
+strings. Role prompts are static instructions: workflow placeholders and
+`file://` expansion are not applied. Global and team prompt maps are included
+in the frozen run fingerprint, and the resolved system prompt is persisted with
+each ordinary turn's durable prompt artifacts.
+
 ## Interstep Manager Supervision
 
 Manager supervision is an opt-in control gate for existing configurations. A

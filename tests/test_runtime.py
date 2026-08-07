@@ -25,11 +25,13 @@ from aflow.run_state import (
 )
 from aflow.runlog import create_run_paths, write_run_metadata
 from aflow.workflow import (
+    _execute_init_repo_handoff,
     _freeze_run_identity,
     _run_injected_runner,
     _pending_matches_scope_and_plan,
     _reconcile_repartition_plan_copies,
 )
+from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
 
 
 def _runner_prompt(argv, kwargs) -> str:
@@ -227,6 +229,175 @@ def _manager_stop_decision(reason: str) -> str:
 
 
 class WorkflowRuntimeTests(unittest.TestCase):
+
+    def test_role_prompt_reaches_harness_preserves_user_prompt_and_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            captured: list[tuple[str, str]] = []
+
+            class CapturingAdapter:
+                name = 'codex'
+                supports_effort = True
+
+                def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
+                    captured.append((system_prompt, user_prompt))
+                    return HarnessInvocation(
+                        label='codex', argv=('codex', 'run', user_prompt), env={},
+                        prompt_mode='prefix-system-into-user-prompt',
+                        system_prompt=system_prompt, user_prompt=user_prompt,
+                        effective_prompt=f'{system_prompt}\n\n{user_prompt}' if system_prompt else user_prompt,
+                    )
+
+            workflow = WorkflowConfig(
+                steps={'review': WorkflowStepConfig(
+                    role='reviewer', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
+                )},
+                first_step='review',
+                team='reviewers',
+            )
+            config = WorkflowUserConfig(
+                roles={'reviewer': 'codex.default'},
+                role_prompts={'reviewer': 'Global reviewer guidance.'},
+                teams={'reviewers': TeamConfig(
+                    roles={'reviewer': 'codex.default'},
+                    role_prompts={'reviewer': 'Team reviewer guidance.'},
+                )},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='gpt-5.6-sol', effort='high'),
+                })},
+                workflows={'review': workflow},
+                prompts={'p': 'Review {ACTIVE_PLAN_PATH}.'},
+            )
+
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, 'done', '')
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                config, 'review', config_dir=repo_root,
+                adapter=CapturingAdapter(), runner=runner,
+            )
+
+            assert captured == [('Team reviewer guidance.', f'Review {plan_path}.')]
+            turn_dir = result.run_dir / 'turns' / 'turn-001'
+            assert (turn_dir / 'system-prompt.txt').read_text() == 'Team reviewer guidance.'
+            assert (turn_dir / 'user-prompt.txt').read_text() == f'Review {plan_path}.'
+
+    def test_role_prompts_change_frozen_run_identity(self) -> None:
+        base = _resume_override_workflow_config()
+        global_prompt = replace(base, role_prompts={'worker': 'Global guidance.'})
+        team_prompt = replace(
+            global_prompt,
+            teams={
+                **global_prompt.teams,
+                'base': replace(
+                    global_prompt.teams['base'],
+                    role_prompts={'worker': 'Team guidance.'},
+                ),
+            },
+        )
+        base_id = _freeze_run_identity('resume_override', base, config_dir=Path('/config'))
+        global_id = _freeze_run_identity('resume_override', global_prompt, config_dir=Path('/config'))
+        team_id = _freeze_run_identity('resume_override', team_prompt, config_dir=Path('/config'))
+        assert len({base_id.config_fingerprint, global_id.config_fingerprint, team_id.config_fingerprint}) == 3
+
+    def test_role_prompt_does_not_reach_manager_or_lifecycle_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            captured: list[tuple[str | None, str]] = []
+
+            class CapturingAdapter:
+                name = 'codex'
+                supports_effort = True
+
+                def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
+                    captured.append((model, system_prompt))
+                    return HarnessInvocation(
+                        label='codex', argv=('codex', 'run', user_prompt), env={},
+                        prompt_mode='prefix-system-into-user-prompt',
+                        system_prompt=system_prompt, user_prompt=user_prompt,
+                        effective_prompt=f'{system_prompt}\n\n{user_prompt}' if system_prompt else user_prompt,
+                    )
+
+            workflow = WorkflowConfig(
+                steps={'review': WorkflowStepConfig(
+                    role='reviewer', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
+                )},
+                first_step='review',
+            )
+            config = WorkflowUserConfig(
+                aflow=AflowSection(team_lead='reviewer'),
+                roles={
+                    'reviewer': 'codex.worker',
+                    'manager_lite': 'codex.lite',
+                    'manager_full': 'codex.full',
+                },
+                role_prompts={'reviewer': 'ROLE-PROMPT-SENTINEL'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'worker': HarnessProfileConfig(model='worker'),
+                    'lite': HarnessProfileConfig(model='lite'),
+                    'full': HarnessProfileConfig(model='full'),
+                })},
+                workflows={'managed': workflow},
+                prompts={'p': 'Review the plan.'},
+                manager=ManagerConfig(
+                    enabled=True, lite_role='manager_lite', full_role='manager_full',
+                ),
+            )
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, 'done', '')
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    'schema_version': 1,
+                    'action': 'continue',
+                    'reason': 'The completed plan permits END.',
+                    'next_step_notes': [],
+                    'stop_report': None,
+                }), '')
+
+            run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                config, 'managed', config_dir=repo_root,
+                adapter=CapturingAdapter(), runner=runner,
+            )
+            assert captured[0] == ('worker', 'ROLE-PROMPT-SENTINEL')
+            assert captured[1][0] == 'lite'
+            assert 'ROLE-PROMPT-SENTINEL' not in captured[1][1]
+
+            lifecycle_captured: list[str] = []
+
+            class LifecycleAdapter(CapturingAdapter):
+                def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
+                    lifecycle_captured.append(system_prompt)
+                    return super().build_invocation(
+                        repo_root=repo_root, model=model, system_prompt=system_prompt,
+                        user_prompt=user_prompt, effort=effort,
+                    )
+
+            _execute_init_repo_handoff(
+                repo_root,
+                config,
+                team_name=None,
+                adapter=LifecycleAdapter(),
+                runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, 'ok', ''),
+                preflight_probe=NoOpHarnessPreflightProbe(),
+                main_branch='main',
+                readme_title='Test',
+                readme_body='Body',
+                banner=object(),
+                state=ControllerState(last_snapshot=load_plan(plan_path).snapshot),
+            )
+            assert lifecycle_captured == ['']
 
     def test_resume_identity_drift_fails_before_event_or_new_run_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

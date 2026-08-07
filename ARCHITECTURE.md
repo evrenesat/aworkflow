@@ -237,7 +237,7 @@ Analyzes `.aflow/runs/` artifacts and powers `aflow analyze`.
 Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped from the bundled defaults on first run). Parses and validates:
 - **`[aflow]`** section: `default_workflow`, `keep_runs`, `max_turns`, `retry_inconsistent_checkpoint_state`, `banner_files_limit`, `max_same_step_turns`, `team_lead`, `branch_prefix`, `worktree_prefix`, `worktree_root`.
 - **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
-- **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining.
+- **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining. Nested `prompts` tables provide static per-role system guidance; active-team values replace global values for ordinary workflow turns only.
 - **`[manager]`**: optional interstep supervision with Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
 - **`[error_handling.harness_error_recovery]`**: ordered recovery rules, `max_consecutive_recoveries`, and the bundled fallback skill name used when deterministic matching cannot decide safely.
 - **`[prompts]`** section: named prompt templates.
@@ -468,10 +468,10 @@ configured adapter already places its effective prompt in argv or a CLI flag;
 the dashboard/controller therefore has exclusive ownership of terminal input.
 
 ### `skill_installer.py`
-Discovers the twelve default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead` and the same-task `aflow-guard-development-run`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
+Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
 
 ### `bundled_skills/`
-Twelve default skill definitions plus one optional shipped skill installed into harness skill directories:
+Thirteen default skill definitions plus one optional shipped skill installed into harness skill directories:
 
 | Skill                       | Purpose                                                        |
 |-----------------------------|----------------------------------------------------------------|
@@ -487,6 +487,7 @@ Twelve default skill definitions plus one optional shipped skill installed into 
 | `aflow-manager`             | Read-only Lite/Full interstep supervision                    |
 | `aflow-repartition-checkpoint` | Scope-preserving checkpoint split proposal and validation  |
 | `aflow-guard-development-run` | Same-task heartbeat guard for one exact AFlow run           |
+| `material-code-review`      | Material-defect admission gate and proportionate review fixes |
 | `aflow-assistant`           | Optional evidence-first debugging and setup helper              |
 
 ### `api/`

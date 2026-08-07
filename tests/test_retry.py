@@ -1,4 +1,5 @@
 from aflow._test_support import *  # noqa: F401,F403
+from dataclasses import replace
 
 class RetryInconsistentCheckpointPlanTests(unittest.TestCase):
 
@@ -21,23 +22,28 @@ class RetryInconsistentCheckpointPlanTests(unittest.TestCase):
 
 class RetryInconsistentCheckpointStartupTests(unittest.TestCase):
 
-    def test_startup_retry_seeding_for_inconsistent_checkpoint_state_uses_retry_appendix(self) -> None:
+    def test_startup_retry_role_prompt_and_inconsistent_checkpoint_appendix(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / 'plan.md'
             broken_plan = '# Plan\n\n### [x] Checkpoint 1: Broken\n- [ ] step one\n'
             complete_plan = '# Plan\n\n### [x] Checkpoint 1: Broken\n- [x] step one\n'
             _write_plan(plan_path, broken_plan)
-            wf_config = _make_simple_wf_config(global_retry=1)
+            wf_config = replace(
+                _make_simple_wf_config(global_retry=1),
+                role_prompts={'architect': 'Retry role guidance.'},
+            )
             recovery = load_plan_tolerant(plan_path)
             assert recovery.parse_error is not None
             captured_user_prompts: list[str] = []
+            captured_system_prompts: list[str] = []
 
             class CapturingAdapter:
                 name = 'codex'
                 supports_effort = False
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
+                    captured_system_prompts.append(system_prompt)
                     captured_user_prompts.append(user_prompt)
                     return HarnessInvocation(
                         label='codex',
@@ -91,6 +97,7 @@ class RetryInconsistentCheckpointStartupTests(unittest.TestCase):
             )
 
             assert captured_user_prompts
+            assert captured_system_prompts == ['Retry role guidance.']
             assert base_user_prompt in captured_user_prompts[0]
             assert 'inconsistent checkpoint state' in captured_user_prompts[0].lower()
             assert str(recovery.parse_error) in captured_user_prompts[0]
@@ -117,13 +124,30 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
                 run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
             assert 'inconsistent checkpoint state' in str(ctx.value).lower()
 
-    def test_retry_enabled_succeeds_when_second_attempt_fixes_plan(self) -> None:
+    def test_role_prompt_is_retained_when_retry_fixes_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
-            wf_config = _make_simple_wf_config(global_retry=1)
+            wf_config = replace(
+                _make_simple_wf_config(global_retry=1),
+                role_prompts={'architect': 'Retry role guidance.'},
+            )
             call_count = [0]
+            captured_system_prompts: list[str] = []
+
+            class CapturingAdapter:
+                name = 'codex'
+                supports_effort = False
+
+                def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
+                    captured_system_prompts.append(system_prompt)
+                    return HarnessInvocation(
+                        label='codex', argv=('codex', 'run', user_prompt), env={},
+                        prompt_mode='prefix-system-into-user-prompt',
+                        system_prompt=system_prompt, user_prompt=user_prompt,
+                        effective_prompt=f'{system_prompt}\n\n{user_prompt}' if system_prompt else user_prompt,
+                    )
 
             def runner(argv, **kwargs):
                 call_count[0] += 1
@@ -134,9 +158,10 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CapturingAdapter(), runner=runner)
             assert result.turns_completed == 2
             assert result.final_snapshot.is_complete
+            assert captured_system_prompts == ['Retry role guidance.', 'Retry role guidance.']
 
     def test_retry_turn_reuses_same_new_plan_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
