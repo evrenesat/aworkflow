@@ -9,6 +9,16 @@
 - Bundled `material-code-review` as a default skill and enabled its guidance for
   the packaged reviewer role.
 
+## 2026-08-07 — Complete and resume every lifecycle mode
+
+- Branch-only merge teardown now switches a clean primary checkout from the
+  expected feature branch to `main` before attempting the engine-owned
+  fast-forward, while unrelated checked-out branches still fail closed.
+- Explicit and interactive resume now reconstruct no-lifecycle, branch-only,
+  and linked-worktree execution contexts from mode-specific durable metadata.
+- Regression coverage exercises ordinary branch-only completion plus
+  environment-preflight recovery without synthetic worktree paths.
+
 ## 2026-08-07 — Preserve guard replacement lineage
 
 - Replacement linkage now retains the original recovery fingerprint, validates

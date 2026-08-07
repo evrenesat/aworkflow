@@ -2703,10 +2703,26 @@ def _try_fast_forward_merge(
             f"merge teardown requires the primary checkout to be on '{exec_ctx.main_branch}': "
             f"{err or head_ref or 'detached HEAD'}"
         )
-    if head_ref.strip() != exec_ctx.main_branch:
+    current_branch = head_ref.strip()
+    if (
+        exec_ctx.worktree_path is None
+        and current_branch == exec_ctx.feature_branch
+    ):
+        rc, checkout_out, checkout_err = _run_git(
+            ["checkout", exec_ctx.main_branch],
+            cwd=primary_root,
+        )
+        if rc != 0:
+            raise WorkflowError(
+                f"lifecycle teardown: cannot switch the branch-only primary checkout "
+                f"from '{exec_ctx.feature_branch}' to '{exec_ctx.main_branch}': "
+                f"{checkout_err or checkout_out or 'unknown git error'}"
+            )
+        current_branch = exec_ctx.main_branch
+    if current_branch != exec_ctx.main_branch:
         raise WorkflowError(
             f"merge teardown requires the primary checkout to be on '{exec_ctx.main_branch}' "
-            f"(got '{head_ref.strip()}')"
+            f"(got '{current_branch}')"
         )
 
     rc, _, _ = _run_git(
@@ -2784,6 +2800,15 @@ def _validate_worktree_resume_context(
 
     Raises WorkflowError if any validation fails.
     """
+    if (
+        resume_ctx.feature_branch is None
+        or resume_ctx.main_branch is None
+        or resume_ctx.worktree_path is None
+    ):
+        raise WorkflowError(
+            "resume validation: linked-worktree lifecycle metadata is incomplete"
+        )
+
     # Verify feature branch exists locally
     rc, _, err = _run_git(
         ["rev-parse", "--verify", f"refs/heads/{resume_ctx.feature_branch}"],
@@ -2851,6 +2876,66 @@ def _validate_worktree_resume_context(
         if (worktree_git_dir / "rebase-merge").exists():
             raise WorkflowError(
                 f"resume validation: worktree '{resume_ctx.worktree_path}' has an in-progress rebase (rebase-merge exists)"
+            )
+
+
+def _validate_branch_resume_context(
+    primary_root: Path,
+    resume_ctx: ResumeContext,
+) -> None:
+    """Validate a branch-only execution context without inventing a worktree."""
+    if resume_ctx.feature_branch is None or resume_ctx.main_branch is None:
+        raise WorkflowError(
+            "resume validation: branch-only lifecycle metadata is incomplete"
+        )
+
+    for branch, label in (
+        (resume_ctx.feature_branch, "feature"),
+        (resume_ctx.main_branch, "main"),
+    ):
+        rc, _, _ = _run_git(
+            ["show-ref", "--verify", f"refs/heads/{branch}"],
+            cwd=primary_root,
+        )
+        if rc != 0:
+            raise WorkflowError(
+                f"resume validation: {label} branch '{branch}' does not exist locally"
+            )
+
+    rc, current_branch, err = _run_git(
+        ["symbolic-ref", "--short", "HEAD"],
+        cwd=primary_root,
+    )
+    if rc != 0:
+        raise WorkflowError(
+            "resume validation: branch-only primary checkout has detached HEAD: "
+            f"{err or current_branch or 'unknown git error'}"
+        )
+    allowed_branches = {resume_ctx.feature_branch}
+    if resume_ctx.terminal_integration_only:
+        allowed_branches.add(resume_ctx.main_branch)
+    if current_branch.strip() not in allowed_branches:
+        expected = " or ".join(sorted(allowed_branches))
+        raise WorkflowError(
+            "resume validation: branch-only primary checkout must be on "
+            f"{expected} (got '{current_branch.strip()}')"
+        )
+
+    rc, git_dir, _ = _run_git(["rev-parse", "--git-dir"], cwd=primary_root)
+    if rc == 0:
+        operation_root = Path(git_dir)
+        if not operation_root.is_absolute():
+            operation_root = primary_root / operation_root
+        if (operation_root / "MERGE_HEAD").exists():
+            raise WorkflowError(
+                f"resume validation: primary checkout '{primary_root}' has an in-progress merge"
+            )
+        if (
+            (operation_root / "REBASE_HEAD").exists()
+            or (operation_root / "rebase-merge").exists()
+        ):
+            raise WorkflowError(
+                f"resume validation: primary checkout '{primary_root}' has an in-progress rebase"
             )
 
 
@@ -3529,16 +3614,35 @@ def run_workflow(
 
             _validate_scope_envelope_bytes(scope, envelope_path.read_bytes())
         try:
-            _validate_worktree_resume_context(config.repo_root, resume)
-            exec_ctx = ExecutionContext(
-                primary_repo_root=config.repo_root,
-                execution_repo_root=resume.worktree_path,
-                main_branch=resume.main_branch,
-                feature_branch=resume.feature_branch,
-                worktree_path=resume.worktree_path,
-                setup=resume.setup,
-                teardown=resume.teardown,
-            )
+            if "worktree" in resume.setup:
+                _validate_worktree_resume_context(config.repo_root, resume)
+                assert resume.worktree_path is not None
+                assert resume.main_branch is not None
+                assert resume.feature_branch is not None
+                exec_ctx = ExecutionContext(
+                    primary_repo_root=config.repo_root,
+                    execution_repo_root=resume.worktree_path,
+                    main_branch=resume.main_branch,
+                    feature_branch=resume.feature_branch,
+                    worktree_path=resume.worktree_path,
+                    setup=resume.setup,
+                    teardown=resume.teardown,
+                )
+            elif "branch" in resume.setup:
+                _validate_branch_resume_context(config.repo_root, resume)
+                assert resume.main_branch is not None
+                assert resume.feature_branch is not None
+                exec_ctx = ExecutionContext(
+                    primary_repo_root=config.repo_root,
+                    execution_repo_root=config.repo_root,
+                    main_branch=resume.main_branch,
+                    feature_branch=resume.feature_branch,
+                    worktree_path=None,
+                    setup=resume.setup,
+                    teardown=resume.teardown,
+                )
+            else:
+                exec_ctx = None
             _sync_startup_plan_metadata_for_execution(
                 original_plan_path,
                 exec_ctx,

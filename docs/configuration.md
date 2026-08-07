@@ -274,8 +274,9 @@ go = [
 
 Accepted lifecycle combinations are:
 
-- `([], [])` - no lifecycle
-- `(["branch"], ["merge"])` - branch-only flow
+- `([], [])` - no lifecycle; execution and resume use the primary checkout
+- `(["branch"], ["merge"])` - branch-only flow; a clean completed feature
+  branch is switched back to `main` and fast-forwarded by the engine
 - `(["worktree", "branch"], ["merge", "rm_worktree"])` - linked worktree flow
 
 When teardown includes `merge`, config validation requires `[aflow].team_lead` and verifies the role can resolve through the effective team or global roles.

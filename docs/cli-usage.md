@@ -162,6 +162,11 @@ After remediating the environment, explicitly resume the exact run:
 
     aflow run --resume RUN_ID
 
+This recovery applies to no-lifecycle, branch-only, and linked-worktree
+workflows. No-lifecycle runs resume in the primary repository; branch-only runs
+require the recorded feature branch to remain checked out for an ordinary
+resume; linked-worktree runs retain strict path and registration validation.
+
 AFlow reports these conditions; it does not install packages, weaken sandbox
 settings, repair configuration, or validate authentication, network reachability,
 quota, provider health, model availability, or arbitrary dependency health.
