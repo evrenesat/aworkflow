@@ -352,10 +352,21 @@ def _resolved_invocation_path(value: str, cwd: str | None) -> str | None:
         return None
 
 
-def _controller_matches_run(record: ProcessRecord, run: dict[str, Any]) -> bool:
+def _controller_matches_run(
+    record: ProcessRecord, run: dict[str, Any], repo: Path
+) -> bool:
     invocation = _aflow_invocation(record.command)
     if invocation is None:
         return False
+
+    expected_resume_ids: set[str] = set()
+    run_dir = run.get("run_dir")
+    if isinstance(run_dir, str) and run_dir:
+        expected_resume_ids.add(Path(run_dir).name)
+    resumed_from = run.get("resumed_from_run_id")
+    if isinstance(resumed_from, str) and resumed_from:
+        expected_resume_ids.add(resumed_from)
+    resume_value = _invocation_option(invocation, "--resume")
 
     expected_plans = {
         str(Path(value).expanduser().resolve())
@@ -366,6 +377,11 @@ def _controller_matches_run(record: ProcessRecord, run: dict[str, Any]) -> bool:
     if plan_value is not None:
         invocation_plan = _resolved_invocation_path(plan_value, record.cwd)
         plan_matches = invocation_plan in expected_plans
+    elif resume_value is not None:
+        plan_matches = (
+            resume_value in expected_resume_ids
+            and record.cwd == str(repo.resolve())
+        )
     else:
         plan_matches = any(
             _resolved_invocation_path(token, record.cwd) in expected_plans
@@ -375,15 +391,6 @@ def _controller_matches_run(record: ProcessRecord, run: dict[str, Any]) -> bool:
     if not plan_matches:
         return False
 
-    expected_resume_ids: set[str] = set()
-    run_dir = run.get("run_dir")
-    if isinstance(run_dir, str) and run_dir:
-        expected_resume_ids.add(Path(run_dir).name)
-    resumed_from = run.get("resumed_from_run_id")
-    if isinstance(resumed_from, str) and resumed_from:
-        expected_resume_ids.add(resumed_from)
-
-    resume_value = _invocation_option(invocation, "--resume")
     if resume_value is not None:
         return resume_value in expected_resume_ids
     return not isinstance(resumed_from, str) or not resumed_from
@@ -408,7 +415,7 @@ def _matching_controller_candidates(
             command=record.command,
             cwd=cwd,
         )
-        if _controller_matches_run(enriched, run):
+        if _controller_matches_run(enriched, run, repo):
             matches.append(enriched)
     return matches
 
@@ -1413,6 +1420,22 @@ def _self_test() -> None:
             500,
             f"/tmp/.venv/bin/python /tmp/.venv/bin/{resumed_invocation}",
         )
+        planless_resumed = process(
+            502,
+            1,
+            502,
+            "/tmp/.venv/bin/python /tmp/.venv/bin/aflow run "
+            "--resume source-run",
+            cwd=str(repo.resolve()),
+        )
+        wrong_cwd_planless_resumed = process(
+            503,
+            1,
+            503,
+            "/tmp/.venv/bin/python /tmp/.venv/bin/aflow run "
+            "--resume source-run",
+            cwd=str(other_repo.resolve()),
+        )
         unrelated_invocation = (
             f"aflow run --plan {other_plan.resolve()} --resume other-run"
         )
@@ -1433,6 +1456,14 @@ def _self_test() -> None:
                 [resumed_wrapper, resumed_child], repo, resumed_run
             )
         ) == 1
+        assert len(
+            _matching_controllers([planless_resumed], repo, resumed_run)
+        ) == 1
+        assert len(
+            _matching_controllers(
+                [wrong_cwd_planless_resumed], repo, resumed_run
+            )
+        ) == 0
         assert len(
             _matching_controllers(
                 [unrelated_wrapper, unrelated_child], repo, resumed_run

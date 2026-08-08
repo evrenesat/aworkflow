@@ -39,6 +39,11 @@ as bounded evidence for improving AFlow's own resilience.
   retries or checkpoint-scope resets.
 - Treat line and file budgets as scope-pressure evidence, not semantic owner
   boundaries.
+- Prefer the fastest safe completion when a blocker offers several valid
+  interpretations and one preserves the plan's core outcome with less scope,
+  risk, downtime, or cost. Choose that reversible minimum without pausing for
+  owner input, record the decision in the active plan or recovery evidence, and
+  keep the deferred enhancement explicit.
 - Ask for owner input only for changed meaning, conflicting requirements,
   destructive handling, ambiguous ownership, or inability to preserve accepted
   work.
@@ -150,6 +155,29 @@ Do not load whole stdout/stderr files, repeated unchanged artifacts, or prior
 scheduled-task history.
 
 ## Recover safely
+
+### Resolve bounded product ambiguity
+
+Use fastest-safe completion as the default tie-breaker when all of these hold:
+
+- the selected behavior preserves the plan's primary usable outcome;
+- it is the smallest reversible choice and does not weaken security, privacy,
+  authorization, licensing, data integrity, or required acceptance checks;
+- it introduces no destructive migration, public publication, new credential
+  authority, or spend beyond an approved ceiling;
+- it does not contradict an explicit user preference; and
+- the omitted behavior can remain a named later enhancement.
+
+Prefer scope reduction over inventing transformation behavior. For example,
+when a pinned audio model only supports source-duration covers and custom
+duration would require undefined trimming, looping, padding, or time-stretching,
+retain source duration, display it clearly, defer custom duration, revise the
+plan accordingly, and continue. A prior request for an ASAP beta or minimum
+downtime strengthens this tie-breaker.
+
+Do not use this rule to reinterpret a core product requirement, bypass a safety
+or acceptance gate, spend without authority, discard accepted work, or make an
+irreversible choice. Those cases still require owner input.
 
 Mark an attempted incident before recovery:
 

@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-08-08 — Prefer fastest-safe guard completion
+
+- Guarded recovery now chooses the smallest reversible, scope-reducing option
+  when it preserves the plan's usable outcome and does not weaken safety,
+  authorization, acceptance, or approved cost boundaries.
+- Plan-less exact `aflow run --resume RUN_ID` controllers are recognized only
+  when the resume ID matches durable lineage and the controller cwd matches the
+  guarded repository; self-tests reject the same argv from another repository.
+
 ## 2026-08-07 — Add role-scoped workflow prompts and material review
 
 - Added validated global and team role prompts with team replacement, global
