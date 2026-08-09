@@ -561,12 +561,17 @@ def _normalize_hotplug_transaction(
 ) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
-    required = (
-        "transaction_id", "source_role", "target_role", "source_selector", "target_selector",
-        "capability_path", "stage", "artifact_paths", "artifact_hashes",
+    scalar_required = (
+        "transaction_id", "source_role", "target_role", "source_selector",
+        "target_selector", "capability_path", "stage",
     )
-    if any(not isinstance(value.get(key), (str, type(None))) for key in required[:6]):
-        return None
+    for key in scalar_required:
+        item = value.get(key)
+        if key == "capability_path":
+            if item is not None and not isinstance(item, str):
+                return None
+        elif not isinstance(item, str) or not item.strip():
+            return None
     paths = value.get("artifact_paths", [])
     hashes = value.get("artifact_hashes", [])
     if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):

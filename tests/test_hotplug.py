@@ -36,7 +36,7 @@ from aflow.run_state import PendingTeamOverride
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, resolve_role_selector, run_workflow
 from aflow.api.events import CollectingObserver, ExecutionEventType, HotplugEvent
-from aflow.analyzer import _hotplug_summary
+from aflow.analyzer import _hotplug_summary, summarize_run
 
 
 def make_transaction(stage: str = "accepted") -> HotplugTransactionV1:
@@ -81,6 +81,26 @@ def test_analyzer_hotplug_summary_exposes_session_presence_not_ids() -> None:
     assert current["target_session_present"] is True
     assert "private-source" not in repr(summary)
     assert "private-target" not in repr(summary)
+
+
+@pytest.mark.parametrize("stage_value", [None, 7])
+def test_analyzer_ignores_malformed_hotplug_stage_without_crashing(
+    tmp_path: Path, stage_value: object,
+) -> None:
+    payload = make_transaction("handover_ready").to_dict()
+    if stage_value is None:
+        del payload["stage"]
+    else:
+        payload["stage"] = stage_value
+    run_json = {
+        "current_hotplug_transaction": payload,
+        "hotplug_history": [],
+        "active_role_sessions": [],
+    }
+
+    assert _hotplug_summary(run_json)["current"] is None
+    analyzed = summarize_run(tmp_path, run_json, [], tmp_path)
+    assert analyzed["hotplug"]["current"] is None
 
 
 def test_every_transaction_stage_round_trips() -> None:
