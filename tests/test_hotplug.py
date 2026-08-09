@@ -928,6 +928,89 @@ def test_run_resume_ambiguous_target_start_never_launches_harness(tmp_path: Path
     assert persisted["current_hotplug_transaction"]["stage"] == "waiting_for_hotplug_recovery"
 
 
+def test_run_resume_applied_transaction_is_normalized_into_history(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    transaction = make_transaction("applied")
+    target = HarnessSessionRefV1(
+        session_id="codex-target", role="worker", selector=transaction.target_selector,
+        harness="codex", profile="high", model_display="codex / high",
+    )
+    resume = ResumeContext(
+        resumed_from_run_id="applied-predecessor", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(target,), hotplug_transaction_number=1,
+    )
+    calls: list[object] = []
+    with pytest.raises(WorkflowError) as error:
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            runner=lambda argv, **kwargs: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "DONE", ""),
+            resume=resume,
+        )
+    persisted = json.loads((error.value.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert calls
+    assert persisted["current_hotplug_transaction"] is None
+    assert persisted["pending_hotplug_transaction"] is None
+    assert [item["transaction_id"] for item in persisted["hotplug_history"]].count(transaction.transaction_id) == 1
+
+
+def test_run_resume_imports_durable_provider_result_once(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    base = make_transaction("waiting_for_hotplug_recovery")
+    source = HarnessSessionRefV1(
+        session_id="source", role="worker", selector=base.source_selector,
+        harness=base.source_harness, profile=base.source_profile,
+        model_display=base.source_model_display,
+    )
+    transaction = replace(base, source_session=source, provider_operation_id="provider-1", idempotency_key=base.transaction_id)
+    resume = ResumeContext(
+        resumed_from_run_id="provider-predecessor", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(source,), hotplug_transaction_number=1,
+    )
+    class ProviderDriver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+        reconciliations = 0
+        def reconcile_provider_operation(self, operation_id, idempotency_key):
+            self.reconciliations += 1
+            assert (operation_id, idempotency_key) == ("provider-1", transaction.transaction_id)
+            return SessionResult(
+                session_id="codex-target", selector="codex.high", model="high-model", effort=None,
+                final_output="DONE", provider_operation_id=operation_id,
+                idempotency_key=idempotency_key, capabilities=self.capabilities,
+            )
+        def build_invocation(self, request):
+            return HarnessInvocation(
+                label="fake", argv=("codex", "exec", "--json"), env={}, prompt_mode="stdin",
+                system_prompt=request.system_prompt, user_prompt=request.user_prompt,
+                effective_prompt=request.user_prompt, stdin_text=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            return SessionResult(
+                session_id="codex-target", selector=request.selector, model=request.model,
+                effort=request.effort, final_output="DONE", capabilities=self.capabilities,
+            )
+    driver = ProviderDriver()
+    with pytest.raises(WorkflowError) as error:
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+            session_driver=driver, resume=resume,
+        )
+    persisted = json.loads((error.value.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert driver.reconciliations == 1
+    assert persisted["current_hotplug_transaction"] is None
+    assert persisted["hotplug_history"][-1]["provider_operation_id"] == "provider-1"
+
+
 @pytest.mark.parametrize("field", [
     "transaction_id", "run_id", "accepted_override_digest", "source_role",
     "source_selector", "source_harness", "source_profile", "source_model_display",

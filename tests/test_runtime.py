@@ -1600,7 +1600,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             )
             runner = unittest.mock.Mock()
             with patch("aflow.workflow._validate_worktree_resume_context", return_value=None):
-                with pytest.raises(WorkflowError, match="hotplug_in_progress") as error:
+                with pytest.raises(WorkflowError, match="waiting_for_hotplug_recovery") as error:
                     run_workflow(
                         ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
                         _resume_override_workflow_config(), "resume_override",

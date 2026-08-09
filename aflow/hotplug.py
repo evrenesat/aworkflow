@@ -147,6 +147,8 @@ class HotplugTransactionV1:
     artifact_hashes: tuple[str, ...] = ()
     failure: str | None = None
     remediation: str | None = None
+    provider_operation_id: str | None = None
+    idempotency_key: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     schema_version: int = HOTPLUG_SCHEMA_VERSION
 
@@ -172,6 +174,10 @@ class HotplugTransactionV1:
             value = getattr(self, value_name)
             if value is not None:
                 _safe_text(value, limit=1024)
+        for value_name in ("provider_operation_id", "idempotency_key"):
+            value = getattr(self, value_name)
+            if value is not None:
+                _safe_text(value, limit=512)
         for value in (self.source_role, self.target_role, self.source_selector, self.target_selector,
                       self.source_harness, self.target_harness, self.source_profile, self.target_profile,
                       self.source_model_display, self.target_model_display):
@@ -214,7 +220,12 @@ class HotplugTransactionV1:
             raise ValueError("invalid hotplug transaction enum")
         failure = raw.get("failure")
         remediation = raw.get("remediation")
+        provider_operation_id = raw.get("provider_operation_id")
+        idempotency_key = raw.get("idempotency_key")
         for name, value in (("failure", failure), ("remediation", remediation)):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{name} must be a string or null")
+        for name, value in (("provider_operation_id", provider_operation_id), ("idempotency_key", idempotency_key)):
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"{name} must be a string or null")
         created_at = raw.get("created_at")
@@ -240,7 +251,9 @@ class HotplugTransactionV1:
                    source_session=HarnessSessionRefV1.from_dict(session, strict=strict) if session is not None else None,
                    capability_path=capability_path, stage=stage,
                    artifact_paths=tuple(artifact_paths), artifact_hashes=tuple(artifact_hashes),
-                   failure=failure, remediation=remediation, created_at=created_at)
+                   failure=failure, remediation=remediation,
+                   provider_operation_id=provider_operation_id,
+                   idempotency_key=idempotency_key, created_at=created_at)
 
 
 @dataclass(frozen=True)

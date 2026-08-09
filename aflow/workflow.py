@@ -95,7 +95,7 @@ from .hotplug import (
     workspace_fingerprint, write_handover_artifacts, hotplug_transaction_id,
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
 )
-from .harnesses.session import SessionDriver, SessionRequest
+from .harnesses.session import SessionDriver, SessionRequest, SessionResult
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
@@ -3330,10 +3330,46 @@ def run_workflow(
                 raise WorkflowError(
                     f"resume hotplug artifact binding failed closed: {exc}"
                 ) from exc
-            if reconciled != transaction or (
+            if (
                 reconciled.stage == "waiting_for_hotplug_recovery"
-                and reconciled.source_session is not None
+                and reconciled.provider_operation_id
+                and session_driver is not None
             ):
+                reconcile_operation = getattr(session_driver, "reconcile_provider_operation", None)
+                if callable(reconcile_operation):
+                    evidence = reconcile_operation(
+                        reconciled.provider_operation_id,
+                        reconciled.idempotency_key or reconciled.transaction_id,
+                    )
+                    if isinstance(evidence, SessionResult):
+                        if (
+                            evidence.idempotency_key is not None
+                            and reconciled.idempotency_key is not None
+                            and evidence.idempotency_key != reconciled.idempotency_key
+                        ):
+                            raise WorkflowError(
+                                "resume hotplug provider evidence has an idempotency-key mismatch"
+                            )
+                        reconciled = replace(
+                            reconciled,
+                            stage="applied",
+                            target_selector=evidence.selector,
+                            provider_operation_id=evidence.provider_operation_id,
+                        )
+                    elif evidence == "not_started":
+                        reconciled = replace(
+                            reconciled,
+                            stage=("handover_ready" if reconciled.artifact_paths else "accepted"),
+                            remediation="provider operation was proven not started; retrying once",
+                        )
+            if reconciled.stage == "applied":
+                state.current_hotplug_transaction = None
+                state.pending_hotplug_transaction = None
+                if not any(item.transaction_id == reconciled.transaction_id for item in state.hotplug_history):
+                    state.hotplug_history = list(bounded_hotplug_history(
+                        [*state.hotplug_history, reconciled]
+                    ))
+            elif reconciled.stage == "waiting_for_hotplug_recovery":
                 state.current_hotplug_transaction = reconciled
                 state.pending_hotplug_transaction = reconciled
                 state.status_message = (
@@ -8636,6 +8672,14 @@ def run_workflow(
                     and transaction.target_selector == selector
                     and transaction.stage not in {"applied", "failed"}
                 ):
+                    transaction = replace(
+                        transaction,
+                        provider_operation_id=session_result.provider_operation_id,
+                        idempotency_key=(
+                            session_result.idempotency_key or turn_session_request.idempotency_key
+                            if turn_session_request is not None else session_result.idempotency_key
+                        ),
+                    )
                     applied_transaction = replace(transaction, stage="applied")
                     state.current_hotplug_transaction = None
                     state.pending_hotplug_transaction = None
