@@ -4,11 +4,18 @@ from .models import (
     CapabilitySet,
     ContextBundle,
     LaunchManifest,
+    PlanRecord,
+    ProjectRecord,
+    ReconciliationResult,
     RunControlRequest,
     RunEvent,
+    RunPage,
     RunStatus,
+    StartupQuestionRecord,
     StartRunResult,
 )
+from .application import ControlPlaneApplication
+from .capabilities import CapabilityError, CapabilityService
 from .persistence import (
     ControlConflictError,
     ControlWriteResult,
@@ -26,15 +33,38 @@ from .persistence import (
     validate_run_id,
     write_launch_phase,
 )
+from .reconciliation import ReconciliationService
+from .repository import (
+    RepositoryError,
+    RepositoryNotFoundError,
+    RepositorySchemaError,
+    RunRepository,
+)
+from .services import (
+    ContextService,
+    ControlIdempotencyConflict,
+    ControlService,
+    ServiceAuthorizationError,
+    StartupQuestionService,
+)
+from .units import InMemoryUnitManager, SystemdUnitManager, UnitManager, UnitState
 
 __all__ = [
     "CapabilitySet",
     "ContextBundle",
     "LaunchManifest",
+    "PlanRecord",
+    "ProjectRecord",
+    "ReconciliationResult",
     "RunControlRequest",
     "RunEvent",
+    "RunPage",
     "RunStatus",
+    "StartupQuestionRecord",
     "StartRunResult",
+    "ControlPlaneApplication",
+    "CapabilityError",
+    "CapabilityService",
     "ControlConflictError",
     "ControlWriteResult",
     "EventJournal",
@@ -50,4 +80,18 @@ __all__ = [
     "reserve_run_id",
     "validate_run_id",
     "write_launch_phase",
+    "ReconciliationService",
+    "RepositoryError",
+    "RepositoryNotFoundError",
+    "RepositorySchemaError",
+    "RunRepository",
+    "ContextService",
+    "ControlIdempotencyConflict",
+    "ControlService",
+    "ServiceAuthorizationError",
+    "StartupQuestionService",
+    "InMemoryUnitManager",
+    "SystemdUnitManager",
+    "UnitManager",
+    "UnitState",
 ]

@@ -79,6 +79,11 @@ class CapabilitySet:
     roles: tuple[str, ...] = ()
     controls: tuple[str, ...] = ()
     context_levels: tuple[Literal["lite", "full"], ...] = ("lite", "full")
+    team_upgrade_chains: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    control_safety: Mapping[str, Literal["safe", "restart_required"]] = field(
+        default_factory=dict
+    )
+    service_features: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))
@@ -92,6 +97,14 @@ class RunStatus:
     ownership: Literal["control_plane", "legacy"] = "control_plane"
     revision: int = 0
     reason: str | None = None
+    unit_name: str | None = None
+    launch_phase: str | None = None
+    workflow_name: str | None = None
+    team: str | None = None
+    current_step: str | None = None
+    turns_completed: int | None = None
+    max_turns: int | None = None
+    evidence: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))
@@ -131,6 +144,74 @@ class ContextBundle:
     run_id: str
     level: Literal["lite", "full"]
     data: Mapping[str, Any]
+    schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class ProjectRecord:
+    """A canonical project root exposed by the transport-neutral repository."""
+
+    project_id: str
+    root: str
+    schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class PlanRecord:
+    """Bounded plan metadata; plan prose remains on disk until explicitly read."""
+
+    path: str
+    status: str
+    modified_at: str
+    schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunPage:
+    """Stable lexicographic run page with an opaque-by-convention cursor."""
+
+    runs: tuple[RunStatus, ...]
+    next_cursor: str | None = None
+    schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class StartupQuestionRecord:
+    """A transient, opaque handle for the existing startup-question protocol."""
+
+    question_id: str
+    kind: str
+    message: str
+    options: Mapping[str, str] = field(default_factory=dict)
+    choices: tuple[str, ...] = ()
+    schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    """One fail-closed observation; it never authorizes a resume or launch."""
+
+    run_id: str
+    status: str
+    reason: str
+    ownership: Literal["control_plane", "legacy"] = "control_plane"
+    unit_name: str | None = None
+    observed_unit_state: str | None = None
     schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
