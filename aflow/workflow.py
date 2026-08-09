@@ -3121,6 +3121,14 @@ def _emit_event(observer: ExecutionObserver | None, event: ExecutionEvent) -> No
         observer.on_event(event)
 
 
+def _emit_hotplug_event(
+    observer: ExecutionObserver | None,
+    event_type: ExecutionEventType,
+    transaction: HotplugTransactionV1,
+) -> None:
+    _emit_event(observer, HotplugEvent.create(event_type, transaction))
+
+
 def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None = None) -> SessionDriver | None:
     """Enable native sessions only for a proven, supported production adapter."""
     if getattr(adapter, "name", None) == "reasonix":
@@ -3397,9 +3405,11 @@ def run_workflow(
                     state.hotplug_history = list(bounded_hotplug_history(
                         [*state.hotplug_history, reconciled]
                     ))
+                _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, reconciled)
             elif reconciled.stage == "waiting_for_hotplug_recovery":
                 state.current_hotplug_transaction = reconciled
                 state.pending_hotplug_transaction = reconciled
+                _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_STAGE_CHANGED, reconciled)
                 state.status_message = (
                     "waiting_for_hotplug_recovery: "
                     + (reconciled.remediation or "ambiguous provider boundary")
@@ -7523,9 +7533,6 @@ def run_workflow(
             resumed_from_run_id=resumed_from_run_id,
         )
 
-    def _emit_hotplug_event(event_type: ExecutionEventType, transaction: HotplugTransactionV1) -> None:
-        _emit_event(observer, HotplugEvent.create(event_type, transaction))
-
     def _fail_hotplug_target(reason: str) -> None:
         transaction = state.current_hotplug_transaction
         if transaction is None or transaction.stage in {"applied", "failed"}:
@@ -7543,7 +7550,7 @@ def run_workflow(
         state.hotplug_history = list(bounded_hotplug_history(
             [*state.hotplug_history, failed]
         ))
-        _emit_hotplug_event(ExecutionEventType.HOTPLUG_FAILED, failed)
+        _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_FAILED, failed)
         state.status_message = f"hotplug target failed; source retained: {reason}"
         _write_override_boundary(status="failed")
 
@@ -7777,7 +7784,6 @@ def run_workflow(
                 )
                 state.hotplug_transaction_number = transaction_number
                 state.current_hotplug_transaction = worker_transaction
-                _emit_hotplug_event(ExecutionEventType.HOTPLUG_REQUESTED, worker_transaction)
         _write_override_boundary(status="running")
 
         if request.next_step is not None:
@@ -7795,7 +7801,7 @@ def run_workflow(
             # Keep the transaction durable until the target turn succeeds.
             state.current_hotplug_transaction = worker_transaction
             state.pending_hotplug_transaction = worker_transaction
-            _emit_hotplug_event(ExecutionEventType.HOTPLUG_REQUESTED, worker_transaction)
+            _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_REQUESTED, worker_transaction)
             # An override injected before the first worker has no live source
             # session to hand over. Preserve its accepted digest/number for
             # compatibility, but do not create a live transaction boundary.
@@ -7805,6 +7811,10 @@ def run_workflow(
                 state.hotplug_history = list(bounded_hotplug_history(
                     [*state.hotplug_history, replace(worker_transaction, stage="applied")]
                 ))
+                _emit_hotplug_event(
+                    observer, ExecutionEventType.HOTPLUG_APPLIED,
+                    replace(worker_transaction, stage="applied"),
+                )
         state.override_result = replace(state.override_result, applied=True)
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
@@ -7928,7 +7938,7 @@ def run_workflow(
         )
         state.current_hotplug_transaction = ready
         state.pending_hotplug_transaction = ready
-        _emit_hotplug_event(ExecutionEventType.HOTPLUG_STAGE_CHANGED, ready)
+        _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_STAGE_CHANGED, ready)
         _write_override_boundary(status="running")
         handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
         projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
@@ -8721,7 +8731,7 @@ def run_workflow(
                     state.hotplug_history = list(bounded_hotplug_history(
                         [*state.hotplug_history, applied_transaction]
                     ))
-                    _emit_hotplug_event(ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
+                    _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
                     write_run_metadata(
                         run_paths, config, state, status="running",
                         last_snapshot=state.last_snapshot,

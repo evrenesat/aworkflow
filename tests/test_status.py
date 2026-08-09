@@ -16,10 +16,36 @@ from aflow.run_state import (
     PendingRepartitionV1,
     PendingTeamOverride,
 )
-from aflow.status import _RICH_AVAILABLE, _build_summary_table
+from aflow.hotplug import HotplugTransactionV1, HarnessSessionRefV1, hotplug_transaction_id
+from aflow.status import _RICH_AVAILABLE, _build_summary_table, _status_display
 
 
 pytestmark = pytest.mark.skipif(not _RICH_AVAILABLE, reason="rich status rendering is unavailable")
+
+
+def test_status_displays_hotplug_history_capability_and_active_selector_without_session_id() -> None:
+    digest = "a" * 64
+    transaction = HotplugTransactionV1(
+        transaction_id=hotplug_transaction_id("run", digest, 1), run_id="run",
+        accepted_override_digest=digest, transaction_number=1,
+        source_role="worker", target_role="worker", source_selector="codex.low",
+        target_selector="codex.high", source_harness="codex", target_harness="codex",
+        source_profile="low", target_profile="high", source_model_display="codex / low",
+        target_model_display="codex / high", capability_path="native_resume", stage="applied",
+    )
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    state.status_message = "completed"
+    state.end_reason = "done"
+    state.hotplug_history = [transaction]
+    state.active_role_sessions = [HarnessSessionRefV1(
+        session_id="private-session", role="worker", selector="codex.high",
+        harness="codex", profile="high", model_display="codex / high",
+    )]
+    rendered = _status_display(state)
+    assert "native session resume" in rendered
+    assert "codex.low -> codex.high" in rendered
+    assert "active codex.high" in rendered
+    assert "private-session" not in rendered
 
 
 def test_status_summary_surfaces_compact_manager_state() -> None:

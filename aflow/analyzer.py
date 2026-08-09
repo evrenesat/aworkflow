@@ -556,11 +556,13 @@ def _normalize_environment_preflight(value: object) -> dict[str, object] | None:
     return result
 
 
-def _normalize_hotplug_transaction(value: object) -> dict[str, object] | None:
+def _normalize_hotplug_transaction(
+    value: object, active_sessions: list[Mapping[str, object]] = (),
+) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
     required = (
-        "transaction_id", "source_role", "source_selector", "target_selector",
+        "transaction_id", "source_role", "target_role", "source_selector", "target_selector",
         "capability_path", "stage", "artifact_paths", "artifact_hashes",
     )
     if any(not isinstance(value.get(key), (str, type(None))) for key in required[:6]):
@@ -574,6 +576,13 @@ def _normalize_hotplug_transaction(value: object) -> dict[str, object] | None:
     return {
         "transaction_id": value["transaction_id"],
         "source_role": value["source_role"],
+        "source_session_present": isinstance(value.get("source_session"), Mapping),
+        "target_session_present": any(
+            item.get("role") == value.get("target_role")
+            and item.get("selector") == value.get("target_selector")
+            and item.get("status", "active") == "active"
+            for item in active_sessions
+        ),
         "source_selector": value["source_selector"],
         "target_selector": value["target_selector"],
         "capability_path": value["capability_path"],
@@ -586,13 +595,15 @@ def _normalize_hotplug_transaction(value: object) -> dict[str, object] | None:
 
 
 def _hotplug_summary(run_json: Mapping[str, Any]) -> dict[str, object]:
+    active_sessions = run_json.get("active_role_sessions", [])
+    active = active_sessions if isinstance(active_sessions, list) else []
     history = run_json.get("hotplug_history")
     normalized_history = [
-        item for raw in history for item in [_normalize_hotplug_transaction(raw)] if item is not None
+        item for raw in history for item in [_normalize_hotplug_transaction(raw, active)] if item is not None
     ] if isinstance(history, list) else []
     return {
-        "current": _normalize_hotplug_transaction(run_json.get("current_hotplug_transaction")),
-        "pending": _normalize_hotplug_transaction(run_json.get("pending_hotplug_transaction")),
+        "current": _normalize_hotplug_transaction(run_json.get("current_hotplug_transaction"), active),
+        "pending": _normalize_hotplug_transaction(run_json.get("pending_hotplug_transaction"), active),
         "history": normalized_history,
         "active_session_count": len(run_json.get("active_role_sessions", []))
         if isinstance(run_json.get("active_role_sessions"), list) else 0,

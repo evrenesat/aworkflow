@@ -35,7 +35,8 @@ from aflow.harnesses.reasonix import ReasonixAcpDriver
 from aflow.run_state import PendingTeamOverride
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, resolve_role_selector, run_workflow
-from aflow.api.events import ExecutionEventType, HotplugEvent
+from aflow.api.events import CollectingObserver, ExecutionEventType, HotplugEvent
+from aflow.analyzer import _hotplug_summary
 
 
 def make_transaction(stage: str = "accepted") -> HotplugTransactionV1:
@@ -61,6 +62,25 @@ def test_hotplug_events_are_secret_safe_and_structured() -> None:
     assert event.target_selector == transaction.target_selector
     assert not hasattr(event, "session_id")
     assert not hasattr(event, "prompt")
+
+
+def test_analyzer_hotplug_summary_exposes_session_presence_not_ids() -> None:
+    summary = _hotplug_summary({
+        "current_hotplug_transaction": {
+            **make_transaction("handover_ready").to_dict(),
+            "source_session": {"session_id": "private-source"},
+        },
+        "active_role_sessions": [{
+            "role": "worker", "selector": "codex.high", "status": "active",
+            "session_id": "private-target",
+        }],
+        "hotplug_history": [],
+    })
+    current = summary["current"]
+    assert current["source_session_present"] is True
+    assert current["target_session_present"] is True
+    assert "private-source" not in repr(summary)
+    assert "private-target" not in repr(summary)
 
 
 def test_every_transaction_stage_round_trips() -> None:
@@ -716,11 +736,12 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
     def runner(argv, **kwargs):
         plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "wire", "")
+    observer = CollectingObserver()
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
         _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
         runner=runner, session_driver=target_driver,
-        source_session_driver=source_driver, resume=resume,
+        source_session_driver=source_driver, resume=resume, observer=observer,
     )
     state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
     assert source_driver.handovers == 1
@@ -740,6 +761,11 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
         assert str(Path(advertised)) in target_driver.prompt
     assert state["hotplug_history"][-1]["stage"] == "applied"
     assert len(state["hotplug_history"][-1]["artifact_hashes"]) == 3
+    hotplug_events = [event for event in observer.events if isinstance(event, HotplugEvent)]
+    assert [event.event_type for event in hotplug_events] == [
+        ExecutionEventType.HOTPLUG_STAGE_CHANGED,
+        ExecutionEventType.HOTPLUG_APPLIED,
+    ]
 
 
 def test_cross_harness_target_failure_restores_source_session_active(tmp_path: Path) -> None:

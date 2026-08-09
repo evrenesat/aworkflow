@@ -213,22 +213,38 @@ def _checkpoint_display(snapshot: PlanSnapshot) -> str:
 
 
 def _status_display(state: ControllerState) -> str:
+    display = state.status_message
     if state.status_message == "completed" and state.end_reason is not None:
         if state.end_reason == "already_complete":
-            return "completed: already complete"
-        if state.end_reason == "done":
-            return "completed: done"
-        if state.end_reason == "max_turns_reached":
-            return "completed: max turns reached"
-        return "completed: transition to END"
+            display = "completed: already complete"
+        elif state.end_reason == "done":
+            display = "completed: done"
+        elif state.end_reason == "max_turns_reached":
+            display = "completed: max turns reached"
+        else:
+            display = "completed: transition to END"
     transaction = state.current_hotplug_transaction or state.pending_hotplug_transaction
+    if transaction is None and state.hotplug_history:
+        transaction = state.hotplug_history[-1]
     if transaction is not None:
-        capability = transaction.capability_path or "capability pending"
-        return (
-            f"{state.status_message} | hotplug {transaction.stage}: "
-            f"{transaction.source_selector} -> {transaction.target_selector} ({capability})"
+        capability = {
+            "native_resume": "native session resume",
+            "handover_required": "handover bootstrap",
+        }.get(transaction.capability_path, "capability pending")
+        active_selector = next(
+            (
+                item.selector for item in state.active_role_sessions
+                if item.role == transaction.source_role and item.status == "active"
+            ),
+            None,
         )
-    return state.status_message
+        session_suffix = f" | active {active_selector}" if active_selector else ""
+        return (
+            f"{display} | hotplug {transaction.stage}: "
+            f"{transaction.source_selector} -> {transaction.target_selector} ({capability})"
+            + session_suffix
+        )
+    return display
 
 
 def _git_row(summary: GitSummary) -> str:
