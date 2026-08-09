@@ -3349,10 +3349,8 @@ def run_workflow(
                             evidence_error = "provider evidence has an empty session id"
                         elif evidence.selector != reconciled.target_selector:
                             evidence_error = "provider evidence selector does not match the recorded target"
-                        elif (
-                            evidence.idempotency_key is not None
-                            and reconciled.idempotency_key is not None
-                            and evidence.idempotency_key != reconciled.idempotency_key
+                        elif evidence.idempotency_key != (
+                            reconciled.idempotency_key or reconciled.transaction_id
                         ):
                             evidence_error = "provider evidence has an idempotency-key mismatch"
                         elif (

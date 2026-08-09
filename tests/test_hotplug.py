@@ -958,7 +958,7 @@ def test_run_resume_applied_transaction_is_normalized_into_history(tmp_path: Pat
     assert [item["transaction_id"] for item in persisted["hotplug_history"]].count(transaction.transaction_id) == 1
 
 
-@pytest.mark.parametrize("evidence_case", ["valid", "wrong_selector", "failure", "empty_session"])
+@pytest.mark.parametrize("evidence_case", ["valid", "wrong_selector", "failure", "empty_session", "missing_idempotency"])
 def test_run_resume_imports_durable_provider_result_once(tmp_path: Path, evidence_case: str) -> None:
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
@@ -990,7 +990,8 @@ def test_run_resume_imports_durable_provider_result_once(tmp_path: Path, evidenc
                 session_id="" if evidence_case == "empty_session" else "codex-target",
                 selector=selector, model="high-model", effort=None,
                 final_output="DONE", provider_operation_id=operation_id,
-                idempotency_key=idempotency_key, capabilities=self.capabilities,
+                idempotency_key=(None if evidence_case == "missing_idempotency" else idempotency_key),
+                capabilities=self.capabilities,
                 failure="provider failed" if evidence_case == "failure" else None,
             )
         def build_invocation(self, request):
