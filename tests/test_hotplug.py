@@ -714,10 +714,67 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
     assert target_driver.handovers == 0
     assert target_driver.starts == 1
     assert target_driver.idempotency_key == transaction.transaction_id
-    assert "handover.md" in target_driver.prompt
-    assert "full-context.json" in target_driver.prompt
+    assert "Source worker handover:" in target_driver.prompt
+    assert "## Objective And Checkpoint" in target_driver.prompt
+    assert "Controller continuity context:" in target_driver.prompt
+    for ref in state["hotplug_history"][-1]["artifact_paths"]:
+        advertised = next(line.split(": ", 1)[1].split(" (sha256=", 1)[0]
+                          for line in target_driver.prompt.splitlines()
+                          if ref in line)
+        assert Path(advertised).is_absolute()
+        assert Path(advertised).exists()
+        assert str(Path(advertised)) in target_driver.prompt
     assert state["hotplug_history"][-1]["stage"] == "applied"
     assert len(state["hotplug_history"][-1]["artifact_hashes"]) == 3
+
+
+def test_cross_harness_target_failure_restores_source_session_active(tmp_path: Path) -> None:
+    transaction = make_transaction("accepted")
+    source = HarnessSessionRefV1(
+        session_id="reasonix-source", role="worker", selector=transaction.source_selector,
+        harness="reasonix", profile="flash", model_display="reasonix / flash",
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    resume = ResumeContext(
+        resumed_from_run_id="reasonix-source-run", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(source,), hotplug_transaction_number=1,
+    )
+
+    class SourceDriver:
+        capabilities = SessionCapabilities(followup_turn=True, read_only_teardown=True)
+        def build_full_context(self, run_dir):
+            return {"plan_state": {"checkpoint": 1}}
+        def handover(self, request, prompt):
+            return _valid_handover()
+
+    class TargetDriver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+        def build_invocation(self, request):
+            return HarnessInvocation(
+                label="fake-codex", argv=("codex", "exec", "--json"), env={},
+                prompt_mode="stdin", system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+                stdin_text=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            raise RuntimeError("target start failed")
+
+    with pytest.raises(WorkflowError):
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "wire", ""),
+            session_driver=TargetDriver(), source_session_driver=SourceDriver(), resume=resume,
+        )
+    run_json = next((tmp_path / ".aflow" / "runs").glob("*/run.json"))
+    state = json.loads(run_json.read_text(encoding="utf-8"))
+    assert state["active_role_sessions"][0]["session_id"] == "reasonix-source"
+    assert state["active_role_sessions"][0]["status"] == "active"
+    assert state["hotplug_history"][-1]["stage"] == "failed"
 
 
 def test_transaction_identity_is_digest_and_number_bound() -> None:

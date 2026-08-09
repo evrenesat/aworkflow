@@ -7800,10 +7800,17 @@ def run_workflow(
         state.current_hotplug_transaction = ready
         state.pending_hotplug_transaction = ready
         _write_override_boundary(status="running")
+        handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
+        projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
+        full_context_path = str((run_paths.run_dir / artifact_refs[2]).resolve())
         return (
-            "\n\nSource worker handover artifact: " + artifact_refs[0]
+            "\n\nSource worker handover:\n" + normalized
+            + "\nSource worker handover artifact: " + handover_path
             + " (sha256=" + artifact_hashes[0] + ")"
-            + "\nController continuity artifact: " + artifact_refs[2]
+            + "\n\nController continuity context:\n"
+            + "Projection artifact: " + projection_path
+            + " (sha256=" + artifact_hashes[1] + ")"
+            + "\nFull context artifact: " + full_context_path
             + " (sha256=" + artifact_hashes[2] + ")"
         )
 
