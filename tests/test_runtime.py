@@ -6,7 +6,8 @@ import hashlib
 from typing import Mapping
 from aflow.analyzer import extract_text_signals
 from aflow.api import AnalyzeRequest, analyze_runs
-from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig
+from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig, TeamConfig
+from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
 from aflow.api.events import ExecutionEventType
 from aflow.run_state import (
     ActiveImplementationScope,
@@ -1370,7 +1371,8 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 created_paths.append(paths)
                 (paths.run_dir / "overrides.toml").write_text(
                     'next_step = "review"\nteam = "strong"\nmax_turns = 3\n'
-                    'notes = ["focus on boundary behavior"]\n',
+                    'notes = ["focus on boundary behavior"]\n'
+                    '[roles]\nworker = "codex.strong"\n',
                     encoding="utf-8",
                 )
                 return paths
@@ -1416,6 +1418,13 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 'notes = ["focus on boundary behavior"]'
                 in payload["override_result"]["source_text"]
             )
+            assert payload["override_result"]["role_selectors"] == {
+                "worker": "codex.strong"
+            }
+            assert payload["hotplug_transaction_number"] == 1
+            assert payload["current_hotplug_transaction"] is None
+            assert len(payload["hotplug_history"]) == 1
+            assert payload["hotplug_history"][0]["stage"] == "applied"
 
     def test_invalid_boundary_override_waits_without_launching(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1465,18 +1474,23 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert payload["override_result"]["status"] == "rejected"
             assert "not an executable step" in payload["status_message"]
 
-    def test_boundary_override_rejects_unknown_team_without_launching(self) -> None:
+    def test_boundary_override_rejects_invalid_role_atomically_without_launching(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
-            workflow_config = _make_simple_wf_config()
+            workflow_config = replace(
+                _make_simple_wf_config(),
+                teams={"strong": TeamConfig(roles={"architect": "codex.default"})},
+            )
             actual_create = create_run_paths
+            created_paths = []
 
             def create_with_override(config):
                 paths = actual_create(config)
+                created_paths.append(paths)
                 (paths.run_dir / "overrides.toml").write_text(
-                    'team = "missing"\n',
+                    'team = "strong"\n[roles]\narchitect = "codex.missing"\n',
                     encoding="utf-8",
                 )
                 return paths
@@ -1486,7 +1500,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 "aflow.workflow.create_run_paths",
                 side_effect=create_with_override,
             ):
-                with pytest.raises(WorkflowError, match="not configured"):
+                with pytest.raises(WorkflowError, match="outside frozen config"):
                     run_workflow(
                         ControllerConfig(
                             repo_root=repo_root,
@@ -1500,6 +1514,103 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         runner=runner,
                     )
             runner.assert_not_called()
+            payload = json.loads(
+                created_paths[0].run_json.read_text(encoding="utf-8")
+            )
+            assert payload["override_result"]["status"] == "rejected"
+            assert payload.get("hotplug_transaction_number", 0) == 0
+
+    def test_direct_selector_cannot_be_overridden_as_a_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            base_config = _make_simple_wf_config()
+            workflow = base_config.workflows["simple"]
+            first_step_name, first_step = next(iter(workflow.steps.items()))
+            direct_workflow = replace(
+                workflow,
+                steps={first_step_name: replace(first_step, role="codex.base"), **{
+                    key: value for key, value in workflow.steps.items() if key != first_step_name
+                }},
+            )
+            workflow_config = replace(
+                base_config, workflows={"simple": direct_workflow}
+            )
+            actual_create = create_run_paths
+            created_paths = []
+
+            def create_with_override(config):
+                paths = actual_create(config)
+                created_paths.append(paths)
+                (paths.run_dir / "overrides.toml").write_text(
+                    '[roles]\n"codex.base" = "codex.strong"\n',
+                    encoding="utf-8",
+                )
+                return paths
+
+            runner = unittest.mock.Mock()
+            with patch("aflow.workflow.create_run_paths", side_effect=create_with_override):
+                with pytest.raises(WorkflowError, match="undeclared ordinary roles"):
+                    run_workflow(
+                        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                        workflow_config,
+                        "simple",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+            runner.assert_not_called()
+            payload = json.loads(created_paths[0].run_json.read_text(encoding="utf-8"))
+            assert payload["override_result"]["status"] == "rejected"
+
+    def test_roles_digest_cannot_replace_nonterminal_hotplug_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            worktree_path = root / "worktree"
+            repo_root.mkdir()
+            worktree_path.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            _write_plan(worktree_path / "plan.md", _VALID_PLAN)
+            predecessor_dir = repo_root / ".aflow" / "runs" / "predecessor"
+            predecessor_dir.mkdir(parents=True)
+            override_text = 'team = "strong"\n[roles]\nworker = "codex.strong"\n'
+            (predecessor_dir / "overrides.toml").write_text(override_text, encoding="utf-8")
+            digest = hashlib.sha256(override_text.encode()).hexdigest()
+            transaction = HotplugTransactionV1(
+                transaction_id=hotplug_transaction_id("predecessor", digest, 1),
+                run_id="predecessor", accepted_override_digest=digest,
+                transaction_number=1, source_role="worker", target_role="worker",
+                source_selector="codex.base", target_selector="codex.strong",
+                source_harness="codex", target_harness="codex",
+                source_profile="base", target_profile="strong",
+                source_model_display="codex / base", target_model_display="codex / strong",
+                stage="waiting_for_hotplug_recovery",
+            )
+            resume = replace(
+                _resume_override_context(
+                    repo_root=repo_root, worktree_path=worktree_path,
+                    predecessor_dir=predecessor_dir,
+                ),
+                current_hotplug_transaction=transaction,
+                hotplug_transaction_number=1,
+            )
+            runner = unittest.mock.Mock()
+            with patch("aflow.workflow._validate_worktree_resume_context", return_value=None):
+                with pytest.raises(WorkflowError, match="hotplug_in_progress") as error:
+                    run_workflow(
+                        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                        _resume_override_workflow_config(), "resume_override",
+                        config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        resume=resume,
+                    )
+            runner.assert_not_called()
+            payload = json.loads(error.value.run_dir.joinpath("run.json").read_text(encoding="utf-8"))
+            assert payload["hotplug_transaction_number"] == 1
+            assert payload["current_hotplug_transaction"]["transaction_id"] == transaction.transaction_id
+            assert payload.get("role_selectors", {}) == {}
 
     def test_override_written_during_turn_applies_only_to_following_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

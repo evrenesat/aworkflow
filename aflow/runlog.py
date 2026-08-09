@@ -23,6 +23,7 @@ from .run_state import (
     RUN_STATE_SCHEMA_VERSION,
     WorkflowEndReason,
     manager_state_payload,
+    hotplug_state_payload,
 )
 from .harnesses.base import HarnessInvocation
 
@@ -861,6 +862,7 @@ def write_run_metadata(
         payload.update(build_recovery_payload(state.current_harness_recovery, state.harness_recovery_history))
     if state is not None:
         payload.update(manager_state_payload(state))
+        payload.update(hotplug_state_payload(state))
     _write_atomic_json(paths.run_json, payload)
 
 

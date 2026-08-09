@@ -89,6 +89,7 @@ from .recovery import (
     TeamLeadRecoveryDecisionError,
 )
 from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
+from .hotplug import HotplugTransactionV1, bounded_hotplug_history, hotplug_transaction_id
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
@@ -768,7 +769,20 @@ def resolve_role_selector(
     config: WorkflowUserConfig,
     *,
     step_path: str = "<unknown>",
+    step_name: str | None = None,
+    run_local_role_selectors: Mapping[str, str] | None = None,
+    pending_team_override: PendingTeamOverride | None = None,
 ) -> str:
+    if (
+        pending_team_override is not None
+        and not pending_team_override.consumed
+        and pending_team_override.role == role
+        and step_name is not None
+        and pending_team_override.target_step == step_name
+    ):
+        return pending_team_override.selector
+    if run_local_role_selectors is not None and role in run_local_role_selectors:
+        return run_local_role_selectors[role]
     selector = config.roles.get(role)
     if selector is None:
         if "." in role:
@@ -810,12 +824,18 @@ def _resolve_step_runtime(
     *,
     team_name: str | None,
     step_path: str,
+    step_name: str | None = None,
+    run_local_role_selectors: Mapping[str, str] | None = None,
+    pending_team_override: PendingTeamOverride | None = None,
 ) -> tuple[str, ResolvedProfile]:
     selector = resolve_role_selector(
         step.role,
         team_name,
         config,
         step_path=step_path,
+        step_name=step_name,
+        run_local_role_selectors=run_local_role_selectors,
+        pending_team_override=pending_team_override,
     )
     return selector, resolve_profile(selector, config, step_path=step_path)
 
@@ -3202,6 +3222,12 @@ def run_workflow(
     )
     if resume is not None:
         state.override_result = resume.override_result
+        state.role_selectors = dict(resume.role_selectors)
+        state.current_hotplug_transaction = resume.current_hotplug_transaction
+        state.pending_hotplug_transaction = resume.pending_hotplug_transaction
+        state.active_role_sessions = tuple(resume.active_role_sessions)
+        state.hotplug_transaction_number = resume.hotplug_transaction_number
+        state.hotplug_history = list(resume.hotplug_history)
         state.pending_override_notes = resume.pending_override_notes
         state.override_source_run_dir = resume.override_source_run_dir
         state.override_file_present = resume.override_file_present
@@ -3546,6 +3572,20 @@ def run_workflow(
         state.repartition_history = list(resume.repartition_history)
         state.scope_pressure_reason = resume.scope_pressure_reason
         state.last_manager_report_path = resume.last_manager_report_path
+
+        # Finish an accepted hotplug transaction that was durably recorded
+        # immediately before a crash. Its counter and identity are reused;
+        # recovery must not create a second transaction or history entry.
+        accepted_hotplug = state.current_hotplug_transaction
+        if accepted_hotplug is not None and accepted_hotplug.stage == "accepted":
+            state.role_selectors[accepted_hotplug.target_role] = accepted_hotplug.target_selector
+            applied_hotplug = replace(accepted_hotplug, stage="applied")
+            state.current_hotplug_transaction = None
+            state.pending_hotplug_transaction = None
+            if not any(item.transaction_id == applied_hotplug.transaction_id for item in state.hotplug_history):
+                state.hotplug_history = list(
+                    bounded_hotplug_history((*state.hotplug_history, applied_hotplug))
+                )
 
         # create_run_paths may already have pruned the source run. Restore the
         # controller-owned transaction artifacts carried by ResumeContext
@@ -7336,6 +7376,7 @@ def run_workflow(
             if prior.max_turns is not None:
                 state.effective_max_turns = prior.max_turns
             state.override_result = replace(prior, applied=True)
+            state.role_selectors.update(prior.role_selectors)
             state.override_source_run_dir = None
             _write_override_boundary(status="running")
             if preserve_resume_override_source:
@@ -7402,6 +7443,47 @@ def run_workflow(
                     f"max_turns ({request.max_turns}) cannot be below completed "
                     f"turns ({state.turns_completed})"
                 )
+            if validation_error is None:
+                allowed_roles = {
+                    candidate.role for candidate in wf.steps.values()
+                    if candidate.role not in {
+                        "manager", "lifecycle", "initialization", "merge", "recovery"
+                    } and "." not in candidate.role
+                }
+                configured_selectors = {
+                    f"{harness_name}.{profile_name}"
+                    for harness_name, harness in workflow_config.harnesses.items()
+                    for profile_name in harness.profiles
+                }
+                unknown_roles = sorted(set(request.role_selectors) - allowed_roles)
+                unknown_selectors = sorted(
+                    set(request.role_selectors.values()) - configured_selectors
+                )
+                if unknown_roles:
+                    validation_error = (
+                        "roles contains undeclared ordinary roles: "
+                        + ", ".join(unknown_roles)
+                    )
+                elif unknown_selectors:
+                    validation_error = (
+                        "roles contains selectors outside frozen config: "
+                        + ", ".join(unknown_selectors)
+                    )
+                elif request.role_selectors:
+                    terminal_hotplug_stages = {"applied", "failed"}
+                    in_progress = tuple(
+                        transaction for transaction in (
+                            state.current_hotplug_transaction,
+                            state.pending_hotplug_transaction,
+                        )
+                        if transaction is not None
+                        and transaction.stage not in terminal_hotplug_stages
+                    )
+                    if in_progress:
+                        validation_error = (
+                            "hotplug_in_progress: a non-terminal hotplug transaction "
+                            "must be completed before accepting another roles digest"
+                        )
 
         if validation_error is not None or request is None:
             digest = (
@@ -7440,9 +7522,61 @@ def run_workflow(
             next_step=request.next_step,
             team=request.team,
             max_turns=request.max_turns,
+            role_selectors=dict(request.role_selectors),
             has_notes=bool(request.notes),
             applied=False,
         )
+
+        worker_target_selector = request.role_selectors.get("worker")
+        worker_transaction: HotplugTransactionV1 | None = None
+        if worker_target_selector is not None:
+            source_selector = resolve_role_selector(
+                "worker",
+                state.current_team,
+                workflow_config,
+                run_local_role_selectors=state.role_selectors,
+            )
+            if source_selector != worker_target_selector:
+                source_profile = resolve_profile(
+                    source_selector, workflow_config, step_path="hotplug source"
+                )
+                target_profile = resolve_profile(
+                    worker_target_selector, workflow_config, step_path="hotplug target"
+                )
+                transaction_number = state.hotplug_transaction_number + 1
+                worker_transaction = HotplugTransactionV1(
+                    transaction_id=hotplug_transaction_id(
+                        state.run_id or run_paths.run_dir.name,
+                        request.digest,
+                        transaction_number,
+                    ),
+                    run_id=state.run_id or run_paths.run_dir.name,
+                    accepted_override_digest=request.digest,
+                    transaction_number=transaction_number,
+                    source_role="worker",
+                    target_role="worker",
+                    source_selector=source_selector,
+                    target_selector=worker_target_selector,
+                    source_harness=source_profile.harness_name,
+                    target_harness=target_profile.harness_name,
+                    source_profile=source_profile.profile_name,
+                    target_profile=target_profile.profile_name,
+                    source_model_display=format_harness_model_display(
+                        source_profile.harness_name, source_profile.model, source_profile.effort
+                    ),
+                    target_model_display=format_harness_model_display(
+                        target_profile.harness_name, target_profile.model, target_profile.effort
+                    ),
+                    source_turn_number=state.turns_completed + 1,
+                    capability_path=(
+                        "native_resume"
+                        if source_profile.harness_name == target_profile.harness_name
+                        else "handover_required"
+                    ),
+                    stage="accepted",
+                )
+                state.hotplug_transaction_number = transaction_number
+                state.current_hotplug_transaction = worker_transaction
         _write_override_boundary(status="running")
 
         if request.next_step is not None:
@@ -7453,6 +7587,14 @@ def run_workflow(
             baseline_team_name = request.team
         if request.max_turns is not None:
             state.effective_max_turns = request.max_turns
+        state.role_selectors.update(request.role_selectors)
+        if worker_transaction is not None:
+            applied_transaction = replace(worker_transaction, stage="applied")
+            state.current_hotplug_transaction = None
+            state.pending_hotplug_transaction = None
+            if not any(item.transaction_id == applied_transaction.transaction_id for item in state.hotplug_history):
+                state.hotplug_history.append(applied_transaction)
+                state.hotplug_history = list(bounded_hotplug_history(state.hotplug_history))
         state.override_result = replace(state.override_result, applied=True)
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
@@ -7560,6 +7702,11 @@ def run_workflow(
                 workflow_config,
                 team_name=active_team_name,
                 step_path=step_path,
+                step_name=current_step_name,
+                run_local_role_selectors=state.role_selectors,
+                pending_team_override=(
+                    state.pending_step_team_override if consume_team_override else None
+                ),
             )
             system_prompt = resolve_role_prompt(
                 step.role,
@@ -7728,6 +7875,11 @@ def run_workflow(
                 workflow_config,
                 team_name=active_team_name,
                 step_path=step_path,
+                step_name=current_step_name,
+                run_local_role_selectors=state.role_selectors,
+                pending_team_override=(
+                    state.pending_step_team_override if consume_team_override else None
+                ),
             )
             system_prompt = resolve_role_prompt(
                 step.role,

@@ -8,6 +8,7 @@ from typing import Any, Literal, Mapping
 import tomllib
 
 from .plan import PlanSnapshot
+from .hotplug import HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history
 
 
 WorkflowEndReason = Literal[
@@ -40,6 +41,7 @@ class OverrideRequest:
     team: str | None = None
     max_turns: int | None = None
     notes: tuple[str, ...] = ()
+    role_selectors: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,7 @@ class OverrideResult:
     next_step: str | None = None
     team: str | None = None
     max_turns: int | None = None
+    role_selectors: Mapping[str, str] = field(default_factory=dict)
     has_notes: bool = False
     applied: bool = False
     recorded_at: str = field(
@@ -122,6 +125,14 @@ def resolve_resume_override(
                     and not isinstance(persisted_result.get("max_turns"), bool)
                     else None
                 ),
+                role_selectors={
+                    str(key): str(value)
+                    for key, value in (
+                        persisted_result.get("role_selectors", {})
+                        if isinstance(persisted_result.get("role_selectors", {}), Mapping)
+                        else {}
+                    ).items()
+                },
                 has_notes=bool(persisted_result.get("has_notes", False)),
                 applied=bool(persisted_result.get("applied", False)),
                 recorded_at=str(persisted_result.get("recorded_at", "")),
@@ -166,6 +177,8 @@ def load_override_request(
     path: Path,
     *,
     consumed_digest: str | None = None,
+    allowed_roles: set[str] | frozenset[str] | None = None,
+    configured_selectors: set[str] | frozenset[str] | None = None,
 ) -> OverrideLoadResult:
     """Load the narrow user override grammar without mutating the file."""
     if not path.is_file():
@@ -193,7 +206,7 @@ def load_override_request(
             source_text=source_text,
             message=f"malformed TOML: {exc}",
         )
-    allowed = {"next_step", "team", "max_turns", "notes"}
+    allowed = {"next_step", "team", "max_turns", "notes", "roles"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         return OverrideLoadResult(
@@ -229,6 +242,33 @@ def load_override_request(
             if not isinstance(note, str) or not note.strip():
                 raise ValueError(f"notes[{index}] must be a non-empty string")
             notes.append(note.strip())
+        roles_value = raw.get("roles", {})
+        if not isinstance(roles_value, dict):
+            raise ValueError("roles must be a table of role selectors")
+        role_selectors: dict[str, str] = {}
+        for role, selector in roles_value.items():
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("roles keys must be non-empty strings")
+            if not isinstance(selector, str) or not selector.strip() or "." not in selector:
+                raise ValueError(f"roles.{role} must be a fully qualified selector")
+            role_selectors[role.strip()] = selector.strip()
+        if "roles" in raw and not role_selectors:
+            raise ValueError("roles must not be empty")
+        if allowed_roles is not None:
+            unknown_roles = sorted(set(role_selectors) - set(allowed_roles))
+            if unknown_roles:
+                raise ValueError(
+                    f"roles contains undeclared roles: {', '.join(unknown_roles)}"
+                )
+        if configured_selectors is not None:
+            unknown_selectors = sorted(
+                set(role_selectors.values()) - set(configured_selectors)
+            )
+            if unknown_selectors:
+                raise ValueError(
+                    "roles contains selectors outside frozen config: "
+                    + ", ".join(unknown_selectors)
+                )
     except ValueError as exc:
         return OverrideLoadResult(
             status="invalid",
@@ -254,6 +294,7 @@ def load_override_request(
             team=team,
             max_turns=max_turns,
             notes=tuple(notes),
+            role_selectors=role_selectors,
         ),
     )
 
@@ -615,6 +656,12 @@ class ResumeContext:
     pending_finalized_turn: PendingFinalizedTurn | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     override_result: OverrideResult | None = None
+    role_selectors: Mapping[str, str] = field(default_factory=dict)
+    current_hotplug_transaction: HotplugTransactionV1 | None = None
+    pending_hotplug_transaction: HotplugTransactionV1 | None = None
+    active_role_sessions: tuple[HarnessSessionRefV1, ...] = ()
+    hotplug_transaction_number: int = 0
+    hotplug_history: tuple[HotplugTransactionV1, ...] = ()
     effective_max_turns: int | None = None
     pending_override_notes: tuple[str, ...] = ()
     override_source_run_dir: Path | None = None
@@ -719,6 +766,12 @@ class ControllerState:
     last_manager_report_path: str | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     override_result: OverrideResult | None = None
+    role_selectors: dict[str, str] = field(default_factory=dict)
+    current_hotplug_transaction: HotplugTransactionV1 | None = None
+    pending_hotplug_transaction: HotplugTransactionV1 | None = None
+    active_role_sessions: tuple[HarnessSessionRefV1, ...] = ()
+    hotplug_transaction_number: int = 0
+    hotplug_history: list[HotplugTransactionV1] = field(default_factory=list)
     effective_max_turns: int | None = None
     pending_override_notes: tuple[str, ...] = ()
     override_source_run_dir: Path | None = None
@@ -769,6 +822,93 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
         "repartition_history": [asdict(item) for item in state.repartition_history],
         "scope_pressure_reason": state.scope_pressure_reason,
         "last_manager_report_path": state.last_manager_report_path,
+    }
+
+
+def hotplug_state_payload(state: ControllerState) -> dict[str, object]:
+    """Serialize hotplug authority with explicit, legacy-tolerant fields."""
+    return {
+        "hotplug_schema_version": 1,
+        "role_selectors": dict(sorted(state.role_selectors.items())),
+        "current_hotplug_transaction": (
+            state.current_hotplug_transaction.to_dict()
+            if state.current_hotplug_transaction is not None else None
+        ),
+        "pending_hotplug_transaction": (
+            state.pending_hotplug_transaction.to_dict()
+            if state.pending_hotplug_transaction is not None else None
+        ),
+        "active_role_sessions": [item.to_dict() for item in state.active_role_sessions],
+        "hotplug_transaction_number": state.hotplug_transaction_number,
+        "hotplug_history": [item.to_dict() for item in bounded_hotplug_history(state.hotplug_history)],
+    }
+
+
+def restore_hotplug_state(state: ControllerState, payload: Mapping[str, Any]) -> None:
+    """Restore hotplug state, rejecting malformed modern authority before launch."""
+    if "hotplug_schema_version" not in payload:
+        return
+    schema_version = payload.get("hotplug_schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
+        raise ValueError("unsupported hotplug state schema version")
+    strict_children = True
+    selectors = payload.get("role_selectors", {})
+    if not isinstance(selectors, Mapping) or any(
+        not isinstance(role, str) or not role or not isinstance(selector, str) or "." not in selector
+        for role, selector in selectors.items()
+    ):
+        raise ValueError("invalid persisted hotplug role selectors")
+    number = payload.get("hotplug_transaction_number", 0)
+    if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+        raise ValueError("invalid persisted hotplug transaction number")
+
+    def decode_transaction(value: object) -> HotplugTransactionV1 | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise ValueError("invalid persisted hotplug transaction")
+        return HotplugTransactionV1.from_dict(value, strict=strict_children)
+
+    history_value = payload.get("hotplug_history", [])
+    if not isinstance(history_value, list) or len(history_value) > 16:
+        raise ValueError("invalid persisted hotplug history")
+    history = tuple(decode_transaction(value) for value in history_value)
+    if any(item is None for item in history):
+        raise ValueError("invalid persisted hotplug history entry")
+    sessions_value = payload.get("active_role_sessions", [])
+    if not isinstance(sessions_value, list):
+        raise ValueError("invalid persisted hotplug sessions")
+    sessions = tuple(
+        HarnessSessionRefV1.from_dict(value, strict=strict_children)
+        if isinstance(value, Mapping) else (_ for _ in ()).throw(ValueError("invalid persisted hotplug session"))
+        for value in sessions_value
+    )
+    current = decode_transaction(payload.get("current_hotplug_transaction"))
+    pending = decode_transaction(payload.get("pending_hotplug_transaction"))
+    max_number = max((item.transaction_number for item in history), default=0)
+    for item in (current, pending):
+        if item is not None:
+            max_number = max(max_number, item.transaction_number)
+    if number < max_number:
+        raise ValueError("persisted hotplug transaction number is not monotonic")
+    state.role_selectors = dict(selectors)
+    state.current_hotplug_transaction = current
+    state.pending_hotplug_transaction = pending
+    state.active_role_sessions = sessions
+    state.hotplug_transaction_number = number
+    state.hotplug_history = list(history)  # type: ignore[list-item]
+
+
+def hotplug_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    restore_hotplug_state(state, payload)
+    return {
+        "role_selectors": dict(state.role_selectors),
+        "current_hotplug_transaction": state.current_hotplug_transaction,
+        "pending_hotplug_transaction": state.pending_hotplug_transaction,
+        "active_role_sessions": tuple(state.active_role_sessions),
+        "hotplug_transaction_number": state.hotplug_transaction_number,
+        "hotplug_history": tuple(state.hotplug_history),
     }
 
 

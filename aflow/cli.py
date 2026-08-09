@@ -46,6 +46,7 @@ from .run_state import (
     ResumeContext,
     WorkflowEndReason,
     describe_end_reason,
+    hotplug_resume_fields,
     manager_resume_fields,
     resolve_resume_override,
 )
@@ -1681,6 +1682,12 @@ def _reconstruct_resume_context(
     effective_max_turns = prev_run.get("effective_max_turns")
     if not isinstance(effective_max_turns, int) or isinstance(effective_max_turns, bool) or effective_max_turns < 1:
         effective_max_turns = None
+    try:
+        hotplug_fields = hotplug_resume_fields(prev_run)
+    except (TypeError, ValueError, KeyError) as exc:
+        if require_resume:
+            raise ValueError(f"error: run '{run_id}' has invalid hotplug state: {exc}") from exc
+        return None
 
     return ResumeContext(
         resumed_from_run_id=run_id,
@@ -1717,6 +1724,7 @@ def _reconstruct_resume_context(
         scope_envelope_bytes=scope_envelope_bytes,
         scope_envelope_source_path=scope_envelope_source_path,
         repartition_artifact_bytes=repartition_artifact_bytes,
+        **hotplug_fields,
         **manager_fields,
     )
 
