@@ -35,6 +35,7 @@ from aflow.harnesses.reasonix import ReasonixAcpDriver
 from aflow.run_state import PendingTeamOverride
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, resolve_role_selector, run_workflow
+from aflow.api.events import ExecutionEventType, HotplugEvent
 
 
 def make_transaction(stage: str = "accepted") -> HotplugTransactionV1:
@@ -49,6 +50,17 @@ def make_transaction(stage: str = "accepted") -> HotplugTransactionV1:
         source_model_display="reasonix / flash", target_model_display="codex / high",
         stage=stage,
     )
+
+
+def test_hotplug_events_are_secret_safe_and_structured() -> None:
+    transaction = make_transaction("handover_ready")
+    event = HotplugEvent.create(ExecutionEventType.HOTPLUG_STAGE_CHANGED, transaction)
+    assert event.event_type == ExecutionEventType.HOTPLUG_STAGE_CHANGED
+    assert event.transaction_id == transaction.transaction_id
+    assert event.source_selector == transaction.source_selector
+    assert event.target_selector == transaction.target_selector
+    assert not hasattr(event, "session_id")
+    assert not hasattr(event, "prompt")
 
 
 def test_every_transaction_stage_round_trips() -> None:

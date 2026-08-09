@@ -110,6 +110,8 @@ from aflow.api.events import (
     StatusChangedEvent,
     TurnFinishedEvent,
     TurnStartedEvent,
+    ExecutionEventType,
+    HotplugEvent,
 )
 
 
@@ -7521,6 +7523,9 @@ def run_workflow(
             resumed_from_run_id=resumed_from_run_id,
         )
 
+    def _emit_hotplug_event(event_type: ExecutionEventType, transaction: HotplugTransactionV1) -> None:
+        _emit_event(observer, HotplugEvent.create(event_type, transaction))
+
     def _fail_hotplug_target(reason: str) -> None:
         transaction = state.current_hotplug_transaction
         if transaction is None or transaction.stage in {"applied", "failed"}:
@@ -7538,6 +7543,7 @@ def run_workflow(
         state.hotplug_history = list(bounded_hotplug_history(
             [*state.hotplug_history, failed]
         ))
+        _emit_hotplug_event(ExecutionEventType.HOTPLUG_FAILED, failed)
         state.status_message = f"hotplug target failed; source retained: {reason}"
         _write_override_boundary(status="failed")
 
@@ -7771,6 +7777,7 @@ def run_workflow(
                 )
                 state.hotplug_transaction_number = transaction_number
                 state.current_hotplug_transaction = worker_transaction
+                _emit_hotplug_event(ExecutionEventType.HOTPLUG_REQUESTED, worker_transaction)
         _write_override_boundary(status="running")
 
         if request.next_step is not None:
@@ -7788,6 +7795,7 @@ def run_workflow(
             # Keep the transaction durable until the target turn succeeds.
             state.current_hotplug_transaction = worker_transaction
             state.pending_hotplug_transaction = worker_transaction
+            _emit_hotplug_event(ExecutionEventType.HOTPLUG_REQUESTED, worker_transaction)
             # An override injected before the first worker has no live source
             # session to hand over. Preserve its accepted digest/number for
             # compatibility, but do not create a live transaction boundary.
@@ -7920,6 +7928,7 @@ def run_workflow(
         )
         state.current_hotplug_transaction = ready
         state.pending_hotplug_transaction = ready
+        _emit_hotplug_event(ExecutionEventType.HOTPLUG_STAGE_CHANGED, ready)
         _write_override_boundary(status="running")
         handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
         projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
@@ -8712,6 +8721,7 @@ def run_workflow(
                     state.hotplug_history = list(bounded_hotplug_history(
                         [*state.hotplug_history, applied_transaction]
                     ))
+                    _emit_hotplug_event(ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
                     write_run_metadata(
                         run_paths, config, state, status="running",
                         last_snapshot=state.last_snapshot,

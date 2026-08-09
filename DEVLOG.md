@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-08-09 — Durable live worker role hotplug
+
+- Added provider-neutral worker selector hotplug with durable transaction
+  stages, exact same-harness resume, and cross-harness read-only operational
+  handover.
+- Resume copies and verifies handover/projection/Full-context artifacts before
+  pruning; ambiguous provider boundaries remain waiting unless a durable
+  operation result proves a matching target completion or not-started retry.
+- Status/events/analyze expose safe transaction stages, selectors, capability
+  path, relative artifact references, and hashes while omitting prompts, notes,
+  environment, and raw session identifiers.
+- Capability evidence was protocol/fixture based; no paid live Reasonix prompt
+  smoke is claimed.
+
 ## 2026-08-08 — Prefer fastest-safe guard completion
 
 - Guarded recovery now chooses the smallest reversible, scope-reducing option

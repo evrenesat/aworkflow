@@ -221,6 +221,13 @@ def _status_display(state: ControllerState) -> str:
         if state.end_reason == "max_turns_reached":
             return "completed: max turns reached"
         return "completed: transition to END"
+    transaction = state.current_hotplug_transaction or state.pending_hotplug_transaction
+    if transaction is not None:
+        capability = transaction.capability_path or "capability pending"
+        return (
+            f"{state.status_message} | hotplug {transaction.stage}: "
+            f"{transaction.source_selector} -> {transaction.target_selector} ({capability})"
+        )
     return state.status_message
 
 

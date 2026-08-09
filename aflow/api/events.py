@@ -26,6 +26,10 @@ class ExecutionEventType(str, Enum):
     QUESTION_REQUIRED = "question_required"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
+    HOTPLUG_REQUESTED = "hotplug_requested"
+    HOTPLUG_STAGE_CHANGED = "hotplug_stage_changed"
+    HOTPLUG_APPLIED = "hotplug_applied"
+    HOTPLUG_FAILED = "hotplug_failed"
 
 
 @dataclass(frozen=True)
@@ -398,6 +402,36 @@ class RunFailedEvent:
         )
 
 
+@dataclass(frozen=True)
+class HotplugEvent:
+    """Secret-safe observability for one durable hotplug transaction boundary."""
+
+    event_type: Literal[
+        ExecutionEventType.HOTPLUG_REQUESTED,
+        ExecutionEventType.HOTPLUG_STAGE_CHANGED,
+        ExecutionEventType.HOTPLUG_APPLIED,
+        ExecutionEventType.HOTPLUG_FAILED,
+    ]
+    timestamp: datetime
+    transaction_id: str
+    role: str
+    source_selector: str
+    target_selector: str
+    capability_path: str | None
+    stage: str
+    artifact_paths: tuple[str, ...] = ()
+
+    @classmethod
+    def create(cls, event_type: ExecutionEventType, transaction: object) -> "HotplugEvent":
+        return cls(
+            event_type=event_type, timestamp=datetime.now(timezone.utc),
+            transaction_id=str(transaction.transaction_id), role=str(transaction.source_role),
+            source_selector=str(transaction.source_selector), target_selector=str(transaction.target_selector),
+            capability_path=transaction.capability_path,
+            stage=str(transaction.stage), artifact_paths=tuple(transaction.artifact_paths),
+        )
+
+
 ExecutionEvent = (
     RunStartedEvent
     | StatusChangedEvent
@@ -409,6 +443,7 @@ ExecutionEvent = (
     | QuestionRequiredEvent
     | RunCompletedEvent
     | RunFailedEvent
+    | HotplugEvent
 )
 
 

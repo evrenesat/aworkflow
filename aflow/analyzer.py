@@ -556,6 +556,49 @@ def _normalize_environment_preflight(value: object) -> dict[str, object] | None:
     return result
 
 
+def _normalize_hotplug_transaction(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    required = (
+        "transaction_id", "source_role", "source_selector", "target_selector",
+        "capability_path", "stage", "artifact_paths", "artifact_hashes",
+    )
+    if any(not isinstance(value.get(key), (str, type(None))) for key in required[:6]):
+        return None
+    paths = value.get("artifact_paths", [])
+    hashes = value.get("artifact_hashes", [])
+    if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
+        return None
+    if not isinstance(hashes, list) or not all(isinstance(item, str) for item in hashes):
+        return None
+    return {
+        "transaction_id": value["transaction_id"],
+        "source_role": value["source_role"],
+        "source_selector": value["source_selector"],
+        "target_selector": value["target_selector"],
+        "capability_path": value["capability_path"],
+        "stage": value["stage"],
+        "artifact_paths": list(paths),
+        "artifact_hashes": list(hashes),
+        "provider_operation_present": isinstance(value.get("provider_operation_id"), str),
+        "remediation": value.get("remediation") if isinstance(value.get("remediation"), str) else None,
+    }
+
+
+def _hotplug_summary(run_json: Mapping[str, Any]) -> dict[str, object]:
+    history = run_json.get("hotplug_history")
+    normalized_history = [
+        item for raw in history for item in [_normalize_hotplug_transaction(raw)] if item is not None
+    ] if isinstance(history, list) else []
+    return {
+        "current": _normalize_hotplug_transaction(run_json.get("current_hotplug_transaction")),
+        "pending": _normalize_hotplug_transaction(run_json.get("pending_hotplug_transaction")),
+        "history": normalized_history,
+        "active_session_count": len(run_json.get("active_role_sessions", []))
+        if isinstance(run_json.get("active_role_sessions"), list) else 0,
+    }
+
+
 def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str, Any]], base: Path | None) -> dict[str, Any]:
     signals: set[str] = set()
     notes: list[str] = []
@@ -693,6 +736,7 @@ def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str,
         "recovery_history": recovery_history,
         "recovery_summary": recovery_summary,
         "manager": _manager_summary(run_json),
+        "hotplug": _hotplug_summary(run_json),
         "run_id": run_dir.name,
         "selected_start_step": run_json.get("selected_start_step"),
         "signal_turns": signal_turns,
@@ -718,6 +762,7 @@ def summarize_run_compact(run_dir: Path, run_json: dict[str, Any], turns: list[d
         "recovery_history": detailed["recovery_history"],
         "recovery_summary": detailed["recovery_summary"],
         "manager": detailed["manager"],
+        "hotplug": detailed["hotplug"],
         "paths": {
             "run_dir": detailed["paths"]["run_dir"],
             "run_json": detailed["paths"]["run_json"],

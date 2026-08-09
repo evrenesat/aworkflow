@@ -109,6 +109,27 @@ Resume reuses a compatible unfinished worktree run and reconstructs its saved
 plan and invocation identity when no plan is supplied. Detailed compatibility,
 recovery, supervision, and next-turn override rules are documented separately.
 
+### Live worker role hotplug
+
+An override may change a worker selector at the next safe worker boundary:
+
+```toml
+[roles]
+worker = "codex.strong"
+```
+
+The frozen workflow configuration validates selectors before accepting the
+digest. `team` and manager-owned one-turn upgrades retain their existing
+precedence; a run-local `[roles]` change is applied only after the current
+worker turn is durable. Same-harness changes require exact session resume and
+model capability. Cross-harness changes require a read-only operational
+handover; they do not migrate hidden context. Unsupported provider capabilities,
+invalid artifacts, capability drift, and ambiguous crashes fail closed.
+
+`aflow analyze <run-id>` reports hotplug stage, selectors, relative artifact
+paths, hashes, and whether a provider operation is present. It intentionally
+omits raw prompts, notes, environment, and provider session identifiers.
+
 ## Local development
 
 Run AFlow from a checkout:

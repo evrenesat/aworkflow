@@ -690,6 +690,29 @@ workflow execution. React keys and API requests carry `provider_id` and
 
 ### Control Flow
 
+### Live worker hotplug boundary
+
+The controller consumes a run-owned override digest at a post-turn boundary,
+validates the selector against the frozen workflow configuration, and persists
+one immutable `HotplugTransactionV1`. Its stages are accepted, preflighted,
+quiescing/source-finalized, handover-ready, target-starting, applied, failed,
+or waiting-for-hotplug-recovery. Only applied and failed are terminal.
+
+Same-harness targets use an exact active source session and capability-gated
+native resume. Cross-harness targets first pass target preflight, then use an
+enforced read-only source handover and three hash-bound artifacts (handover,
+projection, and Full context). The target prompt contains bounded operational
+sections and resolvable artifact references, never hidden context or raw
+provider transport.
+
+Resume copies and verifies required artifacts into the successor before
+pruning. `handover_starting`, `target_starting`, and `quiescing` are ambiguous
+without durable provider evidence and stop before any harness launch. A valid
+provider result must match the recorded operation/idempotency identity,
+selector, and session contract before restoring the target mapping/session.
+Broad analysis exposes stages, relative artifact paths, hashes, and operation
+presence only.
+
 ```text
 browser -> canonical planning routes -> project authorization -> planning service
                                                      |
