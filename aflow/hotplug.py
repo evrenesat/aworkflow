@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -477,3 +477,74 @@ def write_hotplug_artifact(run_dir: Path, relative_path: str,
 
 def bounded_hotplug_history(history: tuple[HotplugTransactionV1, ...] | list[HotplugTransactionV1]) -> tuple[HotplugTransactionV1, ...]:
     return tuple(history[-_MAX_HISTORY:])
+
+
+HOTPLUG_TERMINAL_STAGES = frozenset({"applied", "failed"})
+HOTPLUG_AMBIGUOUS_STAGES = frozenset({"handover_starting", "target_starting"})
+
+
+def _read_bound_artifact(run_dir: Path, relative_path: str, expected_hash: str) -> bytes:
+    path = safe_hotplug_artifact_path(run_dir, relative_path)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"hotplug artifact is missing: {relative_path}") from exc
+    observed = hashlib.sha256(data).hexdigest()
+    if observed != expected_hash:
+        raise ValueError(
+            f"hotplug artifact hash mismatch for {relative_path}: "
+            f"expected {expected_hash}, observed {observed}"
+        )
+    return data
+
+
+def validate_hotplug_resume_artifacts(run_dir: Path, transaction: HotplugTransactionV1) -> None:
+    """Validate every artifact required to continue a persisted transaction."""
+    if transaction.stage in HOTPLUG_TERMINAL_STAGES | {"accepted", "target_preflighted", "source_finalized"}:
+        return
+    if transaction.stage == "waiting_for_hotplug_recovery" and not transaction.artifact_paths:
+        return
+    if transaction.source_session is None:
+        raise ValueError("hotplug handover stage requires an exact source session id")
+    if transaction.stage in HOTPLUG_AMBIGUOUS_STAGES and not transaction.artifact_paths:
+        return
+    if len(transaction.artifact_paths) != 3 or len(transaction.artifact_hashes) != 3:
+        raise ValueError("hotplug handover requires exactly three bound artifacts")
+    for relative, digest in zip(transaction.artifact_paths, transaction.artifact_hashes):
+        _read_bound_artifact(run_dir, relative, digest)
+    try:
+        json.loads(_read_bound_artifact(run_dir, transaction.artifact_paths[1], transaction.artifact_hashes[1]))
+        json.loads(_read_bound_artifact(run_dir, transaction.artifact_paths[2], transaction.artifact_hashes[2]))
+    except json.JSONDecodeError as exc:
+        raise ValueError("hotplug continuity artifact is not valid JSON") from exc
+
+
+def classify_hotplug_resume_stage(
+    run_dir: Path, transaction: HotplugTransactionV1,
+) -> HotplugTransactionV1:
+    """Return the fail-closed resume state for a transaction boundary."""
+    validate_hotplug_resume_artifacts(run_dir, transaction)
+    if transaction.stage in HOTPLUG_AMBIGUOUS_STAGES:
+        return replace(
+            transaction,
+            stage="waiting_for_hotplug_recovery",
+            remediation=(
+                "provider operation result is unavailable; inspect the durable "
+                "provider/session operation before retrying"
+            ),
+        )
+    return transaction
+
+
+def copy_hotplug_resume_artifacts(
+    source_run_dir: Path, target_run_dir: Path, transaction: HotplugTransactionV1,
+) -> None:
+    """Copy and hash-bind immutable hotplug artifacts into a successor run."""
+    if not transaction.artifact_paths:
+        return
+    validate_hotplug_resume_artifacts(source_run_dir, transaction)
+    for relative, digest in zip(transaction.artifact_paths, transaction.artifact_hashes):
+        data = _read_bound_artifact(source_run_dir, relative, digest)
+        new_relative, new_digest = write_hotplug_artifact(target_run_dir, relative, data)
+        if new_relative != relative or new_digest != digest:
+            raise ValueError(f"hotplug artifact copy changed bytes: {relative}")

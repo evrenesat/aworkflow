@@ -93,6 +93,7 @@ from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
     build_handover_context_v1, render_handover_prompt, validate_handover_output,
     workspace_fingerprint, write_handover_artifacts, hotplug_transaction_id,
+    classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
 )
 from .harnesses.session import SessionDriver, SessionRequest
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
@@ -3288,6 +3289,40 @@ def run_workflow(
         state.pending_override_notes = resume.pending_override_notes
         state.override_source_run_dir = resume.override_source_run_dir
         state.override_file_present = resume.override_file_present
+        transactions = [
+            item for item in (state.current_hotplug_transaction, state.pending_hotplug_transaction)
+            if item is not None
+        ]
+        if transactions and any(item != transactions[0] for item in transactions[1:]):
+            raise WorkflowError("resume hotplug state has conflicting current and pending transactions")
+        if transactions:
+            transaction = transactions[0]
+            predecessor_dir = run_paths.runs_root / resume.resumed_from_run_id
+            try:
+                reconciled = classify_hotplug_resume_stage(predecessor_dir, transaction)
+                if transaction.artifact_paths:
+                    copy_hotplug_resume_artifacts(predecessor_dir, run_paths.run_dir, transaction)
+            except (OSError, ValueError) as exc:
+                raise WorkflowError(
+                    f"resume hotplug artifact binding failed closed: {exc}"
+                ) from exc
+            if reconciled != transaction or (
+                reconciled.stage == "waiting_for_hotplug_recovery"
+                and reconciled.source_session is not None
+            ):
+                state.current_hotplug_transaction = reconciled
+                state.pending_hotplug_transaction = reconciled
+                state.status_message = (
+                    "waiting_for_hotplug_recovery: "
+                    + (reconciled.remediation or "ambiguous provider boundary")
+                )
+                write_run_metadata(
+                    run_paths, config, state, status="waiting_for_hotplug_recovery",
+                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                    active_plan_path=active_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                raise WorkflowError(state.status_message, run_dir=run_paths.run_dir)
     state.status_message = "initializing"
     state.selected_start_step = config.start_step
     state.startup_recovery_used = startup_retry is not None

@@ -14,6 +14,8 @@ from aflow.hotplug import (
     HotplugTransactionV1,
     build_handover_context_v1,
     bounded_hotplug_history,
+    classify_hotplug_resume_stage,
+    copy_hotplug_resume_artifacts,
     hotplug_artifact_dir,
     hotplug_transaction_id,
     render_handover_prompt,
@@ -836,6 +838,94 @@ def test_pending_waiting_for_recovery_round_trips_as_nonterminal_state() -> None
     restored = hotplug_resume_fields(hotplug_state_payload(state))
     assert restored["pending_hotplug_transaction"] == transaction
     assert restored["pending_hotplug_transaction"].stage == "waiting_for_hotplug_recovery"
+
+
+@pytest.mark.parametrize("stage", ["accepted", "target_preflighted", "source_finalized", "applied", "failed"])
+def test_hotplug_resume_replays_only_safe_durable_stages(tmp_path: Path, stage: str) -> None:
+    transaction = make_transaction(stage)
+    assert classify_hotplug_resume_stage(tmp_path, transaction) == transaction
+
+
+@pytest.mark.parametrize("stage", ["handover_starting", "target_starting"])
+def test_hotplug_resume_marks_provider_boundary_ambiguous(tmp_path: Path, stage: str) -> None:
+    transaction = make_transaction(stage)
+    source = HarnessSessionRefV1(
+        session_id="source", role="worker", selector=transaction.source_selector,
+        harness=transaction.source_harness, profile=transaction.source_profile,
+        model_display=transaction.source_model_display,
+    )
+    recovered = classify_hotplug_resume_stage(
+        tmp_path, replace(transaction, source_session=source)
+    )
+    assert recovered.stage == "waiting_for_hotplug_recovery"
+    assert "provider operation result" in (recovered.remediation or "")
+
+
+def test_hotplug_resume_binds_and_copies_handover_artifacts_and_rejects_drift(tmp_path: Path) -> None:
+    predecessor = tmp_path / "predecessor"
+    successor = tmp_path / "successor"
+    transaction = make_transaction("handover_ready")
+    source = HarnessSessionRefV1(
+        session_id="source", role="worker", selector=transaction.source_selector,
+        harness=transaction.source_harness, profile=transaction.source_profile,
+        model_display=transaction.source_model_display,
+    )
+    refs, hashes = write_handover_artifacts(
+        predecessor, 1, build_handover_context_v1(transaction, {"plan_state": {"checkpoint": 1}}),
+        _valid_handover(), {"plan_state": {"checkpoint": 1}},
+    )
+    bound = replace(transaction, source_session=source, artifact_paths=refs, artifact_hashes=hashes)
+    copy_hotplug_resume_artifacts(predecessor, successor, bound)
+    assert all((successor / ref).is_file() for ref in refs)
+    (predecessor / refs[0]).write_text("corrupt", encoding="utf-8")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        classify_hotplug_resume_stage(predecessor, bound)
+
+
+def test_hotplug_resume_rejects_missing_source_session_and_artifacts(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exact source session"):
+        classify_hotplug_resume_stage(tmp_path, make_transaction("handover_ready"))
+    source = HarnessSessionRefV1(
+        session_id="source", role="worker", selector="reasonix.flash",
+        harness="reasonix", profile="flash", model_display="reasonix / flash",
+    )
+    with pytest.raises(ValueError, match="exactly three"):
+        classify_hotplug_resume_stage(
+            tmp_path, replace(make_transaction("handover_ready"), source_session=source)
+        )
+
+
+def test_run_resume_ambiguous_target_start_never_launches_harness(tmp_path: Path) -> None:
+    predecessor = tmp_path / ".aflow" / "runs" / "predecessor"
+    predecessor.mkdir(parents=True)
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    transaction = make_transaction("target_starting")
+    source = HarnessSessionRefV1(
+        session_id="source", role="worker", selector=transaction.source_selector,
+        harness=transaction.source_harness, profile=transaction.source_profile,
+        model_display=transaction.source_model_display,
+    )
+    transaction = replace(transaction, source_session=source)
+    resume = ResumeContext(
+        resumed_from_run_id="predecessor", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(source,), hotplug_transaction_number=1,
+    )
+    calls: list[object] = []
+    with pytest.raises(WorkflowError, match="waiting_for_hotplug_recovery"):
+        run_workflow(
+            ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+            _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            runner=lambda *args, **kwargs: calls.append(args) or subprocess.CompletedProcess(args[0], 0, "", ""),
+            resume=resume,
+        )
+    assert calls == []
+    run_json = next((tmp_path / ".aflow" / "runs").glob("*/run.json"))
+    persisted = json.loads(run_json.read_text(encoding="utf-8"))
+    assert persisted["current_hotplug_transaction"]["stage"] == "waiting_for_hotplug_recovery"
 
 
 @pytest.mark.parametrize("field", [
