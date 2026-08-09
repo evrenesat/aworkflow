@@ -8,19 +8,27 @@ import pytest
 
 from aflow.hotplug import (
     HOTPLUG_STAGES,
+    HANDOVER_HEADINGS,
     HarnessSessionRefV1,
+    HandoverContextV1,
     HotplugTransactionV1,
+    build_handover_context_v1,
     bounded_hotplug_history,
     hotplug_artifact_dir,
     hotplug_transaction_id,
+    render_handover_prompt,
     safe_hotplug_artifact_path,
+    validate_handover_output,
+    workspace_fingerprint,
+    write_handover_artifacts,
     write_hotplug_artifact,
 )
 from aflow.plan import PlanSnapshot
 from aflow.run_state import ControllerState, RetryContext, ResumeContext, hotplug_resume_fields, hotplug_state_payload, load_override_request
 from aflow.config import GoTransition, HarnessProfileConfig, TeamConfig, WorkflowConfig, WorkflowHarnessConfig, WorkflowStepConfig, WorkflowUserConfig
 from aflow.harnesses.codex import CodexAdapter
-from aflow.harnesses.session import SessionRequest
+from aflow.harnesses.base import HarnessInvocation
+from aflow.harnesses.session import SessionCapabilities, SessionRequest, SessionResult
 from aflow.run_state import PendingTeamOverride
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, resolve_role_selector, run_workflow
@@ -550,6 +558,123 @@ def test_crash_resume_before_target_start_or_success_keeps_transaction_nontermin
     assert sum(call[:4] == ("codex", "exec", "resume", "source") for call in calls) == 2
     assert after["hotplug_history"][-1]["transaction_id"] == persisted["current_hotplug_transaction"]["transaction_id"]
     assert after["hotplug_history"][-1]["stage"] == "applied"
+
+
+def _valid_handover() -> str:
+    return "\n".join(f"## {heading}\n- bounded operational evidence" for heading in HANDOVER_HEADINGS)
+
+
+def test_cross_harness_handover_context_is_bounded_and_redacted(tmp_path: Path) -> None:
+    transaction = make_transaction()
+    context = build_handover_context_v1(
+        transaction,
+        {
+            "plan_state": {"checkpoint": 1, "name": "First"},
+            "active_implementation_scope": {"scope_id": "scope-1"},
+            "completed_work": ["implemented boundary"],
+            "implementation_attempts": [{"turn": 1, "selector": "reasonix.flash"}],
+            "latest_full_rejection": {"summary": "repair required"},
+            "run_summary": {"turns_completed": 1},
+            "workspace_facts": {"dirty": True},
+            "manager_action": "must-not-cross-boundary",
+            "prompt": "must-not-cross-boundary",
+        },
+        artifact_refs=("hotplugs/hotplug-001/transaction.json",),
+    )
+    assert isinstance(context, HandoverContextV1)
+    payload = json.dumps(context.to_dict(), sort_keys=True)
+    assert "must-not-cross-boundary" not in payload
+    assert len(payload.encode()) < 8192
+    prompt = render_handover_prompt(transaction, context)
+    assert "Source worker handover" not in prompt
+    assert transaction.transaction_id in prompt
+    assert "## Objective And Checkpoint" in prompt
+
+
+def test_cross_harness_handover_requires_all_sections_and_8k_bound() -> None:
+    assert validate_handover_output(_valid_handover()).endswith("\n")
+    with pytest.raises(ValueError, match="missing sections"):
+        validate_handover_output("## Objective And Checkpoint\n- incomplete")
+    with pytest.raises(ValueError, match="8 KiB"):
+        validate_handover_output(_valid_handover() + "x" * 9000)
+    with pytest.raises(ValueError, match="hidden reasoning"):
+        validate_handover_output(_valid_handover().replace("bounded operational evidence", "hidden reasoning"))
+
+
+def test_cross_harness_artifacts_are_hash_bound_and_workspace_fingerprint_detects_mutation(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n", encoding="utf-8")
+    before = workspace_fingerprint(tmp_path, (plan,))
+    transaction = make_transaction()
+    context = build_handover_context_v1(transaction, {"plan_state": {"checkpoint": 1}})
+    paths, hashes = write_handover_artifacts(tmp_path, 1, context, _valid_handover())
+    assert paths == ("hotplugs/hotplug-001/handover.md", "hotplugs/hotplug-001/context.json")
+    assert all(len(value) == 64 for value in hashes)
+    plan.write_text("# Mutated\n", encoding="utf-8")
+    after = workspace_fingerprint(tmp_path, (plan,))
+    assert before["sha256"] != after["sha256"]
+
+
+def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_path: Path) -> None:
+    transaction = make_transaction("accepted")
+    source = HarnessSessionRefV1(
+        session_id="reasonix-source", role="worker", selector=transaction.source_selector,
+        harness="reasonix", profile="flash", model_display="reasonix / flash",
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    resume = ResumeContext(
+        resumed_from_run_id="reasonix-source-run", feature_branch=None,
+        worktree_path=None, main_branch=None, setup=(), teardown=(),
+        interrupted_step_name="implement", role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
+        active_role_sessions=(source,), hotplug_transaction_number=1,
+    )
+    class CrossDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True, followup_turn=True, read_only_teardown=True,
+            idempotent_turn_start=True,
+        )
+        handovers = 0
+        starts = 0
+        prompt = ""
+        idempotency_key = None
+        def build_full_context(self, run_dir):
+            return {"plan_state": {"checkpoint": 1}, "workspace_facts": {"dirty": False}}
+        def handover(self, request, prompt):
+            self.handovers += 1
+            return _valid_handover()
+        def build_invocation(self, request):
+            self.prompt = request.user_prompt
+            self.idempotency_key = request.idempotency_key
+            return HarnessInvocation(
+                label="fake-codex", argv=("codex", "exec", "--json"), env={},
+                prompt_mode="stdin", system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt, effective_prompt=request.user_prompt,
+                stdin_text=request.user_prompt,
+            )
+        def parse_result(self, request, stdout, *, returncode=0):
+            self.starts += 1
+            return SessionResult(
+                session_id="codex-target", selector=request.selector, model=request.model,
+                effort=request.effort, final_output="DONE", capabilities=self.capabilities,
+            )
+    driver = CrossDriver()
+    def runner(argv, **kwargs):
+        plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "wire", "")
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+        _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+        runner=runner, session_driver=driver, resume=resume,
+    )
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert driver.handovers == 1
+    assert driver.starts == 1
+    assert driver.idempotency_key == transaction.transaction_id
+    assert "Source worker handover" in driver.prompt
+    assert state["hotplug_history"][-1]["stage"] == "applied"
+    assert len(state["hotplug_history"][-1]["artifact_hashes"]) == 2
 
 
 def test_transaction_identity_is_digest_and_number_bound() -> None:

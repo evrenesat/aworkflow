@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Literal, Mapping
 from uuid import uuid4
 
@@ -24,6 +25,13 @@ HotplugStage = Literal[
 ]
 _MAX_HISTORY = 16
 _SHA256_HEX = 64
+HANDOVER_MAX_BYTES = 8192
+HANDOVER_HEADINGS = (
+    "Objective And Checkpoint", "Completed Work", "Changed Files",
+    "Verification", "Unfinished Work And Exact Next Action",
+    "Decisions And Assumptions", "Hazards And Dirty State",
+    "Relevant Paths And Artifacts",
+)
 
 
 def _safe_text(value: object | None, *, limit: int = 512) -> str | None:
@@ -232,6 +240,155 @@ class HotplugTransactionV1:
                    capability_path=capability_path, stage=stage,
                    artifact_paths=tuple(artifact_paths), artifact_hashes=tuple(artifact_hashes),
                    failure=failure, remediation=remediation, created_at=created_at)
+
+
+@dataclass(frozen=True)
+class HandoverContextV1:
+    """Bounded controller projection used for cross-harness bootstrap."""
+
+    transaction_id: str
+    source_selector: str
+    target_selector: str
+    objective: str
+    checkpoint: Mapping[str, object]
+    scope: Mapping[str, object]
+    completed_work: tuple[str, ...]
+    implementation_attempts: tuple[Mapping[str, object], ...]
+    rejection_summary: str | None
+    run_summary: Mapping[str, object]
+    workspace_facts: Mapping[str, object]
+    artifact_refs: tuple[str, ...]
+    full_context_sha256: str
+    schema_version: int = HOTPLUG_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != HOTPLUG_SCHEMA_VERSION:
+            raise ValueError("unsupported handover context schema version")
+        for value in (self.transaction_id, self.source_selector, self.target_selector, self.objective, self.full_context_sha256):
+            if _safe_text(value, limit=2048) is None:
+                raise ValueError("handover context authority fields are required")
+        if not _is_sha256(self.full_context_sha256):
+            raise ValueError("full_context_sha256 must be a SHA-256 hex digest")
+        for path in self.artifact_refs:
+            _validate_artifact_reference(path)
+
+    def to_dict(self) -> dict[str, object]:
+        result = asdict(self)
+        result["artifact_refs"] = list(self.artifact_refs)
+        result["completed_work"] = list(self.completed_work)
+        result["implementation_attempts"] = [dict(item) for item in self.implementation_attempts]
+        return result
+
+
+def _bounded_context_value(value: object, *, limit: int = 2048) -> object:
+    """Keep context JSON deterministic and prevent transcript/prompt leakage."""
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, Mapping):
+        return {str(key): _bounded_context_value(child, limit=limit) for key, child in list(value.items())[:32]}
+    if isinstance(value, (list, tuple)):
+        return [_bounded_context_value(child, limit=limit) for child in list(value)[:32]]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:limit]
+
+
+def build_handover_context_v1(
+    transaction: HotplugTransactionV1,
+    full_context: Mapping[str, object],
+    *,
+    artifact_refs: tuple[str, ...] = (),
+) -> HandoverContextV1:
+    """Project Full evidence without manager authority, prompts, or secrets."""
+    canonical = json.dumps(_bounded_context_value(full_context), sort_keys=True, separators=(",", ":"))
+    plan_state = full_context.get("plan_state", {})
+    scope = full_context.get("active_implementation_scope", {})
+    attempts = full_context.get("implementation_attempts", ())
+    rejections = full_context.get("latest_full_rejection", {})
+    run_summary = full_context.get("run_summary", {})
+    workspace = full_context.get("workspace_facts", {})
+    completed = full_context.get("completed_work", ())
+    return HandoverContextV1(
+        transaction_id=transaction.transaction_id,
+        source_selector=transaction.source_selector,
+        target_selector=transaction.target_selector,
+        objective="Continue the selected workflow checkpoint from the source worker boundary.",
+        checkpoint=_bounded_context_value(plan_state) if isinstance(plan_state, Mapping) else {},
+        scope=_bounded_context_value(scope) if isinstance(scope, Mapping) else {},
+        completed_work=tuple(str(item)[:512] for item in completed if isinstance(item, str)) if isinstance(completed, (list, tuple)) else (),
+        implementation_attempts=tuple(
+            _bounded_context_value(item) for item in attempts if isinstance(item, Mapping)
+        ) if isinstance(attempts, (list, tuple)) else (),
+        rejection_summary=(
+            str(rejections.get("summary", ""))[:2048]
+            if isinstance(rejections, Mapping) and rejections.get("summary") else None
+        ),
+        run_summary=_bounded_context_value(run_summary) if isinstance(run_summary, Mapping) else {},
+        workspace_facts=_bounded_context_value(workspace) if isinstance(workspace, Mapping) else {},
+        artifact_refs=tuple(artifact_refs),
+        full_context_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
+
+
+def validate_handover_output(output: str, *, max_bytes: int = HANDOVER_MAX_BYTES) -> str:
+    if not isinstance(output, str):
+        raise ValueError("handover output must be text")
+    normalized = output.replace("\r\n", "\n").strip()
+    if not normalized or len(normalized.encode("utf-8")) > max_bytes:
+        raise ValueError("handover output is empty or exceeds the 8 KiB bound")
+    missing = [heading for heading in HANDOVER_HEADINGS if f"## {heading}" not in normalized]
+    if missing:
+        raise ValueError("handover output is missing sections: " + ", ".join(missing))
+    if any(marker in normalized.lower() for marker in ("chain of thought", "scratchpad", "hidden reasoning")):
+        raise ValueError("handover output requests hidden reasoning")
+    return normalized + "\n"
+
+
+def render_handover_prompt(
+    transaction: HotplugTransactionV1,
+    context: HandoverContextV1,
+) -> str:
+    return (
+        "Produce a bounded operational handover for the controller.\n"
+        "Do not modify the repository, plan, or run artifacts. Do not disclose hidden reasoning.\n"
+        f"Transaction: {transaction.transaction_id}\n"
+        f"Target selector: {transaction.target_selector}\n"
+        "Read the plan and worktree as authoritative over conflicting prose.\n\n"
+        "Required Markdown sections:\n"
+        + "\n".join(f"## {heading}" for heading in HANDOVER_HEADINGS)
+        + "\n\nController continuity context (artifact reference only):\n"
+        + json.dumps(context.to_dict(), sort_keys=True, separators=(",", ":"))
+    )
+
+
+def workspace_fingerprint(repo_root: Path, plan_paths: tuple[Path, ...] = ()) -> dict[str, object]:
+    """Fingerprint tracked/untracked state and plan bytes for read-only enforcement."""
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, check=False)
+        return result.stdout.strip()
+    plans = {}
+    for path in plan_paths:
+        try:
+            plans[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            plans[str(path)] = "<missing>"
+    payload = {"head": git("rev-parse", "HEAD"), "status": git("status", "--porcelain=v1", "--untracked-files=all"), "plans": plans}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
+
+
+def write_handover_artifacts(
+    run_dir: Path,
+    transaction_number: int,
+    context: HandoverContextV1,
+    output: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    normalized = validate_handover_output(output)
+    prefix = f"hotplugs/hotplug-{transaction_number:03d}"
+    output_ref, output_hash = write_hotplug_artifact(run_dir, f"{prefix}/handover.md", normalized)
+    context_ref, context_hash = write_hotplug_artifact(run_dir, f"{prefix}/context.json", context.to_dict())
+    return (output_ref, context_ref), (output_hash, context_hash)
 
 
 def hotplug_artifact_dir(run_dir: Path, transaction_number: int) -> Path:

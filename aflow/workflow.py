@@ -89,7 +89,11 @@ from .recovery import (
     TeamLeadRecoveryDecisionError,
 )
 from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
-from .hotplug import HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history, hotplug_transaction_id
+from .hotplug import (
+    HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
+    build_handover_context_v1, render_handover_prompt, validate_handover_output,
+    workspace_fingerprint, write_handover_artifacts, hotplug_transaction_id,
+)
 from .harnesses.session import SessionDriver, SessionRequest
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
@@ -7656,6 +7660,15 @@ def run_workflow(
             # Keep the transaction durable until the target turn succeeds.
             state.current_hotplug_transaction = worker_transaction
             state.pending_hotplug_transaction = worker_transaction
+            # An override injected before the first worker has no live source
+            # session to hand over. Preserve its accepted digest/number for
+            # compatibility, but do not create a live transaction boundary.
+            if state.turns_completed == 0 and not state.active_role_sessions:
+                state.current_hotplug_transaction = None
+                state.pending_hotplug_transaction = None
+                state.hotplug_history = list(bounded_hotplug_history(
+                    [*state.hotplug_history, replace(worker_transaction, stage="applied")]
+                ))
         state.override_result = replace(state.override_result, applied=True)
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
@@ -7695,6 +7708,94 @@ def run_workflow(
             "hotplug request observed; finishing the current worker boundary"
         )
 
+    def _prepare_cross_harness_handover(
+        transaction: HotplugTransactionV1,
+        driver: SessionDriver,
+        *,
+        selector: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        """Collect one bounded read-only source brief before a cross-harness target."""
+        capabilities = getattr(driver, "capabilities", None)
+        if capabilities is None or not capabilities.followup_turn or not capabilities.read_only_teardown:
+            raise RuntimeError(
+                "cross-harness hotplug requires followup_turn and enforced read_only_teardown"
+            )
+        source_session = next(
+            (
+                item for item in state.active_role_sessions
+                if item.role == transaction.source_role
+                and item.selector == transaction.source_selector
+                and item.harness == transaction.source_harness
+                and item.status == "active"
+            ),
+            None,
+        )
+        if source_session is None:
+            raise RuntimeError("cross-harness hotplug requires an exact active source session")
+        context_builder = getattr(driver, "build_full_context", None)
+        if callable(context_builder):
+            full_context = context_builder(run_paths.run_dir)
+        else:
+            full_context = build_manager_context(
+                run_paths.run_dir, level="full", trigger="hotplug_handover",
+            )
+        if not isinstance(full_context, Mapping):
+            raise RuntimeError("Full handover context is unavailable")
+        context = build_handover_context_v1(transaction, full_context)
+        prompt = render_handover_prompt(transaction, context)
+        before = workspace_fingerprint(
+            execution_repo_root, (original_plan_path, active_plan_path)
+        )
+        handover = getattr(driver, "handover", None)
+        if not callable(handover):
+            raise RuntimeError("source driver does not implement read-only handover")
+        source_request = SessionRequest(
+            repo_root=execution_repo_root,
+            selector=transaction.source_selector,
+            model=None,
+            effort=None,
+            system_prompt="",
+            user_prompt=prompt,
+            session_id=source_session.session_id,
+        )
+        try:
+            output = handover(source_request, prompt)
+        except TypeError:
+            output = handover(source_request)
+        if not isinstance(output, str):
+            output = getattr(output, "final_output", None)
+        normalized = validate_handover_output(output)
+        after = workspace_fingerprint(
+            execution_repo_root, (original_plan_path, active_plan_path)
+        )
+        if before["sha256"] != after["sha256"]:
+            raise RuntimeError("read-only source handover changed the workspace or plan")
+        artifact_refs, artifact_hashes = write_handover_artifacts(
+            run_paths.run_dir, transaction.transaction_number, context, normalized,
+        )
+        ready = replace(
+            transaction,
+            stage="handover_ready",
+            source_session=replace(source_session, status="handed_over"),
+            artifact_paths=artifact_refs,
+            artifact_hashes=artifact_hashes,
+        )
+        state.current_hotplug_transaction = ready
+        state.pending_hotplug_transaction = ready
+        state.active_role_sessions = tuple(
+            replace(item, status="handed_over")
+            if item.session_id == source_session.session_id else item
+            for item in state.active_role_sessions
+        )
+        _write_override_boundary(status="running")
+        return (
+            "\n\nSource worker handover:\n" + normalized
+            + "\n\nController continuity context:\n"
+            + json.dumps(context.to_dict(), sort_keys=True, separators=(",", ":"))
+        )
+
     turn_number = 1
     while turn_number <= (state.effective_max_turns or config.max_turns):
         current_step_name, baseline_team_name = _apply_boundary_override()
@@ -7712,6 +7813,7 @@ def run_workflow(
         consume_team_override = False
         turn_session_request: SessionRequest | None = None
         owned_session_result = None
+        cross_handover_prompt = ""
         live_session_driver = None
         live_session_id = None
 
@@ -7832,11 +7934,27 @@ def run_workflow(
                         )
                     )
                 transaction = state.current_hotplug_transaction
+                if (
+                    (runner is None or session_driver is not None)
+                    and
+                    step.role == "worker"
+                    and transaction is not None
+                    and transaction.target_selector == selector
+                    and transaction.source_harness != transaction.target_harness
+                    and turn_session_driver is not None
+                ):
+                    cross_handover_prompt = _prepare_cross_harness_handover(
+                        transaction, turn_session_driver, selector=selector,
+                        system_prompt=system_prompt, user_prompt=user_prompt,
+                    )
+                    user_prompt += cross_handover_prompt
                 owned_executor = (
                     callable(getattr(turn_session_driver, "execute_session", None))
                     if turn_session_driver is not None else False
                 )
                 if (
+                    (runner is None or session_driver is not None)
+                    and
                     step.role == "worker"
                     and transaction is not None
                     and transaction.target_selector == selector
@@ -7897,6 +8015,12 @@ def run_workflow(
                                 turn_session_driver.capabilities.resume_with_model
                                 or owned_executor
                             )
+                            else None
+                        ),
+                        idempotency_key=(
+                            transaction.transaction_id
+                            if transaction is not None
+                            and transaction.source_harness != transaction.target_harness
                             else None
                         ),
                     )
@@ -8116,6 +8240,18 @@ def run_workflow(
                     )
 
                 transaction = state.current_hotplug_transaction
+                if (
+                    step.role == "worker"
+                    and transaction is not None
+                    and transaction.target_selector == selector
+                    and transaction.source_harness != transaction.target_harness
+                    and turn_session_driver is not None
+                ):
+                    cross_handover_prompt = _prepare_cross_harness_handover(
+                        transaction, turn_session_driver, selector=selector,
+                        system_prompt=system_prompt, user_prompt=user_prompt,
+                    )
+                    user_prompt += cross_handover_prompt
                 owned_executor = (
                     callable(getattr(turn_session_driver, "execute_session", None))
                     if turn_session_driver is not None else False
@@ -8181,6 +8317,12 @@ def run_workflow(
                                 turn_session_driver.capabilities.resume_with_model
                                 or owned_executor
                             )
+                            else None
+                        ),
+                        idempotency_key=(
+                            transaction.transaction_id
+                            if transaction is not None
+                            and transaction.source_harness != transaction.target_harness
                             else None
                         ),
                     )
