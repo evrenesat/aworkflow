@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import select
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from .base import HarnessInvocation
-from .session import SessionCapabilities, SessionRequest, SessionResult, parse_structured_result
+from .session import SessionCapabilities, SessionExecutionResult, SessionRequest, SessionResult
 from .preflight import (
     HarnessEnvironmentBlocker,
     HarnessPreflightContext,
@@ -182,29 +185,120 @@ class ReasonixAdapter:
         )
 
 
+class ReasonixAcpProcess:
+    """Owned stdio ACP seam with correlated request/response handling."""
+
+    def __init__(self, process: subprocess.Popen[str]) -> None:
+        self.process = process
+        self._next_id = 1
+        self.last_request_id: int | None = None
+        self.notifications: list[Mapping[str, Any]] = []
+
+    @classmethod
+    def start(cls, *, repo_root: Path, executable: str = "reasonix") -> "ReasonixAcpProcess":
+        process = subprocess.Popen(
+            [executable, "acp"], cwd=str(repo_root),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        return cls(process)
+
+    def request(
+        self, method: str, params: Mapping[str, Any], *, timeout_seconds: float = 10.0
+    ) -> Mapping[str, Any]:
+        if self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("Reasonix ACP stdio transport is unavailable")
+        request_id = self._next_id
+        self._next_id += 1
+        self.last_request_id = request_id
+        self.process.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": request_id, "method": method,
+            "params": dict(params),
+        }) + "\n")
+        self.process.stdin.flush()
+        while True:
+            ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
+            if not ready:
+                raise TimeoutError("Reasonix ACP response timed out")
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError("Reasonix ACP exited before correlated response")
+            event = json.loads(line)
+            if not isinstance(event, Mapping) or event.get("jsonrpc") != "2.0":
+                raise ValueError("Reasonix ACP emitted a non-JSON-RPC event")
+            if "method" in event and "id" in event:
+                raise RuntimeError(
+                    "Reasonix ACP agent request requires an owned client handler: "
+                    f"{event.get('method')}"
+                )
+            if "method" in event and "id" not in event:
+                self.notifications.append(event)
+                continue
+            if event.get("id") != request_id:
+                raise ValueError("Reasonix ACP response id mismatch")
+            if "error" in event:
+                raise RuntimeError(f"Reasonix ACP error: {event['error']}")
+            return event
+
+    def initialize(self) -> Mapping[str, Any]:
+        """Perform the no-prompt ACP handshake and return its JSON-RPC result."""
+        return self.request("initialize", {})
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        self.process.terminate()
+
+
 class ReasonixAcpDriver:
     """Small ACP transport contract; the caller owns the stdio process."""
 
     def __init__(self, capabilities: SessionCapabilities, methods: frozenset[str]) -> None:
         self.capabilities = capabilities
         self.methods = methods
+        self.executable = "reasonix"
+        self.config_update_method: str | None = None
 
     @classmethod
     def from_initialize(cls, payload: Mapping[str, Any]) -> "ReasonixAcpDriver":
-        raw = payload.get("capabilities", payload)
+        raw_payload = payload.get("result", payload)
+        if not isinstance(raw_payload, Mapping):
+            raise ValueError("Reasonix ACP initialize result must be an object")
+        agent = raw_payload.get("agentCapabilities", raw_payload)
+        raw = agent.get("capabilities", agent) if isinstance(agent, Mapping) else agent
         if not isinstance(raw, Mapping):
             raise ValueError("Reasonix ACP initialize capabilities must be an object")
         methods_raw = raw.get("methods", raw.get("supported_methods", ()))
         methods = frozenset(value for value in methods_raw if isinstance(value, str)) if isinstance(methods_raw, list) else frozenset()
-        session_identity = "session/new" in methods or "session/open" in methods
-        followup = "session/prompt" in methods or "session/send" in methods
+        nested_handshake = "agentCapabilities" in raw_payload
+        session_identity = (
+            "session/new" in methods or "session/open" in methods
+            or bool(agent.get("loadSession")) if isinstance(agent, Mapping) else False
+        )
+        followup = (
+            "session/prompt" in methods or "session/send" in methods
+            or bool(agent.get("promptCapabilities")) if isinstance(agent, Mapping) else False
+        )
         resume = "session/update_config" in methods or "session/set_config" in methods
+        steer_advertised = "_reasonix.io/session/steer" in methods
+        if isinstance(agent, Mapping):
+            meta = agent.get("_meta")
+            reasonix_meta = meta.get("reasonix.io") if isinstance(meta, Mapping) else None
+            steer_advertised = steer_advertised or (
+                isinstance(reasonix_meta, Mapping)
+                and isinstance(reasonix_meta.get("sessionSteer"), Mapping)
+                and isinstance(reasonix_meta["sessionSteer"].get("method"), str)
+            )
         return cls(
             SessionCapabilities(
                 session_identity=session_identity,
                 followup_turn=followup,
                 resume_with_model=resume,
-                mid_turn_steer="_reasonix.io/session/steer" in methods,
+                # Flat fixtures remain fail-closed; the nested v1 handshake is
+                # only advertised by the owned ReasonixAcpProcess seam.
+                # The current executor has no concurrent request writer while
+                # prompt is being read; do not advertise an undeliverable steer.
+                mid_turn_steer=False,
                 # A method name alone cannot prove provider-enforced
                 # read-only teardown. CP4 may advertise this after it adds
                 # an enforceable control operation.
@@ -218,6 +312,86 @@ class ReasonixAcpDriver:
         if method not in self.methods:
             raise RuntimeError(f"Reasonix ACP method is not advertised: {method}")
         return json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)})
+
+    def build_invocation(self, request: SessionRequest) -> HarnessInvocation:
+        """Describe the ACP process for secret-safe preflight and turn artifacts."""
+        return HarnessInvocation(
+            label="reasonix-acp",
+            argv=(self.executable, "acp"),
+            env={}, prompt_mode="owned-session", system_prompt=request.system_prompt,
+            user_prompt=request.user_prompt, effective_prompt="",
+        )
+
+    def execute_session(
+        self, request: SessionRequest, invocation: HarnessInvocation,
+        control_callback: Any | None = None,
+    ) -> SessionExecutionResult:
+        process = ReasonixAcpProcess.start(repo_root=request.repo_root, executable=invocation.argv[0])
+        wire: list[Mapping[str, Any]] = []
+        try:
+            initialize = process.initialize()
+            wire.append(initialize)
+            negotiated = ReasonixAcpDriver.from_initialize(initialize)
+            self.capabilities = negotiated.capabilities
+            session_params: dict[str, Any] = {"cwd": str(request.repo_root)}
+            if request.session_id is not None:
+                session_params["sessionId"] = request.session_id
+                opened = process.request("session/resume", session_params)
+            else:
+                opened = process.request("session/new", session_params)
+            wire.extend(process.notifications)
+            process.notifications.clear()
+            wire.append(opened)
+            opened_result = opened.get("result")
+            if not isinstance(opened_result, Mapping) or not isinstance(opened_result.get("sessionId"), str):
+                raise ValueError("Reasonix ACP session response has no exact session id")
+            session_id = opened_result["sessionId"]
+            options = {
+                item.get("id") for item in opened_result.get("configOptions", [])
+                if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+            }
+            if request.model is not None and "model" not in options:
+                raise RuntimeError("Reasonix ACP session cannot configure the target model")
+            if request.effort is not None and "effort" not in options:
+                raise RuntimeError("Reasonix ACP session cannot configure target effort")
+            config_method = self.config_update_method
+            if request.model is not None or request.effort is not None:
+                config = {}
+                if request.model is not None:
+                    config["model"] = request.model
+                if request.effort is not None:
+                    config["effort"] = request.effort
+                for config_id, value in config.items():
+                    updated = process.request(config_method or "session/set_config_option", {
+                        "sessionId": session_id, "configId": config_id, "value": value,
+                    })
+                    wire.extend(process.notifications)
+                    process.notifications.clear()
+                    wire.append(updated)
+            if control_callback is not None:
+                control_callback()
+            prompt = process.request("session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "\n\n".join((request.system_prompt, request.user_prompt))}],
+            }, timeout_seconds=3600.0)
+            wire.extend(process.notifications)
+            wire.append(prompt)
+            raw = "\n".join(json.dumps(item) for item in wire) + "\n"
+            _events, parsed_id, final_output, _matched = parse_acp_jsonrpc(
+                raw, expected_response_id=process.last_request_id,
+                expected_session_id=request.session_id, require_output=True,
+            )
+            if parsed_id is None or final_output is None:
+                raise ValueError("Reasonix ACP prompt did not return exact output")
+            return SessionExecutionResult(
+                result=SessionResult(
+                    session_id=parsed_id, selector=request.selector, model=request.model,
+                    effort=request.effort, final_output=final_output,
+                    capabilities=self.capabilities,
+                ), raw_transport=raw, events=tuple(wire),
+            )
+        finally:
+            process.close()
 
     def build_initialize(self, *, client_name: str = "aflow") -> str:
         return json.dumps({
@@ -233,7 +407,7 @@ class ReasonixAcpDriver:
         method = "session/prompt" if "session/prompt" in self.methods else "session/send"
         params: dict[str, Any] = {
             "sessionId": session_id,
-            "prompt": "\n\n".join((request.system_prompt, request.user_prompt)),
+            "prompt": [{"type": "text", "text": "\n\n".join((request.system_prompt, request.user_prompt))}],
         }
         if request.idempotency_key is not None:
             params["idempotencyKey"] = request.idempotency_key
@@ -267,7 +441,7 @@ class ReasonixAcpDriver:
     def build_steer(self, *, session_id: str, message: str) -> str:
         return self._request(
             "_reasonix.io/session/steer",
-            {"sessionId": session_id, "message": message},
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": message}]},
             request_id=3,
         )
 

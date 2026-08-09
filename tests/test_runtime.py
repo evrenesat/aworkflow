@@ -29,6 +29,7 @@ from aflow.workflow import (
     _execute_init_repo_handoff,
     _freeze_run_identity,
     _run_injected_runner,
+    _run_process,
     _pending_matches_scope_and_plan,
     _reconcile_repartition_plan_copies,
 )
@@ -1834,6 +1835,36 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert stdout_capture.getvalue() == ''
             assert stderr_capture.getvalue() == ''
             assert banner.updated
+
+    def test_run_process_polls_a_bounded_control_callback_without_interrupting_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = root / "slow_output.py"
+            script.write_text(
+                "import time\n"
+                "time.sleep(0.15)\n"
+                "print('finished')\n",
+                encoding="utf-8",
+            )
+            invocation = HarnessInvocation(
+                label="test", argv=(sys.executable, str(script)), env={},
+                prompt_mode="stdin", system_prompt="", user_prompt="",
+                effective_prompt="",
+            )
+            state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+            calls: list[int] = []
+
+            class FakeBanner:
+                def update(self, state: ControllerState) -> None:
+                    pass
+
+            completed = _run_process(
+                invocation, root, FakeBanner(), state,  # type: ignore[arg-type]
+                control_callback=lambda: calls.append(1),
+            )
+            assert completed.returncode == 0
+            assert completed.stdout == "finished\n"
+            assert calls
 
     def test_run_process_sends_large_stdin_prompt_without_argv_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

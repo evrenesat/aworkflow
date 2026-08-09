@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from aflow.api.models import PreparedRun
     from aflow.run_state import ControllerRunResult, RetryContext, ResumeContext
     from aflow.status import BannerRenderer
+    from aflow.harnesses.session import SessionDriver
 from aflow.harnesses.preflight import HarnessPreflightProbe
 
 from aflow.config import WorkflowUserConfig
@@ -32,6 +33,8 @@ class RunnerConfig:
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None
     preflight_probe: HarnessPreflightProbe | None = None
     resume: ResumeContext | None = None
+    control_source: Callable[[], object] | None = None
+    session_driver: SessionDriver | None = None
 
 
 class WorkflowRunner:
@@ -76,6 +79,8 @@ class WorkflowRunner:
             banner=self._config.banner,
             resume=self._config.resume,
             observer=self._config.observer,
+            control_source=self._config.control_source,
+            session_driver=self._config.session_driver,
         )
         return result
 
@@ -89,6 +94,8 @@ def execute_workflow(
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     preflight_probe: HarnessPreflightProbe | None = None,
     resume: ResumeContext | None = None,
+    control_source: Callable[[], object] | None = None,
+    session_driver: SessionDriver | None = None,
 ) -> ControllerRunResult:
     """Execute a prepared workflow with optional event observation.
 
@@ -115,6 +122,8 @@ def execute_workflow(
         runner=runner,
         preflight_probe=preflight_probe,
         resume=resume,
+        control_source=control_source,
+        session_driver=session_driver,
     )
     runner_obj = WorkflowRunner(config)
     return runner_obj.run()

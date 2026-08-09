@@ -1,11 +1,15 @@
 from pathlib import Path
 from dataclasses import dataclass, field
+import json
 
 import pytest
 
 from aflow.harnesses.codex import CodexAdapter, probe_codex_capabilities
 from aflow.harnesses.base import HarnessInvocation
-from aflow.harnesses.reasonix import ReasonixAcpDriver
+import aflow.harnesses.reasonix as reasonix_module
+from aflow.harnesses.reasonix import ReasonixAcpDriver, ReasonixAcpProcess
+import aflow.workflow as workflow_module
+from aflow.harnesses.reasonix import ReasonixAdapter
 from aflow.harnesses.session import (
     NO_SESSION_CAPABILITIES,
     NoSessionDriver,
@@ -152,7 +156,9 @@ def test_reasonix_capabilities_and_steer_are_handshake_gated() -> None:
     })
     assert driver.capabilities.session_identity is True
     assert driver.capabilities.resume_with_model is True
-    assert driver.capabilities.mid_turn_steer is True
+    # The current ACP driver owns no live stdio channel, so it must fail closed
+    # instead of advertising an undeliverable mid-turn operation.
+    assert driver.capabilities.mid_turn_steer is False
     assert driver.capabilities.idempotent_turn_start is True
     assert driver.capabilities.read_only_teardown is False
     assert '"method": "session/new"' in driver.build_session_open(request())
@@ -160,15 +166,48 @@ def test_reasonix_capabilities_and_steer_are_handshake_gated() -> None:
     assert '"method": "_reasonix.io/session/steer"' in driver.build_steer(
         session_id="session-123", message="finish at the next safe boundary"
     )
-    update = driver.build_session_update_config(
-        request(), session_id="session-123"
-    )
+    update = driver.build_session_update_config(request(), session_id="session-123")
     assert '"method": "session/update_config"' in update
     assert '"model": "sol"' in update
     assert '"effort": "high"' in update
     assert '"method": "session/cancel"' in driver.build_session_cancel(session_id="session-123")
     assert '"method": "session/close"' in driver.build_session_close(session_id="session-123")
 
+
+def test_reasonix_v1_nested_initialize_negotiates_live_capabilities() -> None:
+    driver = ReasonixAcpDriver.from_initialize({
+        "jsonrpc": "2.0", "id": 1, "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": True,
+                "sessionCapabilities": {"resume": {}, "close": {}},
+                "promptCapabilities": {"embeddedContext": True},
+                "_meta": {"reasonix.io": {
+                    "sessionSteer": {"method": "_reasonix.io/session/steer"}
+                }},
+            },
+            "agentInfo": {"name": "reasonix", "version": "v1.18.0"},
+        },
+    })
+    assert driver.capabilities.session_identity is True
+    assert driver.capabilities.followup_turn is True
+    # The nested metadata identifies a possible vendor method, but this
+    # driver has no concurrent write channel while prompt() is active.
+    assert driver.capabilities.mid_turn_steer is False
+    assert driver.capabilities.resume_with_model is False
+
+
+def test_reasonix_owned_invocation_uses_acp_argv_without_dir_flag(tmp_path: Path) -> None:
+    driver = ReasonixAcpDriver.from_initialize({
+        "jsonrpc": "2.0", "id": 1, "result": {
+            "agentCapabilities": {"loadSession": True,
+                "promptCapabilities": {"embeddedContext": True}},
+        },
+    })
+    invocation = driver.build_invocation(request())
+    assert invocation.argv == ("reasonix", "acp")
+    assert invocation.prompt_mode == "owned-session"
+    assert "USER" not in invocation.argv
     limited = ReasonixAcpDriver.from_initialize({"capabilities": {"methods": ["session/new"]}})
     assert limited.capabilities.mid_turn_steer is False
     with pytest.raises(RuntimeError):
@@ -213,6 +252,85 @@ def test_reasonix_acp_rejects_mismatched_error_or_malformed_wire(stdout: str) ->
     })
     with pytest.raises(ValueError):
         driver.parse_result(request("rx-1"), stdout)
+
+
+def test_reasonix_owned_executor_uses_exact_resume_config_and_prompt_wire(monkeypatch, tmp_path: Path) -> None:
+    class FakeProcess:
+        def __init__(self):
+            self.calls = []
+            self.last_request_id = 0
+            self.notifications = []
+        def initialize(self):
+            self.last_request_id = 1
+            return {"jsonrpc": "2.0", "id": 1, "result": {"agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True}}}}
+        def request(self, method, params, *, timeout_seconds=10.0):
+            self.calls.append((method, dict(params), timeout_seconds))
+            self.last_request_id += 1
+            if method == "session/resume":
+                return {"jsonrpc": "2.0", "id": self.last_request_id, "result": {"sessionId": "source", "configOptions": [{"id": "model"}, {"id": "effort"}]}}
+            if method == "session/prompt":
+                return {"jsonrpc": "2.0", "id": self.last_request_id, "result": {"sessionId": "source", "finalOutput": "DONE"}}
+            return {"jsonrpc": "2.0", "id": self.last_request_id, "result": {"sessionId": "source"}}
+        def close(self):
+            self.closed = True
+    fake = FakeProcess()
+    monkeypatch.setattr(ReasonixAcpProcess, "start", lambda **kwargs: fake)
+    driver = ReasonixAcpDriver.from_initialize({"capabilities": {"methods": ["session/new", "session/prompt"]}})
+    result = driver.execute_session(request("source"), driver.build_invocation(request("source")))
+    assert result.result.final_output == "DONE"
+    assert [method for method, _, _ in fake.calls] == ["session/resume", "session/set_config_option", "session/set_config_option", "session/prompt"]
+    assert fake.calls[1][1] == {"sessionId": "source", "configId": "model", "value": "sol"}
+    assert fake.calls[2][1] == {"sessionId": "source", "configId": "effort", "value": "high"}
+    assert fake.calls[3][1]["prompt"][0]["type"] == "text"
+    assert fake.calls[3][2] > 60
+
+
+def test_reasonix_owned_executor_fails_before_prompt_when_config_option_missing(monkeypatch, tmp_path: Path) -> None:
+    class FakeProcess:
+        def __init__(self): self.calls = []; self.notifications = []
+        def initialize(self): return {"result": {"agentCapabilities": {"loadSession": True}}}
+        def request(self, method, params, **kwargs):
+            self.calls.append(method)
+            return {"result": {"sessionId": "fresh", "configOptions": []}}
+        def close(self): pass
+    fake = FakeProcess()
+    monkeypatch.setattr(ReasonixAcpProcess, "start", lambda **kwargs: fake)
+    driver = ReasonixAcpDriver.from_initialize({"capabilities": {"methods": ["session/new"]}})
+    with pytest.raises(RuntimeError, match="cannot configure"):
+        driver.execute_session(request(), driver.build_invocation(request()))
+    assert "session/prompt" not in fake.calls
+
+
+def test_reasonix_transport_accepts_long_prompt_timeout_without_fixed_sixty_second_cap(monkeypatch):
+    class Stream:
+        def write(self, value): pass
+        def flush(self): pass
+        def readline(self): return '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+    class Proc:
+        stdin = Stream()
+        stdout = Stream()
+    seen = []
+    monkeypatch.setattr(reasonix_module.select, "select", lambda r, w, e, timeout: (seen.append(timeout) or ([r[0]], [], [])))
+    ReasonixAcpProcess(Proc()).request("session/prompt", {}, timeout_seconds=3600.0)
+    assert seen == [3600.0]
+
+
+def test_reasonix_discovery_is_initialize_only_and_does_not_mutate_model(monkeypatch, tmp_path: Path):
+    class FakeProcess:
+        calls = []
+        def initialize(self):
+            self.calls.append("initialize")
+            return {"result": {"agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True}}}}
+        def close(self): self.calls.append("close")
+    fake = FakeProcess()
+    monkeypatch.setattr(workflow_module.shutil, "which", lambda name: "/usr/local/bin/reasonix")
+    monkeypatch.setattr(ReasonixAcpProcess, "start", lambda **kwargs: fake)
+    driver = workflow_module._discover_session_driver(ReasonixAdapter(), repo_root=tmp_path)
+    assert driver is not None
+    assert fake.calls == ["initialize", "close"]
+    assert driver.capabilities.resume_with_model is False
+    assert driver.capabilities.mid_turn_steer is False
+    assert driver.config_update_method is None
 
 
 def test_no_session_driver_is_explicitly_one_shot() -> None:

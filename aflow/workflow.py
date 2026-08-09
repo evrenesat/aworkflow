@@ -89,7 +89,8 @@ from .recovery import (
     TeamLeadRecoveryDecisionError,
 )
 from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
-from .hotplug import HotplugTransactionV1, bounded_hotplug_history, hotplug_transaction_id
+from .hotplug import HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history, hotplug_transaction_id
+from .harnesses.session import SessionDriver, SessionRequest
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
@@ -1469,6 +1470,7 @@ def _run_process(
     repo_root: Path,
     banner: BannerRenderer,
     state: ControllerState,
+    control_callback: Callable[[], object] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         proc = subprocess.Popen(
@@ -1550,7 +1552,8 @@ def _run_process(
             proc.wait(timeout=PROCESS_POLL_INTERVAL_SECONDS)
             break
         except subprocess.TimeoutExpired:
-            pass
+            if control_callback is not None:
+                control_callback()
 
     if t_in is not None:
         t_in.join()
@@ -3111,6 +3114,53 @@ def _emit_event(observer: ExecutionObserver | None, event: ExecutionEvent) -> No
         observer.on_event(event)
 
 
+def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None = None) -> SessionDriver | None:
+    """Enable native sessions only for a proven, supported production adapter."""
+    if getattr(adapter, "name", None) == "reasonix":
+        executable = shutil.which("reasonix") or "/usr/local/bin/reasonix"
+        if not Path(executable).is_file():
+            return None
+        from .harnesses.reasonix import ReasonixAcpDriver, ReasonixAcpProcess
+        if repo_root is None:
+            return None
+        try:
+            process = ReasonixAcpProcess.start(repo_root=repo_root, executable=executable)
+            initialize = process.initialize()
+            driver = ReasonixAcpDriver.from_initialize(initialize)
+            driver.executable = executable
+            # Initialize is capability negotiation only. Do not open a
+            # session or mutate a provider-selected model during discovery.
+            driver.config_update_method = None
+            return driver
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return None
+        finally:
+            try:
+                process.close()
+            except (UnboundLocalError, OSError):
+                pass
+    if getattr(adapter, "name", None) != "codex":
+        return None
+    try:
+        executable = shutil.which("codex")
+        if executable is None:
+            return None
+        exec_help = subprocess.run(
+            [executable, "exec", "--help"],
+            capture_output=True, text=True, check=False, timeout=2,
+        ).stdout
+        resume_help = subprocess.run(
+            [executable, "exec", "resume", "--help"],
+            capture_output=True, text=True, check=False, timeout=2,
+        ).stdout
+        from .harnesses.codex import CodexAdapter
+        return CodexAdapter().session_driver(
+            exec_help=exec_help, resume_help=resume_help
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def run_workflow(
     config: ControllerConfig,
     workflow_config: WorkflowUserConfig,
@@ -3127,6 +3177,8 @@ def run_workflow(
     banner: BannerRenderer | None = None,
     resume: ResumeContext | None = None,
     observer: ExecutionObserver | None = None,
+    control_source: Callable[[], object] | None = None,
+    session_driver: SessionDriver | None = None,
 ) -> ControllerRunResult:
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
@@ -3573,19 +3625,9 @@ def run_workflow(
         state.scope_pressure_reason = resume.scope_pressure_reason
         state.last_manager_report_path = resume.last_manager_report_path
 
-        # Finish an accepted hotplug transaction that was durably recorded
-        # immediately before a crash. Its counter and identity are reused;
-        # recovery must not create a second transaction or history entry.
-        accepted_hotplug = state.current_hotplug_transaction
-        if accepted_hotplug is not None and accepted_hotplug.stage == "accepted":
-            state.role_selectors[accepted_hotplug.target_role] = accepted_hotplug.target_selector
-            applied_hotplug = replace(accepted_hotplug, stage="applied")
-            state.current_hotplug_transaction = None
-            state.pending_hotplug_transaction = None
-            if not any(item.transaction_id == applied_hotplug.transaction_id for item in state.hotplug_history):
-                state.hotplug_history = list(
-                    bounded_hotplug_history((*state.hotplug_history, applied_hotplug))
-                )
+        # Leave an accepted transaction pending across resume.  The normal
+        # boundary path must still perform target selector activation,
+        # preflight, and target-session success before marking it applied.
 
         # create_run_paths may already have pruned the source run. Restore the
         # controller-owned transaction artifacts carried by ResumeContext
@@ -7353,6 +7395,20 @@ def run_workflow(
             resumed_from_run_id=resumed_from_run_id,
         )
 
+    def _fail_hotplug_target(reason: str) -> None:
+        transaction = state.current_hotplug_transaction
+        if transaction is None or transaction.stage in {"applied", "failed"}:
+            return
+        state.role_selectors[transaction.source_role] = transaction.source_selector
+        failed = replace(transaction, stage="failed", failure=reason)
+        state.current_hotplug_transaction = None
+        state.pending_hotplug_transaction = None
+        state.hotplug_history = list(bounded_hotplug_history(
+            [*state.hotplug_history, failed]
+        ))
+        state.status_message = f"hotplug target failed; source retained: {reason}"
+        _write_override_boundary(status="failed")
+
     def _apply_boundary_override() -> tuple[str, str | None]:
         nonlocal current_step_name, baseline_team_name
         source_run_dir = state.override_source_run_dir or run_paths.run_dir
@@ -7377,6 +7433,9 @@ def run_workflow(
                 state.effective_max_turns = prior.max_turns
             state.override_result = replace(prior, applied=True)
             state.role_selectors.update(prior.role_selectors)
+            transaction = state.current_hotplug_transaction
+            if transaction is not None and transaction.stage == "accepted":
+                state.role_selectors[transaction.target_role] = transaction.target_selector
             state.override_source_run_dir = None
             _write_override_boundary(status="running")
             if preserve_resume_override_source:
@@ -7567,7 +7626,10 @@ def run_workflow(
                     target_model_display=format_harness_model_display(
                         target_profile.harness_name, target_profile.model, target_profile.effort
                     ),
-                    source_turn_number=state.turns_completed + 1,
+                    # The request is consumed at the boundary after the
+                    # source turn finalized; bind the transaction to that
+                    # completed source turn, not the target turn.
+                    source_turn_number=max(1, state.turns_completed),
                     capability_path=(
                         "native_resume"
                         if source_profile.harness_name == target_profile.harness_name
@@ -7587,14 +7649,13 @@ def run_workflow(
             baseline_team_name = request.team
         if request.max_turns is not None:
             state.effective_max_turns = request.max_turns
+        # This boundary is reached only after the source turn has finalized;
+        # make the accepted target authoritative for the next worker turn.
         state.role_selectors.update(request.role_selectors)
         if worker_transaction is not None:
-            applied_transaction = replace(worker_transaction, stage="applied")
-            state.current_hotplug_transaction = None
-            state.pending_hotplug_transaction = None
-            if not any(item.transaction_id == applied_transaction.transaction_id for item in state.hotplug_history):
-                state.hotplug_history.append(applied_transaction)
-                state.hotplug_history = list(bounded_hotplug_history(state.hotplug_history))
+            # Keep the transaction durable until the target turn succeeds.
+            state.current_hotplug_transaction = worker_transaction
+            state.pending_hotplug_transaction = worker_transaction
         state.override_result = replace(state.override_result, applied=True)
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
@@ -7606,6 +7667,33 @@ def run_workflow(
     # proposal/validation artifacts are reused; no Full subcall is replayed.
     if state.pending_repartition is not None:
         _apply_pending_repartition()
+
+    live_control_digest: str | None = None
+    live_session_driver: SessionDriver | None = None
+    live_session_id: str | None = None
+
+    def _poll_live_control() -> None:
+        """Notice a changed run-owned override without interrupting the child."""
+        nonlocal live_control_digest
+        observed: object = control_source() if control_source is not None else None
+        if observed is None:
+            source_dir = state.override_source_run_dir or run_paths.run_dir
+            override_path = source_dir / "overrides.toml"
+            try:
+                observed = hashlib.sha256(
+                    override_path.read_bytes()
+                ).hexdigest() if override_path.is_file() else None
+            except OSError:
+                observed = None
+        if not isinstance(observed, str) or not observed:
+            return
+        consumed = state.override_result.digest if state.override_result is not None else None
+        if observed == consumed or observed == live_control_digest:
+            return
+        live_control_digest = observed
+        state.status_message = (
+            "hotplug request observed; finishing the current worker boundary"
+        )
 
     turn_number = 1
     while turn_number <= (state.effective_max_turns or config.max_turns):
@@ -7622,6 +7710,10 @@ def run_workflow(
         followup_candidates_before: set[Path] = set()
         consume_manager_notes = False
         consume_team_override = False
+        turn_session_request: SessionRequest | None = None
+        owned_session_result = None
+        live_session_driver = None
+        live_session_id = None
 
         if retry_ctx is not None:
             state.status_message = (
@@ -7715,6 +7807,9 @@ def run_workflow(
                 step_path=step_path,
             )
             step_adapter = adapter or get_adapter(resolved.harness_name)
+            turn_session_driver = session_driver or (
+                _discover_session_driver(step_adapter, repo_root=execution_repo_root) if runner is None else None
+            )
             snapshot_before = retry_ctx.snapshot_before
             manager_notes, consume_manager_notes = _prepare_pending_manager_notes(
                 step_name=current_step_name,
@@ -7736,13 +7831,97 @@ def run_workflow(
                             f"- {note}" for note in state.pending_override_notes
                         )
                     )
-                invocation = step_adapter.build_invocation(
-                    repo_root=execution_repo_root,
-                    model=resolved.model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    effort=resolved.effort,
+                transaction = state.current_hotplug_transaction
+                owned_executor = (
+                    callable(getattr(turn_session_driver, "execute_session", None))
+                    if turn_session_driver is not None else False
                 )
+                if (
+                    step.role == "worker"
+                    and transaction is not None
+                    and transaction.target_selector == selector
+                    and transaction.source_harness == resolved.harness_name
+                    and transaction.target_harness == resolved.harness_name
+                    and (
+                        (turn_session_driver is None or (
+                            not turn_session_driver.capabilities.resume_with_model
+                            and not owned_executor
+                        ))
+                    )
+                ):
+                    raise RuntimeError(
+                        "same-harness hotplug requires a session driver with exact resume"
+                    )
+                if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
+                    transaction = state.current_hotplug_transaction
+                    source_selector = (
+                        transaction.source_selector
+                        if transaction is not None
+                        and transaction.target_selector == selector
+                        else selector
+                    )
+                    source_harness = (
+                        transaction.source_harness
+                        if transaction is not None
+                        and transaction.target_selector == selector
+                        else resolved.harness_name
+                    )
+                    previous_session = next(
+                        (
+                            item for item in state.active_role_sessions
+                            if item.role == "worker" and item.status == "active"
+                            and item.selector == source_selector
+                            and item.harness == source_harness
+                            and (
+                                transaction is None
+                                or (
+                                    transaction.target_selector == selector
+                                    and transaction.source_harness == resolved.harness_name
+                                    and transaction.target_harness == resolved.harness_name
+                                )
+                            )
+                        ),
+                        None,
+                    )
+                    turn_session_request = SessionRequest(
+                        repo_root=execution_repo_root,
+                        selector=selector,
+                        model=resolved.model,
+                        effort=resolved.effort,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        session_id=(
+                            previous_session.session_id
+                            if previous_session is not None
+                            and (
+                                turn_session_driver.capabilities.resume_with_model
+                                or owned_executor
+                            )
+                            else None
+                        ),
+                    )
+                    transaction = state.current_hotplug_transaction
+                    if (
+                        transaction is not None
+                        and transaction.target_selector == selector
+                        and transaction.source_harness == resolved.harness_name
+                        and transaction.target_harness == resolved.harness_name
+                        and turn_session_request.session_id is None
+                    ):
+                        raise RuntimeError(
+                            "same-harness hotplug requires an exact active source session"
+                        )
+                    live_session_driver = turn_session_driver
+                    live_session_id = turn_session_request.session_id
+                    invocation = turn_session_driver.build_invocation(turn_session_request)
+                else:
+                    invocation = step_adapter.build_invocation(
+                        repo_root=execution_repo_root,
+                        model=resolved.model,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        effort=resolved.effort,
+                    )
                 _preflight_or_fail(
                     invocation,
                     step_adapter,
@@ -7754,7 +7933,9 @@ def run_workflow(
                 )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":
+                    _fail_hotplug_target(exc.summary)
                     raise
+                _fail_hotplug_target(exc.summary)
                 _raise_pre_turn_failure(
                     reason=exc.summary,
                     snapshot=snapshot_before,
@@ -7762,6 +7943,7 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
             except Exception as exc:
+                _fail_hotplug_target(str(exc))
                 _raise_pre_turn_failure(
                     reason=str(exc),
                     snapshot=snapshot_before,
@@ -7889,6 +8071,9 @@ def run_workflow(
             )
 
             step_adapter = adapter or get_adapter(resolved.harness_name)
+            turn_session_driver = session_driver or (
+                _discover_session_driver(step_adapter, repo_root=execution_repo_root) if runner is None else None
+            )
             snapshot_before = state.last_snapshot
 
             _sync_plan_to_worktree(original_plan_path, exec_ctx)
@@ -7930,13 +8115,97 @@ def run_workflow(
                         )
                     )
 
-                invocation = step_adapter.build_invocation(
-                    repo_root=execution_repo_root,
-                    model=resolved.model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    effort=resolved.effort,
+                transaction = state.current_hotplug_transaction
+                owned_executor = (
+                    callable(getattr(turn_session_driver, "execute_session", None))
+                    if turn_session_driver is not None else False
                 )
+                if (
+                    step.role == "worker"
+                    and transaction is not None
+                    and transaction.target_selector == selector
+                    and transaction.source_harness == resolved.harness_name
+                    and transaction.target_harness == resolved.harness_name
+                    and (
+                        (turn_session_driver is None or (
+                            not turn_session_driver.capabilities.resume_with_model
+                            and not owned_executor
+                        ))
+                    )
+                ):
+                    raise RuntimeError(
+                        "same-harness hotplug requires a session driver with exact resume"
+                    )
+                if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
+                    transaction = state.current_hotplug_transaction
+                    source_selector = (
+                        transaction.source_selector
+                        if transaction is not None
+                        and transaction.target_selector == selector
+                        else selector
+                    )
+                    source_harness = (
+                        transaction.source_harness
+                        if transaction is not None
+                        and transaction.target_selector == selector
+                        else resolved.harness_name
+                    )
+                    previous_session = next(
+                        (
+                            item for item in state.active_role_sessions
+                            if item.role == "worker" and item.status == "active"
+                            and item.selector == source_selector
+                            and item.harness == source_harness
+                            and (
+                                transaction is None
+                                or (
+                                    transaction.target_selector == selector
+                                    and transaction.source_harness == resolved.harness_name
+                                    and transaction.target_harness == resolved.harness_name
+                                )
+                            )
+                        ),
+                        None,
+                    )
+                    turn_session_request = SessionRequest(
+                        repo_root=execution_repo_root,
+                        selector=selector,
+                        model=resolved.model,
+                        effort=resolved.effort,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        session_id=(
+                            previous_session.session_id
+                            if previous_session is not None
+                            and (
+                                turn_session_driver.capabilities.resume_with_model
+                                or owned_executor
+                            )
+                            else None
+                        ),
+                    )
+                    transaction = state.current_hotplug_transaction
+                    if (
+                        transaction is not None
+                        and transaction.target_selector == selector
+                        and transaction.source_harness == resolved.harness_name
+                        and transaction.target_harness == resolved.harness_name
+                        and turn_session_request.session_id is None
+                    ):
+                        raise RuntimeError(
+                            "same-harness hotplug requires an exact active source session"
+                        )
+                    live_session_driver = turn_session_driver
+                    live_session_id = turn_session_request.session_id
+                    invocation = turn_session_driver.build_invocation(turn_session_request)
+                else:
+                    invocation = step_adapter.build_invocation(
+                        repo_root=execution_repo_root,
+                        model=resolved.model,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        effort=resolved.effort,
+                    )
                 _preflight_or_fail(
                     invocation,
                     step_adapter,
@@ -7948,7 +8217,9 @@ def run_workflow(
                 )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":
+                    _fail_hotplug_target(exc.summary)
                     raise
+                _fail_hotplug_target(exc.summary)
                 _raise_pre_turn_failure(
                     reason=exc.summary,
                     snapshot=snapshot_before,
@@ -7956,6 +8227,7 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
             except Exception as exc:
+                _fail_hotplug_target(str(exc))
                 _raise_pre_turn_failure(
                     reason=str(exc),
                     snapshot=snapshot_before,
@@ -8021,10 +8293,108 @@ def run_workflow(
             )
 
         if use_popen:
-            completed = _run_process(invocation, execution_repo_root, banner, state)
+            execute_session = (
+                getattr(turn_session_driver, "execute_session", None)
+                if turn_session_driver is not None else None
+            )
+            if callable(execute_session) and turn_session_request is not None:
+                execution = execute_session(
+                    turn_session_request, invocation,
+                    _poll_live_control if step.role == "worker" else None,
+                )
+                owned_session_result = execution.result
+                completed = subprocess.CompletedProcess(
+                    invocation.argv, 0, execution.raw_transport, ""
+                )
+            else:
+                completed = _run_process(
+                    invocation, execution_repo_root, banner, state,
+                    control_callback=(
+                        _poll_live_control if step.role == "worker" else None
+                    ),
+                )
         else:
             assert runner is not None
+            if step.role == "worker":
+                _poll_live_control()
             completed = _run_injected_runner(runner, invocation, execution_repo_root)
+
+        if turn_session_request is not None and turn_session_driver is not None:
+            try:
+                raw_transport_stdout = completed.stdout
+                session_result = (
+                    owned_session_result
+                    if owned_session_result is not None
+                    else turn_session_driver.parse_result(
+                        turn_session_request,
+                        completed.stdout,
+                        returncode=completed.returncode,
+                    )
+                )
+                if session_result.selector != selector:
+                    raise ValueError(
+                        "session result selector does not match the workflow invocation"
+                    )
+                session_ref = HarnessSessionRefV1(
+                    session_id=session_result.session_id,
+                    role=step.role,
+                    selector=selector,
+                    harness=resolved.harness_name,
+                    profile=selector.partition(".")[2],
+                    model_display=format_harness_model_display(
+                        resolved.harness_name, resolved.model, resolved.effort
+                    ),
+                    status="active",
+                )
+                state.active_role_sessions = tuple(
+                    item for item in state.active_role_sessions
+                    if item.role != step.role
+                ) + (session_ref,)
+                write_run_metadata(
+                    run_paths, config, state, status="running",
+                    last_snapshot=state.last_snapshot,
+                    workflow_name=workflow_name,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                (turn_dir / "transport.stdout").write_text(
+                    raw_transport_stdout, encoding="utf-8"
+                )
+                completed = subprocess.CompletedProcess(
+                    completed.args, completed.returncode,
+                    session_result.final_output, completed.stderr,
+                )
+                transaction = state.current_hotplug_transaction
+                if (
+                    transaction is not None
+                    and transaction.target_selector == selector
+                    and transaction.stage not in {"applied", "failed"}
+                ):
+                    applied_transaction = replace(transaction, stage="applied")
+                    state.current_hotplug_transaction = None
+                    state.pending_hotplug_transaction = None
+                    state.hotplug_history = list(bounded_hotplug_history(
+                        [*state.hotplug_history, applied_transaction]
+                    ))
+                    write_run_metadata(
+                        run_paths, config, state, status="running",
+                        last_snapshot=state.last_snapshot,
+                        workflow_name=workflow_name,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        resumed_from_run_id=resumed_from_run_id,
+                    )
+            except (RuntimeError, ValueError) as exc:
+                _fail_hotplug_target(f"session result validation failed: {exc}")
+                completed = subprocess.CompletedProcess(
+                    completed.args, 1, completed.stdout,
+                    f"session result validation failed: {exc}",
+                )
 
         stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
         if stop_reason is not None:

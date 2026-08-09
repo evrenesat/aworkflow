@@ -49,6 +49,15 @@ class SessionResult:
     failure: str | None = None
 
 
+@dataclass(frozen=True)
+class SessionExecutionResult:
+    """Result of an owned session turn, keeping semantic and raw channels separate."""
+
+    result: SessionResult
+    raw_transport: str
+    events: tuple[Mapping[str, Any], ...] = ()
+
+
 class SessionDriver(Protocol):
     capabilities: SessionCapabilities
 
@@ -58,6 +67,14 @@ class SessionDriver(Protocol):
     def parse_result(
         self, request: SessionRequest, stdout: str, *, returncode: int = 0
     ) -> SessionResult:
+        ...
+
+    def execute_session(
+        self,
+        request: SessionRequest,
+        invocation: HarnessInvocation,
+        control_callback: Any | None = None,
+    ) -> SessionExecutionResult:
         ...
 
 
