@@ -3342,20 +3342,48 @@ def run_workflow(
                         reconciled.idempotency_key or reconciled.transaction_id,
                     )
                     if isinstance(evidence, SessionResult):
-                        if (
+                        evidence_error = None
+                        if evidence.failure is not None:
+                            evidence_error = "provider evidence reports a failed operation"
+                        elif not isinstance(evidence.session_id, str) or not evidence.session_id.strip():
+                            evidence_error = "provider evidence has an empty session id"
+                        elif evidence.selector != reconciled.target_selector:
+                            evidence_error = "provider evidence selector does not match the recorded target"
+                        elif (
                             evidence.idempotency_key is not None
                             and reconciled.idempotency_key is not None
                             and evidence.idempotency_key != reconciled.idempotency_key
                         ):
-                            raise WorkflowError(
-                                "resume hotplug provider evidence has an idempotency-key mismatch"
+                            evidence_error = "provider evidence has an idempotency-key mismatch"
+                        elif (
+                            reconciled.provider_operation_id is not None
+                            and evidence.provider_operation_id != reconciled.provider_operation_id
+                        ):
+                            evidence_error = "provider evidence operation id does not match the recorded operation"
+                        if evidence_error is not None:
+                            reconciled = replace(
+                                reconciled, stage="waiting_for_hotplug_recovery",
+                                remediation=evidence_error,
                             )
-                        reconciled = replace(
-                            reconciled,
-                            stage="applied",
-                            target_selector=evidence.selector,
-                            provider_operation_id=evidence.provider_operation_id,
-                        )
+                        else:
+                            recovered_target = HarnessSessionRefV1(
+                                session_id=evidence.session_id,
+                                role=reconciled.target_role,
+                                selector=reconciled.target_selector,
+                                harness=reconciled.target_harness,
+                                profile=reconciled.target_profile,
+                                model_display=reconciled.target_model_display,
+                                status="active",
+                            )
+                            state.role_selectors[reconciled.source_role] = reconciled.target_selector
+                            state.active_role_sessions = tuple(
+                                item for item in state.active_role_sessions
+                                if item.role != reconciled.target_role
+                            ) + (recovered_target,)
+                            reconciled = replace(
+                                reconciled, stage="applied",
+                                provider_operation_id=evidence.provider_operation_id,
+                            )
                     elif evidence == "not_started":
                         reconciled = replace(
                             reconciled,

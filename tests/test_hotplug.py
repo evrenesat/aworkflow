@@ -958,7 +958,8 @@ def test_run_resume_applied_transaction_is_normalized_into_history(tmp_path: Pat
     assert [item["transaction_id"] for item in persisted["hotplug_history"]].count(transaction.transaction_id) == 1
 
 
-def test_run_resume_imports_durable_provider_result_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize("evidence_case", ["valid", "wrong_selector", "failure", "empty_session"])
+def test_run_resume_imports_durable_provider_result_once(tmp_path: Path, evidence_case: str) -> None:
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
     base = make_transaction("waiting_for_hotplug_recovery")
@@ -981,10 +982,16 @@ def test_run_resume_imports_durable_provider_result_once(tmp_path: Path) -> None
         def reconcile_provider_operation(self, operation_id, idempotency_key):
             self.reconciliations += 1
             assert (operation_id, idempotency_key) == ("provider-1", transaction.transaction_id)
+            if evidence_case == "wrong_selector":
+                selector = "codex.other"
+            else:
+                selector = "codex.high"
             return SessionResult(
-                session_id="codex-target", selector="codex.high", model="high-model", effort=None,
+                session_id="" if evidence_case == "empty_session" else "codex-target",
+                selector=selector, model="high-model", effort=None,
                 final_output="DONE", provider_operation_id=operation_id,
                 idempotency_key=idempotency_key, capabilities=self.capabilities,
+                failure="provider failed" if evidence_case == "failure" else None,
             )
         def build_invocation(self, request):
             return HarnessInvocation(
@@ -1007,8 +1014,16 @@ def test_run_resume_imports_durable_provider_result_once(tmp_path: Path) -> None
         )
     persisted = json.loads((error.value.run_dir / "run.json").read_text(encoding="utf-8"))
     assert driver.reconciliations == 1
-    assert persisted["current_hotplug_transaction"] is None
-    assert persisted["hotplug_history"][-1]["provider_operation_id"] == "provider-1"
+    if evidence_case == "valid":
+        assert persisted["current_hotplug_transaction"] is None
+        assert persisted["hotplug_history"][-1]["provider_operation_id"] == "provider-1"
+        assert persisted["role_selectors"]["worker"] == transaction.target_selector
+        assert persisted["active_role_sessions"][-1]["session_id"] == "codex-target"
+        assert persisted["active_role_sessions"][-1]["harness"] == transaction.target_harness
+        assert persisted["active_role_sessions"][-1]["profile"] == transaction.target_profile
+    else:
+        assert persisted["current_hotplug_transaction"]["stage"] == "waiting_for_hotplug_recovery"
+        assert persisted["active_role_sessions"][0]["session_id"] == "source"
 
 
 @pytest.mark.parametrize("field", [
