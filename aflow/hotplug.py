@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Literal, Mapping
 from uuid import uuid4
@@ -336,9 +337,16 @@ def validate_handover_output(output: str, *, max_bytes: int = HANDOVER_MAX_BYTES
     normalized = output.replace("\r\n", "\n").strip()
     if not normalized or len(normalized.encode("utf-8")) > max_bytes:
         raise ValueError("handover output is empty or exceeds the 8 KiB bound")
-    missing = [heading for heading in HANDOVER_HEADINGS if f"## {heading}" not in normalized]
-    if missing:
-        raise ValueError("handover output is missing sections: " + ", ".join(missing))
+    matches = list(re.finditer(r"(?m)^## ([^\n]+)\n", normalized))
+    headings = tuple(match.group(1).strip() for match in matches)
+    if headings != HANDOVER_HEADINGS:
+        raise ValueError("handover output must contain the exact required section order")
+    for index, match in enumerate(matches):
+        body_start = match.end()
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        body = normalized[body_start:body_end].strip()
+        if not body or re.fullmatch(r"(?:[-*]?\s*(?:tbd|n/?a|none|unknown)\.?\s*)+", body, re.IGNORECASE):
+            raise ValueError(f"handover section '{match.group(1)}' is empty or placeholder")
     if any(marker in normalized.lower() for marker in ("chain of thought", "scratchpad", "hidden reasoning")):
         raise ValueError("handover output requests hidden reasoning")
     return normalized + "\n"
@@ -356,8 +364,9 @@ def render_handover_prompt(
         "Read the plan and worktree as authoritative over conflicting prose.\n\n"
         "Required Markdown sections:\n"
         + "\n".join(f"## {heading}" for heading in HANDOVER_HEADINGS)
-        + "\n\nController continuity context (artifact reference only):\n"
-        + json.dumps(context.to_dict(), sort_keys=True, separators=(",", ":"))
+        + "\n\nController continuity context artifact hash: "
+        + context.full_context_sha256
+        + "\nThe controller will provide the run-relative artifact reference after validation."
     )
 
 
@@ -383,12 +392,17 @@ def write_handover_artifacts(
     transaction_number: int,
     context: HandoverContextV1,
     output: str,
+    full_context: Mapping[str, object] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     normalized = validate_handover_output(output)
     prefix = f"hotplugs/hotplug-{transaction_number:03d}"
     output_ref, output_hash = write_hotplug_artifact(run_dir, f"{prefix}/handover.md", normalized)
     context_ref, context_hash = write_hotplug_artifact(run_dir, f"{prefix}/context.json", context.to_dict())
-    return (output_ref, context_ref), (output_hash, context_hash)
+    full_ref, full_hash = write_hotplug_artifact(
+        run_dir, f"{prefix}/full-context.json",
+        _bounded_context_value(full_context if full_context is not None else context.to_dict()),
+    )
+    return (output_ref, context_ref, full_ref), (output_hash, context_hash, full_hash)
 
 
 def hotplug_artifact_dir(run_dir: Path, transaction_number: int) -> Path:

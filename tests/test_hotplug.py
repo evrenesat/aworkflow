@@ -29,6 +29,7 @@ from aflow.config import GoTransition, HarnessProfileConfig, TeamConfig, Workflo
 from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.base import HarnessInvocation
 from aflow.harnesses.session import SessionCapabilities, SessionRequest, SessionResult
+from aflow.harnesses.reasonix import ReasonixAcpDriver
 from aflow.run_state import PendingTeamOverride
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, resolve_role_selector, run_workflow
@@ -593,12 +594,33 @@ def test_cross_harness_handover_context_is_bounded_and_redacted(tmp_path: Path) 
 
 def test_cross_harness_handover_requires_all_sections_and_8k_bound() -> None:
     assert validate_handover_output(_valid_handover()).endswith("\n")
-    with pytest.raises(ValueError, match="missing sections"):
+    with pytest.raises(ValueError, match="exact required section order"):
         validate_handover_output("## Objective And Checkpoint\n- incomplete")
     with pytest.raises(ValueError, match="8 KiB"):
         validate_handover_output(_valid_handover() + "x" * 9000)
     with pytest.raises(ValueError, match="hidden reasoning"):
         validate_handover_output(_valid_handover().replace("bounded operational evidence", "hidden reasoning"))
+    with pytest.raises(ValueError, match="placeholder"):
+        validate_handover_output(_valid_handover().replace("bounded operational evidence", "TBD"))
+    reordered = _valid_handover().replace(
+        "## Completed Work\n", "## Verification\n- evidence\n## Completed Work\n", 1
+    )
+    with pytest.raises(ValueError, match="exact required section order"):
+        validate_handover_output(reordered)
+
+
+def test_reasonix_production_driver_does_not_claim_unsupported_handover() -> None:
+    driver = ReasonixAcpDriver.from_initialize({
+        "result": {
+            "agentCapabilities": {
+                "loadSession": True,
+                "promptCapabilities": {"embeddedContext": True},
+                "_meta": {"reasonix.io": {"sessionSteer": {"method": "_reasonix.io/session/steer"}}},
+            },
+        },
+    })
+    assert driver.capabilities.read_only_teardown is False
+    assert not callable(getattr(driver, "handover", None))
 
 
 def test_cross_harness_artifacts_are_hash_bound_and_workspace_fingerprint_detects_mutation(tmp_path: Path) -> None:
@@ -607,9 +629,16 @@ def test_cross_harness_artifacts_are_hash_bound_and_workspace_fingerprint_detect
     before = workspace_fingerprint(tmp_path, (plan,))
     transaction = make_transaction()
     context = build_handover_context_v1(transaction, {"plan_state": {"checkpoint": 1}})
-    paths, hashes = write_handover_artifacts(tmp_path, 1, context, _valid_handover())
-    assert paths == ("hotplugs/hotplug-001/handover.md", "hotplugs/hotplug-001/context.json")
+    paths, hashes = write_handover_artifacts(
+        tmp_path, 1, context, _valid_handover(), {"plan_state": {"checkpoint": 1}}
+    )
+    assert paths == (
+        "hotplugs/hotplug-001/handover.md",
+        "hotplugs/hotplug-001/context.json",
+        "hotplugs/hotplug-001/full-context.json",
+    )
     assert all(len(value) == 64 for value in hashes)
+    assert json.loads((tmp_path / paths[2]).read_text()) == {"plan_state": {"checkpoint": 1}}
     plan.write_text("# Mutated\n", encoding="utf-8")
     after = workspace_fingerprint(tmp_path, (plan,))
     assert before["sha256"] != after["sha256"]
@@ -630,7 +659,7 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
         current_hotplug_transaction=transaction, pending_hotplug_transaction=transaction,
         active_role_sessions=(source,), hotplug_transaction_number=1,
     )
-    class CrossDriver:
+    class SourceDriver:
         capabilities = SessionCapabilities(
             session_identity=True, followup_turn=True, read_only_teardown=True,
             idempotent_turn_start=True,
@@ -644,6 +673,15 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
         def handover(self, request, prompt):
             self.handovers += 1
             return _valid_handover()
+        def build_invocation(self, request):
+            raise AssertionError("source driver must not start the target")
+
+    class TargetDriver:
+        capabilities = SessionCapabilities(session_identity=True, idempotent_turn_start=True)
+        handovers = 0
+        starts = 0
+        prompt = ""
+        idempotency_key = None
         def build_invocation(self, request):
             self.prompt = request.user_prompt
             self.idempotency_key = request.idempotency_key
@@ -659,22 +697,27 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
                 session_id="codex-target", selector=request.selector, model=request.model,
                 effort=request.effort, final_output="DONE", capabilities=self.capabilities,
             )
-    driver = CrossDriver()
+    source_driver = SourceDriver()
+    target_driver = TargetDriver()
     def runner(argv, **kwargs):
         plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "wire", "")
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
         _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
-        runner=runner, session_driver=driver, resume=resume,
+        runner=runner, session_driver=target_driver,
+        source_session_driver=source_driver, resume=resume,
     )
     state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
-    assert driver.handovers == 1
-    assert driver.starts == 1
-    assert driver.idempotency_key == transaction.transaction_id
-    assert "Source worker handover" in driver.prompt
+    assert source_driver.handovers == 1
+    assert source_driver.starts == 0
+    assert target_driver.handovers == 0
+    assert target_driver.starts == 1
+    assert target_driver.idempotency_key == transaction.transaction_id
+    assert "handover.md" in target_driver.prompt
+    assert "full-context.json" in target_driver.prompt
     assert state["hotplug_history"][-1]["stage"] == "applied"
-    assert len(state["hotplug_history"][-1]["artifact_hashes"]) == 2
+    assert len(state["hotplug_history"][-1]["artifact_hashes"]) == 3
 
 
 def test_transaction_identity_is_digest_and_number_bound() -> None:

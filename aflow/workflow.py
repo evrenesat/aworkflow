@@ -3183,6 +3183,7 @@ def run_workflow(
     observer: ExecutionObserver | None = None,
     control_source: Callable[[], object] | None = None,
     session_driver: SessionDriver | None = None,
+    source_session_driver: SessionDriver | None = None,
 ) -> ControllerRunResult:
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
@@ -7404,6 +7405,12 @@ def run_workflow(
         if transaction is None or transaction.stage in {"applied", "failed"}:
             return
         state.role_selectors[transaction.source_role] = transaction.source_selector
+        if transaction.source_session is not None:
+            state.active_role_sessions = tuple(
+                replace(item, status="active")
+                if item.session_id == transaction.source_session.session_id else item
+                for item in state.active_role_sessions
+            )
         failed = replace(transaction, stage="failed", failure=reason)
         state.current_hotplug_transaction = None
         state.pending_hotplug_transaction = None
@@ -7710,14 +7717,18 @@ def run_workflow(
 
     def _prepare_cross_harness_handover(
         transaction: HotplugTransactionV1,
-        driver: SessionDriver,
+        source_driver: SessionDriver,
+        target_driver: SessionDriver,
         *,
         selector: str,
         system_prompt: str,
         user_prompt: str,
+        target_preflight: Callable[[], None],
     ) -> str:
         """Collect one bounded read-only source brief before a cross-harness target."""
-        capabilities = getattr(driver, "capabilities", None)
+        if source_driver is target_driver:
+            raise RuntimeError("cross-harness hotplug requires distinct source and target drivers")
+        capabilities = getattr(source_driver, "capabilities", None)
         if capabilities is None or not capabilities.followup_turn or not capabilities.read_only_teardown:
             raise RuntimeError(
                 "cross-harness hotplug requires followup_turn and enforced read_only_teardown"
@@ -7734,7 +7745,10 @@ def run_workflow(
         )
         if source_session is None:
             raise RuntimeError("cross-harness hotplug requires an exact active source session")
-        context_builder = getattr(driver, "build_full_context", None)
+        # The target environment must be known usable before any source-side
+        # handover or quiesce side effect is allowed.
+        target_preflight()
+        context_builder = getattr(source_driver, "build_full_context", None)
         if callable(context_builder):
             full_context = context_builder(run_paths.run_dir)
         else:
@@ -7748,7 +7762,7 @@ def run_workflow(
         before = workspace_fingerprint(
             execution_repo_root, (original_plan_path, active_plan_path)
         )
-        handover = getattr(driver, "handover", None)
+        handover = getattr(source_driver, "handover", None)
         if not callable(handover):
             raise RuntimeError("source driver does not implement read-only handover")
         source_request = SessionRequest(
@@ -7774,26 +7788,23 @@ def run_workflow(
             raise RuntimeError("read-only source handover changed the workspace or plan")
         artifact_refs, artifact_hashes = write_handover_artifacts(
             run_paths.run_dir, transaction.transaction_number, context, normalized,
+            full_context,
         )
         ready = replace(
             transaction,
             stage="handover_ready",
-            source_session=replace(source_session, status="handed_over"),
+            source_session=source_session,
             artifact_paths=artifact_refs,
             artifact_hashes=artifact_hashes,
         )
         state.current_hotplug_transaction = ready
         state.pending_hotplug_transaction = ready
-        state.active_role_sessions = tuple(
-            replace(item, status="handed_over")
-            if item.session_id == source_session.session_id else item
-            for item in state.active_role_sessions
-        )
         _write_override_boundary(status="running")
         return (
-            "\n\nSource worker handover:\n" + normalized
-            + "\n\nController continuity context:\n"
-            + json.dumps(context.to_dict(), sort_keys=True, separators=(",", ":"))
+            "\n\nSource worker handover artifact: " + artifact_refs[0]
+            + " (sha256=" + artifact_hashes[0] + ")"
+            + "\nController continuity artifact: " + artifact_refs[2]
+            + " (sha256=" + artifact_hashes[2] + ")"
         )
 
     turn_number = 1
@@ -7943,9 +7954,31 @@ def run_workflow(
                     and transaction.source_harness != transaction.target_harness
                     and turn_session_driver is not None
                 ):
+                    source_driver = source_session_driver or (
+                        _discover_session_driver(
+                            get_adapter(transaction.source_harness),
+                            repo_root=execution_repo_root,
+                        )
+                        if runner is None else None
+                    )
                     cross_handover_prompt = _prepare_cross_harness_handover(
-                        transaction, turn_session_driver, selector=selector,
+                        transaction, source_driver, turn_session_driver, selector=selector,
                         system_prompt=system_prompt, user_prompt=user_prompt,
+                        target_preflight=lambda: _preflight_or_fail(
+                            step_adapter.build_invocation(
+                                repo_root=execution_repo_root,
+                                model=resolved.model,
+                                system_prompt=system_prompt,
+                                user_prompt=user_prompt,
+                                effort=resolved.effort,
+                            ),
+                            step_adapter,
+                            invocation_kind="workflow_turn",
+                            cwd=execution_repo_root,
+                            workflow_turn=turn_number,
+                            step_name=current_step_name,
+                            turn_number=turn_number,
+                        ),
                     )
                     user_prompt += cross_handover_prompt
                 owned_executor = (
@@ -8247,9 +8280,31 @@ def run_workflow(
                     and transaction.source_harness != transaction.target_harness
                     and turn_session_driver is not None
                 ):
+                    source_driver = source_session_driver or (
+                        _discover_session_driver(
+                            get_adapter(transaction.source_harness),
+                            repo_root=execution_repo_root,
+                        )
+                        if runner is None else None
+                    )
                     cross_handover_prompt = _prepare_cross_harness_handover(
-                        transaction, turn_session_driver, selector=selector,
+                        transaction, source_driver, turn_session_driver, selector=selector,
                         system_prompt=system_prompt, user_prompt=user_prompt,
+                        target_preflight=lambda: _preflight_or_fail(
+                            step_adapter.build_invocation(
+                                repo_root=execution_repo_root,
+                                model=resolved.model,
+                                system_prompt=system_prompt,
+                                user_prompt=user_prompt,
+                                effort=resolved.effort,
+                            ),
+                            step_adapter,
+                            invocation_kind="workflow_turn",
+                            cwd=execution_repo_root,
+                            workflow_turn=turn_number,
+                            step_name=current_step_name,
+                            turn_number=turn_number,
+                        ),
                     )
                     user_prompt += cross_handover_prompt
                 owned_executor = (

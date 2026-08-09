@@ -35,6 +35,7 @@ class RunnerConfig:
     resume: ResumeContext | None = None
     control_source: Callable[[], object] | None = None
     session_driver: SessionDriver | None = None
+    source_session_driver: SessionDriver | None = None
 
 
 class WorkflowRunner:
@@ -81,6 +82,7 @@ class WorkflowRunner:
             observer=self._config.observer,
             control_source=self._config.control_source,
             session_driver=self._config.session_driver,
+            source_session_driver=self._config.source_session_driver,
         )
         return result
 
@@ -96,6 +98,7 @@ def execute_workflow(
     resume: ResumeContext | None = None,
     control_source: Callable[[], object] | None = None,
     session_driver: SessionDriver | None = None,
+    source_session_driver: SessionDriver | None = None,
 ) -> ControllerRunResult:
     """Execute a prepared workflow with optional event observation.
 
@@ -124,6 +127,7 @@ def execute_workflow(
         resume=resume,
         control_source=control_source,
         session_driver=session_driver,
+        source_session_driver=source_session_driver,
     )
     runner_obj = WorkflowRunner(config)
     return runner_obj.run()
