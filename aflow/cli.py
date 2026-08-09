@@ -116,6 +116,7 @@ Flags:
   --start-step/-ss STEP     Start from this step name or 1-based index (default: first).
   --team/-t TEAM_NAME       Override workflow team.
   --max-turns/-mt N         Maximum turns (default from config).
+  --run-id RUN_ID           Canonical pre-reserved run identity (advanced use).
   --resume [RUN_ID]         Resume a saved run; plan and identity are optional when omitted.
 
 Positional arguments:
@@ -1933,6 +1934,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of turns for this run. Defaults to [aflow].max_turns.",
     )
     run_parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        metavar="RUN_ID",
+        help="Use a canonical pre-reserved run identity for this launch.",
+    )
+    run_parser.add_argument(
         "--team", "-t",
         type=str,
         default=None,
@@ -2657,6 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
         team=startup_team,
         extra_instructions=extra_instructions,
         resume_requested=require_resume,
+        reserved_run_id=args.run_id,
     )
 
     prepared_run = _handle_startup_questions(startup_request)

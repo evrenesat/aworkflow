@@ -439,6 +439,9 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         startup_base_head_refresh_sha=effective_startup_base_head_refresh_sha,
         move_completed_plan_to_done=is_complete_plan,
         parsed_plan=parsed_plan,
+        reserved_run_id=request.reserved_run_id,
+        idempotency_key=request.idempotency_key,
+        caller_scope=request.caller_scope,
     )
 
 

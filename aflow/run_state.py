@@ -16,6 +16,7 @@ WorkflowEndReason = Literal[
     "done",
     "max_turns_reached",
     "transition_end",
+    "owner_stopped",
 ]
 RUN_STATE_SCHEMA_VERSION = 1
 OverrideLoadStatus = Literal[
@@ -40,6 +41,8 @@ class OverrideRequest:
     next_step: str | None = None
     team: str | None = None
     max_turns: int | None = None
+    owner_stop: bool = False
+    revision: int = 0
     notes: tuple[str, ...] = ()
     role_selectors: Mapping[str, str] = field(default_factory=dict)
 
@@ -62,6 +65,7 @@ class OverrideResult:
     next_step: str | None = None
     team: str | None = None
     max_turns: int | None = None
+    owner_stop: bool = False
     role_selectors: Mapping[str, str] = field(default_factory=dict)
     has_notes: bool = False
     applied: bool = False
@@ -125,6 +129,7 @@ def resolve_resume_override(
                     and not isinstance(persisted_result.get("max_turns"), bool)
                     else None
                 ),
+                owner_stop=bool(persisted_result.get("owner_stop", False)),
                 role_selectors={
                     str(key): str(value)
                     for key, value in (
@@ -206,7 +211,7 @@ def load_override_request(
             source_text=source_text,
             message=f"malformed TOML: {exc}",
         )
-    allowed = {"next_step", "team", "max_turns", "notes", "roles"}
+    allowed = {"revision", "next_step", "team", "max_turns", "notes", "roles", "owner_stop"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         return OverrideLoadResult(
@@ -234,6 +239,16 @@ def load_override_request(
             or max_turns < 1
         ):
             raise ValueError("max_turns must be a positive integer")
+        revision = raw.get("revision", 0)
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+        ):
+            raise ValueError("revision must be a non-negative integer")
+        owner_stop = raw.get("owner_stop", False)
+        if not isinstance(owner_stop, bool):
+            raise ValueError("owner_stop must be a boolean")
         notes_value = raw.get("notes", [])
         if not isinstance(notes_value, list):
             raise ValueError("notes must be an array of non-empty strings")
@@ -293,6 +308,8 @@ def load_override_request(
             next_step=next_step,
             team=team,
             max_turns=max_turns,
+            owner_stop=owner_stop,
+            revision=revision,
             notes=tuple(notes),
             role_selectors=role_selectors,
         ),
@@ -313,6 +330,8 @@ def describe_end_reason(end_reason: WorkflowEndReason) -> str:
         return "DONE evaluated true"
     if end_reason == "max_turns_reached":
         return "MAX_TURNS_REACHED matched"
+    if end_reason == "owner_stopped":
+        return "the owner requested a stop"
     return "the workflow selected END"
 
 
@@ -325,6 +344,9 @@ class ControllerConfig:
     team: str | None = None
     extra_instructions: tuple[str, ...] = ()
     start_step: str | None = None
+    reserved_run_id: str | None = None
+    idempotency_key: str | None = None
+    caller_scope: str | None = None
 
 
 @dataclass(frozen=True)

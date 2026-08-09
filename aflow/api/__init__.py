@@ -19,7 +19,14 @@ from .events import (
 )
 from .models import (
     AnalyzeRequest,
+    CapabilitySet,
+    ContextBundle,
+    LaunchManifest,
     PreparedRun,
+    RunControlRequest,
+    RunEvent,
+    RunStatus,
+    StartRunResult,
     StartupContext,
     StartupQuestion,
     StartupQuestionKind,
@@ -32,6 +39,13 @@ from .startup import prepare_startup, prepare_startup_with_answer, StartupError
 __all__ = [
     "PreparedRun",
     "AnalyzeRequest",
+    "CapabilitySet",
+    "ContextBundle",
+    "LaunchManifest",
+    "RunControlRequest",
+    "RunEvent",
+    "RunStatus",
+    "StartRunResult",
     "StartupContext",
     "StartupQuestion",
     "StartupQuestionKind",

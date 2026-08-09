@@ -60,6 +60,9 @@ class WorkflowRunner:
             team=prepared.team,
             extra_instructions=prepared.extra_instructions,
             start_step=prepared.start_step,
+            reserved_run_id=prepared.reserved_run_id,
+            idempotency_key=prepared.idempotency_key,
+            caller_scope=prepared.caller_scope,
         )
 
         parsed_plan: ParsedPlan | None = None
