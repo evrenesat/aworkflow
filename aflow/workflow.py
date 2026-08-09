@@ -3297,6 +3297,30 @@ def run_workflow(
             raise WorkflowError("resume hotplug state has conflicting current and pending transactions")
         if transactions:
             transaction = transactions[0]
+            if runner is None:
+                try:
+                    source_profile = resolve_profile(
+                        transaction.source_selector, workflow_config,
+                        step_path="resume.hotplug.source",
+                    )
+                    target_profile = resolve_profile(
+                        transaction.target_selector, workflow_config,
+                        step_path="resume.hotplug.target",
+                    )
+                except Exception as exc:
+                    raise WorkflowError(
+                        f"resume hotplug configuration drift: {exc}"
+                    ) from exc
+                if (
+                    source_profile.harness_name != transaction.source_harness
+                    or source_profile.profile_name != transaction.source_profile
+                    or target_profile.harness_name != transaction.target_harness
+                    or target_profile.profile_name != transaction.target_profile
+                ):
+                    raise WorkflowError(
+                        "resume hotplug configuration drift: transaction selector "
+                        "no longer resolves to its recorded harness/profile"
+                    )
             predecessor_dir = run_paths.runs_root / resume.resumed_from_run_id
             try:
                 reconciled = classify_hotplug_resume_stage(predecessor_dir, transaction)

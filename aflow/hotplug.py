@@ -480,7 +480,7 @@ def bounded_hotplug_history(history: tuple[HotplugTransactionV1, ...] | list[Hot
 
 
 HOTPLUG_TERMINAL_STAGES = frozenset({"applied", "failed"})
-HOTPLUG_AMBIGUOUS_STAGES = frozenset({"handover_starting", "target_starting"})
+HOTPLUG_AMBIGUOUS_STAGES = frozenset({"quiescing", "handover_starting", "target_starting"})
 
 
 def _read_bound_artifact(run_dir: Path, relative_path: str, expected_hash: str) -> bytes:
