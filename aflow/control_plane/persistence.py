@@ -296,11 +296,18 @@ def _same_idempotent_request(existing: LaunchManifest, requested: LaunchManifest
 def create_launch_manifest(repo_root: Path, manifest: LaunchManifest) -> StartRunResult:
     """Exclusively create immutable launch intent, or return an identical replay."""
     run_id = validate_run_id(manifest.run_id)
-    _safe_run_dir(repo_root, run_id)
+    run_dir = _safe_run_dir(repo_root, run_id)
     launches = _launches_root(repo_root)
     path = launches / f"{run_id}.json"
     if path.is_symlink():
         raise RunIdentityError("launch manifest may not be a symlink")
+    # An existing manifest owns the identity and remains the authority for an
+    # idempotent replay.  Without one, an existing legacy/controller run
+    # directory must never be claimed by publishing a new launch artifact.
+    if not path.exists() and run_dir.exists():
+        raise RunIdentityConflict(
+            f"run id '{run_id}' already has a run directory without a launch manifest"
+        )
     resolved_manifest = LaunchManifest(
         **{**asdict(manifest), "run_id": run_id,
            # The durable idempotency digest belongs to this persistence

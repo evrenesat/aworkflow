@@ -23,7 +23,7 @@ from aflow.control_plane import (
 )
 from aflow.run_state import load_override_request
 from aflow.run_state import ControllerConfig
-from aflow.workflow import run_workflow
+from aflow.workflow import WorkflowError, run_workflow
 
 
 def _run_dir(tmp_path: Path, run_id: str = "control-run-6") -> Path:
@@ -161,3 +161,51 @@ def test_owner_stop_terminalizes_at_the_existing_pre_turn_boundary(
     metadata = (result.run_dir / "run.json").read_text()
     assert '"status": "owner_stopped"' in metadata
     assert read_events(result.run_dir)[-1].event_type == "owner_stopped"
+
+
+def test_reserved_run_id_collision_fails_before_launch_artifacts(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n")
+    existing_run = _run_dir(tmp_path, "occupied-run")
+    existing_marker = existing_run / "legacy.txt"
+    existing_marker.write_text("keep me\n")
+    config = WorkflowUserConfig(
+        roles={"worker": "codex.high"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"high": HarnessProfileConfig(model="high-model")}
+            )
+        },
+        workflows={
+            "live": WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    )
+                },
+                first_step="implement",
+            )
+        },
+        prompts={"p": "Work."},
+    )
+
+    with pytest.raises(WorkflowError, match="cannot reserve run identity: .*already has a run directory"):
+        run_workflow(
+            ControllerConfig(
+                repo_root=tmp_path,
+                plan_path=plan,
+                max_turns=2,
+                reserved_run_id=existing_run.name,
+            ),
+            config,
+            "live",
+            config_dir=tmp_path,
+            runner=lambda *args, **kwargs: pytest.fail("collision must precede child launch"),
+        )
+
+    launches = tmp_path / ".aflow" / "launches"
+    assert not (launches / f"{existing_run.name}.json").exists()
+    assert not (launches / f"{existing_run.name}.state.json").exists()
+    assert existing_marker.read_text() == "keep me\n"

@@ -56,6 +56,7 @@ def test_manifest_is_exclusive_and_idempotent_without_mutation(tmp_path: Path) -
     assert result.created is True
     manifest_path = tmp_path / ".aflow" / "launches" / f"{run_id}.json"
     original = manifest_path.read_bytes()
+    (tmp_path / ".aflow" / "runs" / run_id).mkdir()
 
     replay = create_launch_manifest(tmp_path, first)
     assert replay.created is False
@@ -103,6 +104,22 @@ def test_manifest_omits_extra_instructions_but_digests_them(tmp_path: Path) -> N
     assert sentinel not in json.dumps(payload, sort_keys=True)
     assert "extra_instructions" not in payload
     assert payload["request_digest"] == normalized_request_digest(request)
+
+
+def test_manifest_rejects_existing_run_without_launch_artifacts(tmp_path: Path) -> None:
+    run_id = "control-run-existing"
+    run_dir = tmp_path / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    existing_metadata = run_dir / "run.json"
+    existing_metadata.write_text('{"status":"legacy"}\n')
+
+    with pytest.raises(RunIdentityConflict, match="already has a run directory"):
+        create_launch_manifest(tmp_path, _manifest(run_id))
+
+    launches = tmp_path / ".aflow" / "launches"
+    assert not (launches / f"{run_id}.json").exists()
+    assert not (launches / f"{run_id}.state.json").exists()
+    assert existing_metadata.read_text() == '{"status":"legacy"}\n'
 
 
 def test_abandoned_temporary_manifest_does_not_block_same_request_retry(tmp_path: Path) -> None:
