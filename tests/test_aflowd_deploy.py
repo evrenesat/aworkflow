@@ -436,6 +436,37 @@ def test_tailscale_only_smoke_rejects_loopback_and_eth0_and_requires_bearer() ->
         server.server_close()
 
 
+def test_rollback_rewrites_the_pinned_service_to_the_selected_release(tmp_path: Path) -> None:
+    state_root = tmp_path / "aflowd"
+    old_release = state_root / "releases" / ("a" * 40)
+    selected_release = state_root / "releases" / ("b" * 40)
+    for release in (old_release, selected_release):
+        (release / "bin").mkdir(parents=True)
+        (release / "config").mkdir()
+        _write_executable(release / "bin" / "aflow-app-server", "#!/bin/sh\nexit 0\n")
+        (release / "config" / "config.toml").write_text("[server]\n")
+    (state_root / "current").symlink_to(old_release)
+    service_path = state_root / "aflowd.service"
+    service_path.write_text(f"ExecStart={old_release}/bin/aflow-app-server\n")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
+
+    result = _run(
+        "bash", str(DEPLOY / "rollback.sh"),
+        "--root", str(state_root),
+        "--service-path", str(service_path),
+        "--release", selected_release.name,
+        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (state_root / "current").resolve() == selected_release.resolve()
+    rendered = service_path.read_text()
+    assert str(selected_release) in rendered
+    assert str(old_release) not in rendered
+
+
 @pytest.mark.parametrize("name", ("install.sh", "rollback.sh", "status.sh", "uninstall-emergency.sh", "validate-runtime.sh"))
 def test_deploy_scripts_are_executable(name: str) -> None:
     assert os.access(DEPLOY / name, os.X_OK)
