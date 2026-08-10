@@ -70,7 +70,7 @@ describe('PlanPanel and SessionPanel interactions', () => {
     vi.mocked(api.listProjectPlans).mockResolvedValue([])
     vi.mocked(api.listPlanDrafts).mockResolvedValue(['draft-1'])
     vi.mocked(api.loadPlanDraft).mockResolvedValue({ name: 'draft-1', content: planMarkdown })
-    const { container } = render(<PlanPanel project={project} onStartExecution={vi.fn()} />)
+    const { container } = render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
     await waitFor(() => expect(screen.getByText('draft-1')).toBeDefined())
     fireEvent.click(screen.getByText('draft-1'))
     await waitFor(() => expect(screen.getByText('Draft content')).toBeDefined())

@@ -4,10 +4,10 @@ import * as api from '../api'
 
 interface PlanPanelProps {
   project: ProjectInfo
-  onStartExecution: (planPath: string) => void
+  onOpenRunDashboard: (planPath: string) => void
 }
 
-export function PlanPanel({ project, onStartExecution }: PlanPanelProps) {
+export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
   const [plans, setPlans] = useState<PlanInfo[]>([])
   const [drafts, setDrafts] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -209,8 +209,8 @@ export function PlanPanel({ project, onStartExecution }: PlanPanelProps) {
                 <div className="text-xs text-dim">
                   {plan.checkpoint_count} checkpoints, {plan.unchecked_count} remaining
                 </div>
-                <button className="btn btn-primary btn-sm" onClick={() => onStartExecution(plan.path)}>
-                  Start execution
+                <button className="btn btn-primary btn-sm" onClick={() => onOpenRunDashboard(plan.path)}>
+                  Open run dashboard
                 </button>
               </div>
             ))}

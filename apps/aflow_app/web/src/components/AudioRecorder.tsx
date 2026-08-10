@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react'
+import * as api from '../api'
 
 interface AudioRecorderProps {
   onTranscript: (text: string) => void
@@ -56,27 +57,7 @@ export function AudioRecorder({ onTranscript, disabled }: AudioRecorderProps) {
     setError(null)
 
     try {
-      const formData = new FormData()
-      formData.append('file', audioBlob, 'recording.webm')
-
-      const token = localStorage.getItem('aflow_auth_token')
-      const headers: HeadersInit = {}
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`
-      }
-
-      const response = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers,
-        body: formData,
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ detail: 'Transcription failed' }))
-        throw new Error(errorData.detail || 'Transcription failed')
-      }
-
-      const data = await response.json()
+      const data = await api.transcribeAudio(new File([audioBlob], 'recording.webm', { type: 'audio/webm' }))
       onTranscript(data.text)
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to transcribe audio'

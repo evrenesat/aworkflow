@@ -3,17 +3,17 @@ import type { ProjectInfo } from './types'
 import { ProjectPicker } from './components/ProjectPicker'
 import { SessionPanel } from './components/SessionPanel'
 import { PlanPanel } from './components/PlanPanel'
-import { ExecutionPanel } from './components/ExecutionPanel'
+import { RunDashboard } from './components/RunDashboard'
 import * as api from './api'
 
-type View = 'sessions' | 'plans' | 'execution'
+type View = 'sessions' | 'plans' | 'runs'
 
 export function App() {
   const [authToken, setAuthTokenState] = useState('')
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [selectedProject, setSelectedProject] = useState<ProjectInfo | null>(null)
   const [currentView, setCurrentView] = useState<View>('sessions')
-  const [executionPlanPath, setExecutionPlanPath] = useState<string | null>(null)
+  const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
   const [savingPlan, setSavingPlan] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
 
@@ -37,7 +37,7 @@ export function App() {
     setAuthTokenState('')
     setSelectedProject(null)
     setCurrentView('sessions')
-    setExecutionPlanPath(null)
+    setRunDashboardPlanPath(null)
   }
 
   function handleSelectProject(project: ProjectInfo) {
@@ -62,14 +62,9 @@ export function App() {
     }
   }
 
-  function handleStartExecution(planPath: string) {
-    setExecutionPlanPath(planPath)
-    setCurrentView('execution')
-  }
-
-  function handleCloseExecution() {
-    setExecutionPlanPath(null)
-    setCurrentView('plans')
+  function handleOpenRunDashboard(planPath: string) {
+    setRunDashboardPlanPath(planPath)
+    setCurrentView('runs')
   }
 
   if (!isAuthenticated) {
@@ -117,7 +112,7 @@ export function App() {
       >
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>aflow</h1>
-          <div className="text-xs text-dim truncate">Projects and planning sessions</div>
+          <div className="text-xs text-dim truncate">Projects, planning sessions, and daemon-owned runs</div>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={handleLogout}>
           Logout
@@ -173,14 +168,27 @@ export function App() {
                   >
                     Plans
                   </button>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => setCurrentView('runs')}
+                    style={{
+                      borderBottom: currentView === 'runs' ? '2px solid var(--color-primary)' : undefined,
+                    }}
+                  >
+                    Runs
+                  </button>
                 </div>
               </div>
 
               <div style={{ minHeight: 0, flex: 1 }}>
                 {currentView === 'sessions' && <SessionPanel project={selectedProject} onSavePlanDraft={handleSavePlanDraft} />}
-                {currentView === 'plans' && <PlanPanel project={selectedProject} onStartExecution={handleStartExecution} />}
-                {currentView === 'execution' && executionPlanPath && (
-                  <ExecutionPanel project={selectedProject} planPath={executionPlanPath} onClose={handleCloseExecution} />
+                {currentView === 'plans' && <PlanPanel project={selectedProject} onOpenRunDashboard={handleOpenRunDashboard} />}
+                {currentView === 'runs' && (
+                  <RunDashboard
+                    initialProjectRoot={selectedProject.current_path}
+                    initialPlanPath={runDashboardPlanPath}
+                    onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
+                  />
                 )}
               </div>
             </>
