@@ -9244,6 +9244,7 @@ def run_workflow(
             and scope_before_finalize.awaiting_review
             and step.role != "worker"
             and not done
+            and new_plan_exists
             and snapshot_before == post_snapshot
             and controller_next_step is not None
             and controller_next_step.role == "worker"

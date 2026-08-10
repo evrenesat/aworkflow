@@ -21,8 +21,10 @@ The dry-run prints the exact source, release destination, service, bind
 address, allowlist, and rollback target. --apply verifies that 100.103.69.9 is
 on tailscale0, builds the server and web app in the staged release, validates
 all three entrypoints and their hashes, renders a release-pinned config/service,
-switches current atomically, and then performs an authenticated /ready request.
-A failed readiness check restores the prior current target and aflowd.service;
+switches current atomically, and then polls an authenticated /ready request.
+Release entrypoints use Python safe-path mode so the service working directory
+cannot shadow the immutable package. A failed readiness check restores the
+prior current target and the prior release-pinned aflowd.service together;
 without a prior target it stops and disables only aflowd.
 
 The service is intentionally bound to 100.103.69.9:8765; it does not bind
@@ -32,6 +34,9 @@ writable, while retaining the systemd access necessary to create independent
 workflow units.
 
 ## Operation, rollback, and rotation
+Rollback moves both current and aflowd.service ExecStart to the selected
+immutable release before restarting only the daemon.
+
 
     sudo deploy/aflowd/status.sh
     sudo deploy/aflowd/rollback.sh --release <40-char-prior-commit>
