@@ -390,8 +390,10 @@ class DaemonService:
                 raise DaemonError("source workflow unit identity is ambiguous")
             if observed is not None and observed.is_active:
                 raise DaemonError("an active workflow unit cannot be resumed")
-            if source.launch_phase in {"manifest_only", "launch_requested", "launch_started"}:
+            if source.launch_phase in {"manifest_only", "launch_requested"}:
                 raise DaemonError("source run has an incomplete or ambiguous launch attempt")
+            if source.launch_phase == "launch_started" and source.status != "needs_attention":
+                raise DaemonError("a killed launched run must be reconciled before explicit resume")
             if source.status not in {"running", "failed", "interrupted", "needs_attention", "waiting_for_valid_override"}:
                 raise DaemonError("source run is incomplete, terminal, or lacks safe resume evidence")
             bootstrap = self._resume_bootstrap(source_run_id)

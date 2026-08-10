@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from aflow.api.models import PreparedRun
 from aflow.config import GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
 from aflow.control_plane import InMemoryUnitManager, LaunchManifest, create_launch_manifest, read_events, write_launch_phase
@@ -27,7 +29,8 @@ def _workflow_config() -> WorkflowUserConfig:
     )
 
 
-def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("source_phase", ("unit_started", "launch_started"))
+def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Path, monkeypatch, source_phase: str) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     config_path = repo_root / "aflow.toml"
@@ -60,7 +63,7 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     source_dir.joinpath("run.json").write_text(
         '{"status":"running","workflow_name":"managed","team":null,"selected_start_step":null}'
     )
-    write_launch_phase(repo_root, source_id, "unit_started")
+    write_launch_phase(repo_root, source_id, source_phase)
     units = InMemoryUnitManager()
     daemon = AflowDaemon(
         DaemonConfig(
