@@ -970,7 +970,7 @@ class DaemonService:
         for record in self._iter_records():
             if (
                 record.get("operation") == operation
-                and record.get("caller_scope") == caller_scope
+                and _equivalent_caller_scope(record.get("caller_scope"), caller_scope)
                 and record.get("idempotency_key") == idempotency_key
             ):
                 return record
@@ -992,7 +992,7 @@ class DaemonService:
                 if status.ownership != "control_plane":
                     continue
                 manifest = self._application.repository.get_launch_manifest(status.run_id)
-                if manifest is None or manifest.idempotency_key != idempotency_key or manifest.caller_scope != caller_scope:
+                if manifest is None or manifest.idempotency_key != idempotency_key or not _equivalent_caller_scope(manifest.caller_scope, caller_scope):
                     continue
                 if manifest.request_digest != request_digest:
                     raise DaemonIdempotencyConflict("start idempotency key was reused for a different request")
@@ -1124,14 +1124,14 @@ class DaemonService:
     def _assert_record_caller(self, record: Mapping[str, object], caller_scope: str) -> None:
         if not isinstance(caller_scope, str) or not caller_scope.strip():
             raise DaemonAuthorizationError("caller scope must be non-empty")
-        if record.get("caller_scope") != caller_scope:
+        if not _equivalent_caller_scope(record.get("caller_scope"), caller_scope):
             raise DaemonAuthorizationError("caller scope is not authorized for this startup request")
 
     def _assert_manifest_caller(self, run_id: str, caller_scope: str) -> None:
         if not isinstance(caller_scope, str) or not caller_scope.strip():
             raise DaemonAuthorizationError("caller scope must be non-empty")
         manifest = self._application.repository.get_launch_manifest(run_id)
-        if manifest is None or manifest.caller_scope != caller_scope:
+        if manifest is None or not _equivalent_caller_scope(manifest.caller_scope, caller_scope):
             raise DaemonAuthorizationError("caller scope is not authorized for this run")
 
     @contextmanager
@@ -1668,6 +1668,22 @@ def _question_identity(question_id: str) -> tuple[str, int]:
 def _unit_name(run_id: str) -> str:
     return f"aflow-run-{validate_run_id(run_id)}.service"
 
+
+def _equivalent_caller_scope(left: object, right: object) -> bool:
+    """Treat REST and MCP as one bearer-owned project authorization scope."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    if left == right:
+        return True
+    left_prefix, left_separator, left_project = left.partition(":")
+    right_prefix, right_separator, right_project = right.partition(":")
+    compatible_prefixes = {"rest", "mcp", "bearer"}
+    return (
+        bool(left_separator and right_separator and left_project)
+        and left_project == right_project
+        and left_prefix in compatible_prefixes
+        and right_prefix in compatible_prefixes
+    )
 
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None

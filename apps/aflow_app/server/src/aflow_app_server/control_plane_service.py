@@ -267,7 +267,7 @@ class ControlPlaneService:
     def _caller_scope(project_id: str, transport: str) -> str:
         if transport not in {"rest", "mcp"}:
             raise ValueError("unsupported control-plane transport")
-        return f"{transport}:{project_id}"
+        return f"bearer:{project_id}"
 
     @staticmethod
     def _plan_path(root: Path, requested: str) -> Path:

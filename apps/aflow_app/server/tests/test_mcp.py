@@ -236,16 +236,13 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
         "aflow.daemon.prepare_startup_with_answer",
         lambda _question, request, _answer: _prepared(request),
     )
-    answered = _mcp_tool(
-        client,
-        "answer_startup",
-        {
-            "project_id": PROJECT_ID,
-            "question_id": question["question_id"],
-            "answer": "implement",
-            "idempotency_key": "mcp-answer-1",
-        },
+    answered_response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/startup-answers/{question['question_id']}",
+        headers={"Authorization": f"Bearer {TOKEN}", "Idempotency-Key": "mcp-answer-1"},
+        json={"answer": "implement"},
     )
+    assert answered_response.status_code == 200
+    answered = answered_response.json()
     replayed_answer = _mcp_tool(
         client,
         "answer_startup",
