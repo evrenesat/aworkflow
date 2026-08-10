@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+from starlette.routing import Match, Mount, get_route_path
+from starlette.types import Scope
 
 from aflow.control_plane import (
     ControlConflictError,
@@ -40,6 +42,7 @@ from .control_plane_service import (
     ControlPlaneUnavailableError,
     ProjectNotAllowedError,
 )
+from .mcp_adapter import create_control_plane_mcp
 from .models import (
     CapabilityResponse,
     ContextResponse,
@@ -102,6 +105,9 @@ class AccessLogPathFilter(logging.Filter):
 _SECRET_TEXT = re.compile(
     r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|secret|password|api[_-]?key)\s*[:=]\s*[\"']?)([^\s\",'&]+)"
 )
+_MCP_CREDENTIAL_TEXT = re.compile(
+    r"(?i)\bbearer[ \t]+[^\s]+|(?:token|access_token|authorization)=[^&\s]+"
+)
 
 
 def _redact_text(value: str) -> str:
@@ -116,6 +122,25 @@ def _redact_url_credentials(value: str) -> str:
         r"\1[redacted]",
         value,
     )
+
+
+def _mcp_payload_contains_credential(body: bytes) -> bool:
+    """Reject bearer-shaped MCP JSON values before a transport can echo them."""
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return _contains_credential_value(payload)
+
+
+def _contains_credential_value(value: object) -> bool:
+    if isinstance(value, str):
+        return _MCP_CREDENTIAL_TEXT.search(value) is not None
+    if isinstance(value, dict):
+        return any(_contains_credential_value(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_credential_value(item) for item in value)
+    return False
 
 
 class SensitiveDataFilter(logging.Filter):
@@ -236,23 +261,41 @@ def get_planning_service() -> PlanningService:
 security = HTTPBearer(auto_error=False)
 
 
-async def verify_token(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    config: ServerConfig = Depends(get_config),
-) -> str:
-    """Verify one header-only bearer token using constant-time comparison."""
+def _verify_bearer_token(provided_token: str | None, config: ServerConfig) -> str:
+    """Verify a header bearer credential for every authenticated transport."""
     try:
         expected = config.current_auth_token()
     except ValueError:
         expected = ""
-    provided_token = credentials.credentials if credentials and credentials.scheme.lower() == "bearer" else ""
-    if not expected or not hmac.compare_digest(provided_token, expected):
+    if not expected or not provided_token or not hmac.compare_digest(provided_token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
     return "authenticated"
+
+
+def _bearer_token_from_header(authorization: str | None) -> str | None:
+    if authorization is None:
+        return None
+    scheme, separator, token = authorization.strip().partition(" ")
+    if separator != " " or scheme.lower() != "bearer" or not token:
+        return None
+    return token
+
+
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    config: ServerConfig = Depends(get_config),
+) -> str:
+    """Verify one header-only bearer token using constant-time comparison."""
+    provided_token = (
+        credentials.credentials
+        if credentials and credentials.scheme.lower() == "bearer"
+        else None
+    )
+    return _verify_bearer_token(provided_token, config)
 
 
 def get_plan_store_factory(project_catalog: ProjectCatalog = Depends(get_project_catalog)):
@@ -299,6 +342,26 @@ def _build_uvicorn_log_config() -> dict[str, Any]:
     access_handler = log_config.setdefault("handlers", {}).setdefault("access", {})
     access_handler["filters"] = [*access_handler.get("filters", []), "suppress_plugin_events"]
     return log_config
+
+
+mcp_server = create_control_plane_mcp(get_control_plane_service)
+mcp_http_app = mcp_server.http_app(path="/", json_response=True, stateless_http=True)
+
+
+class _MCPMount(Mount):
+    """Make the Streamable HTTP endpoint available at both `/mcp` and `/mcp/`."""
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        if scope["type"] in {"http", "websocket"} and get_route_path(scope) == self.path:
+            root_path = scope.get("root_path", "")
+            return Match.FULL, {
+                "path_params": dict(scope.get("path_params", {})),
+                "app_root_path": scope.get("app_root_path", root_path),
+                "root_path": root_path + self.path,
+                "path": "/",
+                "endpoint": self.app,
+            }
+        return super().matches(scope)
 
 
 @asynccontextmanager
@@ -366,7 +429,8 @@ async def lifespan(app: FastAPI):
     app.state.attachment_store = attachment_store
 
     try:
-        yield
+        async with mcp_http_app.lifespan(app):
+            yield
     finally:
         await _planning_registry.close()
         # Cleanup
@@ -401,6 +465,23 @@ async def block_local_plugin_probe(request: Request, call_next):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"detail": {"code": "token_query_rejected"}},
         )
+    if request.url.path == "/mcp" or request.url.path.startswith("/mcp/"):
+        if _mcp_payload_contains_credential(await request.body()):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": {"code": "token_payload_rejected"}},
+            )
+        try:
+            _verify_bearer_token(
+                _bearer_token_from_header(request.headers.get("authorization")),
+                get_config(),
+            )
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
     if request.url.path == "/api/plugin/events":
         body = await request.body()
         if _plugin_probe_logging_enabled():
@@ -412,6 +493,7 @@ app.dependency_overrides[planning_routes_module._get_project_catalog] = get_proj
 app.dependency_overrides[planning_routes_module._get_planning_service] = get_planning_service
 
 app.include_router(planning_routes_module.router, dependencies=[Depends(verify_token)])
+app.router.routes.append(_MCPMount("/mcp", app=mcp_http_app, name="mcp"))
 
 
 def _error_response(status_code: int, code: str, **extra: Any) -> JSONResponse:

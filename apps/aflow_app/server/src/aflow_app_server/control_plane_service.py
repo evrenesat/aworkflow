@@ -165,6 +165,7 @@ class ControlPlaneService:
         start_step: str | None,
         max_turns: int | None,
         idempotency_key: str | None,
+        caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
         item = self._project(project_id)
         request = StartupRequest(
@@ -179,7 +180,7 @@ class ControlPlaneService:
         )
         return item.daemon.service.start(
             request,
-            caller_scope=self._caller_scope(project_id),
+            caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
 
@@ -190,11 +191,12 @@ class ControlPlaneService:
         answer: str | int | bool,
         *,
         idempotency_key: str | None,
+        caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
         return self._project(project_id).daemon.service.answer_startup(
             question_id,
             answer,
-            caller_scope=self._caller_scope(project_id),
+            caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
 
@@ -205,12 +207,13 @@ class ControlPlaneService:
         request: RunControlRequest,
         *,
         idempotency_key: str | None,
+        caller_scope: str = "rest",
     ) -> tuple[ControlWriteResult, RunStatus]:
         item = self._project(project_id)
         result = item.daemon.application.controls.apply(
             run_id,
             request,
-            caller_scope=self._caller_scope(project_id),
+            caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
         return result, item.daemon.application.repository.get_run_status(run_id)
@@ -222,11 +225,12 @@ class ControlPlaneService:
         *,
         expected_revision: int,
         idempotency_key: str | None,
+        caller_scope: str = "rest",
     ) -> RunStatus:
         return self._project(project_id).daemon.service.owner_stop(
             run_id,
             expected_revision=expected_revision,
-            caller_scope=self._caller_scope(project_id),
+            caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
 
@@ -236,10 +240,11 @@ class ControlPlaneService:
         run_id: str,
         *,
         idempotency_key: str | None,
+        caller_scope: str = "rest",
     ) -> StartRunResult:
         return self._project(project_id).daemon.service.resume(
             run_id,
-            caller_scope=self._caller_scope(project_id),
+            caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
 
@@ -254,8 +259,10 @@ class ControlPlaneService:
         return item
 
     @staticmethod
-    def _caller_scope(project_id: str) -> str:
-        return f"rest:{project_id}"
+    def _caller_scope(project_id: str, transport: str) -> str:
+        if transport not in {"rest", "mcp"}:
+            raise ValueError("unsupported control-plane transport")
+        return f"{transport}:{project_id}"
 
     @staticmethod
     def _plan_path(root: Path, requested: str) -> Path:
