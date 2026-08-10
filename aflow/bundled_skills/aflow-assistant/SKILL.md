@@ -13,6 +13,12 @@ Use this skill when helping a user understand, debug, or recover an aflow run. T
   - CLI command that deterministically extracts a single-run report by default and can also summarize a corpus when asked. It pulls out high-signal patterns such as merge failures, missing original plans, blocked review preconditions, interrupted runs, and alternating no-progress loops.
 - `references/engine-map.md`
   - High-level engine and artifact map for installed-skill scenarios where the original `aflow` source checkout is not present.
+- `references/engine-features.md`
+  - Complete engine features reference: configuration system (every key,
+    type, and default), workflow/step/condition model, harnesses, session
+    capabilities, the hotplug system (stages, capability paths, handover),
+    manager supervision, error recovery, repartition, scope pressure, run
+    artifacts, CLI surface, bundled skills, and plan format.
 
 Use these bundled resources first. They are part of the shipped skill and remain available after installation even when the repo source tree is not.
 
@@ -53,7 +59,11 @@ Use these bundled resources first. They are part of the shipped skill and remain
    aflow analyze --all
    ```
 4. Read `references/engine-map.md` before assuming you need direct source-code access.
-5. Use repo source files only when a source checkout is actually present and you need deeper implementation detail than the bundled reference provides.
+5. For "how is this configured / what does this feature do" questions, read
+   `references/engine-features.md` — it covers the full config surface,
+   workflows, harnesses, hotplug, manager, recovery, repartition, artifacts,
+   CLI, and skills without source access.
+6. Use repo source files only when a source checkout is actually present and you need deeper implementation detail than the bundled reference provides.
 
 ## What Lives Where
 
@@ -74,6 +84,12 @@ Use these bundled resources first. They are part of the shipped skill and remain
   - Relevant only when investigating plan sync or backup behavior.
 - `references/engine-map.md`
   - Installed bundled architecture summary. Use this first when the skill is installed outside the original repo.
+- `references/engine-features.md`
+  - Complete engine surface reference: config keys and defaults, workflows,
+    harnesses, session capabilities, hotplug stages and capability paths,
+    manager, recovery, repartition, scope pressure, run artifacts, CLI, and
+    skills. Use it to answer "how does X work / what is configurable" without
+    opening source files.
 - `aflow analyze`
   - CLI command for deterministic single-run extraction first, with optional corpus mode.
 - `README.md`
@@ -193,7 +209,8 @@ When the skill is installed into a harness directory, the original repo files su
 
 1. Read `references/engine-map.md`.
 2. Use `aflow analyze` plus `run.json` and turn `result.json` as the primary evidence path.
-3. Escalate to source-code lookup only if the user is working inside an actual `aflow` source checkout.
+3. Consult `references/engine-features.md` for configuration, feature, and CLI questions the map does not cover.
+4. Escalate to source-code lookup only if the user is working inside an actual `aflow` source checkout.
 
 Do not tell the user to inspect source files that are not present in their environment.
 

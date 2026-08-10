@@ -14,7 +14,7 @@ On first run, `aflow` creates both files under `~/.config/aflow/` from packaged 
 | `default_workflow` | string | - | Workflow to run when none is specified on the CLI. |
 | `keep_runs` | int | `20` | Number of run log directories to retain under `.aflow/runs/`. |
 | `max_turns` | int | `15` | Hard cap on turns for a run. `--max-turns` / `-mt` overrides it for one invocation. |
-| `retry_inconsistent_checkpoint_state` | int | `0` | Automatic retry count when a harness exits cleanly but leaves a checkpoint heading checked while tasks remain unchecked. |
+| `retry_inconsistent_checkpoint_state` | int | `0` | Automatic retry count when a harness exits cleanly but leaves a checkpoint heading checked while tasks remain unchecked. The packaged bootstrap file ships `1`, so a freshly bootstrapped config effectively defaults to 1. |
 | `banner_files_limit` | int | `10` | Maximum changed files shown in the live banner before `+N more`. |
 | `max_same_step_turns` | int | `5` | Maximum consecutive turns the same step can be selected in multi-step workflows. `0` disables it. |
 | `team_lead` | string | - | Role name used for merge handoff and fallback harness recovery. Required for workflows with `merge` teardown. |
@@ -253,6 +253,9 @@ and does not change quality-upgrade routing.
 - Concrete workflows live under `[workflow.<name>]`.
 - Alias workflows use `extends = "base_workflow"` and may set an optional `team`.
 - Alias workflows inherit steps from the base workflow and cannot redefine `steps`.
+- Aliases also cannot set `retry_inconsistent_checkpoint_state` (it is always
+  inherited from the base) and cannot extend another alias — only concrete
+  base workflows. Alias cycles are rejected at config load.
 - `exclude = ["step_name"]` removes steps from execution while keeping them visible in `aflow show` and the live banner. Alias exclusions are applied after inheritance.
 - Concrete workflows start at their first declared step unless `--start-step` overrides that.
 - `prompts` must be a non-empty array of prompt keys.

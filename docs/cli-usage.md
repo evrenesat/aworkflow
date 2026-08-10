@@ -132,11 +132,20 @@ aflow analyze --repo-root path/to/repo <RUN_ID>
 aflow analyze
 aflow analyze --repo-root path/to/repo
 aflow analyze --all
+aflow analyze --all --limit 50
+aflow analyze --all --include-noise
 aflow analyze <RUN_ID> --manager-context lite
 aflow analyze <RUN_ID> --manager-context full --turn 3
 ```
 
 Single-run resolution uses the same lookup order as resume: explicit `RUN_ID`, shell-local last run id, `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`. `--all` switches to corpus mode.
+
+Corpus mode flags:
+
+- `--limit N` caps the number of run directories considered (default `20`).
+- `--include-noise` keeps low-signal test-noise runs instead of filtering
+  them out (noise = `workflow_name == "other"` with `turns_completed == 0`
+  and `end_reason == "already_complete"`).
 
 `--manager-context lite|full` rebuilds the same read-only versioned context
 that manager supervision used for a finalized workflow turn. `--turn N` selects
@@ -201,7 +210,7 @@ With no workflow argument, it prints a shared roles/teams section followed by ev
 
 Parser rules:
 
-- Checkpoint headings must start with `### [ ] Checkpoint ...` or `### [x] Checkpoint ...`.
+- Checkpoint headings must start with `### [ ] Checkpoint ...` or `### [x] Checkpoint ...` (the `[X]` uppercase spelling is also accepted).
 - Only task items under a checkpoint section count toward that checkpoint's remaining work.
 - A checked checkpoint heading cannot contain unchecked task items.
 - If no checkpoint sections are found, the run fails before starting.
@@ -220,5 +229,5 @@ Supported harness adapters:
 | `gemini` | `gemini --prompt ... --approval-mode yolo --sandbox=false` | No |
 | `kiro` | `kiro-cli chat --no-interactive --trust-all-tools` | No |
 | `opencode` | `opencode run --format default --dir <repo-root>` | No |
-| `reasonix` | `reasonix run --dir <repo-root> [--model MODEL]` | No |
+| `reasonix` | `reasonix run --dir <repo-root> [--model MODEL] [--effort EFFORT]` | Yes |
 | `pi` | `pi --print --tools read,bash,edit,write,grep,find,ls` | Yes |

@@ -64,6 +64,9 @@ Selection flags:
 
 - `--include-optional` installs the default bundled skills plus optional bundled skills, including `aflow-assistant`.
 - `--only SKILL` installs exactly the named skill. It can be repeated and does not include the default set unless you name each skill explicitly.
+- `--yes` skips the confirmation prompt. It is required for non-interactive
+  stdin: without it, an unattended install aborts and tells you to rerun with
+  `--yes`.
 
 Auto-install destination map:
 

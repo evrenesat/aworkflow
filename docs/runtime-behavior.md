@@ -142,6 +142,7 @@ The complete supported grammar is:
 next_step = "implement_plan"
 team = "strong"
 max_turns = 20
+roles = { worker = "codex.high" }
 notes = ["Re-run the focused regression before broader tests."]
 ```
 
@@ -150,6 +151,13 @@ name an executable step in the frozen workflow. `team` must be configured and
 able to resolve the target step's role. `max_turns` must be positive and cannot
 be below the number of completed turns. `notes` is an array of non-empty
 strings and is appended only to the next worker prompt.
+`roles` maps role names to fully qualified `harness.profile` selectors and is
+the run-local role-selector hotplug surface: it overrides the frozen role
+routing for the next worker turn (validated against the frozen config) and
+creates a durable hotplug transaction instead of a plain override. Same-harness
+switches resume the exact active source session (`native_resume`); cross-harness
+switches require a bounded read-only handover brief before the target starts
+(`handover_required`). See the Live Role-Selector Hotplug section below.
 
 AFlow reads this file once at the pre-turn boundary, never while a harness is
 running. It retains the exact source and its hash in the controller record,
@@ -205,6 +213,83 @@ Active/completed turn history, plan lineage, lifecycle/worktree ownership,
 manager decisions, the workflow graph, and configuration files cannot be
 changed through this surface. There is no live config reload, file watcher,
 daemon, database, or supported direct-edit workflow for `run.json`.
+
+## Live Role-Selector Hotplug
+
+A `roles` override in `overrides.toml` (or a manager-selected upgrade that
+changes the worker selector) creates a durable hotplug transaction instead of
+a plain override. Hotplug is the run-local role-selector switching surface: it
+changes which harness/profile selector runs the next worker turn while the run
+stays alive.
+
+### Session capabilities
+
+Only session-capable harnesses participate in hotplug. The engine probes each
+adapter's `SessionCapabilities` (six flags: `session_identity`,
+`followup_turn`, `resume_with_model`, `mid_turn_steer`, `read_only_teardown`,
+`idempotent_turn_start`):
+
+- `codex` capabilities are probed from the installed binary's `--help`
+  surface (`--json` support, `resume [SESSION_ID]`, and `--model` in resume
+  help).
+- `reasonix` capabilities are negotiated at runtime from the ACP
+  `initialize` handshake (`session/new`, `session/prompt`,
+  `session/update_config`, `idempotency_key`, ...).
+- All other adapters advertise no session capabilities and always start a
+  fresh subprocess.
+
+### Transaction and capability path
+
+Each transaction records source/target role, selector, harness, profile,
+model display, the exact source session, `capability_path`, a stage, and
+SHA-256-bound artifacts. `capability_path` is decided when the override is
+accepted:
+
+- `native_resume` — source and target harness are the same. The target turn
+  resumes the exact active source session; this requires a session driver
+  with exact resume (`resume_with_model` or an owned executor), otherwise the
+  boundary fails closed.
+- `handover_required` — cross-harness switch. The target environment is
+  preflighted first, then the source session produces a bounded read-only
+  handover brief (≤ 8 KiB, eight required Markdown sections, no hidden
+  reasoning, workspace fingerprint unchanged). The brief, its bounded context
+  projection, and a bounded full-context snapshot are written hash-bound under
+  `.aflow/runs/<run-id>/hotplugs/hotplug-<NNN>/` (`handover.md`,
+  `context.json`, `full-context.json`) and appended to the target turn's
+  prompt.
+
+### Stages
+
+The durable stage machine is: `accepted` → `target_preflighted` → `quiescing`
+→ `source_finalized` → `handover_starting` → `handover_ready` →
+`target_starting` → `applied`, with `failed` and
+`waiting_for_hotplug_recovery` as terminal/fail-closed exits. In the live
+engine the observable transitions are `accepted` → (`handover_ready` for
+cross-harness) → `applied` or `failed`; the intermediate stages exist for
+durable resume validation. Terminal stages are `applied` and `failed`;
+`quiescing`, `handover_starting`, and `target_starting` are ambiguous and fail
+closed on resume to `waiting_for_hotplug_recovery` with a remediation message
+(the run stops with `status = waiting_for_hotplug_recovery` until the
+provider operation is reconciled or the owner intervenes).
+
+On target success the transaction records the target's provider operation id
+and idempotency key and moves to `applied`. On failure the controller reverts
+the selector to the source, restores the source session to `active`, records
+`failed` with the failure reason, and keeps the source worker live. History is
+bounded to the last 16 transactions. Resume reconciles a pending transaction
+before any harness starts: recorded selectors must still resolve to the same
+harness/profile, handover artifacts are copied hash-bound into the successor
+run, and a recoverable ambiguous operation is reconciled through the session
+driver's `reconcile_provider_operation` when available. All hotplug artifact
+writes are atomic and refuse to overwrite; paths must stay inside the run
+directory.
+
+Hotplug events (`hotplug_requested`, `hotplug_stage_changed`,
+`hotplug_applied`, `hotplug_failed`) are emitted to observers. The live banner
+shows `hotplug <stage>: <source_selector> -> <target_selector> (<capability>)
+| active <selector>` while a transaction is live, and `aflow analyze` reports
+the current/pending transactions, normalized history, capability paths, and
+active session count.
 
 ## Loop Limits
 
@@ -455,6 +540,8 @@ Fields include:
 - run-state schema, frozen-config fingerprint, and safe override status
 - workflow and current step
 - harness, model, and effort
+- hotplug stage, selector transition, and capability path when a hotplug
+  transaction is live
 - checkpoint progress and turn count
 - original and active plan paths
 - workflow graph
