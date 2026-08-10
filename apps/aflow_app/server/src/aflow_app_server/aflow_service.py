@@ -1,241 +1,51 @@
-"""Service layer for aflow library integration."""
+"""Compatibility reads for the project and planning APIs."""
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
 
-from aflow.api.events import (
-    ExecutionEvent,
-    ExecutionEventType,
-    ExecutionObserver,
-    RunCompletedEvent,
-    RunFailedEvent,
-    RunStartedEvent,
-    StatusChangedEvent,
-    TurnFinishedEvent,
-    TurnStartedEvent,
-)
-from aflow.api.models import PreparedRun, StartupContext
-from aflow.api.runner import execute_workflow
-from aflow.api.startup import prepare_startup
 from aflow.plan import load_plan
 
-from .models import ExecutionRequest, ExecutionStatus, PlanInfo, PlanStatus
+from .models import PlanInfo, PlanStatus
 
 
 class AflowServiceError(Exception):
-    """Error in aflow service operations."""
-    pass
-
-
-@dataclass
-class StartupResult:
-    """Result of startup preparation."""
-
-    prepared_run: PreparedRun | None = None
-    question: dict[str, Any] | None = None
-    error: str | None = None
+    """Error in the compatibility read adapter."""
 
 
 class AflowService:
-    """Service for interacting with the aflow library."""
+    """Expose legacy plan metadata without becoming a workflow owner.
 
-    def __init__(self) -> None:
-        self._active_runs: dict[str, ExecutionStatus] = {}
-        self._event_queues: dict[str, asyncio.Queue[ExecutionEvent]] = {}
+    Lifecycle operations were deliberately moved to ``ControlPlaneService``.
+    It composes daemon-owned services and is the only REST execution path.
+    """
 
     def list_plans(self, project_path: Path) -> list[PlanInfo]:
-        """List all plan files in a repository.
-
-        Args:
-            project_path: Path to the project root.
-
-        Returns:
-            List of PlanInfo for all found plans.
-        """
+        """List legacy planning metadata for the pre-existing application UI."""
         plans: list[PlanInfo] = []
-
-        # Check drafts directory
-        drafts_dir = project_path / "plans" / "drafts"
-        if drafts_dir.exists():
-            for plan_file in drafts_dir.glob("*.md"):
-                info = self._get_plan_info(plan_file, PlanStatus.DRAFT)
-                if info:
+        for directory, status in (
+            (project_path / "plans" / "drafts", PlanStatus.DRAFT),
+            (project_path / "plans" / "in-progress", PlanStatus.IN_PROGRESS),
+        ):
+            if not directory.exists():
+                continue
+            for plan_file in directory.glob("*.md"):
+                info = self._get_plan_info(plan_file, status)
+                if info is not None:
                     plans.append(info)
+        return sorted(plans, key=lambda item: item.name)
 
-        # Check in-progress directory
-        in_progress_dir = project_path / "plans" / "in-progress"
-        if in_progress_dir.exists():
-            for plan_file in in_progress_dir.glob("*.md"):
-                info = self._get_plan_info(plan_file, PlanStatus.IN_PROGRESS)
-                if info:
-                    plans.append(info)
-
-        return sorted(plans, key=lambda p: p.name)
-
-    def _get_plan_info(self, plan_path: Path, status: PlanStatus) -> PlanInfo | None:
-        """Get plan info for a single file."""
+    @staticmethod
+    def _get_plan_info(plan_path: Path, status: PlanStatus) -> PlanInfo | None:
         try:
-            parsed = load_plan(plan_path)
-            snapshot = parsed.snapshot
-            return PlanInfo(
-                name=plan_path.stem,
-                path=plan_path,
-                status=status,
-                checkpoint_count=snapshot.total_checkpoint_count,
-                unchecked_count=snapshot.unchecked_checkpoint_count,
-                is_complete=snapshot.is_complete,
-            )
+            snapshot = load_plan(plan_path).snapshot
         except Exception:
             return None
-
-    def prepare_execution(
-        self,
-        project_path: Path,
-        request: ExecutionRequest,
-    ) -> StartupResult:
-        """Prepare a workflow execution.
-
-        Args:
-            project_path: Path to the project root.
-            request: Execution request parameters.
-
-        Returns:
-            StartupResult with either a PreparedRun or a question.
-        """
-        plan_path = project_path / request.plan_path
-
-        if not plan_path.exists():
-            return StartupResult(error=f"Plan file not found: {request.plan_path}")
-
-        try:
-            from aflow.api.models import StartupRequest
-            startup_request = StartupRequest(
-                repo_root=project_path,
-                plan_path=plan_path,
-                workflow_name=request.workflow_name,
-                team=request.team,
-                start_step=request.start_step,
-                max_turns=request.max_turns,
-                extra_instructions=request.extra_instructions,
-            )
-
-            result = prepare_startup(startup_request)
-
-            if isinstance(result, PreparedRun):
-                return StartupResult(prepared_run=result)
-
-            # It's a StartupQuestion
-            return StartupResult(question={
-                "kind": result.kind.value if hasattr(result.kind, "value") else str(result.kind),
-                "message": result.message,
-                "options": result.options,
-                "choices": result.choices,
-            })
-
-        except Exception as e:
-            return StartupResult(error=str(e))
-
-    async def execute_workflow_async(
-        self,
-        prepared_run: PreparedRun,
-        project_id: str,
-    ) -> str:
-        """Execute a workflow asynchronously.
-
-        Args:
-            prepared_run: The prepared run configuration.
-            project_id: ID of the project.
-
-        Returns:
-            Run ID for tracking.
-        """
-        run_id = str(uuid4())[:8]
-        event_queue: asyncio.Queue[ExecutionEvent] = asyncio.Queue()
-        self._event_queues[run_id] = event_queue
-
-        status = ExecutionStatus(
-            run_id=run_id,
-            project_id=project_id,
-            plan_path=str(prepared_run.plan_path),
-            workflow_name=prepared_run.workflow_name,
-            status="starting",
-            turns_completed=0,
-            current_step=prepared_run.start_step,
-            started_at=datetime.now(timezone.utc),
+        return PlanInfo(
+            name=plan_path.stem,
+            path=plan_path,
+            status=status,
+            checkpoint_count=snapshot.total_checkpoint_count,
+            unchecked_count=snapshot.unchecked_checkpoint_count,
+            is_complete=snapshot.is_complete,
         )
-        self._active_runs[run_id] = status
-
-        # Run in background
-        asyncio.create_task(self._run_workflow(run_id, prepared_run, event_queue))
-
-        return run_id
-
-    async def _run_workflow(
-        self,
-        run_id: str,
-        prepared_run: PreparedRun,
-        event_queue: asyncio.Queue[ExecutionEvent],
-    ) -> None:
-        """Run the workflow and emit events."""
-        status = self._active_runs[run_id]
-
-        class QueueObserver(ExecutionObserver):
-            def __init__(self, queue: asyncio.Queue[ExecutionEvent]) -> None:
-                self._queue = queue
-
-            def on_event(self, event: ExecutionEvent) -> None:
-                try:
-                    asyncio.get_event_loop().call_soon_threadsafe(
-                        lambda: self._queue.put_nowait(event)
-                    )
-                except Exception:
-                    pass
-
-        observer = QueueObserver(event_queue)
-
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: execute_workflow(prepared_run, observer=observer)
-            )
-
-            status = ExecutionStatus(
-                run_id=run_id,
-                project_id=status.project_id,
-                plan_path=status.plan_path,
-                workflow_name=status.workflow_name,
-                status="completed" if result.end_reason == "done" else "failed",
-                turns_completed=result.turns_completed,
-                current_step=status.current_step,
-                started_at=status.started_at,
-                error=None if result.end_reason == "done" else str(result.end_reason),
-            )
-            self._active_runs[run_id] = status
-
-        except Exception as e:
-            status = ExecutionStatus(
-                run_id=run_id,
-                project_id=status.project_id,
-                plan_path=status.plan_path,
-                workflow_name=status.workflow_name,
-                status="failed",
-                turns_completed=status.turns_completed,
-                current_step=status.current_step,
-                started_at=status.started_at,
-                error=str(e),
-            )
-            self._active_runs[run_id] = status
-
-    def get_run_status(self, run_id: str) -> ExecutionStatus | None:
-        """Get the status of a run."""
-        return self._active_runs.get(run_id)
-
-    def get_event_queue(self, run_id: str) -> asyncio.Queue[ExecutionEvent] | None:
-        """Get the event queue for a run."""
-        return self._event_queues.get(run_id)
