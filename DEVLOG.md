@@ -14,6 +14,13 @@
 - Capability evidence was protocol/fixture based; no paid live Reasonix prompt
   smoke is claimed.
 
+## 2026-08-08 — Forward Reasonix effort independently
+
+- Reasonix profiles now pass their configured effort through the CLI's native
+  `--effort` option instead of requiring a nonexistent model-name variant.
+- Adapter coverage fixes the DeepSeek V4 Flash/max invocation contract; the
+  deployment configuration selects Sol 5.6/medium for `ds4_flash_max` reviews.
+
 ## 2026-08-08 — Prefer fastest-safe guard completion
 
 - Guarded recovery now chooses the smallest reversible, scope-reducing option

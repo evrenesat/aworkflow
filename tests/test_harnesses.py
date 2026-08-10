@@ -33,7 +33,7 @@ class AdaptersTests(unittest.TestCase):
             'SYSTEM\n\nUSER',
         )
         assert '-dir' not in invocation.argv
-        assert not adapter.supports_effort
+        assert adapter.supports_effort
         assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
         assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
         final_invocation = invocation.for_final_output()
@@ -50,7 +50,7 @@ class AdaptersTests(unittest.TestCase):
         )
         assert final_invocation.argv.index('--print') < final_invocation.argv.index('SYSTEM\n\nUSER')
 
-    def test_reasonix_without_model_and_with_effort_ignores_effort(self) -> None:
+    def test_reasonix_without_model_and_with_effort(self) -> None:
         adapter = ReasonixAdapter()
         invocation = adapter.build_invocation(
             repo_root=Path('/repo'),
@@ -59,12 +59,29 @@ class AdaptersTests(unittest.TestCase):
             user_prompt='USER',
             effort='high',
         )
-        assert invocation.argv == ('reasonix', 'run', '--dir', '/repo', 'SYSTEM\n\nUSER')
+        assert invocation.argv == (
+            'reasonix', 'run', '--dir', '/repo', '--effort', 'high', 'SYSTEM\n\nUSER'
+        )
         assert '-dir' not in invocation.argv
-        assert '--effort' not in invocation.argv
+        assert invocation.argv[invocation.argv.index('--effort') + 1] == 'high'
         assert '--model' not in invocation.argv
         assert invocation.for_final_output().argv == (
-            'reasonix', 'run', '--dir', '/repo', '--print', 'SYSTEM\n\nUSER'
+            'reasonix', 'run', '--dir', '/repo', '--effort', 'high', '--print',
+            'SYSTEM\n\nUSER'
+        )
+
+    def test_reasonix_flash_max_effort_is_forwarded(self) -> None:
+        adapter = ReasonixAdapter()
+        invocation = adapter.build_invocation(
+            repo_root=Path('/repo'),
+            model='deepseek-flash',
+            system_prompt='SYSTEM',
+            user_prompt='USER',
+            effort='max',
+        )
+        assert invocation.argv == (
+            'reasonix', 'run', '--dir', '/repo', '--model', 'deepseek-flash',
+            '--effort', 'max', 'SYSTEM\n\nUSER'
         )
 
     def test_codex_without_effort(self) -> None:

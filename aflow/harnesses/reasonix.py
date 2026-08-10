@@ -10,10 +10,10 @@ from typing import Any, Mapping
 from .base import HarnessInvocation
 from .session import SessionCapabilities, SessionExecutionResult, SessionRequest, SessionResult
 from .preflight import (
+    REASONIX_BWRAP_REMEDIATION,
     HarnessEnvironmentBlocker,
     HarnessPreflightContext,
     HarnessPreflightProbe,
-    REASONIX_BWRAP_REMEDIATION,
     diagnostic_fields,
 )
 
@@ -101,9 +101,8 @@ def parse_acp_jsonrpc(
 class ReasonixAdapter:
     """Harness adapter for the Reasonix AI coding agent.
 
-    Reasonix does not expose an ``--effort`` flag; reasoning effort is baked
-    into each model variant (e.g. ``deepseek-flash`` vs ``deepseek-pro-max``),
-    so ``supports_effort`` is ``False``.
+    Current Reasonix releases expose an ``--effort`` flag, so AFlow forwards
+    configured effort independently from the selected model.
 
     Permission bypass is handled through the Reasonix config file (``reasonix.toml``)
     rather than CLI flags — the user should set ``[permissions] mode = "allow"``
@@ -111,7 +110,7 @@ class ReasonixAdapter:
     """
 
     name = "reasonix"
-    supports_effort = False
+    supports_effort = True
 
     def session_driver(self, initialize_payload: Mapping[str, Any]) -> "ReasonixAcpDriver":
         return ReasonixAcpDriver.from_initialize(initialize_payload)
@@ -132,6 +131,8 @@ class ReasonixAdapter:
         argv: list[str] = ["reasonix", "run", "--dir", str(repo_root)]
         if model is not None:
             argv.extend(["--model", model])
+        if effort is not None:
+            argv.extend(["--effort", effort])
         argv.append(effective_prompt)
         final_output_argv = [*argv[:-1], "--print", effective_prompt]
         return HarnessInvocation(

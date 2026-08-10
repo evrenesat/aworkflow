@@ -55,6 +55,44 @@ def _run(
     }
 
 
+def test_uv_global_project_option_is_collapsed_into_one_controller() -> None:
+    helper = _helper_module()
+    cwd = "/root/code/audioventura"
+    wrapper = helper.ProcessRecord(
+        pid=854387,
+        ppid=1,
+        pgid=854387,
+        state="S",
+        elapsed="00:01",
+        command=(
+            "uv --project /root/code/agent_flow run aflow run "
+            "--resume 20260808T151419Z-36183503"
+        ),
+        cwd=cwd,
+    )
+    child = helper.ProcessRecord(
+        pid=854393,
+        ppid=854387,
+        pgid=854387,
+        state="S",
+        elapsed="00:01",
+        command=(
+            "/root/code/agent_flow/.venv/bin/python "
+            "/root/code/agent_flow/.venv/bin/aflow run "
+            "--resume 20260808T151419Z-36183503"
+        ),
+        cwd=cwd,
+    )
+
+    controllers, wrappers = helper._logical_controller_matches(
+        [wrapper, child],
+        [wrapper, child],
+    )
+
+    assert [record.pid for record in controllers] == [854393]
+    assert [record.pid for record in wrappers] == [854387]
+
+
 def test_replacement_linkage_uses_original_recovery_fingerprint_and_is_fail_closed(
     tmp_path: Path,
 ) -> None:

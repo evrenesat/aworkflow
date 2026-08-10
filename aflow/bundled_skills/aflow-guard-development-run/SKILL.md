@@ -1,6 +1,6 @@
 ---
 name: aflow-guard-development-run
-description: Guard any explicitly requested AFlow run in the task that requested supervision, with one attached heartbeat automation, bounded durable-state snapshots, one-shot safe recovery, automatic scheduler shutdown, actionable same-task reporting, and evidence or fix-plan extraction for improving AFlow itself. Use whenever the user asks to babysit, guard, monitor, or keep an AFlow workflow running, whether it is ordinary product work or an AFlow development experiment. Do not invoke automatically for an unguarded run; external guardianship is temporary resilience scaffolding until AFlow is stable enough not to need it.
+description: Guard any explicitly requested AFlow run in the task that requested supervision, with one attached heartbeat automation, bounded durable-state snapshots, one-shot safe recovery, automatic scheduler shutdown, multi-format visual reporting, optional completion/owner-action/reviewer-turn email delivery, worker-upgrade strategy auditing, and evidence or fix-plan extraction for improving AFlow itself. Use whenever the user asks to babysit, guard, monitor, or keep an AFlow workflow running, whether it is ordinary product work or an AFlow development experiment. Do not invoke automatically for an unguarded run; external guardianship is temporary resilience scaffolding until AFlow is stable enough not to need it.
 ---
 
 # Guard an AFlow Run
@@ -39,6 +39,17 @@ as bounded evidence for improving AFlow's own resilience.
   retries or checkpoint-scope resets.
 - Treat line and file budgets as scope-pressure evidence, not semantic owner
   boundaries.
+- Treat the selected team as the entry team for worker resolution, not as a
+  fixed roster or proof that one worker model will handle the whole run. Resolve
+  the frozen worker selector, full `upgrade_to` chain, per-step overrides, and
+  observed worker turns before describing model behavior.
+- Never count architect, senior-architect, reviewer, reworker, or manager turns
+  as worker-model samples. Never label an unsampled configured worker successful
+  or unsuccessful.
+- Render in-task PNG and downloadable PDF reports as the same single A4
+  dashboard page. Use a tight multi-box grid with data-derived progress,
+  status, upgrade-chain, and worker-sample graphs; keep the standalone HTML as
+  the expandable full-detail surface.
 - Prefer the fastest safe completion when a blocker offers several valid
   interpretations and one preserves the plan's core outcome with less scope,
   risk, downtime, or cost. Choose that reversible minimum without pausing for
@@ -47,6 +58,13 @@ as bounded evidence for improving AFlow's own resilience.
 - Ask for owner input only for changed meaning, conflicting requirements,
   destructive handling, ambiguous ownership, or inability to preserve accepted
   work.
+- Send email only when the user explicitly requests it. Default to completion
+  and owner-decision/action reports. Enable reviewer-turn reports only as a
+  separate explicit opt-in; never infer that preference from ordinary guard
+  authorization. Never email healthy progress or automatically recoverable
+  friction. Email delivery is independently throttled to at most one report
+  per two hours for a repeated event fingerprint; this does not slow or pause
+  the guard heartbeat, retry, recovery, or controller-liveness checks.
 
 ## Establish the guard
 
@@ -56,8 +74,9 @@ as bounded evidence for improving AFlow's own resilience.
 2. Resolve an exact run ID and inspect its `.aflow/runs/<run-id>/run.json`.
    Never guard “the latest run” without first pinning the resulting ID.
 3. Record the guarded repository, optional AFlow source checkout, run ID, plan,
-   worktree, feature branch, workflow, team, start step, maximum turns, and
-   optional Screen session. Treat `run.json` as read-only.
+   worktree, feature branch, workflow, entry team, starting worker selector,
+   complete frozen worker-upgrade chain, start step, maximum turns, and optional
+   Screen session. Treat `run.json` as read-only.
 4. Run `scripts/aflow_guard_snapshot.py` once. Do not schedule unless it reports
    an active controller. If the run is recoverable, recover it first and
    schedule only after the continuation is verified active.
@@ -71,7 +90,9 @@ as bounded evidence for improving AFlow's own resilience.
    selected guard; never leave two schedules active.
 8. In the initiating task, run the snapshot with its task ID supplied as both
    compatibility routing IDs. Then create a heartbeat attached to that same
-   task, normally every ten minutes. Set failed-runs-only notifications. Do not
+   task, normally every five minutes. Set failed-runs-only notifications. The
+   five-minute heartbeat is the guard's retry and liveness cadence; it is
+   independent of the optional two-hour email-delivery throttle. Do not
    create another task or worktree.
 9. Verify all of the following before claiming the guard is active: both
    persisted routing IDs equal the initiating task ID, the heartbeat targets
@@ -94,6 +115,37 @@ Run the heartbeat in the initiating local task because the guard must observe
 the real process tree, Screen session, run artifacts, and managed worktree.
 Use absolute repository paths in every tick so the task's current directory
 cannot redirect inspection.
+
+## Resolve the worker strategy
+
+Interpret a requested worker model or effort as the starting worker role unless
+the user explicitly requests a fixed single-model run. Resolve candidate entry
+teams whose effective `worker` selector matches that starting role. When more
+than one matches, prefer the unique valid entry team that preserves the requested
+starting worker and exposes the intended non-cyclic `upgrade_to` chain; do not
+silently choose a terminal same-named team merely because its name resembles the
+worker profile.
+
+From frozen configuration, follow `teams.<team>.upgrade_to` until the chain ends.
+Also inspect durable manager decisions and `pending_step_team_override` when an
+actionable report needs the realized strategy. Distinguish:
+
+1. configured worker candidates;
+2. workers actually sampled by finalized `role=worker` turns; and
+3. upgrades or overrides actually applied.
+
+If the resolved entry team has no upgrade path, say so before claiming adaptive
+intelligence or effort. If the user requested dynamic scaling and another unique
+entry team begins with the same requested worker while providing that path, use
+that entry team. If no such configuration exists, report the exact configuration
+gap instead of inventing a worker chain or waiting through repeated rejections.
+
+After repeated material rejections from the same worker, audit whether AFlow
+used the next configured team. A configured-but-unapplied upgrade is orchestration
+evidence, not proof that the entry worker was intentionally the only candidate.
+Do not interrupt a live child or create a second controller; preserve the run and
+promote a repeatable missing-upgrade condition through the normal AFlow-defect
+evidence path.
 
 ## Perform one scheduled tick
 
@@ -142,6 +194,13 @@ multiple controllers:
 Healthy ticks perform only the snapshot call. Do not emit commentary, read
 transcripts, inspect git history, rebuild manager context, create an inbox item,
 or create another task. Return exactly `DONT_NOTIFY`.
+
+Exception: when reviewer-turn email is explicitly enabled and the snapshot
+shows a finalized reviewer boundary newer than the last delivered fingerprint,
+inspect only that newest finalized reviewer `result.json`, render and send its
+bounded report, record delivery after Gmail succeeds, then return exactly
+`DONT_NOTIFY` if the tick is otherwise healthy. Do not reread earlier reviewer
+turns or send catch-up duplicates when this mode is first enabled.
 
 For an anomaly, inspect only:
 
@@ -337,6 +396,34 @@ recovery performed, an unrecovered failure, unsafe state, required owner
 decision, or a newly written fix plan. Include the run ID, checkpoint/step,
 evidence, recovery attempted, fix-plan path when present, and exact next action.
 Never route guard reports to another task.
+
+When the user requested email reporting, read
+`references/reporting-and-email.md` before producing or sending a report. Use
+`scripts/aflow_guard_report.py --bundle-dir` to render the same bounded evidence
+as Markdown, interactive standalone HTML, a mobile-readable single-A4 PNG, a
+matching single-page A4 PDF, and mobile-first email HTML. The script accepts
+`completed`, `needs_owner_action`,
+and explicitly enabled `reviewer_turn` states and rejects secret-bearing fields
+or common credential patterns.
+
+For reviewer-turn delivery, send only after a finalized reviewer result exists.
+Use the exact finalized turn ID plus verdict as the notification fingerprint,
+record successful delivery beside guardian deduplication state, and never send
+the same fingerprint twice. Include checkpoint, verdict, review model, duration,
+material findings, next workflow action, and current model sample size when
+known. A reviewer email does not pause the guard or turn an otherwise healthy
+tick into an actionable in-task notification.
+
+Keep the initiating task as the authoritative report surface. Email is an
+additional delivery channel, not a replacement. Show the same report in the
+task by embedding the generated PNG and linking the interactive HTML and PDF.
+Do not rely on an interactive visualization reference as the only task report.
+Use only a short delivery sentence around those artifacts so rendering does not
+consume model tokens. Attach the HTML or PDF to email only when useful. Resolve the recipient from the
+user's explicit instruction or a previously authorized destination; never
+guess, harvest contacts, or hard-code a project-wide address. Use the Gmail
+connector only for the requested outbound send and identity verification. Do
+not search or read inbox contents for report delivery.
 
 For an actionable event, return the concise report directly in the initiating
 task instead of `DONT_NOTIFY`. Pause first when required. Healthy observations

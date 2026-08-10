@@ -316,10 +316,40 @@ def _aflow_invocation(command: str) -> tuple[str, ...] | None:
 
 
 def _is_supported_launcher(record: ProcessRecord) -> bool:
+    """Recognize uv launchers without mistaking their aflow child as a peer."""
     tokens = _command_tokens(record.command)
     if not tokens or len(tokens) < 2:
         return False
-    return Path(tokens[0]).name == "uv" and tokens[1] == "run"
+    if Path(tokens[0]).name != "uv":
+        return False
+    if tokens[1] == "run":
+        return True
+
+    value_options = {"--project", "--directory", "--config-file"}
+    flag_options = {
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "--offline",
+        "--no-cache",
+    }
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "run":
+            return True
+        if token in value_options:
+            index += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in value_options):
+            index += 1
+            continue
+        if token in flag_options:
+            index += 1
+            continue
+        return False
+    return False
 
 
 def _invocation_option(
