@@ -196,6 +196,7 @@ class StartupQuestionRecord:
     message: str
     options: Mapping[str, str] = field(default_factory=dict)
     choices: tuple[str, ...] = ()
+    run_id: str | None = None
     schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:

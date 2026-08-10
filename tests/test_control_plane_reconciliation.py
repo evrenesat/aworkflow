@@ -60,12 +60,12 @@ def test_reconciliation_classifies_active_missing_and_ambiguous_units_without_st
     service = ReconciliationService(RunRepository(tmp_path), units)
 
     assert service.reconcile_run("active-run").status == "running"
-    assert service.reconcile_run("missing-run").status == "interrupted"
-    assert service.reconcile_run("dead-run").status == "interrupted"
-    assert service.reconcile_run("rebooted-run").status == "interrupted"
+    assert service.reconcile_run("missing-run").status == "needs_attention"
+    assert service.reconcile_run("dead-run").status == "needs_attention"
+    assert service.reconcile_run("rebooted-run").status == "needs_attention"
     assert service.reconcile_run("completed-run").status == "completed"
     assert service.reconcile_run("ambiguous-run").status == "needs_attention"
-    assert RunRepository(tmp_path).get_run_status("missing-run").status == "interrupted"
+    assert RunRepository(tmp_path).get_run_status("missing-run").status == "needs_attention"
     assert units.start_calls == []
 
 
@@ -106,6 +106,19 @@ def test_startup_and_periodic_reconciliation_are_idempotent_observations(tmp_pat
     assert service.reconcile_periodic()[0].status == "running"
 
     assert read_events(run_dir) == after_startup
+
+
+def test_collected_unit_requires_durable_aflow_terminal_state_before_completion(tmp_path: Path) -> None:
+    create_launch_manifest(tmp_path, _manifest("collected-run"))
+    write_launch_phase(tmp_path, "collected-run", "completed")
+    service = ReconciliationService(RunRepository(tmp_path), InMemoryUnitManager())
+
+    assert service.reconcile_run("collected-run").status == "needs_attention"
+
+    run_dir = tmp_path / ".aflow" / "runs" / "collected-run"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text('{"status":"completed"}')
+    assert service.reconcile_run("collected-run").status == "completed"
 
 
 def test_systemd_adapter_uses_bounded_argv_without_a_shell() -> None:

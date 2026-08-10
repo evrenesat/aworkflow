@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import subprocess
 from typing import Callable, Mapping, Protocol
 
@@ -27,7 +28,15 @@ class UnitState:
 class UnitManager(Protocol):
     """Unit operations used by control-plane services, without shell execution."""
 
-    def start(self, name: str, argv: tuple[str, ...], *, cwd: Path) -> UnitState:
+    def start(
+        self,
+        name: str,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment_file: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> UnitState:
         ...
 
     def stop(self, name: str) -> UnitState | None:
@@ -47,13 +56,37 @@ class SystemdUnitManager:
     ) -> None:
         self._runner = runner or subprocess.run
 
-    def start(self, name: str, argv: tuple[str, ...], *, cwd: Path) -> UnitState:
+    def start(
+        self,
+        name: str,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment_file: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> UnitState:
+        if not name.startswith("aflow-run-") or not name.endswith(".service"):
+            raise ValueError("workflow unit name must use the aflow-run-<id>.service form")
+        if not argv or not all(isinstance(value, str) and value for value in argv):
+            raise ValueError("workflow unit argv must be a non-empty string tuple")
+        working_directory = Path(cwd).resolve()
+        if not working_directory.is_dir():
+            raise ValueError("workflow unit working directory must exist")
+        environment_arguments = _environment_arguments(environment)
+        environment_property: tuple[str, ...] = ()
+        if environment_file is not None:
+            resolved_environment = Path(environment_file).resolve()
+            if Path(environment_file).is_symlink() or not resolved_environment.is_file():
+                raise ValueError("workflow environment file must be a regular non-symlink file")
+            environment_property = (f"--property=EnvironmentFile={resolved_environment}",)
         command = (
             "systemd-run",
             f"--unit={name}",
             "--property=Restart=no",
             "--collect",
-            f"--working-directory={cwd}",
+            f"--working-directory={working_directory}",
+            *environment_property,
+            *environment_arguments,
             *argv,
         )
         completed = self._runner(command, check=False, capture_output=True, text=True)
@@ -106,7 +139,15 @@ class InMemoryUnitManager:
         self.start_calls: list[tuple[str, tuple[str, ...], Path]] = []
         self.stop_calls: list[str] = []
 
-    def start(self, name: str, argv: tuple[str, ...], *, cwd: Path) -> UnitState:
+    def start(
+        self,
+        name: str,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment_file: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> UnitState:
         self.start_calls.append((name, argv, cwd))
         state = UnitState(name=name, active_state="active", sub_state="running")
         self.units[name] = state
@@ -138,3 +179,26 @@ def _systemctl_fields(stdout: str) -> dict[str, str]:
         if separator:
             fields[key] = value
     return fields
+
+
+_ENVIRONMENT_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+
+
+def _environment_arguments(environment: Mapping[str, str] | None) -> tuple[str, ...]:
+    """Render an explicit, bounded environment allowlist for a unit command."""
+    if environment is None:
+        return ()
+    rendered: list[str] = []
+    for key in sorted(environment):
+        value = environment[key]
+        if (
+            not isinstance(key, str)
+            or _ENVIRONMENT_NAME_RE.fullmatch(key) is None
+            or not isinstance(value, str)
+            or "\x00" in value
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise ValueError("unit environment must contain safe uppercase string entries")
+        rendered.append(f"--setenv={key}={value}")
+    return tuple(rendered)

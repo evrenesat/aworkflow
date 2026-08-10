@@ -36,6 +36,7 @@ class RunnerConfig:
     control_source: Callable[[], object] | None = None
     session_driver: SessionDriver | None = None
     source_session_driver: SessionDriver | None = None
+    allow_existing_launch_manifest: bool = False
 
 
 class WorkflowRunner:
@@ -86,6 +87,7 @@ class WorkflowRunner:
             control_source=self._config.control_source,
             session_driver=self._config.session_driver,
             source_session_driver=self._config.source_session_driver,
+            allow_existing_launch_manifest=self._config.allow_existing_launch_manifest,
         )
         return result
 
@@ -102,6 +104,7 @@ def execute_workflow(
     control_source: Callable[[], object] | None = None,
     session_driver: SessionDriver | None = None,
     source_session_driver: SessionDriver | None = None,
+    allow_existing_launch_manifest: bool = False,
 ) -> ControllerRunResult:
     """Execute a prepared workflow with optional event observation.
 
@@ -131,6 +134,7 @@ def execute_workflow(
         control_source=control_source,
         session_driver=session_driver,
         source_session_driver=source_session_driver,
+        allow_existing_launch_manifest=allow_existing_launch_manifest,
     )
     runner_obj = WorkflowRunner(config)
     return runner_obj.run()

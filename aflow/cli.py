@@ -1975,6 +1975,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("run_args", nargs=argparse.REMAINDER)
 
+    daemon_worker_parser = subparsers.add_parser(
+        "daemon-worker",
+        help=argparse.SUPPRESS,
+    )
+    daemon_worker_parser.add_argument("--repo-root", required=True, type=Path)
+    daemon_worker_parser.add_argument("--config", required=True, type=Path)
+    daemon_worker_parser.add_argument("--run-id", required=True)
+
     install_parser = subparsers.add_parser(
         "install-skills",
         description="Install the bundled aflow skills into harness skill directories.",
@@ -2480,6 +2488,15 @@ def main(argv: list[str] | None = None) -> int:
             print(exc, file=sys.stderr)
             return 1
         return 0
+
+    if args.command == "daemon-worker":
+        from .daemon import worker_main
+
+        return worker_main(
+            repo_root=args.repo_root,
+            config_path=args.config,
+            run_id=args.run_id,
+        )
 
     if args.command == "analyze":
         import json

@@ -14,7 +14,7 @@ from .models import (
     StartupQuestionRecord,
     StartRunResult,
 )
-from .application import ControlPlaneApplication
+from .application import ControlPlaneApplication, compose_control_plane
 from .capabilities import CapabilityError, CapabilityService
 from .persistence import (
     ControlConflictError,
@@ -63,6 +63,7 @@ __all__ = [
     "StartupQuestionRecord",
     "StartRunResult",
     "ControlPlaneApplication",
+    "compose_control_plane",
     "CapabilityError",
     "CapabilityService",
     "ControlConflictError",

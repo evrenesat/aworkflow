@@ -109,11 +109,19 @@ class ReconciliationService:
                 unit_name=unit_name,
                 observed_unit_state=observed_state,
             )
+        if status.status == "running" and observed is not None and observed.active_state == "failed":
+            return ReconciliationResult(
+                status.run_id,
+                "needs_attention",
+                "exact workflow unit failed; explicit resume is required",
+                unit_name=unit_name,
+                observed_unit_state=observed_state,
+            )
         if status.status == "running":
             return ReconciliationResult(
                 status.run_id,
-                "interrupted",
-                "disk state is running but the exact workflow unit is inactive or missing",
+                "needs_attention",
+                "running state has no exact active workflow unit; explicit resume is required",
                 unit_name=unit_name,
                 observed_unit_state=observed_state,
             )

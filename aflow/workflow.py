@@ -167,6 +167,34 @@ def _freeze_run_identity(
     )
 
 
+def _daemon_manifest_matches_execution(existing: object, expected: object) -> bool:
+    """Accept only a daemon's pre-preparation manifest for its exact worker.
+
+    A daemon records request-level intent before startup questions are
+    answered, so its immutable manifest may deliberately omit ``start_step``.
+    Every other execution identity field remains exact.  This narrow bridge is
+    never used by direct CLI execution.
+    """
+    fields = (
+        "run_id",
+        "project_root",
+        "plan_path",
+        "workflow_name",
+        "max_turns",
+        "team",
+        "idempotency_key",
+        "caller_scope",
+        "frozen_config_fingerprint",
+    )
+    if any(getattr(existing, field, None) != getattr(expected, field, None) for field in fields):
+        return False
+    if getattr(existing, "intended_unit", None) != f"aflow-run-{getattr(expected, 'run_id', '')}.service":
+        return False
+    existing_start_step = getattr(existing, "start_step", None)
+    expected_start_step = getattr(expected, "start_step", None)
+    return existing_start_step is None or existing_start_step == expected_start_step
+
+
 def _frozen_identity_mismatch(
     saved: FrozenRunIdentity,
     current: FrozenRunIdentity,
@@ -3199,6 +3227,7 @@ def run_workflow(
     control_source: Callable[[], object] | None = None,
     session_driver: SessionDriver | None = None,
     source_session_driver: SessionDriver | None = None,
+    allow_existing_launch_manifest: bool = False,
 ) -> ControllerRunResult:
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
@@ -3227,6 +3256,8 @@ def run_workflow(
         EventJournal,
         LaunchManifest,
         RunIdentityConflict,
+        RunRepository,
+        StartRunResult,
         append_run_event,
         create_launch_manifest,
         reserve_run_id,
@@ -3235,25 +3266,39 @@ def run_workflow(
 
     try:
         reserved_run_id = reserve_run_id(config.repo_root, config.reserved_run_id)
-        launch_result = create_launch_manifest(
-            config.repo_root,
-            LaunchManifest(
-                run_id=reserved_run_id,
-                project_root=str(config.repo_root.resolve()),
-                plan_path=str(config.plan_path.resolve()),
-                workflow_name=workflow_name,
-                max_turns=config.max_turns,
-                team=config.team,
-                start_step=config.start_step,
-                extra_instructions=config.extra_instructions,
-                idempotency_key=config.idempotency_key,
-                caller_scope=config.caller_scope,
-                frozen_config_fingerprint=current_frozen_identity.config_fingerprint,
-            ),
+        launch_manifest = LaunchManifest(
+            run_id=reserved_run_id,
+            project_root=str(config.repo_root.resolve()),
+            plan_path=str(config.plan_path.resolve()),
+            workflow_name=workflow_name,
+            max_turns=config.max_turns,
+            team=config.team,
+            start_step=config.start_step,
+            extra_instructions=config.extra_instructions,
+            idempotency_key=config.idempotency_key,
+            caller_scope=config.caller_scope,
+            frozen_config_fingerprint=current_frozen_identity.config_fingerprint,
         )
+        existing_manifest = (
+            RunRepository(config.repo_root).get_launch_manifest(reserved_run_id)
+            if allow_existing_launch_manifest
+            else None
+        )
+        if existing_manifest is not None and _daemon_manifest_matches_execution(
+            existing_manifest,
+            launch_manifest,
+        ):
+            launch_result = StartRunResult(
+                run_id=reserved_run_id,
+                created=False,
+                status="existing",
+                manifest_path=str(config.repo_root / ".aflow" / "launches" / f"{reserved_run_id}.json"),
+            )
+        else:
+            launch_result = create_launch_manifest(config.repo_root, launch_manifest)
     except (ValueError, RunIdentityConflict) as exc:
         raise WorkflowError(f"cannot reserve run identity: {exc}") from exc
-    if not launch_result.created:
+    if not launch_result.created and not allow_existing_launch_manifest:
         # The daemon/service layer consumes this proven replay result directly.
         # A controller process must never attach itself as a second child.
         raise WorkflowError(
@@ -3323,13 +3368,14 @@ def run_workflow(
         )
     )
     journal = EventJournal(run_paths.run_dir)
-    append_run_event(
-        run_paths.run_dir,
-        "reserved",
-        {"run_id": reserved_run_id, "manifest_path": launch_result.manifest_path},
-    )
-    write_launch_phase(config.repo_root, reserved_run_id, "launch_requested")
-    append_run_event(run_paths.run_dir, "launch_requested", {"resumed": resume is not None})
+    if launch_result.created:
+        append_run_event(
+            run_paths.run_dir,
+            "reserved",
+            {"run_id": reserved_run_id, "manifest_path": launch_result.manifest_path},
+        )
+        write_launch_phase(config.repo_root, reserved_run_id, "launch_requested")
+        append_run_event(run_paths.run_dir, "launch_requested", {"resumed": resume is not None})
     write_launch_phase(config.repo_root, reserved_run_id, "launch_started")
     append_run_event(run_paths.run_dir, "launch_started", {"resumed": resume is not None})
     if resume is not None:

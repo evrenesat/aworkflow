@@ -138,7 +138,17 @@ class RunRepository:
         phase = self._launch_phase(valid)
         reconciled = self._latest_reconciliation(run_dir) if run_dir.is_dir() else {}
         recorded_status = _optional_text(reconciled.get("status")) or _optional_text(metadata.get("status"))
-        status = recorded_status or phase or "manifest_only"
+        # A collected transient unit is not completion evidence.  Only a
+        # durable controller terminal record (or the daemon's explicit owner
+        # stop control) may classify a missing unit as terminal.
+        if phase == "owner_stopped":
+            status = "owner_stopped"
+        elif recorded_status is not None:
+            status = recorded_status
+        elif phase in {"completed", "failed", "interrupted"}:
+            status = "needs_attention"
+        else:
+            status = phase or "manifest_only"
         return RunStatus(
             run_id=valid,
             status=status,
