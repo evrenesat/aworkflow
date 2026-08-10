@@ -25,6 +25,7 @@ KillMode=process
 Delegate=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
+StateDirectory=aflowd
 ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=yes

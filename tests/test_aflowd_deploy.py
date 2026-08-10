@@ -229,6 +229,7 @@ def test_non_default_install_renders_a_service_for_the_selected_paths(tmp_path: 
     assert f"--environment-file {token} --project-root {project} --project-config {config}" in service
     assert f"ExecStart=/usr/bin/env {release}/bin/aflow-app-server" in service
     assert f"ConditionPathIsDirectory={project}" in service
+    assert "StateDirectory=aflowd" in service
     assert f"ReadWritePaths={project} /var/lib/aflowd" in service
     for default_path in ("/opt/aflowd/releases", "/etc/aflowd/aflowd.env", "/root/code/aflow-control-plane"):
         assert default_path not in service
@@ -334,6 +335,7 @@ def test_service_template_and_mcp_example_are_hardened_and_credential_free(tmp_p
     assert "/@RELEASE_DIR@/bin/aflow-app-server" in service
     assert "/opt/aflowd/current" not in service
     assert "NoNewPrivileges=yes" in service and "ProtectSystem=strict" in service
+    assert "StateDirectory=aflowd" in service
     assert "ReadWritePaths=/@PROJECT_ROOT@ /var/lib/aflowd" in service
     assert "Environment=AFLOW_APP_HOST=100.103.69.9" in service
     assert "--interface tailscale0" in service
