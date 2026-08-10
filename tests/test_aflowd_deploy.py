@@ -74,7 +74,7 @@ if [[ "$1" == "run" && "$2" == "build" ]]; then
 fi
 """,
     )
-    return tools, {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
+    return tools, {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "AFLOWD_READINESS_DELAY_SECONDS": "0"}
 
 
 def _project_and_token(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -207,6 +207,37 @@ exit 22
     assert "rolled back" in result.stderr
     assert not Path(curl_config_path.read_text()).exists()
 
+
+def test_readiness_retries_until_server_is_available(tmp_path: Path) -> None:
+    source, commit = _git_source(tmp_path)
+    tools, env = _fake_build_tools(tmp_path)
+    project, config, token = _project_and_token(tmp_path)
+    state_root = tmp_path / "aflowd"
+    counter = tmp_path / "readiness-attempts"
+    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
+    _write_executable(tools / "ip", "#!/bin/sh\necho '1: tailscale0    inet 100.103.69.9/32'\n")
+    _write_executable(
+        tools / "curl",
+        """#!/usr/bin/env bash
+set -euo pipefail
+attempt=0
+if [[ -f "$AFLOWD_TEST_READINESS_COUNTER" ]]; then
+  read -r attempt <"$AFLOWD_TEST_READINESS_COUNTER"
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" >"$AFLOWD_TEST_READINESS_COUNTER"
+(( attempt >= 3 ))
+""",
+    )
+
+    result = _run(
+        *_install_args(source, commit, state_root, project, config, token, tools),
+        "--apply",
+        env={**env, "AFLOWD_TEST_READINESS_COUNTER": str(counter)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert counter.read_text().strip() == "3"
 
 def test_non_default_install_renders_a_service_for_the_selected_paths(tmp_path: Path) -> None:
     source, commit = _git_source(tmp_path)

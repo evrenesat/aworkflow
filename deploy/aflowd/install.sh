@@ -132,6 +132,9 @@ rollback_install() {
     rm -f -- "$previous_config_backup"
   fi
   if (( installed || service_rendered )); then
+    if (( ! skip_service )); then
+      systemctl stop aflowd.service || true
+    fi
     if (( service_existed )); then
       install -D -m 0644 -- "$previous_service" "$service_path"
     else
@@ -140,13 +143,16 @@ rollback_install() {
     if [[ -n "$previous_target" ]]; then
       ln -s -- "$previous_target" "$temporary_current"
       mv -Tf -- "$temporary_current" "$current_link"
-    elif (( ! skip_service )); then
-      systemctl stop aflowd.service || true
-      systemctl disable aflowd.service || true
+    else
+      rm -f -- "$current_link"
     fi
     if (( ! skip_service )); then
       systemctl daemon-reload || true
-      [[ -z "$previous_target" ]] || systemctl restart aflowd.service || true
+      if [[ -n "$previous_target" ]] && (( service_existed )); then
+        systemctl restart aflowd.service || true
+      else
+        systemctl disable aflowd.service || true
+      fi
     fi
     printf 'aflowd install rolled back to %s\n' "$previous_target" >&2
   fi
@@ -271,7 +277,16 @@ if (( ! skip_readiness )); then
   token=$(sed -n 's/^AFLOW_APP_TOKEN=//p' "$environment_file")
   printf 'header = "Authorization: Bearer %s"\nurl = "http://%s:%s/ready"\n' "$token" "$bind_address" "$bind_port" >"$curl_config"
   chmod 0600 -- "$curl_config"
-  curl --fail --silent --show-error --max-time 10 --config "$curl_config" >/dev/null
+  readiness_delay=${AFLOWD_READINESS_DELAY_SECONDS:-0.5}
+  ready=0
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    if curl --fail --silent --max-time 2 --config "$curl_config" >/dev/null; then
+      ready=1
+      break
+    fi
+    (( attempt == 20 )) || sleep "$readiness_delay"
+  done
+  (( ready )) || fail "authenticated readiness did not succeed after 20 attempts"
   rm -f -- "$curl_config"
   curl_config=""
 fi
