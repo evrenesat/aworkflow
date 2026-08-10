@@ -207,7 +207,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 call_count[0] += 1
-                captured_prompts.append(' '.join(argv))
+                captured_prompts.append(str(kwargs.get("input", "")))
                 if call_count[0] == 1:
                     _write_plan(plan_path, _BROKEN_PLAN)
                 else:

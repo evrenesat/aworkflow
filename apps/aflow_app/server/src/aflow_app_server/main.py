@@ -1134,6 +1134,8 @@ async def serve_web_root() -> FileResponse:
 @app.get("/{path:path}", include_in_schema=False)
 async def serve_web_path(path: str) -> FileResponse:
     """Serve built frontend assets and SPA routes."""
+    if path == "api" or path.startswith("api/") or path == "mcp" or path.startswith("mcp/"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     asset_path = _get_web_file(path)
     if asset_path.is_file():
         return FileResponse(asset_path)

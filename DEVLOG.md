@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-08-10 — Document daemon-backed control-plane boundary
+
+- Documented the release-pinned p100 service, strict project allowlist,
+  header-only bearer transport, and the separation between daemon workflow
+  ownership and HTTP/MCP/UI transports.
+- Recorded reconciliation semantics: a collected or failed workflow unit is
+  `needs_attention`, never automatic completion or restart; owner stop and
+  explicit linked resume remain durable operator actions.
+- Corrected remote-app documentation that described the retired in-memory
+  execution map and query-token SSE behavior.
+
 ## 2026-08-09 — Durable live worker role hotplug
 
 - Added provider-neutral worker selector hotplug with durable transaction

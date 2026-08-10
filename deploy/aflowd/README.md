@@ -49,6 +49,28 @@ restart only the daemon:
 New workflow units receive the rotated environment. Existing workflow units are
 not restarted.
 
+## Diagnosis and ownership
+
+Start with `sudo deploy/aflowd/status.sh`; it prints the resolved `current`
+release before the service status. Use `sudo journalctl -u aflowd.service -n
+100 --no-pager` for a local diagnosis, but redact output before sharing it. If
+an install fails readiness, the installer has already restored the prior
+release/service state. Do not repair a failed install by manually repointing
+`current`; use the explicit rollback command once the prior 40-character
+release identity is known.
+
+`aflowd.service` owns only the control-plane process. It may restart without
+touching a workflow unit. A workflow unit with a failed, missing, or ambiguous
+identity is intentionally reported as `needs_attention`; do not use
+`systemctl restart` on that unit. Authenticate to the control plane and request
+an explicit resume, which creates a linked continuation rather than reviving
+the old identity. Owner stop is terminal.
+
+The optional `aflow-guard-development-run` skill remains scoped to an
+explicitly guarded normal/legacy AFlow workflow. It is not a daemon watchdog
+and must not create a competing controller or heartbeat automation for a
+daemon-owned workflow.
+
 ## Mac MCP client
 
 Copy aflow-control-plane.mcp.example.toml into the Mac Codex configuration and

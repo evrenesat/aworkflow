@@ -162,9 +162,13 @@ Normal requests use:
 Authorization: Bearer <token>
 ```
 
-The frontend stores the token in browser `localStorage` under `aflow_auth_token`. Logout clears that key.
+The built web client keeps the entered token in memory for the page lifetime and
+sends it only in the `Authorization` header. Logout clears it; a page refresh
+requires re-entry.
 
-Execution event streams also accept `?token=<token>` because browser `EventSource` cannot set custom authorization headers.
+All routes, including SSE and MCP, use the same header-only bearer check.
+Credential-like query parameters are rejected before routing, so tokens must
+never appear in URLs, logs, browser history, or MCP arguments.
 
 ## Projects
 
@@ -238,27 +242,70 @@ Codex is the first concrete provider. Its adapter uses `codex-app-server-sdk` fo
 
 Sending a turn supports Cmd/Ctrl+Enter. The UI polls the selected session while work is active, refreshes approvals when supported, and treats `completed`, `failed`, and `interrupted` turns as terminal.
 
-## Executions
+## Daemon-backed control plane
 
-Executions are started with a project id and a plan path. The server joins the requested plan path to the project path before preparing startup.
+The run dashboard, REST API, and MCP server are views over the same
+daemon-owned control plane. The HTTP process does not own workflow processes,
+an in-memory execution map, or a second run database. Each served project must
+be present in `[control_plane].projects`; a request cannot supply an arbitrary
+root, executable, environment file, or plan location.
 
-Optional execution fields:
+Start requests name one allowlisted project and a safe project-relative plan.
+They may select `workflow_name`, `team`, `start_step`, and `max_turns`. A ready
+start creates one durable run identity and an independent `systemd-run`
+workflow unit. If startup needs an answer, the service returns
+`awaiting_startup_answer` instead; no workflow unit exists before the accepted
+answer. The answer is journaled under the same durable idempotency scope and
+then creates at most one unit.
 
-- `workflow_name`
-- `team`
-- `start_step`
-- `max_turns`
-- `extra_instructions`
+Writes (`start`, `startup-answer`, `control`, `owner-stop`, and `resume`) accept
+`Idempotency-Key`. Replaying the same request returns its recorded effect;
+reusing a key for different input is rejected. Controls also require an
+`expected_revision` compare-and-swap value. The dashboard renders only controls
+advertised as safe by the server; a restart-required setting is information,
+not a live control. Owner stop is an explicit destructive operation, not a
+generic control flag.
 
-Startup uses the public `aflow` library API. If startup needs an interactive question, the API returns `prepared: false` with the question payload. If startup is ready, the server launches the workflow in a background task and returns an app-level run id.
+Loss of the client, MCP connection, or SSH transport has no lifecycle effect.
+The daemon service may restart while a workflow unit continues. A failed or
+ambiguous exact workflow unit is reported as `needs_attention` and is never
+automatically restarted; explicit resume creates one linked continuation with a
+new run id. A legacy run without the control-plane manifest is read-only and
+reported as legacy/interrupted rather than guessed into a mutable state.
 
-The app-level run id is an 8-character UUID prefix used for UI tracking and SSE. It is separate from the `.aflow/runs/<run-id>` directory created by the engine itself.
+Read operations return bounded pages, event tails, and context snapshots. The
+authenticated SSE endpoint is
+`/api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`; browser
+code uses `fetch` with its bearer header rather than query-token `EventSource`.
+The older `/api/executions` endpoints are deprecated, header-authenticated
+aliases over the same allowlisted control plane. They do not restore the former
+in-memory execution behavior.
 
-Execution status is stored in memory. Restarting the server loses the app-level status map and event queues, while engine run artifacts remain on disk under the project.
+### REST, MCP, and deployment use
 
-Status note: the current app marks a run as `completed` only when the engine end reason is `done`; other successful engine end reasons can appear as `failed` in app status with the end reason as the error string. Check `.aflow/runs/` for the authoritative engine result when that distinction matters.
+`GET /ready` confirms daemon-backed projects after bearer authentication.
+`GET /api/control-plane/capabilities` and the per-project capability endpoint
+provide valid team/worker upgrade chains and the availability of control and
+context features. Project, plan, run, ordered-event, and context reads are
+scoped to the allowlist.
 
-Execution events are streamed from `/api/executions/{run_id}/events` as SSE. The server emits `ping` events after 30 seconds of inactivity and closes the stream after run completion or failure.
+The stateless MCP endpoint is `/mcp`. It exposes the same bounded reads plus
+start, startup-answer, control, owner-stop, and resume tools. MCP write tools
+are configured for explicit client approval; credentials belong only in the
+client bearer-token environment variable, never in a tool argument or URL.
+Validate the Mac configuration with
+`python3 deploy/aflowd/validate-mcp-config.py ~/.codex/config.toml`.
+
+The supported p100 release is the immutable installer described in
+[`deploy/aflowd/README.md`](../deploy/aflowd/README.md). It requires a reviewed
+commit, binds only `100.103.69.9:8765` on `tailscale0`, and keeps
+`/etc/aflowd/aflowd.env` mode 0600 outside the repository. It validates the
+release before switching `current` atomically and rolls back the previous
+target if readiness fails. Token rotation replaces that environment file and
+restarts only `aflowd`; existing workflow units are not restarted. For an
+incident, rollback changes only the `current` release and `aflowd`; emergency
+containment stops/disables only the daemon and preserves all releases, runs,
+plans, worktrees, and secrets.
 
 ## Audio Transcription
 
@@ -321,7 +368,25 @@ Plan drafts:
 - `POST /api/projects/{project_id}/plans/promote`
 - `GET /api/projects/{project_id}/plans/in-progress`
 
-Executions:
+Daemon control plane:
+
+- `GET /ready`
+- `GET /api/control-plane/capabilities`
+- `GET /api/control-plane/projects`
+- `GET /api/control-plane/projects/{project_id}/capabilities`
+- `GET /api/control-plane/projects/{project_id}/plans`
+- `GET /api/control-plane/projects/{project_id}/runs`
+- `GET /api/control-plane/projects/{project_id}/runs/{run_id}`
+- `GET /api/control-plane/projects/{project_id}/runs/{run_id}/events`
+- `GET /api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`
+- `GET /api/control-plane/projects/{project_id}/runs/{run_id}/context`
+- `POST /api/control-plane/projects/{project_id}/runs`
+- `POST /api/control-plane/projects/{project_id}/startup-answers/{question_id}`
+- `PATCH /api/control-plane/projects/{project_id}/runs/{run_id}/control`
+- `POST /api/control-plane/projects/{project_id}/runs/{run_id}/owner-stop`
+- `POST /api/control-plane/projects/{project_id}/runs/{run_id}/resume`
+
+Deprecated execution compatibility aliases:
 
 - `POST /api/executions`
 - `GET /api/executions/{run_id}`
@@ -342,7 +407,12 @@ Local probe handling:
 
 ## Security Notes
 
-- The server requires a bearer token for all API operations except `/health`.
+- The server requires a bearer token in the `Authorization` header for all API
+  operations except `/health`; query credentials and credential-like MCP
+  arguments are rejected.
 - Do not expose the server to the internet without additional security controls.
-- Browser tokens are stored in local storage, so use a dedicated token and trusted browser profile.
-- Bind to `127.0.0.1` unless you intentionally need LAN access.
+- Browser bearer material is never placed in persistent browser storage. It
+  remains in memory for the page lifetime; logout clears it and refresh requires
+  re-entry.
+- Bind to `127.0.0.1` unless you intentionally need LAN access. The supported
+  p100 daemon binds only the Tailscale address, not loopback or `eth0`.

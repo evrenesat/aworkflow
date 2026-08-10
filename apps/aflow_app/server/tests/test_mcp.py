@@ -14,10 +14,7 @@ from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow_app_server.main import app
-from test_control_plane_api import PROJECT_ID, TOKEN, _prepared
-
-
-pytest_plugins = ("test_control_plane_api",)
+from test_control_plane_api import PROJECT_ID, TOKEN, _prepared, control_client
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 MCP_HEADERS = {

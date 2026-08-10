@@ -690,6 +690,51 @@ workflow execution. React keys and API requests carry `provider_id` and
 
 ### Control Flow
 
+### Daemon-backed control plane
+
+The p100 control plane separates durable workflow ownership from its HTTP, UI,
+and MCP transports. `aflowd.service` runs the release-pinned remote-app server
+on the Tailscale address only. Its `ControlPlaneService` owns the static project
+allowlist and calls the AFlow daemon for every lifecycle operation; the
+transport layer neither launches subprocesses nor reads or writes `.aflow`
+artifacts directly.
+
+```text
+Mac UI / REST client / MCP client
+                |  bearer header; write approval for MCP
+                v
+aflowd.service (one immutable /opt/aflowd/releases/<commit>)
+                |  static allowlisted project only
+                v
+AFlow daemon -> launch manifest / ordered events / revisioned overrides
+                |                         |
+                v                         v
+independent systemd-run workflow    existing .aflow/runs/<run-id>
+```
+
+`aflowd` has `Restart=always`; workflow units have `Restart=no` and retain an
+absolute executable from the release selected at launch. A daemon restart,
+client disconnect, or SSH disconnect therefore cannot restart or stop a
+workflow. Reconciliation is observational: a missing, failed, or ambiguously
+collected exact unit becomes `needs_attention`, never completion evidence or an
+automatic restart. A user must explicitly resume an eligible non-legacy run,
+which creates a linked continuation with a distinct run id. Owner stop is a
+separate, durably recorded terminal operation.
+
+Starts, startup answers, controls, owner stops, and resumes are scoped by
+idempotency evidence. Mutable controls also require an `expected_revision`
+compare-and-swap value. A startup question leaves the launch manifest in
+`awaiting_startup_answer` and creates no workflow unit until an accepted,
+idempotent answer. Older runs without control-plane manifests remain readable
+as legacy/interrupted data but cannot be mutated or resumed through this API.
+
+Deployment stages a Git commit under `/opt/aflowd/releases/<commit>`, validates
+release entrypoint hashes and a mode-0600 token environment file, switches the
+`current` symlink atomically, then performs authenticated readiness. A failed
+readiness check restores the previous service and release target. The
+deployment guide owns the exact install, rotation, rollback, and emergency
+containment commands.
+
 ### Live worker hotplug boundary
 
 The controller consumes a run-owned override digest at a post-turn boundary,

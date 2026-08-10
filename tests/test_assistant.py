@@ -846,6 +846,7 @@ class LastRunIdTrackingTests(unittest.TestCase):
             config = type("ControllerConfig", (), {
                 "repo_root": repo_root,
                 "keep_runs": 5,
+                "reserved_run_id": None,
             })()
 
             with patch.dict(os.environ, {"AFLOW_SHELL_ID": "shell-a"}):
