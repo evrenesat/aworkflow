@@ -18,7 +18,8 @@ Use this skill when helping a user understand, debug, or recover an aflow run. T
     type, and default), workflow/step/condition model, harnesses, session
     capabilities, the hotplug system (stages, capability paths, handover),
     manager supervision, error recovery, repartition, scope pressure, run
-    artifacts, CLI surface, bundled skills, and plan format.
+    artifacts, CLI surface, bundled skills, plan format, and the MCP control
+    plane (aflowd).
 
 Use these bundled resources first. They are part of the shipped skill and remain available after installation even when the repo source tree is not.
 
@@ -87,9 +88,9 @@ Use these bundled resources first. They are part of the shipped skill and remain
 - `references/engine-features.md`
   - Complete engine surface reference: config keys and defaults, workflows,
     harnesses, session capabilities, hotplug stages and capability paths,
-    manager, recovery, repartition, scope pressure, run artifacts, CLI, and
-    skills. Use it to answer "how does X work / what is configurable" without
-    opening source files.
+    manager, recovery, repartition, scope pressure, run artifacts, CLI,
+    skills, and the MCP control plane. Use it to answer "how does X work /
+    what is configurable" without opening source files.
 - `aflow analyze`
   - CLI command for deterministic single-run extraction first, with optional corpus mode.
 - `README.md`

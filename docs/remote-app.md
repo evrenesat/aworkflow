@@ -296,6 +296,34 @@ client bearer-token environment variable, never in a tool argument or URL.
 Validate the Mac configuration with
 `python3 deploy/aflowd/validate-mcp-config.py ~/.codex/config.toml`.
 
+The MCP server ("AFlow Control Plane", version 1) exposes:
+
+- Read tools: `get_capabilities`, `list_projects`,
+  `get_project_capabilities(project_id)`, `list_plans(project_id, limit,
+  cursor)`, `list_runs(project_id, limit, cursor)`, `get_run(project_id,
+  run_id)`, `get_run_events(project_id, run_id, ...)`,
+  `get_run_context(project_id, run_id, ...)`. Pages are bounded (limit
+  1–1000, default 100) with bounded cursors.
+- Write tools (idempotency-keyed, approval-gated):
+  `start_run(project_id, plan_path, idempotency_key, workflow_name, team,
+  start_step, max_turns)`, `answer_startup(project_id, question_id, answer,
+  idempotency_key)`, `control_run(project_id, run_id, expected_revision,
+  idempotency_key, max_turns, team, role_selectors, unsafe_changes)`,
+  `owner_stop(project_id, run_id, expected_revision, idempotency_key)`,
+  `resume_run(project_id, run_id, idempotency_key)`.
+- Resources: `AFlow project capabilities`, `AFlow run state`,
+  `AFlow lite run context`.
+- Stable error codes: `project_not_found`, `control_plane_unavailable`,
+  `run_not_found`, `idempotency_conflict`, `revision_conflict`,
+  `restart_required`, `operation_forbidden`, `operation_rejected`,
+  `internal_error`.
+
+Client configuration example: `deploy/aflowd/aflow-control-plane.mcp.example.toml`
+(`[mcp_servers.aflow_control_plane]` with `url = "http://<host>:8765/mcp"`,
+`bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"`, and per-write-tool
+`approval_mode = "approve"`). The full surface is also documented in the
+`aflow-assistant` skill reference (`references/engine-features.md`, section 15).
+
 The supported p100 release is the immutable installer described in
 [`deploy/aflowd/README.md`](../deploy/aflowd/README.md). It requires a reviewed
 commit, binds only `100.103.69.9:8765` on `tailscale0`, and keeps

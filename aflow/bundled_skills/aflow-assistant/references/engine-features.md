@@ -744,7 +744,111 @@ during lifecycle setup; the engine tracks `plans/in-progress/` as the durable
 plan location and `plans/backups/` for original-plan backups (reused when
 content matches, `_vNN` versions otherwise).
 
-## 15. Fast-Facts Summary
+## 15. MCP Control Plane (aflowd)
+
+The optional daemon control plane (`aflowd`, `aflow/daemon.py`) exposes the
+same durable AFlow run state over authenticated REST, web UI, and an MCP
+server. It is an additive transport over the engine; direct `aflow run`
+workflows remain unchanged and are never guessed into daemon-owned state.
+
+### Daemon and app config
+
+`aflowd` CLI: `--repo-root` (default cwd), `--config` (required app TOML),
+`--aflow-executable`, `--environment-file` (required, bearer-token
+EnvironmentFile; the p100 deploy tooling additionally enforces mode 0600),
+`--release-identity`, `--once`.
+
+The app TOML carries `[control_plane]` with a `[[control_plane.projects]]`
+allowlist (project id, repo root, config path, aflow executable, environment
+file, release identity, environment). Every served
+project must be allowlisted; requests cannot supply arbitrary roots,
+executables, environment files, or plan locations. Writes are journaled under
+durable idempotency scopes in `.aflow/launches/` and run as independent
+`systemd-run` workflow units.
+
+### MCP server
+
+The stateless FastMCP server ("AFlow Control Plane", version 1,
+`mask_error_details=True`) is mounted at `/mcp` (and `/mcp/`) on the FastAPI
+app (`apps/aflow_app/server/src/aflow_app_server/mcp_adapter.py`,
+`main.py`). Bearer authentication; credentials belong only in the client's
+bearer-token environment variable — literal bearer tokens, `token=`/
+`authorization=` patterns, query parameters, fragments, and userinfo in URLs
+or tool arguments are rejected.
+
+**Read tools** (read-only, idempotent annotations; bounded pages — `limit`
+must be 1–1000, default 100 — plus bounded cursors):
+
+- `get_capabilities` — versioned capabilities for every allowlisted project.
+- `list_projects` — the configured project allowlist.
+- `get_project_capabilities(project_id)` — one project's versioned capabilities.
+- `list_plans(project_id, limit=100, cursor=None)` — bounded plan metadata.
+- `list_runs(project_id, limit=100, cursor=None)` — bounded, versioned run status page.
+- `get_run(project_id, run_id)` — one run's state.
+- `get_run_events(project_id, run_id, ...)` — bounded ordered event tail.
+- `get_run_context(project_id, run_id, ...)` — context snapshot.
+
+**Write tools** (require client approval; all take an `idempotency_key`; a
+replayed key returns the recorded effect, a reused key with different input is
+rejected):
+
+- `start_run(project_id, plan_path, idempotency_key, workflow_name=None,
+  team=None, start_step=None, max_turns=None)` — reserve and start one
+  daemon-owned workflow; when startup needs an answer the response carries
+  the startup question and the run state becomes `awaiting_startup_answer`.
+- `answer_startup(project_id, question_id, answer, idempotency_key)` — submit
+  one authenticated answer for a pending startup question.
+- `control_run(project_id, run_id, expected_revision, idempotency_key,
+  max_turns=None, team=None, role_selectors=None, unsafe_changes=None)` —
+  compare-and-swap control; `expected_revision` is required.
+- `owner_stop(project_id, run_id, expected_revision, idempotency_key)` —
+  explicit terminal owner stop (destructive; not a generic control flag).
+- `resume_run(project_id, run_id, idempotency_key)` — explicit
+  lineage-linked continuation with a new run id for a stopped run.
+
+**Resources:**
+
+- `AFlow project capabilities` (project_id)
+- `AFlow run state` (project_id, run_id)
+- `AFlow lite run context` (project_id, run_id)
+
+**Stable public error codes** (ToolError/ResourceError messages):
+`project_not_found`, `control_plane_unavailable`, `run_not_found`,
+`idempotency_conflict`, `revision_conflict`, `restart_required`,
+`operation_forbidden`, `operation_rejected`, `internal_error`.
+
+### Client configuration
+
+```toml
+[mcp_servers.aflow_control_plane]
+url = "http://<host>:8765/mcp"
+required = false
+bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"
+default_tools_approval_mode = "writes"
+
+[mcp_servers.aflow_control_plane.tools.start_run]
+approval_mode = "approve"
+# ... same for answer_startup, control_run, owner_stop, resume_run
+```
+
+Validate a client config with
+`python3 deploy/aflowd/validate-mcp-config.py ~/.codex/config.toml` (see the
+example at `deploy/aflowd/aflow-control-plane.mcp.example.toml`).
+
+### Semantics
+
+- Failed or ambiguous daemon-owned units are reported `needs_attention` and
+  are never auto-restarted; explicit `resume_run` creates one linked
+  continuation.
+- Legacy runs without the control-plane manifest are read-only and reported
+  as legacy/interrupted.
+- Loss of the client, MCP connection, or SSH transport has no lifecycle
+  effect; daemon restarts do not stop workflow units.
+- `aflow-guard-development-run` remains opt-in supervision for exact
+  explicitly-guarded runs (typically direct-CLI workflows), not a second
+  daemon controller or an automatic recovery loop for daemon-owned units.
+
+## 16. Fast-Facts Summary
 
 - Stop marker: `AFLOW_STOP: <reason>` — terminal, defeats scope pressure.
 - Scope pressure: `AFLOW_SCOPE_PRESSURE: <reason>` — nonterminal, forces Full.
@@ -760,3 +864,6 @@ content matches, `_vNN` versions otherwise).
   `switch_to_backup_team_and_retry`, `fail_immediately`.
 - Resume: new successor run dir; frozen config identity must match; hotplug
   and repartition transactions reconcile before any harness.
+- MCP: stateless FastMCP server at `/mcp` on the aflowd control plane — 8 read
+  tools, 5 write tools (idempotency-keyed, client approval), 3 resources;
+  bearer token only via `AFLOW_CONTROL_PLANE_TOKEN` env var (Section 15).
