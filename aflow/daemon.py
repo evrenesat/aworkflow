@@ -445,6 +445,23 @@ class DaemonService:
             self._create_record(record)
             return self._recover_resume_record(record, prepared=prepared, created=True)
 
+    def run_status(self, run_id: str) -> RunStatus:
+        """Project a persisted startup question into canonical run status."""
+        status = self._application.repository.get_run_status(run_id)
+        if status.ownership != "control_plane":
+            return status
+        try:
+            record = self._read_record(run_id)
+        except DaemonError:
+            return status
+        if record.get("state") != "awaiting_startup_answer":
+            return status
+        return replace(
+            status,
+            status="awaiting_startup_answer",
+            reason="startup answer required before workflow unit creation",
+        )
+
     def poll_events(
         self,
         run_id: str,

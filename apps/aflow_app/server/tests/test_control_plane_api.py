@@ -272,7 +272,10 @@ def test_control_plane_reads_pending_start_and_idempotency(control_client) -> No
         f"/api/control-plane/projects/{PROJECT_ID}/runs/{question['run_id']}"
     )
     assert pending_run.status_code == 200
-    assert pending_run.json()["status"] == "manifest_only"
+    assert pending_run.json()["status"] == "awaiting_startup_answer"
+    listed_pending = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()["runs"]
+    assert len(listed_pending) == 1
+    assert listed_pending[0]["status"] == "awaiting_startup_answer"
     replay = client.post(
         f"/api/control-plane/projects/{PROJECT_ID}/runs",
         headers={"Idempotency-Key": "start-1"},

@@ -105,12 +105,17 @@ class ControlPlaneService:
         )
 
     def list_runs(self, project_id: str, *, limit: int, cursor: str | None) -> RunPage:
-        return self._project(project_id).daemon.application.repository.list_runs(
+        item = self._project(project_id)
+        page = item.daemon.application.repository.list_runs(
             limit=limit, cursor=cursor
+        )
+        return RunPage(
+            runs=tuple(item.daemon.service.run_status(run.run_id) for run in page.runs),
+            next_cursor=page.next_cursor,
         )
 
     def run_status(self, project_id: str, run_id: str) -> RunStatus:
-        return self._project(project_id).daemon.application.repository.get_run_status(run_id)
+        return self._project(project_id).daemon.service.run_status(run_id)
 
     def find_run(self, run_id: str) -> tuple[str, RunStatus]:
         """Compatibility lookup for the legacy unscoped execution endpoint."""
