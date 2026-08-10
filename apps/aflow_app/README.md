@@ -69,6 +69,16 @@ Common variables:
 
 See [Remote App Configuration](../../docs/remote-app.md#configuration) for the full table and behavioral notes.
 
+### p100 control-plane deployment
+
+The supported p100 deployment is release-pinned and Tailscale-only. It builds
+the web bundle and server into `/opt/aflowd/releases/<commit>`, runs the app
+server as `aflowd.service`, and leaves daemon-owned workflow units independent
+of daemon restarts. Follow [the deployment guide](../../deploy/aflowd/README.md)
+for dry-run, token rotation, rollback, emergency containment, and the
+approval-gated Mac MCP configuration example. Do not run the installer against
+an unreviewed checkout or put a bearer token in a URL.
+
 ### Control-plane allowlist
 
 The lifecycle API is disabled until projects are explicitly configured in the

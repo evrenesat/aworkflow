@@ -11,6 +11,12 @@ as bounded evidence for improving AFlow's own resilience.
 
 ## Non-negotiable invariants
 
+- A daemon-owned run (one with control-plane launch ownership) is observed and
+  controlled through the authenticated control plane. Never attach a ChatGPT
+  heartbeat guard to it, and use the server's explicit owner-stop or resume
+  operation rather than a local recovery attempt.
+- Legacy/manual runs and an explicitly requested SRE stabilization retain this
+  guard path. The daemon transition changes no other guard authority.
 - Use the task that requested the guard as the sole guard and report task, and
   attach exactly one heartbeat automation to it. Never create a secondary task
   for setup, scheduled beats, or actionable reporting.

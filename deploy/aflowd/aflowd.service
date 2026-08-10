@@ -1,0 +1,40 @@
+[Unit]
+Description=AFlow daemon-backed control plane
+Documentation=file:/@RELEASE_DIR@/src/deploy/aflowd/README.md
+After=network-online.target tailscaled.service
+Wants=network-online.target
+ConditionPathIsDirectory=/@PROJECT_ROOT@
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/@RELEASE_DIR@
+Environment=AFLOW_APP_CONFIG_DIR=/@RELEASE_DIR@/config
+Environment=AFLOW_APP_WEB_DIST=/@RELEASE_DIR@/src/apps/aflow_app/web/dist
+Environment=AFLOW_APP_HOST=100.103.69.9
+Environment=AFLOW_APP_PORT=8765
+Environment=AFLOWD_INTERFACE=tailscale0
+Environment=PATH=/@RELEASE_DIR@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/@ENVIRONMENT_FILE@
+ExecStartPre=/usr/bin/env /@RELEASE_DIR@/src/deploy/aflowd/validate-runtime.sh --release /@RELEASE_DIR@ --config /@RELEASE_DIR@/config/config.toml --environment-file /@ENVIRONMENT_FILE@ --project-root /@PROJECT_ROOT@ --project-config /@PROJECT_CONFIG@ --interface tailscale0 --bind-address 100.103.69.9
+ExecStart=/usr/bin/env /@RELEASE_DIR@/bin/aflow-app-server
+Restart=always
+RestartSec=5s
+KillMode=process
+Delegate=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/@PROJECT_ROOT@ /var/lib/aflowd
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+# Rendered into the selected immutable release by install.sh. This file never
+# contains bearer material; aflowd.env is a separate mode-0600 EnvironmentFile.
+[server]
+bind_host = "100.103.69.9"
+bind_port = 8765
+repo_registry_path = "/var/lib/aflowd/repos.json"
+
+[project_catalog]
+projects_home = "/root/code"
+project_overrides_path = "/var/lib/aflowd/project_overrides.json"
+
+[planning]
+attachment_root = "/var/lib/aflowd/attachments"
+
+[control_plane]
+projects = [
+  {
+    id = "aflow-control-plane",
+    root = "@PROJECT_ROOT@",
+    config_path = "@PROJECT_CONFIG@",
+    aflow_executable = "@RELEASE_DIR@/bin/aflow",
+    environment_file = "@ENVIRONMENT_FILE@",
+    release_identity = "@RELEASE_ID@",
+    environment = { PATH = "@RELEASE_DIR@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
+  },
+]
