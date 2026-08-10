@@ -1,5 +1,27 @@
 # DEVLOG
 
+## 2026-08-10 — Document daemon-backed control-plane boundary
+
+- Documented the release-pinned p100 service, strict project allowlist,
+  header-only bearer transport, and the separation between daemon workflow
+  ownership and HTTP/MCP/UI transports.
+- Recorded reconciliation semantics: a collected or failed workflow unit is
+  `needs_attention`, never automatic completion or restart; owner stop and
+  explicit linked resume remain durable operator actions.
+- Corrected remote-app documentation that described the retired in-memory
+  execution map and query-token SSE behavior.
+- Production-installed the exact release on p100 and exercised authenticated
+  REST/MCP parity, idempotent start, safe-boundary CAS steering, startup
+  questions, daemon restart, hard workflow death and explicit resume, owner
+  stop, token rotation, legacy-run read integrity, and versioned rollback.
+- Live failures led to focused fixes for writable daemon state, Tailscale
+  address inspection, TOML validation, readiness rollback, Python safe-path
+  entrypoints, hard-kill reconciliation, startup-question status,
+  cross-surface bearer ownership, and release-pinned rollback.
+- Review transitions now enter the rejection ledger only when a new repair
+  plan exists, preventing approvals from influencing worker-upgrade routing.
+
+
 ## 2026-08-09 — Durable live worker role hotplug
 
 - Added provider-neutral worker selector hotplug with durable transaction

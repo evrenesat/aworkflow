@@ -725,7 +725,7 @@ class ActivePlanLifecycleTests(unittest.TestCase):
 
             def capturing_runner(argv, **kwargs):
                 turn_counter[0] += 1
-                prompt = ' '.join(argv)
+                prompt = str(kwargs.get("input", ""))
                 import re as _re
                 m = _re.search(r'Active: (\S+)', prompt)
                 if m:
@@ -795,7 +795,7 @@ class ActivePlanLifecycleTests(unittest.TestCase):
             def capturing_runner(argv, **kwargs):
                 turn_counter[0] += 1
                 turn = turn_counter[0]
-                prompt = ' '.join(argv)
+                prompt = str(kwargs.get("input", ""))
                 import re as _re
                 match = _re.search(r'Active: (\S+)', prompt)
                 assert match is not None

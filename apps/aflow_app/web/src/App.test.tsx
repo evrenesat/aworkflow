@@ -12,7 +12,11 @@ vi.mock('./api', () => ({
   listPendingApprovals: vi.fn(), respondToApproval: vi.fn(),
   listAttachments: vi.fn(), uploadAttachment: vi.fn(), deleteAttachment: vi.fn(),
   listProjectPlans: vi.fn(), listPlanDrafts: vi.fn(), loadPlanDraft: vi.fn(), savePlanDraft: vi.fn(),
-  promotePlanDraft: vi.fn(), deletePlanDraft: vi.fn(), startExecution: vi.fn(), subscribeToExecutionEvents: vi.fn(),
+  promotePlanDraft: vi.fn(), deletePlanDraft: vi.fn(),
+  listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
+  listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
+  startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(),
+  ownerStopControlPlaneRun: vi.fn(), resumeControlPlaneRun: vi.fn(), subscribeToRunEvents: vi.fn(),
 }))
 
 const project = {
@@ -50,6 +54,15 @@ describe('App', () => {
     vi.mocked(api.listPendingApprovals).mockResolvedValue([])
     vi.mocked(api.listProjectPlans).mockResolvedValue([])
     vi.mocked(api.listPlanDrafts).mockResolvedValue([])
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([{ project_id: 'control-project', root: '/workspace/alpha', schema_version: 1 }])
+    vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['control-project'] })
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
+      schema_version: 1, workflows: ['managed'], teams: [], roles: [], controls: [], context_levels: ['lite'],
+      team_upgrade_chains: {}, control_safety: {}, service_features: [],
+    })
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([])
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.subscribeToRunEvents).mockReturnValue(() => {})
   })
 
   it('shows the login screen when not authenticated', () => {
@@ -64,7 +77,7 @@ describe('App', () => {
     await waitFor(() => expect(screen.getByText('Alpha Project')).toBeDefined())
     fireEvent.click(screen.getByText('Open'))
     await waitFor(() => expect(screen.getByText('Planning session')).toBeDefined())
-    expect(screen.getByText('Projects and planning sessions')).toBeDefined()
+    expect(screen.getByText('Projects, planning sessions, and daemon-owned runs')).toBeDefined()
     expect(screen.getByText('1 linked sessions')).toBeDefined()
     expect(api.listProjectSessions).toHaveBeenCalledWith('project-1', { archived: false })
   })
@@ -110,7 +123,7 @@ describe('App', () => {
     expect(screen.getByText('No planning sessions found for this project yet.')).toBeDefined()
   })
 
-  it('opens a selected project plan for execution', async () => {
+  it('opens the daemon-owned run dashboard from a selected project plan', async () => {
     vi.mocked(api.listProjectPlans).mockResolvedValue([{
       name: 'demo',
       path: '/workspace/alpha/plans/in-progress/demo.md',
@@ -119,20 +132,16 @@ describe('App', () => {
       unchecked_count: 1,
       is_complete: false,
     }])
-    vi.mocked(api.startExecution).mockResolvedValue({ run_id: 'run-1' })
-    vi.mocked(api.subscribeToExecutionEvents).mockReturnValue(() => {})
     render(<App />)
 
     await waitFor(() => expect(screen.getByText('Alpha Project')).toBeDefined())
     fireEvent.click(screen.getByText('Open'))
     fireEvent.click(screen.getByText('Plans'))
-    await waitFor(() => expect(screen.getByText('Start execution')).toBeDefined())
-    fireEvent.click(screen.getByText('Start execution'))
+    await waitFor(() => expect(screen.getByText('Open run dashboard')).toBeDefined())
+    fireEvent.click(screen.getByText('Open run dashboard'))
 
-    await waitFor(() => expect(api.startExecution).toHaveBeenCalledWith({
-      project_id: 'project-1',
-      plan_path: '/workspace/alpha/plans/in-progress/demo.md',
-    }))
+    await waitFor(() => expect(screen.getByText('Run dashboard')).toBeDefined())
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('control-project', { limit: 100 }))
   })
 
   it('logs out and returns to the login form', async () => {

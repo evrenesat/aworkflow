@@ -290,6 +290,27 @@ shows `hotplug <stage>: <source_selector> -> <target_selector> (<capability>)
 | active <selector>` while a transaction is live, and `aflow analyze` reports
 the current/pending transactions, normalized history, capability paths, and
 active session count.
+## Daemon control plane and direct CLI
+
+The p100 control plane is an optional, allowlisted daemon transport over the
+same durable AFlow run state; it does not replace direct CLI workflows. A normal
+`aflow run ...` invocation remains the appropriate local/developer interface
+and keeps its existing lifecycle, plan, and resume behavior. Do not expect a
+direct-CLI run without a daemon launch manifest to become a mutable control
+plane run: it is deliberately observed as legacy/interrupted rather than
+guessed into a daemon-owned state.
+
+For a daemon-owned run, use the authenticated REST, UI, or MCP resume operation
+after reconciliation reports `needs_attention`. Do not restart an exact
+workflow unit to recover it: the daemon records the ambiguity and an explicit
+resume creates a new linked continuation. An owner stop is terminal.
+
+`aflow-guard-development-run` remains opt-in supervision for the exact run a
+user explicitly asks it to guard, particularly normal direct-CLI and legacy
+workflows. It is not a second daemon controller, a release-health monitor, or
+an automatic recovery loop for daemon-owned units. The p100 deployment service
+and its rollback procedure own service availability; the daemon owns its
+allowlisted workflow reconciliation.
 
 ## Loop Limits
 

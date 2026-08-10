@@ -418,7 +418,20 @@ def write_last_run_id(repo_root: Path, run_id: str) -> None:
 def create_run_paths(config: ControllerConfig) -> RunPaths:
     runs_root = config.repo_root / ".aflow" / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
-    run_dir = runs_root / _utc_run_id()
+    # A control-plane caller may reserve a canonical identity before launch;
+    # direct CLI/library callers retain the historical generated-ID behavior.
+    if config.reserved_run_id is not None:
+        from .control_plane.persistence import validate_run_id
+
+        run_id = validate_run_id(config.reserved_run_id)
+    else:
+        run_id = _utc_run_id()
+    run_dir = runs_root / run_id
+    try:
+        resolved_runs_root = runs_root.resolve()
+        run_dir.resolve(strict=False).relative_to(resolved_runs_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError("run directory escapes .aflow/runs") from exc
     turns_dir = run_dir / "turns"
     turns_dir.mkdir(parents=True, exist_ok=False)
     manager_dir = run_dir / "manager"

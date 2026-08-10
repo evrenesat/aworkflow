@@ -50,6 +50,9 @@ class StartupRequest:
     startup_base_head_refresh_sha: str | None = None
     dirty_worktree_confirmed: bool = False
     resume_requested: bool = False
+    reserved_run_id: str | None = None
+    idempotency_key: str | None = None
+    caller_scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,3 +103,18 @@ class PreparedRun:
     startup_base_head_refresh_sha: str | None = None
     move_completed_plan_to_done: bool = False
     parsed_plan: object | None = None
+    reserved_run_id: str | None = None
+    idempotency_key: str | None = None
+    caller_scope: str | None = None
+
+
+# Re-export shared, versioned control-plane models through the public API.
+from aflow.control_plane.models import (  # noqa: E402
+    CapabilitySet,
+    ContextBundle,
+    LaunchManifest,
+    RunControlRequest,
+    RunEvent,
+    RunStatus,
+    StartRunResult,
+)

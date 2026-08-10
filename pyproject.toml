@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 aflow = "aflow.cli:main"
 aworkflow = "aflow.cli:main"
+aflowd = "aflow.daemon:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["aflow"]

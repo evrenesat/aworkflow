@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 try:
     import tomllib
@@ -16,6 +16,7 @@ except ImportError:
 
 
 _PROVIDER_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 @dataclass(frozen=True)
@@ -31,17 +32,63 @@ class PlanningProviderConfig:
 
 
 @dataclass(frozen=True)
+class ControlPlaneProjectConfig:
+    """One explicitly allowlisted project served by the daemon-backed API."""
+
+    id: str
+    root: Path
+    config_path: Path
+    aflow_executable: Path
+    environment_file: Path
+    release_identity: str
+    environment: Mapping[str, str] = field(default_factory=dict, repr=False)
+
+    def normalized(self) -> "ControlPlaneProjectConfig":
+        """Resolve and validate static daemon inputs before the service starts."""
+        root = self.root.expanduser().resolve()
+        config_path = self.config_path.expanduser().resolve()
+        executable = self.aflow_executable.expanduser().resolve()
+        environment_file = self.environment_file.expanduser().resolve()
+        if not _PROJECT_ID_PATTERN.fullmatch(self.id):
+            raise ValueError("project id must be a path-safe slug")
+        if not root.is_dir():
+            raise ValueError("project root must be an existing directory")
+        if self.config_path.is_symlink() or not config_path.is_file():
+            raise ValueError("workflow configuration must be a regular file")
+        if self.aflow_executable.is_symlink() or not executable.is_file():
+            raise ValueError("aflow executable must be a regular file")
+        if self.environment_file.is_symlink() or not environment_file.is_file():
+            raise ValueError("daemon environment file must be a regular file")
+        if not self.release_identity.strip():
+            raise ValueError("release identity is required")
+        if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in self.environment.items()
+        ):
+            raise ValueError("daemon environment must contain only string values")
+        return ControlPlaneProjectConfig(
+            id=self.id,
+            root=root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity=self.release_identity,
+            environment=dict(self.environment),
+        )
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     """Configuration for the remote app server."""
 
     bind_host: str
     bind_port: int
-    auth_token: str
+    auth_token: str = field(repr=False)
     repo_registry_path: Path
     codex_app_server_url: str | None
-    codex_app_server_token: str | None
+    codex_app_server_token: str | None = field(repr=False)
     transcription_url: str | None
-    transcription_token: str | None
+    transcription_token: str | None = field(repr=False)
     projects_home: Path = field(default_factory=lambda: Path("~/code").expanduser())
     project_overrides_path: Path = field(
         default_factory=lambda: Path("~/.config/aflow/project_overrides.json").expanduser()
@@ -60,6 +107,8 @@ class ServerConfig:
     attachment_max_total_size_bytes_per_turn: int = 50 * 1024 * 1024
     planning_operation_timeout_seconds: float = 30.0
     planning_execution_policy: str = "full_access"
+    auth_token_file: Path | None = None
+    control_plane_projects: tuple[ControlPlaneProjectConfig, ...] = ()
 
     @classmethod
     def from_env(cls) -> ServerConfig:
@@ -78,6 +127,7 @@ class ServerConfig:
         planning_section = file_config.get("planning", {})
         projects_section = file_config.get("project_catalog", file_config.get("projects", {}))
         transcription_section = file_config.get("transcription", {})
+        control_plane_section = file_config.get("control_plane", {})
 
         legacy_codex_url = (
             os.environ.get("AFLOW_CODEX_APP_SERVER_URL")
@@ -150,6 +200,16 @@ class ServerConfig:
         codex_provider = next(
             (provider for provider in planning_providers if provider.id == "codex"), None
         )
+        control_plane_projects = cls._control_plane_project_values(control_plane_section)
+        projects_json = os.environ.get("AFLOW_CONTROL_PLANE_PROJECTS")
+        if projects_json is not None:
+            try:
+                decoded_projects = json.loads(projects_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("AFLOW_CONTROL_PLANE_PROJECTS must be valid JSON") from exc
+            control_plane_projects = cls._control_plane_project_values(
+                {"projects": decoded_projects}
+            )
 
         # Environment overrides file config
         return cls(
@@ -226,6 +286,20 @@ class ServerConfig:
                 "AFLOW_PLANNING_EXECUTION_POLICY",
                 planning_section.get("execution_policy", "full_access"),
             ),
+            auth_token_file=(
+                Path(
+                    os.environ.get(
+                        "AFLOW_APP_TOKEN_FILE",
+                        server_section.get("auth_token_file", ""),
+                    )
+                ).expanduser()
+                if (
+                    os.environ.get("AFLOW_APP_TOKEN_FILE")
+                    or server_section.get("auth_token_file")
+                )
+                else None
+            ),
+            control_plane_projects=tuple(control_plane_projects),
         )
 
     @staticmethod
@@ -247,11 +321,67 @@ class ServerConfig:
             raise ValueError("planning.providers entries must be objects")
         return [dict(value) for value in raw_providers]
 
+    @staticmethod
+    def _control_plane_project_values(section: Any) -> list[ControlPlaneProjectConfig]:
+        """Parse an explicit project allowlist without accepting arbitrary paths."""
+        if not isinstance(section, dict):
+            raise ValueError("control_plane config must be a table")
+        raw_projects = section.get("projects", [])
+        if not isinstance(raw_projects, list) or not all(
+            isinstance(value, dict) for value in raw_projects
+        ):
+            raise ValueError("control_plane.projects must be a list of tables")
+        projects: list[ControlPlaneProjectConfig] = []
+        for raw in raw_projects:
+            environment = raw.get("environment", {})
+            if not isinstance(environment, dict):
+                raise ValueError("control_plane project environment must be a table")
+            required = (
+                "id",
+                "root",
+                "config_path",
+                "aflow_executable",
+                "environment_file",
+                "release_identity",
+            )
+            if any(not isinstance(raw.get(key), str) or not raw[key].strip() for key in required):
+                raise ValueError("control_plane projects require complete daemon configuration")
+            projects.append(
+                ControlPlaneProjectConfig(
+                    id=str(raw["id"]),
+                    root=Path(str(raw["root"])),
+                    config_path=Path(str(raw["config_path"])),
+                    aflow_executable=Path(str(raw["aflow_executable"])),
+                    environment_file=Path(str(raw["environment_file"])),
+                    release_identity=str(raw["release_identity"]),
+                    environment={str(key): str(value) for key, value in environment.items()},
+                )
+            )
+        return projects
+
+    def current_auth_token(self) -> str:
+        """Read the bearer secret on each request so a file can rotate in place."""
+        if self.auth_token_file is None:
+            return self.auth_token
+        path = self.auth_token_file.expanduser()
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("authentication token file is unavailable")
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError("authentication token file is unreadable") from exc
+        if not token:
+            raise ValueError("authentication token file is empty")
+        return token
+
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors: list[str] = []
-        if not self.auth_token:
-            errors.append("auth_token is required (set AFLOW_APP_TOKEN or server.auth_token in config)")
+        try:
+            if not self.current_auth_token():
+                errors.append("authentication token is required")
+        except ValueError:
+            errors.append("authentication token file is unavailable")
         if self.bind_port < 1 or self.bind_port > 65535:
             errors.append(f"invalid bind_port: {self.bind_port}")
         provider_ids: set[str] = set()
@@ -290,4 +420,14 @@ class ServerConfig:
             )
         if self.planning_execution_policy != "full_access":
             errors.append("planning_execution_policy must be 'full_access'")
+        project_ids: set[str] = set()
+        for project in self.control_plane_projects:
+            if project.id in project_ids:
+                errors.append(f"duplicate control-plane project id: {project.id}")
+                continue
+            project_ids.add(project.id)
+            try:
+                project.normalized()
+            except ValueError:
+                errors.append(f"invalid control-plane project configuration: {project.id}")
         return errors

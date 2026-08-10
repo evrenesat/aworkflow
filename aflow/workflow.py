@@ -167,6 +167,34 @@ def _freeze_run_identity(
     )
 
 
+def _daemon_manifest_matches_execution(existing: object, expected: object) -> bool:
+    """Accept only a daemon's pre-preparation manifest for its exact worker.
+
+    A daemon records request-level intent before startup questions are
+    answered, so its immutable manifest may deliberately omit ``start_step``.
+    Every other execution identity field remains exact.  This narrow bridge is
+    never used by direct CLI execution.
+    """
+    fields = (
+        "run_id",
+        "project_root",
+        "plan_path",
+        "workflow_name",
+        "max_turns",
+        "team",
+        "idempotency_key",
+        "caller_scope",
+        "frozen_config_fingerprint",
+    )
+    if any(getattr(existing, field, None) != getattr(expected, field, None) for field in fields):
+        return False
+    if getattr(existing, "intended_unit", None) != f"aflow-run-{getattr(expected, 'run_id', '')}.service":
+        return False
+    existing_start_step = getattr(existing, "start_step", None)
+    expected_start_step = getattr(expected, "start_step", None)
+    return existing_start_step is None or existing_start_step == expected_start_step
+
+
 def _frozen_identity_mismatch(
     saved: FrozenRunIdentity,
     current: FrozenRunIdentity,
@@ -622,6 +650,10 @@ class WorkflowError(RuntimeError):
         self.summary = summary
         self.run_dir = run_dir
         self.failure_kind = failure_kind
+
+
+class OwnerStopRequested(RuntimeError):
+    """A run owner requested a safe stop at an inter-turn boundary."""
 
 
 class HarnessEnvironmentPreflightError(RuntimeError):
@@ -3195,6 +3227,7 @@ def run_workflow(
     control_source: Callable[[], object] | None = None,
     session_driver: SessionDriver | None = None,
     source_session_driver: SessionDriver | None = None,
+    allow_existing_launch_manifest: bool = False,
 ) -> ControllerRunResult:
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
@@ -3218,6 +3251,59 @@ def run_workflow(
                 "resume frozen configuration mismatch: "
                 f"{identity_mismatch}"
             )
+
+    from .control_plane import (
+        EventJournal,
+        LaunchManifest,
+        RunIdentityConflict,
+        RunRepository,
+        StartRunResult,
+        append_run_event,
+        create_launch_manifest,
+        reserve_run_id,
+        write_launch_phase,
+    )
+
+    try:
+        reserved_run_id = reserve_run_id(config.repo_root, config.reserved_run_id)
+        launch_manifest = LaunchManifest(
+            run_id=reserved_run_id,
+            project_root=str(config.repo_root.resolve()),
+            plan_path=str(config.plan_path.resolve()),
+            workflow_name=workflow_name,
+            max_turns=config.max_turns,
+            team=config.team,
+            start_step=config.start_step,
+            extra_instructions=config.extra_instructions,
+            idempotency_key=config.idempotency_key,
+            caller_scope=config.caller_scope,
+            frozen_config_fingerprint=current_frozen_identity.config_fingerprint,
+        )
+        existing_manifest = (
+            RunRepository(config.repo_root).get_launch_manifest(reserved_run_id)
+            if allow_existing_launch_manifest
+            else None
+        )
+        if existing_manifest is not None and _daemon_manifest_matches_execution(
+            existing_manifest,
+            launch_manifest,
+        ):
+            launch_result = StartRunResult(
+                run_id=reserved_run_id,
+                created=False,
+                status="existing",
+                manifest_path=str(config.repo_root / ".aflow" / "launches" / f"{reserved_run_id}.json"),
+            )
+        else:
+            launch_result = create_launch_manifest(config.repo_root, launch_manifest)
+    except (ValueError, RunIdentityConflict) as exc:
+        raise WorkflowError(f"cannot reserve run identity: {exc}") from exc
+    if not launch_result.created and not allow_existing_launch_manifest:
+        # The daemon/service layer consumes this proven replay result directly.
+        # A controller process must never attach itself as a second child.
+        raise WorkflowError(
+            f"launch intent already exists for run '{reserved_run_id}'; refusing duplicate controller"
+        )
 
     _emit_event(observer, RunStartedEvent.create(
         workflow_name=workflow_name,
@@ -3275,10 +3361,46 @@ def run_workflow(
         == (config.repo_root / ".aflow" / "runs").resolve()
     )
     run_paths = create_run_paths(
-        replace(config, keep_runs=config.keep_runs + 1)
-        if preserve_resume_override_source
-        else config
+        replace(
+            config,
+            keep_runs=(config.keep_runs + 1) if preserve_resume_override_source else config.keep_runs,
+            reserved_run_id=reserved_run_id,
+        )
     )
+    journal = EventJournal(run_paths.run_dir)
+    if launch_result.created:
+        append_run_event(
+            run_paths.run_dir,
+            "reserved",
+            {"run_id": reserved_run_id, "manifest_path": launch_result.manifest_path},
+        )
+        write_launch_phase(config.repo_root, reserved_run_id, "launch_requested")
+        append_run_event(run_paths.run_dir, "launch_requested", {"resumed": resume is not None})
+    write_launch_phase(config.repo_root, reserved_run_id, "launch_started")
+    append_run_event(run_paths.run_dir, "launch_started", {"resumed": resume is not None})
+    if resume is not None:
+        append_run_event(
+            run_paths.run_dir,
+            "resumed",
+            {"resumed_from_run_id": resume.resumed_from_run_id},
+        )
+
+    original_observer = observer
+
+    class _JournalObserver:
+        def on_event(self, event: ExecutionEvent) -> None:
+            event_type = getattr(event.event_type, "value", str(event.event_type))
+            journal.append(event_type, asdict(event))
+            if event_type in {"run_completed", "run_failed"}:
+                write_launch_phase(
+                    config.repo_root,
+                    reserved_run_id,
+                    "completed" if event_type == "run_completed" else "failed",
+                )
+            if original_observer is not None:
+                original_observer.on_event(event)
+
+    observer = _JournalObserver()
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
@@ -7568,6 +7690,8 @@ def run_workflow(
             and prior.status == "accepted"
             and not prior.applied
         ):
+            if prior.owner_stop:
+                raise OwnerStopRequested()
             if prior.next_step is not None:
                 current_step_name = prior.next_step
             if prior.team is not None:
@@ -7613,6 +7737,17 @@ def run_workflow(
                 f"correct '{override_path}' before resuming"
             )
         if loaded.status == "valid" and request is not None:
+            if request.owner_stop:
+                state.override_result = OverrideResult(
+                    status="accepted",
+                    digest=request.digest,
+                    message="owner stop accepted at pre-turn boundary",
+                    source_text=request.source_text,
+                    owner_stop=True,
+                    applied=True,
+                )
+                _write_override_boundary(status="owner_stop_requested")
+                raise OwnerStopRequested()
             target_step = request.next_step or current_step_name
             if target_step not in wf.steps:
                 validation_error = (
@@ -7726,6 +7861,7 @@ def run_workflow(
             next_step=request.next_step,
             team=request.team,
             max_turns=request.max_turns,
+            owner_stop=request.owner_stop,
             role_selectors=dict(request.role_selectors),
             has_notes=bool(request.notes),
             applied=False,
@@ -7956,7 +8092,37 @@ def run_workflow(
 
     turn_number = 1
     while turn_number <= (state.effective_max_turns or config.max_turns):
-        current_step_name, baseline_team_name = _apply_boundary_override()
+        try:
+            current_step_name, baseline_team_name = _apply_boundary_override()
+        except OwnerStopRequested:
+            state.end_reason = "owner_stopped"
+            state.status_message = "owner_stopped"
+            write_run_metadata(
+                run_paths,
+                config,
+                state,
+                status="owner_stopped",
+                end_reason="owner_stopped",
+                last_snapshot=state.last_snapshot,
+                workflow_name=workflow_name,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
+                resumed_from_run_id=resumed_from_run_id,
+            )
+            append_run_event(run_paths.run_dir, "owner_stopped", {"turns_completed": state.turns_completed})
+            write_launch_phase(config.repo_root, reserved_run_id, "owner_stopped")
+            banner.stop(state)
+            return ControllerRunResult(
+                run_dir=run_paths.run_dir,
+                turns_completed=state.turns_completed,
+                final_snapshot=state.last_snapshot,
+                status="owner_stopped",
+                issues_accumulated=state.issues_accumulated,
+                end_reason="owner_stopped",
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            )
         effective_max_turns = state.effective_max_turns or config.max_turns
         if turn_number > effective_max_turns:
             break
@@ -9078,6 +9244,7 @@ def run_workflow(
             and scope_before_finalize.awaiting_review
             and step.role != "worker"
             and not done
+            and new_plan_exists
             and snapshot_before == post_snapshot
             and controller_next_step is not None
             and controller_next_step.role == "worker"

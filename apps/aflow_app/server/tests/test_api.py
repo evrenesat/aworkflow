@@ -51,6 +51,7 @@ def _set_server_state(
     """Install the shared server state used by tests."""
     from aflow_app_server import main as main_module
     from aflow_app_server.aflow_service import AflowService
+    from aflow_app_server.control_plane_service import ControlPlaneService
 
     main_module._config = config
     main_module._project_catalog = ProjectCatalog(
@@ -59,6 +60,8 @@ def _set_server_state(
         legacy_registry_path=config.repo_registry_path,
     )
     main_module._service = service if service is not None else AflowService()
+    main_module._control_plane_service = ControlPlaneService(())
+    main_module._control_plane_service.start()
     main_module._planning_service = planning_service
 
 
@@ -135,6 +138,7 @@ def client_with_config(test_config: ServerConfig, test_token: str) -> TestClient
         main_module._config = None
         main_module._project_catalog = None
         main_module._service = None
+        main_module._control_plane_service = None
         main_module._planning_service = None
 
 
@@ -193,8 +197,8 @@ class TestAuth:
             main_module._project_catalog = None
             main_module._service = None
 
-    def test_query_token_is_accepted(self, test_config: ServerConfig, test_token: str) -> None:
-        """Test that token query param works for clients like EventSource."""
+    def test_query_token_is_rejected(self, test_config: ServerConfig, test_token: str) -> None:
+        """Bearer tokens are never accepted in URLs, including SSE requests."""
         from aflow_app_server import main as main_module
 
         _set_server_state(test_config)
@@ -202,8 +206,8 @@ class TestAuth:
         try:
             client = TestClient(app)
             response = client.get(f"/api/projects?token={test_token}")
-            assert response.status_code == 200
-            assert response.json() == []
+            assert response.status_code == 400
+            assert response.json() == {"detail": {"code": "token_query_rejected"}}
         finally:
             main_module._config = None
             main_module._project_catalog = None
@@ -544,7 +548,7 @@ class TestExecutionEndpoints:
                 "plan_path": "nonexistent.md",
             },
         )
-        assert response.status_code == 400
+        assert response.status_code == 404
 
     def test_get_execution_not_found(self, client_with_config: TestClient) -> None:
         """Test getting non-existent execution."""

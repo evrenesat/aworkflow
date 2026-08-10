@@ -152,4 +152,5 @@ provider-neutral planning-session API; Codex integration is implemented through
 - [Runtime behavior, artifacts, resume, and recovery](docs/runtime-behavior.md)
 - [Python library API](docs/library-api.md)
 - [Remote app](docs/remote-app.md)
+- [p100 control-plane deployment](deploy/aflowd/README.md)
 - [Architecture](ARCHITECTURE.md)

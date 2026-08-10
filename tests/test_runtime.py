@@ -8234,6 +8234,69 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert next_scope[-1] == 1
             assert next_scope[4] != legacy_scope_id
 
+    def test_review_without_repair_plan_is_not_recorded_as_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="review", preserve_active_plan=True),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement"),),
+                    ),
+                },
+                first_step="implement",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker",
+                    "reviewer": "codex.reviewer",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                })},
+                workflows={"review": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+            )
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, "approved", "")
+
+            with pytest.raises(WorkflowError, match="reached max turns limit") as exc:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    wf_config,
+                    "review",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            run_dir = exc.value.run_dir
+            review_turn = json.loads(
+                (run_dir / "turns" / "turn-002" / "result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            run_json = json.loads(
+                (run_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert review_turn["review_rejection"] is None
+            assert run_json["review_rejection_history"] == []
+
+
 
 class WorkflowMaxTurnsEndToEndTests(unittest.TestCase):
 
