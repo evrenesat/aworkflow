@@ -182,7 +182,7 @@ if [[ ! -d "$release_dir" ]]; then
     function=$3
     cat >"$stage/bin/$name" <<EOF
 #!/bin/sh
-exec "$release_dir/venv/bin/python" -c 'from $module import $function; raise SystemExit($function())' "\$@"
+exec "$release_dir/venv/bin/python" -P -c 'from $module import $function; raise SystemExit($function())' "\$@"
 EOF
     chmod 0755 -- "$stage/bin/$name"
   }

@@ -157,6 +157,7 @@ def test_staged_install_uses_release_realpaths_and_atomic_current(tmp_path: Path
     for entrypoint in ("aflow", "aflowd", "aflow-app-server"):
         path = release / "bin" / entrypoint
         assert path.is_file() and os.access(path, os.X_OK) and not path.is_symlink()
+        assert ' -P -c ' in path.read_text()
 
     (release / "bin" / "aflow").write_text("#!/bin/sh\nexit 1\n")
     corrupted = _run(
