@@ -13,14 +13,11 @@ project_overrides_path = "/var/lib/aflowd/project_overrides.json"
 attachment_root = "/var/lib/aflowd/attachments"
 
 [control_plane]
-projects = [
-  {
-    id = "aflow-control-plane",
-    root = "@PROJECT_ROOT@",
-    config_path = "@PROJECT_CONFIG@",
-    aflow_executable = "@RELEASE_DIR@/bin/aflow",
-    environment_file = "@ENVIRONMENT_FILE@",
-    release_identity = "@RELEASE_ID@",
-    environment = { PATH = "@RELEASE_DIR@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
-  },
-]
+[[control_plane.projects]]
+id = "aflow-control-plane"
+root = "@PROJECT_ROOT@"
+config_path = "@PROJECT_CONFIG@"
+aflow_executable = "@RELEASE_DIR@/bin/aflow"
+environment_file = "@ENVIRONMENT_FILE@"
+release_identity = "@RELEASE_ID@"
+environment = { PATH = "@RELEASE_DIR@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }

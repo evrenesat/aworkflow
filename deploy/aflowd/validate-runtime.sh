@@ -58,6 +58,7 @@ done
 mode=$(stat -c '%a' -- "$environment_file")
 [[ "$mode" == "600" ]] || fail "token environment file must have mode 0600"
 grep -Eq '^AFLOW_APP_TOKEN=[A-Za-z0-9._~-]+$' "$environment_file" || fail "token environment file must contain one opaque AFLOW_APP_TOKEN value"
+python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$config" >/dev/null 2>&1 || fail "rendered control-plane config must be valid TOML"
 grep -Fq "root = \"$project_root\"" "$config" || fail "control-plane allowlist does not name the configured project root"
 grep -Fq "config_path = \"$project_config\"" "$config" || fail "control-plane config path is not explicit"
 grep -Fq "aflow_executable = \"$release/bin/aflow\"" "$config" || fail "daemon executable is not release-pinned"

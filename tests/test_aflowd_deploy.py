@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
 import subprocess
 from threading import Thread
+import tomllib
 
 import pytest
 
@@ -148,6 +149,8 @@ def test_staged_install_uses_release_realpaths_and_atomic_current(tmp_path: Path
     assert (state_root / "current").resolve() == release.resolve()
     assert "source_commit=" + commit in (release / "release-manifest.sha256").read_text()
     rendered = (release / "config" / "config.toml").read_text()
+    parsed = tomllib.loads(rendered)
+    assert parsed["control_plane"]["projects"][0]["release_identity"] == commit
     assert f'aflow_executable = "{release}/bin/aflow"' in rendered
     assert f'release_identity = "{commit}"' in rendered
     assert "/current/" not in rendered
@@ -296,6 +299,18 @@ def test_runtime_validator_rejects_non_private_token_and_current_indirection(tmp
         "--project-config", str(project_config), "--skip-interface-check",
     )
     assert success.returncode == 0, success.stderr
+
+    valid_config = config.read_text()
+    config.write_text(valid_config + "broken = [\n")
+    invalid_toml = _run(
+        "bash", str(DEPLOY / "validate-runtime.sh"),
+        "--release", str(release), "--config", str(config),
+        "--environment-file", str(token), "--project-root", str(project),
+        "--project-config", str(project_config), "--skip-interface-check",
+    )
+    assert invalid_toml.returncode != 0
+    assert "valid TOML" in invalid_toml.stderr
+    config.write_text(valid_config)
 
     token.chmod(0o640)
     private_failure = _run(
