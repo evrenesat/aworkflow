@@ -137,7 +137,16 @@ class RunRepository:
 
         phase = self._launch_phase(valid)
         reconciled = self._latest_reconciliation(run_dir) if run_dir.is_dir() else {}
-        recorded_status = _optional_text(reconciled.get("status")) or _optional_text(metadata.get("status"))
+        metadata_status = _optional_text(metadata.get("status"))
+        reconciled_status = _optional_text(reconciled.get("status"))
+        # A controller terminal record written after the latest daemon
+        # observation is authoritative when its launch phase agrees.  This
+        # prevents a pre-restart "running" reconciliation event from masking
+        # durable completion after the independent workflow unit exits.
+        if metadata_status in {"completed", "failed", "interrupted"} and phase == metadata_status:
+            recorded_status = metadata_status
+        else:
+            recorded_status = reconciled_status or metadata_status
         # A collected transient unit is not completion evidence.  Only a
         # durable controller terminal record (or the daemon's explicit owner
         # stop control) may classify a missing unit as terminal.

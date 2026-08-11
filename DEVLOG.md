@@ -10,6 +10,9 @@
   retaining the FastAPI adapter's header-auth and safe-error boundary.
 - Added config validation, split-config preservation, public FastMCP parity,
   and stdio initialization/EOF cleanup regressions.
+- Live restart proof fixed reconciliation precedence so a durable terminal
+  controller record and matching launch phase supersede an older daemon
+  observation instead of being misreported as needs_attention.
 
 ## 2026-08-10 — Document daemon-backed control-plane boundary
 

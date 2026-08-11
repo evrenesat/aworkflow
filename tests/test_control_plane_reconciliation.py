@@ -121,6 +121,31 @@ def test_collected_unit_requires_durable_aflow_terminal_state_before_completion(
     assert service.reconcile_run("collected-run").status == "completed"
 
 
+def test_durable_terminal_state_supersedes_stale_running_reconciliation(
+    tmp_path: Path,
+) -> None:
+    run_dir = _owned_running(tmp_path)
+    unit_name = "aflow-run-owned-run.service"
+    active = ReconciliationService(
+        RunRepository(tmp_path),
+        InMemoryUnitManager(
+            {unit_name: UnitState(name=unit_name, active_state="active", sub_state="running")}
+        ),
+    )
+    assert active.reconcile_run("owned-run").status == "running"
+    assert read_events(run_dir)[-1].data["status"] == "running"
+
+    (run_dir / "run.json").write_text('{"status":"completed"}')
+    write_launch_phase(tmp_path, "owned-run", "completed")
+    after_restart = ReconciliationService(
+        RunRepository(tmp_path),
+        InMemoryUnitManager(),
+    )
+
+    assert after_restart.reconcile_run("owned-run").status == "completed"
+    assert RunRepository(tmp_path).get_run_status("owned-run").status == "completed"
+
+
 def test_systemd_adapter_uses_bounded_argv_without_a_shell() -> None:
     calls: list[tuple[str, ...]] = []
 
