@@ -48,6 +48,10 @@ Add an `aflow daemon` subcommand that runs a long-lived per-project idle loop: i
 - Observe: candidate `1231 passed, 180 subtests, 4 failed`; baseline `1206 passed, 180 subtests, 4 failed`, with the same four nodes and reasons.
 - Run: installed `/root/.local/bin/aflow` through a FastMCP stdio client and detached loopback HTTP proof.
 - Observe: 13 tools, successful capabilities, stdio run `20260811t183735z-72bca0a7`, one exact owned child, EOF drain with no pidfile/process, and HTTP status/stop cleanup. Redacted evidence: `/root/code/evidence/finish-daemon-stdio-mcp-20260811`.
+- Run: current-release p100 REST/MCP, daemon-restart, idempotency, and startup-question acceptance.
+- Observe: release `878da7c3e9ea018d1a5b17bce7e3fee98170711e`; marker run `20260811t191155z-af36c819` and startup run `20260811t192812z-ad9be518` completed with ordered REST/MCP parity.
+- Run: `uv run pytest -q tests/test_control_plane_repository.py tests/test_control_plane_reconciliation.py tests/test_aflowd.py tests/test_control_plane_resume.py`.
+- Observe: `23 passed`; durable terminal metadata now supersedes an older running reconciliation after daemon restart.
 
 **Done When:**
 
