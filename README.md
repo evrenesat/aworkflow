@@ -46,8 +46,9 @@ aflow show
 ```
 
 Configuration is split across two TOML files: `aflow.toml` contains harness
-profiles, roles, teams, prompts, and controller
-settings. `workflows.toml` contains workflow graphs and lifecycle defaults.
+profiles, roles, teams, prompts, controller settings, and the optional
+`[daemon]` section. `workflows.toml` contains workflow graphs and lifecycle
+defaults.
 
 ## Run a plan
 
@@ -60,6 +61,25 @@ aflow run path/to/plan.md -- keep changes limited to the requested scope
 
 If no workflow is named, AFlow uses `aflow.default_workflow` from the
 configuration.
+
+## Run the lightweight local daemon
+
+`aflow daemon` exposes the same 13 control-plane MCP tools without the remote
+web app, FastAPI, or systemd. Stdio is the default and must stay attached to its
+client; optional HTTP binds only to loopback.
+
+```bash
+aflow daemon start --foreground
+aflow daemon start --mcp-transport http --mcp-port 8765
+aflow daemon status
+aflow daemon stop
+```
+
+The daemon owns one repository. Each workflow runs in its own subprocess group;
+client EOF, `daemon stop`, SIGINT, and SIGTERM drain those owned children. A
+mode-0600 pidfile binds stop/status operations to the daemon's process-birth
+identity. This local mode does not serve REST or the React dashboard and does
+not replace the production `aflowd` deployment.
 
 A minimal plan has checkpoint headings and task items:
 
@@ -132,10 +152,13 @@ omits raw prompts, notes, environment, and provider session identifiers.
 
 ## Local development
 
-Run AFlow from a checkout:
+Develop AFlow from a checkout through the same installed entry point used in
+normal operation:
 
 ```bash
-uv run python -m aflow run path/to/plan.md
+uv tool install -e . --force
+aflow run path/to/plan.md
+aflow daemon --help
 uv run pytest -q
 ```
 

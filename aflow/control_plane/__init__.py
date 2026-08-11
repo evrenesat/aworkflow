@@ -47,7 +47,13 @@ from .services import (
     ServiceAuthorizationError,
     StartupQuestionService,
 )
-from .units import InMemoryUnitManager, SystemdUnitManager, UnitManager, UnitState
+from .units import (
+    InMemoryUnitManager,
+    SubprocessUnitManager,
+    SystemdUnitManager,
+    UnitManager,
+    UnitState,
+)
 
 __all__ = [
     "CapabilitySet",
@@ -92,6 +98,7 @@ __all__ = [
     "ServiceAuthorizationError",
     "StartupQuestionService",
     "InMemoryUnitManager",
+    "SubprocessUnitManager",
     "SystemdUnitManager",
     "UnitManager",
     "UnitState",

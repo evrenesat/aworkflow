@@ -692,6 +692,20 @@ workflow execution. React keys and API requests carry `provider_id` and
 
 ### Daemon-backed control plane
 
+There are two transport/lifetime adapters over the same durable control-plane
+application. The lightweight `aflow daemon` CLI owns one project and uses
+`SubprocessUnitManager`: each `daemon-worker` is launched without a shell in a
+new process group, and daemon shutdown terminates and reaps every owned group.
+Stdio MCP runs attached by default; optional streamable HTTP binds to
+`127.0.0.1`. Its atomic mode-0600 pidfile includes process-birth identity, so a
+stale or reused PID cannot authorize a signal. It has no REST or web surface.
+
+The 13 MCP tools and three resource templates are registered in
+`aflow.mcp_control_plane`. The remote app's `mcp_adapter` is a compatibility
+wrapper that adds app-specific safe error mappings. Its FastAPI `/mcp` mount
+retains the server-owned header bearer check; registry sharing does not move
+authorization into a client or URL.
+
 The p100 control plane separates durable workflow ownership from its HTTP, UI,
 and MCP transports. `aflowd.service` runs the release-pinned remote-app server
 on the Tailscale address only. Its `ControlPlaneService` owns the static project

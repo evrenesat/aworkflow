@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-08-11 — Add lightweight stdio MCP daemon
+
+- Added `aflow daemon start|status|stop` for a single local project, with stdio
+  MCP by default and optional loopback HTTP, separate from production `aflowd`.
+- Added exact subprocess-unit ownership, process-group drain/escalation, and an
+  atomic mode-0600 pidfile bound to process-birth identity.
+- Moved the 13-tool, three-resource MCP registry into the core package while
+  retaining the FastAPI adapter's header-auth and safe-error boundary.
+- Added config validation, split-config preservation, public FastMCP parity,
+  and stdio initialization/EOF cleanup regressions.
+
 ## 2026-08-10 — Document daemon-backed control-plane boundary
 
 - Documented the release-pinned p100 service, strict project allowlist,

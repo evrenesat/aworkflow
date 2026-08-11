@@ -292,13 +292,27 @@ the current/pending transactions, normalized history, capability paths, and
 active session count.
 ## Daemon control plane and direct CLI
 
-The p100 control plane is an optional, allowlisted daemon transport over the
-same durable AFlow run state; it does not replace direct CLI workflows. A normal
-`aflow run ...` invocation remains the appropriate local/developer interface
-and keeps its existing lifecycle, plan, and resume behavior. Do not expect a
-direct-CLI run without a daemon launch manifest to become a mutable control
-plane run: it is deliberately observed as legacy/interrupted rather than
-guessed into a daemon-owned state.
+The lightweight local daemon starts with `aflow daemon start --foreground`.
+It owns one repository and exposes the shared 13-tool MCP registry over stdio;
+closing MCP input stops the daemon. Optional HTTP runs on `127.0.0.1` only and
+may be detached. `aflow daemon status` verifies the pidfile's process-birth
+identity and reports only direct `daemon-worker` children, not every legacy run
+directory. `aflow daemon stop`, SIGINT, and SIGTERM drain each child process
+group with SIGTERM followed by bounded SIGKILL escalation. A malformed pidfile
+or reused PID is ambiguous and never authorizes a signal.
+
+The production p100 control plane is a separate, allowlisted deployment over
+the same durable AFlow run state. `aflowd.service` uses systemd workflow units,
+serves authenticated REST, React, and FastAPI `/mcp`, and survives client
+disconnects. The lightweight daemon does not serve those surfaces or replace
+that deployment. FastAPI bearer authorization remains header-only and
+server-owned even though both MCP transports share the core registry.
+
+A normal `aflow run ...` invocation remains the direct local/developer
+interface and keeps its existing lifecycle, plan, and resume behavior. Do not
+expect a direct-CLI run without a daemon launch manifest to become a mutable
+control-plane run: it is deliberately observed as legacy/interrupted rather
+than guessed into daemon ownership.
 
 For a daemon-owned run, use the authenticated REST, UI, or MCP resume operation
 after reconciliation reports `needs_attention`. Do not restart an exact

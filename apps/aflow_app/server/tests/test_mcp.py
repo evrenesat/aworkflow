@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -23,6 +24,45 @@ MCP_HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
 }
+EXPECTED_TOOL_NAMES = {
+    "get_capabilities",
+    "list_projects",
+    "get_project_capabilities",
+    "list_plans",
+    "list_runs",
+    "get_run",
+    "get_run_events",
+    "get_run_context",
+    "start_run",
+    "answer_startup",
+    "control_run",
+    "owner_stop",
+    "resume_run",
+}
+
+
+def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> None:
+    from aflow.mcp_control_plane import create_control_plane_mcp as create_shared_mcp
+    from aflow_app_server.mcp_adapter import create_control_plane_mcp as create_fastapi_mcp
+
+    shared = create_shared_mcp(lambda: None)
+    fastapi = create_fastapi_mcp(lambda: None)
+    shared_tools = asyncio.run(shared.list_tools())
+    fastapi_tools = asyncio.run(fastapi.list_tools())
+    assert {tool.name for tool in shared_tools} == EXPECTED_TOOL_NAMES
+    assert {
+        tool.name: tool.to_mcp_tool().model_dump(mode="json") for tool in shared_tools
+    } == {
+        tool.name: tool.to_mcp_tool().model_dump(mode="json") for tool in fastapi_tools
+    }
+    shared_resources = asyncio.run(shared.list_resource_templates())
+    fastapi_resources = asyncio.run(fastapi.list_resource_templates())
+    assert {
+        resource.uri_template: resource.parameters for resource in shared_resources
+    } == {
+        resource.uri_template: resource.parameters for resource in fastapi_resources
+    }
+    assert len(shared_resources) == 3
 
 
 @pytest.fixture
@@ -98,21 +138,7 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
 
     tools = _mcp_request(client, "tools/list")["result"]["tools"]
     tool_by_name = {tool["name"]: tool for tool in tools}
-    assert {
-        "get_capabilities",
-        "list_projects",
-        "get_project_capabilities",
-        "list_plans",
-        "list_runs",
-        "get_run",
-        "get_run_events",
-        "get_run_context",
-        "start_run",
-        "answer_startup",
-        "control_run",
-        "owner_stop",
-        "resume_run",
-    }.issubset(tool_by_name)
+    assert set(tool_by_name) == EXPECTED_TOOL_NAMES
     assert tool_by_name["list_projects"]["annotations"]["readOnlyHint"] is True
     assert tool_by_name["start_run"]["annotations"]["readOnlyHint"] is False
     assert tool_by_name["owner_stop"]["annotations"]["destructiveHint"] is True

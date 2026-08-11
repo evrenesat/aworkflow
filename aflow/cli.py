@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -2065,6 +2066,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional workflow name. Omit it to show every workflow in config order.",
     )
 
+    daemon_parser = subparsers.add_parser(
+        "daemon",
+        description="Run the daemon-owned control plane for one project without the web app.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    daemon_subparsers = daemon_parser.add_subparsers(dest="daemon_command", required=True)
+
+    daemon_start_parser = daemon_subparsers.add_parser(
+        "start",
+        description="Start the idle control-plane daemon and its MCP listener.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    daemon_start_parser.add_argument("--repo-root", type=Path, default=None, help="Repository to own (default: current directory).")
+    daemon_start_parser.add_argument("--config", type=Path, default=None, help="AFlow config TOML (default: ~/.config/aflow/aflow.toml).")
+    daemon_start_parser.add_argument("--environment-file", type=Path, default=None, help="Bearer environment file (default: .aflow/daemon.env in the repo).")
+    daemon_start_parser.add_argument("--mcp-transport", choices=("stdio", "http"), default=None, help="MCP transport (default: [daemon].mcp_transport, then stdio).")
+    daemon_start_parser.add_argument("--mcp-port", type=int, default=None, help="Port for the http transport (default: [daemon].mcp_port, then 8765).")
+    daemon_start_parser.add_argument("--poll-interval", type=float, default=None, help="Journal poll interval in seconds (default: [daemon].poll_interval_seconds, then 1.0).")
+    daemon_start_parser.add_argument("--stop-timeout", type=float, default=None, help="Subprocess stop timeout in seconds (default: [daemon].stop_timeout_seconds, then 30.0).")
+    daemon_start_parser.add_argument("--foreground", action="store_true", help="Stay attached; required for the stdio transport.")
+
+    daemon_status_parser = daemon_subparsers.add_parser(
+        "status",
+        description="Report daemon liveness and owned runs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    daemon_status_parser.add_argument("--repo-root", type=Path, default=None)
+
+    daemon_stop_parser = daemon_subparsers.add_parser(
+        "stop",
+        description="Terminate the daemon and drain its child units.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    daemon_stop_parser.add_argument("--repo-root", type=Path, default=None)
+    daemon_stop_parser.add_argument("--stop-timeout", type=float, default=None)
+
     return parser
 
 
@@ -2496,6 +2533,93 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=args.repo_root,
             config_path=args.config,
             run_id=args.run_id,
+        )
+
+    if args.command == "daemon":
+        from .daemon_cli import (
+            LocalControlPlaneService,
+            SubprocessUnitManager,
+            daemon_status,
+            daemon_stop,
+            default_project_id,
+            detach_daemon,
+            resolve_daemon_config,
+            run_daemon_foreground,
+        )
+        from .daemon import AflowDaemon
+
+        repo_root = (args.repo_root or Path.cwd()).resolve()
+        if args.daemon_command == "status":
+            return daemon_status(repo_root)
+        if args.daemon_command == "stop":
+            stop_timeout = args.stop_timeout if args.stop_timeout is not None else 30.0
+            return daemon_stop(repo_root, stop_timeout_seconds=stop_timeout)
+
+        user_config = load_workflow_config(args.config)
+        transport = (
+            args.mcp_transport
+            if args.mcp_transport is not None
+            else user_config.daemon.mcp_transport
+        )
+        mcp_port = (
+            args.mcp_port if args.mcp_port is not None else user_config.daemon.mcp_port
+        )
+        poll_interval = (
+            args.poll_interval
+            if args.poll_interval is not None
+            else user_config.daemon.poll_interval_seconds
+        )
+        stop_timeout = (
+            args.stop_timeout
+            if args.stop_timeout is not None
+            else user_config.daemon.stop_timeout_seconds
+        )
+        if not 1 <= mcp_port <= 65535:
+            print("aflow daemon: MCP port must be between 1 and 65535", file=sys.stderr)
+            return 2
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            print("aflow daemon: poll interval must be positive", file=sys.stderr)
+            return 2
+        if not math.isfinite(stop_timeout) or stop_timeout < 0:
+            print("aflow daemon: stop timeout must be non-negative", file=sys.stderr)
+            return 2
+        if transport == "stdio" and not args.foreground:
+            print(
+                "aflow daemon: the stdio transport requires --foreground",
+                file=sys.stderr,
+            )
+            return 1
+        if not args.foreground:
+            return detach_daemon(
+                repo_root,
+                config_path=args.config,
+                environment_file=args.environment_file,
+                mcp_port=mcp_port,
+                poll_interval_seconds=poll_interval,
+                stop_timeout_seconds=stop_timeout,
+            )
+        daemon_config = resolve_daemon_config(
+            repo_root=repo_root,
+            config_path=args.config,
+            environment_file=args.environment_file,
+            poll_interval_seconds=poll_interval,
+            stop_timeout_seconds=stop_timeout,
+        )
+        daemon = AflowDaemon(
+            daemon_config,
+            units=SubprocessUnitManager(stop_timeout_seconds=stop_timeout),
+        )
+        daemon.start()
+        project_id = default_project_id(repo_root)
+        service = LocalControlPlaneService(
+            daemon, project_id=project_id, repo_root=repo_root
+        )
+        return run_daemon_foreground(
+            daemon,
+            transport=transport,
+            mcp_port=mcp_port,
+            get_service=lambda: service,
+            repo_root=repo_root,
         )
 
     if args.command == "analyze":

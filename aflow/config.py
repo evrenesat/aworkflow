@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from collections.abc import Mapping
 import tomllib
+from typing import Literal
 
 from .harnesses import ADAPTERS
 
@@ -175,6 +177,14 @@ class WorkflowConfig:
 
 
 @dataclass(frozen=True)
+class DaemonUserConfig:
+    mcp_transport: Literal["stdio", "http"] = "stdio"
+    mcp_port: int = 8765
+    poll_interval_seconds: float = 1.0
+    stop_timeout_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class WorkflowUserConfig:
     aflow: AflowSection = field(default_factory=AflowSection)
     harnesses: dict[str, WorkflowHarnessConfig] = field(default_factory=dict)
@@ -185,6 +195,7 @@ class WorkflowUserConfig:
     error_handling: ErrorHandlingConfig = field(default_factory=ErrorHandlingConfig)
     workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
     prompts: dict[str, str] = field(default_factory=dict)
+    daemon: DaemonUserConfig = field(default_factory=DaemonUserConfig)
 
 
 def _validate_condition_symbols(expression: str, *, path: str) -> None:
@@ -877,6 +888,46 @@ def _materialize_workflows(
     return resolved
 
 
+def _parse_daemon_config(raw: Mapping[str, object], *, path: str) -> DaemonUserConfig:
+    allowed = {
+        "mcp_transport",
+        "mcp_port",
+        "poll_interval_seconds",
+        "stop_timeout_seconds",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ConfigError(f"unsupported keys in {path}: {', '.join(unknown)}")
+    mcp_transport = raw.get("mcp_transport", "stdio")
+    if mcp_transport not in {"stdio", "http"}:
+        raise ConfigError(f"{path}.mcp_transport must be 'stdio' or 'http'")
+    mcp_port = raw.get("mcp_port", 8765)
+    if not isinstance(mcp_port, int) or isinstance(mcp_port, bool) or not 1 <= mcp_port <= 65535:
+        raise ConfigError(f"{path}.mcp_port must be an integer between 1 and 65535")
+    poll_interval_seconds = raw.get("poll_interval_seconds", 1.0)
+    if (
+        isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or not math.isfinite(poll_interval_seconds)
+        or poll_interval_seconds <= 0
+    ):
+        raise ConfigError(f"{path}.poll_interval_seconds must be a positive number")
+    stop_timeout_seconds = raw.get("stop_timeout_seconds", 30.0)
+    if (
+        isinstance(stop_timeout_seconds, bool)
+        or not isinstance(stop_timeout_seconds, (int, float))
+        or not math.isfinite(stop_timeout_seconds)
+        or stop_timeout_seconds < 0
+    ):
+        raise ConfigError(f"{path}.stop_timeout_seconds must be a non-negative number")
+    return DaemonUserConfig(
+        mcp_transport=mcp_transport,
+        mcp_port=mcp_port,
+        poll_interval_seconds=float(poll_interval_seconds),
+        stop_timeout_seconds=float(stop_timeout_seconds),
+    )
+
+
 def _parse_workflow_user_config(
     raw: Mapping[str, object], *, path: Path, allowed_top_level_keys: set[str]
 ) -> WorkflowUserConfig:
@@ -964,6 +1015,10 @@ def _parse_workflow_user_config(
             prompts[prompt_key] = _require_text(
                 prompt_value, path=f"{path}.prompts.{prompt_key}"
             )
+    daemon = DaemonUserConfig()
+    if "daemon" in raw:
+        daemon_table = _require_table(raw["daemon"], path=f"{path}.daemon")
+        daemon = _parse_daemon_config(daemon_table, path=f"{path}.daemon")
     return WorkflowUserConfig(
         aflow=aflow,
         harnesses=harnesses,
@@ -974,6 +1029,7 @@ def _parse_workflow_user_config(
         error_handling=error_handling,
         workflows=workflows,
         prompts=prompts,
+        daemon=daemon,
     )
 
 
@@ -991,7 +1047,7 @@ def load_workflow_config(
     except OSError as exc:
         raise ConfigError(f"unable to read config file {path}: {exc}") from exc
     sibling_path = path.with_name("workflows.toml")
-    aflow_allowed_top_level_keys = {"aflow", "harness", "roles", "teams", "prompts", "error_handling", "manager"}
+    aflow_allowed_top_level_keys = {"aflow", "harness", "roles", "teams", "prompts", "error_handling", "manager", "daemon"}
     if sibling_path.exists():
         config = _parse_workflow_user_config(
             raw, path=path, allowed_top_level_keys=aflow_allowed_top_level_keys
@@ -1020,6 +1076,7 @@ def load_workflow_config(
             error_handling=config.error_handling,
             workflows={**config.workflows, **sibling_config.workflows},
             prompts={**config.prompts, **sibling_config.prompts},
+            daemon=config.daemon,
         )
     else:
         merged = _parse_workflow_user_config(

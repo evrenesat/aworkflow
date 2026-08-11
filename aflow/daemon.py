@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -103,7 +104,12 @@ class DaemonConfig:
             raise DaemonError("daemon environment file must be a regular non-symlink file")
         if not isinstance(self.release_identity, str) or not self.release_identity.strip():
             raise DaemonError("daemon release identity must be a non-empty string")
-        if self.stop_timeout_seconds < 0 or self.poll_interval_seconds <= 0:
+        if (
+            not math.isfinite(self.stop_timeout_seconds)
+            or not math.isfinite(self.poll_interval_seconds)
+            or self.stop_timeout_seconds < 0
+            or self.poll_interval_seconds <= 0
+        ):
             raise DaemonError("daemon timeout and polling values must be positive")
         environment = dict(self.environment or {})
         for key, value in environment.items():
@@ -134,6 +140,11 @@ class AflowDaemon:
         self._service: DaemonService | None = None
         self._ready = False
         self._stop = Event()
+
+    @property
+    def config_path(self) -> Path:
+        """The validated, read-only configuration path selected for this daemon."""
+        return self._config.config_path
 
     @property
     def ready(self) -> bool:
@@ -179,6 +190,14 @@ class AflowDaemon:
 
     def request_shutdown(self) -> None:
         self._stop.set()
+
+    def shutdown(self) -> tuple[UnitState, ...]:
+        """Stop the poll loop and drain only locally owned subprocess units."""
+        self.request_shutdown()
+        shutdown = getattr(self._units, "shutdown", None)
+        if shutdown is None:
+            return ()
+        return tuple(shutdown())
 
 
 class DaemonService:
