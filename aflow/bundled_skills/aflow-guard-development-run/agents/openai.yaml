@@ -1,4 +1,4 @@
 interface:
-  display_name: "Guard AFlow Run"
-  short_description: "Guard runs with visual reports and upgrade audits"
-  default_prompt: "Use $aflow-guard-development-run to guard this AFlow run, audit its worker upgrade strategy, and deliver compact HTML, PNG, and PDF reports in this task."
+  display_name: "Observe AFlow Run"
+  short_description: "Observe legacy, local-daemon, and aflowd runs"
+  default_prompt: "Use $aflow-guard-development-run to resolve this run's legacy, local-daemon, or aflowd ownership, then monitor it every 30 minutes through the matching read-only surface. Stay silent while healthy, never fix or steer it, report each anomaly once, audit the terminal result, and then stop."

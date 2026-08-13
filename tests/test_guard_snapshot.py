@@ -27,275 +27,226 @@ def _helper_module():
     return module
 
 
-def _run(
-    *,
-    status: str,
-    plan: Path,
-    team: str = "team",
-) -> dict[str, object]:
-    return {
-        "status": status,
-        "turns_completed": 0,
-        "feature_branch": None,
-        "worktree_path": None,
-        "resumed_from_run_id": None,
-        "plan_path": str(plan),
-        "original_plan_path": str(plan),
-        "workflow_name": "workflow",
-        "team": team,
-        "selected_start_step": "implement",
-        "effective_max_turns": 40,
-        "extra_instructions": [],
-        "frozen_config": {
-            "workflow_name": "workflow",
-            "config_path": str(plan.parent / "aflow.toml"),
-            "config_fingerprint": "f" * 64,
-        },
-        "last_snapshot": {"is_complete": False},
-    }
-
-
-def test_uv_global_project_option_is_collapsed_into_one_controller() -> None:
-    helper = _helper_module()
-    cwd = "/root/code/audioventura"
-    wrapper = helper.ProcessRecord(
-        pid=854387,
-        ppid=1,
-        pgid=854387,
-        state="S",
-        elapsed="00:01",
-        command=(
-            "uv --project /root/code/agent_flow run aflow run "
-            "--resume 20260808T151419Z-36183503"
-        ),
-        cwd=cwd,
-    )
-    child = helper.ProcessRecord(
-        pid=854393,
-        ppid=854387,
-        pgid=854387,
-        state="S",
-        elapsed="00:01",
-        command=(
-            "/root/code/agent_flow/.venv/bin/python "
-            "/root/code/agent_flow/.venv/bin/aflow run "
-            "--resume 20260808T151419Z-36183503"
-        ),
-        cwd=cwd,
-    )
-
-    controllers, wrappers = helper._logical_controller_matches(
-        [wrapper, child],
-        [wrapper, child],
-    )
-
-    assert [record.pid for record in controllers] == [854393]
-    assert [record.pid for record in wrappers] == [854387]
-
-
-def test_replacement_linkage_uses_original_recovery_fingerprint_and_is_fail_closed(
-    tmp_path: Path,
-) -> None:
-    helper = _helper_module()
-    repo = tmp_path / "repo"
+def _write_run(repo: Path, run_id: str, *, status: str, complete: bool) -> Path:
+    run_dir = repo / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True)
     plan = repo / "plan.md"
-    plan.parent.mkdir()
     plan.write_text("# plan\n", encoding="utf-8")
-    predecessor_id = "20260802T231403Z-11be6e20"
-    successor_id = "20260802T235429Z-dc254244"
-    predecessor_path = repo / ".aflow" / "runs" / predecessor_id / "run.json"
-    successor_path = repo / ".aflow" / "runs" / successor_id / "run.json"
-    predecessor_path.parent.mkdir(parents=True)
-    successor_path.parent.mkdir(parents=True)
-    predecessor_path.write_text(
-        json.dumps(_run(status="failed", plan=plan)), encoding="utf-8"
-    )
-    successor_path.write_text(
-        json.dumps(_run(status="running", plan=plan)), encoding="utf-8"
-    )
-
-    original_fingerprint = "6c935122dc7c867483b974a3"
-    unsafe_fingerprint = "158e067adc6025a764e34efa"
-    state_path = tmp_path / "state.json"
-    state_path.write_text(
+    (run_dir / "run.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
-                "last_fingerprint": unsafe_fingerprint,
-                "recovery_fingerprints": [original_fingerprint],
-                "notified_fingerprints": [original_fingerprint],
-                "replacement_successor": {
-                    "predecessor_run_id": predecessor_id,
-                    "successor_run_id": successor_id,
-                    "predecessor_fingerprint": unsafe_fingerprint,
-                },
+                "status": status,
+                "turns_completed": 1,
+                "plan_path": str(plan),
+                "original_plan_path": str(plan),
+                "workflow_name": "workflow",
+                "team": "team",
+                "last_snapshot": {"is_complete": complete},
             }
         ),
         encoding="utf-8",
     )
-    controller = helper.ProcessRecord(
-        pid=520120,
-        ppid=1,
-        pgid=520120,
+    return plan
+
+
+def _process(helper, pid: int, ppid: int, pgid: int, command: str):
+    return helper.ProcessRecord(
+        pid=pid,
+        ppid=ppid,
+        pgid=pgid,
         state="S",
         elapsed="00:01",
-        command=f"/usr/bin/python /tmp/aflow run --plan {plan}",
-        cwd=str(repo),
+        command=command,
     )
 
-    linked = helper.collect_snapshot(
+
+def test_healthy_progress_waiting_and_child_are_silent(tmp_path: Path) -> None:
+    helper = _helper_module()
+    repo = tmp_path / "repo"
+    run_id = "20260811T120000Z-abcd1234"
+    plan = _write_run(repo, run_id, status="running", complete=False)
+    state = tmp_path / "state.json"
+    controller = _process(
+        helper, 100, 1, 100, f"/usr/bin/aflow run --plan {plan}"
+    )
+
+    first = helper.collect_snapshot(
         repo,
-        predecessor_id,
-        None,
-        state_path,
+        run_id,
+        "session",
+        state,
         write_state=True,
-        mark_recovery_attempt=False,
         mark_notified=False,
         process_records=[controller],
-        replacement_successor_run_id=successor_id,
     )
-
-    assert linked["classification"] == "replacement_linked"
-    assert linked["fingerprint"] == original_fingerprint
-    assert linked["replacement_successor"]["predecessor_fingerprint"] == original_fingerprint
-    assert linked["replacement_successor"]["migrated_from_predecessor_fingerprint"] == unsafe_fingerprint
-    repaired_state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert repaired_state["last_fingerprint"] == unsafe_fingerprint
-    assert repaired_state["replacement_successor"]["predecessor_fingerprint"] == original_fingerprint
-
-    successor_path.write_text(
-        json.dumps(_run(status="running", plan=plan, team="wrong-team")),
-        encoding="utf-8",
-    )
-    before = state_path.read_bytes()
-    with pytest.raises(ValueError, match="does not match predecessor"):
-        helper.collect_snapshot(
-            repo,
-            predecessor_id,
-            None,
-            state_path,
-            write_state=True,
-            mark_recovery_attempt=False,
-            mark_notified=False,
-            process_records=[controller],
-            replacement_successor_run_id=successor_id,
-        )
-    assert state_path.read_bytes() == before
-
-    missing_identity = _run(status="running", plan=plan)
-    missing_identity.pop("frozen_config")
-    successor_path.write_text(json.dumps(missing_identity), encoding="utf-8")
-    before = state_path.read_bytes()
-    with pytest.raises(ValueError, match="successor frozen_config is missing or invalid"):
-        helper.collect_snapshot(
-            repo,
-            predecessor_id,
-            None,
-            state_path,
-            write_state=True,
-            mark_recovery_attempt=False,
-            mark_notified=False,
-            process_records=[controller],
-            replacement_successor_run_id=successor_id,
-        )
-    assert state_path.read_bytes() == before
-
-
-@pytest.mark.parametrize(
-    ("run_name", "missing_key"),
-    [
-        (run_name, missing_key)
-        for run_name in ("predecessor", "successor")
-        for missing_key in (
-            "workflow_name",
-            "team",
-            "selected_start_step",
-            "effective_max_turns",
-            "extra_instructions",
-            "frozen_config",
-        )
-    ],
-)
-def test_replacement_identity_rejects_missing_required_fields(
-    tmp_path: Path,
-    run_name: str,
-    missing_key: str,
-) -> None:
-    helper = _helper_module()
-    repo = tmp_path / "repo"
-    plan = repo / "plan.md"
-    plan.parent.mkdir()
-    plan.write_text("# plan\n", encoding="utf-8")
-    predecessor = _run(status="failed", plan=plan)
-    successor = _run(status="running", plan=plan)
-    selected = predecessor if run_name == "predecessor" else successor
-    selected.pop(missing_key)
-
-    errors = helper._replacement_identity_errors(repo, predecessor, successor)
-
-    assert f"{run_name} {missing_key} is missing or invalid" in errors
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid_value"),
-    [
-        ("workflow_name", ""),
-        ("team", None),
-        ("selected_start_step", ""),
-        ("effective_max_turns", True),
-        ("extra_instructions", "not-a-list"),
-        ("frozen_config", {"workflow_name": "workflow"}),
-    ],
-)
-def test_replacement_identity_rejects_malformed_required_fields(
-    tmp_path: Path,
-    field: str,
-    invalid_value: object,
-) -> None:
-    helper = _helper_module()
-    repo = tmp_path / "repo"
-    plan = repo / "plan.md"
-    plan.parent.mkdir()
-    plan.write_text("# plan\n", encoding="utf-8")
-    predecessor = _run(status="failed", plan=plan)
-    successor = _run(status="running", plan=plan)
-    predecessor[field] = invalid_value
-
-    errors = helper._replacement_identity_errors(repo, predecessor, successor)
-
-    assert f"predecessor {field} is missing or invalid" in errors
-
-
-@pytest.mark.parametrize("run_name", ["predecessor", "successor"])
-def test_replacement_identity_requires_explicit_original_plan_path(
-    tmp_path: Path,
-    run_name: str,
-) -> None:
-    helper = _helper_module()
-    repo = tmp_path / "repo"
-    plan = repo / "plan.md"
-    plan.parent.mkdir()
-    plan.write_text("# plan\n", encoding="utf-8")
-    predecessor = _run(status="failed", plan=plan)
-    successor = _run(status="running", plan=plan)
-    selected = predecessor if run_name == "predecessor" else successor
-    selected.pop("original_plan_path")
-
-    errors = helper._replacement_identity_errors(repo, predecessor, successor)
-
-    assert "successor original plan does not match predecessor" in errors
-
-
-def test_replacement_identity_requires_existing_original_plan(tmp_path: Path) -> None:
-    helper = _helper_module()
-    repo = tmp_path / "repo"
-    plan = repo / "missing-plan.md"
-    repo.mkdir()
-
-    errors = helper._replacement_identity_errors(
+    second = helper.collect_snapshot(
         repo,
-        _run(status="failed", plan=plan),
-        _run(status="running", plan=plan),
+        run_id,
+        "session",
+        state,
+        write_state=True,
+        mark_notified=False,
+        process_records=[controller],
+    )
+    child = _process(helper, 101, 100, 100, "codex exec task")
+    third = helper.collect_snapshot(
+        repo,
+        run_id,
+        "session",
+        state,
+        write_state=True,
+        mark_notified=False,
+        process_records=[controller, child],
     )
 
-    assert "predecessor original plan does not exist" in errors
+    assert first["classification"] == "active_progress"
+    assert first["recommended_action"] == "stay_silent"
+    assert second["classification"] == "active_waiting"
+    assert second["unchanged_intervals"] == 1
+    assert third["classification"] == "active_waiting_child"
+    assert third["recommended_action"] == "stay_silent"
+
+
+@pytest.mark.parametrize(
+    ("status", "complete", "process_count", "classification", "action"),
+    [
+        ("running", False, 0, "orphaned_controller", "report_and_pause"),
+        ("failed", False, 0, "terminal_failed", "report_and_pause"),
+        ("completed", False, 0, "terminal_incomplete", "report_and_pause"),
+        ("completed", True, 0, "terminal_success", "audit_and_pause"),
+    ],
+)
+def test_terminal_and_orphan_states_never_recover(
+    tmp_path: Path,
+    status: str,
+    complete: bool,
+    process_count: int,
+    classification: str,
+    action: str,
+) -> None:
+    helper = _helper_module()
+    repo = tmp_path / "repo"
+    run_id = "20260811T120000Z-abcd1234"
+    _write_run(repo, run_id, status=status, complete=complete)
+
+    result = helper.collect_snapshot(
+        repo,
+        run_id,
+        "session",
+        tmp_path / "state.json",
+        write_state=False,
+        mark_notified=False,
+        process_records=[],
+    )
+
+    assert process_count == 0
+    assert result["classification"] == classification
+    assert result["recommended_action"] == action
+    assert "recovery" not in result
+
+
+def test_duplicate_controller_is_unsafe(tmp_path: Path) -> None:
+    helper = _helper_module()
+    repo = tmp_path / "repo"
+    run_id = "20260811T120000Z-abcd1234"
+    plan = _write_run(repo, run_id, status="running", complete=False)
+    processes = [
+        _process(helper, 100, 1, 100, f"/usr/bin/aflow run --plan {plan}"),
+        _process(helper, 200, 1, 200, f"/usr/bin/aflow run --plan {plan}"),
+    ]
+
+    result = helper.collect_snapshot(
+        repo,
+        run_id,
+        None,
+        tmp_path / "state.json",
+        write_state=False,
+        mark_notified=False,
+        process_records=processes,
+    )
+
+    assert result["classification"] == "unsafe_duplicate_controllers"
+    assert result["recommended_action"] == "report_and_pause"
+
+
+def test_tmux_presence_never_substitutes_for_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = _helper_module()
+    repo = tmp_path / "repo"
+    run_id = "20260811T120000Z-abcd1234"
+    _write_run(repo, run_id, status="running", complete=False)
+    monkeypatch.setattr(helper, "_list_processes", lambda: [])
+    monkeypatch.setattr(helper, "_tmux_present", lambda _: True)
+
+    result = helper.collect_snapshot(
+        repo,
+        run_id,
+        "session",
+        tmp_path / "state.json",
+        write_state=False,
+        mark_notified=False,
+    )
+
+    assert result["processes"]["tmux_present"] is True
+    assert result["classification"] == "orphaned_controller"
+
+
+def test_same_task_routing_and_notification_deduplication(tmp_path: Path) -> None:
+    helper = _helper_module()
+    repo = tmp_path / "repo"
+    run_id = "20260811T120000Z-abcd1234"
+    plan = _write_run(repo, run_id, status="running", complete=False)
+    thread_id = "019ff1a9-a23f-7c33-9e4f-d2f14270fd9d"
+    controller = _process(
+        helper, 100, 1, 100, f"/usr/bin/aflow run --plan {plan}"
+    )
+    state = tmp_path / "state.json"
+
+    result = helper.collect_snapshot(
+        repo,
+        run_id,
+        None,
+        state,
+        write_state=True,
+        mark_notified=True,
+        process_records=[controller],
+        thread_id=thread_id,
+        current_thread_id=thread_id,
+    )
+    repeated = helper.collect_snapshot(
+        repo,
+        run_id,
+        None,
+        state,
+        write_state=True,
+        mark_notified=False,
+        process_records=[controller],
+        thread_id=thread_id,
+        current_thread_id=thread_id,
+    )
+
+    assert result["notification_already_sent"] is True
+    assert repeated["notification_already_sent"] is True
+    with pytest.raises(ValueError, match="current task"):
+        helper.collect_snapshot(
+            repo,
+            run_id,
+            None,
+            state,
+            write_state=True,
+            mark_notified=False,
+            process_records=[controller],
+            thread_id=thread_id,
+            current_thread_id="019fa876-6d0b-7c42-b5d9-a0f0467a204a",
+        )
+
+
+def test_cli_exposes_tmux_and_no_recovery_options() -> None:
+    helper = _helper_module()
+    help_text = helper._parser().format_help()
+
+    assert "--tmux-session" in help_text
+    assert "--screen-session" not in help_text
+    assert "--mark-recovery-attempt" not in help_text
+    assert "--replacement-successor-run-id" not in help_text

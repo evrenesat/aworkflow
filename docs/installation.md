@@ -40,9 +40,17 @@ aflow run path/to/plan.md
 `aflow install-skills` copies the default bundled skills, including
 `aflow-harness-recovery-lead`, the read-only `aflow-manager`, and the strict
 read-only `aflow-repartition-checkpoint`, plus `material-code-review`, into every detected supported harness
-skill directory. The default `aflow-guard-development-run` skill attaches one
-heartbeat to the task that requested supervision; it does not create a second
-task for scheduled beats. The optional `aflow-assistant` skill is not installed
+skill directory. The default `aflow-guard-development-run` skill launches new
+legacy runs in tmux, then attaches one observer-only 30-minute heartbeat to the
+task that requested supervision. It stays silent while healthy, never repairs
+or steers implementation, audits the terminal result, and then stops. Remote
+MCP use is read-only and ownership-aware: direct legacy controllers use the
+bounded local snapshot, lightweight `aflow daemon` runs use daemon status
+plus its configured MCP transport, and production `aflowd` runs use the
+advertised authenticated control-plane endpoint and exact systemd unit.
+The lightweight daemon has no REST or web UI; production `aflowd` may
+advertise both. Deployment requires explicit per-run authorization. The
+optional `aflow-assistant` skill is not installed
 unless you ask for it. Keep the legacy recovery skill installed even when using
 manager supervision: manager-disabled configurations retain that recovery path.
 Manager and repartition prompts also carry their complete JSON contracts inline,
@@ -95,7 +103,7 @@ Default skills:
 - `aflow-harness-recovery-lead` - team-lead fallback for harness recovery decisions.
 - `aflow-manager` - read-only Lite/Full interstep supervision.
 - `aflow-repartition-checkpoint` - strict Full proposal and independent semantic validation for scope-preserving splits.
-- `aflow-guard-development-run` - same-task heartbeat supervision and bounded recovery for an exact AFlow run.
+- `aflow-guard-development-run` - observer-only monitoring for an exact legacy or daemon-owned AFlow run.
 - `material-code-review` - high-confidence, material-defect review guidance with a proportionate-fix gate.
 
 Optional skills:
