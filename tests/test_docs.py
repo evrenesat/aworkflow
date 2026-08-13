@@ -58,17 +58,55 @@ class SkillDocsTests(unittest.TestCase):
         skill_root = repo_root / 'aflow' / 'bundled_skills' / 'aflow-guard-development-run'
         assert (skill_root / 'SKILL.md').exists()
         assert (skill_root / 'agents' / 'openai.yaml').exists()
-        assert (skill_root / 'references' / 'aflow-defect-plan.md').exists()
+        assert (skill_root / 'references' / 'aflow-defect-issue.md').exists()
+        assert (skill_root / 'references' / 'remote-observation.md').exists()
         assert (skill_root / 'scripts' / 'aflow_guard_snapshot.py').exists()
+        assert (skill_root / 'scripts' / 'aflow_guard_issue.py').exists()
+        assert not (skill_root / 'scripts' / 'aflow_guard_report.py').exists()
+        assert not (skill_root / 'references' / 'reporting-and-email.md').exists()
 
         text = (skill_root / 'SKILL.md').read_text(encoding='utf-8')
         assert 'Never create a secondary task' in text
         assert 'create_thread' not in text
         assert 'send_message_to_thread' not in text
-        assert '--guard-thread-id <same-task-id>' in text
-        assert 'terminal_transient_environment' in text
-        assert 'zero-turn, no-mutation replacement' in text
-        assert '--replacement-successor-run-id option' in text
+        assert 'every 30 minutes' in text
+        assert '--thread-id <initiating-task-id>' in text
+        assert '--tmux-session <optional-session>' in text
+        assert 'Never fix, retry, resume' in text
+        assert 'terminal_transient_environment' not in text
+        assert 'replacement-successor' not in text
+        assert 'SRE mode' not in text
+        assert ' ship mode' not in text.lower()
+
+    def test_guard_remote_observation_matches_current_control_plane(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        skill_root = repo_root / 'aflow' / 'bundled_skills' / 'aflow-guard-development-run'
+        skill_text = (skill_root / 'SKILL.md').read_text(encoding='utf-8')
+        remote_text = (skill_root / 'references' / 'remote-observation.md').read_text(encoding='utf-8')
+
+        assert 'legacy' in skill_text
+        assert 'local-daemon' in skill_text
+        assert 'aflowd' in skill_text
+        assert 'aflow daemon status --repo-root <guarded-repo>' in skill_text
+        assert 'Never create a disposable stdio connection' in skill_text
+        assert 'aflow-run-<run-id>.service' in skill_text
+        assert 'needs_attention' in skill_text
+        assert 'no REST API, web UI, or systemd ownership' in remote_text
+        assert 'http://100.103.69.9:8765/mcp' in remote_text
+
+        read_tools = (
+            'get_capabilities', 'list_projects', 'get_project_capabilities',
+            'list_plans', 'list_runs', 'get_run', 'get_run_events',
+            'get_run_context',
+        )
+        write_tools = (
+            'start_run', 'answer_startup', 'control_run', 'owner_stop',
+            'resume_run',
+        )
+        for tool in read_tools:
+            assert f'`{tool}`' in remote_text
+        for tool in write_tools:
+            assert f'`{tool}`' in remote_text
 
     def test_final_review_skill_is_distinct_and_no_squash(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

@@ -418,8 +418,12 @@ def test_only_guard_copies_complete_bundled_skill(tmp_path: Path) -> None:
     guard_dir = destination / "aflow-guard-development-run"
     assert (guard_dir / "SKILL.md").is_file()
     assert (guard_dir / "agents" / "openai.yaml").is_file()
-    assert (guard_dir / "references" / "aflow-defect-plan.md").is_file()
+    assert (guard_dir / "references" / "aflow-defect-issue.md").is_file()
+    assert (guard_dir / "references" / "remote-observation.md").is_file()
     assert (guard_dir / "scripts" / "aflow_guard_snapshot.py").is_file()
+    assert (guard_dir / "scripts" / "aflow_guard_issue.py").is_file()
+    assert not (guard_dir / "scripts" / "aflow_guard_report.py").exists()
+    assert not (guard_dir / "references" / "reporting-and-email.md").exists()
 
 
 def test_include_optional_copies_aflow_assistant_bundled_resources(tmp_path: Path) -> None:
