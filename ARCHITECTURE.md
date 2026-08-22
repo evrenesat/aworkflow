@@ -370,6 +370,15 @@ This leaves the controller/dashboard as the sole owner of interactive terminal
 input while preserving the existing stdout/stderr pipes, return codes, and
 prompt metadata. Injected runner callables are unchanged.
 
+Reasonix owned sessions use a stricter ACP boundary. The driver owns one stdio
+process through initialize, session creation or exact resume, configuration,
+prompt, and close. Before prompting it must negotiate the exact
+`tool_approval=yolo` select value, then model and effort, consuming a complete
+`configOptions` acknowledgement after every update and rechecking all applied
+values. Any missing, malformed, rejected, or reset state closes the process and
+terminalizes the run before the prompt. A permissive global Reasonix permissions
+file is not AFlow's proof that an owned ACP session is noninteractive.
+
 Codex uses the documented `codex exec ... -` form: the complete effective
 prompt is sent through stdin and is never added to argv. The subprocess
 boundary drains stdout and stderr while feeding stdin, and the equivalent

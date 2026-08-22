@@ -3177,7 +3177,6 @@ def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None 
             driver.executable = executable
             # Initialize is capability negotiation only. Do not open a
             # session or mutate a provider-selected model during discovery.
-            driver.config_update_method = None
             return driver
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             return None
