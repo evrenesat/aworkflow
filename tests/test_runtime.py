@@ -8,7 +8,7 @@ from aflow.analyzer import extract_text_signals
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig, TeamConfig
 from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
-from aflow.api.events import ExecutionEventType
+from aflow.api.events import CollectingObserver, ExecutionEventType, TurnFinishedEvent
 from aflow.run_state import (
     ActiveImplementationScope,
     FrozenRunIdentity,
@@ -34,6 +34,8 @@ from aflow.workflow import (
     _reconcile_repartition_plan_copies,
 )
 from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
+from aflow.harnesses.base import HarnessInvocation
+from aflow.harnesses.session import SessionCapabilities
 
 
 def _runner_prompt(argv, kwargs) -> str:
@@ -2465,7 +2467,8 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'loop': WorkflowConfig(steps={'review': WorkflowStepConfig(role='architect', prompts=('review_prompt',), go=(GoTransition(to='implement'),)), 'implement': WorkflowStepConfig(role='architect', prompts=('impl_prompt',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='review')))}, first_step='review')}, prompts={'review_prompt': 'Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.', 'impl_prompt': 'Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=4)
-            run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=capturing_runner)
+            with pytest.raises(WorkflowError, match='reached max turns limit'):
+                run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=capturing_runner)
             for p in captured_active_paths:
                 assert str(plan_path) == p
 
@@ -2579,7 +2582,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert result.final_snapshot.is_complete
             assert call_order == ['claude', 'opencode']
 
-    def test_workflow_max_turns_routing_to_end(self) -> None:
+    def test_workflow_max_turns_end_fails_when_plan_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             config_dir = repo_root
@@ -2590,9 +2593,25 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, stdout='noop', stderr='')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
-            assert result.turns_completed == 3
-            assert not result.final_snapshot.is_complete
+            observer = CollectingObserver()
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    controller_config, wf_config, 'simple', config_dir=config_dir,
+                    adapter=CodexAdapter(), runner=runner, observer=observer,
+                )
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            turn_json = json.loads((ctx.value.run_dir / 'turns' / 'turn-003' / 'result.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            assert 'reached max turns limit of 3' in run_json['failure_reason']
+            assert run_json['turns_completed'] == 3
+            assert 'end_reason' not in run_json
+            assert turn_json['status'] == 'completed'
+            assert turn_json['conditions']['MAX_TURNS_REACHED'] is True
+            assert turn_json['chosen_transition'] == 'END'
+            assert 'end_reason' not in turn_json
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
+            assert ExecutionEventType.RUN_COMPLETED not in event_types
 
     def test_workflow_no_matching_transition_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2686,7 +2705,8 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     return HarnessInvocation(label='codex', argv=('codex', 'run', user_prompt), env={}, prompt_mode='prefix-system-into-user-prompt', system_prompt=system_prompt, user_prompt=user_prompt, effective_prompt=f'{system_prompt}\n\n{user_prompt}' if system_prompt else user_prompt)
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1, extra_instructions=('be careful', 'use tests'))
-            run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CapturingAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
+            with pytest.raises(WorkflowError, match='reached max turns limit'):
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CapturingAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
             assert len(captured_user_prompts) == 1
             assert 'Work from' in captured_user_prompts[0]
             assert 'be careful use tests' in captured_user_prompts[0]
@@ -2756,7 +2776,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert result.to_dict()['end_reason'] == 'already_complete'
             assert call_count[0] == 0
 
-    def test_workflow_unconditional_end_uses_transition_end_reason(self) -> None:
+    def test_workflow_unconditional_end_fails_when_plan_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             config_dir = repo_root
@@ -2767,15 +2787,23 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END'),))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
-            assert result.turns_completed == 1
-            assert result.end_reason == 'transition_end'
-            run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['end_reason'] == 'transition_end'
-            turn_result = json.loads((result.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
-            assert turn_result['end_reason'] == 'transition_end'
+            observer = CollectingObserver()
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    controller_config, wf_config, 'simple', config_dir=config_dir,
+                    adapter=CodexAdapter(), runner=runner, observer=observer,
+                )
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            turn_result = json.loads((ctx.value.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            assert 'selected END while the active plan remains incomplete' in run_json['failure_reason']
+            assert 'end_reason' not in run_json
             assert turn_result['status'] == 'completed'
-            assert turn_result['duration_seconds'] >= 0
+            assert turn_result['chosen_transition'] == 'END'
+            assert 'end_reason' not in turn_result
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
+            assert ExecutionEventType.RUN_COMPLETED not in event_types
 
     def test_workflow_end_reason_prefers_done_when_plan_completes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3035,6 +3063,151 @@ class RunlogSingleRunDirTests(unittest.TestCase):
 
 
 class WorkflowArtifactTests(unittest.TestCase):
+
+    def test_owned_session_exception_terminalizes_turn_and_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+
+            class FailingOwnedDriver:
+                capabilities = SessionCapabilities(session_identity=True)
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def build_invocation(self, request):
+                    return HarnessInvocation(
+                        label='owned-fake',
+                        argv=('owned-fake',),
+                        env={'PRIVATE_ENV': 'fake-env-secret'},
+                        prompt_mode='stdin',
+                        system_prompt=request.system_prompt,
+                        user_prompt=request.user_prompt,
+                        effective_prompt=request.user_prompt,
+                        stdin_text=request.user_prompt,
+                    )
+
+                def execute_session(self, request, invocation, control_callback=None):
+                    self.calls += 1
+                    raise RuntimeError(
+                        f"{invocation.user_prompt}\nAuthorization: Bearer fake-secret "
+                        "token=fake-token fake-env-secret"
+                    )
+
+            driver = FailingOwnedDriver()
+            observer = CollectingObserver()
+            wf_config = WorkflowUserConfig(
+                roles={'worker': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})},
+                workflows={'simple': WorkflowConfig(
+                    steps={'implement_plan': WorkflowStepConfig(
+                        role='worker', prompts=('p',), go=(GoTransition(to='END'),),
+                    )},
+                    first_step='implement_plan',
+                )},
+                prompts={'p': 'PRIVATE PROMPT MARKER'},
+            )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config,
+                    'simple',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    session_driver=driver,
+                    preflight_probe=NoOpHarnessPreflightProbe(),
+                    observer=observer,
+                )
+
+            assert isinstance(ctx.value.__cause__, RuntimeError)
+            assert driver.calls == 1
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            turn_json = json.loads((ctx.value.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'failed'
+            assert run_json['turns_completed'] == 0
+            assert run_json['last_snapshot']['is_complete'] is False
+            assert run_json['frozen_config']['workflow_name'] == 'simple'
+            assert turn_json['status'] == 'harness-failed'
+            assert len(turn_json['error']) <= 512
+            assert turn_json['snapshot_after'] is None
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
+            assert ExecutionEventType.RUN_COMPLETED not in event_types
+            persisted_text = '\n'.join(
+                [
+                    str(ctx.value),
+                    (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'),
+                    (ctx.value.run_dir / 'issues.md').read_text(encoding='utf-8'),
+                    (ctx.value.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'),
+                ]
+            )
+            for secret in (
+                'PRIVATE PROMPT MARKER',
+                'fake-secret',
+                'fake-token',
+                'fake-env-secret',
+            ):
+                assert secret not in persisted_text
+
+    def test_turn_finished_observer_exception_fails_run_without_refinalizing_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            class RaisingObserver:
+                def __init__(self) -> None:
+                    self.events = []
+                    self.raised = False
+
+                def on_event(self, event):
+                    self.events.append(event)
+                    if isinstance(event, TurnFinishedEvent) and not self.raised:
+                        self.raised = True
+                        raise RuntimeError('observer callback failed')
+
+            observer = RaisingObserver()
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})},
+                workflows={'simple': WorkflowConfig(
+                    steps={'implement_plan': WorkflowStepConfig(
+                        role='architect', prompts=('p',), go=(GoTransition(to='END'),),
+                    )},
+                    first_step='implement_plan',
+                )},
+                prompts={'p': 'Work.'},
+            )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config,
+                    'simple',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    observer=observer,
+                )
+
+            assert isinstance(ctx.value.__cause__, RuntimeError)
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            turn_path = ctx.value.run_dir / 'turns' / 'turn-001' / 'result.json'
+            turn_json = json.loads(turn_path.read_text(encoding='utf-8'))
+            finished_at = turn_json['finished_at']
+            assert turn_json['status'] == 'completed'
+            assert json.loads(turn_path.read_text(encoding='utf-8'))['finished_at'] == finished_at
+            assert run_json['status'] == 'failed'
+            assert run_json['turns_completed'] == 1
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
+            assert ExecutionEventType.RUN_COMPLETED not in event_types
 
     def test_run_json_includes_workflow_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4442,19 +4615,19 @@ class WorkflowEndToEndTests(unittest.TestCase):
             _write_plan(completed_plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n- [x] step two\n')
             _write_workflow_harness_script(repo_root, 'codex')
             result = _run_workflow_launcher(repo_root, '--max-turns', '4', '--start-step', 'review', str(plan_path), env=_workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir, completed_plan_path=completed_plan_path))
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['status'] == 'completed'
+            assert run_json['status'] == 'failed'
             assert run_json['turns_completed'] == 4
-            assert run_json['end_reason'] == 'max_turns_reached'
+            assert 'end_reason' not in run_json
             for turn_dir in sorted((run_dirs[0] / 'turns').iterdir()):
                 turn_result = json.loads((turn_dir / 'result.json').read_text(encoding='utf-8'))
                 assert Path(turn_result['active_plan_path']).resolve() == plan_path.resolve()
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-004' / 'result.json').read_text(encoding='utf-8'))
-            assert turn_result['end_reason'] == 'max_turns_reached'
+            assert 'end_reason' not in turn_result
 
-    def test_max_turns_routes_to_end(self) -> None:
+    def test_max_turns_end_fails_when_plan_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = _copy_aflow_repo(tmp_path)
@@ -4466,16 +4639,17 @@ class WorkflowEndToEndTests(unittest.TestCase):
             _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
             _write_workflow_harness_script(repo_root, 'codex')
             result = _run_workflow_launcher(repo_root, '--max-turns', '3', str(plan_path), env=_workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir))
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['status'] == 'completed'
+            assert run_json['status'] == 'failed'
             assert run_json['turns_completed'] == 3
-            assert run_json['end_reason'] == 'max_turns_reached'
-            assert result.stdout.strip() == "Workflow 'simple' completed after 3 turns because MAX_TURNS_REACHED matched."
+            assert 'end_reason' not in run_json
+            assert 'reached max turns limit of 3' in result.stderr
+            assert "Workflow 'simple' completed" not in result.stdout
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-003' / 'result.json').read_text(encoding='utf-8'))
-            assert turn_result['end_reason'] == 'max_turns_reached'
+            assert 'end_reason' not in turn_result
             assert turn_result['status'] == 'completed'
             assert turn_result['duration_seconds'] >= 0
 
@@ -4554,7 +4728,7 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
@@ -4619,7 +4793,7 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['selector'] == 'claude.default'
@@ -4716,11 +4890,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
             assert run_json['turns_completed'] == 2
-            assert run_json['end_reason'] == 'max_turns_reached'
+            assert run_json['status'] == 'failed'
+            assert 'end_reason' not in run_json
 
     def test_cli_max_turns_overrides_config_max_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4767,11 +4942,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
             assert run_json['turns_completed'] == 1
-            assert run_json['end_reason'] == 'max_turns_reached'
+            assert run_json['status'] == 'failed'
+            assert 'end_reason' not in run_json
 
     def test_launcher_numeric_start_step_matches_named_start_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4794,7 +4970,7 @@ class WorkflowEndToEndTests(unittest.TestCase):
                 str(plan_path),
                 env=env_numeric,
             )
-            assert result_numeric.returncode == 0
+            assert result_numeric.returncode != 0
             run_dirs_numeric = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs_numeric) == 1
             run_json_numeric = json.loads((run_dirs_numeric[0] / 'run.json').read_text(encoding='utf-8'))
@@ -4813,7 +4989,7 @@ class WorkflowEndToEndTests(unittest.TestCase):
                 str(plan_path),
                 env=env_named,
             )
-            assert result_named.returncode == 0
+            assert result_named.returncode != 0
             run_dirs_named = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs_named) == 1
             run_json_named = json.loads((run_dirs_named[0] / 'run.json').read_text(encoding='utf-8'))
@@ -4864,8 +5040,9 @@ class WorkflowPreflightTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
-            result = run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
-            assert result.turns_completed == 1
+            with pytest.raises(WorkflowError, match='reached max turns limit'):
+                run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            assert call_count[0] == 1
 
     def test_preflight_skipped_for_non_review_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4933,11 +5110,12 @@ class WorkflowPreflightTests(unittest.TestCase):
                 assert f'`{current_head}`' in text
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
-            run_workflow(
-                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
-                wf_config, 'simple', config_dir=repo_root,
-                runner=runner,
-            )
+            with pytest.raises(WorkflowError, match='reached max turns limit'):
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                    wf_config, 'simple', config_dir=repo_root,
+                    runner=runner,
+                )
             assert call_count[0] == 1
             assert f'`{current_head}`' in plan_path.read_text(encoding='utf-8')
 
@@ -5052,6 +5230,82 @@ class WorkflowPreflightTests(unittest.TestCase):
 
 
 class WorkflowLifecycleRuntimeTests(unittest.TestCase):
+
+    def test_incomplete_end_preserves_unmerged_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            wf_config = _make_worktree_wf_config(
+                worktree_root=str(worktree_root)
+            )
+            observed_worktree: list[Path] = []
+            observed_branch: list[str] = []
+
+            def runner(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                observed_worktree.append(cwd)
+                rc, branch, _ = _run_git_in_test(
+                    ['branch', '--show-current'], cwd=cwd
+                )
+                assert rc == 0
+                observed_branch.append(branch.strip())
+                marker = cwd / 'incomplete-feature.txt'
+                marker.write_text('preserve me\n', encoding='utf-8')
+                _run_git_in_test(['add', 'incomplete-feature.txt'], cwd=cwd)
+                rc, _, err = _run_git_in_test(
+                    ['commit', '-m', 'incomplete feature marker'], cwd=cwd
+                )
+                assert rc == 0, err
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            with pytest.raises(WorkflowError, match='reached max turns limit') as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                    ),
+                    wf_config,
+                    'wt_wf',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert len(observed_worktree) == 1
+            worktree_path = observed_worktree[0]
+            feature_branch = observed_branch[0]
+            assert worktree_path.exists()
+            assert (worktree_path / 'incomplete-feature.txt').is_file()
+            rc, _, _ = _run_git_in_test(
+                ['cat-file', '-e', 'main:incomplete-feature.txt'], cwd=repo_root
+            )
+            assert rc != 0
+            rc, branches, _ = _run_git_in_test(
+                ['branch', '--list', feature_branch], cwd=repo_root
+            )
+            assert rc == 0
+            assert feature_branch in branches
+            rc, worktrees, _ = _run_git_in_test(
+                ['worktree', 'list', '--porcelain'], cwd=repo_root
+            )
+            assert rc == 0
+            assert str(worktree_path) in worktrees
+            run_json = json.loads(
+                (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert run_json['status'] == 'failed'
+            assert run_json['feature_branch'] == feature_branch
+            assert run_json['worktree_path'] == str(worktree_path)
+            assert 'merge_status' not in run_json
+            assert 'end_reason' not in run_json
 
     def test_bootstrap_succeeds_for_unborn_main_branch_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5521,7 +5775,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 runner=runner,
             )
 
-            assert call_count[0] == 2
+            assert call_count[0] == 1
             assert result.turns_completed == 1
             assert f'`{current_head}`' in plan_path.read_text(encoding='utf-8')
 
@@ -6674,6 +6928,19 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                         '### [ ] Checkpoint 2: Second\n'
                         '- [ ] step two\n',
                     )
+                else:
+                    execution_plan = (
+                        Path(kwargs['cwd'])
+                        / plan_path.relative_to(repo_root)
+                    )
+                    _write_plan(
+                        execution_plan,
+                        '# Plan\n\n'
+                        '### [x] Checkpoint 1: First\n'
+                        '- [x] step one\n\n'
+                        '### [x] Checkpoint 2: Second\n'
+                        '- [x] step two\n',
+                    )
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             result = run_workflow(
@@ -6807,19 +7074,20 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 )
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
-            result = run_workflow(
-                ControllerConfig(
-                    repo_root=repo_root,
-                    plan_path=plan_path,
-                    max_turns=2,
-                    start_step='implement',
-                ),
-                wf_config,
-                'repair_loop',
-                config_dir=repo_root,
-                adapter=CodexAdapter(),
-                runner=runner,
-                resume=ResumeContext(
+            with pytest.raises(WorkflowError, match='active plan remains incomplete') as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                        start_step='implement',
+                    ),
+                    wf_config,
+                    'repair_loop',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    resume=ResumeContext(
                     resumed_from_run_id='prior-run',
                     feature_branch='resume-feature',
                     worktree_path=worktree_path,
@@ -6852,8 +7120,8 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                             f'{logical_repair}::checkpoint-complete'
                         ),
                     ),
-                ),
-            )
+                    ),
+                )
 
             assert len(captured_prompt) == 1
             assert next_scope_captured_before_worker == [True]
@@ -6861,7 +7129,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert str(execution_plan) in captured_prompt[0]
             assert str(execution_repair) not in captured_prompt[0]
             run_payload = json.loads(
-                (result.run_dir / 'run.json').read_text(encoding='utf-8')
+                (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
             )
             assert run_payload['active_plan_path'] == str(plan_path)
             assert run_payload['active_implementation_scope'] is not None
@@ -7407,6 +7675,14 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 calls.append((argv[argv.index('--model') + 1], _runner_invocation_text(argv, kwargs)))
+                _write_plan(
+                    execution_plan,
+                    '# Plan\n\n'
+                    '### [x] Checkpoint 1: First\n'
+                    '- [x] step one\n\n'
+                    '### [x] Checkpoint 2: Second\n'
+                    '- [x] step two\n',
+                )
                 return subprocess.CompletedProcess(argv, 0, 'reviewed', '')
 
             result = run_workflow(
@@ -8300,7 +8576,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
 class WorkflowMaxTurnsEndToEndTests(unittest.TestCase):
 
-    def test_review_implement_review_ends_via_max_turns(self) -> None:
+    def test_review_implement_review_fails_via_max_turns_when_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = _copy_aflow_repo(tmp_path)
@@ -8312,10 +8588,12 @@ class WorkflowMaxTurnsEndToEndTests(unittest.TestCase):
             _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
             _write_workflow_harness_script(repo_root, 'codex')
             result = _run_workflow_launcher(repo_root, '--max-turns', '1', '--start-step', 'review_plan', str(plan_path), env=_workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir))
-            assert result.returncode == 0
+            assert result.returncode != 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['end_reason'] == 'max_turns_reached'
+            assert run_json['status'] == 'failed'
+            assert 'end_reason' not in run_json
+            assert 'reached max turns limit of 1' in result.stderr
 
 
 class StopMarkerTests(unittest.TestCase):
@@ -8903,6 +9181,152 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             assert result.end_reason == 'already_complete'
             assert not (repo_root / '.git').exists(), 'no git repo should be initialized for non-lifecycle workflows'
+
+    def test_manager_enabled_incomplete_max_turn_calls_full_once_then_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={'impl': WorkflowStepConfig(
+                    role='architect',
+                    prompts=('p',),
+                    go=(GoTransition(to='END', when='MAX_TURNS_REACHED'),),
+                )},
+                first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'architect': 'codex.default',
+                    'manager_lite': 'codex.nano',
+                    'manager_full': 'codex.high',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'),
+                    'nano': HarnessProfileConfig(model='nano'),
+                    'high': HarnessProfileConfig(model='high'),
+                })},
+                workflows={'managed': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role='manager_lite',
+                    full_role='manager_full',
+                ),
+            )
+            calls: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index('--model') + 1]
+                calls.append(model)
+                if model == 'high':
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        _manager_stop_decision(
+                            'The max-turn boundary left the plan incomplete.'
+                        ),
+                        '',
+                    )
+                return subprocess.CompletedProcess(argv, 0, 'work remains', '')
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                    ),
+                    wf_config,
+                    'managed',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert calls == ['default', 'high']
+            run_json = json.loads(
+                (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert run_json['status'] == 'failed'
+            assert 'end_reason' not in run_json
+            decision_dirs = sorted((ctx.value.run_dir / 'manager').iterdir())
+            assert len(decision_dirs) == 1
+            decision = json.loads(
+                (decision_dirs[0] / 'result.json').read_text(encoding='utf-8')
+            )
+            assert decision['level'] == 'full'
+            assert decision['trigger'] == 'max_turns'
+
+    def test_manager_enabled_incomplete_end_runs_normal_gate_then_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={'impl': WorkflowStepConfig(
+                    role='architect', prompts=('p',), go=(GoTransition(to='END'),),
+                )},
+                first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'architect': 'codex.default',
+                    'manager_lite': 'codex.nano',
+                    'manager_full': 'codex.high',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'),
+                    'nano': HarnessProfileConfig(model='nano'),
+                    'high': HarnessProfileConfig(model='high'),
+                })},
+                workflows={'managed': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role='manager_lite',
+                    full_role='manager_full',
+                ),
+            )
+            calls: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index('--model') + 1]
+                calls.append(model)
+                if model == 'nano':
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        'schema_version': 1,
+                        'action': 'continue',
+                        'reason': 'Keep the proposed END transition.',
+                        'next_step_notes': [],
+                        'stop_report': None,
+                    }), '')
+                return subprocess.CompletedProcess(argv, 0, 'work remains', '')
+
+            with pytest.raises(
+                WorkflowError,
+                match='active plan remains incomplete',
+            ) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    wf_config,
+                    'managed',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert calls == ['default', 'nano']
+            run_json = json.loads(
+                (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert run_json['status'] == 'failed'
+            assert 'end_reason' not in run_json
+            assert len(list((ctx.value.run_dir / 'manager').iterdir())) == 1
 
     def test_manager_gates_end_and_persists_its_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

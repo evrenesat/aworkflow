@@ -582,10 +582,19 @@ def test_crash_resume_before_target_start_or_success_keeps_transaction_nontermin
             raise RuntimeError("crash before target provider operation")
         provider_operations.append("source")
         return subprocess.CompletedProcess(argv, 0, '{"type":"thread.started","thread_id":"source"}\n{"type":"message.completed","text":"continue"}\n', "")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(WorkflowError) as error:
         run_workflow(ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=3), config, "live", config_dir=tmp_path, adapter=CodexAdapter(), runner=crashing_runner, session_driver=driver, control_source=control)
-    run_dir = sorted((tmp_path / ".aflow" / "runs").glob("*"))[-1]
+    assert isinstance(error.value.__cause__, RuntimeError)
+    run_dir = error.value.run_dir
     persisted = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    failed_turn = json.loads(
+        (run_dir / "turns" / "turn-002" / "result.json").read_text(encoding="utf-8")
+    )
+    assert persisted["status"] == "failed"
+    assert persisted["turns_completed"] == 1
+    assert failed_turn["status"] == "harness-failed"
+    assert failed_turn["error"].startswith("RuntimeError: crash before target provider operation")
+    assert len(failed_turn["error"]) <= 512
     assert persisted["current_hotplug_transaction"]["stage"] == "accepted"
     assert persisted["pending_hotplug_transaction"]["stage"] == "accepted"
     assert not persisted["hotplug_history"]
