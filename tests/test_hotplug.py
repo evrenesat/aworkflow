@@ -707,10 +707,18 @@ def test_cross_harness_artifacts_are_hash_bound_and_workspace_fingerprint_detect
     assert before["sha256"] != after["sha256"]
 
 
-@pytest.mark.parametrize("observer_fails", [False, True], ids=("success", "observer-failure"))
+@pytest.mark.parametrize(
+    "observer_error",
+    [
+        None,
+        KeyError("hotplug observer failed"),
+        RuntimeError('hotplug observer failed password="quoted-alpha quoted-bravo"'),
+    ],
+    ids=("success", "key-error", "runtime-error"),
+)
 def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
     tmp_path: Path,
-    observer_fails: bool,
+    observer_error: Exception | None,
 ) -> None:
     transaction = make_transaction("accepted")
     source = HarnessSessionRefV1(
@@ -772,11 +780,11 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
     class HotplugObserver(CollectingObserver):
         def on_event(self, event):
             super().on_event(event)
-            if observer_fails and event.event_type == ExecutionEventType.HOTPLUG_APPLIED:
-                raise KeyError("hotplug observer failed")
+            if observer_error is not None and event.event_type == ExecutionEventType.HOTPLUG_APPLIED:
+                raise observer_error
 
     observer = HotplugObserver()
-    if observer_fails:
+    if observer_error is not None:
         with pytest.raises(WorkflowError) as ctx:
             run_workflow(
                 ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
@@ -784,7 +792,7 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
                 runner=runner, session_driver=target_driver,
                 source_session_driver=source_driver, resume=resume, observer=observer,
             )
-        assert isinstance(ctx.value.__cause__, KeyError)
+        assert isinstance(ctx.value.__cause__, type(observer_error))
         state = json.loads((ctx.value.run_dir / "run.json").read_text(encoding="utf-8"))
         turn = json.loads(
             (ctx.value.run_dir / "turns" / "turn-001" / "result.json").read_text(
@@ -794,6 +802,20 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
         assert state["status"] == "failed"
         assert turn["status"] == "harness-failed"
         assert state["turns_completed"] == 0
+        issues = (ctx.value.run_dir / "issues.md").read_text(encoding="utf-8")
+        assert "unexpected-turn-exception" in issues
+        assert "recovery-scheduled" not in issues
+        if isinstance(observer_error, RuntimeError):
+            persisted_text = "\n".join(
+                [
+                    str(ctx.value),
+                    json.dumps(state),
+                    json.dumps(turn),
+                    issues,
+                ]
+            )
+            assert "quoted-alpha" not in persisted_text
+            assert "quoted-bravo" not in persisted_text
         return
 
     result = run_workflow(

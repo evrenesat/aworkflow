@@ -4399,6 +4399,7 @@ def run_workflow(
         was_retry: bool | None = None,
         recovery: HarnessRecoveryContext | None = None,
         review_rejection: ReviewRejectionRecord | None = None,
+        preserve_terminal_outcome_on_observer_error: bool = False,
     ) -> None:
         record = state.turn_history[-1]
         normalized_status = (
@@ -4467,6 +4468,8 @@ def run_workflow(
                 recovery=recovery,
             ))
         except Exception as exc:
+            if preserve_terminal_outcome_on_observer_error:
+                return
             _raise_unexpected_started_turn_failure(
                 exc,
                 invocation=invocation,
@@ -4704,6 +4707,7 @@ def run_workflow(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                preserve_terminal_outcome_on_observer_error=True,
             )
             summary = _format_failure(
                 reason=reason,
@@ -4879,6 +4883,7 @@ def run_workflow(
                         "NEW_PLAN_EXISTS": False,
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=str(exc),
@@ -4987,6 +4992,7 @@ def run_workflow(
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
                     recovery=recovery,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=recovery.reason,
@@ -5073,6 +5079,7 @@ def run_workflow(
                         "NEW_PLAN_EXISTS": False,
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=str(exc),
@@ -5249,6 +5256,7 @@ def run_workflow(
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
                     recovery=recovery,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=failure_reason,
@@ -5377,6 +5385,7 @@ def run_workflow(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                preserve_terminal_outcome_on_observer_error=True,
             )
             summary = _format_failure(
                 reason=recovery.reason,
@@ -7931,6 +7940,7 @@ def run_workflow(
                 selector=selector,
                 active_path=active_plan_path,
                 new_path=new_plan_path,
+                preserve_terminal_outcome_on_observer_error=True,
             )
         state.end_reason = "owner_stopped"
         state.status_message = "owner_stopped"
@@ -9164,6 +9174,13 @@ def run_workflow(
                         raise ValueError(
                             "session result selector does not match the workflow invocation"
                         )
+                except (RuntimeError, ValueError) as exc:
+                    _fail_hotplug_target(f"session result validation failed: {exc}")
+                    completed = subprocess.CompletedProcess(
+                        completed.args, 1, completed.stdout,
+                        f"session result validation failed: {exc}",
+                    )
+                else:
                     session_ref = HarnessSessionRefV1(
                         session_id=session_result.session_id,
                         role=step.role,
@@ -9227,12 +9244,6 @@ def run_workflow(
                             new_plan_path=new_plan_path,
                             resumed_from_run_id=resumed_from_run_id,
                         )
-                except (RuntimeError, ValueError) as exc:
-                    _fail_hotplug_target(f"session result validation failed: {exc}")
-                    completed = subprocess.CompletedProcess(
-                        completed.args, 1, completed.stdout,
-                        f"session result validation failed: {exc}",
-                    )
 
             stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
             if stop_reason is not None:
@@ -9254,6 +9265,7 @@ def run_workflow(
                     selector=selector,
                     active_path=active_plan_path,
                     new_path=new_plan_path,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 report = _manager_terminal_incident(
                     trigger="explicit_stop", reason=f"AFLOW_STOP: {stop_reason}",
@@ -9392,6 +9404,7 @@ def run_workflow(
                     active_path=active_plan_path,
                     new_path=new_plan_path,
                     conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 report = _manager_terminal_incident(
                     trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
@@ -9488,6 +9501,7 @@ def run_workflow(
                     active_path=active_plan_path,
                     new_path=new_plan_path,
                     conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 report = _manager_terminal_incident(
                     trigger="ambiguous_failure",
@@ -9559,6 +9573,7 @@ def run_workflow(
                     active_path=active_plan_path,
                     new_path=new_plan_path,
                     conditions=conditions,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 report = _manager_terminal_incident(
                     trigger="illegal_transition", reason=exc.summary, current_step=current_step_name,

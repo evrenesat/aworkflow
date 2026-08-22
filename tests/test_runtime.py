@@ -8605,6 +8605,54 @@ class StopMarkerTests(unittest.TestCase):
     def _make_wf_config(self) -> WorkflowUserConfig:
         return _make_simple_wf_config()
 
+    def test_stop_marker_failure_survives_turn_observer_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout='AFLOW_STOP: exact-stop-reason\n',
+                    stderr='',
+                )
+
+            class RaisingObserver(CollectingObserver):
+                def on_event(self, event):
+                    super().on_event(event)
+                    if isinstance(event, TurnFinishedEvent):
+                        raise RuntimeError('observer failed during specialized stop')
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                    self._make_wf_config(),
+                    'simple',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                    observer=RaisingObserver(),
+                )
+
+            assert 'AFLOW_STOP' in str(ctx.value)
+            assert 'exact-stop-reason' in str(ctx.value)
+            assert 'observer failed during specialized stop' not in str(ctx.value)
+            run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
+            turn_json = json.loads(
+                (ctx.value.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            assert run_json['status'] == 'failed'
+            assert 'AFLOW_STOP' in run_json['failure_reason']
+            assert 'exact-stop-reason' in run_json['failure_reason']
+            assert turn_json['status'] == 'harness-failed'
+            assert turn_json['error'] == 'AFLOW_STOP: exact-stop-reason'
+            issues = (ctx.value.run_dir / 'issues.md').read_text(encoding='utf-8')
+            assert 'unexpected-turn-exception' not in issues
+
     def test_stop_marker_in_stdout_fails_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
