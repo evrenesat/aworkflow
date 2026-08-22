@@ -70,9 +70,14 @@ class FakeSessionDriver:
         )
 
 
-def request(session_id: str | None = None) -> SessionRequest:
+def request(
+    session_id: str | None = None,
+    *,
+    model: str | None = "sol",
+    effort: str | None = "high",
+) -> SessionRequest:
     return SessionRequest(
-        repo_root=Path("/repo"), selector="codex.sol", model="sol", effort="high",
+        repo_root=Path("/repo"), selector="codex.sol", model=model, effort=effort,
         system_prompt="SYSTEM", user_prompt="USER", session_id=session_id,
         idempotency_key="hotplug-1",
     )
@@ -254,51 +259,379 @@ def test_reasonix_acp_rejects_mismatched_error_or_malformed_wire(stdout: str) ->
         driver.parse_result(request("rx-1"), stdout)
 
 
-def test_reasonix_owned_executor_uses_exact_resume_config_and_prompt_wire(monkeypatch, tmp_path: Path) -> None:
-    class FakeProcess:
-        def __init__(self):
-            self.calls = []
-            self.last_request_id = 0
-            self.notifications = []
-        def initialize(self):
-            self.last_request_id = 1
-            return {"jsonrpc": "2.0", "id": 1, "result": {"agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True}}}}
-        def request(self, method, params, *, timeout_seconds=10.0):
-            self.calls.append((method, dict(params), timeout_seconds))
-            self.last_request_id += 1
-            if method == "session/resume":
-                return {"jsonrpc": "2.0", "id": self.last_request_id, "result": {"sessionId": "source", "configOptions": [{"id": "model"}, {"id": "effort"}]}}
-            if method == "session/prompt":
-                return {"jsonrpc": "2.0", "id": self.last_request_id, "result": {"sessionId": "source", "finalOutput": "DONE"}}
-            return {"jsonrpc": "2.0", "id": self.last_request_id, "result": {"sessionId": "source"}}
-        def close(self):
-            self.closed = True
-    fake = FakeProcess()
-    monkeypatch.setattr(ReasonixAcpProcess, "start", lambda **kwargs: fake)
-    driver = ReasonixAcpDriver.from_initialize({"capabilities": {"methods": ["session/new", "session/prompt"]}})
-    result = driver.execute_session(request("source"), driver.build_invocation(request("source")))
-    assert result.result.final_output == "DONE"
-    assert [method for method, _, _ in fake.calls] == ["session/resume", "session/set_config_option", "session/set_config_option", "session/prompt"]
-    assert fake.calls[1][1] == {"sessionId": "source", "configId": "model", "value": "sol"}
-    assert fake.calls[2][1] == {"sessionId": "source", "configId": "effort", "value": "high"}
-    assert fake.calls[3][1]["prompt"][0]["type"] == "text"
-    assert fake.calls[3][2] > 60
+def test_reasonix_config_state_retains_complete_records_in_advertised_order() -> None:
+    unknown = {"id": "vendor_option", "description": "opaque"}
+    approval = {
+        "id": "tool_approval", "type": "select", "currentValue": "ask",
+        "options": [{"value": "ask"}, {"value": "yolo"}],
+    }
+    options = reasonix_module._require_config_options(
+        {"result": {"configOptions": [unknown, approval]}}, stage="session/new"
+    )
+    assert options == (unknown, approval)
 
 
-def test_reasonix_owned_executor_fails_before_prompt_when_config_option_missing(monkeypatch, tmp_path: Path) -> None:
-    class FakeProcess:
-        def __init__(self): self.calls = []; self.notifications = []
-        def initialize(self): return {"result": {"agentCapabilities": {"loadSession": True}}}
-        def request(self, method, params, **kwargs):
-            self.calls.append(method)
-            return {"result": {"sessionId": "fresh", "configOptions": []}}
-        def close(self): pass
-    fake = FakeProcess()
+@pytest.mark.parametrize("response", [
+    {},
+    {"result": []},
+    {"result": {}},
+    {"result": {"configOptions": ()}},
+    {"result": {"configOptions": ["SECRET"]}},
+    {"result": {"configOptions": [{"id": ""}]}},
+    {"result": {"configOptions": [{"id": "model"}, {"id": "model"}]}},
+])
+def test_reasonix_config_state_rejects_malformed_or_ambiguous_payloads_without_echo(
+    response,
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Reasonix ACP session/resume response has invalid configOptions state$",
+    ) as exc_info:
+        reasonix_module._require_config_options(response, stage="session/resume")
+    assert "SECRET" not in str(exc_info.value)
+
+
+def test_reasonix_select_config_option_requires_exact_valid_advertised_value() -> None:
+    option = {
+        "id": "tool_approval", "type": "select", "currentValue": "ask",
+        "options": [{"value": "ask"}, {"value": "yolo"}],
+    }
+    options = (option, {"id": "opaque"})
+    assert reasonix_module._require_select_config_option(
+        options, option_id="tool_approval", desired_value="yolo"
+    ) is option
+    with pytest.raises(RuntimeError, match="does not advertise required option 'model'"):
+        reasonix_module._require_select_config_option(
+            options, option_id="model", desired_value="sol"
+        )
+    with pytest.raises(RuntimeError, match="does not advertise required value 'auto'"):
+        reasonix_module._require_select_config_option(
+            options, option_id="tool_approval", desired_value="auto"
+        )
+
+
+@pytest.mark.parametrize("malformed", [
+    {"id": "tool_approval", "currentValue": "ask", "options": [{"value": "yolo"}]},
+    {"id": "tool_approval", "type": "boolean", "currentValue": "ask", "options": [{"value": "yolo"}]},
+    {"id": "tool_approval", "type": "select", "currentValue": True, "options": [{"value": "yolo"}]},
+    {"id": "tool_approval", "type": "select", "currentValue": "ask", "options": {}},
+    {"id": "tool_approval", "type": "select", "currentValue": "ask", "options": ["SECRET"]},
+    {"id": "tool_approval", "type": "select", "currentValue": "ask", "options": [{"value": ""}]},
+])
+def test_reasonix_select_config_option_rejects_malformed_records_without_echo(
+    malformed,
+) -> None:
+    with pytest.raises(RuntimeError, match="is not a valid select option") as exc_info:
+        reasonix_module._require_select_config_option(
+            (malformed,), option_id="tool_approval", desired_value="yolo"
+        )
+    assert "SECRET" not in str(exc_info.value)
+
+
+def test_reasonix_applied_config_values_require_exact_current_acknowledgements() -> None:
+    options = (
+        {"id": "tool_approval", "type": "select", "currentValue": "yolo",
+         "options": [{"value": "ask"}, {"value": "yolo"}]},
+        {"id": "model", "type": "select", "currentValue": "sol",
+         "options": [{"value": "sol"}]},
+    )
+    reasonix_module._require_applied_config_values(
+        options, {"tool_approval": "yolo", "model": "sol"}
+    )
+    reset_options = ({**options[0], "currentValue": "ask"}, options[1])
+    with pytest.raises(RuntimeError, match="did not acknowledge required value 'yolo'"):
+        reasonix_module._require_applied_config_values(
+            reset_options, {"tool_approval": "yolo", "model": "sol"}
+        )
+
+
+def _reasonix_select_option(
+    option_id: str, current_value: str, values: tuple[str, ...]
+) -> dict[str, object]:
+    return {
+        "id": option_id,
+        "type": "select",
+        "currentValue": current_value,
+        "options": [{"value": value} for value in values],
+    }
+
+
+def _reasonix_config_options(
+    *, approval: str = "ask", model: str = "other", effort: str = "low"
+) -> list[dict[str, object]]:
+    return [
+        _reasonix_select_option("tool_approval", approval, ("ask", "yolo")),
+        _reasonix_select_option("model", model, ("other", "sol")),
+        _reasonix_select_option("effort", effort, ("low", "high")),
+    ]
+
+
+class _FakeReasonixAcpProcess:
+    def __init__(
+        self,
+        *,
+        session_id: str = "fresh",
+        open_response: dict[str, object] | None = None,
+        update_responses: tuple[dict[str, object], ...] = (),
+        update_error_at: int | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.open_response = open_response
+        self.update_responses = update_responses
+        self.update_error_at = update_error_at
+        self.current = {
+            "tool_approval": "ask",
+            "model": "other",
+            "effort": "low",
+        }
+        self.calls: list[tuple[str, dict[str, object], float]] = []
+        self.notifications: list[dict[str, object]] = []
+        self.last_request_id = 0
+        self.update_count = 0
+        self.closed = False
+
+    def config_options(self) -> list[dict[str, object]]:
+        return _reasonix_config_options(
+            approval=self.current["tool_approval"],
+            model=self.current["model"],
+            effort=self.current["effort"],
+        )
+
+    def initialize(self) -> dict[str, object]:
+        self.last_request_id = 1
+        return {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "promptCapabilities": {"embeddedContext": True},
+                }
+            },
+        }
+
+    def request(
+        self, method: str, params: dict[str, object], *, timeout_seconds: float = 10.0
+    ) -> dict[str, object]:
+        self.calls.append((method, dict(params), timeout_seconds))
+        self.last_request_id += 1
+        if method in {"session/new", "session/resume"}:
+            if self.open_response is not None:
+                return self.open_response
+            return self._response(config_options=self.config_options())
+        if method == "session/set_config_option":
+            self.update_count += 1
+            if self.update_error_at == self.update_count:
+                raise RuntimeError("SECRET raw JSON-RPC rejection")
+            if self.update_count <= len(self.update_responses):
+                return self.update_responses[self.update_count - 1]
+            self.current[str(params["configId"])] = str(params["value"])
+            return self._response(config_options=self.config_options())
+        if method == "session/prompt":
+            return self._response(final_output="DONE")
+        raise AssertionError(f"unexpected fake ACP method: {method}")
+
+    def _response(
+        self,
+        *,
+        config_options: list[dict[str, object]] | None = None,
+        final_output: str | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {"sessionId": self.session_id}
+        if config_options is not None:
+            result["configOptions"] = config_options
+        if final_output is not None:
+            result["finalOutput"] = final_output
+        return {
+            "jsonrpc": "2.0",
+            "id": self.last_request_id,
+            "result": result,
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _execute_fake_reasonix(
+    monkeypatch,
+    fake: _FakeReasonixAcpProcess,
+    session_request: SessionRequest,
+    *,
+    control_callback=None,
+):
     monkeypatch.setattr(ReasonixAcpProcess, "start", lambda **kwargs: fake)
-    driver = ReasonixAcpDriver.from_initialize({"capabilities": {"methods": ["session/new"]}})
-    with pytest.raises(RuntimeError, match="cannot configure"):
-        driver.execute_session(request(), driver.build_invocation(request()))
-    assert "session/prompt" not in fake.calls
+    driver = ReasonixAcpDriver.from_initialize(
+        {"capabilities": {"methods": ["session/new", "session/prompt"]}}
+    )
+    return driver.execute_session(
+        session_request,
+        driver.build_invocation(session_request),
+        control_callback,
+    )
+
+
+def test_reasonix_owned_executor_sets_yolo_before_model_effort_and_prompt_for_new_session(
+    monkeypatch,
+) -> None:
+    fake = _FakeReasonixAcpProcess()
+    control_calls: list[str] = []
+    execution = _execute_fake_reasonix(
+        monkeypatch, fake, request(), control_callback=lambda: control_calls.append("control")
+    )
+
+    assert [method for method, _, _ in fake.calls] == [
+        "session/new",
+        "session/set_config_option",
+        "session/set_config_option",
+        "session/set_config_option",
+        "session/prompt",
+    ]
+    assert [call[1] for call in fake.calls[1:4]] == [
+        {"sessionId": "fresh", "configId": "tool_approval", "value": "yolo"},
+        {"sessionId": "fresh", "configId": "model", "value": "sol"},
+        {"sessionId": "fresh", "configId": "effort", "value": "high"},
+    ]
+    assert fake.calls[4][1]["prompt"][0]["type"] == "text"
+    assert fake.calls[4][2] > 60
+    assert control_calls == ["control"]
+    assert execution.result.session_id == "fresh"
+    assert execution.result.final_output == "DONE"
+    assert execution.result.model == "sol"
+    assert execution.result.effort == "high"
+    assert "tool_approval" in execution.raw_transport
+    assert any("configOptions" in event.get("result", {}) for event in execution.events)
+    assert not hasattr(execution.result, "raw_transport")
+    assert fake.closed is True
+
+
+def test_reasonix_owned_executor_sets_yolo_before_model_effort_and_prompt_for_resume(
+    monkeypatch,
+) -> None:
+    fake = _FakeReasonixAcpProcess(session_id="source")
+    session_request = request("source", model=None, effort=None)
+    execution = _execute_fake_reasonix(monkeypatch, fake, session_request)
+
+    assert [method for method, _, _ in fake.calls] == [
+        "session/resume", "session/set_config_option", "session/prompt"
+    ]
+    assert fake.calls[1][1] == {
+        "sessionId": "source",
+        "configId": "tool_approval",
+        "value": "yolo",
+    }
+    assert execution.result.session_id == "source"
+    assert execution.result.model is None
+    assert execution.result.effort is None
+    assert execution.result.final_output == "DONE"
+    assert fake.closed is True
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_error", "expected_updates"),
+    [
+        ("missing_state", "invalid configOptions state", 0),
+        ("non_list_state", "invalid configOptions state", 0),
+        ("missing_id", "invalid configOptions state", 0),
+        ("duplicate_id", "invalid configOptions state", 0),
+        ("missing_approval", "does not advertise required option 'tool_approval'", 0),
+        ("non_select_approval", "is not a valid select option", 0),
+        ("missing_values", "is not a valid select option", 0),
+        ("invalid_values", "is not a valid select option", 0),
+        ("missing_yolo", "does not advertise required value 'yolo'", 0),
+        ("missing_model", "does not advertise required option 'model'", 0),
+        ("invalid_effort", "does not advertise required value 'high'", 0),
+        ("update_rejected", "option 'tool_approval' update failed", 1),
+        ("update_missing_state", "invalid configOptions state", 1),
+        ("update_not_acknowledged", "did not acknowledge required value 'yolo'", 1),
+        ("approval_reset_by_model", "did not acknowledge required value 'yolo'", 2),
+    ],
+)
+def test_reasonix_owned_executor_fails_closed_before_prompt(
+    monkeypatch, scenario: str, expected_error: str, expected_updates: int
+) -> None:
+    fake = _FakeReasonixAcpProcess()
+    if scenario == "missing_state":
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION"}}
+    elif scenario == "non_list_state":
+        fake.open_response = {
+            "result": {"sessionId": "PRIVATE SESSION", "configOptions": {}}
+        }
+    elif scenario == "missing_id":
+        fake.open_response = {
+            "result": {"sessionId": "PRIVATE SESSION", "configOptions": [{}]}
+        }
+    elif scenario == "duplicate_id":
+        duplicate = _reasonix_select_option("tool_approval", "ask", ("ask", "yolo"))
+        fake.open_response = {
+            "result": {
+                "sessionId": "PRIVATE SESSION",
+                "configOptions": [duplicate, duplicate],
+            }
+        }
+    elif scenario == "missing_approval":
+        fake.open_response = {
+            "result": {
+                "sessionId": "PRIVATE SESSION",
+                "configOptions": _reasonix_config_options()[1:],
+            }
+        }
+    elif scenario == "non_select_approval":
+        options = _reasonix_config_options()
+        options[0]["type"] = "boolean"
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION", "configOptions": options}}
+    elif scenario == "missing_values":
+        options = _reasonix_config_options()
+        options[0].pop("options")
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION", "configOptions": options}}
+    elif scenario == "invalid_values":
+        options = _reasonix_config_options()
+        options[0]["options"] = [{"value": "yolo"}, {"value": ""}]
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION", "configOptions": options}}
+    elif scenario == "missing_yolo":
+        options = _reasonix_config_options()
+        options[0] = _reasonix_select_option("tool_approval", "ask", ("ask",))
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION", "configOptions": options}}
+    elif scenario == "missing_model":
+        options = [option for option in _reasonix_config_options() if option["id"] != "model"]
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION", "configOptions": options}}
+    elif scenario == "invalid_effort":
+        options = _reasonix_config_options()
+        options[2] = _reasonix_select_option("effort", "low", ("low",))
+        fake.open_response = {"result": {"sessionId": "PRIVATE SESSION", "configOptions": options}}
+    elif scenario == "update_rejected":
+        fake.update_error_at = 1
+    elif scenario == "update_missing_state":
+        fake.update_responses = ({"result": {"sessionId": "PRIVATE SESSION"}},)
+    elif scenario == "update_not_acknowledged":
+        fake.update_responses = (
+            {"result": {"sessionId": "PRIVATE SESSION", "configOptions": _reasonix_config_options()}},
+        )
+    elif scenario == "approval_reset_by_model":
+        fake.update_responses = (
+            {"result": {"sessionId": "PRIVATE SESSION", "configOptions": _reasonix_config_options(approval="yolo")}},
+            {"result": {"sessionId": "PRIVATE SESSION", "configOptions": _reasonix_config_options(model="sol")}},
+        )
+    else:
+        raise AssertionError(f"unknown scenario: {scenario}")
+
+    control_calls: list[str] = []
+    with pytest.raises(RuntimeError, match=expected_error) as exc_info:
+        _execute_fake_reasonix(
+            monkeypatch,
+            fake,
+            request(),
+            control_callback=lambda: control_calls.append("control"),
+        )
+
+    methods = [method for method, _, _ in fake.calls]
+    assert methods.count("session/set_config_option") == expected_updates
+    assert "session/prompt" not in methods
+    assert control_calls == []
+    assert fake.closed is True
+    error = str(exc_info.value)
+    assert len(error) < 160
+    for secret in ("SECRET", "PRIVATE SESSION", "SYSTEM", "USER"):
+        assert secret not in error
 
 
 def test_reasonix_transport_accepts_long_prompt_timeout_without_fixed_sixty_second_cap(monkeypatch):
@@ -330,7 +663,6 @@ def test_reasonix_discovery_is_initialize_only_and_does_not_mutate_model(monkeyp
     assert fake.calls == ["initialize", "close"]
     assert driver.capabilities.resume_with_model is False
     assert driver.capabilities.mid_turn_steer is False
-    assert driver.config_update_method is None
 
 
 def test_no_session_driver_is_explicitly_one_shot() -> None:

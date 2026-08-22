@@ -48,6 +48,81 @@ def _collect_acp_text(value: object, streamed: list[str], finals: list[str]) -> 
             _collect_acp_text(child, streamed, finals)
 
 
+def _require_config_options(
+    response: Mapping[str, Any], *, stage: str
+) -> tuple[Mapping[str, Any], ...]:
+    """Return one complete, unambiguous ACP configuration state."""
+    result = response.get("result")
+    raw_options = result.get("configOptions") if isinstance(result, Mapping) else None
+    if not isinstance(raw_options, list):
+        raise RuntimeError(
+            f"Reasonix ACP {stage} response has invalid configOptions state"
+        )
+
+    options: list[Mapping[str, Any]] = []
+    option_ids: set[str] = set()
+    for option in raw_options:
+        if not isinstance(option, Mapping):
+            raise RuntimeError(
+                f"Reasonix ACP {stage} response has invalid configOptions state"
+            )
+        option_id = option.get("id")
+        if not isinstance(option_id, str) or not option_id or option_id in option_ids:
+            raise RuntimeError(
+                f"Reasonix ACP {stage} response has invalid configOptions state"
+            )
+        option_ids.add(option_id)
+        options.append(option)
+    return tuple(options)
+
+
+def _require_select_config_option(
+    options: tuple[Mapping[str, Any], ...], *, option_id: str, desired_value: str
+) -> Mapping[str, Any]:
+    """Require an exact ACP select option and advertised string value."""
+    option = next((item for item in options if item["id"] == option_id), None)
+    if option is None:
+        raise RuntimeError(
+            f"Reasonix ACP session does not advertise required option '{option_id}'"
+        )
+    advertised = option.get("options")
+    if (
+        option.get("type") != "select"
+        or not isinstance(option.get("currentValue"), str)
+        or not isinstance(advertised, list)
+        or any(
+            not isinstance(item, Mapping)
+            or not isinstance(item.get("value"), str)
+            or not item["value"]
+            for item in advertised
+        )
+    ):
+        raise RuntimeError(
+            f"Reasonix ACP option '{option_id}' is not a valid select option"
+        )
+    if desired_value not in {item["value"] for item in advertised}:
+        raise RuntimeError(
+            f"Reasonix ACP option '{option_id}' does not advertise required value "
+            f"'{desired_value}'"
+        )
+    return option
+
+
+def _require_applied_config_values(
+    options: tuple[Mapping[str, Any], ...], applied_values: Mapping[str, str]
+) -> None:
+    """Require the latest complete state to acknowledge every applied value."""
+    for option_id, desired_value in applied_values.items():
+        option = _require_select_config_option(
+            options, option_id=option_id, desired_value=desired_value
+        )
+        if option["currentValue"] != desired_value:
+            raise RuntimeError(
+                f"Reasonix ACP option '{option_id}' did not acknowledge required value "
+                f"'{desired_value}'"
+            )
+
+
 def parse_acp_jsonrpc(
     stdout: str,
     *,
@@ -104,9 +179,9 @@ class ReasonixAdapter:
     Current Reasonix releases expose an ``--effort`` flag, so AFlow forwards
     configured effort independently from the selected model.
 
-    Permission bypass is handled through the Reasonix config file (``reasonix.toml``)
-    rather than CLI flags — the user should set ``[permissions] mode = "allow"``
-    or appropriate allow rules for non-interactive use.
+    Owned ACP sessions negotiate and verify ``tool_approval=yolo`` before the
+    first prompt; global Reasonix permissions are not treated as proof that an
+    owned turn is noninteractive.
     """
 
     name = "reasonix"
@@ -258,7 +333,6 @@ class ReasonixAcpDriver:
         self.capabilities = capabilities
         self.methods = methods
         self.executable = "reasonix"
-        self.config_update_method: str | None = None
 
     @classmethod
     def from_initialize(cls, payload: Mapping[str, Any]) -> "ReasonixAcpDriver":
@@ -337,9 +411,10 @@ class ReasonixAcpDriver:
             session_params: dict[str, Any] = {"cwd": str(request.repo_root)}
             if request.session_id is not None:
                 session_params["sessionId"] = request.session_id
-                opened = process.request("session/resume", session_params)
+                open_method = "session/resume"
             else:
-                opened = process.request("session/new", session_params)
+                open_method = "session/new"
+            opened = process.request(open_method, session_params)
             wire.extend(process.notifications)
             process.notifications.clear()
             wire.append(opened)
@@ -347,30 +422,46 @@ class ReasonixAcpDriver:
             if not isinstance(opened_result, Mapping) or not isinstance(opened_result.get("sessionId"), str):
                 raise ValueError("Reasonix ACP session response has no exact session id")
             session_id = opened_result["sessionId"]
-            options = {
-                item.get("id") for item in opened_result.get("configOptions", [])
-                if isinstance(item, Mapping) and isinstance(item.get("id"), str)
-            }
-            if request.model is not None and "model" not in options:
-                raise RuntimeError("Reasonix ACP session cannot configure the target model")
-            if request.effort is not None and "effort" not in options:
-                raise RuntimeError("Reasonix ACP session cannot configure target effort")
-            config_method = self.config_update_method
-            if request.model is not None or request.effort is not None:
-                config = {}
-                if request.model is not None:
-                    config["model"] = request.model
-                if request.effort is not None:
-                    config["effort"] = request.effort
-                for config_id, value in config.items():
-                    updated = process.request(config_method or "session/set_config_option", {
-                        "sessionId": session_id, "configId": config_id, "value": value,
+            config_options = _require_config_options(opened, stage=open_method)
+            desired = [("tool_approval", "yolo")]
+            if request.model is not None:
+                desired.append(("model", request.model))
+            if request.effort is not None:
+                desired.append(("effort", request.effort))
+            for config_id, value in desired:
+                _require_select_config_option(
+                    config_options, option_id=config_id, desired_value=value
+                )
+
+            applied_values: dict[str, str] = {}
+            for index, (config_id, value) in enumerate(desired):
+                try:
+                    updated = process.request("session/set_config_option", {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": value,
                     })
-                    wire.extend(process.notifications)
-                    process.notifications.clear()
-                    wire.append(updated)
+                except (OSError, RuntimeError, TimeoutError, ValueError):
+                    raise RuntimeError(
+                        f"Reasonix ACP option '{config_id}' update failed"
+                    ) from None
+                wire.extend(process.notifications)
+                process.notifications.clear()
+                wire.append(updated)
+                config_options = _require_config_options(
+                    updated, stage="session/set_config_option"
+                )
+                applied_values[config_id] = value
+                _require_applied_config_values(config_options, applied_values)
+                for remaining_id, remaining_value in desired[index + 1:]:
+                    _require_select_config_option(
+                        config_options,
+                        option_id=remaining_id,
+                        desired_value=remaining_value,
+                    )
             if control_callback is not None:
                 control_callback()
+            _require_applied_config_values(config_options, applied_values)
             prompt = process.request("session/prompt", {
                 "sessionId": session_id,
                 "prompt": [{"type": "text", "text": "\n\n".join((request.system_prompt, request.user_prompt))}],

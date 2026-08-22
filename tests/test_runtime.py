@@ -35,6 +35,11 @@ from aflow.workflow import (
 )
 from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
 from aflow.harnesses.base import HarnessInvocation
+from aflow.harnesses.reasonix import (
+    ReasonixAcpDriver,
+    ReasonixAcpProcess,
+    ReasonixAdapter,
+)
 from aflow.harnesses.session import SessionCapabilities
 
 
@@ -3152,6 +3157,175 @@ class WorkflowArtifactTests(unittest.TestCase):
                 'quoted-alpha',
                 'quoted-bravo',
                 'quoted-charlie',
+            ):
+                assert secret not in persisted_text
+
+    def test_reasonix_approval_negotiation_failure_terminalizes_before_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(
+                plan_path,
+                '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n',
+            )
+
+            class MissingApprovalProcess:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+                    self.notifications: list[dict[str, object]] = []
+                    self.last_request_id = 0
+                    self.closed = False
+
+                def initialize(self):
+                    self.last_request_id = 1
+                    return {
+                        'jsonrpc': '2.0',
+                        'id': 1,
+                        'result': {
+                            'agentCapabilities': {
+                                'loadSession': True,
+                                'promptCapabilities': {'embeddedContext': True},
+                            }
+                        },
+                    }
+
+                def request(self, method, params, **kwargs):
+                    self.calls.append(method)
+                    self.last_request_id += 1
+                    if method != 'session/new':
+                        raise AssertionError(
+                            f'unexpected Reasonix request after negotiation failure: {method}'
+                        )
+                    return {
+                        'jsonrpc': '2.0',
+                        'id': self.last_request_id,
+                        'result': {
+                            'sessionId': 'PRIVATE SESSION MARKER',
+                            'configOptions': [
+                                {
+                                    'id': 'model',
+                                    'type': 'select',
+                                    'currentValue': 'sol',
+                                    'description': 'RAW CONFIG MARKER',
+                                    'options': [{'value': 'sol'}],
+                                },
+                                {
+                                    'id': 'effort',
+                                    'type': 'select',
+                                    'currentValue': 'high',
+                                    'options': [{'value': 'high'}],
+                                },
+                            ],
+                        },
+                    }
+
+                def close(self):
+                    self.closed = True
+
+            fake = MissingApprovalProcess()
+            start_calls: list[dict[str, object]] = []
+
+            def start(**kwargs):
+                start_calls.append(kwargs)
+                return fake
+
+            observer = CollectingObserver()
+            workflow_config = WorkflowUserConfig(
+                roles={'worker': 'reasonix.default'},
+                harnesses={
+                    'reasonix': WorkflowHarnessConfig(
+                        profiles={
+                            'default': HarnessProfileConfig(
+                                model='sol', effort='high'
+                            )
+                        }
+                    )
+                },
+                workflows={
+                    'simple': WorkflowConfig(
+                        steps={
+                            'implement_plan': WorkflowStepConfig(
+                                role='worker',
+                                prompts=('p',),
+                                go=(GoTransition(to='END'),),
+                            )
+                        },
+                        first_step='implement_plan',
+                    )
+                },
+                prompts={'p': 'PRIVATE USER PROMPT MARKER'},
+            )
+            driver = ReasonixAcpDriver.from_initialize(
+                {
+                    'result': {
+                        'agentCapabilities': {
+                            'loadSession': True,
+                            'promptCapabilities': {'embeddedContext': True},
+                        }
+                    }
+                }
+            )
+
+            with patch.object(ReasonixAcpProcess, 'start', side_effect=start), pytest.raises(
+                WorkflowError
+            ) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    'simple',
+                    config_dir=repo_root,
+                    adapter=ReasonixAdapter(),
+                    session_driver=driver,
+                    preflight_probe=NoOpHarnessPreflightProbe(),
+                    observer=observer,
+                )
+
+            assert isinstance(ctx.value.__cause__, RuntimeError)
+            assert str(ctx.value.__cause__) == (
+                "Reasonix ACP session does not advertise required option "
+                "'tool_approval'"
+            )
+            assert len(start_calls) == 1
+            assert fake.calls == ['session/new']
+            assert fake.closed is True
+            run_dir = ctx.value.run_dir
+            run_json = json.loads(
+                (run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            turn_json = json.loads(
+                (run_dir / 'turns' / 'turn-001' / 'result.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            assert run_json['status'] == 'failed'
+            assert run_json['turns_completed'] == 0
+            assert run_json['last_snapshot']['is_complete'] is False
+            assert turn_json['status'] == 'harness-failed'
+            assert turn_json['snapshot_after'] is None
+            event_types = [event.event_type for event in observer.events]
+            assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
+            assert ExecutionEventType.RUN_COMPLETED not in event_types
+            assert not (run_dir / 'turns' / 'turn-001' / 'transport.stdout').exists()
+            persisted_text = '\n'.join(
+                [
+                    str(ctx.value),
+                    (run_dir / 'run.json').read_text(encoding='utf-8'),
+                    (run_dir / 'issues.md').read_text(encoding='utf-8'),
+                    (run_dir / 'turns' / 'turn-001' / 'result.json').read_text(
+                        encoding='utf-8'
+                    ),
+                ]
+            )
+            for secret in (
+                'PRIVATE USER PROMPT MARKER',
+                'PRIVATE SESSION MARKER',
+                'RAW CONFIG MARKER',
             ):
                 assert secret not in persisted_text
 
