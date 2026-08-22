@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-08-22 — Fail-closed headless Reasonix ACP (F-02)
+
+- Owned new and resumed Reasonix sessions now negotiate the exact
+  `tool_approval=yolo` select option before model, effort, and prompt.
+- Every configuration update must return a complete, unambiguous state that
+  still acknowledges all applied values; missing, rejected, or reset approval
+  closes and terminalizes the run before prompting without retry.
+- Added deterministic new/resume ordering, malformed and rejected state, reset
+  detection, process-close, and durable workflow-failure coverage. No live or
+  paid model prompt was run.
+
 ## 2026-08-22 — Truthful turn and run termination (F-01/F-04)
 
 - Finalize ordinary catchable post-start exceptions into one terminal turn and

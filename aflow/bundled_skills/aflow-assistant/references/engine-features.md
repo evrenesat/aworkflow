@@ -302,7 +302,10 @@ Probing:
   ⇒ `session_identity`; `session/prompt`/`session/send` ⇒ `followup_turn`;
   `session/update_config`/`session/set_config` ⇒ `resume_with_model`;
   `idempotency_key` method ⇒ `idempotent_turn_start`. `mid_turn_steer` and
-  `read_only_teardown` are deliberately never advertised.
+  `read_only_teardown` are deliberately never advertised. Before every owned
+  prompt, AFlow requires full-state ACP configuration acknowledgements and
+  verifies `tool_approval=yolo` before optional model and effort selections;
+  missing, rejected, or reset approval fails closed before the prompt.
 - All other harnesses expose `NO_SESSION_CAPABILITIES` (all false).
 
 Session output contract: JSONL events on stdout, exactly one

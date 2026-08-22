@@ -238,6 +238,17 @@ adapter's `SessionCapabilities` (six flags: `session_identity`,
 - All other adapters advertise no session capabilities and always start a
   fresh subprocess.
 
+Every owned Reasonix ACP turn is configured before its first model prompt.
+After `session/new` or exact `session/resume`, AFlow requires the complete
+`configOptions` state, verifies that the exact select option
+`tool_approval` advertises `yolo`, and sends `tool_approval=yolo` before any
+requested model and effort selections. Every `session/set_config_option`
+response must acknowledge the complete current state; AFlow rechecks all
+previous selections after each dependent update so model or effort cannot
+silently reset approval. Missing, malformed, rejected, or unacknowledged state
+closes the owned process and fails before `session/prompt`. The ordinary durable
+turn/run failure boundary records that negotiation failure once without retry.
+
 ### Transaction and capability path
 
 Each transaction records source/target role, selector, harness, profile,
