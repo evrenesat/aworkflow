@@ -10,6 +10,9 @@ STEP_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+")
 FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
 GIT_TRACKING_RE = re.compile(r"^##\s+Git Tracking\b")
 NON_CHECKPOINT_HEADING_RE = re.compile(r"^#{1,3}\s+")
+GIT_TRACKING_FIELD_RE = re.compile(
+    r"^\s*(?:[-*]\s+)?(?:Plan Branch|Pre-Handoff Base HEAD|Last Reviewed HEAD|Review Log):"
+)
 
 
 @dataclass(frozen=True)
@@ -284,6 +287,88 @@ def is_handoff_pristine_for_base_refresh(metadata: GitTrackingMetadata, sections
         return False
 
     return True
+
+
+def is_plan_pristine_for_git_tracking_bootstrap(
+    text: str,
+    sections: tuple[CheckpointSection, ...],
+) -> bool:
+    """Return whether a section-less plan is safe for Git Tracking insertion."""
+    if any(section.heading_checked or section.checked_step_count for section in sections):
+        return False
+
+    in_fence = False
+    fence_char: str | None = None
+    fence_len = 0
+    for line in text.splitlines():
+        fence_match = FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
+                in_fence = False
+                fence_char = None
+                fence_len = 0
+            continue
+        if in_fence:
+            continue
+        if GIT_TRACKING_RE.match(line) or GIT_TRACKING_FIELD_RE.match(line):
+            return False
+
+    return True
+
+
+def insert_git_tracking_section(text: str, *, pre_handoff_base_head: str) -> str:
+    """Insert the minimal Git Tracking section before the first live checkpoint."""
+    if "`" in pre_handoff_base_head or "\r" in pre_handoff_base_head or "\n" in pre_handoff_base_head:
+        raise ValueError("Pre-Handoff Base HEAD must be a single value without backticks")
+
+    heading_line_numbers = _live_git_tracking_heading_line_numbers(text)
+    if heading_line_numbers:
+        raise ValueError("Git Tracking section already exists")
+
+    has_crlf = "\r\n" in text
+    has_bare_lf = "\n" in text.replace("\r\n", "")
+    if has_crlf and has_bare_lf:
+        raise ValueError("plan uses mixed newline conventions")
+    newline = "\r\n" if has_crlf else "\n"
+
+    in_fence = False
+    fence_char: str | None = None
+    fence_len = 0
+    insertion_offset: int | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        fence_match = FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+                fence_len = len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_len:
+                in_fence = False
+                fence_char = None
+                fence_len = 0
+            offset += len(line)
+            continue
+        if not in_fence and SECTION_RE.match(line):
+            insertion_offset = offset
+            break
+        offset += len(line)
+
+    if insertion_offset is None:
+        raise ValueError("plan has no live checkpoint for Git Tracking insertion")
+
+    section = (
+        f"## Git Tracking{newline}{newline}"
+        f"- Plan Branch: ``{newline}"
+        f"- Pre-Handoff Base HEAD: `{pre_handoff_base_head}`{newline}{newline}"
+    )
+    return text[:insertion_offset] + section + text[insertion_offset:]
 
 
 def rewrite_git_tracking_field(text: str, field: str, new_value: str) -> str:

@@ -17,7 +17,6 @@ class StartupQuestionKind(str, Enum):
 
     CONFIRM_RECOVERY = "confirm_recovery"
     PICK_STEP = "pick_step"
-    CONFIRM_BASE_HEAD_REFRESH = "confirm_base_head_refresh"
     CONFIRM_WORKTREE_DIRTY = "confirm_worktree_dirty"
 
 

@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-08-22 — Bootstrap Git Tracking before run allocation (F-03)
+
+- Fresh pristine review plans now receive one minimal Git Tracking section
+  before run identity, launch persistence, start events, or run paths exist.
+- The controller preserves the exact pre-insertion backup, atomically writes
+  and reloads the plan, verifies its checkpoint snapshot, and records either
+  current `HEAD` or the verified empty-repository bootstrap commit.
+- Startup rejects prepared-plan snapshot drift before writing, lifecycle branch
+  synchronization rewrites only the parsed live section, and daemon starts run
+  the same normalization boundary before reserving launch identity.
+- Removed the unreachable base-HEAD confirmation enum and dispatch paths;
+  existing pristine-section refresh remains automatic and noninteractive.
+- Added deterministic plan, runtime, lifecycle, public-library, and CLI
+  coverage with injected runners only; no model or provider call is required.
+
 ## 2026-08-22 — Fail-closed headless Reasonix ACP (F-02)
 
 - Owned new and resumed Reasonix sessions now negotiate the exact

@@ -253,6 +253,7 @@ class DaemonService:
             if existing is not None:
                 return self._recover_start_manifest(existing, normalized, request_digest)
 
+            self._prepare_required_git_tracking_before_reservation(normalized)
             run_id = reserve_run_id(self._config.repo_root)
             effective_key = idempotency_key or f"daemon-{run_id}"
             manifest = self._initial_manifest_for(
@@ -534,6 +535,51 @@ class DaemonService:
             caller_scope=caller_scope,
             idempotency_key=idempotency_key,
         )
+
+    def _prepare_required_git_tracking_before_reservation(
+        self,
+        request: StartupRequest,
+    ) -> None:
+        """Normalize required plan metadata before daemon run allocation."""
+        workflow_name = request.workflow_name or self._workflow_config.aflow.default_workflow
+        if workflow_name is None or workflow_name not in self._workflow_config.workflows:
+            raise DaemonError("startup request does not name a configured workflow")
+        workflow = self._workflow_config.workflows[workflow_name]
+
+        from aflow.git_status import probe_repo_state
+        from aflow.plan import PlanParseError, load_plan, parse_git_tracking_metadata
+        from aflow.workflow import (
+            WorkflowError,
+            _backup_original_plan,
+            _lifecycle_is_bootstrap_eligible,
+            _prepare_required_git_tracking_before_allocation,
+            _workflow_requires_git_tracking,
+        )
+
+        if not _workflow_requires_git_tracking(workflow, self._workflow_config):
+            return
+        try:
+            plan_text = request.plan_path.read_bytes().decode("utf-8")
+            if parse_git_tracking_metadata(plan_text) is not None:
+                return
+            repo_state = probe_repo_state(self._config.repo_root)
+            needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
+            _backup_original_plan(self._config.repo_root, request.plan_path)
+            parsed_plan = load_plan(request.plan_path)
+            _prepare_required_git_tracking_before_allocation(
+                repo_root=self._config.repo_root,
+                original_plan_path=request.plan_path,
+                parsed_plan=parsed_plan,
+                wf=workflow,
+                workflow_config=self._workflow_config,
+                repo_state=repo_state,
+                needs_bootstrap=needs_bootstrap,
+                is_resume=request.resume_requested,
+                startup_retry=None,
+            )
+        except (OSError, UnicodeError, PlanParseError, ValueError, WorkflowError) as exc:
+            summary = exc.summary if isinstance(exc, WorkflowError) else str(exc)
+            raise DaemonError(f"startup plan preflight failed: {summary}") from exc
 
     def _new_start_record(
         self,
