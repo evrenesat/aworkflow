@@ -3092,7 +3092,8 @@ class WorkflowArtifactTests(unittest.TestCase):
                     self.calls += 1
                     raise RuntimeError(
                         f"{invocation.user_prompt}\nAuthorization: Bearer fake-secret "
-                        "token=fake-token fake-env-secret"
+                        'token=fake-token fake-env-secret '
+                        'password="quoted-alpha quoted-bravo quoted-charlie"'
                     )
 
             driver = FailingOwnedDriver()
@@ -3148,6 +3149,9 @@ class WorkflowArtifactTests(unittest.TestCase):
                 'fake-secret',
                 'fake-token',
                 'fake-env-secret',
+                'quoted-alpha',
+                'quoted-bravo',
+                'quoted-charlie',
             ):
                 assert secret not in persisted_text
 
@@ -9216,6 +9220,19 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             calls: list[str] = []
 
+            class FailingRunObserver(CollectingObserver):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.run_failed_calls = 0
+
+                def on_event(self, event):
+                    super().on_event(event)
+                    if event.event_type == ExecutionEventType.RUN_FAILED:
+                        self.run_failed_calls += 1
+                        raise RuntimeError('run failure observer failed')
+
+            observer = FailingRunObserver()
+
             def runner(argv, **kwargs):
                 model = argv[argv.index('--model') + 1]
                 calls.append(model)
@@ -9242,9 +9259,11 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     config_dir=repo_root,
                     adapter=CodexAdapter(),
                     runner=runner,
+                    observer=observer,
                 )
 
             assert calls == ['default', 'high']
+            assert observer.run_failed_calls == 1
             run_json = json.loads(
                 (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
             )

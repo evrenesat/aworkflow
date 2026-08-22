@@ -707,7 +707,11 @@ def test_cross_harness_artifacts_are_hash_bound_and_workspace_fingerprint_detect
     assert before["sha256"] != after["sha256"]
 
 
-def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_path: Path) -> None:
+@pytest.mark.parametrize("observer_fails", [False, True], ids=("success", "observer-failure"))
+def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
+    tmp_path: Path,
+    observer_fails: bool,
+) -> None:
     transaction = make_transaction("accepted")
     source = HarnessSessionRefV1(
         session_id="reasonix-source", role="worker", selector=transaction.source_selector,
@@ -765,7 +769,33 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
     def runner(argv, **kwargs):
         plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "wire", "")
-    observer = CollectingObserver()
+    class HotplugObserver(CollectingObserver):
+        def on_event(self, event):
+            super().on_event(event)
+            if observer_fails and event.event_type == ExecutionEventType.HOTPLUG_APPLIED:
+                raise KeyError("hotplug observer failed")
+
+    observer = HotplugObserver()
+    if observer_fails:
+        with pytest.raises(WorkflowError) as ctx:
+            run_workflow(
+                ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+                _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                runner=runner, session_driver=target_driver,
+                source_session_driver=source_driver, resume=resume, observer=observer,
+            )
+        assert isinstance(ctx.value.__cause__, KeyError)
+        state = json.loads((ctx.value.run_dir / "run.json").read_text(encoding="utf-8"))
+        turn = json.loads(
+            (ctx.value.run_dir / "turns" / "turn-001" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert state["status"] == "failed"
+        assert turn["status"] == "harness-failed"
+        assert state["turns_completed"] == 0
+        return
+
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
         _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
