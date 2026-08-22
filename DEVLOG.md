@@ -9,7 +9,8 @@
   current `HEAD` or the verified empty-repository bootstrap commit.
 - Startup rejects prepared-plan snapshot drift before writing, lifecycle branch
   synchronization rewrites only the parsed live section, and daemon starts run
-  the same normalization boundary before reserving launch identity.
+  the same normalization boundary before reserving launch identity. Workers
+  recompute an empty-repository deferred base fill after daemon preparation.
 - Removed the unreachable base-HEAD confirmation enum and dispatch paths;
   existing pristine-section refresh remains automatic and noninteractive.
 - Added deterministic plan, runtime, lifecycle, public-library, and CLI

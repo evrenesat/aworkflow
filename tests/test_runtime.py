@@ -5567,6 +5567,73 @@ class WorkflowPreflightTests(unittest.TestCase):
             assert '## Git Tracking' not in plan_path.read_text(encoding='utf-8')
             assert not (repo_root / '.aflow').exists()
 
+    def test_daemon_preinserted_empty_base_recomputes_deferred_lifecycle_fill(self) -> None:
+        from aflow.git_status import probe_repo_state
+        from aflow.plan import parse_git_tracking_metadata
+        from aflow.workflow import (
+            _lifecycle_is_bootstrap_eligible,
+            _prepare_required_git_tracking_before_allocation,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            subprocess.run(
+                ['git', 'init', '-b', 'main'],
+                cwd=str(repo_root),
+                check=True,
+                capture_output=True,
+            )
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+            workflow_config = self._make_review_wf_config()
+            workflow = replace(
+                workflow_config.workflows['review_wf'],
+                setup=('branch',),
+                main_branch='main',
+            )
+            workflow_config = replace(
+                workflow_config,
+                workflows={'review_wf': workflow},
+            )
+            repo_state = probe_repo_state(repo_root)
+            needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
+
+            inserted_plan, daemon_deferred = (
+                _prepare_required_git_tracking_before_allocation(
+                    repo_root=repo_root,
+                    original_plan_path=plan_path,
+                    parsed_plan=load_plan(plan_path),
+                    wf=workflow,
+                    workflow_config=workflow_config,
+                    repo_state=repo_state,
+                    needs_bootstrap=needs_bootstrap,
+                    is_resume=False,
+                    startup_retry=None,
+                )
+            )
+            assert daemon_deferred
+            metadata = parse_git_tracking_metadata(plan_path.read_text(encoding='utf-8'))
+            assert metadata is not None
+            assert metadata.plan_branch == ''
+            assert metadata.pre_handoff_base_head == ''
+
+            worker_plan, worker_deferred = (
+                _prepare_required_git_tracking_before_allocation(
+                    repo_root=repo_root,
+                    original_plan_path=plan_path,
+                    parsed_plan=inserted_plan,
+                    wf=workflow,
+                    workflow_config=workflow_config,
+                    repo_state=repo_state,
+                    needs_bootstrap=needs_bootstrap,
+                    is_resume=False,
+                    startup_retry=None,
+                )
+            )
+
+            assert worker_deferred
+            assert worker_plan.snapshot == inserted_plan.snapshot
+
     def test_preflight_passes_when_review_skill_and_git_tracking_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

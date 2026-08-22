@@ -1689,7 +1689,29 @@ def _prepare_required_git_tracking_before_allocation(
         raise WorkflowError(f"cannot inspect startup Git Tracking metadata: {exc}") from exc
 
     if metadata is not None:
-        return parsed_plan, False
+        bootstrap_fill_candidate = (
+            not is_resume
+            and startup_retry is None
+            and needs_bootstrap
+            and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN)
+            and metadata.plan_branch == ""
+            and metadata.pre_handoff_base_head == ""
+        )
+        if not bootstrap_fill_candidate:
+            return parsed_plan, False
+        try:
+            current_plan = parse_plan_text(plan_text, source_path=original_plan_path)
+        except PlanParseError as exc:
+            raise WorkflowError(
+                f"cannot parse current startup plan before deferred Git Tracking fill: {exc}"
+            ) from exc
+        if current_plan.snapshot != parsed_plan.snapshot:
+            raise WorkflowError(
+                "startup plan changed after preparation; refusing deferred Git Tracking fill"
+            )
+        if not is_handoff_pristine_for_base_refresh(metadata, current_plan.sections):
+            return parsed_plan, False
+        return current_plan, True
 
     if is_resume or startup_retry is not None:
         mode = "resume" if is_resume else "startup recovery"
