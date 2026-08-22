@@ -522,20 +522,6 @@ def prepare_startup_with_answer(
             )
         return result
 
-    if question.kind == StartupQuestionKind.CONFIRM_BASE_HEAD_REFRESH:
-        if not isinstance(answer, bool) or not answer:
-            raise StartupError("Startup aborted due to Pre-Handoff Base HEAD mismatch")
-        result = prepare_startup(effective_request)
-        if isinstance(result, StartupQuestion):
-            return result.__class__(
-                kind=result.kind,
-                message=result.message,
-                options=result.options,
-                choices=result.choices,
-                continuation_request=effective_request,
-            )
-        return result
-
     if question.kind == StartupQuestionKind.CONFIRM_WORKTREE_DIRTY:
         if not isinstance(answer, bool) or not answer:
             raise StartupError("Startup aborted due to dirty worktree")

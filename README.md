@@ -97,6 +97,12 @@ A minimal plan has checkpoint headings and task items:
 The plan file is the source of truth for progress. A checkpoint is complete only
 when its heading and all tasks in that section are checked.
 
+On the first launch of a pristine plan, review workflows automatically add the
+minimal controller-owned `## Git Tracking` section before the first checkpoint.
+Ready repositories record the current commit; an empty-repository lifecycle
+records the verified bootstrap commit before the first ordinary turn. Started,
+resumed, recovery, malformed, or ambiguous plans are not silently repaired.
+
 ## Included workflows
 
 - `ralph`: repeat one implementation step without a review phase.
