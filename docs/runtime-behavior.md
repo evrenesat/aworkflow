@@ -21,6 +21,23 @@ At a high level:
 
 At run start, `aflow` prints the new run ID immediately. Resumed runs also show which prior run they came from.
 
+## Fresh Review Plan Git Tracking
+
+Before allocating a run ID, launch manifest, run directory, or start event,
+AFlow backs up and validates the startup plan. A fresh review workflow whose
+plan is pristine and has no live `## Git Tracking` section receives exactly one
+minimal section immediately before its first live checkpoint. Normal
+repositories record the verified current `HEAD`. Eligible empty repositories
+temporarily receive an empty base, then record the exact verified bootstrap
+commit and actual lifecycle branch before the first ordinary worker turn.
+
+Insertion is limited to fresh plans with no checked checkpoint or task and no
+orphan tracking fields. Started, resumed, recovery, ambiguous, malformed, and
+no-HEAD/non-bootstrap inputs fail before durable run allocation and leave the
+original plan unchanged. Existing sections retain automatic pristine base-HEAD
+refresh behavior and are never duplicated or rebuilt. There is no interactive
+base-refresh confirmation.
+
 ## Harness Environment Preflight
 
 Before a real model-backed launch, AFlow resolves the adapter invocation and

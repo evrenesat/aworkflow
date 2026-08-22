@@ -555,6 +555,141 @@ class PlanParserFenceTests(unittest.TestCase):
                 assert 'Last Reviewed HEAD: `none`' in lines[i + 1]
                 break
 
+
+class GitTrackingBootstrapPlanTests(unittest.TestCase):
+
+    def test_insert_git_tracking_section_before_first_live_checkpoint_preserves_other_bytes(self) -> None:
+        from aflow.plan import (
+            insert_git_tracking_section,
+            parse_git_tracking_metadata,
+            parse_plan_text,
+        )
+
+        original = (
+            '# Plan\n\n'
+            'Preamble with Unicode: café 🚀\n\n'
+            '### [ ] Checkpoint 1: Add command\n'
+            '- [ ] implement\n\n'
+            '### [ ] Checkpoint 2: Test command\n'
+            '- [ ] test'
+        )
+        inserted = (
+            '## Git Tracking\n\n'
+            '- Plan Branch: ``\n'
+            '- Pre-Handoff Base HEAD: `abc123`\n\n'
+        )
+
+        updated = insert_git_tracking_section(original, pre_handoff_base_head='abc123')
+
+        assert updated.count('## Git Tracking') == 1
+        assert updated.index('## Git Tracking') < updated.index('### [ ] Checkpoint 1')
+        assert updated.replace(inserted, '', 1) == original
+        assert updated.endswith('- [ ] test')
+        assert parse_plan_text(updated, source_path=Path('plan.md')).snapshot == parse_plan_text(
+            original,
+            source_path=Path('plan.md'),
+        ).snapshot
+        metadata = parse_git_tracking_metadata(updated)
+        assert metadata is not None
+        assert metadata.plan_branch == ''
+        assert metadata.pre_handoff_base_head == 'abc123'
+
+    def test_insert_git_tracking_section_preserves_crlf_and_unicode(self) -> None:
+        from aflow.plan import insert_git_tracking_section
+
+        original = '# Prüfen\r\n\r\nRésumé: 東京\r\n\r\n### [ ] Checkpoint 1: Überprüfen\r\n- [ ] étape\r\n'
+        inserted = (
+            '## Git Tracking\r\n\r\n'
+            '- Plan Branch: ``\r\n'
+            '- Pre-Handoff Base HEAD: ``\r\n\r\n'
+        )
+
+        updated = insert_git_tracking_section(original, pre_handoff_base_head='')
+
+        assert updated.replace(inserted, '', 1) == original
+        assert '\n' not in updated.replace('\r\n', '')
+        assert 'Résumé: 東京' in updated
+
+    def test_insert_git_tracking_section_ignores_fenced_fake_section_and_checkpoint(self) -> None:
+        from aflow.plan import insert_git_tracking_section
+
+        original = (
+            '# Plan\n\n'
+            '```md\n'
+            '## Git Tracking\n'
+            '### [ ] Checkpoint 0: Fake\n'
+            '```\n\n'
+            '~~~md\n'
+            '### [ ] Checkpoint 0b: Also fake\n'
+            '~~~\n\n'
+            '### [ ] Checkpoint 1: Real\n'
+            '- [ ] work\n'
+        )
+
+        updated = insert_git_tracking_section(original, pre_handoff_base_head='abc123')
+
+        assert updated.count('## Git Tracking') == 2
+        assert updated.rindex('## Git Tracking') < updated.index('### [ ] Checkpoint 1: Real')
+        assert updated.index('### [ ] Checkpoint 0: Fake') < updated.rindex('## Git Tracking')
+
+    def test_insert_git_tracking_section_rejects_existing_or_missing_live_checkpoint(self) -> None:
+        from aflow.plan import insert_git_tracking_section
+
+        with pytest.raises(ValueError, match='already exists'):
+            insert_git_tracking_section(
+                '# Plan\n\n## Git Tracking\n\n### [ ] Checkpoint 1\n',
+                pre_handoff_base_head='abc123',
+            )
+        with pytest.raises(ValueError, match='already exists'):
+            insert_git_tracking_section(
+                '# Plan\n\n## Git Tracking\n\n## Git Tracking\n\n### [ ] Checkpoint 1\n',
+                pre_handoff_base_head='abc123',
+            )
+        with pytest.raises(ValueError, match='no live checkpoint'):
+            insert_git_tracking_section(
+                '# Plan\n\n```\n### [ ] Checkpoint 1: Fake\n```\n',
+                pre_handoff_base_head='abc123',
+            )
+        for invalid_base in ('bad`sha', 'bad\nsha', 'bad\rsha'):
+            with self.subTest(invalid_base=invalid_base):
+                with pytest.raises(ValueError, match='single value'):
+                    insert_git_tracking_section(
+                        '# Plan\n\n### [ ] Checkpoint 1\n',
+                        pre_handoff_base_head=invalid_base,
+                    )
+
+    def test_git_tracking_bootstrap_pristine_rejects_checked_heading_task_or_orphan_fields(self) -> None:
+        from aflow.plan import (
+            _collect_sections,
+            is_plan_pristine_for_git_tracking_bootstrap,
+        )
+
+        pristine = '# Plan\n\n### [ ] Checkpoint 1\n- [ ] work\n'
+        fenced_orphans = (
+            '# Plan\n\n```\n- Plan Branch: `fake`\n```\n\n'
+            '~~~\n- Review Log:\n~~~\n\n'
+            '### [ ] Checkpoint 1\n- [ ] work\n'
+        )
+        rejected = (
+            '# Plan\n\n### [x] Checkpoint 1\n- [x] done\n',
+            '# Plan\n\n### [ ] Checkpoint 1\n- [x] started\n- [ ] work\n',
+            '# Plan\n\n- Plan Branch: `orphan`\n\n### [ ] Checkpoint 1\n- [ ] work\n',
+            '# Plan\n\n- Pre-Handoff Base HEAD: `abc123`\n\n### [ ] Checkpoint 1\n- [ ] work\n',
+            '# Plan\n\n- Last Reviewed HEAD: `abc123`\n\n### [ ] Checkpoint 1\n- [ ] work\n',
+            '# Plan\n\n- Review Log:\n  - None yet.\n\n### [ ] Checkpoint 1\n- [ ] work\n',
+            '# Plan\n\nPlan Branch: `orphan without bullet`\n\n### [ ] Checkpoint 1\n- [ ] work\n',
+            '# Plan\n\n* Review Log:\n\n### [ ] Checkpoint 1\n- [ ] work\n',
+        )
+
+        for text in (pristine, fenced_orphans):
+            with self.subTest(accepted=text):
+                sections = _collect_sections(text, source_path=Path('plan.md'))
+                assert is_plan_pristine_for_git_tracking_bootstrap(text, sections)
+        for text in rejected:
+            with self.subTest(rejected=text):
+                sections = _collect_sections(text, source_path=Path('plan.md'))
+                assert not is_plan_pristine_for_git_tracking_bootstrap(text, sections)
+
     def test_generate_new_plan_path_none_checkpoint_uses_cp01(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             original = Path(tmpdir) / 'plan.md'

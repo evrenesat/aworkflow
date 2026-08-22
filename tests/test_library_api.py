@@ -836,6 +836,121 @@ class LibraryRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_git_tracking_readme_minimal_review_plan_uses_runtime_normalization(self) -> None:
+        from aflow.api import execute_workflow
+        from aflow.harnesses.base import HarnessAdapter, HarnessInvocation
+        from aflow.plan import parse_git_tracking_metadata
+
+        subprocess.run(
+            ['git', 'init', '-b', 'main'],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'user.email', 'test@test.com'],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ['git', 'config', 'user.name', 'Test'],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        config_path = _write_config(
+            self.home_dir,
+            (
+                '[aflow]\ndefault_workflow = "review"\n\n'
+                '[workflow.review.steps.step1]\nrole = "architect"\n'
+                'prompts = ["p"]\ngo = [{to = "END"}]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                '[roles]\narchitect = "opencode.default"\n\n'
+                '[prompts]\np = "Use aflow-review-checkpoint with {ACTIVE_PLAN_PATH}."\n'
+            ),
+        )
+        workflow_config = load_workflow_config(config_path)
+        plan_path = self.repo_root / 'plan.md'
+        plan_path.write_text(
+            '# Plan\n\n### [ ] Checkpoint 1: Test\n- [ ] step one\n',
+            encoding='utf-8',
+        )
+        subprocess.run(['git', 'add', 'plan.md'], cwd=self.repo_root, check=True, capture_output=True)
+        subprocess.run(
+            ['git', 'commit', '-m', 'add plan'],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        current_head = subprocess.run(
+            ['git', 'rev-parse', '--verify', 'HEAD'],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        prepared = prepare_startup(
+            StartupRequest(
+                repo_root=self.repo_root,
+                plan_path=plan_path,
+                config_path=config_path,
+                workflow_config=workflow_config,
+                workflow_name='review',
+                start_step=None,
+                max_turns=1,
+                team=None,
+                extra_instructions=(),
+            )
+        )
+        self.assertIsInstance(prepared, PreparedRun)
+        assert isinstance(prepared, PreparedRun)
+        self.assertIsNone(prepared.startup_base_head_refresh_sha)
+
+        class FakeAdapter(HarnessAdapter):
+            name = 'fake'
+            supports_effort = False
+
+            def build_invocation(
+                self,
+                *,
+                repo_root,
+                model,
+                system_prompt,
+                user_prompt,
+                effort=None,
+            ):
+                return HarnessInvocation(
+                    label='fake',
+                    argv=('fake',),
+                    env={},
+                    prompt_mode='text',
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    effective_prompt=user_prompt,
+                )
+
+        runner_calls: list[int] = []
+
+        def runner(argv, **kwargs):
+            runner_calls.append(1)
+            metadata = parse_git_tracking_metadata(plan_path.read_text(encoding='utf-8'))
+            assert metadata is not None
+            assert metadata.pre_handoff_base_head == current_head
+            completed = plan_path.read_text(encoding='utf-8').replace(
+                '### [ ] Checkpoint 1',
+                '### [x] Checkpoint 1',
+            ).replace('- [ ] step one', '- [x] step one')
+            plan_path.write_text(completed, encoding='utf-8')
+            return subprocess.CompletedProcess(argv, 0, 'done', '')
+
+        result = execute_workflow(prepared, adapter=FakeAdapter(), runner=runner)
+
+        self.assertTrue(result.final_snapshot.is_complete)
+        self.assertEqual(runner_calls, [1])
+        self.assertEqual(plan_path.read_text(encoding='utf-8').count('## Git Tracking'), 1)
+
     def test_execute_workflow_with_observer_emits_events(self) -> None:
         """Test that execute_workflow emits events through the observer."""
         from aflow.api import (

@@ -2948,20 +2948,6 @@ def _answer_startup_question(question: StartupQuestion) -> str | int | bool | No
             return None
         return response in ("y", "yes")
 
-    if question.kind == StartupQuestionKind.CONFIRM_BASE_HEAD_REFRESH:
-        if not is_tty:
-            print(
-                f"error: {question.message} "
-                "Interactive confirmation is required.",
-                file=sys.stderr,
-            )
-            return None
-        try:
-            response = input(f"{question.message} [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return None
-        return response in ("y", "yes")
-
     return None
 
 

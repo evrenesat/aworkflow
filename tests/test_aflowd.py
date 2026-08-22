@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+import subprocess
 from threading import Event
 
 import pytest
@@ -34,6 +35,24 @@ def _workflow_config() -> WorkflowUserConfig:
         roles={"worker": "codex.worker"},
         workflows={"managed": workflow},
         prompts={"p": "Work."},
+    )
+
+
+def _review_workflow_config() -> WorkflowUserConfig:
+    workflow = WorkflowConfig(
+        steps={
+            "review": WorkflowStepConfig(
+                role="worker",
+                prompts=("review_prompt",),
+                go=(GoTransition(to="END", when="DONE"),),
+            )
+        },
+        first_step="review",
+    )
+    return WorkflowUserConfig(
+        roles={"worker": "codex.worker"},
+        workflows={"managed": workflow},
+        prompts={"review_prompt": "Use aflow-review-checkpoint."},
     )
 
 
@@ -89,6 +108,89 @@ def _prepared(request: StartupRequest) -> PreparedRun:
         extra_instructions=(),
         start_step="implement",
     )
+
+
+@pytest.mark.parametrize("invalid_state", ["started", "ambiguous", "no_head"])
+def test_daemon_git_tracking_preflight_failure_does_not_allocate_run_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+    invalid_state: str,
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    review_config = _review_workflow_config()
+    daemon.service._workflow_config = review_config
+    request = StartupRequest(
+        repo_root=request.repo_root,
+        plan_path=request.plan_path,
+        config_path=request.config_path,
+        workflow_config=review_config,
+        workflow_name="managed",
+        start_step=None,
+        max_turns=2,
+        team=None,
+    )
+    plan_path = request.plan_path
+
+    if invalid_state in {"started", "ambiguous"}:
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=request.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=request.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=request.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        readme = request.repo_root / "README.md"
+        readme.write_text("ready\n")
+        subprocess.run(
+            ["git", "add", "README.md"],
+            cwd=request.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=request.repo_root,
+            check=True,
+            capture_output=True,
+        )
+
+    if invalid_state == "started":
+        plan_path.write_text(
+            "# Plan\n\n### [ ] Checkpoint 1: First\n- [x] started\n- [ ] step\n"
+        )
+    elif invalid_state == "ambiguous":
+        plan_path.write_text(
+            "# Plan\n\n## Git Tracking\n\n- Plan Branch: ``\n"
+            "- Pre-Handoff Base HEAD: `abc`\n\n## Git Tracking\n\n"
+            "- Plan Branch: ``\n- Pre-Handoff Base HEAD: `def`\n\n"
+            "### [ ] Checkpoint 1: First\n- [ ] step\n"
+        )
+    original_bytes = plan_path.read_bytes()
+
+    with pytest.raises(DaemonError, match="startup plan preflight failed"):
+        daemon.service.start(
+            request,
+            caller_scope="project:review",
+            idempotency_key=f"invalid-{invalid_state}",
+        )
+
+    assert plan_path.read_bytes() == original_bytes
+    assert units.start_calls == []
+    assert not (request.repo_root / ".aflow" / "launches").exists()
+    assert not (request.repo_root / ".aflow" / "runs").exists()
+    assert not (request.repo_root / ".aflow" / "last_run_id").exists()
 
 
 def test_daemon_persists_startup_question_then_launches_once_when_answered(

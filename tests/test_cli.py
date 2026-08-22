@@ -3137,7 +3137,14 @@ p = "do it"
 
 class WorkflowStartupFlowTests(unittest.TestCase):
 
-    def _write_workflow_config(self, home_dir: Path, *, workflow_name: str, multi_step: bool) -> None:
+    def _write_workflow_config(
+        self,
+        home_dir: Path,
+        *,
+        workflow_name: str,
+        multi_step: bool,
+        review_skill: bool = False,
+    ) -> None:
         if multi_step:
             workflow_block = (
                 f'[workflow.{workflow_name}.steps.review_plan]\n'
@@ -3156,6 +3163,11 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 'prompts = ["impl_prompt"]\n'
                 'go = [{ to = "END", when = "DONE || MAX_TURNS_REACHED" }, { to = "implement_plan" }]\n'
             )
+        implementation_prompt = (
+            'Use aflow-review-checkpoint with {ACTIVE_PLAN_PATH}.'
+            if review_skill
+            else 'Implement from {ACTIVE_PLAN_PATH}.'
+        )
         _write_config(
             home_dir,
             (
@@ -3168,7 +3180,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 f'{workflow_block}'
                 '[prompts]\n'
                 'review_prompt = "Review {ACTIVE_PLAN_PATH}."\n'
-                'impl_prompt = "Implement from {ACTIVE_PLAN_PATH}."\n'
+                f'impl_prompt = "{implementation_prompt}"\n'
             ),
         )
 
@@ -3593,7 +3605,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert 'interactive confirmation is required' in stderr_output
             assert 'inconsistent checkpoint state' in stderr_output
 
-    def test_cli_pre_handoff_prompts_and_accepts_pristine_base_head_refresh(self) -> None:
+    def test_cli_pre_handoff_auto_refreshes_pristine_stale_base_without_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = tmp_path / 'repo'
@@ -3645,7 +3657,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('sys.stdout.isatty', return_value=True), \
-                         patch('builtins.input', side_effect=['y']), \
+                         patch('builtins.input', side_effect=AssertionError('unexpected input')), \
                          patch('sys.stderr', stderr_capture):
                         result = main(['run', str(plan_path)])
             finally:
@@ -3657,7 +3669,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert f'`{current_head}`' in plan_path.read_text(encoding='utf-8')
             assert 'startup aborted' not in stderr_capture.getvalue().lower()
 
-    def test_cli_pre_handoff_prompts_and_accepts_pristine_empty_base_head_refresh(self) -> None:
+    def test_cli_pre_handoff_auto_refreshes_pristine_empty_base_noninteractively(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = tmp_path / 'repo'
@@ -3705,9 +3717,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     cli_module.probe_worktree = lambda _: None
                     startup_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
-                    with patch('sys.stdin.isatty', return_value=True), \
-                         patch('sys.stdout.isatty', return_value=True), \
-                         patch('builtins.input', side_effect=['y']), \
+                    with patch('sys.stdin.isatty', return_value=False), \
+                         patch('sys.stdout.isatty', return_value=False), \
+                         patch('builtins.input', side_effect=AssertionError('unexpected input')), \
                          patch('sys.stderr', stderr_capture):
                         result = main(['run', str(plan_path)])
             finally:
@@ -3718,94 +3730,36 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert f'`{current_head}`' in plan_path.read_text(encoding='utf-8')
             assert 'startup aborted' not in stderr_capture.getvalue().lower()
 
-    def test_cli_pre_handoff_declines_pristine_base_head_refresh_before_run(self) -> None:
+    def test_cli_git_tracking_readme_minimal_review_plan_runs_noninteractively(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             repo_root = tmp_path / 'repo'
             repo_root.mkdir()
             _make_lifecycle_git_repo(repo_root, branch='main')
-            rc, initial_head, _ = _run_git_in_test(['rev-parse', 'HEAD'], cwd=repo_root)
+            rc, current_head, _ = _run_git_in_test(['rev-parse', '--verify', 'HEAD'], cwd=repo_root)
             assert rc == 0
             home_dir = tmp_path / 'home'
             home_dir.mkdir()
-            self._write_workflow_config(home_dir, workflow_name='single_step', multi_step=False)
+            self._write_workflow_config(
+                home_dir,
+                workflow_name='single_step',
+                multi_step=False,
+                review_skill=True,
+            )
             plan_path = repo_root / 'plan.md'
             completed_plan_path = repo_root / 'completed.md'
             count_file = repo_root / 'count.txt'
-            _write_plan(
-                plan_path,
-                _VALID_GIT_TRACKING_PLAN.replace('`base`', f'`{initial_head}`'),
-            )
-            _git_commit_file(repo_root, plan_path)
-            _write_plan(repo_root / 'notes.txt', 'follow-up\n')
-            _git_commit_file(repo_root, repo_root / 'notes.txt')
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
             _write_plan(
                 completed_plan_path,
-                _VALID_GIT_TRACKING_PLAN.replace('`base`', f'`{initial_head}`').replace(
-                    '### [ ] Checkpoint 1: First', '### [x] Checkpoint 1: First'
-                ).replace('- [ ] step one', '- [x] step one'),
-            )
-            _write_workflow_harness_script(repo_root, 'codex')
-            env = _workflow_test_env(
-                repo_root,
-                scenario='complete',
-                plan_path=plan_path,
-                count_file=count_file,
-                home_dir=home_dir,
-                completed_plan_path=completed_plan_path,
-            )
-            original_cwd = Path.cwd()
-            import io
-            import aflow.cli as cli_module
-            import aflow.api.startup as startup_module
-            original_probe = cli_module.probe_worktree
-            original_startup_probe = startup_module.probe_worktree
-            stderr_capture = io.StringIO()
-            try:
-                with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
-                    startup_module.probe_worktree = lambda _: None
-                    os.chdir(repo_root)
-                    with patch('sys.stdin.isatty', return_value=True), \
-                         patch('sys.stdout.isatty', return_value=True), \
-                         patch('builtins.input', side_effect=['n']), \
-                         patch('sys.stderr', stderr_capture):
-                        result = main(['run', str(plan_path)])
-            finally:
-                os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
-                startup_module.probe_worktree = original_startup_probe
-            assert result == 1
-            assert 'startup aborted' in stderr_capture.getvalue().lower()
-            assert f'`{initial_head}`' in plan_path.read_text(encoding='utf-8')
-            assert not (repo_root / '.aflow').exists()
-
-    def test_cli_pre_handoff_refuses_pristine_base_head_refresh_non_interactively(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            repo_root = tmp_path / 'repo'
-            repo_root.mkdir()
-            _make_lifecycle_git_repo(repo_root, branch='main')
-            rc, initial_head, _ = _run_git_in_test(['rev-parse', 'HEAD'], cwd=repo_root)
-            assert rc == 0
-            home_dir = tmp_path / 'home'
-            home_dir.mkdir()
-            self._write_workflow_config(home_dir, workflow_name='single_step', multi_step=False)
-            plan_path = repo_root / 'plan.md'
-            completed_plan_path = repo_root / 'completed.md'
-            count_file = repo_root / 'count.txt'
-            _write_plan(
-                plan_path,
-                _VALID_GIT_TRACKING_PLAN.replace('`base`', f'`{initial_head}`'),
-            )
-            _git_commit_file(repo_root, plan_path)
-            _write_plan(repo_root / 'notes.txt', 'follow-up\n')
-            _git_commit_file(repo_root, repo_root / 'notes.txt')
-            _write_plan(
-                completed_plan_path,
-                _VALID_GIT_TRACKING_PLAN.replace('`base`', f'`{initial_head}`').replace(
-                    '### [ ] Checkpoint 1: First', '### [x] Checkpoint 1: First'
-                ).replace('- [ ] step one', '- [x] step one'),
+                (
+                    '# Plan\n\n'
+                    '## Git Tracking\n\n'
+                    '- Plan Branch: ``\n'
+                    f'- Pre-Handoff Base HEAD: `{current_head}`\n\n'
+                    '### [x] Checkpoint 1: First\n'
+                    '- [x] step one\n'
+                ),
             )
             _write_workflow_harness_script(repo_root, 'codex')
             env = _workflow_test_env(
@@ -3837,10 +3791,17 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 os.chdir(original_cwd)
                 cli_module.probe_worktree = original_probe
                 startup_module.probe_worktree = original_startup_probe
-            assert result == 1
-            stderr_output = stderr_capture.getvalue().lower()
-            assert 'interactive confirmation is required' in stderr_output
-            assert 'pre-handoff base head' in stderr_output
+
+            assert result == 0
+            final_text = plan_path.read_text(encoding='utf-8')
+            assert final_text.count('## Git Tracking') == 1
+            assert final_text.count('- Plan Branch: ``') == 1
+            assert final_text.count(f'- Pre-Handoff Base HEAD: `{current_head}`') == 1
+            run_dirs = list((repo_root / '.aflow' / 'runs').iterdir())
+            assert len(run_dirs) == 1
+            assert (run_dirs[0] / 'turns' / 'turn-001' / 'result.json').is_file()
+            assert not (run_dirs[0] / 'turns' / 'turn-002').exists()
+            assert 'startup aborted' not in stderr_capture.getvalue().lower()
 
     def test_cli_one_step_workflow_skips_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
