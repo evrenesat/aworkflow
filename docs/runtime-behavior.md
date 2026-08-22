@@ -335,8 +335,12 @@ limit without changing an in-flight turn.
 On the last allowed turn:
 
 - `MAX_TURNS_REACHED` evaluates true.
-- If a transition routes to `END`, the run completes successfully with end reason `max_turns_reached` unless `DONE` is also true.
-- If no transition routes to `END`, the run fails with a max-turns error.
+- The selected transition is still recorded, including an `END` selected by
+  `MAX_TURNS_REACHED`.
+- If the original plan remains incomplete, the run fails with a max-turns
+  error whether or not the transition selected `END`.
+- A max-turn `END` is successful only when the post-turn original-plan
+  snapshot is complete.
 
 `max_same_step_turns` limits consecutive selection of the same step in multi-step workflows. The streak resets only after a different step actually executes. Single-step workflows are not affected.
 
@@ -663,7 +667,12 @@ scope-preserving repartition transaction above.
 - terminal `end_reason`
 - `issues.md` when issues accumulate
 
-Turn directories are created before the harness process launches and finalized in place afterward. If a harness crashes after the turn directory is created, partial logs are still inspectable.
+Turn directories are created before the harness process launches and finalized
+in place afterward. Once a durable turn starts, every ordinary catchable
+post-start exception finalizes that turn exactly once and leaves the run
+failed and resumable. Persisted exception evidence contains only the exception
+class and a single-line, redacted message capped at 512 characters; AFlow does
+not store a traceback or automatically retry an unexpected provider boundary.
 
 Older run directories are pruned according to `keep_runs`.
 
@@ -678,4 +687,9 @@ Machine-readable `end_reason` values:
 - `max_turns_reached`
 - `transition_end`
 
-`transition_end` covers successful `END` transitions when the plan is still incomplete and the chosen transition is not driven by `DONE` or `MAX_TURNS_REACHED`, including unconditional `go = [{ to = "END" }]`.
+`transition_end` covers a successful `END` transition that is not driven by
+`DONE` or `MAX_TURNS_REACHED`, including an unconditional
+`go = [{ to = "END" }]`, but only when the post-turn original-plan snapshot is
+complete. An incomplete `END` fails without an `end_reason`; lifecycle branch,
+worktree, plan, and run state remain available for explicit resume, and merge
+teardown is not entered.

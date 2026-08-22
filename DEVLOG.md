@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-08-22 — Truthful turn and run termination (F-01/F-04)
+
+- Finalize ordinary catchable post-start exceptions into one terminal turn and
+  a failed, resumable run with bounded, redacted evidence and no generic retry.
+- Require a complete post-turn original-plan snapshot before `END`, merge,
+  worktree removal, or successful completion; incomplete max-turn and ordinary
+  `END` preserve routing evidence and lifecycle state but fail.
+- Added owned-session, observer, hotplug-resume, manager-on/off, CLI, and real
+  worktree regressions. Harness negotiation, Git Tracking bootstrap, guard,
+  daemon/API/UI, and architecture rewrites remain intentionally excluded.
+
 ## 2026-08-11 — Add lightweight stdio MCP daemon
 
 - Added `aflow daemon start|status|stop` for a single local project, with stdio

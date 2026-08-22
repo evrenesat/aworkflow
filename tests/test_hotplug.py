@@ -582,10 +582,19 @@ def test_crash_resume_before_target_start_or_success_keeps_transaction_nontermin
             raise RuntimeError("crash before target provider operation")
         provider_operations.append("source")
         return subprocess.CompletedProcess(argv, 0, '{"type":"thread.started","thread_id":"source"}\n{"type":"message.completed","text":"continue"}\n', "")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(WorkflowError) as error:
         run_workflow(ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=3), config, "live", config_dir=tmp_path, adapter=CodexAdapter(), runner=crashing_runner, session_driver=driver, control_source=control)
-    run_dir = sorted((tmp_path / ".aflow" / "runs").glob("*"))[-1]
+    assert isinstance(error.value.__cause__, RuntimeError)
+    run_dir = error.value.run_dir
     persisted = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    failed_turn = json.loads(
+        (run_dir / "turns" / "turn-002" / "result.json").read_text(encoding="utf-8")
+    )
+    assert persisted["status"] == "failed"
+    assert persisted["turns_completed"] == 1
+    assert failed_turn["status"] == "harness-failed"
+    assert failed_turn["error"].startswith("RuntimeError: crash before target provider operation")
+    assert len(failed_turn["error"]) <= 512
     assert persisted["current_hotplug_transaction"]["stage"] == "accepted"
     assert persisted["pending_hotplug_transaction"]["stage"] == "accepted"
     assert not persisted["hotplug_history"]
@@ -698,7 +707,19 @@ def test_cross_harness_artifacts_are_hash_bound_and_workspace_fingerprint_detect
     assert before["sha256"] != after["sha256"]
 
 
-def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "observer_error",
+    [
+        None,
+        KeyError("hotplug observer failed"),
+        RuntimeError('hotplug observer failed password="quoted-alpha quoted-bravo"'),
+    ],
+    ids=("success", "key-error", "runtime-error"),
+)
+def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
+    tmp_path: Path,
+    observer_error: Exception | None,
+) -> None:
     transaction = make_transaction("accepted")
     source = HarnessSessionRefV1(
         session_id="reasonix-source", role="worker", selector=transaction.source_selector,
@@ -756,7 +777,47 @@ def test_cross_harness_run_uses_one_read_only_handover_and_one_target_start(tmp_
     def runner(argv, **kwargs):
         plan.write_text("# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "wire", "")
-    observer = CollectingObserver()
+    class HotplugObserver(CollectingObserver):
+        def on_event(self, event):
+            super().on_event(event)
+            if observer_error is not None and event.event_type == ExecutionEventType.HOTPLUG_APPLIED:
+                raise observer_error
+
+    observer = HotplugObserver()
+    if observer_error is not None:
+        with pytest.raises(WorkflowError) as ctx:
+            run_workflow(
+                ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+                _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                runner=runner, session_driver=target_driver,
+                source_session_driver=source_driver, resume=resume, observer=observer,
+            )
+        assert isinstance(ctx.value.__cause__, type(observer_error))
+        state = json.loads((ctx.value.run_dir / "run.json").read_text(encoding="utf-8"))
+        turn = json.loads(
+            (ctx.value.run_dir / "turns" / "turn-001" / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert state["status"] == "failed"
+        assert turn["status"] == "harness-failed"
+        assert state["turns_completed"] == 0
+        issues = (ctx.value.run_dir / "issues.md").read_text(encoding="utf-8")
+        assert "unexpected-turn-exception" in issues
+        assert "recovery-scheduled" not in issues
+        if isinstance(observer_error, RuntimeError):
+            persisted_text = "\n".join(
+                [
+                    str(ctx.value),
+                    json.dumps(state),
+                    json.dumps(turn),
+                    issues,
+                ]
+            )
+            assert "quoted-alpha" not in persisted_text
+            assert "quoted-bravo" not in persisted_text
+        return
+
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
         _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),

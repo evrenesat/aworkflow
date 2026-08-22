@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping, NoReturn
 
 if TYPE_CHECKING:
     from aflow.api.events import ExecutionEvent, ExecutionObserver
@@ -96,7 +96,7 @@ from .hotplug import (
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
 )
 from .harnesses.session import SessionDriver, SessionRequest, SessionResult
-from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
+from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
@@ -4325,6 +4325,52 @@ def run_workflow(
         banner.update(state)
         return turn_dir, started_at
 
+    def _bounded_turn_exception_text(
+        exc: Exception,
+        invocation: HarnessInvocation,
+    ) -> str:
+        message = " ".join(str(exc).splitlines()).strip()
+        sensitive_values = {
+            invocation.system_prompt,
+            invocation.user_prompt,
+            invocation.effective_prompt,
+            invocation.stdin_text or "",
+            *invocation.env.values(),
+        }
+        for value in sorted(
+            (value for value in sensitive_values if value),
+            key=len,
+            reverse=True,
+        ):
+            message = message.replace(value, "[redacted]")
+        message = re.sub(
+            r"(?i)\b(authorization|api[-_]?key|token|password|secret)\b"
+            r"(\s*[:=]?\s*)(?:bearer\s+)?"
+            r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''',
+            lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)\b(bearer)\b(\s*[:=]?\s*)"
+            r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''',
+            lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)\b(authorization)\b(\s*[:=]?\s*)(?:bearer\s+)?([^\s,;]+)",
+            lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)\b(bearer|api[-_]?key|token|password|secret)\b"
+            r"(\s*[:=]?\s*)([^\s,;]+)",
+            lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+            message,
+        )
+        exception_class = type(exc).__name__
+        text = f"{exception_class}: {message}" if message else exception_class
+        return text[:512]
+
     def _finalize_turn_record(
         *,
         status: str,
@@ -4353,6 +4399,7 @@ def run_workflow(
         was_retry: bool | None = None,
         recovery: HarnessRecoveryContext | None = None,
         review_rejection: ReviewRejectionRecord | None = None,
+        preserve_terminal_outcome_on_observer_error: bool = False,
     ) -> None:
         record = state.turn_history[-1]
         normalized_status = (
@@ -4408,17 +4455,160 @@ def run_workflow(
         record.finished_at = finished_at
         record.duration_seconds = duration_seconds
 
-        _emit_event(observer, TurnFinishedEvent.create(
-            turn_number=state.active_turn,
-            step_name=step_name or record.step_name,
-            outcome=record.outcome,
-            duration_seconds=record.duration_seconds,
-            stdout_artifact_path=record.stdout_artifact_path,
-            stderr_artifact_path=record.stderr_artifact_path,
-            returncode=returncode,
-            error=error,
-            recovery=recovery,
-        ))
+        try:
+            _emit_event(observer, TurnFinishedEvent.create(
+                turn_number=state.active_turn,
+                step_name=step_name or record.step_name,
+                outcome=record.outcome,
+                duration_seconds=record.duration_seconds,
+                stdout_artifact_path=record.stdout_artifact_path,
+                stderr_artifact_path=record.stderr_artifact_path,
+                returncode=returncode,
+                error=error,
+                recovery=recovery,
+            ))
+        except Exception as exc:
+            if preserve_terminal_outcome_on_observer_error:
+                return
+            _raise_unexpected_started_turn_failure(
+                exc,
+                invocation=invocation,
+                turn_dir=turn_dir,
+                started_at=started_at,
+                step_name=step_name or record.step_name,
+                step_role=step_role or record.step_role,
+                selector=selector or record.resolved_selector,
+                snapshot_before=snapshot_before,
+                post_snapshot=snapshot_after,
+                completed=subprocess.CompletedProcess(
+                    invocation.argv,
+                    returncode,
+                    stdout,
+                    stderr,
+                ),
+                conditions=conditions,
+                chosen_transition=chosen_transition,
+                chosen_transition_condition=chosen_transition_condition,
+            )
+
+    def _raise_unexpected_started_turn_failure(
+        exc: Exception,
+        *,
+        invocation: HarnessInvocation,
+        turn_dir: Path,
+        started_at: datetime,
+        step_name: str,
+        step_role: str | None,
+        selector: str | None,
+        snapshot_before: PlanSnapshot,
+        post_snapshot: PlanSnapshot | None = None,
+        completed: subprocess.CompletedProcess[str] | None = None,
+        conditions: dict[str, bool] | None = None,
+        chosen_transition: str | None = None,
+        chosen_transition_condition: str | None = None,
+    ) -> NoReturn:
+        persisted = load_run_json(run_paths.run_dir) or {}
+        persisted_status = persisted.get("status")
+        if persisted_status in {
+            "failed",
+            "completed",
+            "owner_stopped",
+            "waiting_for_hotplug_recovery",
+        }:
+            if isinstance(exc, WorkflowError):
+                raise exc
+            stored_reason = persisted.get("failure_reason")
+            reason = (
+                str(stored_reason)
+                if isinstance(stored_reason, str) and stored_reason
+                else _bounded_turn_exception_text(exc, invocation)
+            )
+            raise WorkflowError(reason, run_dir=run_paths.run_dir) from exc
+
+        exception_text = _bounded_turn_exception_text(exc, invocation)
+        record = state.turn_history[-1]
+        duplicate_issue = any(
+            issue.kind == "unexpected-turn-exception"
+            and issue.turn_number == record.turn_number
+            for issue in state.issue_history
+        )
+        if not duplicate_issue:
+            _record_issue(
+                "unexpected-turn-exception",
+                exception_text,
+                turn_dir=turn_dir,
+            )
+
+        if record.outcome == "running":
+            state.turns_completed = min(
+                state.turns_completed,
+                max(0, record.turn_number - 1),
+            )
+            failed_process = completed or subprocess.CompletedProcess(
+                invocation.argv,
+                1,
+                "",
+                "",
+            )
+            _finalize_turn_record(
+                status="harness-failed",
+                started_at=started_at,
+                snapshot_before=snapshot_before,
+                snapshot_after=post_snapshot,
+                invocation=invocation,
+                turn_dir=turn_dir,
+                stdout=failed_process.stdout or "",
+                stderr=failed_process.stderr or "",
+                returncode=failed_process.returncode,
+                error=exception_text,
+                step_name=step_name,
+                step_role=step_role,
+                selector=selector,
+                active_path=active_plan_path,
+                new_path=new_plan_path,
+                conditions=conditions,
+                chosen_transition=chosen_transition,
+                chosen_transition_condition=chosen_transition_condition,
+            )
+
+        final_snapshot = post_snapshot or state.last_snapshot or snapshot_before
+        state.status_message = "failed"
+        state.end_reason = None
+        summary = _format_failure(
+            reason=f"unexpected turn exception: {exception_text}",
+            run_dir=run_paths.run_dir,
+            snapshot=final_snapshot,
+        )
+        write_run_metadata(
+            run_paths,
+            config,
+            state,
+            status="failed",
+            failure_reason=summary,
+            turns_completed=state.turns_completed,
+            last_snapshot=final_snapshot,
+            execution_context=exec_ctx,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+        try:
+            _emit_event(observer, RunFailedEvent.create(
+                run_dir=run_paths.run_dir,
+                turns_completed=state.turns_completed,
+                failure_reason=summary,
+                final_snapshot=final_snapshot,
+                issues_accumulated=state.issues_accumulated,
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            ))
+        except Exception:
+            pass
+        banner.stop(state)
+        raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
     def _handle_harness_recovery(
         *,
@@ -4517,6 +4707,7 @@ def run_workflow(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                preserve_terminal_outcome_on_observer_error=True,
             )
             summary = _format_failure(
                 reason=reason,
@@ -4692,6 +4883,7 @@ def run_workflow(
                         "NEW_PLAN_EXISTS": False,
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=str(exc),
@@ -4800,6 +4992,7 @@ def run_workflow(
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
                     recovery=recovery,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=recovery.reason,
@@ -4886,6 +5079,7 @@ def run_workflow(
                         "NEW_PLAN_EXISTS": False,
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=str(exc),
@@ -5062,6 +5256,7 @@ def run_workflow(
                         "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                     },
                     recovery=recovery,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
                 summary = _format_failure(
                     reason=failure_reason,
@@ -5190,6 +5385,7 @@ def run_workflow(
                     "MAX_TURNS_REACHED": turn_number >= config.max_turns,
                 },
                 recovery=recovery,
+                preserve_terminal_outcome_on_observer_error=True,
             )
             summary = _format_failure(
                 reason=recovery.reason,
@@ -7126,6 +7322,52 @@ def run_workflow(
                            new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
         return report
 
+    def _raise_incomplete_terminal_failure(
+        *,
+        reason: str,
+        post_snapshot: PlanSnapshot,
+        turn_dir: Path,
+        manager_report: str | None = None,
+    ) -> NoReturn:
+        state.status_message = "failed"
+        state.end_reason = None
+        _record_issue("incomplete-terminal", reason, turn_dir=turn_dir)
+        summary = manager_report or _format_failure(
+            reason=reason,
+            run_dir=run_paths.run_dir,
+            snapshot=post_snapshot,
+        )
+        write_run_metadata(
+            run_paths,
+            config,
+            state,
+            status="failed",
+            failure_reason=summary,
+            turns_completed=state.turns_completed,
+            last_snapshot=post_snapshot,
+            execution_context=exec_ctx,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+        try:
+            _emit_event(observer, RunFailedEvent.create(
+                run_dir=run_paths.run_dir,
+                turns_completed=state.turns_completed,
+                failure_reason=summary,
+                final_snapshot=post_snapshot,
+                issues_accumulated=state.issues_accumulated,
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            ))
+        except Exception:
+            pass
+        banner.stop(state)
+        raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
     def _prepare_pending_manager_notes(
         *,
         step_name: str,
@@ -7655,6 +7897,86 @@ def run_workflow(
             resumed_from_run_id=resumed_from_run_id,
         )
 
+    def _finish_owner_stop(
+        *,
+        invocation: HarnessInvocation | None = None,
+        turn_dir: Path | None = None,
+        started_at: datetime | None = None,
+        step_name: str | None = None,
+        step_role: str | None = None,
+        selector: str | None = None,
+        snapshot_before: PlanSnapshot | None = None,
+        post_snapshot: PlanSnapshot | None = None,
+        completed: subprocess.CompletedProcess[str] | None = None,
+    ) -> ControllerRunResult:
+        final_snapshot = post_snapshot or state.last_snapshot
+        if (
+            invocation is not None
+            and turn_dir is not None
+            and started_at is not None
+            and snapshot_before is not None
+            and state.turn_history
+            and state.turn_history[-1].outcome == "running"
+        ):
+            owner_process = completed or subprocess.CompletedProcess(
+                invocation.argv,
+                0,
+                "",
+                "",
+            )
+            _finalize_turn_record(
+                status="owner-stopped",
+                started_at=started_at,
+                snapshot_before=snapshot_before,
+                snapshot_after=final_snapshot,
+                invocation=invocation,
+                turn_dir=turn_dir,
+                stdout=owner_process.stdout or "",
+                stderr=owner_process.stderr or "",
+                returncode=owner_process.returncode,
+                error=None,
+                step_name=step_name,
+                step_role=step_role,
+                selector=selector,
+                active_path=active_plan_path,
+                new_path=new_plan_path,
+                preserve_terminal_outcome_on_observer_error=True,
+            )
+        state.end_reason = "owner_stopped"
+        state.status_message = "owner_stopped"
+        write_run_metadata(
+            run_paths,
+            config,
+            state,
+            status="owner_stopped",
+            end_reason="owner_stopped",
+            last_snapshot=final_snapshot,
+            turns_completed=state.turns_completed,
+            workflow_name=workflow_name,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            resumed_from_run_id=resumed_from_run_id,
+        )
+        append_run_event(
+            run_paths.run_dir,
+            "owner_stopped",
+            {"turns_completed": state.turns_completed},
+        )
+        write_launch_phase(config.repo_root, reserved_run_id, "owner_stopped")
+        banner.stop(state)
+        return ControllerRunResult(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=final_snapshot,
+            status="owner_stopped",
+            issues_accumulated=state.issues_accumulated,
+            end_reason="owner_stopped",
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        )
+
     def _fail_hotplug_target(reason: str) -> None:
         transaction = state.current_hotplug_transaction
         if transaction is None or transaction.stage in {"applied", "failed"}:
@@ -8095,34 +8417,7 @@ def run_workflow(
         try:
             current_step_name, baseline_team_name = _apply_boundary_override()
         except OwnerStopRequested:
-            state.end_reason = "owner_stopped"
-            state.status_message = "owner_stopped"
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
-                status="owner_stopped",
-                end_reason="owner_stopped",
-                last_snapshot=state.last_snapshot,
-                workflow_name=workflow_name,
-                original_plan_path=original_plan_path,
-                current_step_name=current_step_name,
-                active_plan_path=active_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
-            )
-            append_run_event(run_paths.run_dir, "owner_stopped", {"turns_completed": state.turns_completed})
-            write_launch_phase(config.repo_root, reserved_run_id, "owner_stopped")
-            banner.stop(state)
-            return ControllerRunResult(
-                run_dir=run_paths.run_dir,
-                turns_completed=state.turns_completed,
-                final_snapshot=state.last_snapshot,
-                status="owner_stopped",
-                issues_accumulated=state.issues_accumulated,
-                end_reason="owner_stopped",
-                recovery_summary=state.current_harness_recovery,
-                recovery_history=tuple(state.harness_recovery_history),
-            )
+            return _finish_owner_stop()
         effective_max_turns = state.effective_max_turns or config.max_turns
         if turn_number > effective_max_turns:
             break
@@ -8768,136 +9063,139 @@ def run_workflow(
             invocation=invocation,
             snapshot_before=snapshot_before,
         )
-        if consume_manager_notes:
-            state.pending_manager_notes = None
-        if consume_team_override:
-            state.pending_step_team_override = None
-        boundary_target_started = (
-            state.pending_boundary_decision is not None
-            and not state.pending_boundary_decision.consumed
-            and state.pending_boundary_decision.resolved_next_step == current_step_name
-            and (state.pending_boundary_decision.target_role is None or state.pending_boundary_decision.target_role == step.role)
-            and _pending_matches_scope_and_plan(
-                state.pending_boundary_decision,
-                state,
-                _target_plan_identity(active_plan_path),
+        completed: subprocess.CompletedProcess[str] | None = None
+        post_snapshot: PlanSnapshot | None = None
+        conditions: dict[str, bool] | None = None
+        selected_transition: GoTransition | None = None
+        transition_target: str | None = None
+        try:
+            if consume_manager_notes:
+                state.pending_manager_notes = None
+            if consume_team_override:
+                state.pending_step_team_override = None
+            boundary_target_started = (
+                state.pending_boundary_decision is not None
+                and not state.pending_boundary_decision.consumed
+                and state.pending_boundary_decision.resolved_next_step == current_step_name
+                and (state.pending_boundary_decision.target_role is None or state.pending_boundary_decision.target_role == step.role)
+                and _pending_matches_scope_and_plan(
+                    state.pending_boundary_decision,
+                    state,
+                    _target_plan_identity(active_plan_path),
+                )
+                and (state.pending_boundary_decision.target_selector is None or state.pending_boundary_decision.target_selector == selector)
             )
-            and (state.pending_boundary_decision.target_selector is None or state.pending_boundary_decision.target_selector == selector)
-        )
-        if consume_manager_notes or consume_team_override or boundary_target_started:
-            if boundary_target_started:
-                completed_repartition_boundary = (
-                    state.pending_boundary_decision.action
-                    == "repartition_current_checkpoint"
-                )
-                state.pending_boundary_decision = replace(
-                    state.pending_boundary_decision, applied=True, consumed=True
-                )
-                if completed_repartition_boundary:
-                    state.pending_repartition = None
-            write_run_metadata(
-                run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
-            )
-
-        if use_popen:
-            execute_session = (
-                getattr(turn_session_driver, "execute_session", None)
-                if turn_session_driver is not None else None
-            )
-            if callable(execute_session) and turn_session_request is not None:
-                execution = execute_session(
-                    turn_session_request, invocation,
-                    _poll_live_control if step.role == "worker" else None,
-                )
-                owned_session_result = execution.result
-                completed = subprocess.CompletedProcess(
-                    invocation.argv, 0, execution.raw_transport, ""
-                )
-            else:
-                completed = _run_process(
-                    invocation, execution_repo_root, banner, state,
-                    control_callback=(
-                        _poll_live_control if step.role == "worker" else None
-                    ),
-                )
-        else:
-            assert runner is not None
-            if step.role == "worker":
-                _poll_live_control()
-            completed = _run_injected_runner(runner, invocation, execution_repo_root)
-
-        if turn_session_request is not None and turn_session_driver is not None:
-            try:
-                raw_transport_stdout = completed.stdout
-                session_result = (
-                    owned_session_result
-                    if owned_session_result is not None
-                    else turn_session_driver.parse_result(
-                        turn_session_request,
-                        completed.stdout,
-                        returncode=completed.returncode,
+            if consume_manager_notes or consume_team_override or boundary_target_started:
+                if boundary_target_started:
+                    completed_repartition_boundary = (
+                        state.pending_boundary_decision.action
+                        == "repartition_current_checkpoint"
                     )
-                )
-                if session_result.selector != selector:
-                    raise ValueError(
-                        "session result selector does not match the workflow invocation"
+                    state.pending_boundary_decision = replace(
+                        state.pending_boundary_decision, applied=True, consumed=True
                     )
-                session_ref = HarnessSessionRefV1(
-                    session_id=session_result.session_id,
-                    role=step.role,
-                    selector=selector,
-                    harness=resolved.harness_name,
-                    profile=selector.partition(".")[2],
-                    model_display=format_harness_model_display(
-                        resolved.harness_name, resolved.model, resolved.effort
-                    ),
-                    status="active",
-                )
-                state.active_role_sessions = tuple(
-                    item for item in state.active_role_sessions
-                    if item.role != step.role
-                ) + (session_ref,)
+                    if completed_repartition_boundary:
+                        state.pending_repartition = None
                 write_run_metadata(
-                    run_paths, config, state, status="running",
-                    last_snapshot=state.last_snapshot,
-                    workflow_name=workflow_name,
-                    original_plan_path=original_plan_path,
-                    current_step_name=current_step_name,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
+                    run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
+                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
                 )
-                (turn_dir / "transport.stdout").write_text(
-                    raw_transport_stdout, encoding="utf-8"
-                )
-                completed = subprocess.CompletedProcess(
-                    completed.args, completed.returncode,
-                    session_result.final_output, completed.stderr,
-                )
-                transaction = state.current_hotplug_transaction
-                if (
-                    transaction is not None
-                    and transaction.target_selector == selector
-                    and transaction.stage not in {"applied", "failed"}
-                ):
-                    transaction = replace(
-                        transaction,
-                        provider_operation_id=session_result.provider_operation_id,
-                        idempotency_key=(
-                            session_result.idempotency_key or turn_session_request.idempotency_key
-                            if turn_session_request is not None else session_result.idempotency_key
-                        ),
+
+            try:
+                if use_popen:
+                    execute_session = (
+                        getattr(turn_session_driver, "execute_session", None)
+                        if turn_session_driver is not None else None
                     )
-                    applied_transaction = replace(transaction, stage="applied")
-                    state.current_hotplug_transaction = None
-                    state.pending_hotplug_transaction = None
-                    state.hotplug_history = list(bounded_hotplug_history(
-                        [*state.hotplug_history, applied_transaction]
-                    ))
-                    _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
+                    if callable(execute_session) and turn_session_request is not None:
+                        execution = execute_session(
+                            turn_session_request, invocation,
+                            _poll_live_control if step.role == "worker" else None,
+                        )
+                        owned_session_result = execution.result
+                        completed = subprocess.CompletedProcess(
+                            invocation.argv, 0, execution.raw_transport, ""
+                        )
+                    else:
+                        completed = _run_process(
+                            invocation, execution_repo_root, banner, state,
+                            control_callback=(
+                                _poll_live_control if step.role == "worker" else None
+                            ),
+                        )
+                else:
+                    assert runner is not None
+                    if step.role == "worker":
+                        _poll_live_control()
+                    completed = _run_injected_runner(runner, invocation, execution_repo_root)
+            except OwnerStopRequested:
+                return _finish_owner_stop(
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    started_at=turn_started_at,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    snapshot_before=snapshot_before,
+                    post_snapshot=post_snapshot,
+                    completed=completed,
+                )
+            except Exception as exc:
+                _raise_unexpected_started_turn_failure(
+                    exc,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    started_at=turn_started_at,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    snapshot_before=snapshot_before,
+                    post_snapshot=post_snapshot,
+                    completed=completed,
+                )
+
+            assert completed is not None
+
+            if turn_session_request is not None and turn_session_driver is not None:
+                try:
+                    raw_transport_stdout = completed.stdout
+                    session_result = (
+                        owned_session_result
+                        if owned_session_result is not None
+                        else turn_session_driver.parse_result(
+                            turn_session_request,
+                            completed.stdout,
+                            returncode=completed.returncode,
+                        )
+                    )
+                    if session_result.selector != selector:
+                        raise ValueError(
+                            "session result selector does not match the workflow invocation"
+                        )
+                except (RuntimeError, ValueError) as exc:
+                    _fail_hotplug_target(f"session result validation failed: {exc}")
+                    completed = subprocess.CompletedProcess(
+                        completed.args, 1, completed.stdout,
+                        f"session result validation failed: {exc}",
+                    )
+                else:
+                    session_ref = HarnessSessionRefV1(
+                        session_id=session_result.session_id,
+                        role=step.role,
+                        selector=selector,
+                        harness=resolved.harness_name,
+                        profile=selector.partition(".")[2],
+                        model_display=format_harness_model_display(
+                            resolved.harness_name, resolved.model, resolved.effort
+                        ),
+                        status="active",
+                    )
+                    state.active_role_sessions = tuple(
+                        item for item in state.active_role_sessions
+                        if item.role != step.role
+                    ) + (session_ref,)
                     write_run_metadata(
                         run_paths, config, state, status="running",
                         last_snapshot=state.last_snapshot,
@@ -8908,118 +9206,189 @@ def run_workflow(
                         new_plan_path=new_plan_path,
                         resumed_from_run_id=resumed_from_run_id,
                     )
-            except (RuntimeError, ValueError) as exc:
-                _fail_hotplug_target(f"session result validation failed: {exc}")
-                completed = subprocess.CompletedProcess(
-                    completed.args, 1, completed.stdout,
-                    f"session result validation failed: {exc}",
-                )
+                    (turn_dir / "transport.stdout").write_text(
+                        raw_transport_stdout, encoding="utf-8"
+                    )
+                    completed = subprocess.CompletedProcess(
+                        completed.args, completed.returncode,
+                        session_result.final_output, completed.stderr,
+                    )
+                    transaction = state.current_hotplug_transaction
+                    if (
+                        transaction is not None
+                        and transaction.target_selector == selector
+                        and transaction.stage not in {"applied", "failed"}
+                    ):
+                        transaction = replace(
+                            transaction,
+                            provider_operation_id=session_result.provider_operation_id,
+                            idempotency_key=(
+                                session_result.idempotency_key or turn_session_request.idempotency_key
+                                if turn_session_request is not None else session_result.idempotency_key
+                            ),
+                        )
+                        applied_transaction = replace(transaction, stage="applied")
+                        state.current_hotplug_transaction = None
+                        state.pending_hotplug_transaction = None
+                        state.hotplug_history = list(bounded_hotplug_history(
+                            [*state.hotplug_history, applied_transaction]
+                        ))
+                        _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
+                        write_run_metadata(
+                            run_paths, config, state, status="running",
+                            last_snapshot=state.last_snapshot,
+                            workflow_name=workflow_name,
+                            original_plan_path=original_plan_path,
+                            current_step_name=current_step_name,
+                            active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                            resumed_from_run_id=resumed_from_run_id,
+                        )
 
-        stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
-        if stop_reason is not None:
-            state.status_message = "failed"
-            _record_issue("aflow-stop", f"AFLOW_STOP: {stop_reason}", turn_dir=turn_dir)
-            _finalize_turn_record(
-                status="harness-failed",
-                started_at=turn_started_at,
-                snapshot_before=snapshot_before,
-                snapshot_after=None,
-                invocation=invocation,
-                turn_dir=turn_dir,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                returncode=completed.returncode,
-                error=f"AFLOW_STOP: {stop_reason}",
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                active_path=active_plan_path,
-                new_path=new_plan_path,
-            )
-            report = _manager_terminal_incident(
-                trigger="explicit_stop", reason=f"AFLOW_STOP: {stop_reason}",
-                current_step=current_step_name, current_role=step.role,
-                active_team=active_team_name, active_selector=selector,
-            )
-            summary = report or _format_failure(
-                reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
-                run_dir=run_paths.run_dir, snapshot=snapshot_before,
-            )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                turns_completed=state.turns_completed,
-                execution_context=exec_ctx,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
-            )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir)
-
-        try:
-            exec_original = _exec_plan_path(original_plan_path, exec_ctx)
-            resolved_exec_plan_path = _resolve_post_turn_original_plan_path(
-                execution_repo_root,
-                exec_original,
-                completed_returncode=completed.returncode,
-            )
-            parsed_after = load_plan(resolved_exec_plan_path)
-
-            # Sync the original plan back after every worktree turn so the
-            # primary checkout remains the durable source of truth between turns.
-            if exec_ctx is not None and exec_ctx.worktree_path is not None:
-                _sync_plan_from_worktree(original_plan_path, exec_ctx)
-
-            if resolved_exec_plan_path != exec_original:
-                if exec_ctx is not None and exec_ctx.worktree_path is not None:
-                    try:
-                        rel = resolved_exec_plan_path.relative_to(execution_repo_root)
-                        original_plan_path = config.repo_root / rel
-                    except ValueError:
-                        original_plan_path = resolved_exec_plan_path
-                else:
-                    original_plan_path = resolved_exec_plan_path
-                if active_plan_path == config.plan_path:
-                    active_plan_path = original_plan_path
-            resolved_exec_new_plan_path = _resolve_post_turn_new_plan_path(
-                original_plan_path=resolved_exec_plan_path,
-                expected_new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
-                candidates_before=followup_candidates_before,
-            )
-            if resolved_exec_new_plan_path is not None:
-                new_plan_path = _primary_plan_path(resolved_exec_new_plan_path, exec_ctx)
-            post_snapshot = parsed_after.snapshot
-        except (PlanParseError, FileNotFoundError) as exc:
-            is_retryable = (
-                isinstance(exc, PlanParseError)
-                and exc.error_kind == "inconsistent_checkpoint_state"
-                and completed.returncode == 0
-            )
-            current_attempt = (retry_ctx.attempt if retry_ctx is not None else 0) + 1
-            base_prompt = retry_ctx.base_user_prompt if retry_ctx is not None else user_prompt
-
-            if is_retryable and current_attempt <= retry_limit and turn_number < effective_max_turns:
-                _record_issue("retry-scheduled", str(exc), turn_dir=turn_dir)
-                state.turns_completed += 1
-                new_retry_ctx = RetryContext(
+            stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
+            if stop_reason is not None:
+                state.status_message = "failed"
+                _record_issue("aflow-stop", f"AFLOW_STOP: {stop_reason}", turn_dir=turn_dir)
+                _finalize_turn_record(
+                    status="harness-failed",
+                    started_at=turn_started_at,
+                    snapshot_before=snapshot_before,
+                    snapshot_after=None,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    returncode=completed.returncode,
+                    error=f"AFLOW_STOP: {stop_reason}",
                     step_name=current_step_name,
                     step_role=step.role,
-                    resolved_selector=selector,
-                    resolved_harness_name=resolved.harness_name,
-                    resolved_model=resolved.model,
-                    resolved_effort=resolved.effort,
-                    snapshot_before=snapshot_before,
-                    active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                    base_user_prompt=base_prompt,
-                    parse_error_str=str(exc),
-                    attempt=current_attempt,
-                    retry_limit=retry_limit,
+                    selector=selector,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                    preserve_terminal_outcome_on_observer_error=True,
                 )
-                state.pending_retry = new_retry_ctx
+                report = _manager_terminal_incident(
+                    trigger="explicit_stop", reason=f"AFLOW_STOP: {stop_reason}",
+                    current_step=current_step_name, current_role=step.role,
+                    active_team=active_team_name, active_selector=selector,
+                )
+                summary = report or _format_failure(
+                    reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
+                    run_dir=run_paths.run_dir, snapshot=snapshot_before,
+                )
+                write_run_metadata(
+                    run_paths, config, state, status="failed", failure_reason=summary,
+                    turns_completed=state.turns_completed,
+                    execution_context=exec_ctx,
+                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                banner.stop(state)
+                raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+            try:
+                exec_original = _exec_plan_path(original_plan_path, exec_ctx)
+                resolved_exec_plan_path = _resolve_post_turn_original_plan_path(
+                    execution_repo_root,
+                    exec_original,
+                    completed_returncode=completed.returncode,
+                )
+                parsed_after = load_plan(resolved_exec_plan_path)
+
+                # Sync the original plan back after every worktree turn so the
+                # primary checkout remains the durable source of truth between turns.
+                if exec_ctx is not None and exec_ctx.worktree_path is not None:
+                    _sync_plan_from_worktree(original_plan_path, exec_ctx)
+
+                if resolved_exec_plan_path != exec_original:
+                    if exec_ctx is not None and exec_ctx.worktree_path is not None:
+                        try:
+                            rel = resolved_exec_plan_path.relative_to(execution_repo_root)
+                            original_plan_path = config.repo_root / rel
+                        except ValueError:
+                            original_plan_path = resolved_exec_plan_path
+                    else:
+                        original_plan_path = resolved_exec_plan_path
+                    if active_plan_path == config.plan_path:
+                        active_plan_path = original_plan_path
+                resolved_exec_new_plan_path = _resolve_post_turn_new_plan_path(
+                    original_plan_path=resolved_exec_plan_path,
+                    expected_new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
+                    candidates_before=followup_candidates_before,
+                )
+                if resolved_exec_new_plan_path is not None:
+                    new_plan_path = _primary_plan_path(resolved_exec_new_plan_path, exec_ctx)
+                post_snapshot = parsed_after.snapshot
+            except (PlanParseError, FileNotFoundError) as exc:
+                is_retryable = (
+                    isinstance(exc, PlanParseError)
+                    and exc.error_kind == "inconsistent_checkpoint_state"
+                    and completed.returncode == 0
+                )
+                current_attempt = (retry_ctx.attempt if retry_ctx is not None else 0) + 1
+                base_prompt = retry_ctx.base_user_prompt if retry_ctx is not None else user_prompt
+
+                if is_retryable and current_attempt <= retry_limit and turn_number < effective_max_turns:
+                    _record_issue("retry-scheduled", str(exc), turn_dir=turn_dir)
+                    state.turns_completed += 1
+                    new_retry_ctx = RetryContext(
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        resolved_selector=selector,
+                        resolved_harness_name=resolved.harness_name,
+                        resolved_model=resolved.model,
+                        resolved_effort=resolved.effort,
+                        snapshot_before=snapshot_before,
+                        active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        base_user_prompt=base_prompt,
+                        parse_error_str=str(exc),
+                        attempt=current_attempt,
+                        retry_limit=retry_limit,
+                    )
+                    state.pending_retry = new_retry_ctx
+                    _finalize_turn_record(
+                        status="retry-scheduled",
+                        started_at=turn_started_at,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=None,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                        error=str(exc),
+                        step_name=current_step_name,
+                        step_role=step.role,
+                        selector=selector,
+                        active_path=active_plan_path,
+                        new_path=new_plan_path,
+                        conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                        retry_attempt=current_attempt,
+                        retry_limit_value=retry_limit,
+                        retry_reason="inconsistent_checkpoint_state",
+                        retry_next_turn=True,
+                    )
+                    write_run_metadata(
+                        run_paths, config, state, status="running",
+                        turns_completed=state.turns_completed,
+                        last_snapshot=state.last_snapshot,
+                        workflow_name=workflow_name, original_plan_path=original_plan_path,
+                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path,
+                        resumed_from_run_id=resumed_from_run_id,
+                    )
+                    banner.update(state)
+                    turn_number += 1
+                    continue
+
+                state.pending_retry = None
+                state.status_message = "failed"
+                _record_issue("plan-invalid", str(exc), turn_dir=turn_dir)
                 _finalize_turn_record(
-                    status="retry-scheduled",
+                    status="plan-invalid",
                     started_at=turn_started_at,
                     snapshot_before=snapshot_before,
                     snapshot_after=None,
@@ -9035,169 +9404,267 @@ def run_workflow(
                     active_path=active_plan_path,
                     new_path=new_plan_path,
                     conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
-                    retry_attempt=current_attempt,
-                    retry_limit_value=retry_limit,
-                    retry_reason="inconsistent_checkpoint_state",
-                    retry_next_turn=True,
+                    preserve_terminal_outcome_on_observer_error=True,
+                )
+                report = _manager_terminal_incident(
+                    trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
+                    current_role=step.role, active_team=active_team_name, active_selector=selector,
+                )
+                summary = report or _format_failure(
+                    reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
+                    parse_error=exc if isinstance(exc, PlanParseError) else None,
                 )
                 write_run_metadata(
-                    run_paths, config, state, status="running",
+                    run_paths, config, state, status="failed", failure_reason=summary,
                     turns_completed=state.turns_completed,
-                    last_snapshot=state.last_snapshot,
+                    execution_context=exec_ctx,
                     workflow_name=workflow_name, original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
                     resumed_from_run_id=resumed_from_run_id,
                 )
-                banner.update(state)
+                banner.stop(state)
+                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
+            except Exception as exc:
+                _raise_unexpected_started_turn_failure(
+                    exc,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    started_at=turn_started_at,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    snapshot_before=snapshot_before,
+                    post_snapshot=post_snapshot,
+                    completed=completed,
+                )
+
+            state.pending_retry = None
+
+            try:
+                recovery_scheduled = _handle_harness_recovery(
+                    turn_number=turn_number,
+                    step_name=current_step_name,
+                    step=step,
+                    step_path=step_path,
+                    active_team_name=active_team_name,
+                    selector=selector,
+                    resolved=resolved,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    started_at=turn_started_at,
+                    snapshot_before=snapshot_before,
+                    snapshot_after=post_snapshot,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    returncode=completed.returncode,
+                )
+            except Exception as exc:
+                _raise_unexpected_started_turn_failure(
+                    exc,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    started_at=turn_started_at,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    snapshot_before=snapshot_before,
+                    post_snapshot=post_snapshot,
+                    completed=completed,
+                )
+            if recovery_scheduled:
                 turn_number += 1
                 continue
 
-            state.pending_retry = None
-            state.status_message = "failed"
-            _record_issue("plan-invalid", str(exc), turn_dir=turn_dir)
+            state.consecutive_harness_recoveries = 0
+
+            if completed.returncode != 0:
+                state.status_message = "failed"
+                _record_issue(
+                    "harness-failed",
+                    f"harness '{invocation.label}' exited with code {completed.returncode}",
+                    turn_dir=turn_dir,
+                )
+                _finalize_turn_record(
+                    status="harness-failed",
+                    started_at=turn_started_at,
+                    snapshot_before=snapshot_before,
+                    snapshot_after=post_snapshot,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    returncode=completed.returncode,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                    conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
+                    preserve_terminal_outcome_on_observer_error=True,
+                )
+                report = _manager_terminal_incident(
+                    trigger="ambiguous_failure",
+                    reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
+                    current_step=current_step_name, current_role=step.role,
+                    active_team=active_team_name, active_selector=selector,
+                )
+                summary = report or _format_failure(
+                    reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
+                    run_dir=run_paths.run_dir, snapshot=post_snapshot,
+                )
+                write_run_metadata(
+                    run_paths, config, state, status="failed", failure_reason=summary,
+                    turns_completed=state.turns_completed,
+                    last_snapshot=post_snapshot,
+                    execution_context=exec_ctx,
+                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                banner.stop(state)
+                raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+            state.last_snapshot = post_snapshot
+            state.turns_completed += 1
+
+            done = post_snapshot.is_complete
+            new_plan_exists = _exec_plan_path(new_plan_path, exec_ctx).is_file()
+
+            if new_plan_exists:
+                active_plan_path = new_plan_path
+
+            max_turns_reached = turn_number >= effective_max_turns
+
+            conditions = {
+                "DONE": done,
+                "NEW_PLAN_EXISTS": new_plan_exists,
+                "MAX_TURNS_REACHED": max_turns_reached,
+            }
+
+            selected_transition = None
+            transition_target = None
+            try:
+                selected_transition = _select_transition(
+                    step.go,
+                    step_path=step_path,
+                    done=done,
+                    new_plan_exists=new_plan_exists,
+                    max_turns_reached=max_turns_reached,
+                )
+                transition_target = selected_transition.to
+            except WorkflowError as exc:
+                state.status_message = "failed"
+                _record_issue("transition-failed", exc.summary, turn_dir=turn_dir)
+                _finalize_turn_record(
+                    status="transition-failed",
+                    started_at=turn_started_at,
+                    snapshot_before=snapshot_before,
+                    snapshot_after=post_snapshot,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    returncode=completed.returncode,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    active_path=active_plan_path,
+                    new_path=new_plan_path,
+                    conditions=conditions,
+                    preserve_terminal_outcome_on_observer_error=True,
+                )
+                report = _manager_terminal_incident(
+                    trigger="illegal_transition", reason=exc.summary, current_step=current_step_name,
+                    current_role=step.role, active_team=active_team_name, active_selector=selector,
+                )
+                summary = report or _format_failure(
+                    reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
+                )
+                write_run_metadata(
+                    run_paths, config, state, status="failed", failure_reason=summary,
+                    turns_completed=state.turns_completed,
+                    last_snapshot=state.last_snapshot,
+                    execution_context=exec_ctx,
+                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    resumed_from_run_id=resumed_from_run_id,
+                )
+                banner.stop(state)
+                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
+            except Exception as exc:
+                _raise_unexpected_started_turn_failure(
+                    exc,
+                    invocation=invocation,
+                    turn_dir=turn_dir,
+                    started_at=turn_started_at,
+                    step_name=current_step_name,
+                    step_role=step.role,
+                    selector=selector,
+                    snapshot_before=snapshot_before,
+                    post_snapshot=post_snapshot,
+                    completed=completed,
+                    conditions=conditions,
+                )
+
+            review_rejection: ReviewRejectionRecord | None = None
+            scope_before_finalize = state.active_implementation_scope
+            controller_next_step = (
+                wf.steps.get(transition_target)
+                if transition_target != "END" else None
+            )
+            is_scoped_rejection = (
+                scope_before_finalize is not None
+                and scope_before_finalize.awaiting_review
+                and step.role != "worker"
+                and not done
+                and new_plan_exists
+                and snapshot_before == post_snapshot
+                and controller_next_step is not None
+                and controller_next_step.role == "worker"
+            )
+            if is_scoped_rejection:
+                attempts = state.implementation_attempts.get(scope_before_finalize.scope_id, [])
+                if not attempts:
+                    raise WorkflowError(
+                        "internal error: review rejection has no implementation attempt",
+                        run_dir=run_paths.run_dir,
+                    )
+                reviewed_attempt = attempts[-1]
+                repair_path = new_plan_path if new_plan_exists else None
+                try:
+                    repair_path_text = str(repair_path.relative_to(run_paths.repo_root)) if repair_path else None
+                except ValueError:
+                    repair_path_text = str(repair_path) if repair_path else None
+                matching = [
+                    item.rejection_number for item in state.review_rejection_history
+                    if item.scope_id == scope_before_finalize.scope_id
+                ]
+                review_rejection = ReviewRejectionRecord(
+                    scope_id=scope_before_finalize.scope_id,
+                    rejection_number=max(matching, default=0) + 1,
+                    source_run_id=state.run_id or run_paths.run_dir.name,
+                    review_turn_number=turn_number,
+                    review_step_name=current_step_name,
+                    reviewer_selector=selector,
+                    checkpoint_index=scope_before_finalize.checkpoint_index,
+                    checkpoint_name=scope_before_finalize.checkpoint_name,
+                    reviewed_implementation_turn_number=reviewed_attempt.turn_number,
+                    reviewed_worker_team=reviewed_attempt.team,
+                    reviewed_worker_selector=reviewed_attempt.selector,
+                    review_summary=summarize_review_rejection(completed.stdout),
+                    repair_plan_summary=summarize_repair_plan(repair_path),
+                    review_stdout_artifact_path=_turn_artifact_display_path(
+                        run_paths.repo_root, turn_dir, "stdout.txt",
+                        content=completed.stdout,
+                    ),
+                    repair_plan_path=repair_path_text,
+                )
+
             _finalize_turn_record(
-                status="plan-invalid",
-                started_at=turn_started_at,
-                snapshot_before=snapshot_before,
-                snapshot_after=None,
-                invocation=invocation,
-                turn_dir=turn_dir,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                returncode=completed.returncode,
-                error=str(exc),
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                active_path=active_plan_path,
-                new_path=new_plan_path,
-                conditions={"DONE": done, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
-            )
-            report = _manager_terminal_incident(
-                trigger="invalid_plan", reason=str(exc), current_step=current_step_name,
-                current_role=step.role, active_team=active_team_name, active_selector=selector,
-            )
-            summary = report or _format_failure(
-                reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
-                parse_error=exc if isinstance(exc, PlanParseError) else None,
-            )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                turns_completed=state.turns_completed,
-                execution_context=exec_ctx,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
-            )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
-
-        state.pending_retry = None
-
-        if _handle_harness_recovery(
-            turn_number=turn_number,
-            step_name=current_step_name,
-            step=step,
-            step_path=step_path,
-            active_team_name=active_team_name,
-            selector=selector,
-            resolved=resolved,
-            invocation=invocation,
-            turn_dir=turn_dir,
-            started_at=turn_started_at,
-            snapshot_before=snapshot_before,
-            snapshot_after=post_snapshot,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            returncode=completed.returncode,
-        ):
-            turn_number += 1
-            continue
-
-        state.consecutive_harness_recoveries = 0
-
-        if completed.returncode != 0:
-            state.status_message = "failed"
-            _record_issue(
-                "harness-failed",
-                f"harness '{invocation.label}' exited with code {completed.returncode}",
-                turn_dir=turn_dir,
-            )
-            _finalize_turn_record(
-                status="harness-failed",
-                started_at=turn_started_at,
-                snapshot_before=snapshot_before,
-                snapshot_after=post_snapshot,
-                invocation=invocation,
-                turn_dir=turn_dir,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                returncode=completed.returncode,
-                step_name=current_step_name,
-                step_role=step.role,
-                selector=selector,
-                active_path=active_plan_path,
-                new_path=new_plan_path,
-                conditions={"DONE": post_snapshot.is_complete, "NEW_PLAN_EXISTS": False, "MAX_TURNS_REACHED": turn_number >= effective_max_turns},
-            )
-            report = _manager_terminal_incident(
-                trigger="ambiguous_failure",
-                reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
-                current_step=current_step_name, current_role=step.role,
-                active_team=active_team_name, active_selector=selector,
-            )
-            summary = report or _format_failure(
-                reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
-                run_dir=run_paths.run_dir, snapshot=post_snapshot,
-            )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                turns_completed=state.turns_completed,
-                last_snapshot=post_snapshot,
-                execution_context=exec_ctx,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
-            )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir)
-
-        state.last_snapshot = post_snapshot
-        state.turns_completed += 1
-
-        done = post_snapshot.is_complete
-        new_plan_exists = _exec_plan_path(new_plan_path, exec_ctx).is_file()
-
-        if new_plan_exists:
-            active_plan_path = new_plan_path
-
-        max_turns_reached = turn_number >= effective_max_turns
-
-        conditions = {
-            "DONE": done,
-            "NEW_PLAN_EXISTS": new_plan_exists,
-            "MAX_TURNS_REACHED": max_turns_reached,
-        }
-
-        selected_transition: GoTransition | None = None
-        transition_target: str | None = None
-        try:
-            selected_transition = _select_transition(
-                step.go,
-                step_path=step_path,
-                done=done,
-                new_plan_exists=new_plan_exists,
-                max_turns_reached=max_turns_reached,
-            )
-            transition_target = selected_transition.to
-        except WorkflowError as exc:
-            state.status_message = "failed"
-            _record_issue("transition-failed", exc.summary, turn_dir=turn_dir)
-            _finalize_turn_record(
-                status="transition-failed",
+                status="completed" if done else "running",
                 started_at=turn_started_at,
                 snapshot_before=snapshot_before,
                 snapshot_after=post_snapshot,
@@ -9212,112 +9679,56 @@ def run_workflow(
                 active_path=active_plan_path,
                 new_path=new_plan_path,
                 conditions=conditions,
-            )
-            report = _manager_terminal_incident(
-                trigger="illegal_transition", reason=exc.summary, current_step=current_step_name,
-                current_role=step.role, active_team=active_team_name, active_selector=selector,
-            )
-            summary = report or _format_failure(
-                reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
-            )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                turns_completed=state.turns_completed,
-                last_snapshot=state.last_snapshot,
-                execution_context=exec_ctx,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
-            )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
-
-        review_rejection: ReviewRejectionRecord | None = None
-        scope_before_finalize = state.active_implementation_scope
-        controller_next_step = (
-            wf.steps.get(transition_target)
-            if transition_target != "END" else None
-        )
-        is_scoped_rejection = (
-            scope_before_finalize is not None
-            and scope_before_finalize.awaiting_review
-            and step.role != "worker"
-            and not done
-            and new_plan_exists
-            and snapshot_before == post_snapshot
-            and controller_next_step is not None
-            and controller_next_step.role == "worker"
-        )
-        if is_scoped_rejection:
-            attempts = state.implementation_attempts.get(scope_before_finalize.scope_id, [])
-            if not attempts:
-                raise WorkflowError(
-                    "internal error: review rejection has no implementation attempt",
-                    run_dir=run_paths.run_dir,
-                )
-            reviewed_attempt = attempts[-1]
-            repair_path = new_plan_path if new_plan_exists else None
-            try:
-                repair_path_text = str(repair_path.relative_to(run_paths.repo_root)) if repair_path else None
-            except ValueError:
-                repair_path_text = str(repair_path) if repair_path else None
-            matching = [
-                item.rejection_number for item in state.review_rejection_history
-                if item.scope_id == scope_before_finalize.scope_id
-            ]
-            review_rejection = ReviewRejectionRecord(
-                scope_id=scope_before_finalize.scope_id,
-                rejection_number=max(matching, default=0) + 1,
-                source_run_id=state.run_id or run_paths.run_dir.name,
-                review_turn_number=turn_number,
-                review_step_name=current_step_name,
-                reviewer_selector=selector,
-                checkpoint_index=scope_before_finalize.checkpoint_index,
-                checkpoint_name=scope_before_finalize.checkpoint_name,
-                reviewed_implementation_turn_number=reviewed_attempt.turn_number,
-                reviewed_worker_team=reviewed_attempt.team,
-                reviewed_worker_selector=reviewed_attempt.selector,
-                review_summary=summarize_review_rejection(completed.stdout),
-                repair_plan_summary=summarize_repair_plan(repair_path),
-                review_stdout_artifact_path=_turn_artifact_display_path(
-                    run_paths.repo_root, turn_dir, "stdout.txt",
-                    content=completed.stdout,
+                chosen_transition=transition_target,
+                chosen_transition_condition=selected_transition.when,
+                end_reason=(
+                    _normalize_end_reason(
+                        selected_transition=selected_transition,
+                        done=done,
+                        max_turns_reached=max_turns_reached,
+                    )
+                    if (
+                        transition_target == "END"
+                        and selected_transition is not None
+                        and post_snapshot.is_complete
+                    )
+                    else None
                 ),
-                repair_plan_path=repair_path_text,
+                was_retry=True if retry_ctx is not None else None,
+                retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
+                review_rejection=review_rejection,
             )
-
-        _finalize_turn_record(
-            status="completed" if done else "running",
-            started_at=turn_started_at,
-            snapshot_before=snapshot_before,
-            snapshot_after=post_snapshot,
-            invocation=invocation,
-            turn_dir=turn_dir,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            returncode=completed.returncode,
-            step_name=current_step_name,
-            step_role=step.role,
-            selector=selector,
-            active_path=active_plan_path,
-            new_path=new_plan_path,
-            conditions=conditions,
-            chosen_transition=transition_target,
-            chosen_transition_condition=selected_transition.when,
-            end_reason=(
-                _normalize_end_reason(
-                    selected_transition=selected_transition,
-                    done=done,
-                    max_turns_reached=max_turns_reached,
-                )
-                if transition_target == "END" and selected_transition is not None
-                else None
-            ),
-            was_retry=True if retry_ctx is not None else None,
-            retry_attempt=retry_ctx.attempt if retry_ctx is not None else None,
-            review_rejection=review_rejection,
-        )
+        except OwnerStopRequested:
+            return _finish_owner_stop(
+                invocation=invocation,
+                turn_dir=turn_dir,
+                started_at=turn_started_at,
+                step_name=current_step_name,
+                step_role=step.role,
+                selector=selector,
+                snapshot_before=snapshot_before,
+                post_snapshot=post_snapshot,
+                completed=completed,
+            )
+        except Exception as exc:
+            _raise_unexpected_started_turn_failure(
+                exc,
+                invocation=invocation,
+                turn_dir=turn_dir,
+                started_at=turn_started_at,
+                step_name=current_step_name,
+                step_role=step.role,
+                selector=selector,
+                snapshot_before=snapshot_before,
+                post_snapshot=post_snapshot,
+                completed=completed,
+                conditions=conditions,
+                chosen_transition=transition_target,
+                chosen_transition_condition=(
+                    selected_transition.when
+                    if selected_transition is not None else None
+                ),
+            )
         if review_rejection is not None:
             state.review_rejection_history.append(review_rejection)
 
@@ -9375,30 +9786,21 @@ def run_workflow(
         ):
             _close_implementation_scope(state)
 
-        # Preserve the legacy MAX_TURNS transition when supervision is off.
-        # With supervision enabled, exhaustion is itself the finalized
-        # terminal boundary and must go directly to Full rather than through a
-        # normal Lite transition gate.
-        if workflow_config.manager.enabled and max_turns_reached and not done:
+        # Exhaustion is a finalized terminal boundary regardless of whether
+        # manager supervision is enabled. Full enriches the incident when it
+        # is available, but cannot turn an incomplete plan into success.
+        if max_turns_reached and not done:
             reason = f"reached max turns limit of {effective_max_turns} without completing the active plan"
-            state.status_message = "failed"
             report = _manager_terminal_incident(
                 trigger="max_turns", reason=reason, current_step=current_step_name,
                 current_role=step.role, active_team=active_team_name, active_selector=selector,
             )
-            summary = report or _format_failure(
-                reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
+            _raise_incomplete_terminal_failure(
+                reason=reason,
+                post_snapshot=post_snapshot,
+                turn_dir=turn_dir,
+                manager_report=report,
             )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                turns_completed=state.turns_completed, last_snapshot=post_snapshot,
-                execution_context=exec_ctx, workflow_name=workflow_name,
-                original_plan_path=original_plan_path, current_step_name=current_step_name,
-                active_plan_path=active_plan_path, new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
-            )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
         # A same-step cap is a terminal controller boundary, not a normal
         # transition followed by a second manager call.  Decide it before the
@@ -9510,6 +9912,14 @@ def run_workflow(
         )
 
         if transition_target == "END":
+            if not post_snapshot.is_complete:
+                _raise_incomplete_terminal_failure(
+                    reason=(
+                        "workflow selected END while the active plan remains incomplete"
+                    ),
+                    post_snapshot=post_snapshot,
+                    turn_dir=turn_dir,
+                )
             end_reason = _normalize_end_reason(
                 selected_transition=selected_transition,
                 done=done,

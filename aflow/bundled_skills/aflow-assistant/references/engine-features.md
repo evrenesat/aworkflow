@@ -216,6 +216,12 @@ operators `&&`, `||`, `!`, `(`, `)`. Anything else is a config error.
   `false` while an earlier repair plan remains active.
 - `MAX_TURNS_REACHED` — true only on the last allowed turn.
 
+`MAX_TURNS_REACHED` remains routing evidence, so a transition may still select
+`END` on the final turn. Terminal success nevertheless requires the post-turn
+original-plan snapshot to be complete. An incomplete max-turn or unconditional
+`END` fails without an `end_reason` and does not enter merge or worktree-removal
+teardown.
+
 ### `preserve_active_plan`
 
 When a non-`END` transition has `preserve_active_plan = true` and the turn
@@ -602,13 +608,18 @@ Observer events (`ExecutionEventType`): `run_started`, `status_changed`,
 `run_failed`, `hotplug_requested`, `hotplug_stage_changed`, `hotplug_applied`,
 `hotplug_failed`.
 
-Turn statuses to know: `starting` (interrupted/abandoned if no final result),
-`retry-scheduled` (clean exit but inconsistent checkpoint state),
-`plan-invalid`, `completed`. Run statuses: `running`, `completed`, `failed`,
+Turn statuses to know: `starting`, `retry-scheduled` (clean exit but inconsistent
+checkpoint state), `plan-invalid`, `harness-failed`, `transition-failed`,
+`owner-stopped`, `completed`. After a durable `starting` artifact, an ordinary
+catchable exception produces exactly one terminal turn artifact and a failed,
+resumable run. Exception evidence is redacted, single-line, and capped at 512
+characters; unexpected provider boundaries are not retried automatically.
+Run statuses: `running`, `completed`, `failed`,
 `waiting_for_valid_override`, `waiting_for_hotplug_recovery`.
 
 `end_reason` values: `already_complete`, `done`, `max_turns_reached`,
-`transition_end`.
+`transition_end`. They are successful outcomes only; failed incomplete `END`
+selections omit `end_reason`.
 
 ## 12. CLI Surface
 

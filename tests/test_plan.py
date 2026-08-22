@@ -856,20 +856,28 @@ class ActivePlanLifecycleTests(unittest.TestCase):
                 prompts={'p': 'Active: {ACTIVE_PLAN_PATH}.'},
             )
 
-            result = run_workflow(
-                ControllerConfig(
-                    repo_root=repo_root,
-                    plan_path=plan_path,
-                    max_turns=6,
-                ),
-                wf_config,
-                'loop',
-                config_dir=repo_root,
-                adapter=CodexAdapter(),
-                runner=capturing_runner,
-            )
+            with pytest.raises(
+                WorkflowError,
+                match='reached max turns limit',
+            ) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=6,
+                    ),
+                    wf_config,
+                    'loop',
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=capturing_runner,
+                )
 
-            assert result.turns_completed == 6
+            run_json = json.loads(
+                (ctx.value.run_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            assert run_json['status'] == 'failed'
+            assert run_json['turns_completed'] == 6
             assert captured_active == [
                 str(plan_path),
                 str(fix_v01),
@@ -882,7 +890,7 @@ class ActivePlanLifecycleTests(unittest.TestCase):
             assert next_turn_run_state[5] == str(fix_v02)
             assert next_turn_run_state[6] == str(plan_path)
 
-            run_dir = next((repo_root / '.aflow' / 'runs').iterdir())
+            run_dir = ctx.value.run_dir
             expected = [
                 plan_path,
                 fix_v01,
