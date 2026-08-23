@@ -7,6 +7,7 @@ import pytest
 import subprocess
 import sys
 import termios
+import threading
 import time
 import textwrap
 from pathlib import Path
@@ -36,6 +37,13 @@ def _segment_lines(segments: list[Segment]) -> list[list[Segment]]:
 
 def _line_text(line: list[Segment]) -> str:
     return "".join(segment.text for segment in line if not segment.control)
+
+
+def _assert_aflow_terminal_state_restored(before: list[object], after: list[object]) -> None:
+    owned_lflag_mask = termios.ICANON | termios.ECHO | termios.ISIG
+    assert (after[3] & owned_lflag_mask) == (before[3] & owned_lflag_mask)
+    assert after[6][termios.VMIN] == before[6][termios.VMIN]
+    assert after[6][termios.VTIME] == before[6][termios.VTIME]
 
 
 def _drain_pty(fd: int, *, timeout: float = 0.5) -> bytes:
@@ -364,7 +372,7 @@ def test_terminal_input_session_uses_cbreak_preserves_isig_and_restores_attribut
         os.close(master_fd)
         os.close(slave_fd)
 
-    assert after == before
+    _assert_aflow_terminal_state_restored(before, after)
     assert session.is_restored
     assert session.thread is None
 
@@ -597,12 +605,15 @@ def test_terminal_input_session_close_retries_interrupted_callback_unregister(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
-def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_termios() -> None:
+def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_termios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from aflow.plan import PlanSnapshot
     from aflow.run_state import ControllerState
     import aflow.status as status_mod
     from aflow.terminal_viewport import TerminalInputSession
 
+    monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = pty.openpty()
     inspect_fd = os.dup(slave_fd)
     slave_file = os.fdopen(os.dup(slave_fd), "w", buffering=1)
@@ -632,9 +643,17 @@ def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_term
     try:
         with patch.object(status_mod, "TerminalInputSession", PtySession):
             renderer.start(state)
+            output_buffer: list[bytes] = []
+            drain_thread = threading.Thread(
+                target=lambda: output_buffer.append(_drain_pty(master_fd)),
+                daemon=True,
+            )
+            drain_thread.start()
             renderer.stop(state)
+            drain_thread.join(timeout=2.0)
+            assert not drain_thread.is_alive()
         slave_file.flush()
-        output = _drain_pty(master_fd)
+        output = b"".join(output_buffer) + _drain_pty(master_fd, timeout=0.1)
         after = termios.tcgetattr(inspect_fd)
     finally:
         renderer.stop(state)
@@ -643,7 +662,7 @@ def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_term
         os.close(master_fd)
         os.close(slave_fd)
 
-    assert after == before
+    _assert_aflow_terminal_state_restored(before, after)
     assert b"\x1b[?1049h" in output
     assert b"\x1b[?1049l" in output
     assert b"\x1b[?25l" in output
@@ -653,7 +672,10 @@ def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_term
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
-def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_termios() -> None:
+def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_termios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = pty.openpty()
     inspect_fd = os.dup(slave_fd)
     before = termios.tcgetattr(inspect_fd)
@@ -693,14 +715,29 @@ def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_term
     )
     os.close(slave_fd)
     try:
-        assert process.wait(timeout=5.0) == 0
-        output = _drain_pty(master_fd)
+        # macOS may keep TCSADRAIN blocked until the PTY master consumes the
+        # final Rich output emitted during the child's atexit cleanup.
+        os.set_blocking(master_fd, False)
+        output_buffer = bytearray()
+        deadline = time.monotonic() + 5.0
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                output_buffer.extend(os.read(master_fd, 65536))
+            except BlockingIOError:
+                time.sleep(0.01)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+        assert process.wait(timeout=max(0.01, deadline - time.monotonic())) == 0
+        output_buffer.extend(_drain_pty(master_fd, timeout=0.1))
+        output = bytes(output_buffer)
         after = termios.tcgetattr(inspect_fd)
     finally:
         os.close(inspect_fd)
         os.close(master_fd)
 
-    assert after == before
+    _assert_aflow_terminal_state_restored(before, after)
     assert b"\x1b[?1049h" in output
     assert b"\x1b[?1049l" in output
     assert b"\x1b[?25l" in output

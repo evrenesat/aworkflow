@@ -1104,6 +1104,13 @@ class GitBannerTests(unittest.TestCase):
         from datetime import datetime, timezone
         import aflow.status as status_mod
 
+        def transition_segments(console: Console, panel: object) -> list[object]:
+            return [
+                segment
+                for segment in console.render(panel)
+                if not segment.control and ("├─go→" in segment.text or "END" in segment.text)
+            ]
+
         active_steps = {
             "go": WorkflowStepConfig(role="worker", go=(GoTransition(to="END"),)),
         }
@@ -1135,10 +1142,13 @@ class GitBannerTests(unittest.TestCase):
             state=active_state,
         )
         assert active_panel is not None
-        active_console = Console(record=True, width=120, force_terminal=True, color_system="standard")
-        active_console.print(active_panel)
-        active_text = active_console.export_text(styles=True)
-        assert "\x1b[37m  ├─go→ \x1b[0m\x1b[1mEND\x1b[0m" in active_text
+        active_console = Console(width=120)
+        active_segments = transition_segments(active_console, active_panel)
+        assert "├─go→ END" in "".join(segment.text for segment in active_segments)
+        active_arrow = next(segment for segment in active_segments if "├─go→" in segment.text)
+        active_end = next(segment for segment in active_segments if "END" in segment.text)
+        assert active_arrow.style.color.name == "white"
+        assert active_end.style.bold is True
 
         skipped_steps = {
             "prep": WorkflowStepConfig(role="worker", go=(GoTransition(to="END"),)),
@@ -1160,10 +1170,14 @@ class GitBannerTests(unittest.TestCase):
             state=skipped_state,
         )
         assert skipped_panel is not None
-        skipped_console = Console(record=True, width=120, force_terminal=True, color_system="standard")
-        skipped_console.print(skipped_panel)
-        skipped_text = skipped_console.export_text(styles=True)
-        assert "\x1b[38;5;244m  ├─go→ \x1b[0m\x1b[1;38;5;244mEND\x1b[0m" in skipped_text
+        skipped_console = Console(width=120)
+        skipped_segments = transition_segments(skipped_console, skipped_panel)
+        assert "├─go→ END" in "".join(segment.text for segment in skipped_segments)
+        skipped_arrow = next(segment for segment in skipped_segments if "├─go→" in segment.text)
+        skipped_end = next(segment for segment in skipped_segments if "END" in segment.text)
+        assert skipped_arrow.style.color.name == "grey50"
+        assert skipped_end.style.color.name == "grey50"
+        assert skipped_end.style.bold is True
 
     def test_workflow_show_renders_end_transition_with_included_style(self) -> None:
         from rich.console import Console

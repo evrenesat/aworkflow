@@ -656,7 +656,14 @@ def test_reasonix_discovery_is_initialize_only_and_does_not_mutate_model(monkeyp
             return {"result": {"agentCapabilities": {"loadSession": True, "promptCapabilities": {"embeddedContext": True}}}}
         def close(self): self.calls.append("close")
     fake = FakeProcess()
-    monkeypatch.setattr(workflow_module.shutil, "which", lambda name: "/usr/local/bin/reasonix")
+    reasonix = tmp_path / "reasonix"
+    reasonix.write_text("#!/bin/sh\nexit 0\n")
+    reasonix.chmod(0o755)
+    monkeypatch.setattr(
+        workflow_module.shutil,
+        "which",
+        lambda name: str(reasonix) if name == "reasonix" else None,
+    )
     monkeypatch.setattr(ReasonixAcpProcess, "start", lambda **kwargs: fake)
     driver = workflow_module._discover_session_driver(ReasonixAdapter(), repo_root=tmp_path)
     assert driver is not None
