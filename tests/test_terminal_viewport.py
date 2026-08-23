@@ -7,6 +7,7 @@ import pytest
 import subprocess
 import sys
 import termios
+import threading
 import time
 import textwrap
 from pathlib import Path
@@ -642,9 +643,17 @@ def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_term
     try:
         with patch.object(status_mod, "TerminalInputSession", PtySession):
             renderer.start(state)
+            output_buffer: list[bytes] = []
+            drain_thread = threading.Thread(
+                target=lambda: output_buffer.append(_drain_pty(master_fd)),
+                daemon=True,
+            )
+            drain_thread.start()
             renderer.stop(state)
+            drain_thread.join(timeout=2.0)
+            assert not drain_thread.is_alive()
         slave_file.flush()
-        output = _drain_pty(master_fd)
+        output = b"".join(output_buffer) + _drain_pty(master_fd, timeout=0.1)
         after = termios.tcgetattr(inspect_fd)
     finally:
         renderer.stop(state)
