@@ -604,12 +604,15 @@ def test_terminal_input_session_close_retries_interrupted_callback_unregister(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
-def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_termios() -> None:
+def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_termios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from aflow.plan import PlanSnapshot
     from aflow.run_state import ControllerState
     import aflow.status as status_mod
     from aflow.terminal_viewport import TerminalInputSession
 
+    monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = pty.openpty()
     inspect_fd = os.dup(slave_fd)
     slave_file = os.fdopen(os.dup(slave_fd), "w", buffering=1)
@@ -660,7 +663,10 @@ def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_term
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX terminal attributes")
-def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_termios() -> None:
+def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_termios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = pty.openpty()
     inspect_fd = os.dup(slave_fd)
     before = termios.tcgetattr(inspect_fd)

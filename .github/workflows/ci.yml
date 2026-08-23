@@ -10,9 +10,6 @@ on:
 permissions:
   contents: read
 
-env:
-  TERM: xterm-256color
-
 jobs:
   test:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
