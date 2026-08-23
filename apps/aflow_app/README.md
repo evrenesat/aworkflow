@@ -6,11 +6,11 @@ The remote app provides project discovery, provider-neutral planning-session reu
 
 Full documentation lives in [../../docs/remote-app.md](../../docs/remote-app.md).
 
-The server also exposes a daemon-backed control-plane API under
-`/api/control-plane`. It reads and mutates run state only through AFlow's
-shared daemon/control-plane services; the HTTP process does not own workflow
-processes. The former `/api/executions` endpoints remain deprecated
-compatibility aliases for allowlisted projects.
+The server exposes lifecycle REST only through project-scoped routes under
+`/api/control-plane`. REST and MCP delegate to the same durable control-plane
+application and services; the HTTP process does not own workflow processes.
+Clients must carry `project_id` in supported lifecycle routes, and the former
+unscoped execution routes no longer exist.
 
 ## Running
 

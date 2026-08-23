@@ -518,42 +518,6 @@ Test plan for testing.
         assert response.status_code == 404
 
 
-class TestExecutionEndpoints:
-    """Tests for execution endpoints."""
-
-    def test_start_execution_project_not_found(self, client_with_config: TestClient) -> None:
-        """Test starting execution for non-existent project."""
-        response = client_with_config.post(
-            "/api/executions",
-            json={
-                "project_id": "nonexistent",
-                "plan_path": "test.md",
-            },
-        )
-        assert response.status_code == 404
-
-    def test_start_execution_plan_not_found(
-        self,
-        client_with_config: TestClient,
-        test_config: ServerConfig,
-    ) -> None:
-        """Test starting execution with non-existent plan."""
-        project_path = _create_git_project(test_config.projects_home, "test_project")
-        project_id = _project_id_for_path(client_with_config, project_path)
-
-        response = client_with_config.post(
-            "/api/executions",
-            json={
-                "project_id": project_id,
-                "plan_path": "nonexistent.md",
-            },
-        )
-        assert response.status_code == 404
-
-    def test_get_execution_not_found(self, client_with_config: TestClient) -> None:
-        """Test getting non-existent execution."""
-        response = client_with_config.get("/api/executions/nonexistent")
-        assert response.status_code == 404
 class TestPlanDraftEndpoints:
     """Tests for plan draft management endpoints."""
 

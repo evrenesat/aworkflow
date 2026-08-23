@@ -918,23 +918,6 @@ class UpdateProjectRequest(BaseModel):
     alias: str | None = None
 
 
-class ExecuteRequest(BaseModel):
-    project_id: str
-    plan_path: str
-    workflow_name: str | None = None
-    team: str | None = None
-    start_step: str | None = None
-    max_turns: int | None = None
-    extra_instructions: str | None = None
-
-
-class StartupResponse(BaseModel):
-    prepared: bool
-    question: dict[str, Any] | None = None
-    error: str | None = None
-    run_id: str | None = None
-
-
 # Project endpoints
 @app.get("/api/projects")
 async def list_projects(
@@ -999,82 +982,6 @@ async def list_plans(
 
     plans = service.list_plans(project.current_path)
     return [plan.to_dict() for plan in plans]
-
-
-# Execution endpoints
-@app.post("/api/executions")
-def start_execution(
-    request: ExecuteRequest,
-    response: Response,
-    _: str = Depends(verify_token),
-    control_plane: ControlPlaneService = Depends(get_control_plane_service),
-) -> StartupResponse:
-    """Deprecated compatibility route backed by the daemon control plane."""
-    response.headers["Deprecation"] = "true"
-    if request.extra_instructions:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={"code": "prompt_instructions_not_supported"},
-        )
-    result = control_plane.start_run(
-        request.project_id,
-        plan_path=request.plan_path,
-        workflow_name=request.workflow_name,
-        team=request.team,
-        start_step=request.start_step,
-        max_turns=request.max_turns,
-        idempotency_key=None,
-    )
-    adapted = _start_response(result)
-    if adapted.startup_question is not None:
-        return StartupResponse(
-            prepared=False,
-            question=adapted.startup_question.model_dump(mode="json"),
-            run_id=adapted.startup_question.run_id,
-        )
-    assert adapted.result is not None
-    return StartupResponse(
-        prepared=adapted.result.status == "running",
-        run_id=adapted.result.run_id,
-    )
-
-
-@app.get("/api/executions/{run_id}")
-def get_execution_status(
-    run_id: str,
-    response: Response,
-    _: str = Depends(verify_token),
-    control_plane: ControlPlaneService = Depends(get_control_plane_service),
-) -> dict[str, Any]:
-    """Deprecated compatibility status lookup over allowlisted daemons."""
-    response.headers["Deprecation"] = "true"
-    _, run = control_plane.find_run(run_id)
-    return RunStatusResponse.from_canonical(run).model_dump(mode="json")
-
-
-@app.get("/api/executions/{run_id}/events")
-async def stream_execution_events(
-    run_id: str,
-    response: Response,
-    _: str = Depends(verify_token),
-    control_plane: ControlPlaneService = Depends(get_control_plane_service),
-) -> EventSourceResponse:
-    """Deprecated header-authenticated SSE alias with one bounded event snapshot."""
-    response.headers["Deprecation"] = "true"
-    project_id, _ = control_plane.find_run(run_id)
-    snapshot = EventTailResponse(
-        events=tuple(
-            EventResponse.from_canonical(event)
-            for event in control_plane.events(
-                project_id, run_id, after_sequence=None, limit=100
-            )
-        )
-    )
-
-    async def event_generator():
-        yield {"event": "events", "data": snapshot.model_dump_json()}
-
-    return EventSourceResponse(event_generator())
 
 
 # Transcription endpoints
