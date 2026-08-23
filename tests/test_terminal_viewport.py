@@ -706,8 +706,23 @@ def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_term
     )
     os.close(slave_fd)
     try:
-        assert process.wait(timeout=5.0) == 0
-        output = _drain_pty(master_fd)
+        # macOS may keep TCSADRAIN blocked until the PTY master consumes the
+        # final Rich output emitted during the child's atexit cleanup.
+        os.set_blocking(master_fd, False)
+        output_buffer = bytearray()
+        deadline = time.monotonic() + 5.0
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                output_buffer.extend(os.read(master_fd, 65536))
+            except BlockingIOError:
+                time.sleep(0.01)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+        assert process.wait(timeout=max(0.01, deadline - time.monotonic())) == 0
+        output_buffer.extend(_drain_pty(master_fd, timeout=0.1))
+        output = bytes(output_buffer)
         after = termios.tcgetattr(inspect_fd)
     finally:
         os.close(inspect_fd)
