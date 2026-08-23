@@ -13,11 +13,13 @@ import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
+import aflow.daemon_cli as daemon_cli
 from aflow.daemon import DaemonError
 from aflow.daemon_cli import (
     DaemonPidRecord,
     _claim_pidfile,
     _owned_run_processes,
+    _owned_run_processes_from_ps,
     _release_pidfile,
     daemon_status,
     daemon_stop,
@@ -77,6 +79,7 @@ def test_status_reports_only_direct_owned_daemon_workers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     record = _claim_pidfile(tmp_path)
+    config_path = tmp_path / "aflow.toml"
     worker = subprocess.Popen(
         (
             sys.executable,
@@ -85,6 +88,8 @@ def test_status_reports_only_direct_owned_daemon_workers(
             "daemon-worker",
             "--repo-root",
             str(tmp_path.resolve()),
+            "--config",
+            str(config_path.resolve()),
             "--run-id",
             "owned-run",
         )
@@ -101,6 +106,254 @@ def test_status_reports_only_direct_owned_daemon_workers(
     finally:
         worker.terminate()
         worker.wait(timeout=2)
+        _release_pidfile(tmp_path, record)
+
+
+def _ps_row(pid: int, ppid: int, command: str) -> str:
+    return f"{pid} {ppid} {command}"
+
+
+def _worker_command(repo_root: Path, config_path: Path, run_id: str) -> str:
+    return (
+        f"/usr/bin/aflow daemon-worker --repo-root {repo_root} "
+        f"--config {config_path} --run-id {run_id}"
+    )
+
+
+def test_owned_run_processes_uses_real_ps_fallback_with_spaced_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "repo with spaces"
+    repo_root.mkdir()
+    config_path = tmp_path / "config with spaces" / "aflow.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("", encoding="utf-8")
+    worker = subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "daemon-worker",
+            "--repo-root",
+            str(repo_root.resolve()),
+            "--config",
+            str(config_path.resolve()),
+            "--run-id",
+            "portable-run",
+        )
+    )
+    monkeypatch.setattr(daemon_cli, "_owned_run_processes_from_proc", lambda *_: None)
+    try:
+        assert _owned_run_processes(os.getpid(), repo_root) == (
+            ("portable-run", worker.pid),
+        )
+    finally:
+        worker.terminate()
+        worker.wait(timeout=2)
+
+
+def test_ps_parser_returns_sorted_direct_owned_workers_and_ignores_other_shapes(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo with spaces"
+    config_path = tmp_path / "config with spaces" / "aflow.toml"
+    other_root = tmp_path / "other repo"
+    output = "\n".join(
+        (
+            _ps_row(500, 1, "/usr/bin/aflow daemon start"),
+            _ps_row(
+                503,
+                500,
+                _worker_command(repo_root.resolve(), config_path.resolve(), "z-run"),
+            ),
+            _ps_row(
+                501,
+                500,
+                _worker_command(repo_root.resolve(), config_path.resolve(), "a-run"),
+            ),
+            _ps_row(
+                504,
+                499,
+                _worker_command(
+                    repo_root.resolve(), config_path.resolve(), "not-direct"
+                ),
+            ),
+            _ps_row(505, 500, "/bin/sh -c sleep 30"),
+            _ps_row(
+                506, 500, "/usr/bin/aflow run --repo-root /tmp/legacy --run-id legacy"
+            ),
+            _ps_row(
+                507,
+                500,
+                _worker_command(
+                    other_root.resolve(), config_path.resolve(), "other-run"
+                ),
+            ),
+        )
+    )
+
+    assert _owned_run_processes_from_ps(output, 500, repo_root) == (
+        ("a-run", 501),
+        ("z-run", 503),
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    (
+        "not a process row",
+        "500 1",
+        "0 1 command",
+        "500 -1 command",
+        "pid 1 command",
+        "500 parent command",
+        "500 1",
+    ),
+)
+def test_ps_parser_rejects_malformed_process_rows(tmp_path: Path, bad_row: str) -> None:
+    output = "\n".join((_ps_row(500, 1, "daemon"), bad_row))
+    with pytest.raises(DaemonError, match="ambiguous"):
+        _owned_run_processes_from_ps(output, 500, tmp_path)
+
+
+def test_ps_parser_rejects_duplicate_pid_and_missing_daemon_row(tmp_path: Path) -> None:
+    duplicate = "\n".join(
+        (
+            _ps_row(500, 1, "daemon"),
+            _ps_row(501, 500, "child"),
+            _ps_row(501, 500, "duplicate"),
+        )
+    )
+    missing = _ps_row(501, 500, "child")
+    for output in (duplicate, missing):
+        with pytest.raises(DaemonError, match="ambiguous"):
+            _owned_run_processes_from_ps(output, 500, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "/usr/bin/aflow daemon-worker --config /tmp/config --run-id valid",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --run-id valid",
+        "/usr/bin/aflow daemon-worker --config /tmp/config --repo-root /tmp/repo --run-id valid",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --config /tmp/config",
+        "/usr/bin/aflow daemon-worker --unexpected value --repo-root /tmp/repo --config /tmp/config --run-id valid",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --config /tmp/config --run-id valid --extra",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --config relative.toml --run-id valid",
+        "/usr/bin/aflow daemon-worker --repo-root relative-repo --config /tmp/config --run-id valid",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --config /tmp/config --run-id INVALID",
+        "/usr/bin/aflow daemon-worker /tmp/repo --repo-root /tmp/repo --config /tmp/config --run-id valid",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --config /tmp/config --run-id valid daemon-worker",
+        "/usr/bin/aflow daemon-worker --repo-root /tmp/repo --config /tmp/repo --config /tmp/config --run-id valid",
+    ),
+)
+def test_ps_parser_rejects_malformed_direct_worker_candidates(
+    tmp_path: Path, command: str
+) -> None:
+    output = "\n".join((_ps_row(500, 1, "daemon"), _ps_row(501, 500, command)))
+    with pytest.raises(DaemonError, match="ambiguous"):
+        _owned_run_processes_from_ps(output, 500, tmp_path)
+
+
+def test_ps_parser_rejects_marker_like_path_contents(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo --config embedded"
+    command = _worker_command(repo_root, tmp_path / "config.toml", "valid")
+    output = "\n".join((_ps_row(500, 1, "daemon"), _ps_row(501, 500, command)))
+    with pytest.raises(DaemonError, match="ambiguous"):
+        _owned_run_processes_from_ps(output, 500, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        FileNotFoundError("secret process output"),
+        subprocess.TimeoutExpired("ps", 5, output="secret process output"),
+    ),
+)
+def test_ps_runner_maps_expected_failures_to_bounded_errors(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> object:
+        assert args == (("ps", "-ww", "-axo", "pid=,ppid=,command="),)
+        assert kwargs == {
+            "check": False,
+            "capture_output": True,
+            "text": True,
+            "timeout": 5.0,
+        }
+        raise failure
+
+    monkeypatch.setattr(daemon_cli.subprocess, "run", fake_run)
+    with pytest.raises(DaemonError) as caught:
+        daemon_cli._read_ps_process_table()
+    assert "secret process output" not in str(caught.value)
+
+
+def test_ps_runner_maps_nonzero_and_empty_results_to_bounded_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args[0], 1, stdout="secret process output", stderr="secret"
+        )
+
+    monkeypatch.setattr(daemon_cli.subprocess, "run", fake_run)
+    with pytest.raises(DaemonError) as caught:
+        daemon_cli._read_ps_process_table()
+    assert "secret process output" not in str(caught.value)
+
+    monkeypatch.setattr(
+        daemon_cli.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout="", stderr=""
+        ),
+    )
+    monkeypatch.setattr(daemon_cli, "_owned_run_processes_from_proc", lambda *_: None)
+    with pytest.raises(DaemonError, match="ambiguous"):
+        _owned_run_processes(os.getpid(), tmp_path)
+
+
+def test_status_is_ambiguous_when_portable_inventory_is_unavailable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _claim_pidfile(tmp_path)
+    monkeypatch.setattr(
+        daemon_cli,
+        "_owned_run_processes_from_proc",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        daemon_cli,
+        "_read_ps_process_table",
+        lambda: (_ for _ in ()).throw(DaemonError("ps process table unavailable")),
+    )
+    try:
+        assert daemon_status(tmp_path) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("daemon status is ambiguous:")
+        assert "owned runs: 0" not in captured.err
+    finally:
+        _release_pidfile(tmp_path, record)
+
+
+def test_status_is_ambiguous_when_daemon_identity_changes_during_inventory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _claim_pidfile(tmp_path)
+    states = iter(("matching", "mismatched"))
+    monkeypatch.setattr(daemon_cli, "_record_process_state", lambda _: next(states))
+    monkeypatch.setattr(daemon_cli, "_owned_run_processes", lambda *_: ())
+    try:
+        assert daemon_status(tmp_path) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == (
+            "daemon status is ambiguous: daemon identity changed during worker inspection\n"
+        )
+        assert "owned runs: 0" not in captured.err
+    finally:
         _release_pidfile(tmp_path, record)
 
 

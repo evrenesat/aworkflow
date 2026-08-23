@@ -324,10 +324,15 @@ The lightweight local daemon starts with `aflow daemon start --foreground`.
 It owns one repository and exposes the shared 13-tool MCP registry over stdio;
 closing MCP input stops the daemon. Optional HTTP runs on `127.0.0.1` only and
 may be detached. `aflow daemon status` verifies the pidfile's process-birth
-identity and reports only direct `daemon-worker` children, not every legacy run
-directory. `aflow daemon stop`, SIGINT, and SIGTERM drain each child process
-group with SIGTERM followed by bounded SIGKILL escalation. A malformed pidfile
-or reused PID is ambiguous and never authorizes a signal.
+identity and reports only direct `daemon-worker` children for the verified
+repository, using Linux procfs or one bounded portable process-table snapshot.
+It rechecks the daemon's process-birth identity after worker inspection and
+before printing success. If ownership inspection is unavailable or untrusted,
+status is ambiguous and returns 2 rather than claiming zero workers; it does
+not inspect every legacy run directory. `aflow daemon stop`, SIGINT, and
+SIGTERM drain each child process group with SIGTERM followed by bounded SIGKILL
+escalation. A malformed pidfile or reused PID is ambiguous and never
+authorizes a signal.
 
 The production p100 control plane is a separate, allowlisted deployment over
 the same durable AFlow run state. `aflowd.service` uses systemd workflow units,

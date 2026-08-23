@@ -78,8 +78,11 @@ aflow daemon stop
 The daemon owns one repository. Each workflow runs in its own subprocess group;
 client EOF, `daemon stop`, SIGINT, and SIGTERM drain those owned children. A
 mode-0600 pidfile binds stop/status operations to the daemon's process-birth
-identity. This local mode does not serve REST or the React dashboard and does
-not replace the production `aflowd` deployment.
+identity. Status reports only direct workers for the verified repository, using
+Linux procfs or a portable process-table fallback. If ownership inspection is
+unavailable or untrusted, status returns an ambiguous nonzero result instead
+of claiming zero workers. This local mode does not serve REST or the React
+dashboard and does not replace the production `aflowd` deployment.
 
 A minimal plan has checkpoint headings and task items:
 
