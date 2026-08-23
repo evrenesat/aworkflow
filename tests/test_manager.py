@@ -33,6 +33,7 @@ from aflow.manager import (
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
     ActiveImplementationScope,
+    CheckpointRepartitionRecord,
     ControllerConfig,
     ControllerState,
     ExecutionContext,
@@ -44,6 +45,7 @@ from aflow.run_state import (
     PendingTeamOverride,
     ReviewRejectionRecord,
     manager_resume_fields,
+    manager_resume_fields_strict,
     manager_state_payload,
     restore_manager_state,
 )
@@ -1087,3 +1089,49 @@ def test_current_scope_preserves_run_wide_reviewer_rejections() -> None:
     assert isinstance(scope, ActiveImplementationScope)
     assert scope.opened_turn_number == 5
     assert scope.carried_reviewer_rejection_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    (
+        ("partition_ids", [], "partition_ids must be non-empty"),
+        ("child_summaries", [""], "child_summaries must be a list of strings"),
+    ),
+)
+def test_strict_manager_resume_rejects_repartition_history_that_would_be_dropped(
+    field: str,
+    value: list[str],
+    expected: str,
+) -> None:
+    record = CheckpointRepartitionRecord(
+        schema_version=1,
+        decision_number=1,
+        scope_id="scope-1",
+        generation_id="generation-1",
+        envelope_sha256="a" * 64,
+        envelope_artifact_sha256="b" * 64,
+        source_plan_sha256="c" * 64,
+        proposal_sha256="d" * 64,
+        candidate_plan_sha256="e" * 64,
+        partition_ids=("partition-1",),
+        child_summaries=("Child 1",),
+        current_disposition="implement_current_partition",
+        resolved_target_step="implement_plan",
+        resolved_target_role="worker",
+        current_partition_id="partition-1",
+        scope_pressure_reason=None,
+        envelope_artifact_path="scopes/scope-1/envelope.json",
+        proposal_artifact_path="manager/proposal.json",
+        candidate_artifact_path="manager/candidate.md",
+        mechanical_validation_artifact_path="manager/mechanical.json",
+        semantic_verdict_artifact_path="manager/semantic.json",
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 1, False),
+        repartition_history=[record],
+    )
+    payload = json.loads(json.dumps(manager_state_payload(state)))
+    payload["repartition_history"][0][field] = value
+
+    with pytest.raises(ValueError, match=expected):
+        manager_resume_fields_strict(payload)

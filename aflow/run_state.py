@@ -1693,7 +1693,9 @@ def manager_resume_fields_strict(
         partition_ids = item["partition_ids"]
         child_summaries = item["child_summaries"]
         string_list(partition_ids, f"{label}.partition_ids", nonempty=True)
-        string_list(child_summaries, f"{label}.child_summaries")
+        if not partition_ids:
+            raise ValueError(f"{label}.partition_ids must be non-empty")
+        string_list(child_summaries, f"{label}.child_summaries", nonempty=True)
         if len(child_summaries) != len(partition_ids):
             raise ValueError(
                 f"{label}.child_summaries must match partition_ids length"
