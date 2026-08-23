@@ -21,12 +21,10 @@ AFlow invokes existing CLIs rather than provider APIs. The selected harness must
 already be installed and authenticated. Adapters are included for Claude,
 Codex, Copilot, Gemini, Kiro, OpenCode, Pi, and Reasonix.
 
-Before a real harness process starts, AFlow performs a bounded,
-adapter-neutral environment preflight. It verifies the selected executable and
-lets an adapter add a local prerequisite check. Reasonix uses reasonix doctor
---json to report enforced sandboxing that requires an executable bwrap.
-AFlow reports missing prerequisites and never installs packages, repairs
-configuration, or checks authentication, quota, network, or provider health.
+Before starting a harness, AFlow checks that its required local tools are
+available. If a requirement is missing, AFlow stops and explains what is
+needed. It does not install or repair anything, and it does not verify
+authentication, quota, network access, or provider health.
 
 ## Install
 
