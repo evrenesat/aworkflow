@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -55,6 +56,7 @@ def _compact_run(run: dict[str, Any]) -> dict[str, Any]:
         "current_step": run.get("current_step") or last.get("current_step"),
         "is_complete": last.get("is_complete"),
         "plan_name": plan_name,
+        "resumed_from_run_id": run.get("resumed_from_run_id"),
         "workflow_name": run.get("workflow_name"),
         "team": run.get("team"),
     }
@@ -127,19 +129,56 @@ def _is_uv_wrapper(record: ProcessRecord) -> bool:
     return Path(first).name == "uv"
 
 
+def _command_tokens(command: str) -> tuple[str, ...] | None:
+    try:
+        return tuple(shlex.split(command, posix=True))
+    except ValueError:
+        return None
+
+
+def _explicit_resume_identity(tokens: tuple[str, ...]) -> str | None:
+    occurrences: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token == "--resume":
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                occurrences.append("")
+            else:
+                occurrences.append(tokens[index + 1])
+                index += 1
+        elif token.startswith("--resume="):
+            occurrences.append(token.partition("=")[2])
+        index += 1
+    if len(occurrences) != 1 or not occurrences[0]:
+        return None
+    return occurrences[0]
+
+
 def _matching_controllers(
     records: Iterable[ProcessRecord],
     run_id: str,
     plan_path: str | None,
+    resumed_from_run_id: str | None = None,
 ) -> tuple[list[ProcessRecord], list[ProcessRecord]]:
+    allowed_resume_ids = {run_id}
+    if isinstance(resumed_from_run_id, str) and resumed_from_run_id:
+        allowed_resume_ids.add(resumed_from_run_id)
+
     matches: list[ProcessRecord] = []
     for record in records:
         command = record.command
         if not re.search(r"(?:^|[/\s])aflow(?:\s|$).*?\brun\b", command):
             continue
-        if run_id not in command and not (
-            isinstance(plan_path, str) and plan_path and plan_path in command
-        ):
+        tokens = _command_tokens(command)
+        resume_identity = (
+            _explicit_resume_identity(tokens) if tokens is not None else None
+        )
+        resume_matches = resume_identity in allowed_resume_ids
+        plan_matches = isinstance(plan_path, str) and plan_path and plan_path in command
+        if not (resume_matches or plan_matches):
             continue
         matches.append(record)
 
@@ -319,10 +358,14 @@ def collect_snapshot(
     )
     records = process_records if process_records is not None else _list_processes()
     plan_path = run.get("original_plan_path") or run.get("plan_path")
+    resumed_from_run_id = run.get("resumed_from_run_id")
     controllers, wrappers = _matching_controllers(
         records,
         run_id,
         plan_path if isinstance(plan_path, str) else None,
+        resumed_from_run_id
+        if isinstance(resumed_from_run_id, str) and resumed_from_run_id
+        else None,
     )
     descendants = _descendants(records, [record.pid for record in controllers])
     latest_result = _latest_result(run_path.parent)
