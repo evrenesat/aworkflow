@@ -6,6 +6,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
 import subprocess
+import sys
 from threading import Thread
 import tomllib
 
@@ -14,6 +15,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy" / "aflowd"
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="aflowd deployment scripts require Linux systemd, GNU tools, and Tailscale networking",
+)
 
 
 def _run(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

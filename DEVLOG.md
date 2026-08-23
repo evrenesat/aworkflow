@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-08-23 — Restore the supported cross-platform test matrix (F-07)
+
+- The documented root suite now has a truthful Linux/macOS boundary: Linux runs
+  the p100 deployment tests, while macOS skips only that 15-test Linux module.
+- Repaired ownership guidance, executable Reasonix, Rich transition, and
+  AFlow-owned terminal-state test expectations without changing production
+  behavior.
+- Added reusable Ubuntu/macOS Python 3.11 CI and made package publication wait
+  for the same workflow before building or uploading.
+
 ## 2026-08-23 — Make local daemon worker status portable and truthful (F-06)
 
 - Local daemon status preserves Linux procfs ownership inspection and uses one

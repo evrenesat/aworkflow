@@ -38,6 +38,13 @@ def _line_text(line: list[Segment]) -> str:
     return "".join(segment.text for segment in line if not segment.control)
 
 
+def _assert_aflow_terminal_state_restored(before: list[object], after: list[object]) -> None:
+    owned_lflag_mask = termios.ICANON | termios.ECHO | termios.ISIG
+    assert (after[3] & owned_lflag_mask) == (before[3] & owned_lflag_mask)
+    assert after[6][termios.VMIN] == before[6][termios.VMIN]
+    assert after[6][termios.VTIME] == before[6][termios.VTIME]
+
+
 def _drain_pty(fd: int, *, timeout: float = 0.5) -> bytes:
     os.set_blocking(fd, False)
     output = bytearray()
@@ -364,7 +371,7 @@ def test_terminal_input_session_uses_cbreak_preserves_isig_and_restores_attribut
         os.close(master_fd)
         os.close(slave_fd)
 
-    assert after == before
+    _assert_aflow_terminal_state_restored(before, after)
     assert session.is_restored
     assert session.thread is None
 
@@ -643,7 +650,7 @@ def test_banner_renderer_pty_normal_cleanup_restores_rich_screen_cursor_and_term
         os.close(master_fd)
         os.close(slave_fd)
 
-    assert after == before
+    _assert_aflow_terminal_state_restored(before, after)
     assert b"\x1b[?1049h" in output
     assert b"\x1b[?1049l" in output
     assert b"\x1b[?25l" in output
@@ -700,7 +707,7 @@ def test_banner_renderer_pty_atexit_cleanup_restores_rich_screen_cursor_and_term
         os.close(inspect_fd)
         os.close(master_fd)
 
-    assert after == before
+    _assert_aflow_terminal_state_restored(before, after)
     assert b"\x1b[?1049h" in output
     assert b"\x1b[?1049l" in output
     assert b"\x1b[?25l" in output

@@ -169,6 +169,13 @@ aflow daemon --help
 uv run pytest -q
 ```
 
+`uv run pytest -q` is the supported root test command on Linux and macOS. Linux
+runs the p100/systemd deployment module; macOS explicitly skips those 15
+Linux-only tests and runs all core tests. Pull requests and pushes to `main`
+run Python 3.11 on Ubuntu and macOS, and the package build waits for both
+platform test jobs. Publication calls the same reusable CI workflow before
+uploading a package.
+
 The optional remote management app lives in `apps/aflow_app/` and is not
 included in the published wheel. Its server requires Python 3.12+ and exposes a
 provider-neutral planning-session API; Codex integration is implemented through
