@@ -726,9 +726,9 @@ def write_run_metadata(
     merge_failure_reason: str | None = None,
     last_snapshot: PlanSnapshot | None = None,
     turns_completed: int | None = None,
-    workflow_name: str | None = None,
+    workflow_name: str,
     current_step_name: str | None = None,
-    original_plan_path: Path | None = None,
+    original_plan_path: Path,
     active_plan_path: Path | None = None,
     new_plan_path: Path | None = None,
     pending_retry: RetryContext | None = None,
@@ -736,6 +736,40 @@ def write_run_metadata(
     issues_summary_path: str | None = None,
     resumed_from_run_id: str | None = None,
 ) -> None:
+    if not isinstance(workflow_name, str) or not workflow_name.strip():
+        raise ValueError("workflow_name must be a non-empty string")
+    if not isinstance(original_plan_path, Path) or not str(original_plan_path):
+        raise ValueError("original_plan_path must be a non-empty path")
+    for field_name, value in (
+        ("max_turns", config.max_turns),
+        (
+            "effective_max_turns",
+            state.effective_max_turns
+            if state is not None and state.effective_max_turns is not None
+            else config.max_turns,
+        ),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{field_name} must be a positive integer")
+    if any(
+        not isinstance(item, str) for item in config.extra_instructions
+    ):
+        raise ValueError("extra_instructions must be a list of strings")
+    if state is not None:
+        if state.current_team is not None and (
+            not isinstance(state.current_team, str) or not state.current_team.strip()
+        ):
+            raise ValueError("team must be null or a non-empty string")
+        if (
+            state.selected_start_step is not None
+            and (
+                not isinstance(state.selected_start_step, str)
+                or not state.selected_start_step.strip()
+            )
+        ):
+            raise ValueError(
+                "selected_start_step must be null or a non-empty string"
+            )
     previous: Mapping[str, object] = {}
     if paths.run_json.is_file():
         try:
@@ -744,6 +778,10 @@ def write_run_metadata(
             loaded = {}
         if isinstance(loaded, Mapping):
             previous = loaded
+    if previous and previous.get("schema_version") != RUN_STATE_SCHEMA_VERSION:
+        raise ValueError(
+            "cannot overwrite run metadata with an unsupported resume state schema"
+        )
     # A terminal manager report is the authoritative failure summary.  Some
     # callers add merge/recovery metadata in a later write without repeating
     # that summary; retain it rather than replacing it with an empty field.
@@ -757,6 +795,8 @@ def write_run_metadata(
         "run_dir": str(paths.run_dir),
         "status": status,
         "plan_path": str(config.plan_path),
+        "workflow_name": workflow_name,
+        "original_plan_path": str(original_plan_path),
         "max_turns": config.max_turns,
         "keep_runs": config.keep_runs,
         "extra_instructions": list(config.extra_instructions),
@@ -786,20 +826,15 @@ def write_run_metadata(
         ):
             if key in previous:
                 payload[key] = previous[key]
-    if workflow_name is not None:
-        payload["workflow_name"] = workflow_name
     if current_step_name is not None:
         payload["current_step_name"] = current_step_name
-    if original_plan_path is not None:
-        payload["original_plan_path"] = str(original_plan_path)
     if active_plan_path is not None:
         payload["active_plan_path"] = str(active_plan_path)
     if new_plan_path is not None:
         payload["new_plan_path"] = str(new_plan_path)
-    if team is not None:
-        payload["team"] = team
-    elif state is not None and state.current_team is not None:
-        payload["team"] = state.current_team
+    payload["team"] = team if team is not None else (
+        state.current_team if state is not None else None
+    )
     if state is not None and state.issues_summary_path is not None:
         payload["issues_summary_path"] = state.issues_summary_path
     elif issues_summary_path is not None:
@@ -833,6 +868,37 @@ def write_run_metadata(
         payload["selected_start_step"] = None
         payload["startup_recovery_used"] = False
         payload["startup_recovery_reason"] = None
+        payload["effective_max_turns"] = config.max_turns
+
+    lifecycle_setup = payload.get("lifecycle_setup", [])
+    lifecycle_teardown = payload.get("lifecycle_teardown", [])
+    if not isinstance(lifecycle_setup, list) or not all(
+        isinstance(item, str) for item in lifecycle_setup
+    ):
+        raise ValueError("lifecycle_setup must be a list of strings")
+    if not isinstance(lifecycle_teardown, list) or not all(
+        isinstance(item, str) for item in lifecycle_teardown
+    ):
+        raise ValueError("lifecycle_teardown must be a list of strings")
+    payload["lifecycle_setup"] = lifecycle_setup
+    payload["lifecycle_teardown"] = lifecycle_teardown
+
+    frozen_config = payload.get("frozen_config")
+    if frozen_config is None and previous.get("schema_version") == RUN_STATE_SCHEMA_VERSION:
+        frozen_config = previous.get("frozen_config")
+    if not isinstance(frozen_config, Mapping) or any(
+        not isinstance(frozen_config.get(field), str)
+        or not str(frozen_config.get(field)).strip()
+        for field in ("workflow_name", "config_path", "config_fingerprint")
+    ):
+        raise ValueError("frozen_config must contain current non-empty identity fields")
+    payload["frozen_config"] = dict(frozen_config)
+
+    durable_state = state
+    if durable_state is None:
+        durable_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    payload.update(manager_state_payload(durable_state))
+    payload.update(hotplug_state_payload(durable_state))
     if end_reason is not None:
         payload["end_reason"] = end_reason
     if failure_reason is not None:
@@ -873,9 +939,6 @@ def write_run_metadata(
             pass
     if state is not None and state.harness_recovery_history:
         payload.update(build_recovery_payload(state.current_harness_recovery, state.harness_recovery_history))
-    if state is not None:
-        payload.update(manager_state_payload(state))
-        payload.update(hotplug_state_payload(state))
     _write_atomic_json(paths.run_json, payload)
 
 

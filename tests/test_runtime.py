@@ -8,6 +8,7 @@ from aflow.analyzer import extract_text_signals
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.config import ErrorHandlingConfig, HarnessErrorRecoveryConfig, HarnessErrorRecoveryRuleConfig, ManagerConfig, TeamConfig
 from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
+from aflow.repartition import create_envelope
 from aflow.api.events import CollectingObserver, ExecutionEventType, TurnFinishedEvent
 from aflow.run_state import (
     ActiveImplementationScope,
@@ -82,6 +83,38 @@ def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
         scope["checkpoint_name"],
         len(artifacts),
     )
+
+
+def _modernize_resume_scope(
+    scope: ActiveImplementationScope,
+    *,
+    plan_path: Path,
+    repo_root: Path,
+) -> tuple[ActiveImplementationScope, bytes]:
+    """Build the complete immutable scope authority used by direct resume tests."""
+    envelope = create_envelope(
+        scope_id=scope.scope_id,
+        original_plan_path=plan_path,
+        plan_text=plan_path.read_text(encoding="utf-8"),
+        checkpoint_index=scope.checkpoint_index or 1,
+        repo_root=repo_root,
+    )
+    payload = envelope.to_dict()
+    payload["canonical_envelope_sha256"] = envelope.canonical_envelope_sha256
+    envelope_bytes = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )
+    modern_scope = replace(
+        scope,
+        checkpoint_name=envelope.checkpoint_name,
+        envelope_artifact_path=f"scopes/{envelope.scope_digest}/envelope.json",
+        envelope_artifact_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
+        envelope_canonical_sha256=envelope.canonical_envelope_sha256,
+    )
+    return modern_scope, envelope_bytes
 
 
 def _resume_override_workflow_config() -> WorkflowUserConfig:
@@ -1320,17 +1353,31 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 config_path=str(repo_root),
                 config_fingerprint="abc123",
             )
-            write_run_metadata(paths, config, state, status="running")
+            write_run_metadata(
+                paths,
+                config,
+                state,
+                status="running",
+                workflow_name="simple",
+                original_plan_path=plan_path,
+            )
             previous = paths.run_json.read_text(encoding="utf-8")
 
             state.status_message = "new state"
             with patch("aflow.runlog.os.replace", side_effect=OSError("interrupted")):
                 with pytest.raises(OSError, match="interrupted"):
-                    write_run_metadata(paths, config, state, status="running")
+                    write_run_metadata(
+                        paths,
+                        config,
+                        state,
+                        status="running",
+                        workflow_name="simple",
+                        original_plan_path=plan_path,
+                    )
 
             assert paths.run_json.read_text(encoding="utf-8") == previous
             payload = json.loads(previous)
-            assert payload["schema_version"] == 1
+            assert payload["schema_version"] == 2
             assert payload["frozen_config"]["config_fingerprint"] == "abc123"
 
     def test_valid_boundary_override_routes_once_and_appends_notes(self) -> None:
@@ -7762,6 +7809,9 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 opened_turn_number=1,
                 awaiting_review=False,
             )
+            scope, scope_envelope_bytes = _modernize_resume_scope(
+                scope, plan_path=plan_path, repo_root=repo_root
+            )
             captured_prompt: list[str] = []
             next_scope_captured_before_worker: list[bool] = []
 
@@ -7801,6 +7851,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     active_plan_path=logical_repair,
                     interrupted_step_name='implement',
                     active_implementation_scope=scope,
+                    scope_envelope_bytes=scope_envelope_bytes,
                     pending_boundary_decision=PendingBoundaryDecision(
                         finalized_turn_number=3,
                         decision_number=9,
@@ -8006,6 +8057,9 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 opened_turn_number=3,
                 awaiting_review=True,
             )
+            scope, scope_envelope_bytes = _modernize_resume_scope(
+                scope, plan_path=plan_path, repo_root=repo_root
+            )
             calls: list[str] = []
             prompts: list[str] = []
 
@@ -8079,6 +8133,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                         ),
                     },
                     active_implementation_scope=scope,
+                    scope_envelope_bytes=scope_envelope_bytes,
                     pending_finalized_turn=PendingFinalizedTurn(
                         source_run_dir=source_run,
                         turn_number=4,
@@ -8375,6 +8430,9 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 opened_turn_number=1,
                 awaiting_review=False,
             )
+            scope, scope_envelope_bytes = _modernize_resume_scope(
+                scope, plan_path=plan_path, repo_root=repo_root
+            )
             calls: list[tuple[str, str]] = []
 
             def runner(argv, **kwargs):
@@ -8411,6 +8469,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     teardown=(),
                     active_plan_path=logical_repair,
                     active_implementation_scope=scope,
+                    scope_envelope_bytes=scope_envelope_bytes,
                     pending_finalized_turn=PendingFinalizedTurn(
                         source_run_dir=repo_root / '.aflow' / 'runs' / 'prior-run',
                         turn_number=7,
@@ -9059,46 +9118,27 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             )
             assert first_turn["status"] == "retry-scheduled"
 
-    def test_legacy_resume_is_not_backfilled_until_next_scope(self) -> None:
+    def test_legacy_resume_scope_is_rejected_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            repo_root = root / "repo"
-            repo_root.mkdir()
-            _make_lifecycle_git_repo(repo_root, branch="main")
-            worktree_path = root / "worktree"
+            repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
-            _write_plan(
-                plan_path,
-                "# Plan\n\n"
-                "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
-                "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
-            )
-            _git_commit_file(repo_root, plan_path)
-            subprocess.run(
-                [
-                    "git", "worktree", "add", "-b", "resume-feature",
-                    str(worktree_path), "main",
-                ],
-                cwd=repo_root,
-                check=True,
-                capture_output=True,
-                text=True,
+            _write_plan(plan_path, _VALID_PLAN)
+            scope = ActiveImplementationScope(
+                scope_id=f"{plan_path}::checkpoint-1::legacy",
+                original_plan_path=str(plan_path),
+                checkpoint_index=1,
+                checkpoint_name="First",
+                opened_turn_number=1,
             )
             workflow = WorkflowConfig(
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
                         prompts=("p",),
-                        go=(
-                            GoTransition(to="END", when="DONE"),
-                            GoTransition(to="implement"),
-                        ),
-                    ),
+                        go=(GoTransition(to="END", when="DONE"),),
+                    )
                 },
                 first_step="implement",
-                setup=("worktree", "branch"),
-                teardown=(),
-                main_branch="main",
             )
             wf_config = WorkflowUserConfig(
                 roles={"worker": "codex.worker"},
@@ -9108,111 +9148,26 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 workflows={"legacy": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
             )
-            legacy_scope_id = f"{plan_path}::checkpoint-1::first"
-            legacy_payload = {
-                "manager_decision_number": 2,
-                "semantic_stall_count": 1,
-                "reviewer_rejection_count": 0,
-                "implementation_attempts": {
-                    legacy_scope_id: [
-                        {
-                            "turn_number": 1,
-                            "step_name": "implement",
-                            "role": "worker",
-                            "team": None,
-                            "selector": "codex.worker",
-                            "outcome": "completed",
-                            "manager_decision_number": 1,
-                        },
-                    ],
-                },
-                "active_implementation_scope": {
-                    "scope_id": legacy_scope_id,
-                    "original_plan_path": str(plan_path),
-                    "checkpoint_index": 1,
-                    "checkpoint_name": "First",
-                    "opened_turn_number": 1,
-                    "awaiting_review": False,
-                    "carried_reviewer_rejection_count": 0,
-                },
-            }
-            assert not any(
-                key in legacy_payload["active_implementation_scope"]
-                for key in (
-                    "envelope_artifact_path",
-                    "envelope_artifact_sha256",
-                    "envelope_canonical_sha256",
+            with pytest.raises(WorkflowError, match="complete envelope reference"):
+                run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                    wf_config,
+                    "legacy",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                        argv, 0, "unexpected", ""
+                    ),
+                    resume=ResumeContext(
+                        resumed_from_run_id="prior-run",
+                        feature_branch=None,
+                        worktree_path=None,
+                        main_branch=None,
+                        setup=(),
+                        teardown=(),
+                        active_implementation_scope=scope,
+                    ),
                 )
-            )
-            restored_manager_fields = manager_resume_fields(legacy_payload)
-            restored_scope = restored_manager_fields["active_implementation_scope"]
-            assert isinstance(restored_scope, ActiveImplementationScope)
-            assert not restored_scope.has_envelope
-            observations: list[object] = []
-
-            def runner(argv, **kwargs):
-                run_dir = next((repo_root / ".aflow" / "runs").iterdir())
-                payload = json.loads(
-                    (run_dir / "run.json").read_text(encoding="utf-8")
-                )
-                scope = payload["active_implementation_scope"]
-                execution_plan = Path(kwargs["cwd"]) / "plan.md"
-                if not observations:
-                    envelope_values = (
-                        scope.get("envelope_artifact_path"),
-                        scope.get("envelope_artifact_sha256"),
-                        scope.get("envelope_canonical_sha256"),
-                    )
-                    observations.append(
-                        (
-                            scope["checkpoint_index"],
-                            *envelope_values,
-                            not all(envelope_values),
-                            list((run_dir / "scopes").glob("*/envelope.json")),
-                        )
-                    )
-                    _write_plan(
-                        execution_plan,
-                        "# Plan\n\n"
-                        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
-                        "### [ ] Checkpoint 2: Second\n- [ ] step two\n",
-                    )
-                else:
-                    observations.append(_scope_envelope_observation(run_dir))
-                    _write_plan(
-                        execution_plan,
-                        "# Plan\n\n"
-                        "### [x] Checkpoint 1: First\n- [x] step one\n\n"
-                        "### [x] Checkpoint 2: Second\n- [x] step two\n",
-                    )
-                return subprocess.CompletedProcess(argv, 0, "worked", "")
-
-            result = run_workflow(
-                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
-                wf_config,
-                "legacy",
-                config_dir=repo_root,
-                adapter=CodexAdapter(),
-                runner=runner,
-                resume=ResumeContext(
-                    resumed_from_run_id="prior-run",
-                    feature_branch="resume-feature",
-                    worktree_path=worktree_path,
-                    main_branch="main",
-                    setup=("worktree", "branch"),
-                    teardown=(),
-                    interrupted_step_name="implement",
-                    **restored_manager_fields,
-                ),
-            )
-
-            assert result.final_snapshot.is_complete
-            assert observations[0] == (1, None, None, None, True, [])
-            next_scope = observations[1]
-            assert isinstance(next_scope, tuple)
-            assert next_scope[5:7] == (2, "Checkpoint 2: Second")
-            assert next_scope[-1] == 1
-            assert next_scope[4] != legacy_scope_id
 
     def test_review_without_repair_plan_is_not_recorded_as_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -12910,6 +12865,11 @@ def _run_upgrade_resume_scenario(
         1,
         awaiting_review=interruption != "before_worker",
     )
+    scope_envelope_bytes: bytes | None = None
+    if not legacy_scope:
+        scope, scope_envelope_bytes = _modernize_resume_scope(
+            scope, plan_path=plan_path, repo_root=repo_root
+        )
     attempts = [
         ImplementationAttempt(
             1, "implement", "worker", "default", "codex.worker-default", "progress"
@@ -13019,6 +12979,7 @@ def _run_upgrade_resume_scenario(
                 "checkpoint_name": scope.checkpoint_name,
                 "opened_turn_number": 5,
                 "awaiting_review": scope.awaiting_review,
+                "carried_reviewer_rejection_count": 0,
             },
         })
     resume = ResumeContext(
@@ -13029,6 +12990,7 @@ def _run_upgrade_resume_scenario(
         setup=("worktree", "branch"),
         teardown=(),
         active_plan_path=repair_path,
+        scope_envelope_bytes=scope_envelope_bytes,
         **resume_manager_fields,
     )
     workflow_models: list[str] = []
@@ -13141,32 +13103,22 @@ def test_manager_resume_carries_scope_rejections_into_first_boundary(
     assert scope["carried_reviewer_rejection_count"] == 2
 
 
-def test_manager_legacy_resume_discards_prior_checkpoint_rejections(
+def test_manager_legacy_resume_is_rejected_before_manager_decision(
     tmp_path: Path,
 ) -> None:
-    _, _, _, run_dir, _ = _run_upgrade_resume_scenario(
-        tmp_path,
-        interruption="before_review",
-        prior_reviewer_rejections=2,
-        legacy_scope=True,
-    )
-    result = json.loads(
-        (run_dir / "manager" / "decision-003" / "result.json").read_text()
-    )
-    context = json.loads(
-        (run_dir / "manager" / "decision-003" / "context.json").read_text()
-    )
-    scope = context["controller_state"]["active_implementation_scope"]
-    assert result["level"] == "lite"
-    assert context["controller_state"]["reviewer_rejection_count"] == 1
-    assert scope["opened_turn_number"] == 1
-    assert scope["carried_reviewer_rejection_count"] == 0
+    with pytest.raises(WorkflowError, match="complete envelope reference"):
+        _run_upgrade_resume_scenario(
+            tmp_path,
+            interruption="before_review",
+            prior_reviewer_rejections=2,
+            legacy_scope=True,
+        )
 
 
 def test_scope_pressure_with_legacy_resume_scope_fails_before_manager_decision(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(WorkflowError, match="legacy scope has no artifact"):
+    with pytest.raises(WorkflowError, match="complete envelope reference"):
         _run_upgrade_resume_scenario(
             tmp_path,
             interruption="before_review",
@@ -13174,8 +13126,8 @@ def test_scope_pressure_with_legacy_resume_scope_fails_before_manager_decision(
             pressure_on_first_reviewer=True,
         )
 
-    run_dir = next((tmp_path / "repo" / ".aflow" / "runs").iterdir())
-    assert not list((run_dir / "manager").glob("decision-*"))
+    run_root = tmp_path / "repo" / ".aflow" / "runs"
+    assert not run_root.exists() or not list(run_root.glob("*/manager/decision-*"))
 
 
 def test_manager_resume_before_stronger_worker_consumes_override_once(tmp_path: Path) -> None:

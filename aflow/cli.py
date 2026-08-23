@@ -154,7 +154,7 @@ class ResumeBootstrap:
     max_turns: int
     extra_instructions: tuple[str, ...]
     resume_context: ResumeContext
-    frozen_run_identity: FrozenRunIdentity | None = None
+    frozen_run_identity: FrozenRunIdentity
 
 
 INSTALL_SKILLS_HELP = """\
@@ -227,9 +227,8 @@ def _resume_plan_path(
     prev_run: Mapping[str, object],
     repo_root: Path,
 ) -> Path | None:
-    """Return the saved original plan path, including the legacy fallback."""
-    field_name = "original_plan_path" if "original_plan_path" in prev_run else "plan_path"
-    value = prev_run.get(field_name)
+    """Return the saved current original plan path."""
+    value = prev_run.get("original_plan_path")
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -242,24 +241,207 @@ def _resume_plan_path(
 
 
 def _resume_max_turns(prev_run: Mapping[str, object]) -> int | None:
-    """Return the saved invocation max-turns value, with legacy fallback."""
+    """Return the saved current invocation max-turns value."""
     value = prev_run.get("max_turns")
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
-    if "max_turns" in prev_run:
-        return None
-    effective_value = prev_run.get("effective_max_turns")
-    if (
-        isinstance(effective_value, int)
-        and not isinstance(effective_value, bool)
-        and effective_value > 0
-    ):
-        return effective_value
     return None
 
 
 def _resume_metadata_error(run_id: Path, field: str, detail: str) -> ValueError:
     return ValueError(f"error: run '{run_id.name}' has invalid {field}: {detail}.")
+
+
+_CURRENT_MANAGER_RESUME_FIELDS = frozenset({
+    "manager_decision_number",
+    "manager_history",
+    "semantic_stall_count",
+    "reviewer_rejection_count",
+    "implementation_attempts",
+    "active_implementation_scope",
+    "review_rejection_history",
+    "pending_manager_notes",
+    "pending_step_team_override",
+    "pending_boundary_decision",
+    "pending_repartition",
+    "repartition_history",
+    "scope_pressure_reason",
+    "last_manager_report_path",
+})
+
+
+def _validate_current_resume_metadata(
+    prev_run: Mapping[str, object],
+    run_id: Path,
+) -> None:
+    """Validate the complete schema-v2 controller snapshot before resume work."""
+    required_fields = {
+        "repo_root",
+        "workflow_name",
+        "original_plan_path",
+        "plan_path",
+        "team",
+        "selected_start_step",
+        "max_turns",
+        "effective_max_turns",
+        "extra_instructions",
+        "lifecycle_setup",
+        "lifecycle_teardown",
+        "frozen_config",
+        *_CURRENT_MANAGER_RESUME_FIELDS,
+        "hotplug_schema_version",
+        "role_selectors",
+        "current_hotplug_transaction",
+        "pending_hotplug_transaction",
+        "active_role_sessions",
+        "hotplug_transaction_number",
+        "hotplug_history",
+    }
+    missing_fields = sorted(field for field in required_fields if field not in prev_run)
+    if missing_fields:
+        raise _resume_metadata_error(
+            run_id,
+            "run.json",
+            "missing required current fields: " + ", ".join(missing_fields),
+        )
+
+    for field in ("repo_root", "workflow_name", "original_plan_path", "plan_path"):
+        value = prev_run.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise _resume_metadata_error(run_id, field, "expected a non-empty string")
+    team = prev_run.get("team")
+    if team is not None and (not isinstance(team, str) or not team.strip()):
+        raise _resume_metadata_error(
+            run_id, "team", "expected null or a non-empty string"
+        )
+    start_step = prev_run.get("selected_start_step")
+    if start_step is not None and (
+        not isinstance(start_step, str) or not start_step.strip()
+    ):
+        raise _resume_metadata_error(
+            run_id,
+            "selected_start_step",
+            "expected null or a non-empty string",
+        )
+    for field in ("max_turns", "effective_max_turns"):
+        value = prev_run.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise _resume_metadata_error(
+                run_id, field, "expected a positive integer"
+            )
+    extra = prev_run.get("extra_instructions")
+    if not isinstance(extra, list) or not all(isinstance(item, str) for item in extra):
+        raise _resume_metadata_error(run_id, "extra_instructions", "expected a list of strings")
+    for field in ("lifecycle_setup", "lifecycle_teardown"):
+        value = prev_run.get(field)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise _resume_metadata_error(run_id, field, "expected a list of strings")
+
+    for field in ("manager_history", "review_rejection_history", "repartition_history"):
+        value = prev_run.get(field)
+        if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+            raise _resume_metadata_error(run_id, field, "expected a list of mappings")
+    for field in (
+        "manager_decision_number",
+        "semantic_stall_count",
+        "reviewer_rejection_count",
+    ):
+        value = prev_run.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise _resume_metadata_error(run_id, field, "expected a non-negative integer")
+    for field in (
+        "pending_manager_notes",
+        "pending_step_team_override",
+        "pending_boundary_decision",
+        "pending_repartition",
+    ):
+        value = prev_run.get(field)
+        if value is not None and not isinstance(value, Mapping):
+            raise _resume_metadata_error(run_id, field, "expected a mapping or null")
+    for field in ("scope_pressure_reason", "last_manager_report_path"):
+        value = prev_run.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise _resume_metadata_error(
+                run_id, field, "expected a non-empty string or null"
+            )
+    attempts = prev_run.get("implementation_attempts")
+    if not isinstance(attempts, Mapping):
+        raise _resume_metadata_error(run_id, "implementation_attempts", "expected a mapping")
+    for scope_id, records in attempts.items():
+        if not isinstance(scope_id, str) or not scope_id.strip() or not isinstance(records, list):
+            raise _resume_metadata_error(
+                run_id,
+                "implementation_attempts",
+                "expected non-empty scope ids mapped to lists",
+            )
+        for record in records:
+            if not isinstance(record, Mapping) or not {
+                "turn_number", "step_name", "role", "outcome"
+            } <= set(record):
+                raise _resume_metadata_error(
+                    run_id,
+                    "implementation_attempts",
+                    "expected serialized ImplementationAttempt records",
+                )
+
+    active_scope = prev_run.get("active_implementation_scope")
+    if active_scope is not None:
+        if not isinstance(active_scope, Mapping):
+            raise _resume_metadata_error(
+                run_id, "active_implementation_scope", "expected a mapping or null"
+            )
+        required_scope_fields = {
+            "scope_id",
+            "original_plan_path",
+            "opened_turn_number",
+            "carried_reviewer_rejection_count",
+            "envelope_artifact_path",
+            "envelope_artifact_sha256",
+            "envelope_canonical_sha256",
+        }
+        missing_scope_fields = sorted(
+            field for field in required_scope_fields if field not in active_scope
+        )
+        if missing_scope_fields:
+            detail = "missing required fields: " + ", ".join(missing_scope_fields)
+            if any(field.startswith("envelope_") for field in missing_scope_fields):
+                detail = "invalid scope envelope reference: " + detail
+            raise _resume_metadata_error(
+                run_id,
+                "active_implementation_scope",
+                detail,
+            )
+        for field in (
+            "scope_id",
+            "original_plan_path",
+            "envelope_artifact_path",
+            "envelope_artifact_sha256",
+            "envelope_canonical_sha256",
+        ):
+            value = active_scope.get(field)
+            if not isinstance(value, str) or not value.strip():
+                detail = "expected a non-empty string"
+                if field.startswith("envelope_"):
+                    detail = "invalid scope envelope reference: " + detail
+                raise _resume_metadata_error(
+                    run_id,
+                    f"active_implementation_scope.{field}",
+                    detail,
+                )
+        for field in ("opened_turn_number", "carried_reviewer_rejection_count"):
+            value = active_scope.get(field)
+            minimum = 1 if field == "opened_turn_number" else 0
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise _resume_metadata_error(
+                    run_id,
+                    f"active_implementation_scope.{field}",
+                    f"expected an integer >= {minimum}",
+                )
+
+    try:
+        hotplug_resume_fields(prev_run)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise _resume_metadata_error(run_id, "hotplug state", str(exc)) from exc
 
 
 def _pending_repartition_error(
@@ -887,21 +1069,18 @@ def _validate_pending_repartition_resume_state(
 def _decode_frozen_run_identity(
     prev_run: Mapping[str, object],
     run_id: Path,
-) -> FrozenRunIdentity | None:
-    """Decode the persisted configuration identity without legacy guessing."""
-    if "schema_version" not in prev_run:
-        return None
-
+) -> FrozenRunIdentity:
+    """Admit only the exact current persisted schema and decode its identity."""
     schema_version = prev_run.get("schema_version")
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
         or schema_version != RUN_STATE_SCHEMA_VERSION
     ):
-        raise _resume_metadata_error(
-            run_id,
-            "schema_version",
-            f"expected integer {RUN_STATE_SCHEMA_VERSION}",
+        observed = "missing" if "schema_version" not in prev_run else repr(schema_version)
+        raise ValueError(
+            f"error: run '{run_id.name}' uses unsupported resume state schema; "
+            f"expected integer {RUN_STATE_SCHEMA_VERSION} (schema={observed})."
         )
 
     frozen_value = prev_run.get("frozen_config")
@@ -971,10 +1150,10 @@ def _bootstrap_resume_invocation(
             f"error: run '{resolved_run_id.name}' does not contain readable or valid run metadata."
         )
 
+    frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
+    _validate_current_resume_metadata(prev_run, resolved_run_id)
     plan_path = _resume_plan_path(prev_run, repo_root)
-    plan_field = (
-        "original_plan_path" if "original_plan_path" in prev_run else "plan_path"
-    )
+    plan_field = "original_plan_path"
     if plan_path is None:
         raise _resume_metadata_error(
             resolved_run_id,
@@ -1006,19 +1185,17 @@ def _bootstrap_resume_invocation(
         )
     workflow_spec = workflow_config.workflows[workflow_name]
 
-    frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
-    if frozen_run_identity is not None:
-        current_identity = _freeze_run_identity(
-            workflow_name,
-            workflow_config,
-            config_dir=config_path or (repo_root / "aflow.toml"),
+    current_identity = _freeze_run_identity(
+        workflow_name,
+        workflow_config,
+        config_dir=config_path or (repo_root / "aflow.toml"),
+    )
+    mismatch = _frozen_identity_mismatch(frozen_run_identity, current_identity)
+    if mismatch is not None:
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' frozen configuration mismatch: "
+            f"{mismatch}."
         )
-        mismatch = _frozen_identity_mismatch(frozen_run_identity, current_identity)
-        if mismatch is not None:
-            raise ValueError(
-                f"error: run '{resolved_run_id.name}' frozen configuration mismatch: "
-                f"{mismatch}."
-            )
 
     team_value = prev_run.get("team")
     if team_value is not None and (
@@ -1057,18 +1234,7 @@ def _bootstrap_resume_invocation(
             "max_turns",
             "expected a positive integer",
         )
-    if "effective_max_turns" in prev_run:
-        effective_max_turns = prev_run.get("effective_max_turns")
-        if effective_max_turns is not None and (
-            not isinstance(effective_max_turns, int)
-            or isinstance(effective_max_turns, bool)
-            or effective_max_turns < 1
-        ):
-            raise _resume_metadata_error(
-                resolved_run_id,
-                "effective_max_turns",
-                "expected null or a positive integer",
-            )
+    effective_max_turns = prev_run.get("effective_max_turns")
 
     extra_value = prev_run.get("extra_instructions")
     if not isinstance(extra_value, list) or not all(
@@ -1096,9 +1262,7 @@ def _bootstrap_resume_invocation(
                 f"but run '{resolved_run_id.name}' saved '{plan_path}'."
             )
 
-    effective_saved_team = (
-        saved_team if "team" in prev_run else workflow_spec.team
-    )
+    effective_saved_team = saved_team
     if team_arg is not None and team_arg != effective_saved_team:
         raise ValueError(
             f"error: resume team mismatch: requested '{team_arg}', "
@@ -1531,13 +1695,21 @@ def _reconstruct_resume_context(
     run_dir: Path,
     prev_run: Mapping[str, object],
     plan_path: Path,
-    frozen_run_identity: FrozenRunIdentity | None,
+    frozen_run_identity: FrozenRunIdentity,
     reset_scope: bool,
     require_resume: bool,
     workflow_steps: Mapping[str, object] | None = None,
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
+    if frozen_run_identity is None:
+        if require_resume:
+            raise _resume_metadata_error(
+                resolved_run_id,
+                "frozen_config",
+                "a current frozen run identity is required",
+            )
+        return None
     raw_feature_branch = prev_run.get("feature_branch")
     raw_worktree_path = prev_run.get("worktree_path")
     raw_main_branch = prev_run.get("main_branch")
@@ -1612,11 +1784,7 @@ def _reconstruct_resume_context(
     scope_envelope_source_path: str | None = None
     scope_envelope_bytes: bytes | None = None
     active_scope = manager_fields.get("active_implementation_scope")
-    if (
-        not reset_scope
-        and active_scope is not None
-        and hasattr(active_scope, "envelope_artifact_path")
-    ):
+    if not reset_scope and active_scope is not None:
         try:
             scope_envelope_bytes = load_scope_envelope_for_resume(
                 run_dir,
@@ -1627,10 +1795,9 @@ def _reconstruct_resume_context(
                 f"error: run '{run_id}' has invalid scope envelope reference: "
                 f"{exc.summary}"
             ) from exc
-        if scope_envelope_bytes is not None:
-            scope_envelope_source_path = str(
-                run_dir / active_scope.envelope_artifact_path
-            )
+        scope_envelope_source_path = str(
+            run_dir / active_scope.envelope_artifact_path
+        )
     pending_repartition, repartition_artifact_bytes = (
         _validate_pending_repartition_resume_state(
             raw_pending_repartition=(
@@ -1683,7 +1850,13 @@ def _reconstruct_resume_context(
         pending_override_notes = []
     effective_max_turns = prev_run.get("effective_max_turns")
     if not isinstance(effective_max_turns, int) or isinstance(effective_max_turns, bool) or effective_max_turns < 1:
-        effective_max_turns = None
+        if require_resume:
+            raise _resume_metadata_error(
+                resolved_run_id,
+                "effective_max_turns",
+                "expected a positive integer",
+            )
+        return None
     try:
         hotplug_fields = hotplug_resume_fields(prev_run)
     except (TypeError, ValueError, KeyError) as exc:
@@ -1778,6 +1951,7 @@ def _detect_resume_candidate(
                 prev_run,
                 resolved_run_id,
             )
+            _validate_current_resume_metadata(prev_run, resolved_run_id)
         except ValueError:
             if require_resume:
                 raise

@@ -18,7 +18,7 @@ WorkflowEndReason = Literal[
     "transition_end",
     "owner_stopped",
 ]
-RUN_STATE_SCHEMA_VERSION = 1
+RUN_STATE_SCHEMA_VERSION = 2
 OverrideLoadStatus = Literal[
     "absent",
     "valid",
@@ -404,14 +404,13 @@ class ActiveImplementationScope:
     opened_turn_number: int
     awaiting_review: bool = False
     carried_reviewer_rejection_count: int = 0
-    # Immutable envelope reference.  The three values are deliberately kept
+    # Immutable envelope reference. The three values are deliberately kept
     # separate so a resumed run can bind the artifact's exact bytes as well as
-    # its canonical semantic representation.  All three are absent for a
-    # legacy scope opened before scope-envelope capture existed.
+    # its canonical semantic representation.
     #
     # These use object rather than eagerly coercing deserialized JSON: resume
     # validation must reject malformed persisted authority, not quietly turn
-    # it into a legacy/no-envelope scope.
+    # it into a silently normalized historical scope.
     envelope_artifact_path: object | None = None
     envelope_artifact_sha256: object | None = None
     envelope_canonical_sha256: object | None = None
@@ -804,15 +803,36 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
     """Return compact durable manager controller state for ``run.json``."""
     from dataclasses import asdict
 
+    for scope_id, attempts in state.implementation_attempts.items():
+        if not isinstance(attempts, list) or any(
+            not isinstance(attempt, ImplementationAttempt) for attempt in attempts
+        ):
+            raise ValueError(
+                f"implementation attempts for scope '{scope_id}' must be a list "
+                "of ImplementationAttempt records"
+            )
+    active_scope = state.active_implementation_scope
+    if active_scope is not None:
+        envelope_values = (
+            active_scope.envelope_artifact_path,
+            active_scope.envelope_artifact_sha256,
+            active_scope.envelope_canonical_sha256,
+        )
+        if not active_scope.has_envelope or any(
+            not isinstance(value, str) or not value.strip()
+            for value in envelope_values
+        ):
+            raise ValueError(
+                "active implementation scope must include complete envelope references"
+            )
+
     return {
         "manager_decision_number": state.manager_decision_number,
         "manager_history": [asdict(item) for item in state.manager_history],
         "semantic_stall_count": state.semantic_stall_count,
         "reviewer_rejection_count": state.reviewer_rejection_count,
         "implementation_attempts": {
-            # Preserve old integer counters when a caller constructed legacy
-            # state directly; on disk they are read as empty attempt histories.
-            key: (attempts if isinstance(attempts, int) else [asdict(attempt) for attempt in attempts])
+            key: [asdict(attempt) for attempt in attempts]
             for key, attempts in state.implementation_attempts.items()
         },
         "active_implementation_scope": (
@@ -848,7 +868,7 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
 
 
 def hotplug_state_payload(state: ControllerState) -> dict[str, object]:
-    """Serialize hotplug authority with explicit, legacy-tolerant fields."""
+    """Serialize the complete current hotplug authority."""
     return {
         "hotplug_schema_version": 1,
         "role_selectors": dict(sorted(state.role_selectors.items())),
@@ -868,11 +888,23 @@ def hotplug_state_payload(state: ControllerState) -> dict[str, object]:
 
 def restore_hotplug_state(state: ControllerState, payload: Mapping[str, Any]) -> None:
     """Restore hotplug state, rejecting malformed modern authority before launch."""
-    if "hotplug_schema_version" not in payload:
-        return
     schema_version = payload.get("hotplug_schema_version")
     if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
         raise ValueError("unsupported hotplug state schema version")
+    required_fields = {
+        "hotplug_schema_version",
+        "role_selectors",
+        "current_hotplug_transaction",
+        "pending_hotplug_transaction",
+        "active_role_sessions",
+        "hotplug_transaction_number",
+        "hotplug_history",
+    }
+    missing_fields = sorted(field for field in required_fields if field not in payload)
+    if missing_fields:
+        raise ValueError(
+            "missing persisted hotplug fields: " + ", ".join(missing_fields)
+        )
     strict_children = True
     selectors = payload.get("role_selectors", {})
     if not isinstance(selectors, Mapping) or any(
@@ -935,7 +967,7 @@ def hotplug_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
 
 
 def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) -> None:
-    """Restore manager-only durable state from a legacy-tolerant run payload."""
+    """Restore manager-only durable state from a persisted run payload."""
     state.manager_decision_number = int(payload.get("manager_decision_number", 0) or 0)
     history = payload.get("manager_history")
     if isinstance(history, list):
@@ -987,9 +1019,6 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
     state.implementation_attempts = {}
     if isinstance(attempts, Mapping):
         for key, value in attempts.items():
-            if isinstance(value, int) and not isinstance(value, bool):
-                state.implementation_attempts[str(key)] = value  # type: ignore[assignment]
-                continue
             if not isinstance(value, list):
                 continue
             restored_attempts: list[ImplementationAttempt] = []
@@ -1010,11 +1039,9 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             state.implementation_attempts[str(key)] = restored_attempts
     scope = payload.get("active_implementation_scope")
     if isinstance(scope, Mapping) and {
-        "scope_id", "original_plan_path", "opened_turn_number"
+        "scope_id", "original_plan_path", "opened_turn_number",
+        "carried_reviewer_rejection_count",
     } <= set(scope):
-        has_scoped_rejection_count = (
-            "carried_reviewer_rejection_count" in scope
-        )
         # Preserve raw persisted envelope-reference values.  The resume
         # boundary validates their type, layout, hashes, and binding before
         # they are used; silently coercing or discarding malformed values
@@ -1036,7 +1063,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             opened_turn_number=int(scope["opened_turn_number"]),
             awaiting_review=bool(scope.get("awaiting_review", False)),
             carried_reviewer_rejection_count=int(
-                scope.get("carried_reviewer_rejection_count", 0) or 0
+                scope["carried_reviewer_rejection_count"]
             ),
             envelope_artifact_path=envelope_artifact,
             envelope_artifact_sha256=envelope_artifact_sha256,
@@ -1057,11 +1084,6 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 else None
             ),
         )
-        if not has_scoped_rejection_count:
-            # Pre-scoped run metadata may contain a poisoned whole-run total.
-            # The compact run payload has no finalized-turn history from which
-            # to reconstruct this scope, so resume it conservatively at zero.
-            state.reviewer_rejection_count = 0
     notes = payload.get("pending_manager_notes")
     if isinstance(notes, Mapping) and isinstance(notes.get("notes"), (list, tuple)):
         state.pending_manager_notes = PendingManagerNotes(
@@ -1347,7 +1369,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
 
 
 def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
-    """Return legacy-tolerant manager state suitable for ``ResumeContext``."""
+    """Return best-effort manager state suitable for status or resume decoding."""
     restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     restore_manager_state(restored, payload)
     return {
@@ -1356,7 +1378,7 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
         "semantic_stall_count": restored.semantic_stall_count,
         "reviewer_rejection_count": restored.reviewer_rejection_count,
         "implementation_attempts": {
-            key: (() if isinstance(attempts, int) else tuple(attempts))
+            key: tuple(attempts)
             for key, attempts in restored.implementation_attempts.items()
         },
         "active_implementation_scope": restored.active_implementation_scope,

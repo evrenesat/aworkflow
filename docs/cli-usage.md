@@ -79,19 +79,21 @@ Worktree workflows have two resume paths:
 - `aflow run --resume [RUN_ID]` makes resume mandatory. With no `RUN_ID`, `aflow` must resolve a previous run from shell-local state or fail. With a `RUN_ID`, it resumes that exact run or fails.
 
 Resume resolves and validates the selected run before startup preparation. Its
-`original_plan_path` is authoritative, with `plan_path` accepted only for
-legacy metadata, and the saved plan must still be readable. A caller may repeat
+`original_plan_path` is authoritative and must be present; `plan_path` is not a
+resume fallback, and the saved plan must still be readable. A caller may repeat
 the plan, workflow, team, start step, max-turns, or extra instructions only
 when the value is compatible with the saved invocation; conflicting values
 fail without creating a new run. Fresh `aflow run` invocations still require a
 plan.
 
-Modern schema-versioned run metadata also records a frozen configuration
-identity. Resume requires its workflow name, canonical configuration path, and
-fingerprint to match the currently resolved workflow, roles, teams, harness
-profiles, manager policy, and error-handling configuration. This check happens
-before startup questions or new run state. Schema-less legacy metadata without
-`frozen_config` remains resumable under the older scalar and lifecycle checks.
+Only schema-version `2` run metadata is resumable. Older, missing, boolean,
+string, and future schema values are readable for inspection but are rejected
+before plan lookup, startup questions, allocation, or daemon continuation; AFlow
+does not migrate or rewrite them. Current metadata must also contain the full
+manager, lifecycle, frozen-configuration, hotplug, and active-scope envelope
+state. Its frozen configuration identity—workflow name, canonical configuration
+path, and fingerprint—must match the currently resolved workflow, roles, teams,
+harness profiles, manager policy, and error-handling configuration.
 
 Lookup order for a previous run is:
 

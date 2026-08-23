@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-08-23 — Require complete current resume state (PR-08)
+
+- Bumped durable controller metadata to schema version 2. Fresh writers now
+  emit the authoritative original plan, explicit team/lifecycle fields, frozen
+  configuration identity, complete manager state, hotplug state, and active
+  scope envelope references.
+- Explicit, `--resume` auto-selected, and daemon resumes admit only exact
+  integer schema 2 with complete metadata. Older metadata remains readable for
+  analysis but is rejected before plan lookup, startup questions, allocation,
+  or continuation; no migration or rewrite is attempted.
+- Base SHA after PR 7: `30213fc4ed70b5847e1cf78154f943f5b3a957f9`; PR 7 merge SHA:
+  `30213fc4ed70b5847e1cf78154f943f5b3a957f9` (PR-19).
+
 ## 2026-08-23 — Restore the supported cross-platform test matrix (F-07)
 
 - The documented root suite now has a truthful Linux/macOS boundary: Linux runs
