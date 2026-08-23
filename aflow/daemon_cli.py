@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -34,6 +35,7 @@ from aflow.control_plane import (
     RunStatus,
     StartRunResult,
     StartupQuestionRecord,
+    validate_run_id,
 )
 from aflow.control_plane.units import SubprocessUnitManager
 from aflow.api.models import StartupRequest
@@ -431,14 +433,20 @@ def _release_pidfile(repo_root: Path, record: DaemonPidRecord) -> bool:
     return True
 
 
-def _owned_run_processes(daemon_pid: int, repo_root: Path) -> tuple[tuple[str, int], ...]:
-    """Inspect direct daemon-worker children without treating legacy runs as owned."""
+def _owned_run_processes_from_proc(
+    daemon_pid: int, repo_root: Path
+) -> tuple[tuple[str, int], ...] | None:
+    """Inspect direct daemon-worker children through Linux procfs."""
     root = str(Path(repo_root).resolve())
     owned: list[tuple[str, int]] = []
     proc_root = Path("/proc")
     if not proc_root.is_dir():
-        return ()
-    for entry in proc_root.iterdir():
+        return None
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         try:
@@ -459,6 +467,130 @@ def _owned_run_processes(daemon_pid: int, repo_root: Path) -> tuple[tuple[str, i
     return tuple(sorted(owned))
 
 
+def _read_ps_process_table() -> str:
+    """Read one bounded portable process-table snapshot."""
+    try:
+        completed = subprocess.run(
+            ("ps", "-ww", "-axo", "pid=,ppid=,command="),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+        raise DaemonError(
+            "unable to inspect daemon workers: ps process table unavailable"
+        ) from exc
+    if completed.returncode != 0:
+        raise DaemonError(
+            "unable to inspect daemon workers: ps returned a nonzero status"
+        )
+    if not isinstance(completed.stdout, str):
+        raise DaemonError(
+            "unable to inspect daemon workers: ps process table is invalid"
+        )
+    return completed.stdout
+
+
+_WORKER_TOKEN_RE = re.compile(r"(?<!\S)daemon-worker(?=\s|$)")
+_WORKER_OPTION_RE = re.compile(r"(?<!\S)(--repo-root|--config|--run-id)(?=\s|$)")
+
+
+def _ambiguous_process_table() -> None:
+    raise DaemonError("daemon worker process table is ambiguous")
+
+
+def _owned_run_processes_from_ps(
+    output: str, daemon_pid: int, repo_root: Path
+) -> tuple[tuple[str, int], ...]:
+    """Parse one strict ``ps`` snapshot and return exact owned direct workers."""
+    if daemon_pid < 1:
+        _ambiguous_process_table()
+
+    rows: dict[int, tuple[int, str]] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3:
+            _ambiguous_process_table()
+        pid_text, ppid_text, command = fields
+        if not pid_text.isascii() or not pid_text.isdecimal():
+            _ambiguous_process_table()
+        if not ppid_text.isascii() or not ppid_text.isdecimal():
+            _ambiguous_process_table()
+        pid = int(pid_text)
+        ppid = int(ppid_text)
+        if pid < 1 or ppid < 0 or not command:
+            _ambiguous_process_table()
+        if pid in rows:
+            _ambiguous_process_table()
+        rows[pid] = (ppid, command)
+
+    if daemon_pid not in rows:
+        _ambiguous_process_table()
+
+    expected_root = str(Path(repo_root).resolve())
+    owned: list[tuple[str, int]] = []
+    for pid, (ppid, command) in rows.items():
+        if ppid != daemon_pid:
+            continue
+        worker_matches = tuple(_WORKER_TOKEN_RE.finditer(command))
+        if not worker_matches:
+            continue
+        if len(worker_matches) != 1:
+            _ambiguous_process_table()
+
+        suffix = command[worker_matches[0].end() :].strip()
+        option_matches = tuple(_WORKER_OPTION_RE.finditer(suffix))
+        if len(option_matches) != 3:
+            _ambiguous_process_table()
+        if tuple(match.group(1) for match in option_matches) != (
+            "--repo-root",
+            "--config",
+            "--run-id",
+        ):
+            _ambiguous_process_table()
+        if option_matches[0].start() != 0:
+            _ambiguous_process_table()
+
+        values: list[str] = []
+        for index, marker in enumerate(option_matches):
+            end = (
+                option_matches[index + 1].start()
+                if index + 1 < len(option_matches)
+                else len(suffix)
+            )
+            value = suffix[marker.end() : end].strip()
+            if not value:
+                _ambiguous_process_table()
+            values.append(value)
+        worker_root, config_path, run_id = values
+
+        if not Path(worker_root).is_absolute():
+            _ambiguous_process_table()
+        if not Path(config_path).is_absolute():
+            _ambiguous_process_table()
+        try:
+            validate_run_id(run_id)
+        except ValueError:
+            _ambiguous_process_table()
+        if worker_root != expected_root:
+            continue
+        owned.append((run_id, pid))
+    return tuple(sorted(owned))
+
+
+def _owned_run_processes(
+    daemon_pid: int, repo_root: Path
+) -> tuple[tuple[str, int], ...]:
+    """Inspect direct daemon-worker children without treating legacy runs as owned."""
+    proc_owned = _owned_run_processes_from_proc(daemon_pid, repo_root)
+    if proc_owned is not None:
+        return proc_owned
+    return _owned_run_processes_from_ps(_read_ps_process_table(), daemon_pid, repo_root)
+
+
 def daemon_status(repo_root: Path) -> int:
     """Report verified daemon liveness and only its direct owned workers."""
     root = Path(repo_root).resolve()
@@ -477,8 +609,18 @@ def daemon_status(repo_root: Path) -> int:
     if state == "dead":
         print(f"daemon not running for {root}", file=sys.stderr)
         return 1
+    try:
+        owned = _owned_run_processes(record.pid, root)
+    except DaemonError as exc:
+        print(f"daemon status is ambiguous: {exc}", file=sys.stderr)
+        return 2
+    if _record_process_state(record) != "matching":
+        print(
+            "daemon status is ambiguous: daemon identity changed during worker inspection",
+            file=sys.stderr,
+        )
+        return 2
     print(f"daemon running: pid {record.pid} for {root}")
-    owned = _owned_run_processes(record.pid, root)
     print(f"owned runs: {len(owned)}")
     for run_id, pid in owned:
         print(f"  {run_id} pid={pid}")

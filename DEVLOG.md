@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-08-23 — Make local daemon worker status portable and truthful (F-06)
+
+- Local daemon status preserves Linux procfs ownership inspection and uses one
+  bounded, strict process-table snapshot on systems without usable procfs.
+- Only exact direct `daemon-worker` children for the verified repository are
+  counted; malformed or untrusted ownership evidence returns explicit
+  ambiguity instead of a false zero, with a daemon birth-identity recheck
+  before success output.
+- Added real forced-fallback and deterministic parser coverage for spaced paths,
+  multiple workers, unrelated/legacy processes, malformed snapshots, and
+  ownership races.
+
 ## 2026-08-22 — Match resumed legacy controllers by durable lineage (F-05)
 
 - Resumed legacy guards now bind a successor's durable predecessor to one exact
