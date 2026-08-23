@@ -49,6 +49,7 @@ from .run_state import (
     describe_end_reason,
     hotplug_resume_fields,
     manager_resume_fields,
+    manager_resume_fields_strict,
     resolve_resume_override,
 )
 
@@ -273,6 +274,8 @@ _CURRENT_MANAGER_RESUME_FIELDS = frozenset({
 def _validate_current_resume_metadata(
     prev_run: Mapping[str, object],
     run_id: Path,
+    *,
+    reset_scope: bool = False,
 ) -> None:
     """Validate the complete schema-v2 controller snapshot before resume work."""
     required_fields = {
@@ -442,6 +445,13 @@ def _validate_current_resume_metadata(
         hotplug_resume_fields(prev_run)
     except (TypeError, ValueError, KeyError) as exc:
         raise _resume_metadata_error(run_id, "hotplug state", str(exc)) from exc
+    try:
+        manager_resume_fields_strict(
+            prev_run,
+            ignore_pending_repartition=reset_scope,
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        raise _resume_metadata_error(run_id, "manager state", str(exc)) from exc
 
 
 def _pending_repartition_error(
@@ -1151,7 +1161,11 @@ def _bootstrap_resume_invocation(
         )
 
     frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
-    _validate_current_resume_metadata(prev_run, resolved_run_id)
+    _validate_current_resume_metadata(
+        prev_run,
+        resolved_run_id,
+        reset_scope=reset_scope,
+    )
     plan_path = _resume_plan_path(prev_run, repo_root)
     plan_field = "original_plan_path"
     if plan_path is None:
@@ -1951,7 +1965,11 @@ def _detect_resume_candidate(
                 prev_run,
                 resolved_run_id,
             )
-            _validate_current_resume_metadata(prev_run, resolved_run_id)
+            _validate_current_resume_metadata(
+                prev_run,
+                resolved_run_id,
+                reset_scope=reset_scope,
+            )
         except ValueError:
             if require_resume:
                 raise

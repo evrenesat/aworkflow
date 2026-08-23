@@ -298,6 +298,75 @@ def test_run_metadata_never_rewrites_an_old_snapshot(tmp_path: Path) -> None:
     assert paths.run_json.read_bytes() == original
 
 
+@pytest.mark.parametrize(
+    "original",
+    [
+        b"{}\n",
+        b"[]\n",
+        b"{malformed\n",
+    ],
+)
+def test_run_metadata_never_rewrites_existing_malformed_snapshot(
+    tmp_path: Path,
+    original: bytes,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path)
+    paths = create_run_paths(config)
+    paths.run_json.write_bytes(original)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        write_run_metadata(
+            paths,
+            config,
+            state,
+            status="running",
+            workflow_name="managed",
+            original_plan_path=plan_path,
+        )
+
+    assert paths.run_json.read_bytes() == original
+
+
+def test_run_metadata_never_rewrites_existing_unreadable_snapshot(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path)
+    paths = create_run_paths(config)
+    paths.run_json.mkdir()
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="run.json is unreadable"):
+        write_run_metadata(
+            paths,
+            config,
+            state,
+            status="running",
+            workflow_name="managed",
+            original_plan_path=plan_path,
+        )
+
+    assert paths.run_json.is_dir()
+
+
 def test_run_metadata_emits_populated_manager_scope_and_hotplug_authority(
     tmp_path: Path,
 ) -> None:

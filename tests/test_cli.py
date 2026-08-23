@@ -1,5 +1,6 @@
 from aflow._test_support import *  # noqa: F401,F403
 import hashlib
+import re
 from typing import Mapping
 from unittest.mock import Mock
 from aflow.api.models import PreparedRun
@@ -31,10 +32,71 @@ def _current_resume_payload(payload: dict[str, object]) -> dict[str, object]:
     payload.setdefault("reviewer_rejection_count", 0)
     payload.setdefault("implementation_attempts", {})
     payload.setdefault("active_implementation_scope", None)
+    active_scope = payload.get("active_implementation_scope")
+    if isinstance(active_scope, Mapping):
+        active_scope = dict(active_scope)
+        active_scope.setdefault("current_partition_generation_id", None)
+        active_scope.setdefault("current_partition_candidate_sha256", None)
+        active_scope.setdefault("current_partition_id", None)
+        payload["active_implementation_scope"] = active_scope
     payload.setdefault("review_rejection_history", [])
     payload.setdefault("pending_manager_notes", None)
+    pending_notes = payload.get("pending_manager_notes")
+    if isinstance(pending_notes, Mapping):
+        pending_notes = dict(pending_notes)
+        for field in (
+            "target_role",
+            "target_selector",
+            "checkpoint_identity",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            pending_notes.setdefault(field, None)
+        pending_notes.setdefault("consumed", False)
+        pending_notes.setdefault("correction_attempted", False)
+        payload["pending_manager_notes"] = pending_notes
     payload.setdefault("pending_step_team_override", None)
+    pending_override = payload.get("pending_step_team_override")
+    if isinstance(pending_override, Mapping):
+        pending_override = dict(pending_override)
+        for field in (
+            "checkpoint_identity",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            pending_override.setdefault(field, None)
+        pending_override.setdefault("consumed", False)
+        payload["pending_step_team_override"] = pending_override
     payload.setdefault("pending_boundary_decision", None)
+    pending_boundary = payload.get("pending_boundary_decision")
+    if isinstance(pending_boundary, Mapping):
+        pending_boundary = dict(pending_boundary)
+        for field in (
+            "proposed_transition",
+            "resolved_next_step",
+            "target_role",
+            "target_team",
+            "target_selector",
+            "checkpoint_identity",
+            "post_transition_active_plan_path",
+            "post_transition_checkpoint_identity",
+            "notes_reference",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            pending_boundary.setdefault(field, None)
+        pending_boundary.setdefault("applied", False)
+        pending_boundary.setdefault("consumed", False)
+        payload["pending_boundary_decision"] = pending_boundary
     payload.setdefault("pending_repartition", None)
     payload.setdefault("repartition_history", [])
     payload.setdefault("scope_pressure_reason", None)
@@ -150,6 +212,9 @@ def _pending_scope_fixture(
         "envelope_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
         "envelope_canonical_sha256": envelope.canonical_envelope_sha256,
         "source_plan_sha256": hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
+        "current_partition_generation_id": None,
+        "current_partition_candidate_sha256": None,
+        "current_partition_id": None,
     }
 
 
@@ -972,6 +1037,65 @@ class WorkflowCliTests(unittest.TestCase):
                             extra_instructions_provided=False,
                         )
 
+    def test_plan_free_resume_rejects_malformed_current_manager_authority(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            (
+                "empty pending manager notes",
+                lambda run: run.__setitem__("pending_manager_notes", {}),
+                "pending_manager_notes",
+            ),
+            (
+                "incomplete active scope",
+                lambda run: run.__setitem__(
+                    "active_implementation_scope",
+                    {
+                        "scope_id": "saved-scope",
+                        "original_plan_path": "/saved/plan.md",
+                        "checkpoint_index": 1,
+                        "checkpoint_name": "First",
+                        "opened_turn_number": 1,
+                        "carried_reviewer_rejection_count": 0,
+                        "envelope_artifact_path": "scopes/scope/envelope.json",
+                        "envelope_artifact_sha256": "a" * 64,
+                        "envelope_canonical_sha256": "b" * 64,
+                    },
+                ),
+                "active_implementation_scope is missing required fields: awaiting_review",
+            ),
+            (
+                "incomplete implementation attempt",
+                lambda run: run.__setitem__(
+                    "implementation_attempts",
+                    {
+                        "saved-scope": [{
+                            "turn_number": 1,
+                            "step_name": "implement",
+                            "role": "worker",
+                            "outcome": "progress",
+                        }],
+                    },
+                ),
+                "implementation_attempts[saved-scope][0] is missing required fields",
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, prev_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(prev_run)
+                mutate(prev_run)
+                with pytest.raises(ValueError, match=re.escape(expected)):
+                    cli_module._validate_current_resume_metadata(
+                        prev_run,
+                        Path(run_dir.name),
+                    )
+
     def test_resume_bootstrap_accepts_compatible_repeated_identity(
         self,
     ) -> None:
@@ -1243,10 +1367,14 @@ class WorkflowCliTests(unittest.TestCase):
                         "checkpoint_index": 1,
                         "checkpoint_name": "Checkpoint 1: Saved",
                         "opened_turn_number": 1,
+                        "awaiting_review": False,
                         "carried_reviewer_rejection_count": 0,
                         "envelope_artifact_path": "../../outside-envelope.json",
                         "envelope_artifact_sha256": "a" * 64,
                         "envelope_canonical_sha256": "b" * 64,
+                        "current_partition_generation_id": None,
+                        "current_partition_candidate_sha256": None,
+                        "current_partition_id": None,
                     },
                 ),
                 "invalid scope envelope reference",
@@ -2305,6 +2433,7 @@ class WorkflowCliTests(unittest.TestCase):
                 },
             }
         )
+        durable_run = _current_resume_payload(durable_run)
         (run_dir / "run.json").write_text(
             json.dumps(durable_run),
             encoding="utf-8",

@@ -2665,6 +2665,63 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert event_types.count(ExecutionEventType.RUN_FAILED) == 1
             assert ExecutionEventType.RUN_COMPLETED not in event_types
 
+    def test_scope_capture_failure_persists_failed_run_without_active_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(
+                plan_path,
+                "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={"worker": "codex.default"},
+                harnesses={
+                    "codex": WorkflowHarnessConfig(
+                        profiles={"default": HarnessProfileConfig(model="worker")}
+                    )
+                },
+                workflows={
+                    "simple": WorkflowConfig(
+                        steps={
+                            "implement_plan": WorkflowStepConfig(
+                                role="worker",
+                                prompts=("p",),
+                                go=(GoTransition(to="END", when="DONE"),),
+                            )
+                        },
+                        first_step="implement_plan",
+                    )
+                },
+                prompts={"p": "Work."},
+            )
+
+            with patch(
+                "aflow.workflow._capture_scope_envelope",
+                side_effect=WorkflowError("simulated capture failure"),
+            ), pytest.raises(WorkflowError, match="simulated capture failure") as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                    ),
+                    wf_config,
+                    "simple",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=lambda *args, **kwargs: pytest.fail(
+                        "worker must not run after scope capture failure"
+                    ),
+                )
+
+            assert ctx.value.run_dir is not None
+            payload = json.loads(
+                (ctx.value.run_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert payload["status"] == "failed"
+            assert payload["active_implementation_scope"] is None
+            assert "simulated capture failure" in payload["failure_reason"]
+
     def test_workflow_no_matching_transition_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

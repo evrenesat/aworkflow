@@ -253,7 +253,6 @@ def _open_implementation_scope(
         checkpoint_name=name,
         opened_turn_number=turn_number,
     )
-    state.active_implementation_scope = scope
     return scope, True
 
 
@@ -299,6 +298,7 @@ def _resume_completed_worker_can_use_original_plan(
 def _capture_scope_envelope(
     state: ControllerState,
     *,
+    scope: ActiveImplementationScope | None = None,
     plan_text: str | None,
     primary_plan_path: Path,
     run_dir: Path,
@@ -308,12 +308,14 @@ def _capture_scope_envelope(
     """Capture and persist an immutable scope envelope at new-scope opening.
 
     Must be called after ``_open_implementation_scope`` but before the first
-    worker harness invocation.  Idempotent: returns immediately when the
-    active scope already has an envelope artifact.
+    worker harness invocation.  A newly opened scope may be supplied through
+    ``scope`` and is published to controller state only after the complete
+    envelope has been captured and validated.  Idempotent: returns immediately
+    when the active scope already has an envelope artifact.
 
     Raises ``WorkflowError`` when primary and execution plan copies disagree.
     """
-    scope = state.active_implementation_scope
+    scope = scope or state.active_implementation_scope
     if scope is None:
         return
     reference_values = (
@@ -8617,6 +8619,7 @@ def run_workflow(
                     if scope_was_opened:
                         _capture_scope_envelope(
                             state,
+                            scope=_scope,
                             plan_text=None,
                             primary_plan_path=original_plan_path,
                             run_dir=run_paths.run_dir,
@@ -8924,6 +8927,7 @@ def run_workflow(
                     if scope_was_opened:
                         _capture_scope_envelope(
                             state,
+                            scope=_scope,
                             plan_text=None,
                             primary_plan_path=original_plan_path,
                             run_dir=run_paths.run_dir,

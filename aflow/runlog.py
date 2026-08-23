@@ -771,17 +771,23 @@ def write_run_metadata(
                 "selected_start_step must be null or a non-empty string"
             )
     previous: Mapping[str, object] = {}
-    if paths.run_json.is_file():
+    run_json_present = paths.run_json.exists() or paths.run_json.is_symlink()
+    if run_json_present:
         try:
             loaded = json.loads(paths.run_json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = {}
-        if isinstance(loaded, Mapping):
-            previous = loaded
-    if previous and previous.get("schema_version") != RUN_STATE_SCHEMA_VERSION:
-        raise ValueError(
-            "cannot overwrite run metadata with an unsupported resume state schema"
-        )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "cannot overwrite existing run metadata: run.json is unreadable"
+            ) from exc
+        if not isinstance(loaded, Mapping):
+            raise ValueError(
+                "cannot overwrite existing run metadata: run.json must contain a JSON object"
+            )
+        previous = loaded
+        if previous.get("schema_version") != RUN_STATE_SCHEMA_VERSION:
+            raise ValueError(
+                "cannot overwrite run metadata with an unsupported resume state schema"
+            )
     # A terminal manager report is the authoritative failure summary.  Some
     # callers add merge/recovery metadata in a later write without repeating
     # that summary; retain it rather than replacing it with an empty field.
