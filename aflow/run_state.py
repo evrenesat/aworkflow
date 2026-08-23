@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -18,7 +18,7 @@ WorkflowEndReason = Literal[
     "transition_end",
     "owner_stopped",
 ]
-RUN_STATE_SCHEMA_VERSION = 1
+RUN_STATE_SCHEMA_VERSION = 2
 OverrideLoadStatus = Literal[
     "absent",
     "valid",
@@ -404,14 +404,13 @@ class ActiveImplementationScope:
     opened_turn_number: int
     awaiting_review: bool = False
     carried_reviewer_rejection_count: int = 0
-    # Immutable envelope reference.  The three values are deliberately kept
+    # Immutable envelope reference. The three values are deliberately kept
     # separate so a resumed run can bind the artifact's exact bytes as well as
-    # its canonical semantic representation.  All three are absent for a
-    # legacy scope opened before scope-envelope capture existed.
+    # its canonical semantic representation.
     #
     # These use object rather than eagerly coercing deserialized JSON: resume
     # validation must reject malformed persisted authority, not quietly turn
-    # it into a legacy/no-envelope scope.
+    # it into a silently normalized historical scope.
     envelope_artifact_path: object | None = None
     envelope_artifact_sha256: object | None = None
     envelope_canonical_sha256: object | None = None
@@ -804,15 +803,36 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
     """Return compact durable manager controller state for ``run.json``."""
     from dataclasses import asdict
 
+    for scope_id, attempts in state.implementation_attempts.items():
+        if not isinstance(attempts, list) or any(
+            not isinstance(attempt, ImplementationAttempt) for attempt in attempts
+        ):
+            raise ValueError(
+                f"implementation attempts for scope '{scope_id}' must be a list "
+                "of ImplementationAttempt records"
+            )
+    active_scope = state.active_implementation_scope
+    if active_scope is not None:
+        envelope_values = (
+            active_scope.envelope_artifact_path,
+            active_scope.envelope_artifact_sha256,
+            active_scope.envelope_canonical_sha256,
+        )
+        if not active_scope.has_envelope or any(
+            not isinstance(value, str) or not value.strip()
+            for value in envelope_values
+        ):
+            raise ValueError(
+                "active implementation scope must include complete envelope references"
+            )
+
     return {
         "manager_decision_number": state.manager_decision_number,
         "manager_history": [asdict(item) for item in state.manager_history],
         "semantic_stall_count": state.semantic_stall_count,
         "reviewer_rejection_count": state.reviewer_rejection_count,
         "implementation_attempts": {
-            # Preserve old integer counters when a caller constructed legacy
-            # state directly; on disk they are read as empty attempt histories.
-            key: (attempts if isinstance(attempts, int) else [asdict(attempt) for attempt in attempts])
+            key: [asdict(attempt) for attempt in attempts]
             for key, attempts in state.implementation_attempts.items()
         },
         "active_implementation_scope": (
@@ -848,7 +868,7 @@ def manager_state_payload(state: ControllerState) -> dict[str, object]:
 
 
 def hotplug_state_payload(state: ControllerState) -> dict[str, object]:
-    """Serialize hotplug authority with explicit, legacy-tolerant fields."""
+    """Serialize the complete current hotplug authority."""
     return {
         "hotplug_schema_version": 1,
         "role_selectors": dict(sorted(state.role_selectors.items())),
@@ -868,11 +888,23 @@ def hotplug_state_payload(state: ControllerState) -> dict[str, object]:
 
 def restore_hotplug_state(state: ControllerState, payload: Mapping[str, Any]) -> None:
     """Restore hotplug state, rejecting malformed modern authority before launch."""
-    if "hotplug_schema_version" not in payload:
-        return
     schema_version = payload.get("hotplug_schema_version")
     if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
         raise ValueError("unsupported hotplug state schema version")
+    required_fields = {
+        "hotplug_schema_version",
+        "role_selectors",
+        "current_hotplug_transaction",
+        "pending_hotplug_transaction",
+        "active_role_sessions",
+        "hotplug_transaction_number",
+        "hotplug_history",
+    }
+    missing_fields = sorted(field for field in required_fields if field not in payload)
+    if missing_fields:
+        raise ValueError(
+            "missing persisted hotplug fields: " + ", ".join(missing_fields)
+        )
     strict_children = True
     selectors = payload.get("role_selectors", {})
     if not isinstance(selectors, Mapping) or any(
@@ -935,7 +967,7 @@ def hotplug_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
 
 
 def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) -> None:
-    """Restore manager-only durable state from a legacy-tolerant run payload."""
+    """Restore manager-only durable state from a persisted run payload."""
     state.manager_decision_number = int(payload.get("manager_decision_number", 0) or 0)
     history = payload.get("manager_history")
     if isinstance(history, list):
@@ -987,9 +1019,6 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
     state.implementation_attempts = {}
     if isinstance(attempts, Mapping):
         for key, value in attempts.items():
-            if isinstance(value, int) and not isinstance(value, bool):
-                state.implementation_attempts[str(key)] = value  # type: ignore[assignment]
-                continue
             if not isinstance(value, list):
                 continue
             restored_attempts: list[ImplementationAttempt] = []
@@ -1010,11 +1039,9 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             state.implementation_attempts[str(key)] = restored_attempts
     scope = payload.get("active_implementation_scope")
     if isinstance(scope, Mapping) and {
-        "scope_id", "original_plan_path", "opened_turn_number"
+        "scope_id", "original_plan_path", "opened_turn_number",
+        "carried_reviewer_rejection_count",
     } <= set(scope):
-        has_scoped_rejection_count = (
-            "carried_reviewer_rejection_count" in scope
-        )
         # Preserve raw persisted envelope-reference values.  The resume
         # boundary validates their type, layout, hashes, and binding before
         # they are used; silently coercing or discarding malformed values
@@ -1036,7 +1063,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
             opened_turn_number=int(scope["opened_turn_number"]),
             awaiting_review=bool(scope.get("awaiting_review", False)),
             carried_reviewer_rejection_count=int(
-                scope.get("carried_reviewer_rejection_count", 0) or 0
+                scope["carried_reviewer_rejection_count"]
             ),
             envelope_artifact_path=envelope_artifact,
             envelope_artifact_sha256=envelope_artifact_sha256,
@@ -1057,11 +1084,6 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
                 else None
             ),
         )
-        if not has_scoped_rejection_count:
-            # Pre-scoped run metadata may contain a poisoned whole-run total.
-            # The compact run payload has no finalized-turn history from which
-            # to reconstruct this scope, so resume it conservatively at zero.
-            state.reviewer_rejection_count = 0
     notes = payload.get("pending_manager_notes")
     if isinstance(notes, Mapping) and isinstance(notes.get("notes"), (list, tuple)):
         state.pending_manager_notes = PendingManagerNotes(
@@ -1347,7 +1369,7 @@ def restore_manager_state(state: ControllerState, payload: Mapping[str, Any]) ->
 
 
 def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
-    """Return legacy-tolerant manager state suitable for ``ResumeContext``."""
+    """Return best-effort manager state suitable for status or resume decoding."""
     restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     restore_manager_state(restored, payload)
     return {
@@ -1356,7 +1378,7 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
         "semantic_stall_count": restored.semantic_stall_count,
         "reviewer_rejection_count": restored.reviewer_rejection_count,
         "implementation_attempts": {
-            key: (() if isinstance(attempts, int) else tuple(attempts))
+            key: tuple(attempts)
             for key, attempts in restored.implementation_attempts.items()
         },
         "active_implementation_scope": restored.active_implementation_scope,
@@ -1369,6 +1391,318 @@ def manager_resume_fields(payload: Mapping[str, Any]) -> dict[str, object]:
         "scope_pressure_reason": restored.scope_pressure_reason,
         "last_manager_report_path": restored.last_manager_report_path,
     }
+
+
+def manager_resume_fields_strict(
+    payload: Mapping[str, Any],
+    *,
+    ignore_pending_repartition: bool = False,
+) -> dict[str, object]:
+    """Decode current manager authority without silently dropping records.
+
+    ``manager_resume_fields`` remains intentionally tolerant for historical
+    status and analysis projections.  Current schema-v2 resume admission must
+    use this decoder first so every serialized manager record is complete and
+    type-safe before the tolerant projection is allowed to run.
+    """
+
+    def record(value: object, record_type: type[Any], label: str) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{label} must be a mapping")
+        missing = sorted(
+            item.name
+            for item in dataclass_fields(record_type)
+            if item.name not in value
+        )
+        if missing:
+            raise ValueError(f"{label} is missing required fields: {', '.join(missing)}")
+        return value
+
+    def string(value: object, label: str, *, nonempty: bool = False) -> None:
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be a string")
+        if nonempty and not value.strip():
+            raise ValueError(f"{label} must be a non-empty string")
+
+    def optional_string(value: object, label: str, *, nonempty: bool = False) -> None:
+        if value is not None:
+            string(value, label, nonempty=nonempty)
+
+    def integer(value: object, label: str, *, minimum: int | None = None) -> None:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{label} must be an integer")
+        if minimum is not None and value < minimum:
+            raise ValueError(f"{label} must be >= {minimum}")
+
+    def optional_integer(value: object, label: str) -> None:
+        if value is not None:
+            integer(value, label)
+
+    def boolean(value: object, label: str) -> None:
+        if not isinstance(value, bool):
+            raise ValueError(f"{label} must be a boolean")
+
+    def string_list(value: object, label: str, *, nonempty: bool = False) -> None:
+        if not isinstance(value, list):
+            raise ValueError(f"{label} must be a list of strings")
+        if any(
+            not isinstance(item, str) or (nonempty and not item.strip())
+            for item in value
+        ):
+            raise ValueError(f"{label} must be a list of strings")
+
+    def optional_routing_fields(item: Mapping[str, Any], label: str) -> None:
+        for field_name in (
+            "target_role",
+            "target_selector",
+            "checkpoint_identity",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            optional_string(item[field_name], f"{label}.{field_name}")
+
+    history = payload.get("manager_history")
+    if not isinstance(history, list):
+        raise ValueError("manager_history must be a list")
+    for index, value in enumerate(history):
+        label = f"manager_history[{index}]"
+        item = record(value, ManagerDecisionSummary, label)
+        integer(item["decision_number"], f"{label}.decision_number", minimum=0)
+        for field_name in ("level", "trigger", "action", "reason", "artifact_path"):
+            string(item[field_name], f"{label}.{field_name}")
+
+    rejection_history = payload.get("review_rejection_history")
+    if not isinstance(rejection_history, list):
+        raise ValueError("review_rejection_history must be a list")
+    for index, value in enumerate(rejection_history):
+        label = f"review_rejection_history[{index}]"
+        item = record(value, ReviewRejectionRecord, label)
+        for field_name in (
+            "scope_id",
+            "source_run_id",
+            "review_step_name",
+            "review_summary",
+            "review_stdout_artifact_path",
+        ):
+            string(item[field_name], f"{label}.{field_name}", nonempty=True)
+        for field_name in (
+            "reviewer_selector",
+            "checkpoint_name",
+            "reviewed_worker_team",
+            "reviewed_worker_selector",
+            "repair_plan_summary",
+            "repair_plan_path",
+        ):
+            optional_string(item[field_name], f"{label}.{field_name}")
+        for field_name in (
+            "rejection_number",
+            "review_turn_number",
+            "reviewed_implementation_turn_number",
+        ):
+            integer(item[field_name], f"{label}.{field_name}", minimum=0)
+        optional_integer(item["checkpoint_index"], f"{label}.checkpoint_index")
+
+    attempts = payload.get("implementation_attempts")
+    if not isinstance(attempts, Mapping):
+        raise ValueError("implementation_attempts must be a mapping")
+    for scope_id, values in attempts.items():
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ValueError("implementation_attempts keys must be non-empty strings")
+        if not isinstance(values, list):
+            raise ValueError(f"implementation_attempts[{scope_id}] must be a list")
+        for index, value in enumerate(values):
+            label = f"implementation_attempts[{scope_id}][{index}]"
+            item = record(value, ImplementationAttempt, label)
+            integer(item["turn_number"], f"{label}.turn_number", minimum=1)
+            for field_name in ("step_name", "role", "outcome"):
+                string(item[field_name], f"{label}.{field_name}", nonempty=True)
+            optional_string(item["team"], f"{label}.team")
+            optional_string(item["selector"], f"{label}.selector")
+            optional_integer(
+                item["manager_decision_number"],
+                f"{label}.manager_decision_number",
+            )
+
+    active_scope = payload.get("active_implementation_scope")
+    if active_scope is not None:
+        label = "active_implementation_scope"
+        item = record(active_scope, ActiveImplementationScope, label)
+        for field_name in (
+            "scope_id",
+            "original_plan_path",
+            "envelope_artifact_path",
+            "envelope_artifact_sha256",
+            "envelope_canonical_sha256",
+        ):
+            string(item[field_name], f"{label}.{field_name}", nonempty=True)
+        optional_integer(item["checkpoint_index"], f"{label}.checkpoint_index")
+        optional_string(item["checkpoint_name"], f"{label}.checkpoint_name")
+        integer(item["opened_turn_number"], f"{label}.opened_turn_number", minimum=1)
+        boolean(item["awaiting_review"], f"{label}.awaiting_review")
+        integer(
+            item["carried_reviewer_rejection_count"],
+            f"{label}.carried_reviewer_rejection_count",
+            minimum=0,
+        )
+        for field_name in (
+            "current_partition_generation_id",
+            "current_partition_candidate_sha256",
+            "current_partition_id",
+        ):
+            optional_string(item[field_name], f"{label}.{field_name}")
+
+    notes = payload.get("pending_manager_notes")
+    if notes is not None:
+        label = "pending_manager_notes"
+        item = record(notes, PendingManagerNotes, label)
+        string(item["target_step"], f"{label}.target_step", nonempty=True)
+        string_list(item["notes"], f"{label}.notes")
+        integer(item["decision_number"], f"{label}.decision_number", minimum=0)
+        optional_routing_fields(item, label)
+        boolean(item["consumed"], f"{label}.consumed")
+        boolean(item["correction_attempted"], f"{label}.correction_attempted")
+
+    override = payload.get("pending_step_team_override")
+    if override is not None:
+        label = "pending_step_team_override"
+        item = record(override, PendingTeamOverride, label)
+        for field_name in ("target_step", "role", "target_team", "selector"):
+            string(item[field_name], f"{label}.{field_name}", nonempty=True)
+        optional_string(item["source_team"], f"{label}.source_team")
+        optional_string(item["checkpoint_identity"], f"{label}.checkpoint_identity")
+        integer(item["decision_number"], f"{label}.decision_number", minimum=0)
+        boolean(item["consumed"], f"{label}.consumed")
+        for field_name in (
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            optional_string(item[field_name], f"{label}.{field_name}")
+
+    boundary = payload.get("pending_boundary_decision")
+    if boundary is not None:
+        label = "pending_boundary_decision"
+        item = record(boundary, PendingBoundaryDecision, label)
+        for field_name in ("action", "proposed_action"):
+            string(item[field_name], f"{label}.{field_name}", nonempty=True)
+        for field_name in (
+            "finalized_turn_number",
+            "decision_number",
+        ):
+            integer(item[field_name], f"{label}.{field_name}", minimum=0)
+        for field_name in (
+            "proposed_transition",
+            "resolved_next_step",
+            "target_role",
+            "target_team",
+            "target_selector",
+            "checkpoint_identity",
+            "post_transition_active_plan_path",
+            "post_transition_checkpoint_identity",
+            "notes_reference",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            optional_string(item[field_name], f"{label}.{field_name}")
+        boolean(item["applied"], f"{label}.applied")
+        boolean(item["consumed"], f"{label}.consumed")
+
+    pending_repartition = payload.get("pending_repartition")
+    if pending_repartition is not None and not ignore_pending_repartition:
+        label = "pending_repartition"
+        item = record(pending_repartition, PendingRepartitionV1, label)
+        integer(item["schema_version"], f"{label}.schema_version")
+        if item["schema_version"] != 1:
+            raise ValueError(f"{label}.schema_version must be 1")
+        integer(item["decision_number"], f"{label}.decision_number", minimum=0)
+        for field_name in (
+            "scope_id",
+            "stage",
+            "envelope_sha256",
+            "source_plan_sha256",
+        ):
+            string(item[field_name], f"{label}.{field_name}", nonempty=True)
+        if item["stage"] not in {
+            "decided",
+            "proposed",
+            "mechanically_validated",
+            "semantically_validated",
+            "execution_plan_applied",
+            "primary_plan_applied",
+            "applied",
+            "failed",
+        }:
+            raise ValueError(f"{label}.stage is not a recognized current stage")
+        integer(item["attempt_count"], f"{label}.attempt_count", minimum=0)
+        optional_string(item["generation_id"], f"{label}.generation_id")
+        string_list(item["partition_ids"], f"{label}.partition_ids")
+        string_list(item["child_summaries"], f"{label}.child_summaries")
+        for field_name in (
+            "proposal_sha256",
+            "candidate_plan_sha256",
+            "current_disposition",
+            "resolved_target_step",
+            "resolved_target_role",
+            "latest_attempt_path",
+            "proposal_artifact_path",
+            "candidate_artifact_path",
+            "mechanical_validation_artifact_path",
+            "semantic_verdict_artifact_path",
+            "failed_stage",
+            "failure_reason",
+        ):
+            optional_string(item[field_name], f"{label}.{field_name}")
+
+    repartition_history = payload.get("repartition_history")
+    if not isinstance(repartition_history, list):
+        raise ValueError("repartition_history must be a list")
+    for index, value in enumerate(repartition_history):
+        label = f"repartition_history[{index}]"
+        item = record(value, CheckpointRepartitionRecord, label)
+        integer(item["schema_version"], f"{label}.schema_version")
+        if item["schema_version"] != 1:
+            raise ValueError(f"{label}.schema_version must be 1")
+        integer(item["decision_number"], f"{label}.decision_number", minimum=0)
+        for field_name in (
+            "scope_id",
+            "generation_id",
+            "envelope_sha256",
+            "envelope_artifact_sha256",
+            "source_plan_sha256",
+            "proposal_sha256",
+            "candidate_plan_sha256",
+            "current_disposition",
+            "resolved_target_step",
+            "resolved_target_role",
+            "current_partition_id",
+            "envelope_artifact_path",
+            "proposal_artifact_path",
+            "candidate_artifact_path",
+            "mechanical_validation_artifact_path",
+            "semantic_verdict_artifact_path",
+        ):
+            string(item[field_name], f"{label}.{field_name}", nonempty=True)
+        partition_ids = item["partition_ids"]
+        child_summaries = item["child_summaries"]
+        string_list(partition_ids, f"{label}.partition_ids", nonempty=True)
+        if not partition_ids:
+            raise ValueError(f"{label}.partition_ids must be non-empty")
+        string_list(child_summaries, f"{label}.child_summaries", nonempty=True)
+        if len(child_summaries) != len(partition_ids):
+            raise ValueError(
+                f"{label}.child_summaries must match partition_ids length"
+            )
+        optional_string(item["scope_pressure_reason"], f"{label}.scope_pressure_reason")
+
+    return manager_resume_fields(payload)
 
 
 @dataclass(frozen=True)

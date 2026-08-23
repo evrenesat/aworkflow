@@ -2473,30 +2473,18 @@ class EnvelopeLifecycleTests(unittest.TestCase):
         assert restored.active_implementation_scope.envelope_artifact_sha256 == "a" * 64
         assert restored.active_implementation_scope.envelope_canonical_sha256 == "b" * 64
 
-    def test_legacy_payload_without_envelope_path_restores_cleanly(self) -> None:
-        """A run.json from before CP2 should restore with envelope_artifact_path=None."""
+    def test_current_metadata_rejects_scope_without_envelope_reference(self) -> None:
+        """Current durable metadata cannot publish an active scope without its envelope."""
         state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
         state.active_implementation_scope = ActiveImplementationScope(
-            scope_id="plan.md::checkpoint-1::legacy",
+            scope_id="plan.md::checkpoint-1::missing-envelope",
             original_plan_path="plan.md",
             checkpoint_index=1,
-            checkpoint_name="Legacy",
+            checkpoint_name="Missing envelope",
             opened_turn_number=1,
         )
-        payload = manager_state_payload(state)
-        # Simulate a legacy payload that lacks envelope_artifact_path
-        legacy_payload = dict(payload)
-        legacy_scope = dict(legacy_payload["active_implementation_scope"])
-        del legacy_scope["envelope_artifact_path"]
-        del legacy_scope["envelope_artifact_sha256"]
-        del legacy_scope["envelope_canonical_sha256"]
-        legacy_payload["active_implementation_scope"] = legacy_scope
-
-        restored = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        restore_manager_state(restored, legacy_payload)
-        assert restored.active_implementation_scope is not None
-        assert restored.active_implementation_scope.has_envelope is False
-        assert restored.active_implementation_scope.envelope_artifact_path is None
+        with pytest.raises(ValueError, match="complete envelope references"):
+            manager_state_payload(state)
 
     def test_manager_resume_fields_preserves_envelope_path(self) -> None:
         """manager_resume_fields carries envelope_artifact_path through to ResumeContext."""
@@ -2539,6 +2527,7 @@ class EnvelopeLifecycleTests(unittest.TestCase):
                 "checkpoint_index": 1,
                 "checkpoint_name": "Legacy",
                 "opened_turn_number": 1,
+                "carried_reviewer_rejection_count": 0,
                 "envelope_artifact_path": 7,
                 "envelope_artifact_sha256": "a" * 64,
                 "envelope_canonical_sha256": "b" * 64,

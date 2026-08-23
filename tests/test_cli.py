@@ -1,5 +1,6 @@
 from aflow._test_support import *  # noqa: F401,F403
 import hashlib
+import re
 from typing import Mapping
 from unittest.mock import Mock
 from aflow.api.models import PreparedRun
@@ -7,6 +8,107 @@ from aflow.config import ErrorHandlingConfig, ManagerConfig
 from aflow.repartition import create_envelope, derive_generation_id, write_envelope_atomic
 from aflow.status import BannerRenderer as RealBannerRenderer
 from aflow.workflow import _freeze_run_identity
+
+
+def _current_resume_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Complete a small fixture with the schema-v2 controller envelope."""
+    payload = dict(payload)
+    payload.setdefault("schema_version", 2)
+    payload.setdefault("original_plan_path", payload.get("plan_path", "/fake/plan.md"))
+    payload.setdefault("effective_max_turns", payload.get("max_turns", 1))
+    payload.setdefault("lifecycle_setup", [])
+    payload.setdefault("lifecycle_teardown", [])
+    payload.setdefault(
+        "frozen_config",
+        {
+            "workflow_name": str(payload.get("workflow_name", "test_workflow")),
+            "config_path": "/fake/aflow.toml",
+            "config_fingerprint": "fixture-fingerprint",
+        },
+    )
+    payload.setdefault("manager_decision_number", 0)
+    payload.setdefault("manager_history", [])
+    payload.setdefault("semantic_stall_count", 0)
+    payload.setdefault("reviewer_rejection_count", 0)
+    payload.setdefault("implementation_attempts", {})
+    payload.setdefault("active_implementation_scope", None)
+    active_scope = payload.get("active_implementation_scope")
+    if isinstance(active_scope, Mapping):
+        active_scope = dict(active_scope)
+        active_scope.setdefault("current_partition_generation_id", None)
+        active_scope.setdefault("current_partition_candidate_sha256", None)
+        active_scope.setdefault("current_partition_id", None)
+        payload["active_implementation_scope"] = active_scope
+    payload.setdefault("review_rejection_history", [])
+    payload.setdefault("pending_manager_notes", None)
+    pending_notes = payload.get("pending_manager_notes")
+    if isinstance(pending_notes, Mapping):
+        pending_notes = dict(pending_notes)
+        for field in (
+            "target_role",
+            "target_selector",
+            "checkpoint_identity",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            pending_notes.setdefault(field, None)
+        pending_notes.setdefault("consumed", False)
+        pending_notes.setdefault("correction_attempted", False)
+        payload["pending_manager_notes"] = pending_notes
+    payload.setdefault("pending_step_team_override", None)
+    pending_override = payload.get("pending_step_team_override")
+    if isinstance(pending_override, Mapping):
+        pending_override = dict(pending_override)
+        for field in (
+            "checkpoint_identity",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            pending_override.setdefault(field, None)
+        pending_override.setdefault("consumed", False)
+        payload["pending_step_team_override"] = pending_override
+    payload.setdefault("pending_boundary_decision", None)
+    pending_boundary = payload.get("pending_boundary_decision")
+    if isinstance(pending_boundary, Mapping):
+        pending_boundary = dict(pending_boundary)
+        for field in (
+            "proposed_transition",
+            "resolved_next_step",
+            "target_role",
+            "target_team",
+            "target_selector",
+            "checkpoint_identity",
+            "post_transition_active_plan_path",
+            "post_transition_checkpoint_identity",
+            "notes_reference",
+            "scope_id",
+            "target_plan_identity",
+            "repartition_generation_id",
+            "repartition_candidate_sha256",
+            "repartition_partition_id",
+        ):
+            pending_boundary.setdefault(field, None)
+        pending_boundary.setdefault("applied", False)
+        pending_boundary.setdefault("consumed", False)
+        payload["pending_boundary_decision"] = pending_boundary
+    payload.setdefault("pending_repartition", None)
+    payload.setdefault("repartition_history", [])
+    payload.setdefault("scope_pressure_reason", None)
+    payload.setdefault("last_manager_report_path", None)
+    payload.setdefault("hotplug_schema_version", 1)
+    payload.setdefault("role_selectors", {})
+    payload.setdefault("current_hotplug_transaction", None)
+    payload.setdefault("pending_hotplug_transaction", None)
+    payload.setdefault("active_role_sessions", [])
+    payload.setdefault("hotplug_transaction_number", 0)
+    payload.setdefault("hotplug_history", [])
+    return payload
 
 
 def _complete_pending_repartition_fixture(
@@ -110,6 +212,9 @@ def _pending_scope_fixture(
         "envelope_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
         "envelope_canonical_sha256": envelope.canonical_envelope_sha256,
         "source_plan_sha256": hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
+        "current_partition_generation_id": None,
+        "current_partition_candidate_sha256": None,
+        "current_partition_id": None,
     }
 
 
@@ -135,7 +240,7 @@ def test_cli_analysis_adds_safe_controller_state_without_notes(
     (run_dir / "run.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "frozen_config": {
                     "workflow_name": "test",
                     "config_path": "/config",
@@ -161,7 +266,7 @@ def test_cli_analysis_adds_safe_controller_state_without_notes(
     )
 
     controller = payload["run"]["controller_state"]
-    assert controller["schema_version"] == 1
+    assert controller["schema_version"] == 2
     assert controller["corrected_override_required"] is True
     assert "pending_override_notes" not in controller
     assert "private prompt note" not in json.dumps(controller)
@@ -369,7 +474,15 @@ class WorkflowCliTests(unittest.TestCase):
             },
         )()
         run_dir = repo_root / ".aflow" / "runs" / "saved-run"
+        config_path = repo_root / "aflow.toml"
+        config_path.write_text("", encoding="utf-8")
+        identity = _freeze_run_identity(
+            "saved_workflow",
+            workflow_config,
+            config_dir=config_path,
+        )
         prev_run = {
+            "schema_version": 2,
             "repo_root": str(repo_root),
             "workflow_name": "saved_workflow",
             "plan_path": str(plan_path),
@@ -386,6 +499,32 @@ class WorkflowCliTests(unittest.TestCase):
             "main_branch": "main",
             "status": "failed",
             "last_snapshot": {"is_complete": False},
+            "frozen_config": {
+                "workflow_name": identity.workflow_name,
+                "config_path": identity.config_path,
+                "config_fingerprint": identity.config_fingerprint,
+            },
+            "manager_decision_number": 0,
+            "manager_history": [],
+            "semantic_stall_count": 0,
+            "reviewer_rejection_count": 0,
+            "implementation_attempts": {},
+            "active_implementation_scope": None,
+            "review_rejection_history": [],
+            "pending_manager_notes": None,
+            "pending_step_team_override": None,
+            "pending_boundary_decision": None,
+            "pending_repartition": None,
+            "repartition_history": [],
+            "scope_pressure_reason": None,
+            "last_manager_report_path": None,
+            "hotplug_schema_version": 1,
+            "role_selectors": {},
+            "current_hotplug_transaction": None,
+            "pending_hotplug_transaction": None,
+            "active_role_sessions": [],
+            "hotplug_transaction_number": 0,
+            "hotplug_history": [],
         }
         return repo_root, run_dir, workflow_config, prev_run
 
@@ -406,7 +545,7 @@ class WorkflowCliTests(unittest.TestCase):
         modern_run = dict(prev_run)
         modern_run.update(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "frozen_config": {
                     "workflow_name": identity.workflow_name,
                     "config_path": identity.config_path,
@@ -511,6 +650,69 @@ class WorkflowCliTests(unittest.TestCase):
             captured_resume,
         )
 
+    def test_resume_schema_admission_rejects_missing_legacy_bool_string_and_future(
+        self,
+    ) -> None:
+        for observed in (None, 1, True, "2", 3):
+            with self.subTest(observed=observed):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, current_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(current_run)
+                if observed is None:
+                    prev_run.pop("schema_version")
+                else:
+                    prev_run["schema_version"] = observed
+
+                for auto in (False, True):
+                    with self.subTest(auto=auto):
+                        status, stderr, startup, execute, *_ = self._invoke_resume_command(
+                            tmp_path,
+                            prev_run,
+                            run_dir,
+                            workflow_config,
+                            auto=auto,
+                        )
+                        assert status == 1
+                        assert f"run '{run_dir.name}'" in stderr
+                        assert "expected integer 2" in stderr
+                        startup.assert_not_called()
+                        execute.assert_not_called()
+                        assert not (repo_root / ".aflow" / "runs").exists()
+
+    def test_plain_auto_resume_ignores_unsupported_schema_without_prompt(self) -> None:
+        import aflow.cli as cli_module
+
+        for observed in (None, 1, True, "2", 3):
+            with self.subTest(observed=observed):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, current_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(current_run)
+                if observed is None:
+                    prev_run.pop("schema_version")
+                else:
+                    prev_run["schema_version"] = observed
+                with patch(
+                    "aflow.cli.resolve_run_id",
+                    return_value=(Path(run_dir.name), "shell_last_run_id_file"),
+                ), patch("aflow.cli.load_run_json", return_value=prev_run):
+                    result = cli_module._detect_resume_candidate(
+                        repo_root=repo_root,
+                        workflow_config=workflow_config.workflows["saved_workflow"],
+                        workflow_name="saved_workflow",
+                        plan_path=Path(prev_run["original_plan_path"]),
+                        team="base",
+                        selected_start_step="implement_plan",
+                        max_turns=15,
+                        extra_instructions=("keep the patch focused",),
+                        requested_run_id=run_dir.name,
+                        require_resume=False,
+                    )
+                assert result is None
+
     def test_resume_bootstrap_reconstructs_omitted_identity_from_exact_run(
         self,
     ) -> None:
@@ -542,7 +744,7 @@ class WorkflowCliTests(unittest.TestCase):
         assert result.start_step == "implement_plan"
         assert result.max_turns == 15
         assert result.extra_instructions == ("keep the patch focused",)
-        assert result.frozen_run_identity is None
+        assert result.frozen_run_identity is not None
 
     def test_resume_bootstrap_accepts_exact_modern_frozen_identity(self) -> None:
         import aflow.cli as cli_module
@@ -835,6 +1037,65 @@ class WorkflowCliTests(unittest.TestCase):
                             extra_instructions_provided=False,
                         )
 
+    def test_plan_free_resume_rejects_malformed_current_manager_authority(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        cases = (
+            (
+                "empty pending manager notes",
+                lambda run: run.__setitem__("pending_manager_notes", {}),
+                "pending_manager_notes",
+            ),
+            (
+                "incomplete active scope",
+                lambda run: run.__setitem__(
+                    "active_implementation_scope",
+                    {
+                        "scope_id": "saved-scope",
+                        "original_plan_path": "/saved/plan.md",
+                        "checkpoint_index": 1,
+                        "checkpoint_name": "First",
+                        "opened_turn_number": 1,
+                        "carried_reviewer_rejection_count": 0,
+                        "envelope_artifact_path": "scopes/scope/envelope.json",
+                        "envelope_artifact_sha256": "a" * 64,
+                        "envelope_canonical_sha256": "b" * 64,
+                    },
+                ),
+                "active_implementation_scope is missing required fields: awaiting_review",
+            ),
+            (
+                "incomplete implementation attempt",
+                lambda run: run.__setitem__(
+                    "implementation_attempts",
+                    {
+                        "saved-scope": [{
+                            "turn_number": 1,
+                            "step_name": "implement",
+                            "role": "worker",
+                            "outcome": "progress",
+                        }],
+                    },
+                ),
+                "implementation_attempts[saved-scope][0] is missing required fields",
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                tmp_path = self._new_temp_path()
+                repo_root, run_dir, workflow_config, prev_run = (
+                    self._resume_bootstrap_fixture(tmp_path)
+                )
+                prev_run = dict(prev_run)
+                mutate(prev_run)
+                with pytest.raises(ValueError, match=re.escape(expected)):
+                    cli_module._validate_current_resume_metadata(
+                        prev_run,
+                        Path(run_dir.name),
+                    )
+
     def test_resume_bootstrap_accepts_compatible_repeated_identity(
         self,
     ) -> None:
@@ -1094,7 +1355,7 @@ class WorkflowCliTests(unittest.TestCase):
             (
                 "invalid lifecycle teardown",
                 lambda run: run.__setitem__("lifecycle_teardown", "merge"),
-                "lifecycle resume metadata",
+                "invalid lifecycle_teardown",
             ),
             (
                 "unsafe scope envelope reference",
@@ -1106,9 +1367,14 @@ class WorkflowCliTests(unittest.TestCase):
                         "checkpoint_index": 1,
                         "checkpoint_name": "Checkpoint 1: Saved",
                         "opened_turn_number": 1,
+                        "awaiting_review": False,
+                        "carried_reviewer_rejection_count": 0,
                         "envelope_artifact_path": "../../outside-envelope.json",
                         "envelope_artifact_sha256": "a" * 64,
                         "envelope_canonical_sha256": "b" * 64,
+                        "current_partition_generation_id": None,
+                        "current_partition_candidate_sha256": None,
+                        "current_partition_id": None,
                     },
                 ),
                 "invalid scope envelope reference",
@@ -1791,13 +2057,13 @@ class WorkflowCliTests(unittest.TestCase):
             (
                 "malformed lifecycle metadata",
                 lambda run: run.__setitem__("lifecycle_setup", "worktree"),
-                "invalid lifecycle resume metadata",
+                "invalid lifecycle_setup",
             ),
             (
                 "mismatched frozen identity",
                 lambda run: run.update(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "frozen_config": {
                             "workflow_name": "other_workflow",
                             "config_path": str(Path(run["repo_root"]) / "aflow.toml"),
@@ -1811,7 +2077,7 @@ class WorkflowCliTests(unittest.TestCase):
                 "incomplete frozen identity",
                 lambda run: run.update(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "frozen_config": {
                             "workflow_name": "saved_workflow",
                             "config_path": str(Path(run["repo_root"]) / "aflow.toml"),
@@ -1911,7 +2177,7 @@ class WorkflowCliTests(unittest.TestCase):
                             **arguments,
                         )
 
-    def test_resume_bootstrap_accepts_legacy_plan_path_metadata(
+    def test_resume_bootstrap_rejects_missing_original_plan_path_without_fallback(
         self,
     ) -> None:
         import aflow.cli as cli_module
@@ -1924,20 +2190,19 @@ class WorkflowCliTests(unittest.TestCase):
             "aflow.cli.resolve_run_id",
             return_value=(Path(run_dir.name), "explicit_run_id"),
         ), patch("aflow.cli.load_run_json", return_value=prev_run):
-            result = cli_module._bootstrap_resume_invocation(
-                repo_root=repo_root,
-                workflow_config=workflow_config,
-                requested_run_id=run_dir.name,
-                workflow_arg=None,
-                plan_file_arg=None,
-                team_arg=None,
-                start_step_arg=None,
-                max_turns_arg=None,
-                extra_instructions_arg=(),
-                extra_instructions_provided=False,
-            )
-
-        assert result.plan_path == Path(prev_run["plan_path"])
+            with pytest.raises(ValueError, match="original_plan_path"):
+                cli_module._bootstrap_resume_invocation(
+                    repo_root=repo_root,
+                    workflow_config=workflow_config,
+                    requested_run_id=run_dir.name,
+                    workflow_arg=None,
+                    plan_file_arg=None,
+                    team_arg=None,
+                    start_step_arg=None,
+                    max_turns_arg=None,
+                    extra_instructions_arg=(),
+                    extra_instructions_provided=False,
+                )
 
     def test_plan_free_resume_bootstrap_runs_before_startup_and_detector_uses_same_run(
         self,
@@ -2138,7 +2403,7 @@ class WorkflowCliTests(unittest.TestCase):
                 "current_step_name": "review_cp_implementation",
                 "active_plan_path": str(prev_run["original_plan_path"]),
                 "last_snapshot": snapshot,
-                "schema_version": 1,
+                "schema_version": 2,
                 "frozen_config": {
                     "workflow_name": frozen_identity.workflow_name,
                     "config_path": frozen_identity.config_path,
@@ -2168,6 +2433,7 @@ class WorkflowCliTests(unittest.TestCase):
                 },
             }
         )
+        durable_run = _current_resume_payload(durable_run)
         (run_dir / "run.json").write_text(
             json.dumps(durable_run),
             encoding="utf-8",
@@ -3871,6 +4137,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "last_run_id_file")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -3923,6 +4190,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "applied": False,
             },
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch(
             "aflow.cli.resolve_run_id",
@@ -3987,6 +4255,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "status": "failed",
                 "last_snapshot": {"is_complete": False},
             }
+            base_run = _current_resume_payload(base_run)
             accepted_text = 'team = "strong"\n'
             accepted_digest = hashlib.sha256(
                 accepted_text.encode("utf-8")
@@ -4158,6 +4427,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "current_step_name": "review_cp_implementation",
                 "last_snapshot": {"is_complete": False},
             }
+            prev_run = _current_resume_payload(prev_run)
 
             with patch(
                 "aflow.cli.resolve_run_id",
@@ -4233,6 +4503,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "opened_turn_number": 1,
                 "awaiting_review": True,
                 "carried_reviewer_rejection_count": 3,
+                "envelope_artifact_path": "scopes/old-scope/envelope.json",
+                "envelope_artifact_sha256": "a" * 64,
+                "envelope_canonical_sha256": "b" * 64,
             },
             "pending_manager_notes": {
                 "target_step": "implement_plan",
@@ -4263,6 +4536,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             },
             "last_manager_report_path": "manager-report.md",
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch(
             "aflow.cli.resolve_run_id",
@@ -4339,6 +4613,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "active_implementation_scope": scope,
                 "pending_repartition": pending,
             }
+            prev_run = _current_resume_payload(prev_run)
             with patch(
                 "aflow.cli.resolve_run_id",
                 return_value=(run_dir, "explicit_run_id"),
@@ -4406,6 +4681,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "active_implementation_scope": scope,
                 "pending_repartition": pending,
             }
+            prev_run = _current_resume_payload(prev_run)
             workflow_config = type(
                 "WorkflowConfig",
                 (),
@@ -4465,6 +4741,11 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 worktree_path=repo_root,
                 setup=(),
                 teardown=(),
+                frozen_run_identity=_freeze_run_identity(
+                    "test_workflow",
+                    workflow_config,
+                    config_dir=config_path,
+                ),
                 pending_repartition=replace(
                     resume.pending_repartition,
                     stage="proposed",
@@ -4556,17 +4837,10 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "main_branch": "main",
                 "status": "failed",
                 "last_snapshot": {"is_complete": False},
-                "reviewer_rejection_count": 0,
-                "active_implementation_scope": {
-                    "scope_id": "scope-1",
-                    "original_plan_path": str(plan_path),
-                    "checkpoint_index": 1,
-                    "checkpoint_name": "Checkpoint 1: Reopened",
-                    "opened_turn_number": 1,
-                    "awaiting_review": False,
-                    "carried_reviewer_rejection_count": 0,
-                },
+                "reviewer_rejection_count": 1,
+                "active_implementation_scope": None,
             }
+            prev_run = _current_resume_payload(prev_run)
 
             with patch(
                 "aflow.cli.resolve_run_id",
@@ -4658,16 +4932,8 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 "current_step_name": "review_cp_implementation",
                 "active_plan_path": str(plan_path),
                 "last_snapshot": snapshot,
-                "reviewer_rejection_count": 0,
-                "active_implementation_scope": {
-                    "scope_id": "scope-1",
-                    "original_plan_path": str(plan_path),
-                    "checkpoint_index": 1,
-                    "checkpoint_name": "Checkpoint 1: Reopened",
-                    "opened_turn_number": 1,
-                    "awaiting_review": True,
-                    "carried_reviewer_rejection_count": 0,
-                },
+                "reviewer_rejection_count": 1,
+                "active_implementation_scope": None,
                 "pending_boundary_decision": {
                     "finalized_turn_number": 1,
                     "decision_number": 7,
@@ -4678,6 +4944,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     "consumed": True,
                 },
             }
+            prev_run = _current_resume_payload(prev_run)
 
             with patch(
                 "aflow.cli.resolve_run_id",
@@ -4797,6 +5064,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 with self.subTest(name=name):
                     prev_run = dict(base_run)
                     prev_run.update(lifecycle_fields)
+                    prev_run = _current_resume_payload(prev_run)
                     with patch(
                         "aflow.cli.resolve_run_id",
                         return_value=(run_dir, "explicit_run_id"),
@@ -4911,6 +5179,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "last_run_id_file")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -4949,6 +5218,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "last_run_id_file")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -4985,6 +5255,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "last_run_id_file")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -5023,6 +5294,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "completed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "last_run_id_file")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -5059,6 +5331,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "last_run_id_file")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -5096,6 +5369,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "explicit_run_id")), \
              patch('aflow.cli.load_run_json', return_value=prev_run), \
@@ -5143,6 +5417,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "merge_status": "failed",
             "merge_failure_reason": "feature branch is checked out elsewhere",
         }
+        prev_run = _current_resume_payload(prev_run)
         workflow = type(
             "obj",
             (object,),
@@ -5311,6 +5586,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     "last_snapshot": {"is_complete": False},
                     "active_implementation_scope": scope,
                 }
+                run_payload = _current_resume_payload(run_payload)
                 (run_dir / "run.json").write_text(
                     json.dumps(run_payload),
                     encoding="utf-8",
@@ -5381,6 +5657,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             "status": "failed",
             "last_snapshot": {"is_complete": False},
         }
+        prev_run = _current_resume_payload(prev_run)
 
         with patch('aflow.cli.resolve_run_id', return_value=(Path("20260101T000000Z-abc123"), "explicit_run_id")), \
              patch('aflow.cli.load_run_json', return_value=prev_run):

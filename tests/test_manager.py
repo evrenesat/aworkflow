@@ -33,9 +33,11 @@ from aflow.manager import (
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
     ActiveImplementationScope,
+    CheckpointRepartitionRecord,
     ControllerConfig,
     ControllerState,
     ExecutionContext,
+    FrozenRunIdentity,
     ImplementationAttempt,
     ManagerDecisionSummary,
     PendingManagerNotes,
@@ -43,6 +45,7 @@ from aflow.run_state import (
     PendingTeamOverride,
     ReviewRejectionRecord,
     manager_resume_fields,
+    manager_resume_fields_strict,
     manager_state_payload,
     restore_manager_state,
 )
@@ -921,7 +924,7 @@ def test_manager_and_note_correction_artifacts_round_trip_payload(tmp_path: Path
     state.manager_history.append(ManagerDecisionSummary(1, "lite", "normal", "continue", "safe", "manager/decision-001"))
     state.semantic_stall_count = 1
     state.reviewer_rejection_count = 2
-    state.implementation_attempts["cp-2"] = 2
+    state.implementation_attempts["cp-2"] = []
     state.active_implementation_scope = ActiveImplementationScope(
         "plan.md::checkpoint-2::second",
         "plan.md",
@@ -930,6 +933,9 @@ def test_manager_and_note_correction_artifacts_round_trip_payload(tmp_path: Path
         3,
         awaiting_review=True,
         carried_reviewer_rejection_count=1,
+        envelope_artifact_path="scopes/scope-2/envelope.json",
+        envelope_artifact_sha256="b" * 64,
+        envelope_canonical_sha256="c" * 64,
     )
     state.review_rejection_history.append(ReviewRejectionRecord(
         "plan.md::checkpoint-2::second", 1, "source-run", 4, "review", "codex.review",
@@ -939,6 +945,11 @@ def test_manager_and_note_correction_artifacts_round_trip_payload(tmp_path: Path
     state.pending_manager_notes = PendingManagerNotes("implement", ("focus",), 1)
     state.pending_step_team_override = PendingTeamOverride("implement", "worker", "base", "high", "codex.high", "cp-2", 1)
     state.last_manager_report_path = "manager-report.md"
+    state.frozen_run_identity = FrozenRunIdentity(
+        workflow_name="manager",
+        config_path=str(tmp_path / "aflow.toml"),
+        config_fingerprint="a" * 64,
+    )
     payload = manager_state_payload(state)
     assert payload["manager_history"][0]["action"] == "continue"
     assert payload["pending_step_team_override"]["target_team"] == "high"
@@ -964,6 +975,8 @@ def test_manager_and_note_correction_artifacts_round_trip_payload(tmp_path: Path
         ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"),
         state,
         status="running",
+        workflow_name="manager",
+        original_plan_path=tmp_path / "plan.md",
     )
     run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
     assert run_json["last_manager_report_path"] == "manager-report.md"
@@ -975,6 +988,11 @@ def test_manager_style_metadata_write_preserves_worktree_lifecycle(tmp_path: Pat
     config = ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md")
     paths = create_run_paths(config)
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 1, False))
+    state.frozen_run_identity = FrozenRunIdentity(
+        workflow_name="manager",
+        config_path=str(tmp_path / "aflow.toml"),
+        config_fingerprint="b" * 64,
+    )
     worktree = tmp_path / "worktrees" / "feature"
     execution_context = ExecutionContext(
         primary_repo_root=tmp_path,
@@ -991,9 +1009,18 @@ def test_manager_style_metadata_write_preserves_worktree_lifecycle(tmp_path: Pat
         state,
         status="running",
         execution_context=execution_context,
+        workflow_name="manager",
+        original_plan_path=tmp_path / "plan.md",
     )
 
-    write_run_metadata(paths, config, state, status="running")
+    write_run_metadata(
+        paths,
+        config,
+        state,
+        status="running",
+        workflow_name="manager",
+        original_plan_path=tmp_path / "plan.md",
+    )
 
     run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
     assert run_json["execution_repo_root"] == str(worktree)
@@ -1032,10 +1059,10 @@ def test_resume_attempt_history_is_tolerant_and_live_conversion_is_mutable() -> 
 
     legacy = manager_resume_fields({"implementation_attempts": {"checkpoint-1": 2}})
     assert legacy["active_implementation_scope"] is None
-    assert legacy["implementation_attempts"]["checkpoint-1"] == ()
+    assert "checkpoint-1" not in legacy["implementation_attempts"]
 
 
-def test_legacy_scope_does_not_restore_run_wide_reviewer_rejections() -> None:
+def test_current_scope_preserves_run_wide_reviewer_rejections() -> None:
     payload = {
         "reviewer_rejection_count": 2,
         "active_implementation_scope": {
@@ -1045,6 +1072,10 @@ def test_legacy_scope_does_not_restore_run_wide_reviewer_rejections() -> None:
             "checkpoint_name": "Second",
             "opened_turn_number": 5,
             "awaiting_review": False,
+            "carried_reviewer_rejection_count": 0,
+            "envelope_artifact_path": "scopes/scope-2/envelope.json",
+            "envelope_artifact_sha256": "b" * 64,
+            "envelope_canonical_sha256": "c" * 64,
         },
     }
 
@@ -1052,9 +1083,55 @@ def test_legacy_scope_does_not_restore_run_wide_reviewer_rejections() -> None:
     restore_manager_state(restored, payload)
     fields = manager_resume_fields(payload)
 
-    assert restored.reviewer_rejection_count == 0
-    assert fields["reviewer_rejection_count"] == 0
+    assert restored.reviewer_rejection_count == 2
+    assert fields["reviewer_rejection_count"] == 2
     scope = fields["active_implementation_scope"]
     assert isinstance(scope, ActiveImplementationScope)
     assert scope.opened_turn_number == 5
     assert scope.carried_reviewer_rejection_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    (
+        ("partition_ids", [], "partition_ids must be non-empty"),
+        ("child_summaries", [""], "child_summaries must be a list of strings"),
+    ),
+)
+def test_strict_manager_resume_rejects_repartition_history_that_would_be_dropped(
+    field: str,
+    value: list[str],
+    expected: str,
+) -> None:
+    record = CheckpointRepartitionRecord(
+        schema_version=1,
+        decision_number=1,
+        scope_id="scope-1",
+        generation_id="generation-1",
+        envelope_sha256="a" * 64,
+        envelope_artifact_sha256="b" * 64,
+        source_plan_sha256="c" * 64,
+        proposal_sha256="d" * 64,
+        candidate_plan_sha256="e" * 64,
+        partition_ids=("partition-1",),
+        child_summaries=("Child 1",),
+        current_disposition="implement_current_partition",
+        resolved_target_step="implement_plan",
+        resolved_target_role="worker",
+        current_partition_id="partition-1",
+        scope_pressure_reason=None,
+        envelope_artifact_path="scopes/scope-1/envelope.json",
+        proposal_artifact_path="manager/proposal.json",
+        candidate_artifact_path="manager/candidate.md",
+        mechanical_validation_artifact_path="manager/mechanical.json",
+        semantic_verdict_artifact_path="manager/semantic.json",
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 1, False),
+        repartition_history=[record],
+    )
+    payload = json.loads(json.dumps(manager_state_payload(state)))
+    payload["repartition_history"][0][field] = value
+
+    with pytest.raises(ValueError, match=expected):
+        manager_resume_fields_strict(payload)

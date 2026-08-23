@@ -253,7 +253,6 @@ def _open_implementation_scope(
         checkpoint_name=name,
         opened_turn_number=turn_number,
     )
-    state.active_implementation_scope = scope
     return scope, True
 
 
@@ -299,6 +298,7 @@ def _resume_completed_worker_can_use_original_plan(
 def _capture_scope_envelope(
     state: ControllerState,
     *,
+    scope: ActiveImplementationScope | None = None,
     plan_text: str | None,
     primary_plan_path: Path,
     run_dir: Path,
@@ -308,12 +308,14 @@ def _capture_scope_envelope(
     """Capture and persist an immutable scope envelope at new-scope opening.
 
     Must be called after ``_open_implementation_scope`` but before the first
-    worker harness invocation.  Idempotent: returns immediately when the
-    active scope already has an envelope artifact.
+    worker harness invocation.  A newly opened scope may be supplied through
+    ``scope`` and is published to controller state only after the complete
+    envelope has been captured and validated.  Idempotent: returns immediately
+    when the active scope already has an envelope artifact.
 
     Raises ``WorkflowError`` when primary and execution plan copies disagree.
     """
-    scope = state.active_implementation_scope
+    scope = scope or state.active_implementation_scope
     if scope is None:
         return
     reference_values = (
@@ -421,7 +423,7 @@ def _validate_scope_envelope_bytes(
     """Bind exact artifact bytes and parsed envelope authority to one scope."""
     reference = _scope_envelope_reference(scope)
     if reference is None:
-        raise WorkflowError("invalid scope envelope reference: legacy scope has no artifact")
+        raise WorkflowError("invalid scope envelope reference: complete artifact is required")
     _artifact_path, artifact_sha256, canonical_sha256 = reference
     actual_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
     if actual_sha256 != artifact_sha256:
@@ -448,11 +450,13 @@ def _validate_scope_envelope_bytes(
 def load_scope_envelope_for_resume(
     source_run_dir: Path,
     scope: ActiveImplementationScope,
-) -> bytes | None:
+) -> bytes:
     """Read and bind a source artifact before resume pruning can remove it."""
     reference = _scope_envelope_reference(scope)
     if reference is None:
-        return None
+        raise WorkflowError(
+            "cannot resume: active implementation scope has no complete envelope reference"
+        )
     artifact_path, _artifact_sha256, _canonical_sha256 = reference
     source_root = source_run_dir.resolve()
     candidate = source_run_dir / artifact_path
@@ -479,9 +483,8 @@ def _validate_existing_scope_envelope(
     run_dir: Path,
     scope: ActiveImplementationScope,
 ) -> None:
-    """Fail closed for a modern active scope while retaining legacy scopes."""
-    if _scope_envelope_reference(scope) is not None:
-        load_scope_envelope_for_resume(run_dir, scope)
+    """Fail closed unless an active scope has a valid immutable envelope."""
+    load_scope_envelope_for_resume(run_dir, scope)
 
 
 def _require_valid_pressure_scope(
@@ -504,7 +507,7 @@ def _require_valid_pressure_scope(
         reference = _scope_envelope_reference(scope)
         if reference is None:
             raise WorkflowError(
-                "invalid scope envelope reference: legacy scope has no artifact"
+                "invalid scope envelope reference: complete artifact is required"
             )
         load_scope_envelope_for_resume(run_dir, scope)
     except WorkflowError as exc:
@@ -3502,19 +3505,17 @@ def run_workflow(
     if resume is not None and resume.active_implementation_scope is not None:
         reference = _scope_envelope_reference(resume.active_implementation_scope)
         if reference is None:
-            if resumed_envelope_bytes is not None:
-                raise WorkflowError(
-                    "cannot resume: legacy scope unexpectedly carries envelope bytes"
-                )
-        elif resumed_envelope_bytes is None:
+            raise WorkflowError(
+                "cannot resume: active implementation scope has no complete envelope reference"
+            )
+        if resumed_envelope_bytes is None:
             raise WorkflowError(
                 "cannot resume: modern scope envelope bytes were not validated before startup"
             )
-        else:
-            _validate_scope_envelope_bytes(
-                resume.active_implementation_scope,
-                resumed_envelope_bytes,
-            )
+        _validate_scope_envelope_bytes(
+            resume.active_implementation_scope,
+            resumed_envelope_bytes,
+        )
 
     preserve_resume_override_source = (
         resume is not None
@@ -4028,7 +4029,7 @@ def run_workflow(
             reference = _scope_envelope_reference(scope)
             if reference is None:
                 raise WorkflowError(
-                    "cannot resume: legacy scope unexpectedly carries envelope bytes"
+                    "cannot resume: active implementation scope has no complete envelope reference"
                 )
             artifact_path, _artifact_sha256, _canonical_sha256 = reference
             envelope_path = run_paths.run_dir / artifact_path
@@ -6560,11 +6561,6 @@ def run_workflow(
                 reason="accepted repartition decision has no unique active scope transaction",
             )
         envelope_bytes = load_scope_envelope_for_resume(run_paths.run_dir, scope)
-        if envelope_bytes is None:
-            _fail_manager_gate(
-                decision_context,
-                reason="accepted repartition decision lacks an immutable scope envelope",
-            )
         try:
             envelope = parse_envelope_bytes(envelope_bytes)
             source_path = _exec_plan_path(original_plan_path, exec_ctx)
@@ -7130,17 +7126,16 @@ def run_workflow(
                 envelope_bytes = load_scope_envelope_for_resume(
                     run_paths.run_dir, scope,
                 )
-                if envelope_bytes is not None:
-                    eligible_envelope = parse_envelope_bytes(envelope_bytes)
-                    eligible_source = _exec_plan_path(
-                        original_plan_path, exec_ctx,
-                    ).read_bytes().decode("utf-8", "strict")
-                    eligible_drift = validate_envelope_boundary_drift(
-                        envelope=eligible_envelope,
-                        boundary_plan_text=eligible_source,
-                    )
-                    if eligible_drift.allowed:
-                        base_eligible.add("repartition_current_checkpoint")
+                eligible_envelope = parse_envelope_bytes(envelope_bytes)
+                eligible_source = _exec_plan_path(
+                    original_plan_path, exec_ctx,
+                ).read_bytes().decode("utf-8", "strict")
+                eligible_drift = validate_envelope_boundary_drift(
+                    envelope=eligible_envelope,
+                    boundary_plan_text=eligible_source,
+                )
+                if eligible_drift.allowed:
+                    base_eligible.add("repartition_current_checkpoint")
             except (OSError, UnicodeDecodeError, ValueError, WorkflowError):
                 # Invalid authority makes repartition unavailable. Full still
                 # receives continue/upgrade/stop and may report the boundary.
@@ -8613,7 +8608,7 @@ def run_workflow(
             )
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
-            if step.role == "worker":
+            if step.role == "worker" and not done:
                 try:
                     _scope, scope_was_opened = _open_implementation_scope(
                         state,
@@ -8621,9 +8616,10 @@ def run_workflow(
                         original_snapshot=state.last_snapshot,
                         turn_number=turn_number,
                     )
-                    if scope_was_opened and not state.last_snapshot.is_complete:
+                    if scope_was_opened:
                         _capture_scope_envelope(
                             state,
+                            scope=_scope,
                             plan_text=None,
                             primary_plan_path=original_plan_path,
                             run_dir=run_paths.run_dir,
@@ -8920,7 +8916,7 @@ def run_workflow(
 
             step = wf.steps[current_step_name]
             step_path = f"workflow.{workflow_name}.steps.{current_step_name}"
-            if step.role == "worker":
+            if step.role == "worker" and not current_plan.snapshot.is_complete:
                 try:
                     _scope, scope_was_opened = _open_implementation_scope(
                         state,
@@ -8928,9 +8924,10 @@ def run_workflow(
                         original_snapshot=current_plan.snapshot,
                         turn_number=turn_number,
                     )
-                    if scope_was_opened and not current_plan.snapshot.is_complete:
+                    if scope_was_opened:
                         _capture_scope_envelope(
                             state,
+                            scope=_scope,
                             plan_text=None,
                             primary_plan_path=original_plan_path,
                             run_dir=run_paths.run_dir,
@@ -9890,13 +9887,8 @@ def run_workflow(
         if review_rejection is not None:
             state.review_rejection_history.append(review_rejection)
 
-        if step.role == "worker":
+        if step.role == "worker" and state.active_implementation_scope is not None:
             scope = state.active_implementation_scope
-            if scope is None:
-                raise WorkflowError(
-                    "internal error: worker turn finalized without an implementation scope",
-                    run_dir=run_paths.run_dir,
-                )
             state.implementation_attempts.setdefault(scope.scope_id, []).append(ImplementationAttempt(
                 turn_number=turn_number, step_name=current_step_name, role=step.role,
                 team=active_team_name, selector=selector,

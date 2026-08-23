@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from aflow.hotplug import HotplugTransactionV1, hotplug_transaction_id
 import aflow.control_plane.persistence as persistence_module
 from aflow.control_plane import (
     EventJournal,
@@ -18,6 +19,16 @@ from aflow.control_plane import (
     validate_run_id,
 )
 from aflow.control_plane.persistence import normalized_request_digest
+from aflow.plan import PlanSnapshot
+from aflow.run_state import (
+    ActiveImplementationScope,
+    ControllerConfig,
+    ControllerState,
+    FrozenRunIdentity,
+    ImplementationAttempt,
+    hotplug_resume_fields,
+)
+from aflow.runlog import create_run_paths, write_run_metadata
 
 
 def _manifest(
@@ -215,3 +226,225 @@ def test_event_journal_tolerates_only_a_torn_final_line(tmp_path: Path) -> None:
     journal.path.write_bytes(b'{"schema_version":1,"sequence":1,"event_type":"reserved","timestamp":"now","data":{}}\n{bad}\n')
     with pytest.raises(JournalCorruptionError, match="interior"):
         journal.tail()
+
+
+def test_run_metadata_emits_complete_schema_v2_empty_authority(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=7)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+    paths = create_run_paths(config)
+
+    write_run_metadata(
+        paths,
+        config,
+        state,
+        status="running",
+        workflow_name="managed",
+        original_plan_path=plan_path,
+    )
+
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["workflow_name"] == "managed"
+    assert payload["original_plan_path"] == str(plan_path)
+    assert payload["team"] is None
+    assert payload["lifecycle_setup"] == []
+    assert payload["lifecycle_teardown"] == []
+    assert payload["frozen_config"]["config_fingerprint"] == "f" * 64
+    assert payload["manager_history"] == []
+    assert payload["implementation_attempts"] == {}
+    assert payload["active_implementation_scope"] is None
+    assert payload["hotplug_schema_version"] == 1
+    assert payload["current_hotplug_transaction"] is None
+    assert payload["pending_hotplug_transaction"] is None
+    assert payload["active_role_sessions"] == []
+    assert payload["hotplug_history"] == []
+
+
+def test_run_metadata_never_rewrites_an_old_snapshot(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path)
+    paths = create_run_paths(config)
+    original = b'{"schema_version":1,"status":"failed"}\n'
+    paths.run_json.write_bytes(original)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported resume state schema"):
+        write_run_metadata(
+            paths,
+            config,
+            state,
+            status="running",
+            workflow_name="managed",
+            original_plan_path=plan_path,
+        )
+
+    assert paths.run_json.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        b"{}\n",
+        b"[]\n",
+        b"{malformed\n",
+    ],
+)
+def test_run_metadata_never_rewrites_existing_malformed_snapshot(
+    tmp_path: Path,
+    original: bytes,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path)
+    paths = create_run_paths(config)
+    paths.run_json.write_bytes(original)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        write_run_metadata(
+            paths,
+            config,
+            state,
+            status="running",
+            workflow_name="managed",
+            original_plan_path=plan_path,
+        )
+
+    assert paths.run_json.read_bytes() == original
+
+
+def test_run_metadata_never_rewrites_existing_unreadable_snapshot(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path)
+    paths = create_run_paths(config)
+    paths.run_json.mkdir()
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="run.json is unreadable"):
+        write_run_metadata(
+            paths,
+            config,
+            state,
+            status="running",
+            workflow_name="managed",
+            original_plan_path=plan_path,
+        )
+
+    assert paths.run_json.is_dir()
+
+
+def test_run_metadata_emits_populated_manager_scope_and_hotplug_authority(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=7)
+    digest = "a" * 64
+    transaction = HotplugTransactionV1(
+        transaction_id=hotplug_transaction_id("run-1", digest, 1),
+        run_id="run-1",
+        accepted_override_digest=digest,
+        transaction_number=1,
+        source_role="worker",
+        target_role="reviewer",
+        source_selector="codex.worker",
+        target_selector="codex.reviewer",
+        source_harness="codex",
+        target_harness="codex",
+        source_profile="worker",
+        target_profile="reviewer",
+        source_model_display="worker",
+        target_model_display="reviewer",
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        current_team="managed",
+        manager_decision_number=3,
+        implementation_attempts={
+            "scope-1": [
+                ImplementationAttempt(
+                    1, "implement", "worker", "managed", "codex.worker", "progress"
+                )
+            ]
+        },
+        active_implementation_scope=ActiveImplementationScope(
+            scope_id="scope-1",
+            original_plan_path=str(plan_path),
+            checkpoint_index=1,
+            checkpoint_name="First",
+            opened_turn_number=1,
+            carried_reviewer_rejection_count=2,
+            envelope_artifact_path="scopes/scope-1/envelope.json",
+            envelope_artifact_sha256="b" * 64,
+            envelope_canonical_sha256="c" * 64,
+        ),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+        role_selectors={"worker": "codex.worker"},
+        current_hotplug_transaction=transaction,
+        pending_hotplug_transaction=transaction,
+        hotplug_transaction_number=1,
+        hotplug_history=[transaction],
+    )
+    paths = create_run_paths(config)
+
+    write_run_metadata(
+        paths,
+        config,
+        state,
+        status="running",
+        workflow_name="managed",
+        original_plan_path=plan_path,
+    )
+
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["team"] == "managed"
+    assert payload["implementation_attempts"]["scope-1"][0]["outcome"] == "progress"
+    assert payload["active_implementation_scope"]["envelope_artifact_path"] == (
+        "scopes/scope-1/envelope.json"
+    )
+    assert payload["active_implementation_scope"]["carried_reviewer_rejection_count"] == 2
+    assert payload["current_hotplug_transaction"]["transaction_id"] == transaction.transaction_id
+    assert payload["pending_hotplug_transaction"]["stage"] == "accepted"
+    assert payload["hotplug_history"][0]["transaction_number"] == 1
+    restored_hotplug = hotplug_resume_fields(payload)
+    assert restored_hotplug["role_selectors"] == {"worker": "codex.worker"}
+    assert restored_hotplug["pending_hotplug_transaction"] == transaction
+    assert restored_hotplug["hotplug_history"] == (transaction,)

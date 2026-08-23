@@ -132,9 +132,11 @@ aflow analyze <run-id>
 aflow run --resume <run-id>
 ```
 
-Resume reuses a compatible unfinished worktree run and reconstructs its saved
-plan and invocation identity when no plan is supplied. Detailed compatibility,
-recovery, supervision, and next-turn override rules are documented separately.
+Resume reuses only a complete schema-v2 unfinished worktree run and
+reconstructs its saved plan and invocation identity when no plan is supplied.
+Older run metadata remains readable for analysis but is not migrated or
+resumable. Detailed compatibility, recovery, supervision, and next-turn
+override rules are documented separately.
 
 ### Live worker role hotplug
 

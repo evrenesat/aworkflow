@@ -138,13 +138,14 @@ The run fails if recovery exceeds `max_consecutive_recoveries` or a backup-team 
 
 ## Disk-backed run state and boundary overrides
 
-Every new `.aflow/runs/<run-id>/run.json` is a schema-versioned controller
-snapshot. It records the selected workflow, the resolved configuration
-directory, and a stable fingerprint of the already-resolved workflow, roles,
-teams, harness profiles, manager, and recovery configuration. AFlow writes this
-file through a flushed same-directory temporary file and atomic replacement, so
-an interrupted update cannot expose partial JSON. Existing unversioned run
-metadata remains readable by the legacy-tolerant resume path.
+Every new `.aflow/runs/<run-id>/run.json` is a schema-version `2` controller
+snapshot. It records the selected workflow, authoritative original plan path,
+resolved configuration directory, frozen configuration fingerprint, complete
+lifecycle identity, manager authority, hotplug authority, and active-scope
+envelope references. AFlow writes this file through a flushed same-directory
+temporary file and atomic replacement, so an interrupted update cannot expose
+partial JSON. Older or malformed metadata remains readable for inspection but
+is never migrated or resumed.
 
 `run.json` is controller-owned output. To request a safe future-turn change,
 create or edit exactly:
