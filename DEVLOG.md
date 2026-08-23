@@ -70,6 +70,16 @@
   worktree regressions. Harness negotiation, Git Tracking bootstrap, guard,
   daemon/API/UI, and architecture rewrites remain intentionally excluded.
 
+## 2026-08-23 — Remove deprecated unscoped execution routes
+
+- Removed `POST /api/executions`, `GET /api/executions/{run_id}`, and
+  `GET /api/executions/{run_id}/events`, including the `find_run()`
+  cross-project compatibility scan and adapter models; no redirect, tombstone,
+  or compatibility alias remains.
+- Lifecycle REST is now project-scoped under `/api/control-plane`; clients
+  carry `project_id`, while REST and MCP continue to share the same durable
+  control-plane application and services.
+
 ## 2026-08-11 — Add lightweight stdio MCP daemon
 
 - Added `aflow daemon start|status|stop` for a single local project, with stdio

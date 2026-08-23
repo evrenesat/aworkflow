@@ -244,11 +244,15 @@ Sending a turn supports Cmd/Ctrl+Enter. The UI polls the selected session while 
 
 ## Daemon-backed control plane
 
-The run dashboard, REST API, and MCP server are views over the same
-daemon-owned control plane. The HTTP process does not own workflow processes,
-an in-memory execution map, or a second run database. Each served project must
-be present in `[control_plane].projects`; a request cannot supply an arbitrary
-root, executable, environment file, or plan location.
+The run dashboard, project-scoped REST API, and MCP server delegate to the same
+durable control-plane application and services. The HTTP process does not own
+workflow processes, an in-memory execution map, or a second run database. Each
+served project must be present in `[control_plane].projects`; a request cannot
+supply an arbitrary root, executable, environment file, or plan location.
+Lifecycle REST routes are project-scoped under `/api/control-plane` and carry
+`project_id`; clients do not rely on a cross-project run lookup. The former
+unscoped execution routes no longer exist, and no redirect or compatibility
+alias is provided.
 
 Start requests name one allowlisted project and a safe project-relative plan.
 They may select `workflow_name`, `team`, `start_step`, and `max_turns`. A ready
@@ -277,9 +281,6 @@ Read operations return bounded pages, event tails, and context snapshots. The
 authenticated SSE endpoint is
 `/api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`; browser
 code uses `fetch` with its bearer header rather than query-token `EventSource`.
-The older `/api/executions` endpoints are deprecated, header-authenticated
-aliases over the same allowlisted control plane. They do not restore the former
-in-memory execution behavior.
 
 ### REST, MCP, and deployment use
 
@@ -413,12 +414,6 @@ Daemon control plane:
 - `PATCH /api/control-plane/projects/{project_id}/runs/{run_id}/control`
 - `POST /api/control-plane/projects/{project_id}/runs/{run_id}/owner-stop`
 - `POST /api/control-plane/projects/{project_id}/runs/{run_id}/resume`
-
-Deprecated execution compatibility aliases:
-
-- `POST /api/executions`
-- `GET /api/executions/{run_id}`
-- `GET /api/executions/{run_id}/events`
 
 Transcription:
 

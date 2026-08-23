@@ -117,19 +117,6 @@ class ControlPlaneService:
     def run_status(self, project_id: str, run_id: str) -> RunStatus:
         return self._project(project_id).daemon.service.run_status(run_id)
 
-    def find_run(self, run_id: str) -> tuple[str, RunStatus]:
-        """Compatibility lookup for the legacy unscoped execution endpoint."""
-        for project_id in sorted(self._configs):
-            try:
-                return project_id, self.run_status(project_id, run_id)
-            except Exception as exc:
-                from aflow.control_plane import RepositoryNotFoundError, RunIdentityError
-
-                if isinstance(exc, (RepositoryNotFoundError, RunIdentityError)):
-                    continue
-                raise
-        raise ProjectNotAllowedError("run is not available through an allowed project")
-
     def events(
         self,
         project_id: str,

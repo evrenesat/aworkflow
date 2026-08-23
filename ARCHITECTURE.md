@@ -734,12 +734,15 @@ wrapper that adds app-specific safe error mappings. Its FastAPI `/mcp` mount
 retains the server-owned header bearer check; registry sharing does not move
 authorization into a client or URL.
 
-The p100 control plane separates durable workflow ownership from its HTTP, UI,
-and MCP transports. `aflowd.service` runs the release-pinned remote-app server
-on the Tailscale address only. Its `ControlPlaneService` owns the static project
-allowlist and calls the AFlow daemon for every lifecycle operation; the
-transport layer neither launches subprocesses nor reads or writes `.aflow`
-artifacts directly.
+The p100 control plane separates durable workflow ownership from its browser
+REST, UI, and MCP transports. Browser lifecycle REST uses only project-scoped
+`/api/control-plane/projects/{project_id}/...` routes. REST and MCP delegate to
+the same durable control-plane application and services; neither transport
+infers a project by scanning daemons. `aflowd.service` runs the release-pinned
+remote-app server on the Tailscale address only. Its `ControlPlaneService` owns
+the static project allowlist and calls the AFlow daemon for every lifecycle
+operation; the transport layer neither launches subprocesses nor reads or
+writes `.aflow` artifacts directly.
 
 ```text
 Mac UI / REST client / MCP client

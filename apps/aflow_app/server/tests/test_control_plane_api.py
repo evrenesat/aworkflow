@@ -233,6 +233,11 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
     schema = app.openapi()
     paths = schema["paths"]
     assert {
+        "/api/executions",
+        "/api/executions/{run_id}",
+        "/api/executions/{run_id}/events",
+    }.isdisjoint(paths)
+    assert {
         "/ready",
         "/api/control-plane/capabilities",
         "/api/control-plane/projects",
@@ -250,6 +255,12 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
         "RunControlPayload",
         "ContextResponse",
     }.issubset(schema["components"]["schemas"])
+
+
+def test_deprecated_execution_routes_are_not_registered() -> None:
+    assert not any(
+        getattr(route, "path", "").startswith("/api/executions") for route in app.routes
+    )
 
 
 def test_control_plane_reads_pending_start_and_idempotency(control_client) -> None:
