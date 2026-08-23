@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-08-22 — Match resumed legacy controllers by durable lineage (F-05)
+
+- Resumed legacy guards now bind a successor's durable predecessor to one exact
+  explicit `--resume` CLI option.
+- Free run-ID substrings and post-`--` text no longer establish ownership.
+- Wrapper deduplication, descendant selection, classifications, and observer-only
+  authority remain unchanged.
+- Deterministic tests cover lineage positives, wrappers, descendants, duplicates,
+  and collision/spoof cases.
+
 ## 2026-08-22 — Bootstrap Git Tracking before run allocation (F-03)
 
 - Fresh pristine review plans now receive one minimal Git Tracking section
