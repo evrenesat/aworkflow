@@ -269,6 +269,41 @@ def test_run_metadata_emits_complete_schema_v2_empty_authority(tmp_path: Path) -
     assert payload["hotplug_history"] == []
 
 
+def test_run_metadata_persists_resolved_team_before_state_initialization(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(
+        repo_root=tmp_path,
+        plan_path=plan_path,
+        max_turns=7,
+        team="strong",
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            config_path=str(tmp_path / "aflow.toml"),
+            config_fingerprint="f" * 64,
+        ),
+    )
+    paths = create_run_paths(config)
+
+    write_run_metadata(
+        paths,
+        config,
+        state,
+        status="initializing",
+        workflow_name="managed",
+        original_plan_path=plan_path,
+    )
+
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert state.current_team is None
+    assert payload["team"] == "strong"
+
+
 def test_run_metadata_never_rewrites_an_old_snapshot(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.md"
     plan_path.write_text("# Plan\n", encoding="utf-8")
