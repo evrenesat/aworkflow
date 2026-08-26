@@ -839,7 +839,9 @@ def write_run_metadata(
     if new_plan_path is not None:
         payload["new_plan_path"] = str(new_plan_path)
     payload["team"] = team if team is not None else (
-        state.current_team if state is not None else None
+        state.current_team
+        if state is not None and state.current_team is not None
+        else config.team
     )
     if state is not None and state.issues_summary_path is not None:
         payload["issues_summary_path"] = state.issues_summary_path
