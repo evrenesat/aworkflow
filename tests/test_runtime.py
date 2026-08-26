@@ -25,7 +25,7 @@ from aflow.run_state import (
     manager_resume_fields,
     resolve_resume_override,
 )
-from aflow.runlog import create_run_paths, write_run_metadata
+from aflow.runlog import RunMetadataWriter, create_run_paths
 from aflow.workflow import (
     _execute_init_repo_handoff,
     _freeze_run_identity,
@@ -1353,12 +1353,13 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 config_path=str(repo_root),
                 config_fingerprint="abc123",
             )
-            write_run_metadata(
-                paths,
-                config,
-                state,
-                status="running",
+            RunMetadataWriter(
+                paths=paths,
+                config=config,
+                state=state,
                 workflow_name="simple",
+            ).write(
+                status="running",
                 original_plan_path=plan_path,
             )
             previous = paths.run_json.read_text(encoding="utf-8")
@@ -1366,12 +1367,13 @@ class WorkflowRuntimeTests(unittest.TestCase):
             state.status_message = "new state"
             with patch("aflow.runlog.os.replace", side_effect=OSError("interrupted")):
                 with pytest.raises(OSError, match="interrupted"):
-                    write_run_metadata(
-                        paths,
-                        config,
-                        state,
-                        status="running",
+                    RunMetadataWriter(
+                        paths=paths,
+                        config=config,
+                        state=state,
                         workflow_name="simple",
+                    ).write(
+                        status="running",
                         original_plan_path=plan_path,
                     )
 

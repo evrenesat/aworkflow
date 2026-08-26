@@ -55,7 +55,7 @@ from aflow.runlog import (
     write_manager_artifacts,
     write_manager_note_correction_artifacts,
     write_repartition_artifact,
-    write_run_metadata,
+    RunMetadataWriter,
 )
 from aflow.workflow import _implementation_upgrade_depth, _mutable_implementation_attempts
 
@@ -970,12 +970,13 @@ def test_manager_and_note_correction_artifacts_round_trip_payload(tmp_path: Path
     restore_manager_state(malformed_restored, payload)
     assert malformed_restored.review_rejection_history == state.review_rejection_history
     assert manager_resume_fields(payload)["pending_manager_notes"] == state.pending_manager_notes
-    write_run_metadata(
-        paths,
-        ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"),
-        state,
-        status="running",
+    RunMetadataWriter(
+        paths=paths,
+        config=ControllerConfig(repo_root=tmp_path, plan_path=tmp_path / "plan.md"),
+        state=state,
         workflow_name="manager",
+    ).write(
+        status="running",
         original_plan_path=tmp_path / "plan.md",
     )
     run_json = json.loads(paths.run_json.read_text(encoding="utf-8"))
@@ -1003,22 +1004,24 @@ def test_manager_style_metadata_write_preserves_worktree_lifecycle(tmp_path: Pat
         setup=("worktree", "branch"),
         teardown=("merge", "rm_worktree"),
     )
-    write_run_metadata(
-        paths,
-        config,
-        state,
+    RunMetadataWriter(
+        paths=paths,
+        config=config,
+        state=state,
+        workflow_name="manager",
+    ).write(
         status="running",
         execution_context=execution_context,
-        workflow_name="manager",
         original_plan_path=tmp_path / "plan.md",
     )
 
-    write_run_metadata(
-        paths,
-        config,
-        state,
-        status="running",
+    RunMetadataWriter(
+        paths=paths,
+        config=config,
+        state=state,
         workflow_name="manager",
+    ).write(
+        status="running",
         original_plan_path=tmp_path / "plan.md",
     )
 
