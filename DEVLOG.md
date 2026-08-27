@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-08-27 — Lift manager call execution out of the workflow closure (PR-11)
+
+- Lifted the 388-line nested `_run_manager_call()` closure into one private,
+  frozen, module-level `_ManagerCallExecutor`. Its 16 captured names are now
+  12 stable constructor fields plus three per-call mutable inputs:
+  `original_plan_path`, `active_plan_path`, and `current_step_name`.
+- Lifted the repository fingerprint helper with explicit repository and plan
+  paths. Lite/Full decisions, correction eligibility, note scopes, artifacts,
+  events, history, failure handling, repartition, and resume contracts remain
+  unchanged; gate policy remains inside `run_workflow()`.
+- Base SHA: `b674915759b6389498bf370a74fa1e02bf2b92f1`.
+- Verification: manager `42 passed`; manager-filtered runtime `34 passed,
+  221 deselected, 7 subtests passed`; repartition/control-plane resume
+  `104 passed`; runtime/runlog/CLI `434 passed, 171 subtests passed`; root
+  `1352 passed, 216 subtests passed`; app server `186 passed` with three
+  existing dependency deprecation warnings; web `34 passed`; web lint zero
+  errors with five existing React hook warnings; compileall, package build, and
+  web production build passed. Structural ledger: one executor class and
+  construction, five executor calls, four fingerprint calls, and no
+  `_run_manager_call` references.
+
 ## 2026-08-27 — Consolidate standard workflow failure finalization (PR-10)
 
 - Consolidated the 13 standard post-context terminal failure sequences into one

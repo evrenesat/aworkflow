@@ -111,6 +111,11 @@ Every manager prompt names the configured manager skill and embeds the complete
 closed JSON protocol, including the structured stop-report shape. Invalid
 manager output at a terminal incident cannot replace the original controller
 failure as the report's primary cause.
+Manager invocation and note-correction execution is owned by one private,
+module-level `_ManagerCallExecutor` with explicit stable dependencies, while
+the changing plan and step identities remain per-call inputs. Gate selection,
+escalation, stop handling, pending-note policy, and repartition policy remain
+inside `run_workflow()`.
 Manager/status metadata updates preserve the existing lifecycle identity when
 they do not carry an execution context, preventing worktree resume fields from
 being erased at a later boundary.
