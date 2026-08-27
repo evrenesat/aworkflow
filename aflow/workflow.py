@@ -658,6 +658,42 @@ class WorkflowError(RuntimeError):
         self.failure_kind = failure_kind
 
 
+@dataclass(frozen=True)
+class _WorkflowFailureFinalizer:
+    run_metadata: RunMetadataWriter
+    state: ControllerState
+    banner: BannerRenderer
+    execution_context: ExecutionContext | None
+
+    def raise_failure(
+        self,
+        summary: str,
+        *,
+        original_plan_path: Path,
+        current_step_name: str | None,
+        active_plan_path: Path | None,
+        new_plan_path: Path | None,
+        last_snapshot: PlanSnapshot | None = None,
+        cause: BaseException | None = None,
+    ) -> NoReturn:
+        self.run_metadata.write(
+            status="failed",
+            failure_reason=summary,
+            turns_completed=self.state.turns_completed,
+            last_snapshot=last_snapshot,
+            execution_context=self.execution_context,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+        self.banner.stop(self.state)
+        error = WorkflowError(summary, run_dir=self.run_metadata.paths.run_dir)
+        if cause is None:
+            raise error
+        raise error from cause
+
+
 class OwnerStopRequested(RuntimeError):
     """A run owner requested a safe stop at an inter-turn boundary."""
 
@@ -4317,6 +4353,12 @@ def run_workflow(
         active_plan_path=active_plan_path,
         new_plan_path=new_plan_path,
     )
+    failure_finalizer = _WorkflowFailureFinalizer(
+        run_metadata=run_metadata,
+        state=state,
+        banner=banner,
+        execution_context=exec_ctx,
+    )
 
     def _record_issue(
         kind: str,
@@ -4860,19 +4902,14 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=snapshot_after,
             )
-            run_metadata.write(
-                status="failed",
-                failure_reason=summary,
-                turns_completed=state.turns_completed,
-                last_snapshot=snapshot_after,
-                execution_context=exec_ctx,
+            failure_finalizer.raise_failure(
+                summary,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
+                last_snapshot=snapshot_after,
             )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
         def _schedule_team_lead_recovery(
             *,
@@ -5026,19 +5063,15 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                run_metadata.write(
-                    status="failed",
-                    failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    last_snapshot=snapshot_after,
-                    execution_context=exec_ctx,
+                failure_finalizer.raise_failure(
+                    summary,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    last_snapshot=snapshot_after,
+                    cause=exc,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
             if decision.action == "retry_same_team_after_delay":
                 return _schedule_team_lead_recovery(
                     decision=decision,
@@ -5130,19 +5163,14 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                run_metadata.write(
-                    status="failed",
-                    failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    last_snapshot=snapshot_after,
-                    execution_context=exec_ctx,
+                failure_finalizer.raise_failure(
+                    summary,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    last_snapshot=snapshot_after,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
             cap_reason = (
                 f"matched harness recovery rule in {step_path}: "
@@ -5212,19 +5240,15 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                run_metadata.write(
-                    status="failed",
-                    failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    last_snapshot=snapshot_after,
-                    execution_context=exec_ctx,
+                failure_finalizer.raise_failure(
+                    summary,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    last_snapshot=snapshot_after,
+                    cause=exc,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
             if decision.action == "retry_same_team_after_delay":
                 return _schedule_team_lead_recovery(
                     decision=decision,
@@ -5379,19 +5403,14 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                run_metadata.write(
-                    status="failed",
-                    failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    last_snapshot=snapshot_after,
-                    execution_context=exec_ctx,
+                failure_finalizer.raise_failure(
+                    summary,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    last_snapshot=snapshot_after,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
             state.current_team_override = backup_team
             if matched_rule.delay_seconds > 0:
@@ -5498,19 +5517,14 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=snapshot_after,
             )
-            run_metadata.write(
-                status="failed",
-                failure_reason=summary,
-                turns_completed=state.turns_completed,
-                last_snapshot=snapshot_after,
-                execution_context=exec_ctx,
+            failure_finalizer.raise_failure(
+                summary,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
+                last_snapshot=snapshot_after,
             )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
         return False
 
@@ -9310,16 +9324,13 @@ def run_workflow(
                     reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
                     run_dir=run_paths.run_dir, snapshot=snapshot_before,
                 )
-                run_metadata.write(
-                    status="failed", failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    execution_context=exec_ctx,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                failure_finalizer.raise_failure(
+                    summary,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
             try:
                 exec_original = _exec_plan_path(original_plan_path, exec_ctx)
@@ -9446,16 +9457,14 @@ def run_workflow(
                     reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
                     parse_error=exc if isinstance(exc, PlanParseError) else None,
                 )
-                run_metadata.write(
-                    status="failed", failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    execution_context=exec_ctx,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                failure_finalizer.raise_failure(
+                    summary,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    cause=exc,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
             except Exception as exc:
                 _raise_unexpected_started_turn_failure(
                     exc,
@@ -9544,17 +9553,14 @@ def run_workflow(
                     reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
                     run_dir=run_paths.run_dir, snapshot=post_snapshot,
                 )
-                run_metadata.write(
-                    status="failed", failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    last_snapshot=post_snapshot,
-                    execution_context=exec_ctx,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                failure_finalizer.raise_failure(
+                    summary,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    last_snapshot=post_snapshot,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
             state.last_snapshot = post_snapshot
             state.turns_completed += 1
@@ -9612,17 +9618,15 @@ def run_workflow(
                 summary = report or _format_failure(
                     reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
                 )
-                run_metadata.write(
-                    status="failed", failure_reason=summary,
-                    turns_completed=state.turns_completed,
-                    last_snapshot=state.last_snapshot,
-                    execution_context=exec_ctx,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                failure_finalizer.raise_failure(
+                    summary,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
+                    last_snapshot=state.last_snapshot,
+                    cause=exc,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
             except Exception as exc:
                 _raise_unexpected_started_turn_failure(
                     exc,
@@ -9851,15 +9855,14 @@ def run_workflow(
                 summary = report or _format_failure(
                     reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
                 )
-                run_metadata.write(
-                    status="failed", failure_reason=summary,
-                    turns_completed=state.turns_completed, last_snapshot=post_snapshot,
-                    execution_context=exec_ctx,
-                    original_plan_path=original_plan_path, current_step_name=current_step_name,
-                    active_plan_path=active_plan_path, new_plan_path=new_plan_path,
+                failure_finalizer.raise_failure(
+                    summary,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    last_snapshot=post_snapshot,
                 )
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
         # Detect scope pressure from the finalized turn before the manager gate.
         # Stop already won at this point (checked at line 5257).  When pressure
@@ -9904,17 +9907,15 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=state.last_snapshot,
             )
-            run_metadata.write(
-                status="failed", failure_reason=summary,
-                turns_completed=state.turns_completed,
-                last_snapshot=state.last_snapshot,
-                execution_context=exec_ctx,
-                 original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
+            failure_finalizer.raise_failure(
+                summary,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
+                last_snapshot=state.last_snapshot,
+                cause=exc,
             )
-            banner.stop(state)
-            raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
         banner.set_context(
             active_plan_path=active_plan_path,
@@ -10089,17 +10090,14 @@ def run_workflow(
                         run_dir=run_paths.run_dir,
                         snapshot=post_snapshot,
                     )
-                    run_metadata.write(
-                        status="failed", failure_reason=summary,
-                        turns_completed=state.turns_completed,
-                        last_snapshot=post_snapshot,
-                        execution_context=exec_ctx,
-                         original_plan_path=original_plan_path,
-                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    failure_finalizer.raise_failure(
+                        summary,
+                        original_plan_path=original_plan_path,
+                        current_step_name=current_step_name,
+                        active_plan_path=active_plan_path,
                         new_plan_path=new_plan_path,
+                        last_snapshot=post_snapshot,
                     )
-                    banner.stop(state)
-                    raise WorkflowError(summary, run_dir=run_paths.run_dir)
                 state.consec_step_name = current_step_name
                 state.consec_step_count = new_streak
             else:

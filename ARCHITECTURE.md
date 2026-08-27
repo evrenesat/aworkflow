@@ -4,6 +4,12 @@ AFlow is a plan-driven workflow orchestrator that runs coding tasks through exis
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
+Standard terminal failures after execution-context resolution use the private
+`_WorkflowFailureFinalizer` in `workflow.py` to preserve the failed-metadata,
+banner-stop, and `WorkflowError` ordering in one boundary. Startup, preflight,
+manager/event-emitting, and merge failures remain explicit because their
+additional responsibilities differ.
+
 ## High-Level Data Flow
 
 ```mermaid

@@ -33,6 +33,7 @@ from aflow.workflow import (
     _run_process,
     _pending_matches_scope_and_plan,
     _reconcile_repartition_plan_copies,
+    _WorkflowFailureFinalizer,
 )
 from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
 from aflow.harnesses.base import HarnessInvocation
@@ -1381,6 +1382,87 @@ class WorkflowRuntimeTests(unittest.TestCase):
             payload = json.loads(previous)
             assert payload["schema_version"] == 2
             assert payload["frozen_config"]["config_fingerprint"] == "abc123"
+
+    def test_workflow_failure_finalizer_persists_stops_banner_and_chains_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            original_plan_path = repo_root / "plan.md"
+            active_plan_path = repo_root / "active-plan.md"
+            new_plan_path = repo_root / "new-plan.md"
+            for plan_path in (original_plan_path, active_plan_path, new_plan_path):
+                _write_plan(plan_path, "# Plan\n")
+
+            config = ControllerConfig(
+                repo_root=repo_root,
+                plan_path=original_plan_path,
+                max_turns=7,
+            )
+            snapshot = PlanSnapshot(
+                "Checkpoint 1: First",
+                1,
+                2,
+                False,
+                total_checkpoint_count=2,
+                current_checkpoint_index=1,
+            )
+            state = ControllerState(
+                last_snapshot=snapshot,
+                turns_completed=4,
+                frozen_run_identity=FrozenRunIdentity(
+                    workflow_name="simple",
+                    config_path=str(repo_root / "aflow.toml"),
+                    config_fingerprint="f" * 64,
+                ),
+            )
+            paths = create_run_paths(config)
+            stop_states: list[ControllerState] = []
+            persistence_seen: list[bool] = []
+
+            class RecordingBanner:
+                def stop(self, stopped_state: ControllerState) -> None:
+                    stop_states.append(stopped_state)
+                    persistence_seen.append(paths.run_json.is_file())
+
+            finalizer = _WorkflowFailureFinalizer(
+                run_metadata=RunMetadataWriter(
+                    paths=paths,
+                    config=config,
+                    state=state,
+                    workflow_name="simple",
+                ),
+                state=state,
+                banner=RecordingBanner(),
+                execution_context=None,
+            )
+            summary = "workflow failed for test"
+            cause = ValueError("triggering failure")
+
+            with pytest.raises(WorkflowError) as exc:
+                finalizer.raise_failure(
+                    summary,
+                    original_plan_path=original_plan_path,
+                    current_step_name="implement",
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    last_snapshot=snapshot,
+                    cause=cause,
+                )
+
+            assert exc.value.summary == summary
+            assert exc.value.run_dir == paths.run_dir
+            assert exc.value.__cause__ is cause
+            payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+            assert payload["status"] == "failed"
+            assert payload["failure_reason"] == summary
+            assert payload["turns_completed"] == state.turns_completed
+            assert payload["last_snapshot"] == snapshot.to_dict()
+            assert payload["original_plan_path"] == str(original_plan_path)
+            assert payload["current_step_name"] == "implement"
+            assert payload["active_plan_path"] == str(active_plan_path)
+            assert payload["new_plan_path"] == str(new_plan_path)
+            assert len(stop_states) == 1
+            assert stop_states[0] is state
+            assert persistence_seen == [True]
 
     def test_valid_boundary_override_routes_once_and_appends_notes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
