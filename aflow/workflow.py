@@ -99,7 +99,7 @@ from .hotplug import (
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
 )
 from .harnesses.session import SessionDriver, SessionRequest, SessionResult
-from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, write_run_metadata, write_turn_artifacts_start
+from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, write_turn_artifacts_start
 from .stop_marker import detect_stop_marker
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
@@ -3565,6 +3565,13 @@ def run_workflow(
 
     observer = _JournalObserver()
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    run_metadata = RunMetadataWriter(
+        paths=run_paths,
+        config=config,
+        state=state,
+        workflow_name=workflow_name,
+        resumed_from_run_id=resumed_from_run_id,
+    )
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
     state.frozen_run_identity = current_frozen_identity
@@ -3699,11 +3706,10 @@ def run_workflow(
                     "waiting_for_hotplug_recovery: "
                     + (reconciled.remediation or "ambiguous provider boundary")
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="waiting_for_hotplug_recovery",
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                run_metadata.write(
+                    status="waiting_for_hotplug_recovery",
+                     original_plan_path=original_plan_path,
                     active_plan_path=active_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 raise WorkflowError(state.status_message, run_dir=run_paths.run_dir)
     state.status_message = "initializing"
@@ -3713,11 +3719,10 @@ def run_workflow(
     print(f"Run ID: {run_paths.run_dir.name}", file=sys.stderr)
     if resumed_from_run_id is not None:
         print(f"Resuming from: {resumed_from_run_id}", file=sys.stderr)
-    write_run_metadata(
-        run_paths, config, state, status="initializing",
-        workflow_name=workflow_name, original_plan_path=original_plan_path,
+    run_metadata.write(
+        status="initializing",
+         original_plan_path=original_plan_path,
         active_plan_path=active_plan_path,
-        resumed_from_run_id=resumed_from_run_id,
     )
 
     resolved_preflight_probe: HarnessPreflightProbe = (
@@ -3753,11 +3758,10 @@ def run_workflow(
                 f"workflow '{workflow_name}' requires a '## Git Tracking' section "
                 f"in the original plan at '{original_plan_path}'"
             )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
+            run_metadata.write(
+                status="failed", failure_reason=summary,
+                 original_plan_path=original_plan_path,
                 active_plan_path=active_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
@@ -3773,8 +3777,8 @@ def run_workflow(
             f"remediation: {blocker.remediation}"
         )
         state.status_message = summary
-        write_run_metadata(
-            run_paths, config, state, status="failed", failure_reason=summary,
+        run_metadata.write(
+            status="failed", failure_reason=summary,
             failure_kind="environment_preflight",
             environment_preflight=error.to_payload(),
             merge_status=(
@@ -3786,10 +3790,9 @@ def run_workflow(
             execution_context=exec_ctx,
             last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path, new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         print(f"aflow: {summary}", file=sys.stderr)
         banner.stop(state)
@@ -3840,11 +3843,10 @@ def run_workflow(
             run_dir=run_paths.run_dir,
             snapshot=original_snapshot,
         )
-        write_run_metadata(
-            run_paths, config, state, status="failed", failure_reason=summary,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+        run_metadata.write(
+            status="failed", failure_reason=summary,
+             original_plan_path=original_plan_path,
             active_plan_path=active_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
@@ -3903,11 +3905,10 @@ def run_workflow(
     state.last_snapshot = original_snapshot
     if startup_retry is not None:
         state.pending_retry = startup_retry
-    write_run_metadata(
-        run_paths, config, state, status="running", last_snapshot=original_snapshot,
-        workflow_name=workflow_name, original_plan_path=original_plan_path,
+    run_metadata.write(
+        status="running", last_snapshot=original_snapshot,
+         original_plan_path=original_plan_path,
         active_plan_path=active_plan_path,
-        resumed_from_run_id=resumed_from_run_id,
     )
     banner.update(state)
 
@@ -3939,12 +3940,11 @@ def run_workflow(
             recovery_summary=state.current_harness_recovery,
             recovery_history=tuple(state.harness_recovery_history),
         )
-        write_run_metadata(
-            run_paths, config, state, status="completed", last_snapshot=original_snapshot,
+        run_metadata.write(
+            status="completed", last_snapshot=original_snapshot,
             end_reason=end_reason,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+             original_plan_path=original_plan_path,
             active_plan_path=active_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
 
         _emit_event(observer, RunCompletedEvent.create(
@@ -4157,12 +4157,11 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=original_snapshot,
             )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
+            run_metadata.write(
+                status="failed", failure_reason=summary,
+                 original_plan_path=original_plan_path,
                 active_plan_path=active_plan_path,
                 execution_context=exec_ctx,
-                resumed_from_run_id=resumed_from_run_id,
             )
             raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
     elif lifecycle_plan is not None:
@@ -4282,12 +4281,11 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=original_snapshot,
             )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
+            run_metadata.write(
+                status="failed", failure_reason=summary,
+                 original_plan_path=original_plan_path,
                 active_plan_path=active_plan_path,
                 execution_context=exec_ctx,
-                resumed_from_run_id=resumed_from_run_id,
             )
             raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
@@ -4310,19 +4308,14 @@ def run_workflow(
                 active_plan_path = restored_active_plan
 
     execution_repo_root = exec_ctx.execution_repo_root if exec_ctx else config.repo_root
-    write_run_metadata(
-        run_paths,
-        config,
-        state,
+    run_metadata.write(
         status="running",
         execution_context=exec_ctx,
         last_snapshot=state.last_snapshot,
-        workflow_name=workflow_name,
         original_plan_path=original_plan_path,
         current_step_name=current_step_name,
         active_plan_path=active_plan_path,
         new_plan_path=new_plan_path,
-        resumed_from_run_id=resumed_from_run_id,
     )
 
     def _record_issue(
@@ -4383,15 +4376,14 @@ def run_workflow(
             run_dir=run_paths.run_dir,
             snapshot=snapshot,
         )
-        write_run_metadata(
-            run_paths, config, state, status="failed", failure_reason=summary,
+        run_metadata.write(
+            status="failed", failure_reason=summary,
             execution_context=exec_ctx,
             last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+             original_plan_path=original_plan_path,
             current_step_name=current_step_name, active_plan_path=active_path,
             new_plan_path=new_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
@@ -4738,21 +4730,16 @@ def run_workflow(
             run_dir=run_paths.run_dir,
             snapshot=final_snapshot,
         )
-        write_run_metadata(
-            run_paths,
-            config,
-            state,
+        run_metadata.write(
             status="failed",
             failure_reason=summary,
             turns_completed=state.turns_completed,
             last_snapshot=final_snapshot,
             execution_context=exec_ctx,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         try:
             _emit_event(observer, RunFailedEvent.create(
@@ -4873,21 +4860,16 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=snapshot_after,
             )
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="failed",
                 failure_reason=summary,
                 turns_completed=state.turns_completed,
                 last_snapshot=snapshot_after,
                 execution_context=exec_ctx,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -4947,20 +4929,15 @@ def run_workflow(
                 recovery=recovery,
             )
             _supervise_scheduled_recovery()
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="running",
                 turns_completed=state.turns_completed,
                 last_snapshot=state.last_snapshot,
                 execution_context=exec_ctx,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             banner.update(state)
             return True
@@ -5049,21 +5026,16 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                write_run_metadata(
-                    run_paths,
-                    config,
-                    state,
+                run_metadata.write(
                     status="failed",
                     failure_reason=summary,
                     turns_completed=state.turns_completed,
                     last_snapshot=snapshot_after,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
@@ -5158,21 +5130,16 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                write_run_metadata(
-                    run_paths,
-                    config,
-                    state,
+                run_metadata.write(
                     status="failed",
                     failure_reason=summary,
                     turns_completed=state.turns_completed,
                     last_snapshot=snapshot_after,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -5245,21 +5212,16 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                write_run_metadata(
-                    run_paths,
-                    config,
-                    state,
+                run_metadata.write(
                     status="failed",
                     failure_reason=summary,
                     turns_completed=state.turns_completed,
                     last_snapshot=snapshot_after,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
@@ -5353,20 +5315,15 @@ def run_workflow(
                 recovery=recovery,
             )
             _supervise_scheduled_recovery()
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="running",
                 turns_completed=state.turns_completed,
                 last_snapshot=state.last_snapshot,
                 execution_context=exec_ctx,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             banner.update(state)
             return True
@@ -5422,21 +5379,16 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=snapshot_after,
                 )
-                write_run_metadata(
-                    run_paths,
-                    config,
-                    state,
+                run_metadata.write(
                     status="failed",
                     failure_reason=summary,
                     turns_completed=state.turns_completed,
                     last_snapshot=snapshot_after,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name,
                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -5487,20 +5439,15 @@ def run_workflow(
                 recovery=recovery,
             )
             _supervise_scheduled_recovery()
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="running",
                 turns_completed=state.turns_completed,
                 last_snapshot=state.last_snapshot,
                 execution_context=exec_ctx,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             banner.update(state)
             return True
@@ -5551,21 +5498,16 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=snapshot_after,
             )
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="failed",
                 failure_reason=summary,
                 turns_completed=state.turns_completed,
                 last_snapshot=snapshot_after,
                 execution_context=exec_ctx,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -5730,12 +5672,12 @@ def run_workflow(
     ) -> None:
         report = _write_manager_report(context, reason=reason, decision=decision)
         state.status_message = "failed"
-        write_run_metadata(
-            run_paths, config, state, status="failed", failure_reason=report,
+        run_metadata.write(
+            status="failed", failure_reason=report,
             last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+             original_plan_path=original_plan_path,
             current_step_name=current_step_name, active_plan_path=active_plan_path,
-            new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
+            new_plan_path=new_plan_path,
         )
         _emit_event(observer, RunFailedEvent.create(
             run_dir=run_paths.run_dir,
@@ -6157,15 +6099,13 @@ def run_workflow(
 
     def _persist_repartition(pending: PendingRepartitionV1) -> None:
         state.pending_repartition = pending
-        write_run_metadata(
-            run_paths, config, state, status="running",
+        run_metadata.write(
+            status="running",
             last_snapshot=state.last_snapshot,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
 
     def _apply_pending_repartition() -> None:
@@ -7372,10 +7312,10 @@ def run_workflow(
                 repartition_partition_id=active_partition_identity[2],
             )
         # This is intentionally before changing any controller routing state.
-        write_run_metadata(run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
-                           workflow_name=workflow_name, original_plan_path=original_plan_path,
+        run_metadata.write(status="running", last_snapshot=state.last_snapshot,
+                            original_plan_path=original_plan_path,
                            current_step_name=current_step_name, active_plan_path=active_plan_path,
-                           new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
+                           new_plan_path=new_plan_path)
         if decision.action == "retry_current_step":
             return current_step
         if decision.action == "switch_to_backup_and_retry":
@@ -7468,11 +7408,11 @@ def run_workflow(
         state.last_manager_report_path = "manager-report.md"
         # Keep report state durable even though the caller owns the final
         # failure metadata and exception.
-        write_run_metadata(run_paths, config, state, status="failed", failure_reason=report,
+        run_metadata.write(status="failed", failure_reason=report,
                            last_snapshot=state.last_snapshot, turns_completed=state.turns_completed,
-                           workflow_name=workflow_name, original_plan_path=original_plan_path,
+                            original_plan_path=original_plan_path,
                            current_step_name=current_step_name, active_plan_path=active_plan_path,
-                           new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id)
+                           new_plan_path=new_plan_path)
         return report
 
     def _raise_incomplete_terminal_failure(
@@ -7490,21 +7430,16 @@ def run_workflow(
             run_dir=run_paths.run_dir,
             snapshot=post_snapshot,
         )
-        write_run_metadata(
-            run_paths,
-            config,
-            state,
+        run_metadata.write(
             status="failed",
             failure_reason=summary,
             turns_completed=state.turns_completed,
             last_snapshot=post_snapshot,
             execution_context=exec_ctx,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         try:
             _emit_event(observer, RunFailedEvent.create(
@@ -7569,18 +7504,13 @@ def run_workflow(
                 pending,
                 correction_attempted=True,
             )
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="running",
                 last_snapshot=state.last_snapshot,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             boundary = FinalizedTurnBoundary(
                 finalized_turn_number=state.active_turn,
@@ -7642,18 +7572,13 @@ def run_workflow(
                 )
             else:
                 state.pending_manager_notes = None
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="running",
                 last_snapshot=state.last_snapshot,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             corrected = state.pending_manager_notes
             return (
@@ -7711,22 +7636,17 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=original_snapshot,
             )
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="failed",
                 merge_status=merge_status,
                 merge_failure_reason=merge_failure_reason,
                 execution_context=exec_ctx,
                 last_snapshot=original_snapshot,
                 turns_completed=0,
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             prune_old_runs(run_paths.runs_root, config.keep_runs)
             banner.stop(state)
@@ -7764,22 +7684,17 @@ def run_workflow(
             recovery_summary=state.current_harness_recovery,
             recovery_history=tuple(state.harness_recovery_history),
         )
-        write_run_metadata(
-            run_paths,
-            config,
-            state,
+        run_metadata.write(
             status="completed",
             merge_status=merge_status,
             execution_context=exec_ctx,
             last_snapshot=original_snapshot,
             turns_completed=0,
             end_reason=end_reason,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         prune_old_runs(run_paths.runs_root, config.keep_runs)
         banner.stop(state)
@@ -7929,22 +7844,17 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=state.last_snapshot,
                 )
-                write_run_metadata(
-                    run_paths,
-                    config,
-                    state,
+                run_metadata.write(
                     status="failed",
                     merge_status=merge_status,
                     merge_failure_reason=merge_failure_reason,
                     execution_context=exec_ctx,
                     last_snapshot=state.last_snapshot,
                     turns_completed=state.turns_completed,
-                    workflow_name=workflow_name,
                     original_plan_path=original_plan_path,
                     current_step_name=replayed_boundary.step_name,
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -7969,22 +7879,17 @@ def run_workflow(
                 recovery_summary=state.current_harness_recovery,
                 recovery_history=tuple(state.harness_recovery_history),
             )
-            write_run_metadata(
-                run_paths,
-                config,
-                state,
+            run_metadata.write(
                 status="completed",
                 merge_status=merge_status,
                 execution_context=exec_ctx,
                 last_snapshot=state.last_snapshot,
                 turns_completed=state.turns_completed,
                 end_reason="transition_end",
-                workflow_name=workflow_name,
                 original_plan_path=original_plan_path,
                 current_step_name=replayed_boundary.step_name,
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             prune_old_runs(run_paths.runs_root, config.keep_runs)
             banner.stop(state)
@@ -8017,37 +7922,27 @@ def run_workflow(
                 else None
             ),
         )
-        write_run_metadata(
-            run_paths,
-            config,
-            state,
+        run_metadata.write(
             status="running",
             execution_context=exec_ctx,
             last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
 
     def _write_override_boundary(*, status: str) -> None:
-        write_run_metadata(
-            run_paths,
-            config,
-            state,
+        run_metadata.write(
             status=status,
             execution_context=exec_ctx,
             last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
 
     def _finish_owner_stop(
@@ -8097,20 +7992,15 @@ def run_workflow(
             )
         state.end_reason = "owner_stopped"
         state.status_message = "owner_stopped"
-        write_run_metadata(
-            run_paths,
-            config,
-            state,
+        run_metadata.write(
             status="owner_stopped",
             end_reason="owner_stopped",
             last_snapshot=final_snapshot,
             turns_completed=state.turns_completed,
-            workflow_name=workflow_name,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
         append_run_event(
             run_paths.run_dir,
@@ -8594,11 +8484,10 @@ def run_workflow(
                 f"running turn {turn_number}: step {current_step_name} "
                 f"(retry {retry_ctx.attempt}/{retry_ctx.retry_limit})"
             )
-            write_run_metadata(
-                run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
+            run_metadata.write(
+                status="running", last_snapshot=state.last_snapshot,
+                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name, active_plan_path=retry_ctx.active_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             done = retry_ctx.snapshot_before.is_complete
             active_plan_path = retry_ctx.active_plan_path
@@ -8626,17 +8515,15 @@ def run_workflow(
                             exec_ctx=exec_ctx,
                             repo_root=config.repo_root,
                         )
-                        write_run_metadata(
-                            run_paths, config, state, status="running",
+                        run_metadata.write(
+                            status="running",
                             execution_context=exec_ctx,
                             last_snapshot=state.last_snapshot,
                             turns_completed=state.turns_completed,
-                            workflow_name=workflow_name,
                             original_plan_path=original_plan_path,
                             current_step_name=current_step_name,
                             active_plan_path=active_plan_path,
                             new_plan_path=new_plan_path,
-                            resumed_from_run_id=resumed_from_run_id,
                         )
                     elif not scope_was_opened:
                         _validate_existing_scope_envelope(
@@ -8871,11 +8758,10 @@ def run_workflow(
                 )
         else:
             state.status_message = f"running turn {turn_number}: step {current_step_name}"
-            write_run_metadata(
-                run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+            run_metadata.write(
+                status="running", last_snapshot=state.last_snapshot,
+             original_plan_path=original_plan_path,
             current_step_name=current_step_name, active_plan_path=active_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
 
             _sync_plan_to_worktree(original_plan_path, exec_ctx)
@@ -8890,11 +8776,10 @@ def run_workflow(
                     run_dir=run_paths.run_dir,
                     snapshot=state.last_snapshot,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed", failure_reason=summary,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                run_metadata.write(
+                    status="failed", failure_reason=summary,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
@@ -8934,17 +8819,15 @@ def run_workflow(
                             exec_ctx=exec_ctx,
                             repo_root=config.repo_root,
                         )
-                        write_run_metadata(
-                            run_paths, config, state, status="running",
+                        run_metadata.write(
+                            status="running",
                             execution_context=exec_ctx,
                             last_snapshot=current_plan.snapshot,
                             turns_completed=state.turns_completed,
-                            workflow_name=workflow_name,
                             original_plan_path=original_plan_path,
                             current_step_name=current_step_name,
                             active_plan_path=active_plan_path,
                             new_plan_path=new_plan_path,
-                            resumed_from_run_id=resumed_from_run_id,
                         )
                     elif not scope_was_opened:
                         _validate_existing_scope_envelope(
@@ -9198,12 +9081,12 @@ def run_workflow(
         if step.role == "worker":
             state.pending_override_notes = ()
         if step.role == "worker":
-            write_run_metadata(
-                run_paths, config, state, status="running",
-                last_snapshot=state.last_snapshot, workflow_name=workflow_name,
+            run_metadata.write(
+                status="running",
+                last_snapshot=state.last_snapshot,
                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
+                new_plan_path=new_plan_path,
             )
 
         turn_dir, turn_started_at = _start_turn(
@@ -9251,11 +9134,11 @@ def run_workflow(
                     )
                     if completed_repartition_boundary:
                         state.pending_repartition = None
-                write_run_metadata(
-                    run_paths, config, state, status="running", last_snapshot=state.last_snapshot,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                run_metadata.write(
+                    status="running", last_snapshot=state.last_snapshot,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path, resumed_from_run_id=resumed_from_run_id,
+                    new_plan_path=new_plan_path,
                 )
 
             try:
@@ -9351,15 +9234,13 @@ def run_workflow(
                         item for item in state.active_role_sessions
                         if item.role != step.role
                     ) + (session_ref,)
-                    write_run_metadata(
-                        run_paths, config, state, status="running",
+                    run_metadata.write(
+                        status="running",
                         last_snapshot=state.last_snapshot,
-                        workflow_name=workflow_name,
                         original_plan_path=original_plan_path,
                         current_step_name=current_step_name,
                         active_plan_path=active_plan_path,
                         new_plan_path=new_plan_path,
-                        resumed_from_run_id=resumed_from_run_id,
                     )
                     (turn_dir / "transport.stdout").write_text(
                         raw_transport_stdout, encoding="utf-8"
@@ -9389,15 +9270,13 @@ def run_workflow(
                             [*state.hotplug_history, applied_transaction]
                         ))
                         _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_APPLIED, applied_transaction)
-                        write_run_metadata(
-                            run_paths, config, state, status="running",
+                        run_metadata.write(
+                            status="running",
                             last_snapshot=state.last_snapshot,
-                            workflow_name=workflow_name,
                             original_plan_path=original_plan_path,
                             current_step_name=current_step_name,
                             active_plan_path=active_plan_path,
                             new_plan_path=new_plan_path,
-                            resumed_from_run_id=resumed_from_run_id,
                         )
 
             stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
@@ -9431,14 +9310,13 @@ def run_workflow(
                     reason=f"workflow stopped by explicit AFLOW_STOP marker: {stop_reason}",
                     run_dir=run_paths.run_dir, snapshot=snapshot_before,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed", failure_reason=summary,
+                run_metadata.write(
+                    status="failed", failure_reason=summary,
                     turns_completed=state.turns_completed,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -9526,14 +9404,13 @@ def run_workflow(
                         retry_reason="inconsistent_checkpoint_state",
                         retry_next_turn=True,
                     )
-                    write_run_metadata(
-                        run_paths, config, state, status="running",
+                    run_metadata.write(
+                        status="running",
                         turns_completed=state.turns_completed,
                         last_snapshot=state.last_snapshot,
-                        workflow_name=workflow_name, original_plan_path=original_plan_path,
+                         original_plan_path=original_plan_path,
                         current_step_name=current_step_name, active_plan_path=active_plan_path,
                         new_plan_path=new_plan_path,
-                        resumed_from_run_id=resumed_from_run_id,
                     )
                     banner.update(state)
                     turn_number += 1
@@ -9569,14 +9446,13 @@ def run_workflow(
                     reason=str(exc), run_dir=run_paths.run_dir, snapshot=snapshot_before,
                     parse_error=exc if isinstance(exc, PlanParseError) else None,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed", failure_reason=summary,
+                run_metadata.write(
+                    status="failed", failure_reason=summary,
                     turns_completed=state.turns_completed,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
@@ -9668,15 +9544,14 @@ def run_workflow(
                     reason=f"harness '{invocation.label}' exited with code {completed.returncode}",
                     run_dir=run_paths.run_dir, snapshot=post_snapshot,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed", failure_reason=summary,
+                run_metadata.write(
+                    status="failed", failure_reason=summary,
                     turns_completed=state.turns_completed,
                     last_snapshot=post_snapshot,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -9737,15 +9612,14 @@ def run_workflow(
                 summary = report or _format_failure(
                     reason=exc.summary, run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed", failure_reason=summary,
+                run_metadata.write(
+                    status="failed", failure_reason=summary,
                     turns_completed=state.turns_completed,
                     last_snapshot=state.last_snapshot,
                     execution_context=exec_ctx,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
@@ -9977,13 +9851,12 @@ def run_workflow(
                 summary = report or _format_failure(
                     reason=reason, run_dir=run_paths.run_dir, snapshot=post_snapshot,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed", failure_reason=summary,
+                run_metadata.write(
+                    status="failed", failure_reason=summary,
                     turns_completed=state.turns_completed, last_snapshot=post_snapshot,
-                    execution_context=exec_ctx, workflow_name=workflow_name,
+                    execution_context=exec_ctx,
                     original_plan_path=original_plan_path, current_step_name=current_step_name,
                     active_plan_path=active_plan_path, new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -10031,15 +9904,14 @@ def run_workflow(
                 run_dir=run_paths.run_dir,
                 snapshot=state.last_snapshot,
             )
-            write_run_metadata(
-                run_paths, config, state, status="failed", failure_reason=summary,
+            run_metadata.write(
+                status="failed", failure_reason=summary,
                 turns_completed=state.turns_completed,
                 last_snapshot=state.last_snapshot,
                 execution_context=exec_ctx,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
+                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name, active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
@@ -10050,15 +9922,14 @@ def run_workflow(
         )
         banner.update(state)
 
-        write_run_metadata(
-            run_paths, config, state, status="running",
+        run_metadata.write(
+            status="running",
             execution_context=exec_ctx,
             last_snapshot=state.last_snapshot,
             turns_completed=state.turns_completed,
-            workflow_name=workflow_name, original_plan_path=original_plan_path,
+             original_plan_path=original_plan_path,
             current_step_name=current_step_name, active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
-            resumed_from_run_id=resumed_from_run_id,
         )
 
         if transition_target == "END":
@@ -10117,17 +9988,16 @@ def run_workflow(
                     reason=merge_failure_reason or "merge teardown failed",
                     run_dir=run_paths.run_dir, snapshot=post_snapshot,
                 )
-                write_run_metadata(
-                    run_paths, config, state, status="failed",
+                run_metadata.write(
+                    status="failed",
                     merge_status=merge_status,
                     merge_failure_reason=merge_failure_reason,
                     execution_context=exec_ctx,
                     last_snapshot=post_snapshot,
                     turns_completed=state.turns_completed,
-                    workflow_name=workflow_name, original_plan_path=original_plan_path,
+                     original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
-                    resumed_from_run_id=resumed_from_run_id,
                 )
                 prune_old_runs(run_paths.runs_root, config.keep_runs)
                 banner.stop(state)
@@ -10160,17 +10030,16 @@ def run_workflow(
                 recovery_summary=state.current_harness_recovery,
                 recovery_history=tuple(state.harness_recovery_history),
             )
-            write_run_metadata(
-                run_paths, config, state, status="completed",
+            run_metadata.write(
+                status="completed",
                 merge_status=merge_status,
                 execution_context=exec_ctx,
                 last_snapshot=post_snapshot,
                 turns_completed=state.turns_completed,
                 end_reason=end_reason,
-                workflow_name=workflow_name, original_plan_path=original_plan_path,
+                 original_plan_path=original_plan_path,
                 current_step_name=current_step_name, active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
-                resumed_from_run_id=resumed_from_run_id,
             )
             prune_old_runs(run_paths.runs_root, config.keep_runs)
             banner.stop(state)
@@ -10220,15 +10089,14 @@ def run_workflow(
                         run_dir=run_paths.run_dir,
                         snapshot=post_snapshot,
                     )
-                    write_run_metadata(
-                        run_paths, config, state, status="failed", failure_reason=summary,
+                    run_metadata.write(
+                        status="failed", failure_reason=summary,
                         turns_completed=state.turns_completed,
                         last_snapshot=post_snapshot,
                         execution_context=exec_ctx,
-                        workflow_name=workflow_name, original_plan_path=original_plan_path,
+                         original_plan_path=original_plan_path,
                         current_step_name=current_step_name, active_plan_path=active_plan_path,
                         new_plan_path=new_plan_path,
-                        resumed_from_run_id=resumed_from_run_id,
                     )
                     banner.stop(state)
                     raise WorkflowError(summary, run_dir=run_paths.run_dir)
@@ -10252,15 +10120,14 @@ def run_workflow(
         reason=f"reached max turns limit of {effective_max_turns} without a transition to END",
         run_dir=run_paths.run_dir, snapshot=state.last_snapshot,
     )
-    write_run_metadata(
-        run_paths, config, state, status="failed", failure_reason=summary,
+    run_metadata.write(
+        status="failed", failure_reason=summary,
         last_snapshot=state.last_snapshot,
         turns_completed=state.turns_completed,
         execution_context=exec_ctx,
-        workflow_name=workflow_name, original_plan_path=original_plan_path,
+         original_plan_path=original_plan_path,
         current_step_name=current_step_name, active_plan_path=active_plan_path,
         new_plan_path=new_plan_path,
-        resumed_from_run_id=resumed_from_run_id,
     )
     _emit_event(observer, RunFailedEvent.create(
         run_dir=run_paths.run_dir,

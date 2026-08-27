@@ -711,243 +711,247 @@ def _validated_environment_preflight_payload(
     return result
 
 
-def write_run_metadata(
-    paths: RunPaths,
-    config: ControllerConfig,
-    state: ControllerState | None,
-    *,
-    status: str,
-    execution_context: ExecutionContext | None = None,
-    end_reason: WorkflowEndReason | None = None,
-    failure_reason: str | None = None,
-    failure_kind: str | None = None,
-    environment_preflight: Mapping[str, object] | None = None,
-    merge_status: str | None = None,
-    merge_failure_reason: str | None = None,
-    last_snapshot: PlanSnapshot | None = None,
-    turns_completed: int | None = None,
-    workflow_name: str,
-    current_step_name: str | None = None,
-    original_plan_path: Path,
-    active_plan_path: Path | None = None,
-    new_plan_path: Path | None = None,
-    pending_retry: RetryContext | None = None,
-    team: str | None = None,
-    issues_summary_path: str | None = None,
-    resumed_from_run_id: str | None = None,
-) -> None:
-    if not isinstance(workflow_name, str) or not workflow_name.strip():
-        raise ValueError("workflow_name must be a non-empty string")
-    if not isinstance(original_plan_path, Path) or not str(original_plan_path):
-        raise ValueError("original_plan_path must be a non-empty path")
-    for field_name, value in (
-        ("max_turns", config.max_turns),
-        (
-            "effective_max_turns",
-            state.effective_max_turns
-            if state is not None and state.effective_max_turns is not None
-            else config.max_turns,
-        ),
-    ):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(f"{field_name} must be a positive integer")
-    if any(
-        not isinstance(item, str) for item in config.extra_instructions
-    ):
-        raise ValueError("extra_instructions must be a list of strings")
-    if state is not None:
-        if state.current_team is not None and (
-            not isinstance(state.current_team, str) or not state.current_team.strip()
+@dataclass(frozen=True)
+class RunMetadataWriter:
+    paths: RunPaths
+    config: ControllerConfig
+    state: ControllerState | None
+    workflow_name: str
+    resumed_from_run_id: str | None = None
+
+    def write(
+        self,
+        *,
+        status: str,
+        execution_context: ExecutionContext | None = None,
+        end_reason: WorkflowEndReason | None = None,
+        failure_reason: str | None = None,
+        failure_kind: str | None = None,
+        environment_preflight: Mapping[str, object] | None = None,
+        merge_status: str | None = None,
+        merge_failure_reason: str | None = None,
+        last_snapshot: PlanSnapshot | None = None,
+        turns_completed: int | None = None,
+        current_step_name: str | None = None,
+        original_plan_path: Path,
+        active_plan_path: Path | None = None,
+        new_plan_path: Path | None = None,
+        pending_retry: RetryContext | None = None,
+        team: str | None = None,
+        issues_summary_path: str | None = None,
+    ) -> None:
+        if not isinstance(self.workflow_name, str) or not self.workflow_name.strip():
+            raise ValueError("workflow_name must be a non-empty string")
+        if not isinstance(original_plan_path, Path) or not str(original_plan_path):
+            raise ValueError("original_plan_path must be a non-empty path")
+        for field_name, value in (
+            ("max_turns", self.config.max_turns),
+            (
+                "effective_max_turns",
+                self.state.effective_max_turns
+                if self.state is not None and self.state.effective_max_turns is not None
+                else self.config.max_turns,
+            ),
         ):
-            raise ValueError("team must be null or a non-empty string")
-        if (
-            state.selected_start_step is not None
-            and (
-                not isinstance(state.selected_start_step, str)
-                or not state.selected_start_step.strip()
-            )
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        if any(
+            not isinstance(item, str) for item in self.config.extra_instructions
         ):
-            raise ValueError(
-                "selected_start_step must be null or a non-empty string"
-            )
-    previous: Mapping[str, object] = {}
-    run_json_present = paths.run_json.exists() or paths.run_json.is_symlink()
-    if run_json_present:
-        try:
-            loaded = json.loads(paths.run_json.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                "cannot overwrite existing run metadata: run.json is unreadable"
-            ) from exc
-        if not isinstance(loaded, Mapping):
-            raise ValueError(
-                "cannot overwrite existing run metadata: run.json must contain a JSON object"
-            )
-        previous = loaded
-        if previous.get("schema_version") != RUN_STATE_SCHEMA_VERSION:
-            raise ValueError(
-                "cannot overwrite run metadata with an unsupported resume state schema"
-            )
-    # A terminal manager report is the authoritative failure summary.  Some
-    # callers add merge/recovery metadata in a later write without repeating
-    # that summary; retain it rather than replacing it with an empty field.
-    if failure_reason is None and status == "failed":
-        previous_reason = previous.get("failure_reason")
-        if isinstance(previous_reason, str) and previous_reason.startswith("# AFlow manager report"):
-            failure_reason = previous_reason
-    payload: dict[str, object] = {
-        "schema_version": RUN_STATE_SCHEMA_VERSION,
-        "repo_root": str(paths.repo_root),
-        "run_dir": str(paths.run_dir),
-        "status": status,
-        "plan_path": str(config.plan_path),
-        "workflow_name": workflow_name,
-        "original_plan_path": str(original_plan_path),
-        "max_turns": config.max_turns,
-        "keep_runs": config.keep_runs,
-        "extra_instructions": list(config.extra_instructions),
-        "turns_completed": turns_completed if turns_completed is not None else (state.turns_completed if state else 0),
-        "last_snapshot": _snapshot_payload(last_snapshot if last_snapshot is not None else (state.last_snapshot if state else None)),
-    }
-    if execution_context is not None:
-        payload["execution_repo_root"] = str(execution_context.execution_repo_root)
-        payload["feature_branch"] = execution_context.feature_branch
-        payload["main_branch"] = execution_context.main_branch
-        payload["lifecycle_setup"] = list(execution_context.setup)
-        payload["lifecycle_teardown"] = list(execution_context.teardown)
-        if execution_context.worktree_path is not None:
-            payload["worktree_path"] = str(execution_context.worktree_path)
-    else:
-        # Manager and status boundaries often update run metadata without
-        # carrying the execution context again. Lifecycle identity is durable
-        # resume state, so omission must not erase an already-recorded worktree
-        # or branch.
-        for key in (
-            "execution_repo_root",
-            "feature_branch",
-            "main_branch",
-            "lifecycle_setup",
-            "lifecycle_teardown",
-            "worktree_path",
-        ):
-            if key in previous:
-                payload[key] = previous[key]
-    if current_step_name is not None:
-        payload["current_step_name"] = current_step_name
-    if active_plan_path is not None:
-        payload["active_plan_path"] = str(active_plan_path)
-    if new_plan_path is not None:
-        payload["new_plan_path"] = str(new_plan_path)
-    payload["team"] = team if team is not None else (
-        state.current_team
-        if state is not None and state.current_team is not None
-        else config.team
-    )
-    if state is not None and state.issues_summary_path is not None:
-        payload["issues_summary_path"] = state.issues_summary_path
-    elif issues_summary_path is not None:
-        payload["issues_summary_path"] = issues_summary_path
-    if resumed_from_run_id is not None:
-        payload["resumed_from_run_id"] = resumed_from_run_id
-    if state is not None:
-        payload["run_started_at"] = state.run_started_at.isoformat()
-        payload["active_turn"] = state.active_turn
-        payload["status_message"] = state.status_message
-        payload["selected_start_step"] = state.selected_start_step
-        payload["startup_recovery_used"] = state.startup_recovery_used
-        payload["startup_recovery_reason"] = state.startup_recovery_reason
-        payload["effective_max_turns"] = (
-            state.effective_max_turns
-            if state.effective_max_turns is not None
-            else config.max_turns
+            raise ValueError("extra_instructions must be a list of strings")
+        if self.state is not None:
+            if self.state.current_team is not None and (
+                not isinstance(self.state.current_team, str) or not self.state.current_team.strip()
+            ):
+                raise ValueError("team must be null or a non-empty string")
+            if (
+                self.state.selected_start_step is not None
+                and (
+                    not isinstance(self.state.selected_start_step, str)
+                    or not self.state.selected_start_step.strip()
+                )
+            ):
+                raise ValueError(
+                    "selected_start_step must be null or a non-empty string"
+                )
+        previous: Mapping[str, object] = {}
+        run_json_present = self.paths.run_json.exists() or self.paths.run_json.is_symlink()
+        if run_json_present:
+            try:
+                loaded = json.loads(self.paths.run_json.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "cannot overwrite existing run metadata: run.json is unreadable"
+                ) from exc
+            if not isinstance(loaded, Mapping):
+                raise ValueError(
+                    "cannot overwrite existing run metadata: run.json must contain a JSON object"
+                )
+            previous = loaded
+            if previous.get("schema_version") != RUN_STATE_SCHEMA_VERSION:
+                raise ValueError(
+                    "cannot overwrite run metadata with an unsupported resume state schema"
+                )
+        # A terminal manager report is the authoritative failure summary.  Some
+        # callers add merge/recovery metadata in a later write without repeating
+        # that summary; retain it rather than replacing it with an empty field.
+        if failure_reason is None and status == "failed":
+            previous_reason = previous.get("failure_reason")
+            if isinstance(previous_reason, str) and previous_reason.startswith("# AFlow manager report"):
+                failure_reason = previous_reason
+        payload: dict[str, object] = {
+            "schema_version": RUN_STATE_SCHEMA_VERSION,
+            "repo_root": str(self.paths.repo_root),
+            "run_dir": str(self.paths.run_dir),
+            "status": status,
+            "plan_path": str(self.config.plan_path),
+            "workflow_name": self.workflow_name,
+            "original_plan_path": str(original_plan_path),
+            "max_turns": self.config.max_turns,
+            "keep_runs": self.config.keep_runs,
+            "extra_instructions": list(self.config.extra_instructions),
+            "turns_completed": turns_completed if turns_completed is not None else (self.state.turns_completed if self.state else 0),
+            "last_snapshot": _snapshot_payload(last_snapshot if last_snapshot is not None else (self.state.last_snapshot if self.state else None)),
+        }
+        if execution_context is not None:
+            payload["execution_repo_root"] = str(execution_context.execution_repo_root)
+            payload["feature_branch"] = execution_context.feature_branch
+            payload["main_branch"] = execution_context.main_branch
+            payload["lifecycle_setup"] = list(execution_context.setup)
+            payload["lifecycle_teardown"] = list(execution_context.teardown)
+            if execution_context.worktree_path is not None:
+                payload["worktree_path"] = str(execution_context.worktree_path)
+        else:
+            # Manager and status boundaries often update run metadata without
+            # carrying the execution context again. Lifecycle identity is durable
+            # resume state, so omission must not erase an already-recorded worktree
+            # or branch.
+            for key in (
+                "execution_repo_root",
+                "feature_branch",
+                "main_branch",
+                "lifecycle_setup",
+                "lifecycle_teardown",
+                "worktree_path",
+            ):
+                if key in previous:
+                    payload[key] = previous[key]
+        if current_step_name is not None:
+            payload["current_step_name"] = current_step_name
+        if active_plan_path is not None:
+            payload["active_plan_path"] = str(active_plan_path)
+        if new_plan_path is not None:
+            payload["new_plan_path"] = str(new_plan_path)
+        payload["team"] = team if team is not None else (
+            self.state.current_team
+            if self.state is not None and self.state.current_team is not None
+            else self.config.team
         )
-        payload["override_file_present"] = state.override_file_present
-        if state.frozen_run_identity is not None:
-            payload["frozen_config"] = asdict(state.frozen_run_identity)
-        if state.override_result is not None:
-            payload["override_result"] = asdict(state.override_result)
-        if state.pending_override_notes:
-            payload["pending_override_notes"] = list(state.pending_override_notes)
-        if state.override_source_run_dir is not None:
-            payload["override_source_run_dir"] = str(state.override_source_run_dir)
-        if end_reason is None:
-            end_reason = state.end_reason
-    else:
-        payload["selected_start_step"] = None
-        payload["startup_recovery_used"] = False
-        payload["startup_recovery_reason"] = None
-        payload["effective_max_turns"] = config.max_turns
+        if self.state is not None and self.state.issues_summary_path is not None:
+            payload["issues_summary_path"] = self.state.issues_summary_path
+        elif issues_summary_path is not None:
+            payload["issues_summary_path"] = issues_summary_path
+        if self.resumed_from_run_id is not None:
+            payload["resumed_from_run_id"] = self.resumed_from_run_id
+        if self.state is not None:
+            payload["run_started_at"] = self.state.run_started_at.isoformat()
+            payload["active_turn"] = self.state.active_turn
+            payload["status_message"] = self.state.status_message
+            payload["selected_start_step"] = self.state.selected_start_step
+            payload["startup_recovery_used"] = self.state.startup_recovery_used
+            payload["startup_recovery_reason"] = self.state.startup_recovery_reason
+            payload["effective_max_turns"] = (
+                self.state.effective_max_turns
+                if self.state.effective_max_turns is not None
+                else self.config.max_turns
+            )
+            payload["override_file_present"] = self.state.override_file_present
+            if self.state.frozen_run_identity is not None:
+                payload["frozen_config"] = asdict(self.state.frozen_run_identity)
+            if self.state.override_result is not None:
+                payload["override_result"] = asdict(self.state.override_result)
+            if self.state.pending_override_notes:
+                payload["pending_override_notes"] = list(self.state.pending_override_notes)
+            if self.state.override_source_run_dir is not None:
+                payload["override_source_run_dir"] = str(self.state.override_source_run_dir)
+            if end_reason is None:
+                end_reason = self.state.end_reason
+        else:
+            payload["selected_start_step"] = None
+            payload["startup_recovery_used"] = False
+            payload["startup_recovery_reason"] = None
+            payload["effective_max_turns"] = self.config.max_turns
 
-    lifecycle_setup = payload.get("lifecycle_setup", [])
-    lifecycle_teardown = payload.get("lifecycle_teardown", [])
-    if not isinstance(lifecycle_setup, list) or not all(
-        isinstance(item, str) for item in lifecycle_setup
-    ):
-        raise ValueError("lifecycle_setup must be a list of strings")
-    if not isinstance(lifecycle_teardown, list) or not all(
-        isinstance(item, str) for item in lifecycle_teardown
-    ):
-        raise ValueError("lifecycle_teardown must be a list of strings")
-    payload["lifecycle_setup"] = lifecycle_setup
-    payload["lifecycle_teardown"] = lifecycle_teardown
+        lifecycle_setup = payload.get("lifecycle_setup", [])
+        lifecycle_teardown = payload.get("lifecycle_teardown", [])
+        if not isinstance(lifecycle_setup, list) or not all(
+            isinstance(item, str) for item in lifecycle_setup
+        ):
+            raise ValueError("lifecycle_setup must be a list of strings")
+        if not isinstance(lifecycle_teardown, list) or not all(
+            isinstance(item, str) for item in lifecycle_teardown
+        ):
+            raise ValueError("lifecycle_teardown must be a list of strings")
+        payload["lifecycle_setup"] = lifecycle_setup
+        payload["lifecycle_teardown"] = lifecycle_teardown
 
-    frozen_config = payload.get("frozen_config")
-    if frozen_config is None and previous.get("schema_version") == RUN_STATE_SCHEMA_VERSION:
-        frozen_config = previous.get("frozen_config")
-    if not isinstance(frozen_config, Mapping) or any(
-        not isinstance(frozen_config.get(field), str)
-        or not str(frozen_config.get(field)).strip()
-        for field in ("workflow_name", "config_path", "config_fingerprint")
-    ):
-        raise ValueError("frozen_config must contain current non-empty identity fields")
-    payload["frozen_config"] = dict(frozen_config)
+        frozen_config = payload.get("frozen_config")
+        if frozen_config is None and previous.get("schema_version") == RUN_STATE_SCHEMA_VERSION:
+            frozen_config = previous.get("frozen_config")
+        if not isinstance(frozen_config, Mapping) or any(
+            not isinstance(frozen_config.get(field), str)
+            or not str(frozen_config.get(field)).strip()
+            for field in ("workflow_name", "config_path", "config_fingerprint")
+        ):
+            raise ValueError("frozen_config must contain current non-empty identity fields")
+        payload["frozen_config"] = dict(frozen_config)
 
-    durable_state = state
-    if durable_state is None:
-        durable_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-    payload.update(manager_state_payload(durable_state))
-    payload.update(hotplug_state_payload(durable_state))
-    if end_reason is not None:
-        payload["end_reason"] = end_reason
-    if failure_reason is not None:
-        payload["failure_reason"] = failure_reason
-    if merge_status is not None:
-        payload["merge_status"] = merge_status
-    if merge_failure_reason is not None:
-        payload["merge_failure_reason"] = merge_failure_reason
-    effective_retry = pending_retry if pending_retry is not None else (state.pending_retry if state is not None else None)
-    if effective_retry is not None:
-        payload["pending_retry_step_name"] = effective_retry.step_name
-        payload["pending_retry_attempt"] = effective_retry.attempt
-        payload["pending_retry_limit"] = effective_retry.retry_limit
-        payload["pending_retry_reason"] = "inconsistent_checkpoint_state"
-    if state is not None and state.current_harness_recovery is not None:
-        recovery = state.current_harness_recovery
-        payload["recovery_source"] = recovery.source
-        payload["recovery_action"] = recovery.action
-        payload["recovery_match_terms"] = list(recovery.match_terms)
-        payload["recovery_matched_terms"] = list(recovery.matched_terms)
-        payload["recovery_delay_seconds"] = recovery.delay_seconds
-    if failure_kind is not None:
-        if failure_kind != "environment_preflight":
-            raise ValueError("invalid environment preflight failure kind")
-        payload["failure_kind"] = failure_kind
-    elif isinstance(previous.get("failure_kind"), str):
-        payload["failure_kind"] = previous["failure_kind"]
-    if environment_preflight is not None:
-        payload["environment_preflight"] = _validated_environment_preflight_payload(
-            environment_preflight
-        )
-    elif isinstance(previous.get("environment_preflight"), Mapping):
-        try:
+        durable_state = self.state
+        if durable_state is None:
+            durable_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        payload.update(manager_state_payload(durable_state))
+        payload.update(hotplug_state_payload(durable_state))
+        if end_reason is not None:
+            payload["end_reason"] = end_reason
+        if failure_reason is not None:
+            payload["failure_reason"] = failure_reason
+        if merge_status is not None:
+            payload["merge_status"] = merge_status
+        if merge_failure_reason is not None:
+            payload["merge_failure_reason"] = merge_failure_reason
+        effective_retry = pending_retry if pending_retry is not None else (self.state.pending_retry if self.state is not None else None)
+        if effective_retry is not None:
+            payload["pending_retry_step_name"] = effective_retry.step_name
+            payload["pending_retry_attempt"] = effective_retry.attempt
+            payload["pending_retry_limit"] = effective_retry.retry_limit
+            payload["pending_retry_reason"] = "inconsistent_checkpoint_state"
+        if self.state is not None and self.state.current_harness_recovery is not None:
+            recovery = self.state.current_harness_recovery
+            payload["recovery_source"] = recovery.source
+            payload["recovery_action"] = recovery.action
+            payload["recovery_match_terms"] = list(recovery.match_terms)
+            payload["recovery_matched_terms"] = list(recovery.matched_terms)
+            payload["recovery_delay_seconds"] = recovery.delay_seconds
+        if failure_kind is not None:
+            if failure_kind != "environment_preflight":
+                raise ValueError("invalid environment preflight failure kind")
+            payload["failure_kind"] = failure_kind
+        elif isinstance(previous.get("failure_kind"), str):
+            payload["failure_kind"] = previous["failure_kind"]
+        if environment_preflight is not None:
             payload["environment_preflight"] = _validated_environment_preflight_payload(
-                previous["environment_preflight"]
+                environment_preflight
             )
-        except ValueError:
-            pass
-    if state is not None and state.harness_recovery_history:
-        payload.update(build_recovery_payload(state.current_harness_recovery, state.harness_recovery_history))
-    _write_atomic_json(paths.run_json, payload)
+        elif isinstance(previous.get("environment_preflight"), Mapping):
+            try:
+                payload["environment_preflight"] = _validated_environment_preflight_payload(
+                    previous["environment_preflight"]
+                )
+            except ValueError:
+                pass
+        if self.state is not None and self.state.harness_recovery_history:
+            payload.update(build_recovery_payload(self.state.current_harness_recovery, self.state.harness_recovery_history))
+        _write_atomic_json(self.paths.run_json, payload)
 
 
 def write_turn_artifacts_start(

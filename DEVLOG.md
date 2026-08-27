@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-08-26 — Bind workflow run-metadata persistence (PR-09)
+
+- Replaced 56 workflow calls that repeated run paths, controller config/state,
+  workflow name, and predecessor run ID with one frozen `RunMetadataWriter`;
+  mutable plan paths, execution context, current step, snapshots, counters,
+  failures, and terminal metadata remain explicit at every write.
+- Preserved schema-v2 validation and atomic replacement, resolved-team
+  precedence, lifecycle fields, manager/hotplug state, repartition, resume, and
+  terminal persistence contracts. The standalone writer function and alias
+  surface were removed.
+- Base SHA: `aaa8dbc67fcac522023d910c4213679e18cd909d` (merged PR #21).
+- Focused verification: runlog `28 passed`; runtime/CLI `405 passed, 171
+  subtests passed`; manager/repartition/control-plane/runlog `174 passed`;
+  compileall and diff checks passed.
+- Full verification: root `1351 passed, 216 subtests passed`; app server `186
+  passed`; web `34 passed`; web lint completed with zero errors and five known
+  hook warnings; Python/package and web production builds passed.
+
 ## 2026-08-23 — Require complete current resume state (PR-08)
 
 - Bumped durable controller metadata to schema version 2. Fresh writers now
