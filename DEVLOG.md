@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-08-27 — Consolidate standard workflow failure finalization (PR-10)
+
+- Consolidated the 13 standard post-context terminal failure sequences into one
+  private finalizer, preserving summaries, plan identity, snapshots, banner
+  ordering, and all five exception cause chains; the two writer-fallback
+  snapshots remain implicit at their original call sites.
+- Left the 15 special failed writes explicit, including startup, preflight,
+  manager/event, merge, pruning, and max-turn responsibilities.
+- Base SHA: `1a9e8b1df478d0ccf8d79b3e2234da80f07a43a4`.
+- Focused verification: runtime/runlog/CLI `434 passed, 171 subtests passed`;
+  manager/repartition/control-plane resume `146 passed`; compileall and diff
+  checks passed.
+- Full verification: root `1352 passed, 216 subtests passed`; app server `186
+  passed` with three existing dependency deprecation warnings; web `34 passed`;
+  web lint completed with zero errors and five existing React hook warnings;
+  package and web production builds passed.
+
 ## 2026-08-26 — Bind workflow run-metadata persistence (PR-09)
 
 - Replaced 56 workflow calls that repeated run paths, controller config/state,
