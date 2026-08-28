@@ -1,12 +1,21 @@
 # DEVLOG
 
+## 2026-08-28 — Refresh manager gate baseline after team overrides (PR-12 follow-up)
+
+- Removed `baseline_team_name` from the frozen `_ManagerGateCoordinator`
+  constructor and passed the current boundary value into all three `run()`
+  call sites, preserving team-override updates for manager context, upgrade
+  eligibility, and target routing.
+- Added a manager-enabled team-override regression covering the hotplug chain
+  and the executed upgrade selector.
+
 ## 2026-08-28 — Lift manager gate coordinator out of the workflow closure (PR-12)
 
 - Lifted the 436-line nested manager gate closure into one private, frozen,
-  module-level `_ManagerGateCoordinator`. Its 18 captured names are now 12
-  stable constructor fields plus four per-call mutable inputs:
-  `original_plan_path`, `active_plan_path`, `new_plan_path`, and
-  `runtime_current_step_name`.
+  module-level `_ManagerGateCoordinator`. Its 11 stable constructor fields
+  exclude the mutable baseline team; the five boundary inputs are passed per
+  call: `baseline_team_name`, `original_plan_path`, `active_plan_path`,
+  `new_plan_path`, and `runtime_current_step_name`.
 - Kept the manager level helper module-level with an explicit stalled-turn
   threshold, while repartition execution remains nested and automatic
   repartition remains opt-in. Manager action eligibility, Lite/Full selection,
@@ -22,7 +31,7 @@
   web lint zero errors with five existing React hook warnings; Python
   compileall, package build, and web production build passed. Structural
   ledger: one coordinator class/construction and three coordinator calls with
-  12 fields and four per-call mutable inputs; one module helper; unchanged
+  11 fields and five per-call mutable inputs; one module helper; unchanged
   nested repartition callbacks; one executor construction and five executor
   calls.
 

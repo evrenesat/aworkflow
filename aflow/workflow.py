@@ -587,7 +587,6 @@ class _ManagerGateCoordinator:
     workflow_name: str
     max_turns: int
     state: ControllerState
-    baseline_team_name: str | None
     execution_context: ExecutionContext | None
     manager_call_executor: _ManagerCallExecutor
     run_metadata: RunMetadataWriter
@@ -602,6 +601,7 @@ class _ManagerGateCoordinator:
         current_step: str,
         current_role: str,
         active_team: str | None,
+        baseline_team_name: str | None,
         active_selector: str,
         post_transition_active_path: Path,
         original_plan_path: Path,
@@ -653,7 +653,7 @@ class _ManagerGateCoordinator:
         if scope is not None:
             upgrade_depth = _implementation_upgrade_depth(
                 self.workflow_config,
-                baseline_team=self.baseline_team_name,
+                baseline_team=baseline_team_name,
                 most_recent_team=recent_team,
             )
             scope_context = {
@@ -680,7 +680,7 @@ class _ManagerGateCoordinator:
         upgrade = eligible_implementation_upgrade(
             self.workflow_config,
             role=candidate_step.role if candidate_step is not None else current_role,
-            baseline_team=self.baseline_team_name,
+            baseline_team=baseline_team_name,
             most_recent_implementation_team=recent_team,
             is_implementation_attempt=retrying_scoped_implementation,
         )
@@ -769,7 +769,7 @@ class _ManagerGateCoordinator:
             ),
             trigger=trigger, terminal=False,
             proposed_action=proposed_action, proposed_transition=proposed_transition,
-            current_step=current_step, current_role=current_role, baseline_team=self.baseline_team_name,
+            current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
             actual_team=active_team, actual_selector=active_selector,
             original_plan_path=str(original_plan_path), active_plan_path=str(proposed_target_plan),
             checkpoint_identity=target_plan_identity, safely_retryable=safely_retryable,
@@ -807,7 +807,7 @@ class _ManagerGateCoordinator:
         selection_context = build_manager_context(
             context_run_dir or run_paths.run_dir,
             level="lite", trigger=trigger,
-            run_metadata={"team": self.baseline_team_name, "max_turns": self.max_turns, "turns_completed": self.state.turns_completed,
+            run_metadata={"team": baseline_team_name, "max_turns": self.max_turns, "turns_completed": self.state.turns_completed,
                           "original_plan_path": str(original_plan_path), "active_plan_path": str(active_plan_path)},
             boundary=boundary.__dict__,
         )
@@ -951,7 +951,7 @@ class _ManagerGateCoordinator:
                 if decision.action == "retry_current_step"
                 else target_team
                 if target_team is not None
-                else self.baseline_team_name
+                else baseline_team_name
             )
             try:
                 target_selector, _ = _resolve_step_runtime(
@@ -5748,6 +5748,7 @@ def run_workflow(
             manager_gate_coordinator.run(
                 proposed_transition=step_name, current_step=step_name,
                 current_role=step.role, active_team=active_team_name,
+                baseline_team_name=baseline_team_name,
                 active_selector=selector, post_transition_active_path=active_plan_path,
                 original_plan_path=original_plan_path,
                 active_plan_path=active_plan_path,
@@ -7471,7 +7472,6 @@ def run_workflow(
         workflow_name=workflow_name,
         max_turns=config.max_turns,
         state=state,
-        baseline_team_name=baseline_team_name,
         execution_context=exec_ctx,
         manager_call_executor=manager_call_executor,
         run_metadata=run_metadata,
@@ -7918,6 +7918,7 @@ def run_workflow(
             current_step=replayed_boundary.step_name,
             current_role=replayed_boundary.step_role,
             active_team=baseline_team_name,
+            baseline_team_name=baseline_team_name,
             active_selector=replayed_boundary.selector,
             post_transition_active_path=post_transition_active_path,
             original_plan_path=original_plan_path,
@@ -9995,6 +9996,7 @@ def run_workflow(
             current_step=current_step_name,
             current_role=step.role,
             active_team=active_team_name,
+            baseline_team_name=baseline_team_name,
             active_selector=selector,
             post_transition_active_path=post_transition_active_path,
             original_plan_path=original_plan_path,

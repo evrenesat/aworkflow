@@ -116,7 +116,8 @@ module-level `_ManagerCallExecutor` with explicit stable dependencies, while
 the changing plan and step identities remain per-call inputs. Manager gate
 policy is owned by one private, frozen, module-level
 `_ManagerGateCoordinator` with explicit stable dependencies; original, active,
-and new plan paths plus the runtime step identity remain per-boundary inputs.
+and new plan paths plus the current baseline team and runtime step identity
+remain per-boundary inputs.
 Repartition execution remains an injected nested callback, so automatic
 repartition stays opt-in. Gate selection, escalation, stop handling, and
 pending-note policy now remain inside the coordinator rather than
