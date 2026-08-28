@@ -1,5 +1,31 @@
 # DEVLOG
 
+## 2026-08-28 — Lift manager gate coordinator out of the workflow closure (PR-12)
+
+- Lifted the 436-line nested manager gate closure into one private, frozen,
+  module-level `_ManagerGateCoordinator`. Its 18 captured names are now 12
+  stable constructor fields plus four per-call mutable inputs:
+  `original_plan_path`, `active_plan_path`, `new_plan_path`, and
+  `runtime_current_step_name`.
+- Kept the manager level helper module-level with an explicit stalled-turn
+  threshold, while repartition execution remains nested and automatic
+  repartition remains opt-in. Manager action eligibility, Lite/Full selection,
+  recovery, resume, durable artifacts, events, and routing contracts are
+  unchanged.
+- Base SHA: `03992439d006fda19a86f96c73e86ccaae4a8b3b`.
+- Focused verification: manager `42 passed`; manager-filtered runtime `34
+  passed, 221 deselected, 7 subtests passed`; repartition/control-plane resume
+  `104 passed`; runtime/runlog/CLI `434 passed, 171 subtests passed`;
+  compileall, structural ledger, callback-equivalence, and diff checks passed.
+- Full verification: root `1352 passed, 216 subtests passed`; app server `186
+  passed` with three existing dependency deprecation warnings; web `34 passed`;
+  web lint zero errors with five existing React hook warnings; Python
+  compileall, package build, and web production build passed. Structural
+  ledger: one coordinator class/construction and three coordinator calls with
+  12 fields and four per-call mutable inputs; one module helper; unchanged
+  nested repartition callbacks; one executor construction and five executor
+  calls.
+
 ## 2026-08-27 — Lift manager call execution out of the workflow closure (PR-11)
 
 - Lifted the 388-line nested `_run_manager_call()` closure into one private,
