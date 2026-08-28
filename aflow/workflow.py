@@ -156,7 +156,6 @@ class _ManagerCallExecutor:
     max_turns: int
     state: ControllerState
     run_paths: RunPaths
-    baseline_team_name: str | None
     execution_context: ExecutionContext | None
     execution_repo_root: Path
     observer: ExecutionObserver | None
@@ -170,6 +169,7 @@ class _ManagerCallExecutor:
         *,
         level: str,
         boundary: FinalizedTurnBoundary,
+        baseline_team_name: str | None,
         proposed_target_plan: Path | None,
         retry_target_plan: Path | None,
         original_plan_path: Path,
@@ -186,7 +186,7 @@ class _ManagerCallExecutor:
         )
         metadata = {
             "run_id": self.state.run_id,
-            "team": self.baseline_team_name,
+            "team": baseline_team_name,
             "max_turns": self.max_turns,
             "turns_completed": self.state.turns_completed,
             "original_plan_path": str(original_plan_path),
@@ -280,7 +280,7 @@ class _ManagerCallExecutor:
         manager_adapter = None
         try:
             role_resolution = resolve_manager_role(
-                self.workflow_config, level=level, baseline_team=self.baseline_team_name  # type: ignore[arg-type]
+                self.workflow_config, level=level, baseline_team=baseline_team_name  # type: ignore[arg-type]
             )
             manager_profile = resolve_profile(role_resolution.selector, self.workflow_config, step_path="manager")
             manager_adapter = self.adapter or get_adapter(manager_profile.harness_name)
@@ -829,6 +829,7 @@ class _ManagerGateCoordinator:
         outcome = self.manager_call_executor.run(
             level=level,
             boundary=boundary,
+            baseline_team_name=baseline_team_name,
             proposed_target_plan=proposed_target_plan,
             retry_target_plan=(
                 active_plan_path
@@ -857,6 +858,7 @@ class _ManagerGateCoordinator:
             outcome = self.manager_call_executor.run(
                 level=level,
                 boundary=boundary,
+                baseline_team_name=baseline_team_name,
                 proposed_target_plan=proposed_target_plan,
                 retry_target_plan=(
                     active_plan_path
@@ -880,6 +882,7 @@ class _ManagerGateCoordinator:
             outcome = self.manager_call_executor.run(
                 level=level,
                 boundary=boundary,
+                baseline_team_name=baseline_team_name,
                 proposed_target_plan=proposed_target_plan,
                 retry_target_plan=(
                     active_plan_path
@@ -6618,7 +6621,6 @@ def run_workflow(
         max_turns=config.max_turns,
         state=state,
         run_paths=run_paths,
-        baseline_team_name=baseline_team_name,
         execution_context=exec_ctx,
         execution_repo_root=execution_repo_root,
         observer=observer,
@@ -7513,6 +7515,7 @@ def run_workflow(
         outcome = manager_call_executor.run(
             level="full",
             boundary=boundary,
+            baseline_team_name=baseline_team_name,
             proposed_target_plan=None,
             retry_target_plan=None,
             original_plan_path=original_plan_path,
@@ -7667,6 +7670,7 @@ def run_workflow(
             outcome = manager_call_executor.run(
                 level="full",
                 boundary=boundary,
+                baseline_team_name=baseline_team_name,
                 proposed_target_plan=target_plan_path,
                 retry_target_plan=None,
                 original_plan_path=original_plan_path,

@@ -113,8 +113,8 @@ manager output at a terminal incident cannot replace the original controller
 failure as the report's primary cause.
 Manager invocation and note-correction execution is owned by one private,
 module-level `_ManagerCallExecutor` with explicit stable dependencies, while
-the changing plan and step identities remain per-call inputs. Manager gate
-policy is owned by one private, frozen, module-level
+the changing plan and step identities plus the current baseline team remain
+per-call inputs. Manager gate policy is owned by one private, frozen, module-level
 `_ManagerGateCoordinator` with explicit stable dependencies; original, active,
 and new plan paths plus the current baseline team and runtime step identity
 remain per-boundary inputs.

@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-08-28 — Refresh manager executor team after live overrides
+
+- Removed `baseline_team_name` from the frozen `_ManagerCallExecutor`
+  constructor and passed the current boundary team into all five manager calls,
+  so manager metadata and Lite/Full profile resolution follow a team override
+  accepted after the workflow has started.
+- Strengthened the manager team-override regression to apply the override after
+  turn one and verify the manager model changes from the base team to the live
+  team while upgrade routing remains correct.
+
 ## 2026-08-28 — Refresh manager gate baseline after team overrides (PR-12 follow-up)
 
 - Removed `baseline_team_name` from the frozen `_ManagerGateCoordinator`
