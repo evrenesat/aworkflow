@@ -10266,6 +10266,158 @@ class LifecycleBootstrapTests(unittest.TestCase):
             stored = json.loads((decision_dir / 'context.json').read_text(encoding='utf-8'))
             assert rebuilt == stored
 
+    def test_manager_gate_uses_team_override_for_upgrade_context_and_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review"),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement"),),
+                    ),
+                },
+                first_step="implement",
+                team="base",
+            )
+            workflow_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker-base",
+                    "reviewer": "codex.reviewer-base",
+                    "manager_lite": "codex.manager",
+                    "manager_full": "codex.manager",
+                },
+                teams={
+                    "base": TeamConfig(
+                        roles={
+                            "worker": "codex.worker-base",
+                            "reviewer": "codex.reviewer-base",
+                        },
+                        upgrade_to="base-upgrade",
+                    ),
+                    "base-upgrade": TeamConfig(
+                        roles={"worker": "codex.worker-base-upgrade"},
+                    ),
+                    "hotplug": TeamConfig(
+                        roles={
+                            "worker": "codex.worker-hotplug",
+                            "reviewer": "codex.reviewer-hotplug",
+                        },
+                        upgrade_to="hotplug-upgrade",
+                    ),
+                    "hotplug-upgrade": TeamConfig(
+                        roles={"worker": "codex.worker-hotplug-upgrade"},
+                    ),
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker-base": HarnessProfileConfig(model="worker-base"),
+                    "worker-base-upgrade": HarnessProfileConfig(model="worker-base-upgrade"),
+                    "worker-hotplug": HarnessProfileConfig(model="worker-hotplug"),
+                    "worker-hotplug-upgrade": HarnessProfileConfig(model="worker-hotplug-upgrade"),
+                    "reviewer-base": HarnessProfileConfig(model="reviewer-base"),
+                    "reviewer-hotplug": HarnessProfileConfig(model="reviewer-hotplug"),
+                    "manager": HarnessProfileConfig(model="manager"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                    full_after_stalled_turns=99,
+                ),
+            )
+            actual_create = create_run_paths
+            created_paths = []
+
+            def create_with_override(config):
+                paths = actual_create(config)
+                (paths.run_dir / "overrides.toml").write_text(
+                    'team = "hotplug"\n',
+                    encoding="utf-8",
+                )
+                created_paths.append(paths)
+                return paths
+
+            worker_models: list[str] = []
+            manager_calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal manager_calls
+                model = argv[argv.index("--model") + 1]
+                if model == "manager":
+                    manager_calls += 1
+                    action = (
+                        "upgrade_next_implementation"
+                        if manager_calls == 2
+                        else "continue"
+                    )
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": action,
+                        "reason": "Synthetic team-override routing decision.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+
+                worker_models.append(model)
+                if model == "worker-hotplug-upgrade":
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "workflow output", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=4,
+                    ),
+                    workflow_config,
+                    "managed",
+                    config_dir=repo_root,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert created_paths
+            assert result.final_snapshot.is_complete
+            assert worker_models == [
+                "worker-hotplug",
+                "reviewer-hotplug",
+                "worker-hotplug-upgrade",
+            ]
+            assert manager_calls == 3
+            first_context = json.loads(
+                (result.run_dir / "manager" / "decision-001" / "context.json").read_text()
+            )
+            second_context = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "context.json").read_text()
+            )
+            assert first_context["controller_state"]["baseline_team"] == "hotplug"
+            assert second_context["controller_state"]["baseline_team"] == "hotplug"
+            upgrade = second_context["controller_state"]["eligible_upgrade"]
+            assert upgrade["available"] is True
+            assert upgrade["source_team"] == "hotplug"
+            assert upgrade["target_team"] == "hotplug-upgrade"
+            assert upgrade["target_selector"] == "codex.worker-hotplug-upgrade"
+            second_result = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "result.json").read_text()
+            )
+            assert second_result["action"] == "upgrade_next_implementation"
+
     def test_manager_chains_worker_upgrades_within_one_review_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

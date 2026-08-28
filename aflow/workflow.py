@@ -559,6 +559,490 @@ class _ManagerCallExecutor:
         )
 
 
+def _manager_level_for_boundary(
+    context: dict[str, object],
+    *,
+    full_after_stalled_turns: int,
+) -> str:
+    controller = context.get("controller_state")
+    if not isinstance(controller, dict):
+        return "lite"
+    stalled = int(controller.get("semantic_stall_count", 0) or 0)
+    reviewer_failures = int(controller.get("reviewer_rejection_count", 0) or 0)
+    trigger = context.get("trigger")
+    scope_pressure = bool(controller.get("scope_pressure_detected"))
+    if (
+        stalled >= full_after_stalled_turns
+        or reviewer_failures >= 2
+        or scope_pressure
+        or trigger in {"explicit_stop", "invalid_plan", "ambiguous_failure", "same_step_cap", "max_turns", "merge_failure", "illegal_transition"}
+    ):
+        return "full"
+    return "lite"
+
+@dataclass(frozen=True)
+class _ManagerGateCoordinator:
+    workflow_config: WorkflowUserConfig
+    workflow: WorkflowConfig
+    workflow_name: str
+    max_turns: int
+    state: ControllerState
+    execution_context: ExecutionContext | None
+    manager_call_executor: _ManagerCallExecutor
+    run_metadata: RunMetadataWriter
+    fail_manager_gate: Callable[..., NoReturn]
+    run_repartition_cycle: Callable[..., None]
+    apply_pending_repartition: Callable[[], None]
+
+    def run(
+        self,
+        *,
+        proposed_transition: str,
+        current_step: str,
+        current_role: str,
+        active_team: str | None,
+        baseline_team_name: str | None,
+        active_selector: str,
+        post_transition_active_path: Path,
+        original_plan_path: Path,
+        active_plan_path: Path,
+        new_plan_path: Path | None,
+        runtime_current_step_name: str | None,
+        trigger: str = "post_turn",
+        proposed_action: str = "transition",
+        safely_retryable: bool = False,
+        operational_failure: bool = False,
+        backup_team: str | None = None,
+        backup_selector: str | None = None,
+        context_run_dir: Path | None = None,
+        finalized_turn_number: int | None = None,
+        artifact_path: str | None = None,
+        scope_pressure_reason: str | None = None,
+    ) -> str:
+        """Accept or replace the controller transition after a durable turn."""
+        run_paths = self.run_metadata.paths
+        if scope_pressure_reason is not None and not self.workflow_config.manager.enabled:
+            raise WorkflowError(
+                f"AFLOW_SCOPE_PRESSURE detected ('{scope_pressure_reason}') but manager supervision is disabled; "
+                f"scope-pressure rerouting requires an enabled manager",
+                run_dir=run_paths.run_dir,
+            )
+        if not self.workflow_config.manager.enabled:
+            return proposed_transition
+        if scope_pressure_reason is not None:
+            self.state.scope_pressure_reason = scope_pressure_reason
+            _require_valid_pressure_scope(
+                run_paths.run_dir,
+                self.state.active_implementation_scope,
+            )
+        next_step = None if proposed_transition == "END" else proposed_transition
+        candidate_step = self.workflow.steps.get(next_step) if next_step is not None else None
+        proposed_target_plan = (
+            active_plan_path
+            if proposed_transition == current_step
+            else post_transition_active_path
+        )
+        target_plan_identity = _target_plan_identity(proposed_target_plan)
+        scope = self.state.active_implementation_scope
+        attempts = (
+            self.state.implementation_attempts.get(scope.scope_id, [])
+            if scope is not None else []
+        )
+        recent_team = attempts[-1].team if attempts else None
+        scope_context = None
+        if scope is not None:
+            upgrade_depth = _implementation_upgrade_depth(
+                self.workflow_config,
+                baseline_team=baseline_team_name,
+                most_recent_team=recent_team,
+            )
+            scope_context = {
+                "scope_id": scope.scope_id,
+                "opened_turn_number": scope.opened_turn_number,
+                "carried_reviewer_rejection_count": (
+                    scope.carried_reviewer_rejection_count
+                ),
+                "checkpoint_index": scope.checkpoint_index,
+                "checkpoint_name": scope.checkpoint_name,
+                "awaiting_review": scope.awaiting_review,
+                "attempt_count": len(attempts),
+                "attempt_teams": [attempt.team for attempt in attempts],
+                "attempt_selectors": [attempt.selector for attempt in attempts],
+                "most_recent_team": recent_team,
+                "upgrade_depth": upgrade_depth,
+            }
+        retrying_scoped_implementation = (
+            scope is not None
+            and bool(attempts)
+            and candidate_step is not None
+            and candidate_step.role == "worker"
+        )
+        upgrade = eligible_implementation_upgrade(
+            self.workflow_config,
+            role=candidate_step.role if candidate_step is not None else current_role,
+            baseline_team=baseline_team_name,
+            most_recent_implementation_team=recent_team,
+            is_implementation_attempt=retrying_scoped_implementation,
+        )
+        if (
+            candidate_step is not None
+            and candidate_step.role == "worker"
+            and not retrying_scoped_implementation
+        ):
+            upgrade = replace(
+                upgrade,
+                reason="next worker has no prior attempt in an active implementation scope",
+            )
+        base_eligible: set[str] = {"continue", "stop"}
+        if safely_retryable:
+            base_eligible.add("retry_current_step")
+        if operational_failure and backup_team is not None and backup_team != active_team:
+            base_eligible.add("switch_to_backup_and_retry")
+        if upgrade.available:
+            base_eligible.add("upgrade_next_implementation")
+        repartition_disposition_targets: dict[str, tuple[str, str]] = {}
+        for routed_step_name, routed_step in (
+            (next_step, candidate_step),
+            (current_step, self.workflow.steps.get(current_step)),
+        ):
+            if routed_step is None:
+                continue
+            if routed_step.role == "worker":
+                repartition_disposition_targets.setdefault(
+                    "implement_current_partition",
+                    (str(routed_step_name), routed_step.role),
+                )
+            elif routed_step.role == "reviewer":
+                repartition_disposition_targets.setdefault(
+                    "review_current_partition",
+                    (str(routed_step_name), routed_step.role),
+                )
+        if (
+            scope is not None
+            and scope.checkpoint_index is not None
+            and scope.checkpoint_name is not None
+            and self.state.pending_repartition is None
+            and repartition_disposition_targets
+        ):
+            try:
+                from .repartition import (
+                    parse_envelope_bytes,
+                    validate_envelope_boundary_drift,
+                )
+                envelope_bytes = load_scope_envelope_for_resume(
+                    run_paths.run_dir, scope,
+                )
+                eligible_envelope = parse_envelope_bytes(envelope_bytes)
+                eligible_source = _exec_plan_path(
+                    original_plan_path, self.execution_context,
+                ).read_bytes().decode("utf-8", "strict")
+                eligible_drift = validate_envelope_boundary_drift(
+                    envelope=eligible_envelope,
+                    boundary_plan_text=eligible_source,
+                )
+                if eligible_drift.allowed:
+                    base_eligible.add("repartition_current_checkpoint")
+            except (OSError, UnicodeDecodeError, ValueError, WorkflowError):
+                # Invalid authority makes repartition unavailable. Full still
+                # receives continue/upgrade/stop and may report the boundary.
+                pass
+        clean_end_boundary = (
+            proposed_action == "transition"
+            and proposed_transition == "END"
+            and not operational_failure
+            and scope_pressure_reason is None
+            and trigger != "max_turns"
+        )
+        lite_eligible = set(base_eligible)
+        if clean_end_boundary:
+            lite_eligible.discard("stop")
+        boundary = FinalizedTurnBoundary(
+            finalized_turn_number=(
+                self.state.active_turn
+                if finalized_turn_number is None
+                else finalized_turn_number
+            ),
+            artifact_path=(
+                f"turns/turn-{self.state.active_turn:03d}"
+                if artifact_path is None
+                else artifact_path
+            ),
+            trigger=trigger, terminal=False,
+            proposed_action=proposed_action, proposed_transition=proposed_transition,
+            current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
+            actual_team=active_team, actual_selector=active_selector,
+            original_plan_path=str(original_plan_path), active_plan_path=str(proposed_target_plan),
+            checkpoint_identity=target_plan_identity, safely_retryable=safely_retryable,
+            operational_failure=operational_failure, backup_team=backup_team,
+            backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
+            active_implementation_scope=scope_context,
+            eligible_actions=sorted(lite_eligible),
+            scope_pressure_reason=scope_pressure_reason,
+            # Immutable controller-owned copies for deterministic v2 reconstruction.
+            review_rejection_history=[asdict(r) for r in self.state.review_rejection_history],
+            implementation_attempts={
+                sid: [asdict(a) for a in atts]
+                for sid, atts in self.state.implementation_attempts.items()
+            },
+            envelope_artifact_path=(
+                str(scope.envelope_artifact_path)
+                if scope is not None and scope.envelope_artifact_path is not None
+                else None
+            ),
+            envelope_artifact_sha256=(
+                str(scope.envelope_artifact_sha256)
+                if scope is not None and scope.envelope_artifact_sha256 is not None
+                else None
+            ),
+            envelope_canonical_sha256=(
+                str(scope.envelope_canonical_sha256)
+                if scope is not None and scope.envelope_canonical_sha256 is not None
+                else None
+            ),
+            repartition_history=[
+                asdict(record) for record in self.state.repartition_history
+            ],
+        )
+        # Build once to select Lite or Full without exposing plan text to Lite.
+        selection_context = build_manager_context(
+            context_run_dir or run_paths.run_dir,
+            level="lite", trigger=trigger,
+            run_metadata={"team": baseline_team_name, "max_turns": self.max_turns, "turns_completed": self.state.turns_completed,
+                          "original_plan_path": str(original_plan_path), "active_plan_path": str(active_plan_path)},
+            boundary=boundary.__dict__,
+        )
+        signals = selection_context.get("controller_state")
+        if isinstance(signals, dict):
+            self.state.semantic_stall_count = int(signals.get("semantic_stall_count", 0) or 0)
+            self.state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
+        level = _manager_level_for_boundary(
+            selection_context,
+            full_after_stalled_turns=(
+                self.workflow_config.manager.full_after_stalled_turns
+            ),
+        )
+        if level == "full":
+            boundary = replace(
+                boundary,
+                eligible_actions=sorted(base_eligible),
+            )
+        outcome = self.manager_call_executor.run(
+            level=level,
+            boundary=boundary,
+            proposed_target_plan=proposed_target_plan,
+            retry_target_plan=(
+                active_plan_path
+                if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
+                else None
+            ),
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            current_step_name=runtime_current_step_name,
+            context_run_dir=context_run_dir,
+        )
+        decision, context, error = outcome.decision, outcome.context, outcome.error
+        if (
+            decision is None
+            and level == "lite"
+            and not outcome.correction_consumed
+            and error != "manager mutated repository or plan state"
+        ):
+            level = "full"
+            boundary = replace(
+                boundary,
+                trigger="lite_invalid",
+                evidence=error,
+                eligible_actions=sorted(base_eligible),
+            )
+            outcome = self.manager_call_executor.run(
+                level=level,
+                boundary=boundary,
+                proposed_target_plan=proposed_target_plan,
+                retry_target_plan=(
+                    active_plan_path
+                    if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
+                    else None
+                ),
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                current_step_name=runtime_current_step_name,
+                context_run_dir=context_run_dir,
+            )
+            decision, context, error = outcome.decision, outcome.context, outcome.error
+        elif decision is not None and decision.action == "escalate_to_full":
+            level = "full"
+            boundary = replace(
+                boundary,
+                trigger="lite_escalation",
+                evidence=decision.reason,
+                eligible_actions=sorted(base_eligible),
+            )
+            outcome = self.manager_call_executor.run(
+                level=level,
+                boundary=boundary,
+                proposed_target_plan=proposed_target_plan,
+                retry_target_plan=(
+                    active_plan_path
+                    if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
+                    else None
+                ),
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                current_step_name=runtime_current_step_name,
+                context_run_dir=context_run_dir,
+            )
+            decision, context, error = outcome.decision, outcome.context, outcome.error
+        if decision is None:
+            self.fail_manager_gate(
+                context,
+                reason=error or "manager did not return a valid decision",
+            )
+        if decision.action == "stop":
+            self.fail_manager_gate(context, reason=decision.reason, decision=decision)
+        if decision.action == "repartition_current_checkpoint":
+            self.run_repartition_cycle(
+                decision_context=context,
+                disposition_targets=repartition_disposition_targets,
+            )
+            self.apply_pending_repartition()
+            pending = self.state.pending_repartition
+            if pending is None or pending.resolved_target_step is None:
+                raise WorkflowError(
+                    "repartition application did not resolve a post-split target",
+                    run_dir=run_paths.run_dir,
+                )
+            return pending.resolved_target_step
+
+        target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
+        target_config = self.workflow.steps.get(target_step) if target_step not in {None, "END"} else None
+        target_plan = active_plan_path if target_step == current_step else post_transition_active_path
+        target_identity = _target_plan_identity(target_plan)
+        scope_id = (
+            self.state.active_implementation_scope.scope_id
+            if self.state.active_implementation_scope is not None else None
+        )
+        active_partition_identity = (
+            (
+                self.state.active_implementation_scope.current_partition_generation_id,
+                self.state.active_implementation_scope.current_partition_candidate_sha256,
+                self.state.active_implementation_scope.current_partition_id,
+            )
+            if self.state.active_implementation_scope is not None
+            else (None, None, None)
+        )
+        retain_scoped_team = (
+            decision.action == "continue"
+            and retrying_scoped_implementation
+            and recent_team is not None
+        )
+        target_team = (
+            upgrade.target_team
+            if decision.action == "upgrade_next_implementation"
+            else recent_team
+            if retain_scoped_team
+            else None
+        )
+        target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
+        if target_config is not None and target_selector is None:
+            resolution_team = (
+                backup_team
+                if decision.action == "switch_to_backup_and_retry"
+                else active_team
+                if decision.action == "retry_current_step"
+                else target_team
+                if target_team is not None
+                else baseline_team_name
+            )
+            try:
+                target_selector, _ = _resolve_step_runtime(
+                    target_config, self.workflow_config,
+                    team_name=resolution_team,
+                    step_path=f"workflow.{self.workflow_name}.steps.{target_step}",
+                )
+            except WorkflowError:
+                target_selector = None
+        self.state.pending_boundary_decision = PendingBoundaryDecision(
+            finalized_turn_number=boundary.finalized_turn_number,
+            decision_number=self.state.manager_decision_number,
+            action=decision.action, proposed_action=boundary.proposed_action,
+            proposed_transition=proposed_transition, resolved_next_step=target_step,
+            target_role=target_config.role if target_config is not None else None,
+            target_team=target_team,
+            target_selector=target_selector,
+            checkpoint_identity=target_identity,
+            scope_id=scope_id,
+            target_plan_identity=target_identity,
+            post_transition_active_plan_path=str(target_plan),
+            post_transition_checkpoint_identity=target_identity,
+            notes_reference=(f"manager/decision-{self.state.manager_decision_number:03d}" if decision.next_step_notes else None),
+            repartition_generation_id=active_partition_identity[0],
+            repartition_candidate_sha256=active_partition_identity[1],
+            repartition_partition_id=active_partition_identity[2],
+        )
+        if decision.next_step_notes and target_step != "END":
+            self.state.pending_manager_notes = PendingManagerNotes(
+                target_step, decision.next_step_notes, self.state.manager_decision_number,
+                target_role=target_config.role if target_config is not None else None,
+                target_selector=target_selector,
+                checkpoint_identity=target_identity,
+                scope_id=scope_id,
+                target_plan_identity=target_identity,
+                repartition_generation_id=active_partition_identity[0],
+                repartition_candidate_sha256=active_partition_identity[1],
+                repartition_partition_id=active_partition_identity[2],
+            )
+        # This is intentionally before changing any controller routing state.
+        self.run_metadata.write(status="running", last_snapshot=self.state.last_snapshot,
+                            original_plan_path=original_plan_path,
+                           current_step_name=runtime_current_step_name, active_plan_path=active_plan_path,
+                           new_plan_path=new_plan_path)
+        if decision.action == "retry_current_step":
+            return current_step
+        if decision.action == "switch_to_backup_and_retry":
+            backup_team, _ = resolve_backup_team(active_team, self.workflow_config.teams)
+            if backup_team is None:
+                raise WorkflowError("manager selected unavailable backup-team retry", run_dir=run_paths.run_dir)
+            self.state.current_team_override = backup_team
+            return current_step
+        if decision.action == "upgrade_next_implementation":
+            assert next_step is not None
+            if not upgrade.available or upgrade.target_team is None or upgrade.target_selector is None:
+                raise WorkflowError("manager selected unavailable implementation upgrade", run_dir=run_paths.run_dir)
+            self.state.pending_step_team_override = PendingTeamOverride(
+                target_step=next_step, role=self.workflow.steps[next_step].role, source_team=upgrade.source_team,
+                target_team=upgrade.target_team, selector=upgrade.target_selector,
+                checkpoint_identity=target_identity, decision_number=self.state.manager_decision_number,
+                scope_id=scope_id, target_plan_identity=target_identity,
+                repartition_generation_id=active_partition_identity[0],
+                repartition_candidate_sha256=active_partition_identity[1],
+                repartition_partition_id=active_partition_identity[2],
+            )
+        elif (
+            retain_scoped_team
+            and next_step is not None
+            and target_team is not None
+            and target_selector is not None
+        ):
+            # A plain Full/Lite continuation inside the same rejected scope
+            # retains the most recently reviewed worker. Baseline is restored
+            # only when review closes the scope and checkpoint progress opens
+            # a fresh one.
+            self.state.pending_step_team_override = PendingTeamOverride(
+                target_step=next_step,
+                role=self.workflow.steps[next_step].role,
+                source_team=target_team,
+                target_team=target_team,
+                selector=target_selector,
+                checkpoint_identity=target_identity,
+                decision_number=self.state.manager_decision_number,
+                scope_id=scope_id,
+                target_plan_identity=target_identity,
+                repartition_generation_id=active_partition_identity[0],
+                repartition_candidate_sha256=active_partition_identity[1],
+                repartition_partition_id=active_partition_identity[2],
+            )
+        return proposed_transition
+
 _REVIEW_SKILL_NAMES = frozenset({
     "aflow-review-squash",
     "aflow-review-checkpoint",
@@ -5261,10 +5745,15 @@ def run_workflow(
                     )
                 except WorkflowError:
                     backup_selector = None
-            _manager_gate(
+            manager_gate_coordinator.run(
                 proposed_transition=step_name, current_step=step_name,
                 current_role=step.role, active_team=active_team_name,
+                baseline_team_name=baseline_team_name,
                 active_selector=selector, post_transition_active_path=active_plan_path,
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+                runtime_current_step_name=current_step_name,
                 trigger="harness_recovery", proposed_action="recovery",
                 safely_retryable=True, operational_failure=True,
                 backup_team=backup_team, backup_selector=backup_selector,
@@ -6101,7 +6590,7 @@ def run_workflow(
         *,
         reason: str,
         decision: ManagerDecisionV1 | None = None,
-    ) -> None:
+    ) -> NoReturn:
         report = _write_manager_report(context, reason=reason, decision=decision)
         state.status_message = "failed"
         run_metadata.write(
@@ -6123,22 +6612,6 @@ def run_workflow(
         banner.stop(state)
         raise WorkflowError(report, run_dir=run_paths.run_dir)
 
-    def _manager_level_for_boundary(context: dict[str, object]) -> str:
-        controller = context.get("controller_state")
-        if not isinstance(controller, dict):
-            return "lite"
-        stalled = int(controller.get("semantic_stall_count", 0) or 0)
-        reviewer_failures = int(controller.get("reviewer_rejection_count", 0) or 0)
-        trigger = context.get("trigger")
-        scope_pressure = bool(controller.get("scope_pressure_detected"))
-        if (
-            stalled >= workflow_config.manager.full_after_stalled_turns
-            or reviewer_failures >= 2
-            or scope_pressure
-            or trigger in {"explicit_stop", "invalid_plan", "ambiguous_failure", "same_step_cap", "max_turns", "merge_failure", "illegal_transition"}
-        ):
-            return "full"
-        return "lite"
 
     manager_call_executor = _ManagerCallExecutor(
         workflow_config=workflow_config,
@@ -6993,442 +7466,19 @@ def run_workflow(
             return
         raise AssertionError("bounded repartition cycle exhausted without a result")
 
-    def _manager_gate(
-        *,
-        proposed_transition: str,
-        current_step: str,
-        current_role: str,
-        active_team: str | None,
-        active_selector: str,
-        post_transition_active_path: Path,
-        trigger: str = "post_turn",
-        proposed_action: str = "transition",
-        safely_retryable: bool = False,
-        operational_failure: bool = False,
-        backup_team: str | None = None,
-        backup_selector: str | None = None,
-        context_run_dir: Path | None = None,
-        finalized_turn_number: int | None = None,
-        artifact_path: str | None = None,
-        scope_pressure_reason: str | None = None,
-    ) -> str:
-        """Accept or replace the controller transition after a durable turn."""
-        if scope_pressure_reason is not None and not workflow_config.manager.enabled:
-            raise WorkflowError(
-                f"AFLOW_SCOPE_PRESSURE detected ('{scope_pressure_reason}') but manager supervision is disabled; "
-                f"scope-pressure rerouting requires an enabled manager",
-                run_dir=run_paths.run_dir,
-            )
-        if not workflow_config.manager.enabled:
-            return proposed_transition
-        if scope_pressure_reason is not None:
-            state.scope_pressure_reason = scope_pressure_reason
-            _require_valid_pressure_scope(
-                run_paths.run_dir,
-                state.active_implementation_scope,
-            )
-        next_step = None if proposed_transition == "END" else proposed_transition
-        candidate_step = wf.steps.get(next_step) if next_step is not None else None
-        proposed_target_plan = (
-            active_plan_path
-            if proposed_transition == current_step
-            else post_transition_active_path
-        )
-        target_plan_identity = _target_plan_identity(proposed_target_plan)
-        scope = state.active_implementation_scope
-        attempts = (
-            state.implementation_attempts.get(scope.scope_id, [])
-            if scope is not None else []
-        )
-        recent_team = attempts[-1].team if attempts else None
-        scope_context = None
-        if scope is not None:
-            upgrade_depth = _implementation_upgrade_depth(
-                workflow_config,
-                baseline_team=baseline_team_name,
-                most_recent_team=recent_team,
-            )
-            scope_context = {
-                "scope_id": scope.scope_id,
-                "opened_turn_number": scope.opened_turn_number,
-                "carried_reviewer_rejection_count": (
-                    scope.carried_reviewer_rejection_count
-                ),
-                "checkpoint_index": scope.checkpoint_index,
-                "checkpoint_name": scope.checkpoint_name,
-                "awaiting_review": scope.awaiting_review,
-                "attempt_count": len(attempts),
-                "attempt_teams": [attempt.team for attempt in attempts],
-                "attempt_selectors": [attempt.selector for attempt in attempts],
-                "most_recent_team": recent_team,
-                "upgrade_depth": upgrade_depth,
-            }
-        retrying_scoped_implementation = (
-            scope is not None
-            and bool(attempts)
-            and candidate_step is not None
-            and candidate_step.role == "worker"
-        )
-        upgrade = eligible_implementation_upgrade(
-            workflow_config,
-            role=candidate_step.role if candidate_step is not None else current_role,
-            baseline_team=baseline_team_name,
-            most_recent_implementation_team=recent_team,
-            is_implementation_attempt=retrying_scoped_implementation,
-        )
-        if (
-            candidate_step is not None
-            and candidate_step.role == "worker"
-            and not retrying_scoped_implementation
-        ):
-            upgrade = replace(
-                upgrade,
-                reason="next worker has no prior attempt in an active implementation scope",
-            )
-        base_eligible: set[str] = {"continue", "stop"}
-        if safely_retryable:
-            base_eligible.add("retry_current_step")
-        if operational_failure and backup_team is not None and backup_team != active_team:
-            base_eligible.add("switch_to_backup_and_retry")
-        if upgrade.available:
-            base_eligible.add("upgrade_next_implementation")
-        repartition_disposition_targets: dict[str, tuple[str, str]] = {}
-        for routed_step_name, routed_step in (
-            (next_step, candidate_step),
-            (current_step, wf.steps.get(current_step)),
-        ):
-            if routed_step is None:
-                continue
-            if routed_step.role == "worker":
-                repartition_disposition_targets.setdefault(
-                    "implement_current_partition",
-                    (str(routed_step_name), routed_step.role),
-                )
-            elif routed_step.role == "reviewer":
-                repartition_disposition_targets.setdefault(
-                    "review_current_partition",
-                    (str(routed_step_name), routed_step.role),
-                )
-        if (
-            scope is not None
-            and scope.checkpoint_index is not None
-            and scope.checkpoint_name is not None
-            and state.pending_repartition is None
-            and repartition_disposition_targets
-        ):
-            try:
-                from .repartition import (
-                    parse_envelope_bytes,
-                    validate_envelope_boundary_drift,
-                )
-                envelope_bytes = load_scope_envelope_for_resume(
-                    run_paths.run_dir, scope,
-                )
-                eligible_envelope = parse_envelope_bytes(envelope_bytes)
-                eligible_source = _exec_plan_path(
-                    original_plan_path, exec_ctx,
-                ).read_bytes().decode("utf-8", "strict")
-                eligible_drift = validate_envelope_boundary_drift(
-                    envelope=eligible_envelope,
-                    boundary_plan_text=eligible_source,
-                )
-                if eligible_drift.allowed:
-                    base_eligible.add("repartition_current_checkpoint")
-            except (OSError, UnicodeDecodeError, ValueError, WorkflowError):
-                # Invalid authority makes repartition unavailable. Full still
-                # receives continue/upgrade/stop and may report the boundary.
-                pass
-        clean_end_boundary = (
-            proposed_action == "transition"
-            and proposed_transition == "END"
-            and not operational_failure
-            and scope_pressure_reason is None
-            and trigger != "max_turns"
-        )
-        lite_eligible = set(base_eligible)
-        if clean_end_boundary:
-            lite_eligible.discard("stop")
-        boundary = FinalizedTurnBoundary(
-            finalized_turn_number=(
-                state.active_turn
-                if finalized_turn_number is None
-                else finalized_turn_number
-            ),
-            artifact_path=(
-                f"turns/turn-{state.active_turn:03d}"
-                if artifact_path is None
-                else artifact_path
-            ),
-            trigger=trigger, terminal=False,
-            proposed_action=proposed_action, proposed_transition=proposed_transition,
-            current_step=current_step, current_role=current_role, baseline_team=baseline_team_name,
-            actual_team=active_team, actual_selector=active_selector,
-            original_plan_path=str(original_plan_path), active_plan_path=str(proposed_target_plan),
-            checkpoint_identity=target_plan_identity, safely_retryable=safely_retryable,
-            operational_failure=operational_failure, backup_team=backup_team,
-            backup_selector=backup_selector, implementation_upgrade=upgrade.__dict__,
-            active_implementation_scope=scope_context,
-            eligible_actions=sorted(lite_eligible),
-            scope_pressure_reason=scope_pressure_reason,
-            # Immutable controller-owned copies for deterministic v2 reconstruction.
-            review_rejection_history=[asdict(r) for r in state.review_rejection_history],
-            implementation_attempts={
-                sid: [asdict(a) for a in atts]
-                for sid, atts in state.implementation_attempts.items()
-            },
-            envelope_artifact_path=(
-                str(scope.envelope_artifact_path)
-                if scope is not None and scope.envelope_artifact_path is not None
-                else None
-            ),
-            envelope_artifact_sha256=(
-                str(scope.envelope_artifact_sha256)
-                if scope is not None and scope.envelope_artifact_sha256 is not None
-                else None
-            ),
-            envelope_canonical_sha256=(
-                str(scope.envelope_canonical_sha256)
-                if scope is not None and scope.envelope_canonical_sha256 is not None
-                else None
-            ),
-            repartition_history=[
-                asdict(record) for record in state.repartition_history
-            ],
-        )
-        # Build once to select Lite or Full without exposing plan text to Lite.
-        selection_context = build_manager_context(
-            context_run_dir or run_paths.run_dir,
-            level="lite", trigger=trigger,
-            run_metadata={"team": baseline_team_name, "max_turns": config.max_turns, "turns_completed": state.turns_completed,
-                          "original_plan_path": str(original_plan_path), "active_plan_path": str(active_plan_path)},
-            boundary=boundary.__dict__,
-        )
-        signals = selection_context.get("controller_state")
-        if isinstance(signals, dict):
-            state.semantic_stall_count = int(signals.get("semantic_stall_count", 0) or 0)
-            state.reviewer_rejection_count = int(signals.get("reviewer_rejection_count", 0) or 0)
-        level = _manager_level_for_boundary(selection_context)
-        if level == "full":
-            boundary = replace(
-                boundary,
-                eligible_actions=sorted(base_eligible),
-            )
-        outcome = manager_call_executor.run(
-            level=level,
-            boundary=boundary,
-            proposed_target_plan=proposed_target_plan,
-            retry_target_plan=(
-                active_plan_path
-                if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
-                else None
-            ),
-            original_plan_path=original_plan_path,
-            active_plan_path=active_plan_path,
-            current_step_name=current_step_name,
-            context_run_dir=context_run_dir,
-        )
-        decision, context, error = outcome.decision, outcome.context, outcome.error
-        if (
-            decision is None
-            and level == "lite"
-            and not outcome.correction_consumed
-            and error != "manager mutated repository or plan state"
-        ):
-            level = "full"
-            boundary = replace(
-                boundary,
-                trigger="lite_invalid",
-                evidence=error,
-                eligible_actions=sorted(base_eligible),
-            )
-            outcome = manager_call_executor.run(
-                level=level,
-                boundary=boundary,
-                proposed_target_plan=proposed_target_plan,
-                retry_target_plan=(
-                    active_plan_path
-                    if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
-                    else None
-                ),
-                original_plan_path=original_plan_path,
-                active_plan_path=active_plan_path,
-                current_step_name=current_step_name,
-                context_run_dir=context_run_dir,
-            )
-            decision, context, error = outcome.decision, outcome.context, outcome.error
-        elif decision is not None and decision.action == "escalate_to_full":
-            level = "full"
-            boundary = replace(
-                boundary,
-                trigger="lite_escalation",
-                evidence=decision.reason,
-                eligible_actions=sorted(base_eligible),
-            )
-            outcome = manager_call_executor.run(
-                level=level,
-                boundary=boundary,
-                proposed_target_plan=proposed_target_plan,
-                retry_target_plan=(
-                    active_plan_path
-                    if {"retry_current_step", "switch_to_backup_and_retry"} & base_eligible
-                    else None
-                ),
-                original_plan_path=original_plan_path,
-                active_plan_path=active_plan_path,
-                current_step_name=current_step_name,
-                context_run_dir=context_run_dir,
-            )
-            decision, context, error = outcome.decision, outcome.context, outcome.error
-        if decision is None:
-            _fail_manager_gate(
-                context,
-                reason=error or "manager did not return a valid decision",
-            )
-        if decision.action == "stop":
-            _fail_manager_gate(context, reason=decision.reason, decision=decision)
-        if decision.action == "repartition_current_checkpoint":
-            _run_repartition_cycle(
-                decision_context=context,
-                disposition_targets=repartition_disposition_targets,
-            )
-            _apply_pending_repartition()
-            pending = state.pending_repartition
-            if pending is None or pending.resolved_target_step is None:
-                raise WorkflowError(
-                    "repartition application did not resolve a post-split target",
-                    run_dir=run_paths.run_dir,
-                )
-            return pending.resolved_target_step
-
-        target_step = current_step if decision.action in {"retry_current_step", "switch_to_backup_and_retry"} else proposed_transition
-        target_config = wf.steps.get(target_step) if target_step not in {None, "END"} else None
-        target_plan = active_plan_path if target_step == current_step else post_transition_active_path
-        target_identity = _target_plan_identity(target_plan)
-        scope_id = (
-            state.active_implementation_scope.scope_id
-            if state.active_implementation_scope is not None else None
-        )
-        active_partition_identity = (
-            (
-                state.active_implementation_scope.current_partition_generation_id,
-                state.active_implementation_scope.current_partition_candidate_sha256,
-                state.active_implementation_scope.current_partition_id,
-            )
-            if state.active_implementation_scope is not None
-            else (None, None, None)
-        )
-        retain_scoped_team = (
-            decision.action == "continue"
-            and retrying_scoped_implementation
-            and recent_team is not None
-        )
-        target_team = (
-            upgrade.target_team
-            if decision.action == "upgrade_next_implementation"
-            else recent_team
-            if retain_scoped_team
-            else None
-        )
-        target_selector = upgrade.target_selector if decision.action == "upgrade_next_implementation" else None
-        if target_config is not None and target_selector is None:
-            resolution_team = (
-                backup_team
-                if decision.action == "switch_to_backup_and_retry"
-                else active_team
-                if decision.action == "retry_current_step"
-                else target_team
-                if target_team is not None
-                else baseline_team_name
-            )
-            try:
-                target_selector, _ = _resolve_step_runtime(
-                    target_config, workflow_config,
-                    team_name=resolution_team,
-                    step_path=f"workflow.{workflow_name}.steps.{target_step}",
-                )
-            except WorkflowError:
-                target_selector = None
-        state.pending_boundary_decision = PendingBoundaryDecision(
-            finalized_turn_number=boundary.finalized_turn_number,
-            decision_number=state.manager_decision_number,
-            action=decision.action, proposed_action=boundary.proposed_action,
-            proposed_transition=proposed_transition, resolved_next_step=target_step,
-            target_role=target_config.role if target_config is not None else None,
-            target_team=target_team,
-            target_selector=target_selector,
-            checkpoint_identity=target_identity,
-            scope_id=scope_id,
-            target_plan_identity=target_identity,
-            post_transition_active_plan_path=str(target_plan),
-            post_transition_checkpoint_identity=target_identity,
-            notes_reference=(f"manager/decision-{state.manager_decision_number:03d}" if decision.next_step_notes else None),
-            repartition_generation_id=active_partition_identity[0],
-            repartition_candidate_sha256=active_partition_identity[1],
-            repartition_partition_id=active_partition_identity[2],
-        )
-        if decision.next_step_notes and target_step != "END":
-            state.pending_manager_notes = PendingManagerNotes(
-                target_step, decision.next_step_notes, state.manager_decision_number,
-                target_role=target_config.role if target_config is not None else None,
-                target_selector=target_selector,
-                checkpoint_identity=target_identity,
-                scope_id=scope_id,
-                target_plan_identity=target_identity,
-                repartition_generation_id=active_partition_identity[0],
-                repartition_candidate_sha256=active_partition_identity[1],
-                repartition_partition_id=active_partition_identity[2],
-            )
-        # This is intentionally before changing any controller routing state.
-        run_metadata.write(status="running", last_snapshot=state.last_snapshot,
-                            original_plan_path=original_plan_path,
-                           current_step_name=current_step_name, active_plan_path=active_plan_path,
-                           new_plan_path=new_plan_path)
-        if decision.action == "retry_current_step":
-            return current_step
-        if decision.action == "switch_to_backup_and_retry":
-            backup_team, _ = resolve_backup_team(active_team, workflow_config.teams)
-            if backup_team is None:
-                raise WorkflowError("manager selected unavailable backup-team retry", run_dir=run_paths.run_dir)
-            state.current_team_override = backup_team
-            return current_step
-        if decision.action == "upgrade_next_implementation":
-            assert next_step is not None
-            if not upgrade.available or upgrade.target_team is None or upgrade.target_selector is None:
-                raise WorkflowError("manager selected unavailable implementation upgrade", run_dir=run_paths.run_dir)
-            state.pending_step_team_override = PendingTeamOverride(
-                target_step=next_step, role=wf.steps[next_step].role, source_team=upgrade.source_team,
-                target_team=upgrade.target_team, selector=upgrade.target_selector,
-                checkpoint_identity=target_identity, decision_number=state.manager_decision_number,
-                scope_id=scope_id, target_plan_identity=target_identity,
-                repartition_generation_id=active_partition_identity[0],
-                repartition_candidate_sha256=active_partition_identity[1],
-                repartition_partition_id=active_partition_identity[2],
-            )
-        elif (
-            retain_scoped_team
-            and next_step is not None
-            and target_team is not None
-            and target_selector is not None
-        ):
-            # A plain Full/Lite continuation inside the same rejected scope
-            # retains the most recently reviewed worker. Baseline is restored
-            # only when review closes the scope and checkpoint progress opens
-            # a fresh one.
-            state.pending_step_team_override = PendingTeamOverride(
-                target_step=next_step,
-                role=wf.steps[next_step].role,
-                source_team=target_team,
-                target_team=target_team,
-                selector=target_selector,
-                checkpoint_identity=target_identity,
-                decision_number=state.manager_decision_number,
-                scope_id=scope_id,
-                target_plan_identity=target_identity,
-                repartition_generation_id=active_partition_identity[0],
-                repartition_candidate_sha256=active_partition_identity[1],
-                repartition_partition_id=active_partition_identity[2],
-            )
-        return proposed_transition
+    manager_gate_coordinator = _ManagerGateCoordinator(
+        workflow_config=workflow_config,
+        workflow=wf,
+        workflow_name=workflow_name,
+        max_turns=config.max_turns,
+        state=state,
+        execution_context=exec_ctx,
+        manager_call_executor=manager_call_executor,
+        run_metadata=run_metadata,
+        fail_manager_gate=_fail_manager_gate,
+        run_repartition_cycle=_run_repartition_cycle,
+        apply_pending_repartition=_apply_pending_repartition,
+    )
 
     def _manager_terminal_incident(
         *,
@@ -7863,13 +7913,18 @@ def run_workflow(
             selected_transition=matching_transitions[0],
             exec_ctx=exec_ctx,
         )
-        current_step_name = _manager_gate(
+        current_step_name = manager_gate_coordinator.run(
             proposed_transition=replayed_boundary.chosen_transition,
             current_step=replayed_boundary.step_name,
             current_role=replayed_boundary.step_role,
             active_team=baseline_team_name,
+            baseline_team_name=baseline_team_name,
             active_selector=replayed_boundary.selector,
             post_transition_active_path=post_transition_active_path,
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            runtime_current_step_name=current_step_name,
             context_run_dir=replayed_boundary.source_run_dir,
             finalized_turn_number=replayed_boundary.turn_number,
             artifact_path=(
@@ -9925,7 +9980,7 @@ def run_workflow(
 
         # Detect scope pressure from the finalized turn before the manager gate.
         # Stop already won at this point (checked at line 5257).  When pressure
-        # is present, _manager_gate forces Full or fails clearly for disabled
+        # is present, the manager gate coordinator forces Full or fails clearly for disabled
         # supervision; it must not reach the stop path with a simultaneous
         # real AFLOW_STOP marker.
         scope_pressure = parse_scope_pressure(
@@ -9936,13 +9991,18 @@ def run_workflow(
         )
         scope_pressure_reason = scope_pressure.reason if scope_pressure.detected else None
 
-        transition_target = _manager_gate(
+        transition_target = manager_gate_coordinator.run(
             proposed_transition=transition_target,
             current_step=current_step_name,
             current_role=step.role,
             active_team=active_team_name,
+            baseline_team_name=baseline_team_name,
             active_selector=selector,
             post_transition_active_path=post_transition_active_path,
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            runtime_current_step_name=current_step_name,
             scope_pressure_reason=scope_pressure_reason,
         )
 
