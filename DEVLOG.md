@@ -1,5 +1,31 @@
 # DEVLOG
 
+## 2026-08-28 — Lift repartition cycle executor out of the workflow closure (PR-13)
+
+- Lifted the 462-line nested repartition proposal, mechanical-validation, and
+  semantic-validation cycle into one private, frozen, module-level
+  `_RepartitionCycleExecutor`.
+- Replaced its ten captured names with eight stable constructor fields plus the
+  two per-call plan paths, `original_plan_path` and `active_plan_path`.
+- Kept proposal, correction, candidate, verdict, artifact, persistence, and
+  durable transaction contracts unchanged. Invocation, persistence, and plan
+  application remain live nested callbacks; automatic repartition remains
+  opt-in.
+- Base SHA: `388838a794bc713ae9f7c8da8126273a7ff72eb0`.
+- Verification: repartition `100 passed`; repartition-filtered runtime
+  `7 passed, 249 deselected, 6 subtests passed`; control-plane resume `4
+  passed`; manager `42 passed`; manager-filtered runtime `35 passed, 221
+  deselected, 7 subtests passed`; root `1353 passed, 216 subtests passed`;
+  app server `186 passed` with three existing deprecation warnings; web `34
+  passed`; web lint zero errors with five existing React hook warnings; Python
+  compileall, package build, and web production build passed. Structural
+  ledger and diff checks passed: one executor construction and callback
+  injection, eight executor fields, manager gate 11 fields and three manager
+  calls, manager executor 11 fields and five call sites, unchanged 274-line
+  application helper, and zero legacy closure references.
+- No live workflow, editable-tool retarget, service restart, deployment, or
+  unrelated file change occurred.
+
 ## 2026-08-28 — Refresh manager executor team after live overrides
 
 - Removed `baseline_team_name` from the frozen `_ManagerCallExecutor`

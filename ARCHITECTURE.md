@@ -118,10 +118,12 @@ per-call inputs. Manager gate policy is owned by one private, frozen, module-lev
 `_ManagerGateCoordinator` with explicit stable dependencies; original, active,
 and new plan paths plus the current baseline team and runtime step identity
 remain per-boundary inputs.
-Repartition execution remains an injected nested callback, so automatic
-repartition stays opt-in. Gate selection, escalation, stop handling, and
-pending-note policy now remain inside the coordinator rather than
-`run_workflow()`.
+The bounded repartition proposal and semantic-validation cycle is owned by one
+private, frozen, module-level `_RepartitionCycleExecutor`; original and active
+plan paths remain explicit per accepted manager boundary. Its live invocation,
+persistence, and application callbacks remain nested, so automatic repartition
+stays opt-in. Gate selection, escalation, stop handling, and pending-note policy
+now remain inside the coordinator rather than `run_workflow()`.
 Manager/status metadata updates preserve the existing lifecycle identity when
 they do not carry an execution context, preventing worktree resume fields from
 being erased at a later boundary.
