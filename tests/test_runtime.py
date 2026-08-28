@@ -10266,7 +10266,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             stored = json.loads((decision_dir / 'context.json').read_text(encoding='utf-8'))
             assert rebuilt == stored
 
-    def test_manager_gate_uses_team_override_for_upgrade_context_and_routing(self) -> None:
+    def test_manager_gate_and_executor_use_live_team_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
@@ -10294,14 +10294,16 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 roles={
                     "worker": "codex.worker-base",
                     "reviewer": "codex.reviewer-base",
-                    "manager_lite": "codex.manager",
-                    "manager_full": "codex.manager",
+                    "manager_lite": "codex.manager-base",
+                    "manager_full": "codex.manager-base",
                 },
                 teams={
                     "base": TeamConfig(
                         roles={
                             "worker": "codex.worker-base",
                             "reviewer": "codex.reviewer-base",
+                            "manager_lite": "codex.manager-base",
+                            "manager_full": "codex.manager-base",
                         },
                         upgrade_to="base-upgrade",
                     ),
@@ -10312,6 +10314,8 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         roles={
                             "worker": "codex.worker-hotplug",
                             "reviewer": "codex.reviewer-hotplug",
+                            "manager_lite": "codex.manager-hotplug",
+                            "manager_full": "codex.manager-hotplug",
                         },
                         upgrade_to="hotplug-upgrade",
                     ),
@@ -10326,7 +10330,8 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     "worker-hotplug-upgrade": HarnessProfileConfig(model="worker-hotplug-upgrade"),
                     "reviewer-base": HarnessProfileConfig(model="reviewer-base"),
                     "reviewer-hotplug": HarnessProfileConfig(model="reviewer-hotplug"),
-                    "manager": HarnessProfileConfig(model="manager"),
+                    "manager-base": HarnessProfileConfig(model="manager-base"),
+                    "manager-hotplug": HarnessProfileConfig(model="manager-hotplug"),
                 })},
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
@@ -10340,26 +10345,21 @@ class LifecycleBootstrapTests(unittest.TestCase):
             actual_create = create_run_paths
             created_paths = []
 
-            def create_with_override(config):
+            def capture_paths(config):
                 paths = actual_create(config)
-                (paths.run_dir / "overrides.toml").write_text(
-                    'team = "hotplug"\n',
-                    encoding="utf-8",
-                )
                 created_paths.append(paths)
                 return paths
 
             worker_models: list[str] = []
-            manager_calls = 0
+            manager_models: list[str] = []
 
             def runner(argv, **kwargs):
-                nonlocal manager_calls
                 model = argv[argv.index("--model") + 1]
-                if model == "manager":
-                    manager_calls += 1
+                if model in {"manager-base", "manager-hotplug"}:
+                    manager_models.append(model)
                     action = (
                         "upgrade_next_implementation"
-                        if manager_calls == 2
+                        if len(manager_models) == 2
                         else "continue"
                     )
                     return subprocess.CompletedProcess(argv, 0, json.dumps({
@@ -10371,13 +10371,18 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     }), "")
 
                 worker_models.append(model)
-                if model == "worker-hotplug-upgrade":
+                if model == "worker-base":
+                    (created_paths[0].run_dir / "overrides.toml").write_text(
+                        'team = "hotplug"\n',
+                        encoding="utf-8",
+                    )
+                if model == "worker-base-upgrade":
                     _write_plan(plan_path, _COMPLETE_PLAN)
                 return subprocess.CompletedProcess(argv, 0, "workflow output", "")
 
             with patch(
                 "aflow.workflow.create_run_paths",
-                side_effect=create_with_override,
+                side_effect=capture_paths,
             ):
                 result = run_workflow(
                     ControllerConfig(
@@ -10395,24 +10400,28 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert created_paths
             assert result.final_snapshot.is_complete
             assert worker_models == [
-                "worker-hotplug",
+                "worker-base",
                 "reviewer-hotplug",
-                "worker-hotplug-upgrade",
+                "worker-base-upgrade",
             ]
-            assert manager_calls == 3
+            assert manager_models == [
+                "manager-base",
+                "manager-hotplug",
+                "manager-hotplug",
+            ]
             first_context = json.loads(
                 (result.run_dir / "manager" / "decision-001" / "context.json").read_text()
             )
             second_context = json.loads(
                 (result.run_dir / "manager" / "decision-002" / "context.json").read_text()
             )
-            assert first_context["controller_state"]["baseline_team"] == "hotplug"
+            assert first_context["controller_state"]["baseline_team"] == "base"
             assert second_context["controller_state"]["baseline_team"] == "hotplug"
             upgrade = second_context["controller_state"]["eligible_upgrade"]
             assert upgrade["available"] is True
-            assert upgrade["source_team"] == "hotplug"
-            assert upgrade["target_team"] == "hotplug-upgrade"
-            assert upgrade["target_selector"] == "codex.worker-hotplug-upgrade"
+            assert upgrade["source_team"] == "base"
+            assert upgrade["target_team"] == "base-upgrade"
+            assert upgrade["target_selector"] == "codex.worker-base-upgrade"
             second_result = json.loads(
                 (result.run_dir / "manager" / "decision-002" / "result.json").read_text()
             )
