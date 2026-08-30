@@ -121,9 +121,18 @@ remain per-boundary inputs.
 The bounded repartition proposal and semantic-validation cycle is owned by one
 private, frozen, module-level `_RepartitionCycleExecutor`; original and active
 plan paths remain explicit per accepted manager boundary. Its live invocation,
-persistence, and application callbacks remain nested, so automatic repartition
-stays opt-in. Gate selection, escalation, stop handling, and pending-note policy
-now remain inside the coordinator rather than `run_workflow()`.
+persistence callback, and tiny application adapter remain nested, so automatic
+repartition stays opt-in. Gate selection, escalation, stop handling, and
+pending-note policy now remain inside the coordinator rather than
+`run_workflow()`.
+Pending repartition reconciliation and application are owned by the private,
+frozen, module-level `_RepartitionApplicationCoordinator`. It receives the
+original and active plan paths, new-plan path, current step, and baseline team at
+each application boundary and returns the resulting active path and step. A
+small local adapter updates the live loop state for both manager and resume
+consumers. The shared `_persist_pending_repartition()` helper keeps cycle and
+application persistence on one durable metadata path, including the required
+post-application route before event publication.
 Manager/status metadata updates preserve the existing lifecycle identity when
 they do not carry an execution context, preventing worktree resume fields from
 being erased at a later boundary.

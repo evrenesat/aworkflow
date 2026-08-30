@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-08-30 — Lift repartition application coordinator out of the workflow closure (PR-14)
+
+- Lifted the 274-line pending-repartition reconciliation and application
+  closure, replacing its 12 captured names with eight stable coordinator
+  fields and five per-call path/step/team values.
+- Added a small live-state bridge returning and assigning the active plan path
+  and current step, preserving the unchanged manager-gate and startup-resume
+  consumers. Consolidated cycle and application persistence through one
+  explicit `_persist_pending_repartition()` helper, preserving the
+  post-application path/step-before-final-write and event ordering.
+- Base SHA: `3474eeb65e4b80b2561844e72378f666c184dcb2`.
+- Verification: repartition `100 passed`; repartition-filtered runtime `7
+  passed, 249 deselected, 6 subtests passed`; control-plane resume `4 passed`;
+  manager `42 passed`; manager-filtered runtime `35 passed, 221 deselected, 7
+  subtests passed`; root `1353 passed, 216 subtests passed`; app server `186
+  passed` with three existing dependency warnings; web `34 passed`; web lint
+  zero errors with five known React hook warnings; structural AST and
+  behavioral-equivalence ledgers passed; Python compileall, package build, and
+  web production build passed.
+
 ## 2026-08-28 — Lift repartition cycle executor out of the workflow closure (PR-13)
 
 - Lifted the 462-line nested repartition proposal, mechanical-validation, and

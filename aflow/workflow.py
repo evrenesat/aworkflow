@@ -1037,6 +1037,330 @@ class _RepartitionCycleExecutor:
         raise AssertionError("bounded repartition cycle exhausted without a result")
 
 
+def _persist_pending_repartition(
+    pending: PendingRepartitionV1,
+    *,
+    state: ControllerState,
+    run_metadata: RunMetadataWriter,
+    original_plan_path: Path,
+    current_step_name: str,
+    active_plan_path: Path,
+    new_plan_path: Path | None,
+) -> None:
+    state.pending_repartition = pending
+    run_metadata.write(
+        status="running",
+        last_snapshot=state.last_snapshot,
+        original_plan_path=original_plan_path,
+        current_step_name=current_step_name,
+        active_plan_path=active_plan_path,
+        new_plan_path=new_plan_path,
+    )
+
+
+@dataclass(frozen=True)
+class _RepartitionApplicationCoordinator:
+    workflow_config: WorkflowUserConfig
+    workflow: WorkflowConfig
+    workflow_name: str
+    state: ControllerState
+    run_paths: RunPaths
+    execution_context: ExecutionContext | None
+    observer: ExecutionObserver | None
+    run_metadata: RunMetadataWriter
+
+    def run(
+        self,
+        *,
+        original_plan_path: Path,
+        active_plan_path: Path,
+        new_plan_path: Path | None,
+        current_step_name: str,
+        baseline_team_name: str | None,
+    ) -> tuple[Path, str]:
+        pending = self.state.pending_repartition
+        if pending is None:
+            return active_plan_path, current_step_name
+
+        def persist_current(pending: PendingRepartitionV1) -> None:
+            _persist_pending_repartition(
+                pending,
+                state=self.state,
+                run_metadata=self.run_metadata,
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+            )
+        if pending.stage in {"decided", "proposed", "mechanically_validated"}:
+            raise WorkflowError(
+                "pending repartition proposal/validation transaction must be "
+                f"reconciled before a harness can start (stage={pending.stage})",
+                run_dir=self.run_paths.run_dir,
+            )
+        if pending.stage == "failed":
+            raise WorkflowError(
+                "cannot resume a failed repartition transaction without "
+                "explicit scope reset",
+                run_dir=self.run_paths.run_dir,
+            )
+        if pending.stage not in {
+            "semantically_validated",
+            "execution_plan_applied",
+            "primary_plan_applied",
+            "applied",
+        }:
+            raise WorkflowError(
+                f"cannot apply repartition transaction at unknown stage '{pending.stage}'",
+                run_dir=self.run_paths.run_dir,
+            )
+        if (
+            (pending.proposal_sha256 is None or not pending.child_summaries)
+            and pending.proposal_artifact_path is not None
+        ):
+            proposal_path = (
+                self.run_paths.run_dir / pending.proposal_artifact_path
+            ).resolve()
+            try:
+                proposal_path.relative_to(self.run_paths.run_dir.resolve())
+                proposal_bytes = proposal_path.read_bytes()
+                proposal_payload = json.loads(proposal_bytes)
+                raw_children = proposal_payload.get("children")
+                if not isinstance(raw_children, list):
+                    raise ValueError("proposal children are unavailable")
+                child_summaries = tuple(
+                    f"{child['title']}: {child['narrow_goal']}"
+                    for child in raw_children
+                    if isinstance(child, dict)
+                    and isinstance(child.get("title"), str)
+                    and isinstance(child.get("narrow_goal"), str)
+                )
+                if len(child_summaries) != len(raw_children):
+                    raise ValueError("proposal child summaries are incomplete")
+                pending = replace(
+                    pending,
+                    proposal_sha256=hashlib.sha256(proposal_bytes).hexdigest(),
+                    child_summaries=child_summaries,
+                )
+                persist_current(pending)
+            except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
+                raise WorkflowError(
+                    f"cannot restore compact repartition proposal evidence: {exc}",
+                    run_dir=self.run_paths.run_dir,
+                ) from exc
+        if (
+            pending.candidate_artifact_path is None
+            or pending.candidate_plan_sha256 is None
+            or pending.generation_id is None
+            or not pending.partition_ids
+            or len(pending.child_summaries) != len(pending.partition_ids)
+            or pending.proposal_sha256 is None
+            or pending.current_disposition is None
+            or pending.resolved_target_step is None
+            or pending.resolved_target_role is None
+        ):
+            raise WorkflowError(
+                "cannot apply repartition transaction: validated identity or "
+                "routing fields are incomplete",
+                run_dir=self.run_paths.run_dir,
+            )
+        artifact_path = (self.run_paths.run_dir / pending.candidate_artifact_path).resolve()
+        try:
+            artifact_path.relative_to(self.run_paths.run_dir.resolve())
+            candidate_bytes = artifact_path.read_bytes()
+        except (ValueError, OSError) as exc:
+            raise WorkflowError(
+                f"cannot read validated repartition candidate: {exc}",
+                run_dir=self.run_paths.run_dir,
+            ) from exc
+        candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
+        if candidate_hash != pending.candidate_plan_sha256:
+            raise WorkflowError(
+                "validated repartition candidate hash mismatch: "
+                f"expected={pending.candidate_plan_sha256} observed={candidate_hash}",
+                run_dir=self.run_paths.run_dir,
+            )
+
+        execution_path = _exec_plan_path(original_plan_path, self.execution_context)
+        primary_path = _primary_plan_path(original_plan_path, self.execution_context)
+        pending = _reconcile_repartition_plan_copies(
+            pending,
+            candidate_bytes=candidate_bytes,
+            execution_path=execution_path,
+            primary_path=primary_path,
+            persist=persist_current,
+        )
+
+        try:
+            candidate_snapshot = load_plan_tolerant(
+                execution_path
+            ).parsed_plan.snapshot
+        except (OSError, PlanParseError, ValueError) as exc:
+            raise WorkflowError(
+                f"applied repartition candidate cannot be parsed: {exc}",
+                run_dir=self.run_paths.run_dir,
+            ) from exc
+        scope = self.state.active_implementation_scope
+        if scope is None or scope.scope_id != pending.scope_id:
+            raise WorkflowError(
+                "cannot apply repartition transaction without its active parent scope",
+                run_dir=self.run_paths.run_dir,
+            )
+        target_step = self.workflow.steps.get(pending.resolved_target_step)
+        if target_step is None or target_step.role != pending.resolved_target_role:
+            raise WorkflowError(
+                "repartition target no longer resolves to the persisted workflow role",
+                run_dir=self.run_paths.run_dir,
+            )
+
+        # The split supersedes only one-hop state and overlay selection. Attempts,
+        # rejections, dirty code, and the immutable parent envelope remain.
+        self.state.pending_manager_notes = None
+        self.state.pending_step_team_override = None
+        self.state.active_implementation_scope = replace(
+            scope,
+            awaiting_review=target_step.role == "reviewer",
+            current_partition_generation_id=pending.generation_id,
+            current_partition_candidate_sha256=pending.candidate_plan_sha256,
+            current_partition_id=pending.partition_ids[0],
+        )
+        self.state.last_snapshot = candidate_snapshot
+        active_plan_path = original_plan_path
+        current_step_name = pending.resolved_target_step
+        self.state.pending_retry = None
+
+        target_team: str | None = None
+        if target_step.role == "worker":
+            attempts = self.state.implementation_attempts.get(scope.scope_id, [])
+            target_team = attempts[-1].team if attempts else baseline_team_name
+        selector, _resolved = _resolve_step_runtime(
+            target_step,
+            self.workflow_config,
+            team_name=target_team or baseline_team_name,
+            step_path=(
+                f"workflow.{self.workflow_name}.steps.{pending.resolved_target_step}"
+            ),
+        )
+        target_identity = _target_plan_identity(
+            original_plan_path, candidate_snapshot,
+        )
+        self.state.pending_boundary_decision = PendingBoundaryDecision(
+            finalized_turn_number=(
+                self.state.pending_boundary_decision.finalized_turn_number
+                if self.state.pending_boundary_decision is not None
+                else self.state.active_turn
+            ),
+            decision_number=pending.decision_number,
+            action="repartition_current_checkpoint",
+            proposed_action="transition",
+            proposed_transition=None,
+            resolved_next_step=pending.resolved_target_step,
+            target_role=target_step.role,
+            target_team=target_team,
+            target_selector=selector,
+            checkpoint_identity=target_identity,
+            post_transition_active_plan_path=str(original_plan_path),
+            post_transition_checkpoint_identity=target_identity,
+            scope_id=scope.scope_id,
+            target_plan_identity=target_identity,
+            repartition_generation_id=pending.generation_id,
+            repartition_candidate_sha256=pending.candidate_plan_sha256,
+            repartition_partition_id=pending.partition_ids[0],
+        )
+        if target_step.role == "worker" and target_team is not None:
+            self.state.pending_step_team_override = PendingTeamOverride(
+                target_step=pending.resolved_target_step,
+                role=target_step.role,
+                source_team=target_team,
+                target_team=target_team,
+                selector=selector,
+                checkpoint_identity=target_identity,
+                decision_number=pending.decision_number,
+                scope_id=scope.scope_id,
+                target_plan_identity=target_identity,
+                repartition_generation_id=pending.generation_id,
+                repartition_candidate_sha256=pending.candidate_plan_sha256,
+                repartition_partition_id=pending.partition_ids[0],
+            )
+        required_artifact_paths = (
+            scope.envelope_artifact_path,
+            pending.proposal_artifact_path,
+            pending.candidate_artifact_path,
+            pending.mechanical_validation_artifact_path,
+            pending.semantic_verdict_artifact_path,
+        )
+        if not all(
+            isinstance(path, str) and path for path in required_artifact_paths
+        ) or not isinstance(scope.envelope_artifact_sha256, str):
+            raise WorkflowError(
+                "cannot publish applied repartition evidence with incomplete "
+                "artifact references",
+                run_dir=self.run_paths.run_dir,
+            )
+        record = CheckpointRepartitionRecord(
+            schema_version=1,
+            decision_number=pending.decision_number,
+            scope_id=pending.scope_id,
+            generation_id=pending.generation_id,
+            envelope_sha256=pending.envelope_sha256,
+            envelope_artifact_sha256=str(scope.envelope_artifact_sha256),
+            source_plan_sha256=pending.source_plan_sha256,
+            proposal_sha256=pending.proposal_sha256,
+            candidate_plan_sha256=pending.candidate_plan_sha256,
+            partition_ids=pending.partition_ids,
+            child_summaries=pending.child_summaries,
+            current_disposition=pending.current_disposition or "",
+            resolved_target_step=pending.resolved_target_step,
+            resolved_target_role=pending.resolved_target_role,
+            current_partition_id=pending.partition_ids[0],
+            scope_pressure_reason=self.state.scope_pressure_reason,
+            envelope_artifact_path=str(scope.envelope_artifact_path),
+            proposal_artifact_path=str(pending.proposal_artifact_path),
+            candidate_artifact_path=str(pending.candidate_artifact_path),
+            mechanical_validation_artifact_path=str(
+                pending.mechanical_validation_artifact_path
+            ),
+            semantic_verdict_artifact_path=str(
+                pending.semantic_verdict_artifact_path
+            ),
+        )
+        is_new_record = not any(
+            item.generation_id == record.generation_id
+            for item in self.state.repartition_history
+        )
+        if is_new_record:
+            self.state.repartition_history.append(record)
+        pending = replace(pending, stage="applied")
+        persist_current(pending)
+        if is_new_record:
+            _emit_event(self.observer, CheckpointRepartitionedEvent.create(
+                decision_number=record.decision_number,
+                scope_id=record.scope_id,
+                generation_id=record.generation_id,
+                envelope_sha256=record.envelope_sha256,
+                envelope_artifact_sha256=record.envelope_artifact_sha256,
+                source_plan_sha256=record.source_plan_sha256,
+                proposal_sha256=record.proposal_sha256,
+                candidate_plan_sha256=record.candidate_plan_sha256,
+                partition_ids=record.partition_ids,
+                child_summaries=record.child_summaries,
+                current_disposition=record.current_disposition,
+                resolved_target_step=record.resolved_target_step,
+                resolved_target_role=record.resolved_target_role,
+                current_partition_id=record.current_partition_id,
+                scope_pressure_reason=record.scope_pressure_reason,
+                artifact_paths={
+                    "envelope": record.envelope_artifact_path,
+                    "proposal": record.proposal_artifact_path,
+                    "candidate": record.candidate_artifact_path,
+                    "mechanical_validation": (
+                        record.mechanical_validation_artifact_path
+                    ),
+                    "semantic_verdict": record.semantic_verdict_artifact_path,
+                },
+            ))
+        return active_plan_path, current_step_name
+
 def _manager_level_for_boundary(
     context: dict[str, object],
     *,
@@ -7111,290 +7435,36 @@ def run_workflow(
     )
 
     def _persist_repartition(pending: PendingRepartitionV1) -> None:
-        state.pending_repartition = pending
-        run_metadata.write(
-            status="running",
-            last_snapshot=state.last_snapshot,
+        _persist_pending_repartition(
+            pending,
+            state=state,
+            run_metadata=run_metadata,
             original_plan_path=original_plan_path,
             current_step_name=current_step_name,
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
         )
 
+    repartition_application_coordinator = _RepartitionApplicationCoordinator(
+        workflow_config=workflow_config,
+        workflow=wf,
+        workflow_name=workflow_name,
+        state=state,
+        run_paths=run_paths,
+        execution_context=exec_ctx,
+        observer=observer,
+        run_metadata=run_metadata,
+    )
+
     def _apply_pending_repartition() -> None:
-        """Reconcile and route one semantically validated transaction."""
         nonlocal active_plan_path, current_step_name
-
-        pending = state.pending_repartition
-        if pending is None:
-            return
-        if pending.stage in {"decided", "proposed", "mechanically_validated"}:
-            raise WorkflowError(
-                "pending repartition proposal/validation transaction must be "
-                f"reconciled before a harness can start (stage={pending.stage})",
-                run_dir=run_paths.run_dir,
-            )
-        if pending.stage == "failed":
-            raise WorkflowError(
-                "cannot resume a failed repartition transaction without "
-                "explicit scope reset",
-                run_dir=run_paths.run_dir,
-            )
-        if pending.stage not in {
-            "semantically_validated",
-            "execution_plan_applied",
-            "primary_plan_applied",
-            "applied",
-        }:
-            raise WorkflowError(
-                f"cannot apply repartition transaction at unknown stage '{pending.stage}'",
-                run_dir=run_paths.run_dir,
-            )
-        if (
-            (pending.proposal_sha256 is None or not pending.child_summaries)
-            and pending.proposal_artifact_path is not None
-        ):
-            proposal_path = (
-                run_paths.run_dir / pending.proposal_artifact_path
-            ).resolve()
-            try:
-                proposal_path.relative_to(run_paths.run_dir.resolve())
-                proposal_bytes = proposal_path.read_bytes()
-                proposal_payload = json.loads(proposal_bytes)
-                raw_children = proposal_payload.get("children")
-                if not isinstance(raw_children, list):
-                    raise ValueError("proposal children are unavailable")
-                child_summaries = tuple(
-                    f"{child['title']}: {child['narrow_goal']}"
-                    for child in raw_children
-                    if isinstance(child, dict)
-                    and isinstance(child.get("title"), str)
-                    and isinstance(child.get("narrow_goal"), str)
-                )
-                if len(child_summaries) != len(raw_children):
-                    raise ValueError("proposal child summaries are incomplete")
-                pending = replace(
-                    pending,
-                    proposal_sha256=hashlib.sha256(proposal_bytes).hexdigest(),
-                    child_summaries=child_summaries,
-                )
-                _persist_repartition(pending)
-            except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
-                raise WorkflowError(
-                    f"cannot restore compact repartition proposal evidence: {exc}",
-                    run_dir=run_paths.run_dir,
-                ) from exc
-        if (
-            pending.candidate_artifact_path is None
-            or pending.candidate_plan_sha256 is None
-            or pending.generation_id is None
-            or not pending.partition_ids
-            or len(pending.child_summaries) != len(pending.partition_ids)
-            or pending.proposal_sha256 is None
-            or pending.current_disposition is None
-            or pending.resolved_target_step is None
-            or pending.resolved_target_role is None
-        ):
-            raise WorkflowError(
-                "cannot apply repartition transaction: validated identity or "
-                "routing fields are incomplete",
-                run_dir=run_paths.run_dir,
-            )
-        artifact_path = (run_paths.run_dir / pending.candidate_artifact_path).resolve()
-        try:
-            artifact_path.relative_to(run_paths.run_dir.resolve())
-            candidate_bytes = artifact_path.read_bytes()
-        except (ValueError, OSError) as exc:
-            raise WorkflowError(
-                f"cannot read validated repartition candidate: {exc}",
-                run_dir=run_paths.run_dir,
-            ) from exc
-        candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
-        if candidate_hash != pending.candidate_plan_sha256:
-            raise WorkflowError(
-                "validated repartition candidate hash mismatch: "
-                f"expected={pending.candidate_plan_sha256} observed={candidate_hash}",
-                run_dir=run_paths.run_dir,
-            )
-
-        execution_path = _exec_plan_path(original_plan_path, exec_ctx)
-        primary_path = _primary_plan_path(original_plan_path, exec_ctx)
-        pending = _reconcile_repartition_plan_copies(
-            pending,
-            candidate_bytes=candidate_bytes,
-            execution_path=execution_path,
-            primary_path=primary_path,
-            persist=_persist_repartition,
+        active_plan_path, current_step_name = repartition_application_coordinator.run(
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+            current_step_name=current_step_name,
+            baseline_team_name=baseline_team_name,
         )
-
-        try:
-            candidate_snapshot = load_plan_tolerant(
-                execution_path
-            ).parsed_plan.snapshot
-        except (OSError, PlanParseError, ValueError) as exc:
-            raise WorkflowError(
-                f"applied repartition candidate cannot be parsed: {exc}",
-                run_dir=run_paths.run_dir,
-            ) from exc
-        scope = state.active_implementation_scope
-        if scope is None or scope.scope_id != pending.scope_id:
-            raise WorkflowError(
-                "cannot apply repartition transaction without its active parent scope",
-                run_dir=run_paths.run_dir,
-            )
-        target_step = wf.steps.get(pending.resolved_target_step)
-        if target_step is None or target_step.role != pending.resolved_target_role:
-            raise WorkflowError(
-                "repartition target no longer resolves to the persisted workflow role",
-                run_dir=run_paths.run_dir,
-            )
-
-        # The split supersedes only one-hop state and overlay selection. Attempts,
-        # rejections, dirty code, and the immutable parent envelope remain.
-        state.pending_manager_notes = None
-        state.pending_step_team_override = None
-        state.active_implementation_scope = replace(
-            scope,
-            awaiting_review=target_step.role == "reviewer",
-            current_partition_generation_id=pending.generation_id,
-            current_partition_candidate_sha256=pending.candidate_plan_sha256,
-            current_partition_id=pending.partition_ids[0],
-        )
-        state.last_snapshot = candidate_snapshot
-        active_plan_path = original_plan_path
-        current_step_name = pending.resolved_target_step
-        state.pending_retry = None
-
-        target_team: str | None = None
-        if target_step.role == "worker":
-            attempts = state.implementation_attempts.get(scope.scope_id, [])
-            target_team = attempts[-1].team if attempts else baseline_team_name
-        selector, _resolved = _resolve_step_runtime(
-            target_step,
-            workflow_config,
-            team_name=target_team or baseline_team_name,
-            step_path=(
-                f"workflow.{workflow_name}.steps.{pending.resolved_target_step}"
-            ),
-        )
-        target_identity = _target_plan_identity(
-            original_plan_path, candidate_snapshot,
-        )
-        state.pending_boundary_decision = PendingBoundaryDecision(
-            finalized_turn_number=(
-                state.pending_boundary_decision.finalized_turn_number
-                if state.pending_boundary_decision is not None
-                else state.active_turn
-            ),
-            decision_number=pending.decision_number,
-            action="repartition_current_checkpoint",
-            proposed_action="transition",
-            proposed_transition=None,
-            resolved_next_step=pending.resolved_target_step,
-            target_role=target_step.role,
-            target_team=target_team,
-            target_selector=selector,
-            checkpoint_identity=target_identity,
-            post_transition_active_plan_path=str(original_plan_path),
-            post_transition_checkpoint_identity=target_identity,
-            scope_id=scope.scope_id,
-            target_plan_identity=target_identity,
-            repartition_generation_id=pending.generation_id,
-            repartition_candidate_sha256=pending.candidate_plan_sha256,
-            repartition_partition_id=pending.partition_ids[0],
-        )
-        if target_step.role == "worker" and target_team is not None:
-            state.pending_step_team_override = PendingTeamOverride(
-                target_step=pending.resolved_target_step,
-                role=target_step.role,
-                source_team=target_team,
-                target_team=target_team,
-                selector=selector,
-                checkpoint_identity=target_identity,
-                decision_number=pending.decision_number,
-                scope_id=scope.scope_id,
-                target_plan_identity=target_identity,
-                repartition_generation_id=pending.generation_id,
-                repartition_candidate_sha256=pending.candidate_plan_sha256,
-                repartition_partition_id=pending.partition_ids[0],
-            )
-        required_artifact_paths = (
-            scope.envelope_artifact_path,
-            pending.proposal_artifact_path,
-            pending.candidate_artifact_path,
-            pending.mechanical_validation_artifact_path,
-            pending.semantic_verdict_artifact_path,
-        )
-        if not all(
-            isinstance(path, str) and path for path in required_artifact_paths
-        ) or not isinstance(scope.envelope_artifact_sha256, str):
-            raise WorkflowError(
-                "cannot publish applied repartition evidence with incomplete "
-                "artifact references",
-                run_dir=run_paths.run_dir,
-            )
-        record = CheckpointRepartitionRecord(
-            schema_version=1,
-            decision_number=pending.decision_number,
-            scope_id=pending.scope_id,
-            generation_id=pending.generation_id,
-            envelope_sha256=pending.envelope_sha256,
-            envelope_artifact_sha256=str(scope.envelope_artifact_sha256),
-            source_plan_sha256=pending.source_plan_sha256,
-            proposal_sha256=pending.proposal_sha256,
-            candidate_plan_sha256=pending.candidate_plan_sha256,
-            partition_ids=pending.partition_ids,
-            child_summaries=pending.child_summaries,
-            current_disposition=pending.current_disposition or "",
-            resolved_target_step=pending.resolved_target_step,
-            resolved_target_role=pending.resolved_target_role,
-            current_partition_id=pending.partition_ids[0],
-            scope_pressure_reason=state.scope_pressure_reason,
-            envelope_artifact_path=str(scope.envelope_artifact_path),
-            proposal_artifact_path=str(pending.proposal_artifact_path),
-            candidate_artifact_path=str(pending.candidate_artifact_path),
-            mechanical_validation_artifact_path=str(
-                pending.mechanical_validation_artifact_path
-            ),
-            semantic_verdict_artifact_path=str(
-                pending.semantic_verdict_artifact_path
-            ),
-        )
-        is_new_record = not any(
-            item.generation_id == record.generation_id
-            for item in state.repartition_history
-        )
-        if is_new_record:
-            state.repartition_history.append(record)
-        pending = replace(pending, stage="applied")
-        _persist_repartition(pending)
-        if is_new_record:
-            _emit_event(observer, CheckpointRepartitionedEvent.create(
-                decision_number=record.decision_number,
-                scope_id=record.scope_id,
-                generation_id=record.generation_id,
-                envelope_sha256=record.envelope_sha256,
-                envelope_artifact_sha256=record.envelope_artifact_sha256,
-                source_plan_sha256=record.source_plan_sha256,
-                proposal_sha256=record.proposal_sha256,
-                candidate_plan_sha256=record.candidate_plan_sha256,
-                partition_ids=record.partition_ids,
-                child_summaries=record.child_summaries,
-                current_disposition=record.current_disposition,
-                resolved_target_step=record.resolved_target_step,
-                resolved_target_role=record.resolved_target_role,
-                current_partition_id=record.current_partition_id,
-                scope_pressure_reason=record.scope_pressure_reason,
-                artifact_paths={
-                    "envelope": record.envelope_artifact_path,
-                    "proposal": record.proposal_artifact_path,
-                    "candidate": record.candidate_artifact_path,
-                    "mechanical_validation": (
-                        record.mechanical_validation_artifact_path
-                    ),
-                    "semantic_verdict": record.semantic_verdict_artifact_path,
-                },
-            ))
 
     def _build_repartition_invocation(
         *,
