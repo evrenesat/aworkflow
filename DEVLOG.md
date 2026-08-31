@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-01 — Audit public documentation scope and accuracy
+
+- Removed the host-specific p100 deployment from public README navigation and
+  remote-app setup guidance while retaining it as an explicitly scoped operator
+  runbook beside the environment-specific scripts.
+- Corrected command and harness inventories, lifecycle-neutral resume behavior,
+  automatic startup metadata refresh, current profile examples, subprocess
+  stdin behavior, library exports, architecture layout, package metadata, and
+  remote-app configuration and authentication boundaries.
+- Reframed daemon and deployment documentation around portable product
+  boundaries instead of one host's paths, address, and operating procedure;
+  removed private deployment assumptions from the bundled guard guidance.
+
 ## 2026-08-31 — Enforce production static hygiene (PR-16)
 
 - Base SHA: `ab56e821`; the measured baseline was `38 F401 / 0 F811 / 6 F821

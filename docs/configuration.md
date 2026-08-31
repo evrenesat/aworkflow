@@ -70,13 +70,17 @@ senior_architect = "codex.sol-high"
 manager_lite = "codex.luna-max"
 manager_full = "codex.sol-high"
 
-[teams.codex1]
-backup_team = "7teen"
+[teams.standard]
+backup_team = "fallback"
+upgrade_to = "high"
 
-[teams.codex1.roles]
+[teams.standard.roles]
 worker = "codex.sol-med"
 
-[teams.7teen.roles]
+[teams.high.roles]
+worker = "codex.sol-high"
+
+[teams.fallback.roles]
 worker = "codex.luna-max"
 
 [error_handling.harness_error_recovery]
@@ -110,7 +114,7 @@ go = [
 
 [workflow.ralph_jr]
 extends = "ralph"
-team = "7teen"
+team = "high"
 setup = ["branch"]
 teardown = ["merge"]
 merge_prompt = ["simple_merge"]
@@ -133,8 +137,8 @@ selector interface:
 [roles.prompts]
 reviewer = "Use the material-code-review skill during code review."
 
-[teams.codex1.prompts]
-reviewer = "Replacement reviewer guidance for codex1."
+[teams.standard.prompts]
+reviewer = "Replacement reviewer guidance for the standard team."
 ```
 
 For an ordinary workflow step, the active team's prompt for the step role
@@ -161,8 +165,8 @@ Add the following roles and section to opt in safely:
 ```toml
 [roles]
 # Existing roles remain here.
-manager_lite = "codex.nano"
-manager_full = "codex.high"
+manager_lite = "codex.luna-max"
+manager_full = "codex.sol-high"
 
 [manager]
 enabled = true
@@ -220,24 +224,18 @@ Use `upgrade_to` only for a manager-selected quality escalation, not for
 operational recovery:
 
 ```toml
-[teams.codex1]
+[teams.standard]
 backup_team = "fallback"
-upgrade_to = "codexmax"
+upgrade_to = "high"
 
-[teams.codex1.roles]
-worker = "codex.nano"
+[teams.standard.roles]
+worker = "codex.sol-med"
 
-[teams.codexmax]
-upgrade_to = "codexultra"
-
-[teams.codexmax.roles]
-worker = "codex.mini"
-
-[teams.codexultra.roles]
-worker = "codex.high"
+[teams.high.roles]
+worker = "codex.sol-high"
 
 [teams.fallback.roles]
-worker = "codex.nano"
+worker = "codex.luna-max"
 ```
 
 For `upgrade_next_implementation`, the controller follows one `upgrade_to`
@@ -252,10 +250,9 @@ resolved from the actual upgraded worker that was just reviewed. Approval closes
 that scope; the next checkpoint starts from baseline routing while prior attempt
 history remains available for analysis.
 
-In this example, successive manager decisions can route one rejected checkpoint
-through `codex1 → codexmax → codexultra`. They cannot skip directly from
-`codex1` to `codexultra`, and `fallback` remains an independent operational
-recovery route.
+In this example, a manager decision can route one rejected checkpoint from
+`standard` to `high`. Because `high` has no further `upgrade_to` edge, it cannot
+escalate again; `fallback` remains an independent operational recovery route.
 
 `backup_team` remains the immediate operational fallback for a failed harness
 retry. It is selected by recovery rules or the manager's

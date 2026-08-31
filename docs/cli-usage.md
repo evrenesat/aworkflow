@@ -12,7 +12,7 @@ aflow run --resume
 aflow run --resume 20260407T120000Z-abc123
 aflow run --start-step implement_plan path/to/plan.md
 aflow run -ss 2 path/to/plan.md
-aflow run --team 7teen path/to/plan.md
+aflow run --team TEAM_NAME path/to/plan.md
 aflow run -mt 10 path/to/plan.md
 aflow run path/to/plan.md -- keep edits small and update docs if behavior changes
 ```
@@ -25,7 +25,7 @@ aflow run -p path/to/plan.md -w workflow_name
 aflow run --resume -p path/to/plan.md -w workflow_name
 aflow run --resume 20260407T120000Z-abc123 -p path/to/plan.md -w workflow_name
 aflow run --plan path/to/plan.md --workflow workflow_name --start-step implement_plan
-aflow run -p path/to/plan.md -w workflow_name -ss 2 -t 7teen -mt 10
+aflow run -p path/to/plan.md -w workflow_name -ss 2 -t TEAM_NAME -mt 10
 ```
 
 Mixed forms:
@@ -43,12 +43,16 @@ Important flags:
 - `--workflow` / `-w` specifies the workflow name.
 - `--team` / `-t` selects a team and overrides any team set in the workflow config.
 - `--max-turns` / `-mt` overrides `[aflow].max_turns` for that invocation.
+- `--run-id RUN_ID` supplies a canonical identity already reserved by a
+  control-plane caller. Normal interactive CLI runs should let AFlow allocate
+  the run id.
 - `--resume [RUN_ID]` forces resume mode.
 - A plan is optional in resume mode. When omitted, the selected run's saved
   original plan and invocation identity are reused; repeated values must match
   that durable identity.
 - `--resume-reset-scope` requires an explicit `--resume RUN_ID` and starts the
-  reused worktree from a fresh checkpoint scope on the invocation's plan.
+  reused lifecycle context from a fresh checkpoint scope on the invocation's
+  plan.
 - `--start-step` / `-ss` starts from a workflow step name or 1-based step index.
 
 When two bare positional arguments are given, `aflow` resolves them by checking which token is an existing plan file and which token is a configured workflow name. If both tokens could match both categories, or neither can be resolved safely, the command exits with a clear ambiguity error. A single bare positional is always treated as the plan path for backward compatibility.
@@ -62,10 +66,14 @@ If you omit `--start-step` and the plan is partly complete, `aflow` prompts you 
 Interactive-only startup prompts include:
 
 - selecting a start step for partly complete plans
-- refreshing stale `Pre-Handoff Base HEAD` metadata on pristine handoffs
 - recovering from an `inconsistent_checkpoint_state` parse error
 - confirming dirty-worktree startup when required
-- accepting implicit auto-resume for a previous worktree run
+- accepting implicit auto-resume for a compatible previous run
+
+For a pristine fresh review plan, an empty or stale `Pre-Handoff Base HEAD` is
+refreshed automatically to the verified current commit; it is not an
+interactive question. Started, resumed, malformed, or ambiguous plans are not
+silently refreshed.
 
 When one of those prompts is needed and stdin/stdout are not TTYs, `aflow` exits with a clear error instead of guessing.
 
@@ -73,7 +81,7 @@ If you pass `--start-step` on a plan that is already complete, `aflow` exits wit
 
 ## Resume
 
-Worktree workflows have two resume paths:
+Eligible prior runs have two resume paths in every supported lifecycle mode:
 
 - Plain `aflow run` can offer an interactive auto-resume prompt when a compatible prior run is found.
 - `aflow run --resume [RUN_ID]` makes resume mandatory. With no `RUN_ID`, `aflow` must resolve a previous run from shell-local state or fail. With a `RUN_ID`, it resumes that exact run or fails.
@@ -103,26 +111,37 @@ Lookup order for a previous run is:
 
 A prior run is resumable only when all of these are true:
 
-- the run used a worktree lifecycle and recorded a feature branch plus worktree path
-- saved status is `failed` or `running`
-- `last_snapshot.is_complete` is not `true`
-- the run did not already enter merge teardown
+- its lifecycle identity is complete: no Git identity for no-lifecycle,
+  main/feature branches for branch-only, or main/feature branches plus a
+  registered path for linked-worktree runs
+- saved status is `failed`, `running`, or `waiting_for_valid_override`
+- normally, `last_snapshot.is_complete` is not `true` and the run has not
+  entered merge teardown
 - the invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup
 
-If resume is accepted, `aflow` reuses the recorded feature branch and worktree path. The plan file on disk remains the source of truth for checkpoint progress.
+The sole completed-plan exception is a failed terminal integration. It must
+record a complete snapshot, `end_reason = "transition_end"`, failed merge
+status and reason, and configured merge teardown. That resume retries only the
+merge/teardown phase and launches no ordinary workflow harness.
+
+If resume is accepted, `aflow` reuses the recorded lifecycle context: the
+primary checkout for no-lifecycle runs, the checked-out feature branch for
+branch-only runs, or the registered worktree and feature branch for
+linked-worktree runs. The plan file on disk remains the source of truth for
+checkpoint progress.
 If the source run has a durable `starting` turn, resume retries that unfinished
 workflow step rather than returning to the invocation's original
 `--start-step`.
 
 After an owner intentionally repartitions or replaces the active checkpoint,
 use `--resume RUN_ID --resume-reset-scope`. This keeps the source run's
-worktree, branch, lifecycle commands, and manager decision history, while the
-source run retains its historical implementation-attempt audit. The new run
-returns to the invocation's original plan and clears its live attempt index,
-interrupted-step pointer, active implementation scope, scoped stall/rejection
-counters, pending notes/upgrades/boundary decisions, and stale manager-report
-pointer. The explicit run id prevents an accidental reset of an implicitly
-selected run.
+lifecycle context, including its feature branch and worktree when present, plus
+its manager decision history. The source run retains its historical
+implementation-attempt audit. The new run returns to the invocation's original
+plan and clears its live attempt index, interrupted-step pointer, active
+implementation scope, scoped stall/rejection counters, pending
+notes/upgrades/boundary decisions, and stale manager-report pointer. The
+explicit run id prevents an accidental reset of an implicitly selected run.
 
 ## Analyze
 

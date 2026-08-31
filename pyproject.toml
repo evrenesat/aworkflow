@@ -5,13 +5,18 @@ build-backend = "hatchling.build"
 [project]
 name = "aworkflow"
 version = "0.1.12"
-description = "Self-contained plan checkpoint controller for claude, codex, copilot, gemini, kiro, opencode, and pi"
+description = "Plan checkpoint controller for Claude, Codex, Copilot, Gemini, Kiro, OpenCode, Pi, and Reasonix"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "rich>=13.0.0",
     "fastmcp>=3.2.0,<4.0.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/evrenesat/aworkflow"
+Documentation = "https://github.com/evrenesat/aworkflow#readme"
+Issues = "https://github.com/evrenesat/aworkflow/issues"
 
 [dependency-groups]
 dev = [

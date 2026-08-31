@@ -406,7 +406,7 @@ def test_mcp_client_template_is_secret_free_and_requires_write_approval() -> Non
     config = tomllib.loads(raw)
     server = config["mcp_servers"]["aflow_control_plane"]
     assert server == {
-        "url": "http://100.103.69.9:8765/mcp",
+        "url": "http://127.0.0.1:8765/mcp",
         "required": False,
         "bearer_token_env_var": "AFLOW_CONTROL_PLANE_TOKEN",
         "default_tools_approval_mode": "writes",

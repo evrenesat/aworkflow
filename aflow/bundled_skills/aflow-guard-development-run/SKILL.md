@@ -182,8 +182,10 @@ Perform one evidence audit without changing the project:
 Deployment must have been explicitly requested for this guarded run.
 
 1. Require a passing terminal audit.
-2. Resolve an existing playbook and inventory beneath
-   `evreniops/infra/ansible`. Fail closed when mapping is ambiguous.
+2. Resolve an existing project-owned deployment playbook and inventory from
+   the guarded repository's documentation or the user's explicit handoff. Do
+   not assume a private repository or filesystem path; fail closed when the
+   mapping is absent or ambiguous.
 3. Do not edit the playbook, inventory, variables, application, or credentials.
 4. Run the repository's existing syntax check, execute the playbook once, and
    run only its predefined bounded smoke check.

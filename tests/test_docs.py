@@ -83,6 +83,7 @@ class SkillDocsTests(unittest.TestCase):
         skill_root = repo_root / 'aflow' / 'bundled_skills' / 'aflow-guard-development-run'
         skill_text = (skill_root / 'SKILL.md').read_text(encoding='utf-8')
         remote_text = (skill_root / 'references' / 'remote-observation.md').read_text(encoding='utf-8')
+        remote_normalized = ' '.join(remote_text.split())
 
         assert 'legacy' in skill_text
         assert 'local-daemon' in skill_text
@@ -92,7 +93,9 @@ class SkillDocsTests(unittest.TestCase):
         assert 'aflow-run-<run-id>.service' in skill_text
         assert 'needs_attention' in skill_text
         assert 'no REST API, web UI, or systemd ownership' in remote_text
-        assert 'http://100.103.69.9:8765/mcp' in remote_text
+        assert '/mcp' in remote_text
+        assert 'no host, scheme, or port is a product default' in remote_normalized
+        assert '100.103.69.9' not in remote_text
 
         read_tools = (
             'get_capabilities', 'list_projects', 'get_project_capabilities',

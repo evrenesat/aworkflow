@@ -64,20 +64,13 @@ Common variables:
 - `AFLOW_PLANNING_PROVIDERS` - optional JSON provider configuration; Codex is the default provider when no explicit list is configured.
 - `AFLOW_PLANNING_DEFAULT_PROVIDER` - optional default provider id for new planning sessions.
 - `AFLOW_PLANNING_ATTACHMENT_ROOT` - shared attachment storage outside project repositories.
-- `AFLOW_CODEX_APP_SERVER_URL` - legacy compatibility alias for the Codex provider endpoint.
+- `AFLOW_PLANNING_CODEX_URL` and `AFLOW_PLANNING_CODEX_TOKEN` - preferred
+  Codex provider endpoint overrides.
+- `AFLOW_CONTROL_PLANE_PROJECTS` - optional JSON override for the static
+  project allowlist.
 - `AFLOW_TRANSCRIPTION_URL` and `AFLOW_TRANSCRIPTION_TOKEN` - optional transcription endpoint.
 
 See [Remote App Configuration](../../docs/remote-app.md#configuration) for the full table and behavioral notes.
-
-### p100 control-plane deployment
-
-The supported p100 deployment is release-pinned and Tailscale-only. It builds
-the web bundle and server into `/opt/aflowd/releases/<commit>`, runs the app
-server as `aflowd.service`, and leaves daemon-owned workflow units independent
-of daemon restarts. Follow [the deployment guide](../../deploy/aflowd/README.md)
-for dry-run, token rotation, rollback, emergency containment, and the
-approval-gated Mac MCP configuration example. Do not run the installer against
-an unreviewed checkout or put a bearer token in a URL.
 
 ### Control-plane allowlist
 

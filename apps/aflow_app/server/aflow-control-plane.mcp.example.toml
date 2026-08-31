@@ -1,8 +1,8 @@
-# Copy these entries into ~/.codex/config.toml on the Mac client. Set
+# Copy these entries into the Codex client's config.toml. Set
 # AFLOW_CONTROL_PLANE_TOKEN through the operating system's secret storage or
 # another non-repository environment source before starting Codex.
 [mcp_servers.aflow_control_plane]
-url = "http://100.103.69.9:8765/mcp"
+url = "http://127.0.0.1:8765/mcp"
 required = false
 bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"
 default_tools_approval_mode = "writes"

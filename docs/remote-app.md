@@ -26,7 +26,9 @@ apps/aflow_app/
 │   │   ├── config.py          # server configuration
 │   │   ├── project_catalog.py # project discovery and planning-session association
 │   │   ├── project_overrides.py # persistent names, moved paths, aliases
-│   │   ├── aflow_service.py   # aflow library integration
+│   │   ├── aflow_service.py   # read-only legacy run summaries
+│   │   ├── control_plane_service.py # daemon-backed lifecycle operations
+│   │   ├── mcp_adapter.py     # shared MCP registry mounted in FastAPI
 │   │   ├── planning_routes.py # provider-neutral planning and plan-draft routes
 │   │   ├── planning/          # service, provider registry, models, attachments
 │   │   │   └── providers/
@@ -42,7 +44,6 @@ apps/aflow_app/
     │   ├── types.ts
     │   ├── App.tsx
     │   └── main.tsx
-    └── tests/
 ```
 
 ## Configuration
@@ -55,6 +56,7 @@ Configuration is loaded from environment variables and `~/.config/aflow/config.t
 | `AFLOW_APP_HOST` | `server.bind_host` | `127.0.0.1` | Bind host. |
 | `AFLOW_APP_PORT` | `server.bind_port` | `8765` | Bind port. |
 | `AFLOW_APP_TOKEN` | `server.auth_token` | - | Required auth token. |
+| `AFLOW_APP_TOKEN_FILE` | `server.auth_token_file` | - | Optional bearer-token file reread for every request. |
 | `AFLOW_APP_REGISTRY_PATH` | `server.repo_registry_path` | `<config_dir>/repos.json` | Legacy repo registry path used for migration. |
 | `AFLOW_APP_PROJECTS_HOME` | `project_catalog.projects_home` or `projects.projects_home` | `~/code` | Root scanned recursively for git repositories. |
 | `AFLOW_APP_PROJECT_OVERRIDES_PATH` | `project_catalog.project_overrides_path` or `projects.project_overrides_path` | `<config_dir>/project_overrides.json` | Persistent project metadata store. |
@@ -69,10 +71,12 @@ Configuration is loaded from environment variables and `~/.config/aflow/config.t
 | `AFLOW_PLANNING_ATTACHMENT_MAX_FILE_SIZE_BYTES` | `planning.attachment_max_file_size_bytes` | `26214400` | Maximum size of one attachment. |
 | `AFLOW_PLANNING_ATTACHMENT_MAX_COUNT_PER_TURN` | `planning.attachment_max_count_per_turn` | `10` | Maximum attachment references in one turn. |
 | `AFLOW_PLANNING_ATTACHMENT_MAX_TOTAL_SIZE_BYTES_PER_TURN` | `planning.attachment_max_total_size_bytes_per_turn` | `52428800` | Maximum total attachment bytes referenced by one turn. |
+| `AFLOW_CONTROL_PLANE_PROJECTS` | `control_plane.projects` | - | JSON project allowlist override. |
 | `AFLOW_CODEX_APP_SERVER_URL`, `AFLOW_CODEX_URL` | `codex_app_server.server_url`, `codex.url` | - | Legacy compatibility inputs for the default Codex entry. |
 | `AFLOW_CODEX_APP_SERVER_TOKEN`, `AFLOW_CODEX_TOKEN` | `codex_app_server.server_token`, `codex.token` | - | Legacy compatibility inputs for the default Codex entry. |
 | `AFLOW_TRANSCRIPTION_URL` | `transcription.server_url` | - | Optional transcription service URL. |
 | `AFLOW_TRANSCRIPTION_TOKEN` | `transcription.server_token` | - | Optional transcription service token. |
+| `AFLOW_APP_LOG_PLUGIN_PROBES` | - | disabled | Log one fingerprint for each unique local plugin probe while debugging. |
 
 Provider ids must be unique path-safe slugs, and the default must name an enabled provider. New planning environment values override new planning file values; provider-neutral configuration takes precedence over the legacy Codex compatibility reads. Attachment limits must be positive. Attachment storage is rejected if it overlaps an authorized project repository.
 
@@ -154,7 +158,10 @@ uv run --extra dev pytest -q
 
 ## Authentication
 
-All API endpoints except `/health` require the configured token.
+All functional API and MCP endpoints require the configured token. `/health`
+is unauthenticated process liveness, static frontend assets are public, and
+`POST /api/plugin/events` is an unauthenticated local-probe no-op that always
+returns `204`.
 
 Normal requests use:
 
@@ -166,9 +173,9 @@ The built web client keeps the entered token in memory for the page lifetime and
 sends it only in the `Authorization` header. Logout clears it; a page refresh
 requires re-entry.
 
-All routes, including SSE and MCP, use the same header-only bearer check.
-Credential-like query parameters are rejected before routing, so tokens must
-never appear in URLs, logs, browser history, or MCP arguments.
+All authenticated routes, including SSE and MCP, use the same header-only
+bearer check. Credential-like query parameters are rejected before routing, so
+tokens must never appear in URLs, logs, browser history, or MCP arguments.
 
 ## Projects
 
@@ -294,8 +301,8 @@ The stateless MCP endpoint is `/mcp`. It exposes the same bounded reads plus
 start, startup-answer, control, owner-stop, and resume tools. MCP write tools
 are configured for explicit client approval; credentials belong only in the
 client bearer-token environment variable, never in a tool argument or URL.
-Validate the Mac configuration with
-`python3 deploy/aflowd/validate-mcp-config.py ~/.codex/config.toml`.
+Keep the bearer in the client's environment or secret storage, use a private
+authenticated URL, and require explicit approval for every write tool.
 
 The MCP server ("AFlow Control Plane", version 1) exposes:
 
@@ -319,22 +326,18 @@ The MCP server ("AFlow Control Plane", version 1) exposes:
   `restart_required`, `operation_forbidden`, `operation_rejected`,
   `internal_error`.
 
-Client configuration example: `deploy/aflowd/aflow-control-plane.mcp.example.toml`
-(`[mcp_servers.aflow_control_plane]` with `url = "http://<host>:8765/mcp"`,
-`bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"`, and per-write-tool
-`approval_mode = "approve"`). The full surface is also documented in the
-`aflow-assistant` skill reference (`references/engine-features.md`, section 15).
+A client configuration uses `[mcp_servers.aflow_control_plane]` with a private
+`url`, `bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"`, and
+`approval_mode = "approve"` for each write tool. The full surface is also
+documented in the `aflow-assistant` skill reference
+(`references/engine-features.md`, section 15).
 
-The supported p100 release is the immutable installer described in
-[`deploy/aflowd/README.md`](../deploy/aflowd/README.md). It requires a reviewed
-commit, binds only `100.103.69.9:8765` on `tailscale0`, and keeps
-`/etc/aflowd/aflowd.env` mode 0600 outside the repository. It validates the
-release before switching `current` atomically and rolls back the previous
-target if readiness fails. Token rotation replaces that environment file and
-restarts only `aflowd`; existing workflow units are not restarted. For an
-incident, rollback changes only the `current` release and `aflowd`; emergency
-containment stops/disables only the daemon and preserves all releases, runs,
-plans, worktrees, and secrets.
+Deployment is intentionally not prescribed by this public app guide. A secure
+deployment must use an explicit project allowlist, a private bind address,
+header-only bearer authentication, release-pinned executables, and operator-
+tested readiness, rotation, rollback, and containment procedures. The
+repository's `deploy/aflowd/` directory is a host-specific Linux/systemd
+reference, not a portable installer.
 
 ## Audio Transcription
 
@@ -430,12 +433,13 @@ Local probe handling:
 
 ## Security Notes
 
-- The server requires a bearer token in the `Authorization` header for all API
-  operations except `/health`; query credentials and credential-like MCP
-  arguments are rejected.
+- The server requires a bearer token in the `Authorization` header for every
+  functional API and MCP operation. `/health`, static assets, and the inert
+  `/api/plugin/events` probe are the only unauthenticated routes; query
+  credentials and credential-like MCP arguments are rejected.
 - Do not expose the server to the internet without additional security controls.
 - Browser bearer material is never placed in persistent browser storage. It
   remains in memory for the page lifetime; logout clears it and refresh requires
   re-entry.
-- Bind to `127.0.0.1` unless you intentionally need LAN access. The supported
-  p100 daemon binds only the Tailscale address, not loopback or `eth0`.
+- Bind to `127.0.0.1` unless you intentionally need private-network access and
+  have matching network and authentication controls.

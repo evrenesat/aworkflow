@@ -10,15 +10,20 @@ Install the published package with `uv`:
 uv tool install aworkflow
 ```
 
-That exposes both commands:
+That exposes two equivalent workflow commands:
 
 - `aflow`
 - `aworkflow`
 
-From a local checkout, run without installing:
+It also installs `aflowd`, the optional durable control-plane entry point used
+by systemd-backed remote deployments. Most users should start with `aflow`.
+
+From a local checkout, install the checkout as the editable tool used for
+normal operation:
 
 ```bash
-uv run python -m aflow run path/to/plan.md
+uv tool install -e . --force
+aflow --help
 ```
 
 ## First Run

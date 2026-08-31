@@ -606,7 +606,8 @@ class WorkflowConfigTests(unittest.TestCase):
         assert '# Default workflow used when the CLI does not name one.' in aflow_text
         assert '# Harness profiles map a harness name to the model and effort values it should run.' in aflow_text
         assert '# Team-specific role overrides live under [teams.<name>.roles]. Missing roles fall back' in aflow_text
-        assert "backup_team = '7teen'" in aflow_text
+        assert "backup_team = 'fallback'" in aflow_text
+        assert "upgrade_to = 'high'" in aflow_text
         assert '# [error_handling.harness_error_recovery]' in aflow_text
         assert 'retry_same_team_after_delay' in aflow_text
         assert '# Named prompt templates that workflow steps reference by key.' in aflow_text

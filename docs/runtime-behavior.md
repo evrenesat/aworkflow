@@ -160,7 +160,7 @@ The complete supported grammar is:
 next_step = "implement_plan"
 team = "strong"
 max_turns = 20
-roles = { worker = "codex.high" }
+roles = { worker = "codex.sol-high" }
 notes = ["Re-run the focused regression before broader tests."]
 ```
 
@@ -335,12 +335,12 @@ SIGTERM drain each child process group with SIGTERM followed by bounded SIGKILL
 escalation. A malformed pidfile or reused PID is ambiguous and never
 authorizes a signal.
 
-The production p100 control plane is a separate, allowlisted deployment over
+The optional remote control plane is a separate, allowlisted deployment over
 the same durable AFlow run state. `aflowd.service` uses systemd workflow units,
 serves authenticated REST, React, and FastAPI `/mcp`, and survives client
-disconnects. The lightweight daemon does not serve those surfaces or replace
-that deployment. FastAPI bearer authorization remains header-only and
-server-owned even though both MCP transports share the core registry.
+disconnects. The lightweight daemon does not serve those surfaces. FastAPI
+bearer authorization remains header-only and server-owned even though both MCP
+transports share the core registry.
 
 A normal `aflow run ...` invocation remains the direct local/developer
 interface and keeps its existing lifecycle, plan, and resume behavior. Do not
@@ -356,9 +356,9 @@ resume creates a new linked continuation. An owner stop is terminal.
 `aflow-guard-development-run` remains opt-in supervision for the exact run a
 user explicitly asks it to guard, particularly normal direct-CLI and legacy
 workflows. It is not a second daemon controller, a release-health monitor, or
-an automatic recovery loop for daemon-owned units. The p100 deployment service
-and its rollback procedure own service availability; the daemon owns its
-allowlisted workflow reconciliation.
+an automatic recovery loop for daemon-owned units. The deployed service and its
+operator-defined rollback procedure own service availability; the daemon owns
+its allowlisted workflow reconciliation.
 
 ## Loop Limits
 
@@ -600,11 +600,13 @@ one complete borderless dashboard snapshot to normal scrollback before any
 manager or terminal report; non-interactive fallback does not print a
 duplicate snapshot.
 
-Harness execution does not compete with dashboard input. All configured
+Harness execution does not compete with dashboard input. Most configured
 adapters deliver their effective prompt through argv or a prompt flag, and the
-real subprocess path starts each child with `stdin=subprocess.DEVNULL`. Child
-stdout/stderr remain captured and drained as before; injected runner callables
-and adapter invocation construction are unchanged.
+real subprocess path closes those children's stdin with
+`stdin=subprocess.DEVNULL`. An adapter that supplies explicit `stdin_text`,
+currently Codex, receives it through `stdin=subprocess.PIPE`. Child
+stdout/stderr remain captured and drained; injected runner callables receive
+the same explicit input.
 
 Fields include:
 
@@ -686,10 +688,11 @@ advanced, the saved checkpoint or checklist-style repair overlay is complete,
 and the scope is no longer awaiting review. The stale scope and one-hop routing
 state are cleared before the next worker invocation.
 For a manual owner-directed scope reset, CLI
-`--resume RUN_ID --resume-reset-scope` preserves the reused worktree and
-historical manager/attempt audit trail while explicitly discarding the saved
-repair overlay, interrupted step, active implementation scope, scoped counters,
-live attempt index, pending one-hop actions, and prior terminal report pointer.
+`--resume RUN_ID --resume-reset-scope` preserves the reused lifecycle context
+(including the feature branch and worktree when present) and historical
+manager/attempt audit trail while explicitly discarding the saved repair
+overlay, interrupted step, active implementation scope, scoped counters, live
+attempt index, pending one-hop actions, and prior terminal report pointer.
 The source run remains the immutable attempt audit record. The next worker
 therefore opens a new scope from the invocation's original plan and baseline
 team. This manual compatibility path is distinct from the automatic
@@ -727,3 +730,8 @@ Machine-readable `end_reason` values:
 complete. An incomplete `END` fails without an `end_reason`; lifecycle branch,
 worktree, plan, and run state remain available for explicit resume, and merge
 teardown is not entered.
+
+A failed terminal merge is the sole complete-plan resume case. The durable run
+must record `transition_end`, a complete snapshot, failed merge metadata with a
+reason, and configured merge teardown. Its successor retries only terminal
+integration; it does not launch another checkpoint or workflow harness.
