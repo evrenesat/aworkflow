@@ -31,7 +31,9 @@ The service is intentionally bound to 100.103.69.9:8765; it does not bind
 loopback or eth0. SSH remains the installation and emergency transport. The
 service hardening leaves only the explicit project and /var/lib/aflowd
 writable, while retaining the systemd access necessary to create independent
-workflow units.
+workflow units. Each workflow unit receives the release-pinned PATH and the
+service user's HOME explicitly. This lets harnesses and Git use the approved
+per-user configuration while keeping the unit environment bounded.
 
 ## Operation, rollback, and rotation
 Rollback moves both current and aflowd.service ExecStart to the selected
