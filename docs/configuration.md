@@ -38,31 +38,46 @@ branch_prefix = "aflow-{PLAN_NAME}"
 worktree_prefix = "aflow-{PLAN_NAME}"
 worktree_root = "~/code/worktrees"
 
-[harness.codex.profiles.high]
-model = "gpt-5.4"
+[harness.codex.profiles.sol-high]
+model = "gpt-5.6-sol"
 effort = "high"
 
-[harness.codex.profiles.mini]
-model = "gpt-5.4-mini"
+[harness.codex.profiles.sol-med]
+model = "gpt-5.6-sol"
+effort = "medium"
 
-[harness.codex.profiles.nano]
-model = "gpt-5.4-mini"
-effort = "none"
+[harness.codex.profiles.luna-max]
+model = "gpt-5.6-luna"
+effort = "max"
+
+[harness.reasonix.profiles.ds4-flash]
+model = "deepseek-flash"
+
+[harness.reasonix.profiles.ds4-pro]
+model = "deepseek-pro"
+
+[harness.opencode.profiles."glm-5.3"]
+model = "zai-coding-plan/glm-5.3"
+
+[harness.opencode.profiles."glm-5.3-flash"]
+model = "zai-coding-plan/glm-5.3-flash"
 
 [roles]
-architect = "codex.high"
-worker = "codex.high"
-reviewer = "codex.high"
-senior_architect = "codex.high"
+architect = "codex.sol-high"
+worker = "codex.sol-med"
+reviewer = "codex.sol-high"
+senior_architect = "codex.sol-high"
+manager_lite = "codex.luna-max"
+manager_full = "codex.sol-high"
 
 [teams.codex1]
 backup_team = "7teen"
 
 [teams.codex1.roles]
-worker = "codex.high"
+worker = "codex.sol-med"
 
 [teams.7teen.roles]
-worker = "codex.nano"
+worker = "codex.luna-max"
 
 [error_handling.harness_error_recovery]
 max_consecutive_recoveries = 3

@@ -1,3 +1,12 @@
+# 2026-08-31 — Supported harness profile refresh
+
+- Restricted the packaged AFlow configuration to the seven actively supported
+  DeepSeek, Codex, and Z.AI Coding Plan profiles.
+- Removed bundled Claude and superseded model profiles so a fresh install no
+  longer fails because an unused harness is absent.
+- Assigned the default workflow roles to the approved Codex profiles; the
+  DeepSeek and Z.AI profiles remain available for run-local hotplugging.
+
 # 2026-08-03 — Terminal manager action semantics
 
 - Clarified the authoritative manager protocol so `continue` accepts the
