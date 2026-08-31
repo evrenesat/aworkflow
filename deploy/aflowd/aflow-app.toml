@@ -20,4 +20,4 @@ config_path = "@PROJECT_CONFIG@"
 aflow_executable = "@RELEASE_DIR@/bin/aflow"
 environment_file = "@ENVIRONMENT_FILE@"
 release_identity = "@RELEASE_ID@"
-environment = { PATH = "@RELEASE_DIR@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+environment = { HOME = "/root", PATH = "@RELEASE_DIR@/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }

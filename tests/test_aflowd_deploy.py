@@ -157,6 +157,10 @@ def test_staged_install_uses_release_realpaths_and_atomic_current(tmp_path: Path
     rendered = (release / "config" / "config.toml").read_text()
     parsed = tomllib.loads(rendered)
     assert parsed["control_plane"]["projects"][0]["release_identity"] == commit
+    assert parsed["control_plane"]["projects"][0]["environment"] == {
+        "HOME": "/root",
+        "PATH": f"{release}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    }
     assert f'aflow_executable = "{release}/bin/aflow"' in rendered
     assert f'release_identity = "{commit}"' in rendered
     assert "/current/" not in rendered
