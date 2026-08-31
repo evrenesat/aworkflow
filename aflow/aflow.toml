@@ -29,71 +29,49 @@ worktree_root = "~/code/worktrees"
 #### HARNESS PROFILES ####
 
 # Harness profiles map a harness name to the model and effort values it should run.
-[harness.opencode.profiles.turbo]
-# The harness model identifier for this profile.
-model = "zai-coding-plan/glm-5-turbo"
+[harness.opencode.profiles."glm-5.3"]
+# Z.AI GLM Coding Plan model identifier.
+model = "zai-coding-plan/glm-5.3"
 
-[harness.opencode.profiles.glm47]
-# The harness model identifier for this profile.
-model = "zai-coding-plan/glm-4.7"
+[harness.opencode.profiles."glm-5.3-flash"]
+# Z.AI GLM Coding Plan model identifier.
+model = "zai-coding-plan/glm-5.3-flash"
 
-[harness.claude.profiles.opus]
+[harness.codex.profiles.sol-high]
 # The harness model identifier for this profile.
-model = "opus"
-# Optional effort setting passed through to harnesses that support it.
-effort = "medium"
-
-[harness.claude.profiles.sonnet]
-# The harness model identifier for this profile.
-model = "sonnet"
-
-[harness.claude.profiles.haiku]
-# The harness model identifier for this profile.
-model = "haiku"
-
-[harness.codex.profiles.high]
-# The harness model identifier for this profile.
-model = "gpt-5.4"
+model = "gpt-5.6-sol"
 # Optional effort setting passed through to harnesses that support it.
 effort = "high"
 
-[harness.codex.profiles.mini]
+[harness.codex.profiles.sol-med]
 # The harness model identifier for this profile.
-model = "gpt-5.4-mini"
-# Optional effort setting passed through to harnesses that support it.
+model = "gpt-5.6-sol"
+effort = "medium"
 
-[harness.codex.profiles.nano]
+[harness.codex.profiles.luna-max]
 # The harness model identifier for this profile.
-model = "gpt-5.4-mini"
-effort = "none"
+model = "gpt-5.6-luna"
+effort = "max"
 
-[harness.reasonix.profiles.flash]
-# The harness model identifier for this profile.
+[harness.reasonix.profiles.ds4-flash]
+# Reasonix provider name for DeepSeek V4 Flash.
 model = "deepseek-flash"
 
-[harness.reasonix.profiles.pro]
-# The harness model identifier for this profile.
+[harness.reasonix.profiles.ds4-pro]
+# Reasonix provider name for DeepSeek V4 Pro.
 model = "deepseek-pro"
-
-[harness.reasonix.profiles.flash-max]
-# The harness model identifier for this profile.
-model = "deepseek-flash-max"
-
-[harness.reasonix.profiles.pro-max]
-# The harness model identifier for this profile.
-model = "deepseek-pro-max"
 
 
 #### Roles & Teams ####
 
 # Global role-to-selector mappings. Team overrides can replace a subset of these.
 [roles]
-architect = 'claude.opus'
-senior_architect = 'codex.high'
-worker = 'claude.haiku'
-reviewer = 'claude.sonnet'
-manager_lite = 'codex.nano'
-manager_full = 'codex.high'
+architect = 'codex.sol-high'
+senior_architect = 'codex.sol-high'
+worker = 'codex.sol-med'
+reviewer = 'codex.sol-high'
+manager_lite = 'codex.luna-max'
+manager_full = 'codex.sol-high'
 
 [roles.prompts]
 reviewer = """

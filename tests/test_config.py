@@ -546,7 +546,22 @@ class WorkflowConfigTests(unittest.TestCase):
         assert config.aflow.max_turns == 15
         assert config.aflow.team_lead == 'senior_architect'
         assert config.manager.repartition_skill == 'aflow-repartition-checkpoint'
-        assert config.roles['architect'] == 'claude.opus'
+        assert config.roles == {
+            'architect': 'codex.sol-high',
+            'senior_architect': 'codex.sol-high',
+            'worker': 'codex.sol-med',
+            'reviewer': 'codex.sol-high',
+            'manager_lite': 'codex.luna-max',
+            'manager_full': 'codex.sol-high',
+        }
+        assert {
+            harness: set(settings.profiles)
+            for harness, settings in config.harnesses.items()
+        } == {
+            'opencode': {'glm-5.3', 'glm-5.3-flash'},
+            'codex': {'sol-high', 'sol-med', 'luna-max'},
+            'reasonix': {'ds4-flash', 'ds4-pro'},
+        }
         assert config.teams == {}
         assert config.workflows['ralph'].steps['implement_plan'].role == 'worker'
         assert config.workflows['ralph'].setup == ('worktree', 'branch')
