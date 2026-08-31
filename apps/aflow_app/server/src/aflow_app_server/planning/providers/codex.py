@@ -19,7 +19,6 @@ from codex_app_server_sdk import (
     CodexTimeoutError,
     CommandApprovalRequest,
     ConversationStep,
-    FileChangeApprovalRequest,
     ThreadConfig,
     TurnOverrides,
     UNSET,

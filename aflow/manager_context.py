@@ -518,7 +518,6 @@ def _plan_state(run_dir: Path, run_json: dict[str, Any], finished_turn: dict[str
         or run_json.get("plan_path")
     )
     active_path = _path_from_metadata(run_dir, active_value)
-    original_path = _path_from_metadata(run_dir, original_value)
     checkpoints: tuple[dict[str, Any], ...] = ()
     current: dict[str, Any] | None = None
     complete: bool | None = None

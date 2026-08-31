@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any
 
 from aflow.config import bootstrap_config, load_workflow_config
 from aflow.control_plane import (
@@ -37,7 +37,10 @@ from aflow.control_plane import (
     StartupQuestionRecord,
     validate_run_id,
 )
-from aflow.control_plane.units import SubprocessUnitManager
+import aflow.control_plane.units as _units
+
+# Preserve the legacy module-level dependency used by the CLI dispatcher.
+SubprocessUnitManager = _units.SubprocessUnitManager
 from aflow.api.models import StartupRequest
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
 

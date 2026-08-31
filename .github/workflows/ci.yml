@@ -42,6 +42,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Check production Python hygiene
+        run: uv run ruff check aflow apps/aflow_app/server/src
+
       - name: Run tests
         run: uv run pytest -q
 

@@ -159,7 +159,6 @@ def slice_checkpoint_source(
 
     Returns None when no matching checkpoint is found.
     """
-    plan_bytes = plan_text.encode("utf-8")
     lines = plan_text.splitlines(keepends=True)
 
     # Find all checkpoint headings (outside fences)
@@ -339,7 +338,6 @@ def extract_source_blocks(
     in_fence = False
     fence_char: str | None = None
     fence_len = 0
-    fence_start_idx: int | None = None
 
     i = 0
     while i < len(lines):
@@ -353,7 +351,6 @@ def extract_source_blocks(
                 in_fence = True
                 fence_char = marker[0]
                 fence_len = len(marker)
-                fence_start_idx = i
                 # Continue scanning until we close this fence
                 j = i + 1
                 while j < len(lines):
@@ -378,7 +375,6 @@ def extract_source_blocks(
                 in_fence = False
                 fence_char = None
                 fence_len = 0
-                fence_start_idx = None
                 continue
             # else: closing fence inside a fence — handled by the open-fence scan above
             i += 1

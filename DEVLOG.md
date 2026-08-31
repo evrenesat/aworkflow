@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-08-31 — Enforce production static hygiene (PR-16)
+
+- Base SHA: `ab56e821`; the measured baseline was `38 F401 / 0 F811 / 6 F821
+  / 10 F841`.
+- Preserved the intentional seven-model API re-exports with an explicit
+  `__all__` contract.
+- Added pinned Ruff `0.16.5` as a production-only CI gate.
+- Final verification: root `1,354 passed, 216 subtests passed`; app server
+  `186 passed`; web `34 passed`; compile, package build, lock, and clean-wheel
+  checks passed.
+
 ## 2026-08-31 — Stop shipping test support and pytest at runtime (PR-15)
 
 - Base SHA: `059b1fb5ad6654f18935b20db7538663361310ad`.

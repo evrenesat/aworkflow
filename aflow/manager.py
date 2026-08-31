@@ -497,12 +497,6 @@ def build_manager_prompts(
         eligible_actions.add("escalate_to_full")
     eligible_text = ", ".join(sorted(eligible_actions)) or "none"
     proposed_transition = controller.get("proposed_next_step")
-    reviewer_rejections = int(controller.get("reviewer_rejection_count", 0) or 0)
-    eligible_upgrade = (
-        controller.get("eligible_upgrade")
-        if isinstance(controller.get("eligible_upgrade"), Mapping)
-        else {}
-    )
     normal_shape = json.dumps({
         "schema_version": 1,
         "action": "continue",

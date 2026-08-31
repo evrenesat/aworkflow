@@ -6,6 +6,8 @@ import pytest
 
 from aflow.api import CapabilitySet, ContextBundle, RunControlRequest, StartRunResult
 from aflow.control_plane import build_context_bundle
+import aflow.api.models as models
+import aflow.control_plane as control_plane
 
 
 def test_public_control_plane_models_are_versioned_and_redact_secrets() -> None:
@@ -22,6 +24,22 @@ def test_public_control_plane_models_are_versioned_and_redact_secrets() -> None:
     assert result.to_dict()["run_id"] == "control-run-7"
     assert control.to_dict()["expected_revision"] == 2
     assert bundle.to_dict()["data"]["authorization"] == "[redacted]"
+
+
+def test_public_control_plane_models_are_explicitly_reexported() -> None:
+    shared_names = (
+        "CapabilitySet",
+        "ContextBundle",
+        "LaunchManifest",
+        "RunControlRequest",
+        "RunEvent",
+        "RunStatus",
+        "StartRunResult",
+    )
+
+    assert set(shared_names).issubset(models.__all__)
+    for name in shared_names:
+        assert getattr(models, name) is getattr(control_plane, name)
 
 
 def test_context_bundle_defaults_to_lite_and_requires_explicit_full_scope(tmp_path: Path) -> None:

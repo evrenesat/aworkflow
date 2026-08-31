@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 from dataclasses import replace
-from typing import Literal
 
-from aflow.config import WorkflowStepConfig
 from aflow.git_status import probe_worktree, classify_dirtiness_by_prefix
 from aflow.plan import PlanParseError, load_plan, load_plan_tolerant
 from aflow.run_state import RetryContext
@@ -24,7 +21,6 @@ from aflow.workflow import (
 
 from .models import (
     PreparedRun,
-    StartupContext,
     StartupQuestion,
     StartupQuestionKind,
     StartupRequest,

@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from aflow.api.events import ExecutionEvent, ExecutionObserver
+    from aflow.api.events import ExecutionObserver
     from aflow.api.models import PreparedRun
-    from aflow.run_state import ControllerRunResult, RetryContext, ResumeContext
+    from aflow.run_state import ControllerRunResult, ResumeContext
     from aflow.status import BannerRenderer
     from aflow.harnesses.session import SessionDriver
 from aflow.harnesses.preflight import HarnessPreflightProbe
 
-from aflow.config import WorkflowUserConfig
 from aflow.harnesses.base import HarnessAdapter
 from aflow.plan import ParsedPlan
 from aflow.run_state import ControllerConfig

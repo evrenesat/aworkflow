@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import subprocess
 import select
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -345,7 +344,6 @@ class ReasonixAcpDriver:
             raise ValueError("Reasonix ACP initialize capabilities must be an object")
         methods_raw = raw.get("methods", raw.get("supported_methods", ()))
         methods = frozenset(value for value in methods_raw if isinstance(value, str)) if isinstance(methods_raw, list) else frozenset()
-        nested_handshake = "agentCapabilities" in raw_payload
         session_identity = (
             "session/new" in methods or "session/open" in methods
             or bool(agent.get("loadSession")) if isinstance(agent, Mapping) else False

@@ -50,7 +50,7 @@ from aflow.control_plane.persistence import (
     _contained_directory,
     normalized_request_digest,
 )
-from aflow.control_plane.units import UnitManager
+from aflow.control_plane.units import UnitManager, UnitState
 
 
 _START_RECORD_SCHEMA_VERSION = 1

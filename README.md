@@ -168,8 +168,12 @@ normal operation:
 uv tool install -e . --force
 aflow run path/to/plan.md
 aflow daemon --help
+uv run ruff check aflow apps/aflow_app/server/src
 uv run pytest -q
 ```
+
+CI checks only production Python for unused imports, redefinitions, unresolved
+names, and unused locals.
 
 `uv run pytest -q` is the supported root test command on Linux and macOS. Linux
 runs the p100/systemd deployment module; macOS explicitly skips those 15

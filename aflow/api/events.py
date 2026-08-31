@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
     from aflow.plan import PlanSnapshot
-    from aflow.run_state import HarnessRecoveryContext, TurnRecord, WorkflowEndReason
+    from aflow.run_state import HarnessRecoveryContext, WorkflowEndReason
 
 
 class ExecutionEventType(str, Enum):

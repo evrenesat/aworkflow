@@ -31,11 +31,17 @@ from .config import (
     find_placeholders,
     load_workflow_config,
     validate_workflow_config,
+    WorkflowConfig,
     WorkflowStepConfig,
 )
-from .git_status import probe_worktree, classify_dirtiness_by_prefix
+from . import git_status as _git_status
+
+# Preserve the module-level seams used by existing CLI callers and tests while
+# keeping the production implementation in ``aflow.api.startup``.
+probe_worktree = _git_status.probe_worktree
+classify_dirtiness_by_prefix = _git_status.classify_dirtiness_by_prefix
 from .manager_context import scoped_reviewer_rejection_count
-from .plan import PlanParseError, PlanSnapshot, load_plan, load_plan_tolerant
+from .plan import PlanSnapshot
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
@@ -1248,8 +1254,6 @@ def _bootstrap_resume_invocation(
             "max_turns",
             "expected a positive integer",
         )
-    effective_max_turns = prev_run.get("effective_max_turns")
-
     extra_value = prev_run.get("extra_instructions")
     if not isinstance(extra_value, list) or not all(
         isinstance(item, str) for item in extra_value
@@ -2898,8 +2902,6 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = _resolve_repo_root()
     if repo_root is None:
         return 1
-    working_dir = Path.cwd()
-
     if config_path is None:
         config_path = bootstrap_config()
 

@@ -89,9 +89,10 @@ from .recovery import (
     recovery_made_progress,
     parse_team_lead_recovery_decision,
     resolve_backup_team,
+    TeamLeadRecoveryDecision,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
     build_handover_context_v1, render_handover_prompt, validate_handover_output,
@@ -8559,9 +8560,6 @@ def run_workflow(
         _apply_pending_repartition()
 
     live_control_digest: str | None = None
-    live_session_driver: SessionDriver | None = None
-    live_session_id: str | None = None
-
     def _poll_live_control() -> None:
         """Notice a changed run-owned override without interrupting the child."""
         nonlocal live_control_digest
@@ -8706,9 +8704,6 @@ def run_workflow(
         turn_session_request: SessionRequest | None = None
         owned_session_result = None
         cross_handover_prompt = ""
-        live_session_driver = None
-        live_session_id = None
-
         if retry_ctx is not None:
             state.status_message = (
                 f"running turn {turn_number}: step {current_step_name} "
@@ -8947,8 +8942,6 @@ def run_workflow(
                         raise RuntimeError(
                             "same-harness hotplug requires an exact active source session"
                         )
-                    live_session_driver = turn_session_driver
-                    live_session_id = turn_session_request.session_id
                     invocation = turn_session_driver.build_invocation(turn_session_request)
                 else:
                     invocation = step_adapter.build_invocation(
@@ -9268,8 +9261,6 @@ def run_workflow(
                         raise RuntimeError(
                             "same-harness hotplug requires an exact active source session"
                         )
-                    live_session_driver = turn_session_driver
-                    live_session_id = turn_session_request.session_id
                     invocation = turn_session_driver.build_invocation(turn_session_request)
                 else:
                     invocation = step_adapter.build_invocation(
