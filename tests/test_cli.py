@@ -3507,18 +3507,15 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('builtins.input', side_effect=AssertionError('unexpected input')), \
                          patch('sys.stderr', stderr_capture):
                         result = main(['run', '--start-step', 'implement_plan', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 1
             assert 'plan is already complete, --start-step has no effect' in stderr_capture.getvalue()
             assert not (repo_root / '.aflow').exists()
@@ -3561,11 +3558,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('sys.stdout.isatty', return_value=True), \
@@ -3574,7 +3569,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
@@ -3608,14 +3602,12 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stdout_capture = io.StringIO()
             stderr_capture = io.StringIO()
             stdout_capture.isatty = lambda: True  # type: ignore[attr-defined]
             stderr_capture.isatty = lambda: True  # type: ignore[attr-defined]
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('builtins.input', return_value=''), \
@@ -3624,7 +3616,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
 
             assert result == 0
             moved_path = repo_root / 'plans' / 'done' / 'plan.md'
@@ -3674,16 +3665,13 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             )
             original_cwd = Path.cwd()
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('builtins.input', side_effect=AssertionError('unexpected input')):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
@@ -3721,11 +3709,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('sys.stdout.isatty', return_value=True), \
@@ -3734,7 +3720,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
@@ -3768,11 +3753,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
                          patch('sys.stdout.isatty', return_value=True), \
@@ -3781,7 +3764,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 1
             assert 'startup aborted' in stderr_capture.getvalue().lower()
             assert not (repo_root / '.aflow').exists()
@@ -3813,11 +3795,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=False), \
                          patch('sys.stdout.isatty', return_value=False), \
@@ -3826,7 +3806,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 1
             stderr_output = stderr_capture.getvalue().lower()
             assert 're-run with --start-step' in stderr_output
@@ -3852,11 +3831,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=False), \
                          patch('sys.stdout.isatty', return_value=False), \
@@ -3865,7 +3842,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 1
             stderr_output = stderr_capture.getvalue().lower()
             assert 'interactive confirmation is required' in stderr_output
@@ -3913,12 +3889,10 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             import io
             import aflow.cli as cli_module
             import aflow.api.startup as startup_module
-            original_probe = cli_module.probe_worktree
             original_startup_probe = startup_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     startup_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=True), \
@@ -3928,7 +3902,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
                 startup_module.probe_worktree = original_startup_probe
             assert result == 0
             assert 'Pre-Handoff Base HEAD' in plan_path.read_text(encoding='utf-8')
@@ -3975,12 +3948,10 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             import io
             import aflow.cli as cli_module
             import aflow.api.startup as startup_module
-            original_probe = cli_module.probe_worktree
             original_startup_probe = startup_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     startup_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=False), \
@@ -3990,7 +3961,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
                 startup_module.probe_worktree = original_startup_probe
             assert result == 0
             assert f'`{current_head}`' in plan_path.read_text(encoding='utf-8')
@@ -4040,12 +4010,10 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             import io
             import aflow.cli as cli_module
             import aflow.api.startup as startup_module
-            original_probe = cli_module.probe_worktree
             original_startup_probe = startup_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     startup_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=False), \
@@ -4055,7 +4023,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
                 startup_module.probe_worktree = original_startup_probe
 
             assert result == 0
@@ -4093,11 +4060,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             original_cwd = Path.cwd()
             import io
             import aflow.cli as cli_module
-            original_probe = cli_module.probe_worktree
             stderr_capture = io.StringIO()
             try:
                 with patch.dict(os.environ, env, clear=True):
-                    cli_module.probe_worktree = lambda _: None
                     os.chdir(repo_root)
                     with patch('sys.stdin.isatty', return_value=False), \
                          patch('sys.stdout.isatty', return_value=False), \
@@ -4106,7 +4071,6 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                         result = main(['run', str(plan_path)])
             finally:
                 os.chdir(original_cwd)
-                cli_module.probe_worktree = original_probe
             assert result == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
@@ -5798,7 +5762,6 @@ class DirtyWorktreeCliTests(unittest.TestCase):
         import aflow.cli as cli_module
         from aflow.git_status import WorktreeProbe
         dirty_probe = WorktreeProbe(is_dirty=True, modified_count=2, added_count=1, removed_count=0, sample_paths=("a.py",))
-        original_probe = cli_module.probe_worktree
         original_resolve = cli_module._resolve_repo_root
         with tempfile.TemporaryDirectory() as tmpdir:
             home_dir = Path(tmpdir)
@@ -5808,14 +5771,13 @@ class DirtyWorktreeCliTests(unittest.TestCase):
             original_home = os.environ.get("HOME")
             try:
                 os.environ["HOME"] = str(home_dir)
-                cli_module.probe_worktree = lambda _: dirty_probe
                 cli_module._resolve_repo_root = lambda: home_dir
-                with patch("builtins.input", return_value="y"), \
+                with patch("aflow.api.startup.probe_worktree", return_value=dirty_probe), \
+                     patch("builtins.input", return_value="y"), \
                      patch("sys.stdin.isatty", return_value=True), \
                      patch("sys.stdout.isatty", return_value=True):
                     result = cli_module.main(["run", str(plan_path)])
             finally:
-                cli_module.probe_worktree = original_probe
                 cli_module._resolve_repo_root = original_resolve
                 if original_home is None:
                     os.environ.pop("HOME", None)

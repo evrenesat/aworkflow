@@ -37,10 +37,6 @@ from aflow.control_plane import (
     StartupQuestionRecord,
     validate_run_id,
 )
-import aflow.control_plane.units as _units
-
-# Preserve the legacy module-level dependency used by the CLI dispatcher.
-SubprocessUnitManager = _units.SubprocessUnitManager
 from aflow.api.models import StartupRequest
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
 
