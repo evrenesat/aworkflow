@@ -1,4 +1,4 @@
-from aflow._test_support import *  # noqa: F401,F403
+from tests._support import *  # noqa: F401,F403
 from contextlib import nullcontext
 from dataclasses import replace
 import errno

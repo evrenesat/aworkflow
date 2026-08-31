@@ -1,4 +1,4 @@
-from aflow._test_support import *  # noqa: F401,F403
+from tests._support import *  # noqa: F401,F403
 from aflow.workflow import resolve_role_prompt
 from aflow.run_state import load_override_request
 

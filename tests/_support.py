@@ -1,0 +1,507 @@
+from __future__ import annotations
+import io
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from contextlib import redirect_stderr, redirect_stdout
+from importlib import resources
+from unittest.mock import patch
+
+unittest = sys.modules["unittest"]
+
+from aflow.config import (
+    AflowSection,
+    ConfigError,
+    GoTransition,
+    HarnessProfileConfig,
+    TeamConfig,
+    WorkflowConfig,
+    WorkflowHarnessConfig,
+    WorkflowStepConfig,
+    WorkflowUserConfig,
+    bootstrap_config,
+    find_placeholders,
+    load_workflow_config,
+    validate_workflow_config,
+)
+from aflow.workflow import (
+    WorkflowError,
+    _backup_original_plan,
+    _run_process,
+    derive_readme_content,
+    evaluate_condition,
+    generate_new_plan_path,
+    move_completed_plan_to_done,
+    pick_transition,
+    render_prompt,
+    render_step_prompts,
+    resolve_profile,
+    resolve_role_selector,
+    run_workflow,
+)
+from aflow.cli import (
+    _confirm_startup_recovery,
+    _maybe_move_completed_plan_to_done,
+    _parse_run_args,
+    _pick_workflow_step,
+    _resolve_run_arguments,
+    build_parser,
+    main,
+    RUN_HELP,
+)
+from aflow.harnesses.claude import ClaudeAdapter
+from aflow.harnesses.codex import CodexAdapter
+from aflow.harnesses.copilot import CopilotAdapter
+from aflow.harnesses.gemini import GeminiAdapter
+from aflow.harnesses.kiro import KiroAdapter
+from aflow.harnesses.opencode import OpencodeAdapter
+from aflow.harnesses.pi import PiAdapter
+from aflow.harnesses.base import HarnessInvocation
+from aflow.plan import PlanParseError, PlanSnapshot, load_plan, load_plan_tolerant
+from aflow.run_state import (
+    ControllerConfig,
+    ControllerState,
+    ExecutionContext,
+    ResumeContext,
+    RetryContext,
+    TurnRecord,
+)
+from aflow.runlog import prune_old_runs
+from aflow.status import build_banner
+import pytest
+
+
+def _write_plan(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_config(home_dir: Path, text: str) -> Path:
+    config_path = home_dir / ".config" / "aflow" / "aflow.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    aflow_lines: list[str] = []
+    workflow_lines: list[str] = []
+    current = aflow_lines
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("[") and not stripped.startswith("[["):
+            header = stripped[1 : stripped.find("]")]
+            current = workflow_lines if header.startswith("workflow") else aflow_lines
+        current.append(line)
+    config_path.write_text("".join(aflow_lines), encoding="utf-8")
+    config_path.with_name("workflows.toml").write_text(
+        "".join(workflow_lines), encoding="utf-8"
+    )
+    return config_path
+
+
+def _write_split_config(
+    home_dir: Path, aflow_text: str, workflows_text: str
+) -> tuple[Path, Path]:
+    config_dir = home_dir / ".config" / "aflow"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    aflow_path = config_dir / "aflow.toml"
+    workflows_path = config_dir / "workflows.toml"
+    aflow_path.write_text(aflow_text, encoding="utf-8")
+    workflows_path.write_text(workflows_text, encoding="utf-8")
+    return aflow_path, workflows_path
+
+
+def _copy_aflow_repo(tmp_path: Path) -> Path:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    aflow_src = Path(__file__).resolve().parents[1] / "aflow"
+    aflow_dst = repo_root / "aflow"
+    shutil.copytree(
+        aflow_src, aflow_dst, ignore=shutil.ignore_patterns("__pycache__", "tests")
+    )
+    return repo_root
+
+
+def _write_workflow_harness_script(repo_root: Path, harness_name: str) -> Path:
+    bin_dir = repo_root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / harness_name
+    script.write_text(
+        textwrap.dedent(
+            '            #!/usr/bin/env python3\n            from __future__ import annotations\n            import os, shutil, sys\n            from pathlib import Path\n\n            plan_path = Path(os.environ["AFLOW_TEST_PLAN_PATH"])\n            scenario = os.environ.get("AFLOW_TEST_SCENARIO", "noop")\n            count_file = Path(os.environ["AFLOW_TEST_COUNT_FILE"])\n            count = int(count_file.read_text(encoding="utf-8")) + 1 if count_file.exists() else 1\n            count_file.write_text(str(count), encoding="utf-8")\n\n            print(f"{harness_name} turn {count}")\n\n            if scenario == "complete":\n                shutil.copyfile(os.environ["AFLOW_TEST_COMPLETED_PLAN"], plan_path)\n                sys.exit(0)\n\n            if scenario == "noop":\n                sys.exit(0)\n\n            if scenario == "create_plan":\n                new_plan = os.environ.get("AFLOW_TEST_NEW_PLAN_PATH", "")\n                if new_plan:\n                    Path(new_plan).write_text("# Generated\\n", encoding="utf-8")\n                shutil.copyfile(os.environ["AFLOW_TEST_COMPLETED_PLAN"], plan_path)\n                sys.exit(0)\n\n            if scenario == "fail":\n                print(f"{harness_name} failing", file=sys.stderr)\n                sys.exit(int(os.environ.get("AFLOW_TEST_EXIT_CODE", "1")))\n\n            raise SystemExit(f"unknown AFLOW_TEST_SCENARIO {scenario}")\n            '
+        ).replace("{harness_name}", harness_name),
+        encoding="utf-8",
+    )
+    script.chmod(493)
+    return script
+
+
+def _workflow_test_env(
+    repo_root: Path,
+    *,
+    scenario: str,
+    plan_path: Path,
+    count_file: Path,
+    home_dir: Path | None = None,
+    completed_plan_path: Path | None = None,
+    new_plan_path: Path | None = None,
+    exit_code: int | None = None,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PATH"] = f"{repo_root / 'bin'}:{env['PATH']}"
+    if home_dir is not None:
+        env["HOME"] = str(home_dir.resolve())
+    env["AFLOW_TEST_SCENARIO"] = scenario
+    env["AFLOW_TEST_PLAN_PATH"] = str(plan_path.resolve())
+    env["AFLOW_TEST_COUNT_FILE"] = str(count_file.resolve())
+    if completed_plan_path is not None:
+        env["AFLOW_TEST_COMPLETED_PLAN"] = str(completed_plan_path.resolve())
+    if new_plan_path is not None:
+        env["AFLOW_TEST_NEW_PLAN_PATH"] = str(new_plan_path.resolve())
+    if exit_code is not None:
+        env["AFLOW_TEST_EXIT_CODE"] = str(exit_code)
+    return env
+
+
+def _run_workflow_launcher(
+    repo_root: Path, *args: str, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "aflow", "run", *args],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _make_git_repo(path: Path) -> None:
+    """Initialize a git repo with an initial commit in path."""
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "test@test.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    (path / "README.md").write_text("init\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(path), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _make_simple_wf_config(
+    *,
+    global_retry: int = 0,
+    workflow_retry: int | None = None,
+) -> WorkflowUserConfig:
+    from aflow.config import WorkflowConfig
+
+    wf = WorkflowConfig(
+        steps={
+            "implement_plan": WorkflowStepConfig(
+                role="architect",
+                prompts=("p",),
+                go=(
+                    GoTransition(to="END", when="DONE || MAX_TURNS_REACHED"),
+                    GoTransition(to="implement_plan"),
+                ),
+            )
+        },
+        first_step="implement_plan",
+        retry_inconsistent_checkpoint_state=workflow_retry,
+    )
+    return WorkflowUserConfig(
+        aflow=AflowSection(retry_inconsistent_checkpoint_state=global_retry),
+        roles={"architect": "codex.default"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"default": HarnessProfileConfig(model="gpt-5.4")}
+            )
+        },
+        workflows={"simple": wf},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+_VALID_PLAN = "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n"
+_COMPLETE_PLAN = "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n"
+_BROKEN_PLAN = "# Plan\n\n### [x] Checkpoint 1: First\n- [ ] step one\n"
+_VALID_GIT_TRACKING_PLAN = textwrap.dedent(
+    """\
+    # Plan
+
+    ## Git Tracking
+
+    - Plan Branch: `main`
+    - Pre-Handoff Base HEAD: `base`
+    - Last Reviewed HEAD: `none`
+    - Review Log:
+      - None yet.
+
+    ### [ ] Checkpoint 1: First
+    - [ ] step one
+    """
+)
+
+
+def _make_multistep_wf_config(max_same_step_turns: int = 5) -> WorkflowUserConfig:
+    from aflow.config import WorkflowConfig
+
+    wf = WorkflowConfig(
+        steps={
+            "review": WorkflowStepConfig(
+                role="architect",
+                prompts=("p",),
+                go=(GoTransition(to="implement"),),
+            ),
+            "implement": WorkflowStepConfig(
+                role="architect",
+                prompts=("p",),
+                go=(
+                    GoTransition(to="END", when="DONE"),
+                    GoTransition(to="implement"),
+                ),
+            ),
+        },
+        first_step="review",
+    )
+    return WorkflowUserConfig(
+        aflow=AflowSection(max_same_step_turns=max_same_step_turns),
+        roles={"architect": "codex.default"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"default": HarnessProfileConfig(model="gpt-5.4")}
+            )
+        },
+        workflows={"loop": wf},
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+def _make_lifecycle_git_repo(path: Path, branch: str = "main") -> Path:
+    """Initialize a git repo with an initial commit on the given branch."""
+    subprocess.run(
+        ["git", "init", "-b", branch], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    readme = path / "README.md"
+    readme.write_text("test repo\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(path), check=True, capture_output=True
+    )
+    return path
+
+
+def _git_commit_file(repo_root: Path, file_path: Path) -> None:
+    """Stage and commit a single file in a git repo."""
+    subprocess.run(
+        ["git", "add", str(file_path)],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add file"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_force_commit_file(repo_root: Path, file_path: Path) -> None:
+    """Force-stage and commit a file, even if the path is gitignored."""
+    subprocess.run(
+        ["git", "add", "-f", str(file_path)],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "add file"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+    )
+
+
+def _make_branch_only_wf_config(main_branch: str = "main") -> WorkflowUserConfig:
+    """Build a minimal branch-only lifecycle workflow config."""
+    return WorkflowUserConfig(
+        aflow=AflowSection(team_lead="senior_architect"),
+        roles={
+            "architect": "codex.default",
+            "senior_architect": "codex.default",
+        },
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"default": HarnessProfileConfig(model="m")}
+            )
+        },
+        workflows={
+            "branch_wf": WorkflowConfig(
+                steps={
+                    "impl": WorkflowStepConfig(
+                        role="architect",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE || MAX_TURNS_REACHED"),
+                            GoTransition(to="impl"),
+                        ),
+                    )
+                },
+                first_step="impl",
+                setup=("branch",),
+                teardown=("merge",),
+                main_branch=main_branch,
+            )
+        },
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+def _make_worktree_wf_config(
+    main_branch: str = "main", worktree_root: str = "/tmp/worktrees"
+) -> WorkflowUserConfig:
+    """Build a minimal worktree lifecycle workflow config."""
+    return WorkflowUserConfig(
+        aflow=AflowSection(team_lead="senior_architect", worktree_root=worktree_root),
+        roles={
+            "architect": "codex.default",
+            "senior_architect": "codex.default",
+        },
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"default": HarnessProfileConfig(model="m")}
+            )
+        },
+        workflows={
+            "wt_wf": WorkflowConfig(
+                steps={
+                    "impl": WorkflowStepConfig(
+                        role="architect",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE || MAX_TURNS_REACHED"),
+                            GoTransition(to="impl"),
+                        ),
+                    )
+                },
+                first_step="impl",
+                setup=("worktree", "branch"),
+                teardown=("merge", "rm_worktree"),
+                main_branch=main_branch,
+            )
+        },
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+def _make_worktree_no_merge_wf_config(
+    *,
+    main_branch: str = "main",
+    worktree_root: str = "/tmp/worktrees",
+    prompts: tuple[str, ...] = ("p",),
+) -> WorkflowUserConfig:
+    return WorkflowUserConfig(
+        aflow=AflowSection(team_lead="senior_architect", worktree_root=worktree_root),
+        roles={
+            "architect": "codex.default",
+            "senior_architect": "codex.default",
+        },
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"default": HarnessProfileConfig(model="m")}
+            )
+        },
+        workflows={
+            "wt_wf": WorkflowConfig(
+                steps={
+                    "impl": WorkflowStepConfig(
+                        role="architect",
+                        prompts=prompts,
+                        go=(
+                            GoTransition(to="END", when="DONE || MAX_TURNS_REACHED"),
+                            GoTransition(to="impl"),
+                        ),
+                    )
+                },
+                first_step="impl",
+                setup=("worktree", "branch"),
+                teardown=(),
+                main_branch=main_branch,
+            )
+        },
+        prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+    )
+
+
+def _run_git_in_test(args: list[str], *, cwd: Path) -> tuple[int, str, str]:
+    r = subprocess.run(
+        ["git"] + args, cwd=str(cwd), capture_output=True, text=True, check=False
+    )
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def _git_merge_feature_into_main(primary_root: Path, main_branch: str) -> None:
+    """Find the aflow feature branch and merge it into main_branch at primary_root."""
+    rc, branches_out, _ = _run_git_in_test(
+        ["branch", "--list", "aflow-*"], cwd=primary_root
+    )
+    assert rc == 0 and branches_out.strip(), "no aflow feature branch found"
+    # Strip leading markers: '*' (current), '+' (checked out in another worktree), spaces
+    feature_branch = branches_out.strip().lstrip("+* ").strip()
+    rc, _, _ = _run_git_in_test(["checkout", main_branch], cwd=primary_root)
+    assert rc == 0, f"could not checkout {main_branch}"
+    rc, _, err = _run_git_in_test(
+        ["merge", "--ff-only", feature_branch], cwd=primary_root
+    )
+    assert rc == 0, f"merge --ff-only failed: {err}"
+
+
+def _make_unborn_git_repo(path: Path, branch: str = "main") -> None:
+    """Initialize a git repo with NO commits (unborn HEAD)."""
+    subprocess.run(
+        ["git", "init", "-b", branch], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]

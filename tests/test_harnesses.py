@@ -1,4 +1,4 @@
-from aflow._test_support import *  # noqa: F401,F403
+from tests._support import *  # noqa: F401,F403
 from dataclasses import replace
 from typing import Mapping
 from aflow.harnesses.base import HarnessInvocation

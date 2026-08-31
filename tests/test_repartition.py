@@ -1,6 +1,6 @@
 """Tests for aflow.repartition — Checkpoint 1 primitives."""
 
-from aflow._test_support import *  # noqa: F401,F403
+from tests._support import *  # noqa: F401,F403
 
 import json
 import hashlib

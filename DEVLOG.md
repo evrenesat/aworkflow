@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-08-31 — Stop shipping test support and pytest at runtime (PR-15)
+
+- Base SHA: `059b1fb5ad6654f18935b20db7538663361310ad`.
+- Moved the shared helper bundle from `aflow/_test_support.py` to
+  `tests/_support.py`, removed its 7,369 blank padding lines and dead direct
+  execution guard, and preserved the 19-helper wildcard re-export contract.
+  The helper changed from 7,644 physical/275 nonblank lines to 504/457.
+- Moved `pytest>=8.0.0` from runtime dependencies to the default `dev` group;
+  the lockfile keeps it development-only. Root collection stayed at `1,353`
+  and the full suite passed with `1353 passed, 216 subtests passed`.
+- The rebuilt wheel omits the test helper and `pytest` runtime requirement; a
+  fresh Python 3.11 wheel-only install printed `runtime-package-clean`.
+
 ## 2026-08-30 — Lift repartition application coordinator out of the workflow closure (PR-14)
 
 - Lifted the 274-line pending-repartition reconciliation and application

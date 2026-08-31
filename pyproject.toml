@@ -10,9 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "rich>=13.0.0",
-    "pytest>=8.0.0",
     "fastmcp>=3.2.0,<4.0.0",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
 
 [project.scripts]
 aflow = "aflow.cli:main"

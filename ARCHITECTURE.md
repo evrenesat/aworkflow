@@ -664,8 +664,9 @@ aflow/
       references/            aflow-defect-plan.md
       scripts/               aflow_guard_snapshot.py
 tests/
-  test_aflow.py        # workflow engine tests
-  test_skill_install.py # skill installer tests
+  __init__.py           # test package marker
+  _support.py            # shared test-only helpers
+  ...                    # root test modules (excluded from published wheel)
 plans/                 # user plan files and backups
   backups/             # automatic plan backups
   in-progress/         # active handoff plans
@@ -676,6 +677,10 @@ apps/                  # separate subprojects (not in published wheel)
 .aflow/
   runs/                # per-run logs (gitignored)
 ```
+
+The root `tests/` package contains test-only helpers and modules and is
+excluded from the published `aworkflow` wheel. `pytest` is provided by the
+default `dev` dependency group rather than the installed runtime package.
 
 ## Key Design Decisions
 
