@@ -34,12 +34,6 @@ from .config import (
     WorkflowConfig,
     WorkflowStepConfig,
 )
-from . import git_status as _git_status
-
-# Preserve the module-level seams used by existing CLI callers and tests while
-# keeping the production implementation in ``aflow.api.startup``.
-probe_worktree = _git_status.probe_worktree
-classify_dirtiness_by_prefix = _git_status.classify_dirtiness_by_prefix
 from .manager_context import scoped_reviewer_rejection_count
 from .plan import PlanSnapshot
 from .skill_installer import InstallerError, install_skills
@@ -2734,7 +2728,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "daemon":
         from .daemon_cli import (
             LocalControlPlaneService,
-            SubprocessUnitManager,
             daemon_status,
             daemon_stop,
             default_project_id,
@@ -2743,6 +2736,7 @@ def main(argv: list[str] | None = None) -> int:
             run_daemon_foreground,
         )
         from .daemon import AflowDaemon
+        from .control_plane.units import SubprocessUnitManager
 
         repo_root = (args.repo_root or Path.cwd()).resolve()
         if args.daemon_command == "status":
