@@ -4,8 +4,9 @@ AFlow is a local controller for plan-driven coding workflows. It reads a
 checkpointed Markdown plan, runs configured steps through installed agent CLIs,
 and uses the updated plan to decide what runs next.
 
-The Python package is named `aworkflow`; it installs both `aflow` and
-`aworkflow` as equivalent commands.
+The Python package is named `aworkflow`; it installs `aflow` and `aworkflow`
+as equivalent workflow commands. It also installs the optional `aflowd`
+durable control-plane service entry point.
 
 ## How it works
 
@@ -79,8 +80,8 @@ mode-0600 pidfile binds stop/status operations to the daemon's process-birth
 identity. Status reports only direct workers for the verified repository, using
 Linux procfs or a portable process-table fallback. If ownership inspection is
 unavailable or untrusted, status returns an ambiguous nonzero result instead
-of claiming zero workers. This local mode does not serve REST or the React
-dashboard and does not replace the production `aflowd` deployment.
+of claiming zero workers. This local mode does not serve REST or the optional
+remote app's React dashboard.
 
 A minimal plan has checkpoint headings and task items:
 
@@ -132,11 +133,13 @@ aflow analyze <run-id>
 aflow run --resume <run-id>
 ```
 
-Resume reuses only a complete schema-v2 unfinished worktree run and
-reconstructs its saved plan and invocation identity when no plan is supplied.
-Older run metadata remains readable for analysis but is not migrated or
-resumable. Detailed compatibility, recovery, supervision, and next-turn
-override rules are documented separately.
+Resume accepts an eligible, complete schema-v2 run in any supported lifecycle
+mode: no lifecycle, branch-only, or linked worktree. Most resumptions continue
+an incomplete plan; a narrowly validated completed run may instead retry only
+a failed terminal merge. AFlow reconstructs the saved plan, invocation, and
+lifecycle identity when no plan is supplied. Older run metadata remains
+readable for analysis but is not migrated or resumable. Detailed compatibility,
+recovery, supervision, and next-turn override rules are documented separately.
 
 ### Live worker role hotplug
 
@@ -176,11 +179,10 @@ CI checks only production Python for unused imports, redefinitions, unresolved
 names, and unused locals.
 
 `uv run pytest -q` is the supported root test command on Linux and macOS. Linux
-runs the p100/systemd deployment module; macOS explicitly skips those 15
-Linux-only tests and runs all core tests. Pull requests and pushes to `main`
-run Python 3.11 on Ubuntu and macOS, and the package build waits for both
-platform test jobs. Publication calls the same reusable CI workflow before
-uploading a package.
+runs the systemd deployment tests; macOS skips that Linux-only module and runs
+all core tests. Pull requests and pushes to `main` run Python 3.11 on Ubuntu
+and macOS, and the package build waits for both platform test jobs. Publication
+calls the same reusable CI workflow before uploading a package.
 
 The optional remote management app lives in `apps/aflow_app/` and is not
 included in the published wheel. Its server requires Python 3.12+ and exposes a
@@ -195,5 +197,4 @@ provider-neutral planning-session API; Codex integration is implemented through
 - [Runtime behavior, artifacts, resume, and recovery](docs/runtime-behavior.md)
 - [Python library API](docs/library-api.md)
 - [Remote app](docs/remote-app.md)
-- [p100 control-plane deployment](deploy/aflowd/README.md)
 - [Architecture](ARCHITECTURE.md)

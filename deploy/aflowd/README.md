@@ -1,5 +1,11 @@
 # p100 AFlow control-plane deployment
 
+This is an environment-specific operator runbook for the existing p100 host,
+not a portable installation guide or part of AFlow's public setup path. The
+scripts and templates intentionally encode its Tailscale interface, bind
+address, service account, filesystem layout, and default project allowlist.
+Audit and adapt the implementation before using it on another host.
+
 install.sh creates one immutable, commit-addressed release under
 /opt/aflowd/releases/<commit>. It defaults to a dry-run and never uses a
 developer checkout as a daemon or workflow entrypoint. The rendered

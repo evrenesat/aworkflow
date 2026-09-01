@@ -1,6 +1,6 @@
 # Architecture
 
-AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Gemini, Kiro, OpenCode, Pi, and Reasonix). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
+AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Copilot, Gemini, Kiro, OpenCode, Pi, and Reasonix). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
@@ -23,7 +23,7 @@ flowchart TD
     PromptRender["workflow.py — render_step_prompts()"]
     Role["workflow.py — resolve_role_selector()"]
     Adapter["harnesses/ — build CLI invocation"]
-    Subprocess["workflow.py — _run_process() via subprocess.Popen (stdin=DEVNULL)"]
+    Subprocess["workflow.py — _run_process() via subprocess.Popen"]
     PlanReload["plan.py — reload plan, compute post-snapshot"]
     Transition["workflow.py — evaluate_condition() + proposed transition"]
     Manager["workflow.py — optional manager gate"]
@@ -345,7 +345,45 @@ classifier while retaining its backup-plan and active-plan allowances.
    Harness error recovery is inserted after the harness returns and before normal transition handling. If the turn made no plan progress and a configured error-handling rule matches the harness output, the engine produces that cheap deterministic action for manager acceptance. Rules can keep the same team, switch to a configured `backup_team`, or fail immediately. An unmatched ambiguous error goes directly to Full supervision when enabled; manager-disabled runs retain the team-lead recovery handoff. Progress-gated turns skip recovery entirely and continue on the normal transition path.
 5. After normal workflow completion, and only after the original-plan snapshot is
    complete, if `teardown` includes `merge`, execute the merge handoff: resolve `[aflow].team_lead` through the effective team, build a merge prompt (built-in `aflow-merge` instruction plus rendered `merge_prompt` entries), and run the `team_lead` agent from the primary checkout. After the agent returns, verify: no unmerged index entries, clean working tree, HEAD on `main_branch`, and feature branch is an ancestor of the target. Only after all checks pass does `rm_worktree` (if configured) remove the linked worktree. Any verification failure leaves the feature branch and worktree intact and fails the run with the specific failed check. An incomplete `END` never enters merge teardown and preserves its branch/worktree identity for explicit resume.
-6. `aflow` can resume an unfinished prior run in every accepted lifecycle mode, but only from complete schema-v2 `run.json` authority. Resume candidate lookup resolves the previous run id through the current shell's `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID` supplied an explicit run id. A run is resumable only when its lifecycle-specific identity is complete (no Git identity for no-lifecycle, main/feature branches for branch-only, and the registered path for linked-worktree runs), status is `failed` or `running`, `last_snapshot.is_complete != true`, no `merge_status` exists, and the resolved invocation still matches on repo root, workflow name, authoritative original plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup. Plain `aflow run` treats that as an optional interactive prompt in TTY mode and otherwise falls back to the fresh-run path. `aflow run --resume` makes resume mandatory: with no run id it must resolve a prior run from that lookup order or fail; with a run id it must use that run or fail. Missing, old, malformed, or future schemas remain readable for inspection but are rejected before plan lookup, startup questions, allocation, or daemon continuation and are never migrated. Accepted resume builds a `ResumeContext` from the durable lifecycle identity and active logical plan path, validates the primary branch or linked worktree when present, and starts `run_workflow()` directly in the reused execution context instead of provisioning a fresh one. The plan file on disk still remains the durable checkpoint state. Resume recomputes the active scope's rejection count from durable review artifacts so corrected classifiers repair older metadata. If a completed active turn is newer than `run.json.turns_completed`, its finalized result becomes a pending replay boundary: the new run uses the source artifacts for one manager decision before routing another harness. Pending repartition stages, hotplug state, and both plan copies are validated and reconciled before any harness starts; an already applied copy is not replayed. An explicit `--resume RUN_ID --resume-reset-scope` manual boundary remains available for owner-directed replacement and preserves lifecycle identity and manager history while omitting the saved active overlay and clearing the live scope/attempt index; the linked source run retains the immutable attempt audit.
+6. `aflow` can resume an eligible prior run in every accepted lifecycle mode,
+   but only from complete schema-v2 `run.json` authority. Resume candidate
+   lookup resolves the previous run id through the current shell's
+   `.aflow/last_run_ids/<shell-id>` entry when it can detect one, then
+   `AFLOW_LAST_RUN_ID`, then `.aflow/last_run_id`, unless `--resume RUN_ID`
+   supplied an explicit run id. A run is resumable only when its
+   lifecycle-specific identity is complete (no Git identity for no-lifecycle,
+   main/feature branches for branch-only, and the registered path for
+   linked-worktree runs), status is `failed`, `running`, or
+   `waiting_for_valid_override`, and the resolved invocation still matches on
+   repo root, workflow name, authoritative original plan path, effective team,
+   selected start step, max turns, extra instructions, and lifecycle setup.
+   Normally `last_snapshot.is_complete != true` and no `merge_status` exists.
+   The sole exception is a completed `transition_end` run with failed merge
+   status and reason plus configured merge teardown; its successor retries only
+   terminal integration and starts no workflow harness. Plain `aflow run`
+   treats a candidate as an optional interactive prompt in TTY mode and
+   otherwise follows the fresh-run path. `aflow run --resume` makes resume
+   mandatory: with no run id it must resolve a prior run from that lookup order
+   or fail; with a run id it must use that run or fail. Missing, old, malformed,
+   or future schemas remain readable for inspection but are rejected before
+   plan lookup, startup questions, allocation, or daemon continuation and are
+   never migrated. Accepted resume builds a `ResumeContext` from the durable
+   lifecycle identity and active logical plan path, validates the primary
+   branch or linked worktree when present, and starts `run_workflow()` directly
+   in the reused execution context instead of provisioning a fresh one. The
+   plan file on disk remains the durable checkpoint state. Resume recomputes
+   the active scope's rejection count from durable review artifacts so
+   corrected classifiers repair older metadata. If a completed active turn is
+   newer than `run.json.turns_completed`, its finalized result becomes a
+   pending replay boundary: the new run uses the source artifacts for one
+   manager decision before routing another harness. Pending repartition stages,
+   hotplug state, and both plan copies are validated and reconciled before any
+   harness starts; an already applied copy is not replayed. An explicit
+   `--resume RUN_ID --resume-reset-scope` manual boundary remains available for
+   owner-directed replacement and preserves lifecycle identity and manager
+   history while omitting the saved active overlay and clearing the live
+   scope/attempt index; the linked source run retains the immutable attempt
+   audit.
 
 ### `repartition.py`
 
@@ -400,15 +438,16 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `gemini`   | `gemini`    | system prefixed into user prompt | No           |
 | `kiro`     | `kiro-cli`  | system prefixed into user prompt | No           |
 | `opencode` | `opencode`  | system prefixed into user prompt | No           |
-| `reasonix` | `reasonix`  | system prefixed into user prompt | No           |
+| `reasonix` | `reasonix`  | system prefixed into user prompt | Yes          |
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
 
 All harnesses run in non-interactive, auto-approve mode with full tool access.
-Their effective prompts are delivered through argv or explicit prompt flags, so
-`workflow._run_process()` starts real children with `stdin=subprocess.DEVNULL`.
-This leaves the controller/dashboard as the sole owner of interactive terminal
-input while preserving the existing stdout/stderr pipes, return codes, and
-prompt metadata. Injected runner callables are unchanged.
+Most adapters deliver effective prompts through argv or explicit prompt flags,
+so `workflow._run_process()` closes their stdin with `subprocess.DEVNULL`.
+Adapters that intentionally set `HarnessInvocation.stdin_text`, currently
+Codex, receive that text through a pipe instead. In both cases the controller
+dashboard remains the sole owner of interactive terminal input, stdout/stderr
+stay captured, and injected runner callables receive the equivalent input.
 
 Reasonix owned sessions use a stricter ACP boundary. The driver owns one stdio
 process through initialize, session creation or exact resume, configuration,
@@ -459,7 +498,8 @@ Direct `run.json` editing, graph mutation, active-harness mutation, and
 lifecycle/manager/plan-lineage overrides are intentionally unsupported.
 
 Every resume still creates a distinct durable run id linked through
-`resumed_from_run_id`; lifecycle identity and the reused worktree do not change.
+`resumed_from_run_id`; the lifecycle identity and reused execution context do
+not change.
 Before that successor launches its first harness, resume classifies only the
 explicitly selected predecessor's `overrides.toml` against the predecessor's
 durable result. A new, changed, rejected, or accepted-but-unapplied request owns
@@ -550,7 +590,10 @@ Thirteen default skill definitions plus one optional shipped skill installed int
 | `aflow-assistant`           | Optional evidence-first debugging and setup helper              |
 
 ### `api/`
-Public library API for startup preparation and workflow execution. Re-exported from `aflow/__init__.py` for stable imports.
+Public library API for startup preparation, workflow execution, analysis, and
+control-plane models. The core startup/execution and observer surface is also
+re-exported from `aflow/__init__.py`; analysis, control-plane models, and
+manager-specific event classes are imported from `aflow.api`.
 
 **Run analysis (`analyze.py`):**
 - `AnalyzeRequest` -- immutable request parameters for public run analysis. Supports single-run mode via `run_id` and corpus mode via `all=True`.
@@ -578,11 +621,19 @@ Startup models (`models.py`):
 - `CallbackObserver` — Observer implementation that calls a user-provided function for each event.
 - `CollectingObserver` — Observer implementation that collects all events into a list for later inspection.
 - `ExecutionEvent` — Base class for all execution events.
-- `ExecutionEventType` — Enum of event types: `RUN_STARTED`, `STATUS_CHANGED`, `TURN_STARTED`, `TURN_FINISHED`, `QUESTION_REQUIRED`, `RUN_COMPLETED`, `RUN_FAILED`.
+- `ExecutionEventType` — Enum covering run, status, turn, manager,
+  repartition, question, terminal, and hotplug lifecycle events.
 - `RunStartedEvent` — Emitted when a workflow run starts.
 - `StatusChangedEvent` — Emitted when the workflow status changes.
 - `TurnStartedEvent` — Emitted when a workflow turn starts.
 - `TurnFinishedEvent` — Emitted when a workflow turn finishes.
+- `ManagerStartedEvent` / `ManagerDecidedEvent` — Emitted around a durable
+  manager decision.
+- `CheckpointRepartitionedEvent` — Emitted after a validated repartition is
+  durably applied.
+- Hotplug events — `HOTPLUG_REQUESTED`, `HOTPLUG_STAGE_CHANGED`,
+  `HOTPLUG_APPLIED`, and `HOTPLUG_FAILED` carry secret-safe transaction state
+  through the `ExecutionEvent` union.
 - `QuestionRequiredEvent` — Emitted when a workflow step requires a question (currently unused in library context but included for completeness).
 - `RunCompletedEvent` — Emitted when a workflow run completes successfully.
 - `RunFailedEvent` — Emitted when a workflow run fails.
@@ -625,6 +676,25 @@ aflow/
   config.py            # TOML config loading and validation
   plan.py              # Markdown plan parser
   workflow.py          # workflow engine (turn loop, conditions, transitions)
+  daemon.py            # durable lifecycle daemon and aflowd entry point
+  daemon_cli.py        # lightweight local daemon adapter
+  mcp_control_plane.py # shared MCP tools and resources
+  manager.py           # interstep manager protocol and decisions
+  manager_context.py   # versioned Lite/Full manager context
+  hotplug.py           # live worker selector transactions
+  recovery.py          # harness failure classification and recovery
+  scope_pressure.py    # structural scope-pressure signal parsing
+  stop_marker.py       # explicit AFLOW_STOP parsing
+  terminal_viewport.py # terminal viewport and navigation helpers
+  control_plane/       # shared daemon application, persistence, and units
+    application.py     # canonical lifecycle application boundary
+    capabilities.py    # versioned capability descriptions
+    models.py          # launch, run, event, and context models
+    persistence.py     # atomic manifests, events, and revisions
+    reconciliation.py  # durable state and unit reconciliation
+    repository.py      # allowlisted repository/plan operations
+    services.py        # lifecycle service orchestration
+    units.py           # subprocess and systemd unit adapters
   api/
     __init__.py        # public API exports
     startup.py         # startup preparation functions
@@ -658,11 +728,17 @@ aflow/
     aflow-review-checkpoint/ SKILL.md
     aflow-review-final/      SKILL.md
     aflow-merge/             SKILL.md
+    aflow-init-repo/         SKILL.md
+    aflow-harness-recovery-lead/ SKILL.md
+    aflow-manager/           SKILL.md
+    aflow-repartition-checkpoint/ SKILL.md
+    material-code-review/    SKILL.md
     aflow-guard-development-run/
       SKILL.md
       agents/                openai.yaml
-      references/            aflow-defect-plan.md
+      references/            aflow-defect-issue.md, remote-observation.md
       scripts/               aflow_guard_snapshot.py
+    aflow-assistant/         SKILL.md, references/, scripts/ (optional)
 tests/
   __init__.py           # test package marker
   _support.py            # shared test-only helpers
@@ -752,8 +828,6 @@ operations, approvals, interruption, attachment upload/delete, plan drafts, and
 workflow execution. React keys and API requests carry `provider_id` and
 `provider_session_id` separately.
 
-### Control Flow
-
 ### Daemon-backed control plane
 
 There are two transport/lifetime adapters over the same durable control-plane
@@ -770,18 +844,18 @@ wrapper that adds app-specific safe error mappings. Its FastAPI `/mcp` mount
 retains the server-owned header bearer check; registry sharing does not move
 authorization into a client or URL.
 
-The p100 control plane separates durable workflow ownership from its browser
-REST, UI, and MCP transports. Browser lifecycle REST uses only project-scoped
-`/api/control-plane/projects/{project_id}/...` routes. REST and MCP delegate to
-the same durable control-plane application and services; neither transport
-infers a project by scanning daemons. `aflowd.service` runs the release-pinned
-remote-app server on the Tailscale address only. Its `ControlPlaneService` owns
-the static project allowlist and calls the AFlow daemon for every lifecycle
-operation; the transport layer neither launches subprocesses nor reads or
-writes `.aflow` artifacts directly.
+The systemd-backed remote control plane separates durable workflow ownership
+from its browser REST, UI, and MCP transports. Browser lifecycle REST uses only
+project-scoped `/api/control-plane/projects/{project_id}/...` routes. REST and
+MCP delegate to the same durable control-plane application and services;
+neither transport infers a project by scanning daemons. `aflowd.service` runs
+the release-pinned remote-app server on its configured private bind address. Its
+`ControlPlaneService` owns the static project allowlist and calls the AFlow
+daemon for every lifecycle operation; the transport layer neither launches
+subprocesses nor reads or writes `.aflow` artifacts directly.
 
 ```text
-Mac UI / REST client / MCP client
+Browser UI / REST client / MCP client
                 |  bearer header; write approval for MCP
                 v
 aflowd.service (one immutable /opt/aflowd/releases/<commit>)
@@ -809,12 +883,12 @@ compare-and-swap value. A startup question leaves the launch manifest in
 idempotent answer. Older runs without control-plane manifests remain readable
 as legacy/interrupted data but cannot be mutated or resumed through this API.
 
-Deployment stages a Git commit under `/opt/aflowd/releases/<commit>`, validates
-release entrypoint hashes and a mode-0600 token environment file, switches the
-`current` symlink atomically, then performs authenticated readiness. A failed
-readiness check restores the previous service and release target. The
-deployment guide owns the exact install, rotation, rollback, and emergency
-containment commands.
+The repository's environment-specific Linux deployment example stages a Git
+commit under `/opt/aflowd/releases/<commit>`, validates release entrypoint
+hashes and a mode-0600 token environment file, switches the `current` symlink
+atomically, then performs authenticated readiness. A failed readiness check
+restores the previous service and release target. It is an operator reference,
+not a portable installer or part of the public package setup path.
 
 ### Live worker hotplug boundary
 

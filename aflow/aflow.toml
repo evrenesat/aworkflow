@@ -100,33 +100,25 @@ repartition_skill = 'aflow-repartition-checkpoint'
 # chain. Checkpoint approval resets worker routing to the baseline team. Both
 # graph targets must be defined teams; self-links and cycles are rejected
 # independently at config validation.
-# [teams.codex1]
-# backup_team = '7teen'
-# upgrade_to = 'codexmax'
+# [teams.standard]
+# backup_team = 'fallback'
+# upgrade_to = 'high'
 #
-# [teams.codex1.roles]
-# architect = 'codex.high'
-# senior_architect = 'codex.high'
-# reviewer = 'codex.high'
-# worker = 'codex.nano'
+# [teams.standard.roles]
+# architect = 'codex.sol-high'
+# senior_architect = 'codex.sol-high'
+# reviewer = 'codex.sol-high'
+# worker = 'codex.sol-med'
 #
-# [teams.codexmax]
-# upgrade_to = 'codexultra'
+# [teams.high]
 #
-# [teams.codexmax.roles]
-# worker = 'codex.mini'
+# [teams.high.roles]
+# worker = 'codex.sol-high'
 #
-# [teams.codexultra]
+# [teams.fallback]
 #
-# [teams.codexultra.roles]
-# worker = 'codex.high'
-#
-# [teams.7teen]
-#
-# [teams.7teen.roles]
-# architect = 'codex.mini'
-# reviewer = 'codex.mini'
-# worker = 'codex.nano'
+# [teams.fallback.roles]
+# worker = 'codex.luna-max'
 
 
 #### Harness Error Recovery ####

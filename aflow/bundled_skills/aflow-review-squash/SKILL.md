@@ -3,7 +3,7 @@ name: aflow-review-squash
 description: "Review a completed autonomous AFlow plan, compare the full accumulated implementation against the original plan, and either squash the whole handoff into one final commit or create a focused fix plan for the remaining failed checkpoints or behaviors."
 ---
 
-#  Review Squash AFlow Implementation
+# Review Squash AFlow Implementation
 
 Use this skill only for the final review pass of work produced under a aflow plan that includes `Git Tracking`. It is meant to be installed as a static skill and driven by prompt context from the workflow engine.
 

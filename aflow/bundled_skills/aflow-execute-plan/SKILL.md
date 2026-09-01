@@ -3,7 +3,7 @@ name: aflow-execute-plan
 description: "Lightweight execution reinforcement for an existing AFlow plan. Use when an agent must resume from the first unchecked checkpoint and keep the plan synchronized with verified progress."
 ---
 
-#  Execute AFlow Plan
+# Execute AFlow Plan
 
 Use this skill only to execute an existing aflow plan autonomously. Treat `aflow` as the canonical spelling. This skill is intentionally lightweight, the plan itself should already carry the detailed execution contract.
 

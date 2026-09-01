@@ -24,7 +24,7 @@ dependencies = [
 allow-direct-references = true
 
 [project.urls]
-Repository = "https://github.com/evrenesat/aflow"
+Repository = "https://github.com/evrenesat/aworkflow"
 
 [project.optional-dependencies]
 dev = [

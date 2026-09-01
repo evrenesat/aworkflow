@@ -102,8 +102,10 @@ Use these bundled resources first. They are part of the shipped skill and remain
 - `aflow/cli.py`
 - `aflow/status.py`
   - Code-level source of truth when logs show an engine-path question.
-- `tests/test_aflow.py`
-  - Fastest way to confirm intended behavior for many edge cases. Search for the failure string or field name before guessing.
+- `tests/`
+  - Focused behavior tests split by subsystem, including `test_runtime.py`,
+    `test_cli.py`, `test_runlog.py`, `test_plan.py`, and `test_config.py`.
+    Search for the failure string or field name before guessing.
 
 ## Fast Triage Workflow
 
@@ -206,7 +208,9 @@ is insufficient.
 
 ## Bundled Engine Map First
 
-When the skill is installed into a harness directory, the original repo files such as `README.md`, `ARCHITECTURE.md`, `aflow/workflow.py`, and `tests/test_aflow.py` may not exist at all. In that case:
+When the skill is installed into a harness directory, the original repo files
+such as `README.md`, `ARCHITECTURE.md`, `aflow/workflow.py`, and `tests/` may
+not exist at all. In that case:
 
 1. Read `references/engine-map.md`.
 2. Use `aflow analyze` plus `run.json` and turn `result.json` as the primary evidence path.
@@ -231,15 +235,16 @@ When logs are not enough and the source checkout is available, search these file
    - Startup recovery, argument resolution, interactivity rules, and install-skills entrypoints.
 6. `aflow/plan.py`
    - Plan parsing and inconsistent checkpoint-state rules.
-7. `tests/test_aflow.py`
-   - Expected behavior for concrete edge cases. Search for the symptom text first.
+7. `tests/`
+   - Expected behavior split by subsystem. Search for the symptom text first,
+     then open only the matching test module.
 
 Use `rg` to jump directly to the behavior in question. Examples:
 
 ```bash
-rg -n "AFLOW_STOP|retry-scheduled|plan-invalid|merge_failure_reason|startup_recovery" aflow tests/test_aflow.py
+rg -n "AFLOW_STOP|retry-scheduled|plan-invalid|merge_failure_reason|startup_recovery" aflow tests
 rg -n "run.json|result.json|stdout.txt|stderr.txt|effective-prompt" aflow/runlog.py aflow/workflow.py ARCHITECTURE.md README.md
-rg -n "inconsistent checkpoint state|startup aborted|max_turns_reached" aflow tests/test_aflow.py
+rg -n "inconsistent checkpoint state|startup aborted|max_turns_reached" aflow tests
 ```
 
 ## Response Contract

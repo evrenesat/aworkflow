@@ -102,7 +102,7 @@ cycles, manager role resolution, lifecycle combinations).
 | `backup_team` | string | Next team for deterministic harness-recovery retries (operational fallback). |
 | `upgrade_to` | string | Quality/capability escalation edge selectable by manager `upgrade_next_implementation` (one hop per decision). |
 
-Legacy inline role keys (`worker = "codex.high"` directly under
+Legacy inline role keys (`worker = "codex.sol-high"` directly under
 `[teams.<name>]`) are accepted only when no `roles` table is present.
 Backup/upgrade chains are validated at load: targets must exist, cannot be
 self-references, and cannot form cycles.
@@ -328,7 +328,7 @@ least one required:
 next_step = "implement_plan"
 team = "strong"
 max_turns = 20
-roles = { worker = "codex.high" }   # run-local role-selector hotplug
+roles = { worker = "codex.sol-high" }   # run-local role-selector hotplug
 notes = ["Re-run the focused regression before broader tests."]
 ```
 
@@ -628,7 +628,8 @@ selections omit `end_reason`.
 
 ```
 aflow run [--plan/-p PLAN] [--workflow/-w WF] [--max-turns/-mt N]
-          [--team/-t TEAM] [--start-step/-ss STEP] [--resume [RUN_ID]]
+          [--run-id RUN_ID] [--team/-t TEAM] [--start-step/-ss STEP]
+          [--resume [RUN_ID]]
           [--resume-reset-scope] [positionals...] [-- EXTRA...]
 aflow install-skills [DESTINATION] [--yes] [--include-optional] [--only SKILL]
 aflow analyze [RUN_ID] [--all] [--repo-root REPO] [--limit N]
@@ -643,21 +644,29 @@ aflow show [WORKFLOW_NAME]
   clear error). After `--`, everything is extra instructions appended to the
   rendered step prompt.
 - `--max-turns` overrides `[aflow].max_turns` for the invocation.
+- `--run-id` supplies an advanced canonical identity already reserved by a
+  control-plane caller; ordinary interactive runs should let AFlow allocate it.
 - `--team` overrides the workflow team for the run.
 - `--start-step` accepts a step name or 1-based index; rejected if the plan is
   already complete.
 - `--resume` (optional RUN_ID, default `AUTO`) forces resume; plain `aflow
   run` may offer an interactive auto-resume. Resolution order:
   `.aflow/last_run_ids/<shell-id>`, `AFLOW_LAST_RUN_ID`, `.aflow/last_run_id`.
-  Resumable runs: worktree lifecycle, status `failed`/`running`, plan not
-  complete, no merge teardown entered, invocation identity matches.
-- `--resume-reset-scope` requires an explicit RUN_ID; reuses worktree +
-  manager history but restarts from the invocation's original plan with a
+  Resumable runs may use no lifecycle, branch-only, or linked-worktree
+  lifecycle; each requires complete lifecycle-specific identity, status
+  `failed`/`running`/`waiting_for_valid_override`, and matching invocation
+  identity. Normally the plan is incomplete and merge teardown has not begun.
+  The only completed-plan exception is a failed `transition_end` merge with a
+  durable failure reason and configured merge teardown; that continuation
+  retries terminal integration without launching a workflow harness.
+- `--resume-reset-scope` requires an explicit RUN_ID; reuses lifecycle context
+  and manager history but restarts from the invocation's original plan with a
   fresh checkpoint scope.
 - Startup prompts (interactive-only, fail clearly without TTYs): start-step
-  selection for partly complete plans, stale `Pre-Handoff Base HEAD` refresh,
-  inconsistent-checkpoint-state recovery, dirty-worktree confirmation,
-  implicit auto-resume acceptance.
+  selection for partly complete plans, inconsistent-checkpoint-state recovery,
+  dirty-worktree confirmation, and implicit auto-resume acceptance. A pristine
+  plan's empty or stale `Pre-Handoff Base HEAD` is refreshed automatically and
+  is not a prompt.
 
 `install-skills` details: destination omitted → auto-detect supported harness
 CLIs on PATH and install into each harness's global skill directory
@@ -750,13 +759,14 @@ Parser rules:
 - Snapshots record: current checkpoint name/index, unchecked checkpoint
   count, current checkpoint unchecked step count, total checkpoint count.
 
-Plan metadata: a `## Git Tracking` section (outside fenced blocks, at most
-one live section) carries `Plan Branch`, `Pre-Handoff Base HEAD`, `Last
-Reviewed Head`, and a review log. `Pre-Handoff Base HEAD` refresh is one of
-the interactive startup prompts. Plans also get `Plan Branch:` lines rewritten
-during lifecycle setup; the engine tracks `plans/in-progress/` as the durable
-plan location and `plans/backups/` for original-plan backups (reused when
-content matches, `_vNN` versions otherwise).
+Plan metadata: a `## Git Tracking` section (outside fenced blocks, at most one
+live section) carries `Plan Branch`, `Pre-Handoff Base HEAD`, `Last Reviewed
+Head`, and a review log. A pristine fresh plan's empty or stale base is refreshed
+automatically; started, resumed, malformed, or ambiguous plans are not silently
+rewritten. Plans also get `Plan Branch:` lines rewritten during lifecycle
+setup; the engine tracks `plans/in-progress/` as the durable plan location and
+`plans/backups/` for original-plan backups (reused when content matches,
+`_vNN` versions otherwise).
 
 ## 15. MCP Control Plane (aflowd)
 
@@ -768,9 +778,9 @@ workflows remain unchanged and are never guessed into daemon-owned state.
 ### Daemon and app config
 
 `aflowd` CLI: `--repo-root` (default cwd), `--config` (required app TOML),
-`--aflow-executable`, `--environment-file` (required, bearer-token
-EnvironmentFile; the p100 deploy tooling additionally enforces mode 0600),
-`--release-identity`, `--once`.
+`--aflow-executable`, `--environment-file` (required bearer-token
+EnvironmentFile; deployments should enforce restrictive ownership and
+permissions), `--release-identity`, `--once`.
 
 The app TOML carries `[control_plane]` with a `[[control_plane.projects]]`
 allowlist (project id, repo root, config path, aflow executable, environment
@@ -845,9 +855,9 @@ approval_mode = "approve"
 # ... same for answer_startup, control_run, owner_stop, resume_run
 ```
 
-Validate a client config with
-`python3 deploy/aflowd/validate-mcp-config.py ~/.codex/config.toml` (see the
-example at `deploy/aflowd/aflow-control-plane.mcp.example.toml`).
+Validate the final client configuration with the client's own parser before
+connecting. Keep the URL private and free of query strings, fragments,
+userinfo, or literal bearer values; keep every write tool approval-gated.
 
 ### Semantics
 

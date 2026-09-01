@@ -19,21 +19,16 @@ is authoritative and occurs once during guard setup.
 Observe an existing instance only. Never start a temporary stdio daemon for a
 tick and never close a daemon-owned stdio session.
 
-### Production aflowd
+### Remote aflowd
 
-Production `aflowd` exposes authenticated REST, React UI, SSE, and MCP, and
-owns workflow units named `aflow-run-<run-id>.service`. Use only advertised
-endpoints. The supported p100 deployment currently documents:
-
-- web UI: `http://100.103.69.9:8765/`
-- readiness: `http://100.103.69.9:8765/ready`
-- MCP: `http://100.103.69.9:8765/mcp`
-- event stream:
-  `/api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`
-
-Those p100 URLs are deployment-specific documentation, not defaults for other
-hosts. Never guess a port or route. Bearer tokens remain in authorization
-headers and must never appear in URLs, prompts, logs, or reports.
+Remote `aflowd` exposes authenticated REST, React UI, SSE, and MCP, and owns
+workflow units named `aflow-run-<run-id>.service`. Use only endpoints supplied
+by the user, the deployment configuration, or capability discovery. The stable
+product paths are `/ready`, `/mcp`, and
+`/api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`, but no
+host, scheme, or port is a product default. Never guess an endpoint. Bearer
+tokens remain in authorization headers and must never appear in URLs, prompts,
+logs, or reports.
 
 ## MCP version 1 contract
 

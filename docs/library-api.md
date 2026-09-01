@@ -1,6 +1,10 @@
 # Library API
 
-You can use `aflow` as a Python library instead of invoking the CLI. The public API is available under `aflow.api` and re-exported from the top-level `aflow` package for stable imports.
+You can use `aflow` as a Python library instead of invoking the CLI. The full
+public surface is available under `aflow.api`. Core startup, execution, and
+observer names are also re-exported from the top-level `aflow` package for
+compact imports; analysis, control-plane models, and manager-specific event
+classes should be imported from `aflow.api`.
 
 ## Startup and Execution
 
@@ -99,7 +103,7 @@ active-scope rejection and attempt histories, the latest exact rejection, prior
 decisions, and pending/applied repartition evidence. Stored boundaries rebuild
 from captured inputs rather than mutable live plans.
 
-## Manager Events
+## Manager and Hotplug Events
 
 `ExecutionObserver` can receive additive `manager_started` and
 `manager_decided` events. It can also receive
@@ -117,9 +121,15 @@ candidate, mechanical-validation, and semantic-verdict paths. The additive
 event reports a controller-applied execution-boundary change; it does not mean
 the first child passed review.
 
+The `ExecutionEvent` union also carries the four hotplug event types:
+`hotplug_requested`, `hotplug_stage_changed`, `hotplug_applied`, and
+`hotplug_failed`. Their payload is secret-safe transaction metadata; inspect
+the referenced run-relative artifacts only when authorized.
+
 ## Public Types
 
-The stable public API includes:
+The top-level `aflow` package includes the core startup/execution and observer
+types used above:
 
 - `StartupRequest`
 - `StartupQuestion`
@@ -133,10 +143,9 @@ The stable public API includes:
 - `prepare_startup`
 - `prepare_startup_with_answer`
 - `execute_workflow`
-- `AnalyzeRequest`
-- `analyze_runs`
-- `ManagerStartedEvent`
-- `ManagerDecidedEvent`
-- `CheckpointRepartitionedEvent`
+
+`aflow.api` additionally exposes `AnalyzeRequest`, `analyze_runs`, the
+versioned control-plane models, and `ManagerStartedEvent`,
+`ManagerDecidedEvent`, and `CheckpointRepartitionedEvent`.
 
 See [Architecture](../ARCHITECTURE.md) for module-level notes and model details.
