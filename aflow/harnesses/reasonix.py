@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 import select
+import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .base import HarnessInvocation
 from .session import SessionCapabilities, SessionExecutionResult, SessionRequest, SessionResult
@@ -15,6 +16,9 @@ from .preflight import (
     HarnessPreflightProbe,
     diagnostic_fields,
 )
+
+
+REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS = 60.0
 
 
 def _collect_acp_session_ids(value: object, found: set[str]) -> None:
@@ -120,6 +124,25 @@ def _require_applied_config_values(
                 f"Reasonix ACP option '{option_id}' did not acknowledge required value "
                 f"'{desired_value}'"
             )
+
+
+def _config_update_notification_result(
+    event: Mapping[str, Any], *, session_id: str
+) -> Mapping[str, Any] | None:
+    """Adapt one exact same-session config update into a response result."""
+    if event.get("method") != "session/update":
+        return None
+    params = event.get("params")
+    if not isinstance(params, Mapping) or params.get("sessionId") != session_id:
+        return None
+    update = params.get("update")
+    if (
+        not isinstance(update, Mapping)
+        or update.get("sessionUpdate") != "config_option_update"
+        or not isinstance(update.get("configOptions"), list)
+    ):
+        return None
+    return {"sessionId": session_id, "configOptions": update["configOptions"]}
 
 
 def parse_acp_jsonrpc(
@@ -268,6 +291,7 @@ class ReasonixAcpProcess:
         self._next_id = 1
         self.last_request_id: int | None = None
         self.notifications: list[Mapping[str, Any]] = []
+        self._settled_request_ids: set[int] = set()
 
     @classmethod
     def start(cls, *, repo_root: Path, executable: str = "reasonix") -> "ReasonixAcpProcess":
@@ -279,7 +303,13 @@ class ReasonixAcpProcess:
         return cls(process)
 
     def request(
-        self, method: str, params: Mapping[str, Any], *, timeout_seconds: float = 10.0
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        timeout_seconds: float = 10.0,
+        accept_notification: Callable[[Mapping[str, Any]], Mapping[str, Any] | None]
+        | None = None,
     ) -> Mapping[str, Any]:
         if self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError("Reasonix ACP stdio transport is unavailable")
@@ -291,8 +321,12 @@ class ReasonixAcpProcess:
             "params": dict(params),
         }) + "\n")
         self.process.stdin.flush()
+        deadline = time.monotonic() + timeout_seconds
         while True:
-            ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Reasonix ACP response timed out")
+            ready, _, _ = select.select([self.process.stdout], [], [], remaining)
             if not ready:
                 raise TimeoutError("Reasonix ACP response timed out")
             line = self.process.stdout.readline()
@@ -308,8 +342,24 @@ class ReasonixAcpProcess:
                 )
             if "method" in event and "id" not in event:
                 self.notifications.append(event)
+                notification_result = (
+                    accept_notification(event)
+                    if accept_notification is not None
+                    else None
+                )
+                if notification_result is not None:
+                    self._settled_request_ids.add(request_id)
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": dict(notification_result),
+                    }
                 continue
-            if event.get("id") != request_id:
+            response_id = event.get("id")
+            if response_id in self._settled_request_ids:
+                self._settled_request_ids.remove(response_id)
+                continue
+            if response_id != request_id:
                 raise ValueError("Reasonix ACP response id mismatch")
             if "error" in event:
                 raise RuntimeError(f"Reasonix ACP error: {event['error']}")
@@ -412,7 +462,11 @@ class ReasonixAcpDriver:
                 open_method = "session/resume"
             else:
                 open_method = "session/new"
-            opened = process.request(open_method, session_params)
+            opened = process.request(
+                open_method,
+                session_params,
+                timeout_seconds=REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS,
+            )
             wire.extend(process.notifications)
             process.notifications.clear()
             wire.append(opened)
@@ -438,7 +492,14 @@ class ReasonixAcpDriver:
                         "sessionId": session_id,
                         "configId": config_id,
                         "value": value,
-                    })
+                    },
+                        timeout_seconds=REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS,
+                        accept_notification=lambda event: (
+                            _config_update_notification_result(
+                                event, session_id=session_id
+                            )
+                        ),
+                    )
                 except (OSError, RuntimeError, TimeoutError, ValueError):
                     raise RuntimeError(
                         f"Reasonix ACP option '{config_id}' update failed"

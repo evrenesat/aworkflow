@@ -1,6 +1,5 @@
 from pathlib import Path
 from dataclasses import dataclass, field
-import json
 
 import pytest
 
@@ -411,7 +410,12 @@ class _FakeReasonixAcpProcess:
         }
 
     def request(
-        self, method: str, params: dict[str, object], *, timeout_seconds: float = 10.0
+        self,
+        method: str,
+        params: dict[str, object],
+        *,
+        timeout_seconds: float = 10.0,
+        accept_notification=None,
     ) -> dict[str, object]:
         self.calls.append((method, dict(params), timeout_seconds))
         self.last_request_id += 1
@@ -491,6 +495,9 @@ def test_reasonix_owned_executor_sets_yolo_before_model_effort_and_prompt_for_ne
         {"sessionId": "fresh", "configId": "model", "value": "sol"},
         {"sessionId": "fresh", "configId": "effort", "value": "high"},
     ]
+    assert [call[2] for call in fake.calls[:4]] == [
+        reasonix_module.REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS,
+    ] * 4
     assert fake.calls[4][1]["prompt"][0]["type"] == "text"
     assert fake.calls[4][2] > 60
     assert control_calls == ["control"]
@@ -519,6 +526,9 @@ def test_reasonix_owned_executor_sets_yolo_before_model_effort_and_prompt_for_re
         "configId": "tool_approval",
         "value": "yolo",
     }
+    assert [call[2] for call in fake.calls[:2]] == [
+        reasonix_module.REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS,
+    ] * 2
     assert execution.result.session_id == "source"
     assert execution.result.model is None
     assert execution.result.effort is None
@@ -645,7 +655,98 @@ def test_reasonix_transport_accepts_long_prompt_timeout_without_fixed_sixty_seco
     seen = []
     monkeypatch.setattr(reasonix_module.select, "select", lambda r, w, e, timeout: (seen.append(timeout) or ([r[0]], [], [])))
     ReasonixAcpProcess(Proc()).request("session/prompt", {}, timeout_seconds=3600.0)
-    assert seen == [3600.0]
+    assert seen == [pytest.approx(3600.0, abs=0.01)]
+
+
+def test_reasonix_transport_uses_one_deadline_across_notifications(monkeypatch):
+    class Stream:
+        def __init__(self):
+            self.lines = iter((
+                '{"jsonrpc":"2.0","method":"session/update","params":{}}\n',
+                '{"jsonrpc":"2.0","id":1,"result":{}}\n',
+            ))
+        def write(self, value): pass
+        def flush(self): pass
+        def readline(self): return next(self.lines)
+    class Proc:
+        stdin = Stream()
+        stdout = stdin
+    seen = []
+    clock = iter((100.0, 100.0, 101.0))
+    monkeypatch.setattr(reasonix_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        reasonix_module.select,
+        "select",
+        lambda r, w, e, timeout: (seen.append(timeout) or ([r[0]], [], [])),
+    )
+    ReasonixAcpProcess(Proc()).request("session/new", {}, timeout_seconds=10.0)
+    assert seen == [10.0, 9.0]
+
+
+def test_reasonix_transport_accepts_exact_config_update_notification(monkeypatch):
+    class Stream:
+        def write(self, value): pass
+        def flush(self): pass
+        def readline(self):
+            return (
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"sessionId":"rx-1","update":{"sessionUpdate":'
+                '"config_option_update","configOptions":[]}}}\n'
+            )
+    class Proc:
+        stdin = Stream()
+        stdout = stdin
+    monkeypatch.setattr(
+        reasonix_module.select,
+        "select",
+        lambda r, w, e, timeout: ([r[0]], [], []),
+    )
+    process = ReasonixAcpProcess(Proc())
+    response = process.request(
+        "session/set_config_option",
+        {"sessionId": "rx-1", "configId": "tool_approval", "value": "yolo"},
+        accept_notification=lambda event: (
+            reasonix_module._config_update_notification_result(
+                event, session_id="rx-1"
+            )
+        ),
+    )
+    assert response["result"] == {"sessionId": "rx-1", "configOptions": []}
+
+
+def test_reasonix_transport_discards_one_late_notification_settled_response(monkeypatch):
+    class Stream:
+        def __init__(self):
+            self.lines = iter((
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"sessionId":"rx-1","update":{"sessionUpdate":'
+                '"config_option_update","configOptions":[]}}}\n',
+                '{"jsonrpc":"2.0","id":1,"result":{"late":true}}\n',
+                '{"jsonrpc":"2.0","id":2,"result":{"current":true}}\n',
+            ))
+        def write(self, value): pass
+        def flush(self): pass
+        def readline(self): return next(self.lines)
+    class Proc:
+        stdin = Stream()
+        stdout = stdin
+    monkeypatch.setattr(
+        reasonix_module.select,
+        "select",
+        lambda r, w, e, timeout: ([r[0]], [], []),
+    )
+    process = ReasonixAcpProcess(Proc())
+    process.request(
+        "session/set_config_option",
+        {"sessionId": "rx-1"},
+        accept_notification=lambda event: (
+            reasonix_module._config_update_notification_result(
+                event, session_id="rx-1"
+            )
+        ),
+    )
+    response = process.request("session/set_config_option", {"sessionId": "rx-1"})
+    assert response["result"] == {"current": True}
 
 
 def test_reasonix_discovery_is_initialize_only_and_does_not_mutate_model(monkeypatch, tmp_path: Path):

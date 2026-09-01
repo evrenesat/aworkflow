@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-01 — Allow bounded Reasonix ACP workspace initialization
+
+- Raised Reasonix session-open and configuration-update requests from the
+  transport's 10-second default to a bounded 60 seconds, preventing larger
+  worktrees from failing before a prompt while retaining the separate
+  long-running prompt timeout.
+- Enforced one overall request deadline across ACP notifications so progress
+  traffic cannot reset the timeout indefinitely.
+- Accepted Reasonix's exact same-session `config_option_update` notification
+  as the configuration result, while retaining complete-state acknowledgement
+  checks before any prompt.
+- Ignore the single late correlated response for a request already settled by
+  that notification; all unknown response IDs remain terminal mismatches.
+- Added focused coverage for new-session and resumed-session negotiation.
+
 ## 2026-09-01 — Audit public documentation scope and accuracy
 
 - Removed the host-specific p100 deployment from public README navigation and
