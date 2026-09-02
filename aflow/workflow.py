@@ -8855,10 +8855,6 @@ def run_workflow(
                         ),
                     )
                     user_prompt += cross_handover_prompt
-                owned_executor = (
-                    callable(getattr(turn_session_driver, "execute_session", None))
-                    if turn_session_driver is not None else False
-                )
                 if (
                     (runner is None or session_driver is not None)
                     and
@@ -8868,10 +8864,8 @@ def run_workflow(
                     and transaction.source_harness == resolved.harness_name
                     and transaction.target_harness == resolved.harness_name
                     and (
-                        (turn_session_driver is None or (
-                            not turn_session_driver.capabilities.resume_with_model
-                            and not owned_executor
-                        ))
+                        turn_session_driver is None
+                        or not turn_session_driver.capabilities.resume_with_model
                     )
                 ):
                     raise RuntimeError(
@@ -8918,10 +8912,7 @@ def run_workflow(
                         session_id=(
                             previous_session.session_id
                             if previous_session is not None
-                            and (
-                                turn_session_driver.capabilities.resume_with_model
-                                or owned_executor
-                            )
+                            and turn_session_driver.capabilities.resume_with_model
                             else None
                         ),
                         idempotency_key=(
@@ -9176,10 +9167,6 @@ def run_workflow(
                         ),
                     )
                     user_prompt += cross_handover_prompt
-                owned_executor = (
-                    callable(getattr(turn_session_driver, "execute_session", None))
-                    if turn_session_driver is not None else False
-                )
                 if (
                     step.role == "worker"
                     and transaction is not None
@@ -9187,10 +9174,8 @@ def run_workflow(
                     and transaction.source_harness == resolved.harness_name
                     and transaction.target_harness == resolved.harness_name
                     and (
-                        (turn_session_driver is None or (
-                            not turn_session_driver.capabilities.resume_with_model
-                            and not owned_executor
-                        ))
+                        turn_session_driver is None
+                        or not turn_session_driver.capabilities.resume_with_model
                     )
                 ):
                     raise RuntimeError(
@@ -9237,10 +9222,7 @@ def run_workflow(
                         session_id=(
                             previous_session.session_id
                             if previous_session is not None
-                            and (
-                                turn_session_driver.capabilities.resume_with_model
-                                or owned_executor
-                            )
+                            and turn_session_driver.capabilities.resume_with_model
                             else None
                         ),
                         idempotency_key=(

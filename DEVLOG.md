@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-02 — Respect ACP exact-resume capability
+
+- Owned session execution no longer implies that a harness can resume a prior
+  session in a new process. AFlow now supplies a persisted session ID only when
+  the driver explicitly advertises `resume_with_model`.
+- Same-harness hotplug retains its exact-resume requirement, while ordinary
+  Reasonix turns start fresh ACP sessions and replace the persisted role
+  session reference after success.
+- Added a workflow-level regression for a process-local owned ACP executor.
+
 ## 2026-09-01 — Allow bounded Reasonix ACP workspace initialization
 
 - Raised Reasonix session-open and configuration-update requests from the
