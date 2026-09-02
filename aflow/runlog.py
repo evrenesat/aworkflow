@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from .plan import PlanSnapshot
@@ -475,6 +475,194 @@ def load_run_json(run_dir: Path) -> dict[str, object] | None:
         return json.loads(content)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+# 0. Evidence store
+EVIDENCE_DIRNAME = "evidence"
+EVIDENCE_KIND_DIRNAMES = {
+    "plan": "plans",
+    "checkpoint": "checkpoints",
+}
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class EvidenceReference:
+    """Typed content-addressed reference into the run-local evidence store.
+
+    ``path`` is a POSIX, repository-relative path and is the single
+    user-facing path field. Internal run-relative paths may be used during
+    validation but must never create a second exposed path field.
+    """
+
+    kind: Literal["plan", "checkpoint"]
+    path: str
+    sha256: str
+    byte_size: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _evidence_kind_dirname(kind: object) -> str:
+    try:
+        return EVIDENCE_KIND_DIRNAMES[kind]  # type: ignore[index]
+    except KeyError:
+        raise ValueError(f"unknown evidence kind: {kind!r}") from None
+
+
+def evidence_artifact_dir(paths: RunPaths, kind: str) -> Path:
+    """Return the evidence-store subdirectory for one artifact kind."""
+    return paths.run_dir / EVIDENCE_DIRNAME / _evidence_kind_dirname(kind)
+
+
+def evidence_artifact_path(paths: RunPaths, kind: str, sha256: str) -> Path:
+    """Return the digest-addressed destination beneath the run evidence store."""
+    if _SHA256_HEX_RE.fullmatch(sha256) is None:
+        raise ValueError("evidence artifact digest must be 64 lowercase hex characters")
+    return evidence_artifact_dir(paths, kind) / f"{sha256}.md"
+
+
+def evidence_reference(
+    paths: RunPaths, kind: str, sha256: str, byte_size: int
+) -> EvidenceReference:
+    """Build the typed reference whose path is relative to the repository root."""
+    destination = evidence_artifact_path(paths, kind, sha256)
+    try:
+        relative = destination.relative_to(paths.repo_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"evidence artifact is outside the repository: {destination}"
+        ) from exc
+    return EvidenceReference(
+        kind=kind,
+        path=relative.as_posix(),
+        sha256=sha256,
+        byte_size=byte_size,
+    )
+
+
+def _validate_evidence_destination(paths: RunPaths, destination: Path) -> None:
+    """Fail closed unless destination resolves inside this run's evidence store."""
+    if destination.is_symlink():
+        raise ValueError(f"evidence artifact must not be a symlink: {destination}")
+    try:
+        runs_root = paths.runs_root.resolve()
+    except OSError as exc:
+        raise ValueError(f"cannot resolve runs root: {paths.runs_root}") from exc
+    try:
+        resolved = destination.resolve(strict=False)
+        resolved.relative_to(runs_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"evidence artifact escapes the run evidence store: {destination}"
+        ) from exc
+    if not destination.is_file():
+        raise ValueError(f"evidence artifact is not a regular file: {destination}")
+
+
+def store_evidence_artifact(
+    paths: RunPaths, *, kind: str, data: bytes
+) -> EvidenceReference:
+    """Store one exact byte sequence at most once per run.
+
+    Writes are idempotent and atomic. If the digest-addressed destination
+    already exists its bytes are verified and reused; mismatched bytes are
+    never overwritten.
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    destination = evidence_artifact_path(paths, kind, digest)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        _validate_evidence_destination(paths, destination)
+        existing = destination.read_bytes()
+        if hashlib.sha256(existing).hexdigest() != digest:
+            raise ValueError(
+                "existing evidence artifact bytes do not match their filename digest"
+            )
+        return evidence_reference(paths, kind, digest, len(existing))
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    _validate_evidence_destination(paths, destination)
+    return evidence_reference(paths, kind, digest, len(data))
+
+
+def _coerce_evidence_reference(
+    paths: RunPaths, reference: EvidenceReference | Mapping[str, object]
+) -> EvidenceReference:
+    if isinstance(reference, EvidenceReference):
+        coerced = reference
+    else:
+        kind = reference.get("kind")
+        path = reference.get("path")
+        sha256 = reference.get("sha256")
+        byte_size = reference.get("byte_size")
+        if kind not in EVIDENCE_KIND_DIRNAMES or not isinstance(sha256, str):
+            raise ValueError("malformed evidence reference: kind or sha256")
+        if _SHA256_HEX_RE.fullmatch(sha256) is None:
+            raise ValueError(
+                "malformed evidence reference: sha256 must be 64 lowercase hex"
+            )
+        if not isinstance(path, str) or not isinstance(byte_size, int) or byte_size < 0:
+            raise ValueError("malformed evidence reference: path or byte_size")
+        coerced = EvidenceReference(
+            kind=str(kind), path=path, sha256=sha256, byte_size=byte_size
+        )
+    expected = evidence_reference(paths, coerced.kind, coerced.sha256, coerced.byte_size)
+    if coerced.path != expected.path:
+        raise ValueError(
+            f"evidence reference path {coerced.path!r} does not match its digest-addressed location"
+        )
+    return expected
+
+
+def resolve_evidence_artifact(
+    paths: RunPaths, reference: EvidenceReference | Mapping[str, object]
+) -> bytes:
+    """Read one evidence artifact, failing closed on any inconsistency.
+
+    Rejects missing files, escaping or symlinked paths, non-regular files,
+    uppercase or wrong digests, and byte mismatches. The resolved bytes are
+    returned only after the filename digest and declared byte size both match.
+    """
+    ref = _coerce_evidence_reference(paths, reference)
+    destination = evidence_artifact_path(paths, ref.kind, ref.sha256)
+    _validate_evidence_destination(paths, destination)
+    data = destination.read_bytes()
+    if len(data) != ref.byte_size:
+        raise ValueError(
+            f"evidence artifact byte size mismatch: declared {ref.byte_size}, found {len(data)}"
+        )
+    if hashlib.sha256(data).hexdigest() != ref.sha256:
+        raise ValueError("evidence artifact bytes do not match their declared sha256")
+    return data
+
+
+def capture_text_evidence(
+    paths: RunPaths, *, kind: str, text: str
+) -> EvidenceReference:
+    """Capture one exact UTF-8 text body (plan or checkpoint) by content hash."""
+    return store_evidence_artifact(paths, kind=kind, data=text.encode("utf-8"))
+
+
+def capture_plan_evidence(paths: RunPaths, plan_text: str) -> EvidenceReference:
+    """Capture the exact active/original plan bytes into the evidence store."""
+    return capture_text_evidence(paths, kind="plan", text=plan_text)
+
+
+def capture_checkpoint_evidence(paths: RunPaths, checkpoint_text: str) -> EvidenceReference:
+    """Capture the exact current-checkpoint bytes into the evidence store."""
+    return capture_text_evidence(paths, kind="checkpoint", text=checkpoint_text)
 
 
 def _snapshot_payload(snapshot: PlanSnapshot | None) -> dict[str, object] | None:

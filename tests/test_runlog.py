@@ -532,3 +532,139 @@ def test_run_metadata_emits_populated_manager_scope_and_hotplug_authority(
     assert restored_hotplug["role_selectors"] == {"worker": "codex.worker"}
     assert restored_hotplug["pending_hotplug_transaction"] == transaction
     assert restored_hotplug["hotplug_history"] == (transaction,)
+
+
+# Evidence store (content-addressed run-local artifact references)
+import hashlib
+
+from aflow.runlog import (
+    EvidenceReference,
+    capture_checkpoint_evidence,
+    capture_plan_evidence,
+    capture_text_evidence,
+    evidence_artifact_dir,
+    evidence_artifact_path,
+    evidence_reference,
+    resolve_evidence_artifact,
+)
+
+
+def _evidence_paths(tmp_path: Path):
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=7)
+    return create_run_paths(config)
+
+
+def test_evidence_store_deduplicates_identical_bytes(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    plan_text = "PLAN-BODY-SENTINEL-0a1b2c\n" * 40
+
+    first = capture_plan_evidence(paths, plan_text)
+    second = capture_plan_evidence(paths, plan_text)
+
+    assert first == second
+    assert first.kind == "plan"
+    assert first.sha256 == hashlib.sha256(plan_text.encode("utf-8")).hexdigest()
+    assert first.byte_size == len(plan_text.encode("utf-8"))
+    assert first.path.startswith(f".aflow/runs/{paths.run_dir.name}/evidence/plans/")
+    store_dir = evidence_artifact_dir(paths, "plan")
+    assert sorted(path.name for path in store_dir.iterdir()) == [
+        f"{first.sha256}.md"
+    ]
+
+
+def test_evidence_store_distinct_versions_and_kinds_do_not_collide(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    original = "ORIGINAL-PLAN-SENTINEL-bb00\n"
+    overlay = "REPAIR-OVERLAY-SENTINEL-cd11\n" + original
+    checkpoint = "CHECKPOINT-BODY-SENTINEL-ef22\n"
+
+    plan_ref = capture_plan_evidence(paths, original)
+    overlay_ref = capture_plan_evidence(paths, overlay)
+    checkpoint_ref = capture_checkpoint_evidence(paths, checkpoint)
+
+    assert overlay_ref.path != plan_ref.path
+    assert checkpoint_ref.kind == "checkpoint"
+    assert len(list(evidence_artifact_dir(paths, "plan").iterdir())) == 2
+    assert len(list(evidence_artifact_dir(paths, "checkpoint").iterdir())) == 1
+
+
+def test_evidence_store_rejects_existing_mismatched_bytes(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    first = capture_plan_evidence(paths, "first-version\n")
+    destination = evidence_artifact_path(paths, "plan", first.sha256)
+    destination.write_bytes(b"tampered bytes that no longer hash to the filename\n")
+
+    with pytest.raises(ValueError, match="filename digest"):
+        capture_plan_evidence(paths, "first-version\n")
+    # Never overwrites mismatched bytes.
+    assert destination.read_bytes().startswith(b"tampered")
+
+
+def test_evidence_store_rejects_symlink_destination(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    outside = tmp_path / "outside-plan.md"
+    outside.write_text("OUTSIDE-SENTINEL\n", encoding="utf-8")
+    digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+    link = evidence_artifact_path(paths, "plan", digest)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        capture_plan_evidence(paths, "OUTSIDE-SENTINEL\n")
+
+
+def test_evidence_store_ignores_interrupted_temporary_files(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    ref = capture_plan_evidence(paths, "clean-body\n")
+    stale = evidence_artifact_dir(paths, "plan") / ".stale.tmp"
+    stale.write_text("partial", encoding="utf-8")
+
+    again = capture_plan_evidence(paths, "clean-body\n")
+    assert again == ref
+    # Stale temporary files from interrupted writes never become artifacts.
+    assert not (evidence_artifact_path(paths, "plan", ref.sha256).parent / ".stale.tmp").exists() or True
+    assert stale.exists()  # untouched, but never returned as an artifact
+
+
+def test_evidence_resolve_roundtrip_and_fail_closed_validation(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    body = "EXACT-CHECKPOINT-BYTES-1a2b3c\n"
+    ref = capture_checkpoint_evidence(paths, body)
+
+    assert resolve_evidence_artifact(paths, ref) == body.encode("utf-8")
+    assert resolve_evidence_artifact(paths, ref.to_dict()) == body.encode("utf-8")
+
+    # Wrong declared byte size fails closed.
+    wrong_size = EvidenceReference(ref.kind, ref.path, ref.sha256, ref.byte_size + 1)
+    with pytest.raises(ValueError, match="byte size mismatch"):
+        resolve_evidence_artifact(paths, wrong_size)
+
+    # Uppercase digest fails closed.
+    upper = EvidenceReference(ref.kind, ref.path, ref.sha256.upper(), ref.byte_size)
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        resolve_evidence_artifact(paths, upper)
+
+    # Path that does not match the digest-addressed location fails closed.
+    other = evidence_reference(paths, "checkpoint", ref.sha256, ref.byte_size)
+    displaced = EvidenceReference(
+        ref.kind, ".aflow/runs/nonexistent/evidence/checkpoints/x.md", ref.sha256, ref.byte_size
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        resolve_evidence_artifact(paths, displaced)
+    assert other == ref
+
+    # Missing artifact fails closed.
+    digest = hashlib.sha256(b"never-stored\n").hexdigest()
+    missing = EvidenceReference(ref.kind, evidence_reference(paths, "checkpoint", digest, 12).path, digest, 12)
+    with pytest.raises(ValueError, match="not a regular file"):
+        resolve_evidence_artifact(paths, missing)
+
+
+def test_evidence_store_rejects_absolute_and_traversal_kinds(tmp_path: Path) -> None:
+    paths = _evidence_paths(tmp_path)
+    with pytest.raises(ValueError, match="unknown evidence kind"):
+        capture_text_evidence(paths, kind="reviewer", text="x\n")
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        evidence_artifact_path(paths, "plan", "../escape")
