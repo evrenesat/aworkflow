@@ -30,8 +30,14 @@ from aflow.run_state import ControllerState, RetryContext, ResumeContext, hotplu
 from aflow.config import GoTransition, HarnessProfileConfig, TeamConfig, WorkflowConfig, WorkflowHarnessConfig, WorkflowStepConfig, WorkflowUserConfig
 from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.base import HarnessInvocation
-from aflow.harnesses.session import SessionCapabilities, SessionRequest, SessionResult
+from aflow.harnesses.session import (
+    SessionCapabilities,
+    SessionExecutionResult,
+    SessionRequest,
+    SessionResult,
+)
 from aflow.harnesses.reasonix import ReasonixAcpDriver
+from aflow.harnesses.preflight import NoOpHarnessPreflightProbe
 from aflow.run_state import PendingTeamOverride
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, resolve_role_selector, run_workflow
@@ -140,6 +146,90 @@ def test_same_harness_native_resume_uses_exact_session_id(tmp_path: Path) -> Non
         returncode=0,
     )
     assert result.session_id == "source-session"
+
+
+def test_owned_executor_without_exact_resume_starts_fresh_session(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
+        encoding="utf-8",
+    )
+    previous = HarnessSessionRefV1(
+        session_id="process-local-session",
+        role="worker",
+        selector="codex.high",
+        harness="codex",
+        profile="high",
+        model_display="codex / high",
+    )
+    resume = ResumeContext(
+        resumed_from_run_id="previous-run",
+        feature_branch=None,
+        worktree_path=None,
+        main_branch=None,
+        setup=(),
+        teardown=(),
+        interrupted_step_name="implement",
+        role_selectors={"worker": "codex.high"},
+        active_role_sessions=(previous,),
+    )
+
+    class ProcessLocalOwnedDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True,
+            followup_turn=True,
+            resume_with_model=False,
+        )
+
+        def __init__(self) -> None:
+            self.requested_session_ids: list[str | None] = []
+
+        def build_invocation(self, request):
+            self.requested_session_ids.append(request.session_id)
+            return HarnessInvocation(
+                label="process-local-owned",
+                argv=("process-local-owned",),
+                env={},
+                prompt_mode="stdin",
+                system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt,
+                effective_prompt=request.user_prompt,
+                stdin_text=request.user_prompt,
+            )
+
+        def execute_session(self, request, invocation, control_callback=None):
+            plan.write_text(
+                "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n",
+                encoding="utf-8",
+            )
+            return SessionExecutionResult(
+                result=SessionResult(
+                    session_id="fresh-process-session",
+                    selector=request.selector,
+                    model=request.model,
+                    effort=request.effort,
+                    final_output="DONE",
+                    capabilities=self.capabilities,
+                ),
+                raw_transport="fresh owned session",
+            )
+
+    driver = ProcessLocalOwnedDriver()
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+        _controller_config(),
+        "live",
+        config_dir=tmp_path,
+        adapter=CodexAdapter(),
+        session_driver=driver,
+        resume=resume,
+        preflight_probe=NoOpHarnessPreflightProbe(),
+    )
+
+    assert result.status == "completed"
+    assert driver.requested_session_ids == [None]
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert state["active_role_sessions"][0]["session_id"] == "fresh-process-session"
 
 
 def test_live_run_workflow_consumes_semantic_session_output(tmp_path: Path) -> None:
