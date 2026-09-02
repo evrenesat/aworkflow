@@ -8,6 +8,7 @@ from .base import HarnessInvocation
 class GeminiAdapter:
     name = "gemini"
     supports_effort = False
+    manager_workspace_read = True
 
     def build_invocation(
         self,

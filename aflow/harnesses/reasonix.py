@@ -208,6 +208,7 @@ class ReasonixAdapter:
 
     name = "reasonix"
     supports_effort = True
+    manager_workspace_read = True
 
     def session_driver(self, initialize_payload: Mapping[str, Any]) -> "ReasonixAcpDriver":
         return ReasonixAcpDriver.from_initialize(initialize_payload)
@@ -225,22 +226,24 @@ class ReasonixAdapter:
         # Current Reasonix releases expose the directory option only as
         # ``--dir``.  The old single-dash spelling exits during argument
         # parsing before the agent can produce diagnostics.
+        #
+        # One-shot prompt text travels on stdin, never in argv: a prompt can
+        # then never fail execve with E2BIG. Owned ACP sessions are unchanged.
         argv: list[str] = ["reasonix", "run", "--dir", str(repo_root)]
         if model is not None:
             argv.extend(["--model", model])
         if effort is not None:
             argv.extend(["--effort", effort])
-        argv.append(effective_prompt)
-        final_output_argv = [*argv[:-1], "--print", effective_prompt]
         return HarnessInvocation(
             label=self.name,
             argv=tuple(argv),
             env={},
-            prompt_mode="prefix-system-into-user-prompt",
+            prompt_mode="stdin",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             effective_prompt=effective_prompt,
-            final_output_argv=tuple(final_output_argv),
+            stdin_text=effective_prompt,
+            final_output_argv=tuple([*argv, "--print"]),
         )
 
     def preflight_environment(

@@ -8,6 +8,7 @@ from .base import HarnessInvocation
 class OpencodeAdapter:
     name = "opencode"
     supports_effort = False
+    manager_workspace_read = True
 
     def build_invocation(
         self,

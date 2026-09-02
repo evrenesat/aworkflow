@@ -30,12 +30,12 @@ class AdaptersTests(unittest.TestCase):
             '/repo',
             '--model',
             'deepseek-pro',
-            'SYSTEM\n\nUSER',
         )
         assert '-dir' not in invocation.argv
         assert adapter.supports_effort
-        assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
+        assert invocation.prompt_mode == 'stdin'
         assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
+        assert invocation.stdin_text == invocation.effective_prompt
         final_invocation = invocation.for_final_output()
         assert '--print' not in invocation.argv
         assert final_invocation.argv == (
@@ -46,9 +46,10 @@ class AdaptersTests(unittest.TestCase):
             '--model',
             'deepseek-pro',
             '--print',
-            'SYSTEM\n\nUSER',
         )
-        assert final_invocation.argv.index('--print') < final_invocation.argv.index('SYSTEM\n\nUSER')
+        # The prompt is never an argv element in either form.
+        assert 'SYSTEM\n\nUSER' not in final_invocation.argv
+        assert final_invocation.stdin_text == invocation.effective_prompt
 
     def test_reasonix_without_model_and_with_effort(self) -> None:
         adapter = ReasonixAdapter()
@@ -60,15 +61,15 @@ class AdaptersTests(unittest.TestCase):
             effort='high',
         )
         assert invocation.argv == (
-            'reasonix', 'run', '--dir', '/repo', '--effort', 'high', 'SYSTEM\n\nUSER'
+            'reasonix', 'run', '--dir', '/repo', '--effort', 'high'
         )
         assert '-dir' not in invocation.argv
         assert invocation.argv[invocation.argv.index('--effort') + 1] == 'high'
         assert '--model' not in invocation.argv
         assert invocation.for_final_output().argv == (
-            'reasonix', 'run', '--dir', '/repo', '--effort', 'high', '--print',
-            'SYSTEM\n\nUSER'
+            'reasonix', 'run', '--dir', '/repo', '--effort', 'high', '--print'
         )
+        assert invocation.stdin_text == 'SYSTEM\n\nUSER'
 
     def test_reasonix_flash_max_effort_is_forwarded(self) -> None:
         adapter = ReasonixAdapter()
@@ -81,8 +82,10 @@ class AdaptersTests(unittest.TestCase):
         )
         assert invocation.argv == (
             'reasonix', 'run', '--dir', '/repo', '--model', 'deepseek-flash',
-            '--effort', 'max', 'SYSTEM\n\nUSER'
+            '--effort', 'max'
         )
+        assert invocation.stdin_text == 'SYSTEM\n\nUSER'
+        assert invocation.prompt_mode == 'stdin'
 
     def test_codex_without_effort(self) -> None:
         adapter = CodexAdapter()
@@ -2946,3 +2949,55 @@ class PreflightTests(unittest.TestCase):
             )
         self.assertTrue(result.timed_out)
         self.assertIsNone(result.returncode)
+
+    def test_reasonix_oversized_prompt_never_touches_argv(self) -> None:
+        adapter = ReasonixAdapter()
+        # Far beyond Linux's per-argument execve limit (128 KiB): the prompt
+        # must travel on stdin so execve can never fail with E2BIG.
+        prompt = "E2BIG-PROMPT-SENTINEL-" + ("p" * 200_000)
+        invocation = adapter.build_invocation(
+            repo_root=Path('/repo'),
+            model='deepseek-pro',
+            system_prompt='SYSTEM',
+            user_prompt=prompt,
+        )
+        argv_bytes = sum(len(argument.encode('utf-8')) for argument in invocation.argv)
+        assert invocation.prompt_mode == 'stdin'
+        assert invocation.stdin_text == 'SYSTEM\n\n' + prompt
+        assert argv_bytes < 1_024
+        assert all('E2BIG-PROMPT-SENTINEL' not in argument for argument in invocation.argv)
+        final = invocation.for_final_output()
+        assert final.argv == (*invocation.argv, '--print')
+        assert final.stdin_text == invocation.stdin_text
+
+    def test_reasonix_declares_manager_workspace_read(self) -> None:
+        from aflow.harnesses.base import adapter_manager_workspace_read
+        assert ReasonixAdapter().manager_workspace_read is True
+        assert adapter_manager_workspace_read(ReasonixAdapter()) is True
+
+    def test_manager_workspace_read_is_fail_closed_for_unknown_adapters(self) -> None:
+        from aflow.harnesses.base import adapter_manager_workspace_read
+
+        class LegacyAdapter:
+            name = 'legacy'
+            supports_effort = False
+
+            def build_invocation(self, **kwargs):  # pragma: no cover
+                raise NotImplementedError
+
+        assert adapter_manager_workspace_read(LegacyAdapter()) is False
+        assert adapter_manager_workspace_read(object()) is False
+
+    def test_coding_adapters_advertise_manager_workspace_read(self) -> None:
+        from aflow.harnesses.base import adapter_manager_workspace_read
+        from aflow.harnesses.claude import ClaudeAdapter
+        from aflow.harnesses.copilot import CopilotAdapter
+        from aflow.harnesses.gemini import GeminiAdapter
+        from aflow.harnesses.kiro import KiroAdapter
+        from aflow.harnesses.opencode import OpencodeAdapter
+        from aflow.harnesses.pi import PiAdapter
+        for adapter in (
+            CodexAdapter(), ClaudeAdapter(), CopilotAdapter(), GeminiAdapter(),
+            KiroAdapter(), OpencodeAdapter(), PiAdapter(), ReasonixAdapter(),
+        ):
+            assert adapter_manager_workspace_read(adapter) is True, adapter.name

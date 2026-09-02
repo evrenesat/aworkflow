@@ -27,6 +27,7 @@ def probe_codex_capabilities(exec_help: str, resume_help: str) -> SessionCapabil
 class CodexAdapter:
     name = "codex"
     supports_effort = True
+    manager_workspace_read = True
 
     def session_driver(
         self, *, exec_help: str, resume_help: str

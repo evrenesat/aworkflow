@@ -26,6 +26,10 @@ class HarnessInvocation:
 class HarnessAdapter(Protocol):
     name: str
     supports_effort: bool
+    # True only for adapters whose noninteractive coding mode can read
+    # repository files (reference-only manager contexts depend on this).
+    # The default is fail-closed false: absent attributes never advertise.
+    manager_workspace_read: bool
 
     def build_invocation(
         self,
@@ -37,3 +41,8 @@ class HarnessAdapter(Protocol):
         effort: str | None = None,
     ) -> HarnessInvocation:
         ...
+
+
+def adapter_manager_workspace_read(adapter: object) -> bool:
+    """Fail-closed capability probe for manager workspace reads."""
+    return bool(getattr(adapter, "manager_workspace_read", False))

@@ -8,6 +8,7 @@ from .base import HarnessInvocation
 class CopilotAdapter:
     name = "copilot"
     supports_effort = True
+    manager_workspace_read = True
 
     def build_invocation(
         self,
