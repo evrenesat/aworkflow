@@ -29,10 +29,20 @@ from .stop_marker import extract_stop_markers
 
 MANAGER_CONTEXT_SCHEMA_VERSION = 1
 MANAGER_CONTEXT_SCHEMA_VERSION_V2 = 2
+MANAGER_CONTEXT_SCHEMA_VERSION_V3 = 3
 DIAGNOSTIC_LIMIT = 2_000
 MAX_MANAGER_NOTE_SCOPE_PATHS = 32
 MAX_MANAGER_NOTE_SCOPE_PATH_LENGTH = 240
 MAX_MANAGER_NOTE_SCOPE_IDENTITY_LENGTH = 512
+# Prompt budgets: the inline manager user manifest targets 16 KiB and is
+# hard-limited to 32 KiB before any provider process starts.
+MANAGER_INLINE_CONTEXT_TARGET_BYTES = 16 * 1024
+MANAGER_INLINE_CONTEXT_MAX_BYTES = 32 * 1024
+MANAGER_SUMMARY_MAX_CHARS = 2_000
+MANAGER_RUN_EXTRACT_MAX_RECORDS = 12
+# One shared deterministic truncation marker for every bounded semantic
+# field in schema-v3 contexts (decisions, rejections, diagnostics).
+TRUNCATION_MARKER = "\n[evidence excerpt truncated]"
 ManagerLevel = Literal["lite", "full"]
 _ALLOWED_SCOPE_DIRECTIVE_RE = re.compile(
     r"^(?:may\s+(?:create(?:\s+(?:or\s+)?modify|/modify)?|modify(?:\s+only)?)|"
@@ -131,6 +141,39 @@ class ManagerContextV2:
     original_plan_content: str | None = None
     plan_content_disclosure: dict[str, str] | None = None
     envelope: dict[str, Any] | None = None
+    active_scope_rejection_ledger: tuple[dict[str, Any], ...] = ()
+    implementation_attempts: dict[str, Any] | None = None
+    manager_decisions: tuple[dict[str, Any], ...] = ()
+    change_surface_evidence: dict[str, Any] | None = None
+    manager_note_scope: dict[str, Any] | None = None
+    retry_manager_note_scope: dict[str, Any] | None = None
+    scope_pressure_detected: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ManagerContextV3:
+    """Reference-only schema-v3 manager context.
+
+    Deliberately defines none of the v1/v2 body fields. Plan and checkpoint
+    bodies live only in the run-local content-addressed evidence store and
+    are exposed as validated references; the manager reads them from disk
+    only when the compact manifest is insufficient.
+    """
+
+    schema_version: int
+    run_id: str
+    decision_number: int
+    level: ManagerLevel
+    trigger: str
+    finished_turn: dict[str, Any]
+    run_extract: tuple[dict[str, Any], ...]
+    plan_state: dict[str, Any]
+    controller_state: dict[str, Any]
+    evidence: dict[str, Any]
+    plan_content_disclosure: dict[str, str]
     active_scope_rejection_ledger: tuple[dict[str, Any], ...] = ()
     implementation_attempts: dict[str, Any] | None = None
     manager_decisions: tuple[dict[str, Any], ...] = ()
@@ -385,6 +428,327 @@ def _resolve_validated_envelope(
 def _unavailable_envelope(reason: str) -> dict[str, Any]:
     """Return an explicit non-authoritative verdict for missing evidence."""
     return {"available": False, "validated": False, "reason": reason}
+
+
+def _v3_run_paths(run_dir: Path):
+    """Build runlog RunPaths from a run directory without new-run creation."""
+    from .runlog import RunPaths
+
+    return RunPaths(
+        repo_root=run_dir.parent.parent.parent,
+        runs_root=run_dir.parent,
+        run_dir=run_dir,
+        turns_dir=run_dir / "turns",
+        manager_dir=run_dir / "manager",
+        run_json=run_dir / "run.json",
+    )
+
+
+def _v3_bounded_text(value: Any) -> str | None:
+    """Bound one schema-v3 semantic field with the shared truncation marker."""
+    if not isinstance(value, str):
+        return None
+    if len(value) <= MANAGER_SUMMARY_MAX_CHARS:
+        return value
+    return value[:MANAGER_SUMMARY_MAX_CHARS] + TRUNCATION_MARKER
+
+
+def _v3_ref_dict(reference: Any) -> dict[str, Any]:
+    if reference is None:
+        return {}
+    if isinstance(reference, Mapping):
+        return {
+            "kind": reference.get("kind"),
+            "path": reference.get("path"),
+            "sha256": reference.get("sha256"),
+            "byte_size": reference.get("byte_size"),
+        }
+    return {
+        "kind": getattr(reference, "kind", None),
+        "path": getattr(reference, "path", None),
+        "sha256": getattr(reference, "sha256", None),
+        "byte_size": getattr(reference, "byte_size", None),
+    }
+
+
+def _v3_unavailable(reason: str) -> dict[str, Any]:
+    return {"available": False, "reason": reason}
+
+
+def _v3_reference_entry(reference: Any) -> dict[str, Any]:
+    if reference is None:
+        return _v3_unavailable("referenced content is unavailable")
+    return {"available": True, "reference": _v3_ref_dict(reference)}
+
+
+def _capture_v3_evidence(
+    run_dir: Path,
+    *,
+    capture: bool,
+    boundary: Mapping[str, Any],
+    run_json: Mapping[str, Any],
+    finished: Mapping[str, Any],
+    plan_state_payload: Mapping[str, Any],
+    validated_envelope: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    """Capture/reuse content-addressed plan and checkpoint evidence.
+
+    ``capture`` is true only for live runtime boundaries; historical rebuilds
+    never write. Equal active/original bytes share one plan artifact. A
+    repair overlay differing from the envelope original gets its own artifact.
+    Returns (evidence, plan_content_disclosure, checkpoint_info).
+    """
+    from .runlog import (
+        capture_checkpoint_evidence,
+        capture_plan_evidence,
+        resolve_evidence_artifact,
+    )
+    from .repartition import slice_checkpoint_source
+
+    paths = _v3_run_paths(run_dir)
+    unavailable_plan = _v3_unavailable(
+        "the exact active plan bytes are unavailable at this boundary"
+    )
+
+    def available_reference(reference: Any) -> dict[str, Any] | None:
+        if reference is None:
+            return None
+        try:
+            resolve_evidence_artifact(paths, reference)
+        except ValueError:
+            return None
+        return _v3_ref_dict(reference)
+
+    # --- Exact active plan bytes ---
+    active_text: str | None = None
+    active_from = boundary.get("active_plan_content")
+    if isinstance(active_from, str):
+        active_text = active_from
+    else:
+        active_meta = plan_state_payload.get("active_plan_path")
+        if isinstance(active_meta, str):
+            active_candidate = _path_from_metadata(run_dir, active_meta)
+            if active_candidate is not None:
+                active_text = _read_text(active_candidate) or None
+    original_text: str | None = None
+    envelope_plan_ref: Any = None
+    if validated_envelope is not None and validated_envelope.get("available"):
+        envelope_plan_ref = validated_envelope.get("plan_ref")
+        if not isinstance(envelope_plan_ref, Mapping):
+            # Schema-v1 envelope payload embeds the immutable plan text.
+            embedded = validated_envelope.get("plan_text")
+            original_text = embedded if isinstance(embedded, str) else None
+    if original_text is None and envelope_plan_ref is None:
+        original_value = (
+            boundary.get("original_plan_path")
+            or run_json.get("original_plan_path")
+            or run_json.get("plan_path")
+        )
+        original_candidate = _path_from_metadata(run_dir, original_value)
+        if original_candidate is not None:
+            original_text = _read_text(original_candidate) or None
+
+    active_plan_entry = unavailable_plan
+    if active_text is not None:
+        try:
+            active_bytes = active_text.encode("utf-8")
+            if capture:
+                active_ref = capture_plan_evidence(paths, active_text)
+                active_plan_entry = _v3_reference_entry(active_ref)
+            else:
+                digest = hashlib.sha256(active_bytes).hexdigest()
+                from .runlog import evidence_reference
+
+                active_ref = evidence_reference(paths, "plan", digest, len(active_bytes))
+                resolved = available_reference(active_ref)
+                if resolved is not None:
+                    active_plan_entry = _v3_reference_entry(active_ref)
+        except ValueError as exc:
+            active_plan_entry = _v3_unavailable(str(exc))
+
+    # --- Original plan: envelope authority first, then file bytes ---
+    original_entry: dict[str, Any] = _v3_unavailable(
+        "no distinct original plan is available at this boundary"
+    )
+    if envelope_plan_ref is not None:
+        resolved = available_reference(envelope_plan_ref)
+        if resolved is not None:
+            original_entry = {
+                "available": True,
+                "reference": resolved,
+                "source": "scope_envelope",
+            }
+    if original_entry.get("available") is not True and original_text is not None:
+        if active_text is not None and original_text == active_text:
+            original_entry = {
+                "available": True,
+                "shared_with": "active_plan",
+            }
+        else:
+            try:
+                if capture:
+                    original_ref = capture_plan_evidence(paths, original_text)
+                    original_entry = {
+                        "available": True,
+                        "reference": _v3_ref_dict(original_ref),
+                        "source": "boundary_plan_file",
+                    }
+                else:
+                    digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()
+                    from .runlog import evidence_reference
+
+                    original_ref = evidence_reference(
+                        paths, "plan", digest, len(original_text.encode("utf-8"))
+                    )
+                    resolved = available_reference(original_ref)
+                    if resolved is not None:
+                        original_entry = {
+                            "available": True,
+                            "reference": _v3_ref_dict(original_ref),
+                            "source": "boundary_plan_file",
+                        }
+            except ValueError as exc:
+                original_entry = _v3_unavailable(str(exc))
+
+    # --- Current checkpoint of the active plan ---
+    checkpoint_entry: dict[str, Any] = _v3_unavailable(
+        "the current checkpoint bytes are unavailable at this boundary"
+    )
+    checkpoint_info: dict[str, Any] = {}
+    scope = boundary.get("active_implementation_scope")
+    scope_mapping = scope if isinstance(scope, Mapping) else None
+    checkpoint_index: Any = None
+    if scope_mapping is not None:
+        checkpoint_index = scope_mapping.get("checkpoint_index")
+    if not isinstance(checkpoint_index, int):
+        current = plan_state_payload.get("current_checkpoint")
+        if isinstance(current, Mapping):
+            checkpoint_index = current.get("index")
+    if active_text is not None and isinstance(checkpoint_index, int):
+        try:
+            source_slice = slice_checkpoint_source(
+                active_text, checkpoint_index=checkpoint_index
+            )
+        except ValueError:
+            source_slice = None
+        if source_slice is not None:
+            checkpoint_text = source_slice.full_text
+            try:
+                if capture:
+                    checkpoint_ref = capture_checkpoint_evidence(paths, checkpoint_text)
+                    plan_bytes = active_text.encode("utf-8")
+                    line_end = (
+                        plan_bytes[: source_slice.checkpoint_byte_end]
+                        .decode("utf-8", "strict")
+                        .count("\n")
+                        + 1
+                    )
+                    checkpoint_info = {
+                        "checkpoint_index": source_slice.checkpoint_index,
+                        "checkpoint_name": source_slice.checkpoint_name,
+                        "line_start": source_slice.heading_line,
+                        "line_end": line_end,
+                        "byte_start": source_slice.checkpoint_byte_start,
+                        "byte_end": source_slice.checkpoint_byte_end,
+                    }
+                    checkpoint_entry = {
+                        "available": True,
+                        "reference": _v3_ref_dict(checkpoint_ref),
+                        **checkpoint_info,
+                    }
+                else:
+                    digest = hashlib.sha256(checkpoint_text.encode("utf-8")).hexdigest()
+                    from .runlog import evidence_reference
+
+                    checkpoint_ref = evidence_reference(
+                        paths, "checkpoint", digest, len(checkpoint_text.encode("utf-8"))
+                    )
+                    if available_reference(checkpoint_ref) is not None:
+                        plan_bytes = active_text.encode("utf-8")
+                        line_end = (
+                            plan_bytes[: source_slice.checkpoint_byte_end]
+                            .decode("utf-8", "strict")
+                            .count("\n")
+                            + 1
+                        )
+                        checkpoint_info = {
+                            "checkpoint_index": source_slice.checkpoint_index,
+                            "checkpoint_name": source_slice.checkpoint_name,
+                            "line_start": source_slice.heading_line,
+                            "line_end": line_end,
+                            "byte_start": source_slice.checkpoint_byte_start,
+                            "byte_end": source_slice.checkpoint_byte_end,
+                        }
+                        checkpoint_entry = {
+                            "available": True,
+                            "reference": _v3_ref_dict(checkpoint_ref),
+                            **checkpoint_info,
+                        }
+            except (ValueError, UnicodeDecodeError) as exc:
+                checkpoint_entry = _v3_unavailable(str(exc))
+                line_end = (
+                    plan_bytes[: source_slice.checkpoint_byte_end]
+                    .decode("utf-8", "strict")
+                    .count("\n")
+                    + 1
+                )
+                checkpoint_info = {
+                    "checkpoint_index": source_slice.checkpoint_index,
+                    "checkpoint_name": source_slice.checkpoint_name,
+                    "line_start": source_slice.heading_line,
+                    "line_end": line_end,
+                    "byte_start": source_slice.checkpoint_byte_start,
+                    "byte_end": source_slice.checkpoint_byte_end,
+                }
+                checkpoint_entry = {
+                    "available": True,
+                    "reference": _v3_ref_dict(checkpoint_ref),
+                    **checkpoint_info,
+                }
+            except (ValueError, UnicodeDecodeError) as exc:
+                checkpoint_entry = _v3_unavailable(str(exc))
+
+    # --- Reviewer stdout: durable turn-artifact reference, never a copy ---
+    reviewer_entry: dict[str, Any] | None = None
+    if finished.get("step_role") == "reviewer":
+        turn_dir = Path(finished["_turn_dir"])
+        stdout_path = turn_dir / "stdout.txt"
+        if stdout_path.is_file():
+            try:
+                relative = stdout_path.relative_to(run_dir).as_posix()
+                reviewer_entry = {
+                    "artifact_path": relative,
+                    "available": True,
+                    "byte_size": stdout_path.stat().st_size,
+                }
+            except (OSError, ValueError):
+                reviewer_entry = None
+    evidence: dict[str, Any] = {
+        "active_plan": active_plan_entry,
+        "original_plan": original_entry,
+        "checkpoint": checkpoint_entry,
+    }
+    if reviewer_entry is not None:
+        evidence["reviewer_stdout"] = reviewer_entry
+    # Plan disclosure mirrors what the compact manifest actually contains.
+    disclosure: dict[str, str] = {}
+    disclosure["active_plan"] = (
+        "referenced"
+        if active_plan_entry.get("available") is True
+        else "unavailable"
+    )
+    disclosure["original_plan"] = (
+        "referenced"
+        if original_entry.get("available") is True
+        else "omitted" if original_entry.get("shared_with") == "active_plan"
+        else "unavailable"
+    )
+    disclosure["checkpoint"] = (
+        "referenced"
+        if checkpoint_entry.get("available") is True
+        else "unavailable"
+    )
+    return evidence, disclosure, checkpoint_info
 
 
 def build_manager_note_scope(
@@ -658,11 +1022,18 @@ def build_manager_context(
     run_metadata: dict[str, Any] | None = None,
     boundary: dict[str, Any] | None = None,
     active_plan_content: str | None = None,
+    capture_evidence: bool = False,
 ) -> dict[str, Any]:
     """Build deterministic manager context from durable run artifacts.
 
     The exact same function is intentionally suitable for runtime and later
     analysis.  Full is the sole path that reads the active plan text.
+
+    ``capture_evidence`` is true only for live runtime boundaries: it writes
+    content-addressed plan/checkpoint evidence (idempotently, reusing any
+    existing artifact) before the schema-v3 manifest is assembled. Historical
+    rebuilds never write and disclose evidence as unavailable when the exact
+    bytes are not already stored.
     """
     run_dir = Path(run_dir)
     run_json_path = run_dir / "run.json"
@@ -1144,4 +1515,191 @@ def build_manager_context(
     # Carry the controller_state additions through the round-trip.
     if level == "full" and latest_full_rejection is not None:
         context_dict["controller_state"]["latest_full_rejection"] = latest_full_rejection
-    return context_dict
+    # --- Schema v3 (selector >= 4): reference-only compact manifest ---
+    use_v3 = (
+        use_v2
+        and isinstance(boundary_schema_version, int)
+        and boundary_schema_version >= 4
+    )
+    if not use_v3:
+        return context_dict
+    evidence, plan_content_disclosure, checkpoint_info = _capture_v3_evidence(
+        run_dir,
+        capture=capture_evidence,
+        boundary=boundary,
+        run_json=run_json,
+        finished=finished,
+        plan_state_payload=plan_state_payload,
+        validated_envelope=validated_envelope,
+    )
+    finished_turn = context.finished_turn
+    semantic_payload = finished_turn.get("semantic_result")
+    semantic_payload = dict(semantic_payload) if isinstance(semantic_payload, Mapping) else {}
+    if finished.get("step_role") == "reviewer":
+        semantic_payload["result"] = (
+            "Reviewer output is referenced by artifact; see the review stdout artifact."
+        )
+        semantic_payload["fallback"] = False
+    else:
+        semantic_payload["result"] = _v3_bounded_text(semantic_payload.get("result")) or ""
+        semantic_payload["fallback"] = bool(semantic_payload.get("fallback"))
+    v3_finished_turn = {
+        "turn_number": finished_turn.get("turn_number"),
+        "step_name": finished_turn.get("step_name"),
+        "role": finished_turn.get("role"),
+        "team": finished_turn.get("team"),
+        "selector": finished_turn.get("selector"),
+        "status": finished_turn.get("status"),
+        "returncode": finished_turn.get("returncode"),
+        "duration_seconds": finished_turn.get("duration_seconds"),
+        "semantic_result": semantic_payload,
+        "error": _v3_bounded_text(finished_turn.get("error")),
+        "snapshot_before": finished_turn.get("snapshot_before"),
+        "snapshot_after": finished_turn.get("snapshot_after"),
+        "snapshot_changed": finished_turn.get("snapshot_changed"),
+        "proposed_transition": finished_turn.get("proposed_transition"),
+        "recovery": finished_turn.get("recovery"),
+        "conditions": finished_turn.get("conditions"),
+        "detected_stop": finished_turn.get("detected_stop"),
+        "diagnostics": {
+            "signals": (
+                finished_turn.get("diagnostics", {}).get("signals")
+                if isinstance(finished_turn.get("diagnostics"), Mapping)
+                else []
+            ),
+            "signal_provenance": (
+                finished_turn.get("diagnostics", {}).get("signal_provenance")
+                if isinstance(finished_turn.get("diagnostics"), Mapping)
+                else None
+            ),
+            "stdout_excerpt": (
+                "Reviewer output is referenced by artifact; see the review stdout artifact."
+                if finished.get("step_role") == "reviewer"
+                else _v3_bounded_text(stdout)
+            ),
+            "stderr_excerpt": _v3_bounded_text(stderr),
+        },
+        "raw_artifacts": finished_turn.get("raw_artifacts"),
+    }
+    v3_controller_state = {
+        key: value
+        for key, value in context.controller_state.items()
+        if key not in {"latest_full_rejection", "repartition_evidence"}
+    }
+    if validated_envelope is not None:
+        summary: dict[str, Any] = {
+            "available": True,
+            "validated": True,
+            "artifact_path": envelope_artifact_path,
+            "artifact_sha256": envelope_artifact_sha256,
+            "canonical_envelope_sha256": envelope_canonical_sha256,
+            "schema_version": validated_envelope.get("schema_version"),
+            "scope_id": validated_envelope.get("scope_id"),
+            "checkpoint_index": validated_envelope.get("checkpoint_index"),
+            "checkpoint_name": validated_envelope.get("checkpoint_name"),
+        }
+        for field in (
+            "checkpoint_line_start", "checkpoint_line_end",
+            "checkpoint_byte_start", "checkpoint_byte_end",
+        ):
+            if field in validated_envelope:
+                summary[field] = validated_envelope[field]
+        if isinstance(validated_envelope.get("plan_ref"), Mapping):
+            summary["plan_ref"] = _v3_ref_dict(validated_envelope.get("plan_ref"))
+            summary["checkpoint_ref"] = _v3_ref_dict(
+                validated_envelope.get("checkpoint_ref")
+            )
+        else:
+            summary["plan_sha256"] = validated_envelope.get("plan_sha256")
+            summary["checkpoint_sha256"] = validated_envelope.get("checkpoint_sha256")
+        v3_controller_state["repartition_evidence"] = {
+            "status": "validated",
+            "envelope_summary": summary,
+        }
+    else:
+        envelope_reason = "no active implementation scope was captured at this boundary"
+        if active_scope_mapping is not None:
+            envelope_reason = (
+                "the captured immutable envelope is unavailable or failed validation"
+                if complete_envelope_reference
+                else "the active implementation scope has incomplete immutable envelope references"
+            )
+        v3_controller_state["repartition_evidence"] = {
+            "status": "unavailable",
+            "reason": envelope_reason,
+        }
+    if latest_full_rejection is not None:
+        summary_rejection = {
+            key: value for key, value in latest_full_rejection.items()
+            if key != "exact_reviewer_output"
+        }
+        for key in ("review_summary", "repair_plan_summary"):
+            if key in summary_rejection:
+                summary_rejection[key] = _v3_bounded_text(summary_rejection[key])
+        v3_controller_state["latest_full_rejection"] = summary_rejection
+    v3_ledger = tuple({
+        "rejection_number": row.get("rejection_number"),
+        "source_run_id": row.get("source_run_id"),
+        "review_turn_number": row.get("review_turn_number"),
+        "review_step_name": row.get("review_step_name"),
+        "reviewer_selector": row.get("reviewer_selector"),
+        "checkpoint_index": row.get("checkpoint_index"),
+        "checkpoint_name": row.get("checkpoint_name"),
+        "reviewed_implementation_turn_number": row.get("reviewed_implementation_turn_number"),
+        "reviewed_worker_team": row.get("reviewed_worker_team"),
+        "reviewed_worker_selector": row.get("reviewed_worker_selector"),
+        "review_summary": _v3_bounded_text(row.get("review_summary")),
+        "repair_plan_summary": _v3_bounded_text(row.get("repair_plan_summary")),
+        "review_stdout_artifact_path": row.get("review_stdout_artifact_path"),
+        "repair_plan_path": row.get("repair_plan_path"),
+    } for row in active_rejections)
+    v3_manager_decisions = tuple({
+        "decision_number": row.get("decision_number"),
+        "action": row.get("action"),
+        "reason": _v3_bounded_text(row.get("reason")),
+        "level": row.get("level"),
+    } for row in manager_decisions)
+    v3_run_extract = context.run_extract
+    reviewer_turn_numbers = {
+        turn.get("turn_number")
+        for turn in turns
+        if turn.get("step_role") == "reviewer"
+    }
+    bounded_extract: list[dict[str, Any]] = []
+    for record in v3_run_extract:
+        record = dict(record)
+        if record.get("kind") == "manager_decision":
+            record["semantic_summary"] = _v3_bounded_text(record.get("semantic_summary"))
+        elif record.get("number") in reviewer_turn_numbers:
+            record["semantic_summary"] = (
+                "Reviewer output is referenced by artifact; see the review stdout artifact."
+            )
+        else:
+            record["semantic_summary"] = _v3_bounded_text(record.get("semantic_summary"))
+        bounded_extract.append(record)
+    bounded_extract.sort(key=lambda item: (item.get("number", 0), item.get("kind") != "workflow_turn"))
+    v3_run_extract = tuple(bounded_extract[-MANAGER_RUN_EXTRACT_MAX_RECORDS:])
+    v3_context = ManagerContextV3(
+        schema_version=MANAGER_CONTEXT_SCHEMA_VERSION_V3,
+        run_id=context.run_id,
+        decision_number=context.decision_number,
+        level=context.level,
+        trigger=context.trigger,
+        finished_turn=v3_finished_turn,
+        run_extract=v3_run_extract,
+        plan_state=context.plan_state,
+        controller_state=v3_controller_state,
+        evidence=evidence,
+        plan_content_disclosure=plan_content_disclosure,
+        active_scope_rejection_ledger=v3_ledger,
+        implementation_attempts=scoped_attempts,
+        manager_decisions=v3_manager_decisions,
+        change_surface_evidence=change_surface,
+        manager_note_scope=manager_note_scope,
+        retry_manager_note_scope=retry_manager_note_scope,
+        scope_pressure_detected=scope_pressure,
+    )
+    v3_dict = v3_context.to_dict()
+    if retry_manager_note_scope is None:
+        v3_dict.pop("retry_manager_note_scope", None)
+    return json.loads(json.dumps(v3_dict, sort_keys=True))

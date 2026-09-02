@@ -1294,3 +1294,193 @@ def test_schema_v2_scope_pressure_reason_in_controller_state(tmp_path: Path) -> 
     cs = context["controller_state"]
     assert cs["scope_pressure_detected"] is True
     assert cs["scope_pressure_reason"] == "checkpoint too large"
+
+
+# --- Schema-v3 reference-only contexts (selector >= 4) ---
+from aflow.manager_context import (
+    MANAGER_CONTEXT_SCHEMA_VERSION_V2,
+    MANAGER_CONTEXT_SCHEMA_VERSION_V3,
+    MANAGER_INLINE_CONTEXT_TARGET_BYTES,
+    MANAGER_RUN_EXTRACT_MAX_RECORDS,
+    TRUNCATION_MARKER,
+)
+
+
+def _big_plan(text: str) -> str:
+    """Deterministic filler making the plan ~64 KiB with unique sentinels."""
+    filler = "\n".join(
+        f"- task row {index:05d} filler body" for index in range(2_600)
+    )
+    return text + "\n" + filler + "\n"
+
+
+def test_v3_context_is_reference_only_and_within_target_bytes(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan_text = _big_plan(plan.read_text(encoding="utf-8"))
+    plan.write_text(plan_text, encoding="utf-8")
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout=("WORKER-SEMANTIC-SENTINEL-77aa\n" * 20),
+    )
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=True,
+    )
+
+    assert context["schema_version"] == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+    serialized = json.dumps(context, sort_keys=True)
+    assert "PLAN-BODY" not in serialized
+    assert "task row" not in serialized
+    assert "active_plan_content" not in context
+    assert "original_plan_content" not in context
+    assert "envelope" not in context or "plan_text" not in json.dumps(context["envelope"])
+    evidence = context["evidence"]
+    active = evidence["active_plan"]
+    assert active["available"] is True
+    assert active["reference"]["kind"] == "plan"
+    assert active["reference"]["path"].startswith(".aflow/runs/run-1/evidence/plans/")
+    assert len(active["reference"]["sha256"]) == 64
+    assert evidence["original_plan"]["shared_with"] == "active_plan"
+    checkpoint = evidence["checkpoint"]
+    assert checkpoint["available"] is True
+    assert checkpoint["checkpoint_index"] == 1
+    assert checkpoint["checkpoint_name"] == "Checkpoint 1: Context"
+    assert checkpoint["line_start"] >= 1
+    assert checkpoint["byte_start"] < checkpoint["byte_end"]
+    assert checkpoint["reference"]["kind"] == "checkpoint"
+    assert context["plan_content_disclosure"] == {
+        "active_plan": "referenced",
+        "original_plan": "referenced",
+        "checkpoint": "referenced",
+    }
+    # The exact bytes live only in the evidence store.
+    plan_artifact = (
+        tmp_path / "repo" / ".aflow" / "runs" / "run-1" / "evidence" / "plans"
+        / f"{active['reference']['sha256']}.md"
+    )
+    assert plan_artifact.read_text(encoding="utf-8") == plan_text
+    assert len(serialized.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES
+    summary = context["controller_state"]["repartition_evidence"]["envelope_summary"]
+    assert summary["schema_version"] == 1
+    assert summary["canonical_envelope_sha256"]
+    assert "plan_text" not in json.dumps(summary)
+
+
+def test_v3_evidence_capture_is_idempotent_and_selector3_keeps_v2(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan_text = _big_plan(plan.read_text(encoding="utf-8"))
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    first = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan_text, capture_evidence=True,
+    )
+    evidence_dir = tmp_path / "repo" / ".aflow" / "runs" / "run-1" / "evidence"
+    plans_before = sorted((evidence_dir / "plans").iterdir())
+    second = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan_text, capture_evidence=True,
+    )
+    plans_after = sorted((evidence_dir / "plans").iterdir())
+    assert second["evidence"] == first["evidence"]
+    assert plans_after == plans_before
+    # Selector 3 continues to rebuild the exact v2 shape.
+    boundary["context_schema_version"] = 3
+    v2 = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan_text, capture_evidence=True,
+    )
+    assert v2["schema_version"] == MANAGER_CONTEXT_SCHEMA_VERSION_V2
+    assert v2["active_plan_content"] == plan_text
+    assert v2["envelope"]["available"] is True
+
+
+def test_v3_without_capture_discloses_unavailable_and_writes_nothing(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    context = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan.read_text(encoding="utf-8"),
+        capture_evidence=False,
+    )
+    evidence_store = tmp_path / "repo" / ".aflow" / "runs" / "run-1" / "evidence"
+    assert not evidence_store.exists()
+    assert context["evidence"]["active_plan"]["available"] is False
+    assert context["plan_content_disclosure"]["active_plan"] == "unavailable"
+
+
+def test_v3_reviewer_finished_turn_references_stdout_artifact(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    reviewer_stdout = "REVIEWER-EXACT-BODY-SENTINEL-9f9f\n" * 30
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout=reviewer_stdout)
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    context = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan_text, capture_evidence=True,
+    )
+
+    serialized = json.dumps(context, sort_keys=True)
+    assert "REVIEWER-EXACT-BODY-SENTINEL" not in serialized
+    reviewer = context["evidence"].get("reviewer_stdout")
+    assert reviewer is not None
+    assert reviewer["artifact_path"] == "turns/turn-001/stdout.txt"
+    assert reviewer["available"] is True
+    assert reviewer["byte_size"] == len(reviewer_stdout.encode("utf-8"))
+    result = context["finished_turn"]["semantic_result"]["result"]
+    assert "referenced by artifact" in result
+
+
+def test_v3_run_extract_is_bounded_to_twelve_records(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    for number in range(1, 16):
+        _write_turn(
+            run_dir, number,
+            step="implement", role="implementer",
+            stdout=f"result row {number}",
+        )
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    context = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan.read_text(encoding="utf-8"),
+        capture_evidence=True,
+    )
+
+    assert len(context["run_extract"]) <= MANAGER_RUN_EXTRACT_MAX_RECORDS
+    assert context["run_extract"][-1]["number"] == 15
+
+
+def test_v3_bounds_semantic_summaries_with_shared_marker(tmp_path: Path) -> None:
+    run_dir, plan = _run(tmp_path)
+    huge_result = "LONG-SEMANTIC-" + ("x" * 5_000)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=huge_result)
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    context = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan.read_text(encoding="utf-8"),
+        capture_evidence=True,
+    )
+
+    result = context["finished_turn"]["semantic_result"]["result"]
+    assert TRUNCATION_MARKER in result
+    assert len(result) <= 2_000 + len(TRUNCATION_MARKER)
+    record = context["run_extract"][0]
+    assert record["semantic_summary"] == result
