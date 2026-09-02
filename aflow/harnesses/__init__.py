@@ -6,6 +6,7 @@ from .codex import CodexAdapter
 from .copilot import CopilotAdapter
 from .gemini import GeminiAdapter
 from .kiro import KiroAdapter
+from .muse import MuseAdapter
 from .opencode import OpencodeAdapter
 from .pi import PiAdapter
 from .reasonix import ReasonixAdapter
@@ -17,6 +18,7 @@ ADAPTERS: dict[str, HarnessAdapter] = {
     "copilot": CopilotAdapter(),
     "gemini": GeminiAdapter(),
     "kiro": KiroAdapter(),
+    "muse": MuseAdapter(),
     "opencode": OpencodeAdapter(),
     "pi": PiAdapter(),
     "reasonix": ReasonixAdapter(),

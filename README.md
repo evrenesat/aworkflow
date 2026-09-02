@@ -20,7 +20,7 @@ durable control-plane service entry point.
 
 AFlow invokes existing CLIs rather than provider APIs. The selected harness must
 already be installed and authenticated. Adapters are included for Claude,
-Codex, Copilot, Gemini, Kiro, OpenCode, Pi, and Reasonix.
+Codex, Copilot, Gemini, Kiro, Muse, OpenCode, Pi, and Reasonix.
 
 Before starting a harness, AFlow checks that its required local tools are
 available. If a requirement is missing, AFlow stops and explains what is

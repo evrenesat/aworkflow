@@ -90,6 +90,7 @@ Auto-install destination map:
 | `gemini` | `~/.agents/skills` |
 | `pi` | `~/.agents/skills` |
 | `kiro` | `~/.kiro/skills` |
+| `muse` | `~/.agents/skills` |
 | `opencode` | `~/.config/opencode/skills` |
 | `claude` | `~/.claude/skills` |
 

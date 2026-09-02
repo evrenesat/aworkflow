@@ -277,6 +277,38 @@ class AdaptersTests(unittest.TestCase):
         assert 'effort' not in ' '.join(invocation.argv).lower()
         assert invocation.argv == ('kiro-cli', 'chat', '--no-interactive', '--trust-all-tools', '--model', 'kiro-model', 'SYSTEM\n\nUSER')
 
+    def test_muse_without_effort(self) -> None:
+        adapter = MuseAdapter()
+        invocation = adapter.build_invocation(repo_root=Path('/repo'), model='meta-llama', system_prompt='SYSTEM', user_prompt='USER')
+        assert adapter.supports_effort
+        assert invocation.argv == ('muse', 'exec', '--yolo', '--workspace', '/repo', '--model', 'meta-llama', 'SYSTEM\n\nUSER')
+        assert invocation.prompt_mode == 'prefix-system-into-user-prompt'
+        assert invocation.effective_prompt == 'SYSTEM\n\nUSER'
+        assert invocation.stdin_text is None
+
+    def test_muse_with_effort(self) -> None:
+        adapter = MuseAdapter()
+        invocation = adapter.build_invocation(repo_root=Path('/repo'), model='meta-llama', system_prompt='SYSTEM', user_prompt='USER', effort='high')
+        argv = invocation.argv
+        assert '--reasoning-effort' in argv
+        assert argv[argv.index('--reasoning-effort') + 1] == 'high'
+        assert argv[-1] == 'SYSTEM\n\nUSER'
+
+    def test_muse_without_model_omits_model_flag(self) -> None:
+        adapter = MuseAdapter()
+        invocation = adapter.build_invocation(repo_root=Path('/repo'), model=None, system_prompt='SYSTEM', user_prompt='USER')
+        assert '--model' not in invocation.argv
+        assert invocation.argv == ('muse', 'exec', '--yolo', '--workspace', '/repo', 'SYSTEM\n\nUSER')
+
+    def test_muse_without_model_and_with_effort_uses_reasoning_effort_flag(self) -> None:
+        adapter = MuseAdapter()
+        invocation = adapter.build_invocation(repo_root=Path('/repo'), model=None, system_prompt='SYSTEM', user_prompt='USER', effort='low')
+        argv = invocation.argv
+        assert '--model' not in argv
+        assert '--reasoning-effort' in argv
+        assert argv[argv.index('--reasoning-effort') + 1] == 'low'
+        assert argv[-1] == 'SYSTEM\n\nUSER'
+
 
 class RetentionTests(unittest.TestCase):
 
@@ -2994,10 +3026,11 @@ class PreflightTests(unittest.TestCase):
         from aflow.harnesses.copilot import CopilotAdapter
         from aflow.harnesses.gemini import GeminiAdapter
         from aflow.harnesses.kiro import KiroAdapter
+        from aflow.harnesses.muse import MuseAdapter
         from aflow.harnesses.opencode import OpencodeAdapter
         from aflow.harnesses.pi import PiAdapter
         for adapter in (
             CodexAdapter(), ClaudeAdapter(), CopilotAdapter(), GeminiAdapter(),
-            KiroAdapter(), OpencodeAdapter(), PiAdapter(), ReasonixAdapter(),
+            KiroAdapter(), MuseAdapter(), OpencodeAdapter(), PiAdapter(), ReasonixAdapter(),
         ):
             assert adapter_manager_workspace_read(adapter) is True, adapter.name

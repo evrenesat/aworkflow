@@ -1,6 +1,6 @@
 # Architecture
 
-AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Copilot, Gemini, Kiro, OpenCode, Pi, and Reasonix). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
+AFlow is a plan-driven workflow orchestrator that runs coding tasks through existing AI agent CLIs (Claude, Codex, Copilot, Gemini, Kiro, Muse, OpenCode, Pi, and Reasonix). It reads a checkpoint-based Markdown plan, dispatches steps to configurable harness profiles, evaluates condition-based transitions between steps, and logs every turn to disk.
 
 `RunMetadataWriter` is the workflow controller's bound schema-v2 persistence boundary, holding stable run identity while each write supplies mutable lifecycle state explicitly.
 
@@ -478,7 +478,7 @@ The condition evaluator is a full recursive-descent parser supporting `&&`, `||`
 Prompt templates support `file://` references (absolute, config-relative, or cwd-relative).
 
 ### `harnesses/`
-Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Eight adapters:
+Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Nine adapters:
 
 | Harness    | CLI binary  | Prompt mode                    | Effort support |
 |------------|-------------|--------------------------------|----------------|
@@ -487,6 +487,7 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `copilot`  | `copilot`   | system prefixed into user prompt | Yes          |
 | `gemini`   | `gemini`    | system prefixed into user prompt | No           |
 | `kiro`     | `kiro-cli`  | system prefixed into user prompt | No           |
+| `muse`     | `muse`      | system prefixed into user prompt | Yes          |
 | `opencode` | `opencode`  | system prefixed into user prompt | No           |
 | `reasonix` | `reasonix`  | system prefixed into user prompt | Yes          |
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
@@ -617,7 +618,7 @@ configured adapter already places its effective prompt in argv or a CLI flag;
 the dashboard/controller therefore has exclusive ownership of terminal input.
 
 ### `skill_installer.py`
-Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, and pi all use `~/.agents/skills`).
+Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, muse, and pi all use `~/.agents/skills`).
 
 ### `bundled_skills/`
 Thirteen default skill definitions plus one optional shipped skill installed into harness skill directories:

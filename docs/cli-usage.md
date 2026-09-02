@@ -249,6 +249,7 @@ Supported harness adapters:
 | `copilot` | `copilot -p ... -s --allow-all --no-ask-user` | Yes |
 | `gemini` | `gemini --prompt ... --approval-mode yolo --sandbox=false` | No |
 | `kiro` | `kiro-cli chat --no-interactive --trust-all-tools` | No |
+| `muse` | `muse exec --yolo --workspace <repo-root>` | Yes |
 | `opencode` | `opencode run --format default --dir <repo-root>` | No |
 | `reasonix` | `reasonix run --dir <repo-root> [--model MODEL] [--effort EFFORT]` | Yes |
 | `pi` | `pi --print --tools read,bash,edit,write,grep,find,ls` | Yes |

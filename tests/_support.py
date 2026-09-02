@@ -61,6 +61,7 @@ from aflow.harnesses.codex import CodexAdapter
 from aflow.harnesses.copilot import CopilotAdapter
 from aflow.harnesses.gemini import GeminiAdapter
 from aflow.harnesses.kiro import KiroAdapter
+from aflow.harnesses.muse import MuseAdapter
 from aflow.harnesses.opencode import OpencodeAdapter
 from aflow.harnesses.pi import PiAdapter
 from aflow.harnesses.base import HarnessInvocation
