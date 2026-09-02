@@ -1138,3 +1138,97 @@ def test_strict_manager_resume_rejects_repartition_history_that_would_be_dropped
 
     with pytest.raises(ValueError, match=expected):
         manager_resume_fields_strict(payload)
+
+
+def test_v3_prompt_system_instructions_reference_artifacts_only() -> None:
+    context = {
+        "schema_version": 3,
+        "level": "full",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+    }
+    system, _ = build_manager_prompts(context)
+    assert (
+        "Plan and checkpoint content is referenced, not inlined" in system
+    )
+    assert (
+        "artifact paths in MANAGER_CONTEXT_JSON are relative to the "
+        "repository working directory" in system
+    )
+    assert "Read the referenced checkpoint artifact first" in system
+    assert (
+        "Read the referenced active/full plan artifact only if the compact "
+        "evidence is insufficient" in system
+    )
+    assert "do not search for alternate plan files" in system
+
+
+def test_prompt_hard_limit_fails_closed_before_provider_start() -> None:
+    from aflow.manager import (
+        MANAGER_INLINE_CONTEXT_MAX_BYTES,
+        ManagerInlineContextLimitError,
+    )
+
+    oversized = {
+        "schema_version": 3,
+        "level": "full",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+        "bloat": "x" * (MANAGER_INLINE_CONTEXT_MAX_BYTES + 1),
+    }
+    with pytest.raises(ManagerInlineContextLimitError) as captured:
+        build_manager_prompts(oversized)
+    message = str(captured.value)
+    assert "total_bytes=" in message
+    # The fixed error reports counts only: no field content may leak.
+    assert "xxxxx" not in message
+    assert "schema_version=" in message
+    assert oversized["bloat"][:40] not in message
+    assert len(message) < 600
+
+
+def test_v3_prompt_metrics_count_references_without_bodies() -> None:
+    from aflow.manager import manager_prompt_metrics
+
+    context = {
+        "schema_version": 3,
+        "level": "lite",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+        "evidence": {
+            "active_plan": {
+                "available": True,
+                "reference": {
+                    "kind": "plan",
+                    "path": ".aflow/runs/run-1/evidence/plans/aaaa.md",
+                    "sha256": "a" * 64,
+                    "byte_size": 63580,
+                },
+            },
+            "checkpoint": {
+                "available": True,
+                "reference": {
+                    "kind": "checkpoint",
+                    "path": ".aflow/runs/run-1/evidence/checkpoints/bbbb.md",
+                    "sha256": "b" * 64,
+                    "byte_size": 5120,
+                },
+            },
+        },
+    }
+    metrics = manager_prompt_metrics(
+        context,
+        system_prompt="system",
+        user_prompt="user",
+        argv=("reasonix", "run"),
+    )
+    assert metrics == {
+        "system_prompt_bytes": 6,
+        "user_prompt_bytes": 4,
+        "argv_bytes": 11,
+        "referenced_artifact_count": 2,
+        "referenced_artifact_bytes": 63580 + 5120,
+    }
+    # Metrics are numeric counts only: no prompt text or evidence bodies.
+    assert '"system_prompt"' not in json.dumps(metrics)
+    assert '"user_prompt"' not in json.dumps(metrics)

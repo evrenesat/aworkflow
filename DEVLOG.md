@@ -1,5 +1,33 @@
 # DEVLOG
 
+## 2026-09-02 — Manager context references and prompt budget
+
+- A 340 KB manager context (incident `20260902t053828z-5cfe3386`, decision
+  `manager/decision-005`) failed before Reasonix started with `errno 7:
+  Argument list too long`. The same 63,580-byte plan was duplicated across
+  `active_plan_content`, `original_plan_content`, `envelope.plan_text`,
+  envelope base64, and checkpoint payloads.
+- Added a run-local content-addressed evidence store
+  (`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md`) with
+  idempotent atomic writes and fail-closed reads; each distinct plan/checkpoint
+  byte sequence is stored once per run.
+- Scope envelopes now have a reference-only schema v2 (no plan/checkpoint text,
+  no copied source-block text); new scopes write v2, v1 artifacts remain
+  strictly parseable and readable. Drift validation and repartition rendering
+  resolve referenced evidence bytes and materialize source blocks by verified
+  byte spans.
+- Manager-context schema v3 (selector >= 4) is reference-only: no plan bodies,
+  no base64 evidence, no raw reviewer transcript. Runtime boundaries capture
+  evidence once by content hash; historical rebuilds never write.
+- The inline manager prompt targets 16 KiB with a deterministic 32 KiB hard
+  limit enforced before any provider process starts; non-sensitive prompt
+  metrics persist in the manager result and analysis labels referenced
+  artifact bytes as not model input.
+- Manager adapters must advertise the fail-closed `manager_workspace_read`
+  capability for reference-only contexts; Reasonix one-shot prompts moved from
+  argv to stdin so they can never fail `execve` with `E2BIG`.
+
+
 ## 2026-09-02 — Respect ACP exact-resume capability
 
 - Owned session execution no longer implies that a harness can resume a prior

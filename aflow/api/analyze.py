@@ -176,7 +176,8 @@ def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
                                     key for key in {*rebuilt, *stored}
                                     if rebuilt.get(key) == stored.get(key)
                                 })
-                                raise ValueError(
+                                if rebuilt != stored:
+                                    raise ValueError(
                                     f"manager context drift for decision-{int(durable['decision_number']):03d} "
                                     f"({', '.join(differing_keys)})"
                                 )

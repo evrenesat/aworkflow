@@ -100,6 +100,56 @@ Durable plan, branch, worktree, boundary, and turn-outcome fields override
 contradictory transcript text. Lite keeps active and original plan bodies null
 and marks both as intentionally omitted; this redaction is not evidence that a
 plan is missing, while Full can include available plan content.
+
+### Run-local evidence store and reference-only manager contexts
+
+Each run keeps a content-addressed evidence store at
+`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md`. Every distinct
+plan/checkpoint byte sequence is stored at most once per run; writes are
+idempotent and atomic, and reads fail closed on missing, escaping, symlinked,
+non-regular, or hash-mismatched artifacts. Envelope captures and manager
+contexts reference these files instead of copying bodies:
+
+- **Scope-envelope schema v2** is a reference-only metadata manifest: it holds
+  scope identities, checkpoint offsets, and `plan_ref`/`checkpoint_ref`
+  content-addressed references plus deterministic source-block identity
+  records (stable IDs, byte/line spans, content hashes). It contains no
+  `plan_text`, `plan_bytes_b64`, `checkpoint_text`, or copied source-block
+  text. New scopes write v2 only; strict schema-v1 parsing, validation, and
+  artifacts remain supported read-only, dispatched by the exact stored schema
+  version. The canonical v2 digest binds canonical metadata plus referenced
+  content hashes and sizes and never depends on absolute host paths.
+  Drift validation and repartition rendering resolve referenced evidence bytes
+  (with materialized source-block text verified by content hash) before any
+  plan/checkpoint identity comparison.
+- **Manager-context schema v3** (runtime boundary selector `context_schema_version
+  = 4`; constant `MANAGER_CONTEXT_SCHEMA_VERSION_V3 = 3`) is reference-only and
+  defines none of the v1/v2 body fields. Before each live boundary the exact
+  active plan and its current checkpoint are captured/reused in the evidence
+  store (equal active/original bytes share one artifact); the context carries
+  repository-relative artifact paths, SHA-256 hashes, byte sizes, checkpoint
+  line/byte ranges, and disclosure state. Reviewer stdout is referenced through
+  its durable turn artifact and never copied. Bounded semantic fields share one
+  deterministic truncation marker at 2,000 characters, and the run extract is
+  capped at the 12 newest records. Selector 3 still rebuilds schema v2 exactly;
+  selectors 1/2 rebuild schema v1 for historical analysis.
+
+Manager prompts inline only the compact manifest. The exact UTF-8 user prompt
+targets 16 KiB and is hard-limited to 32 KiB before any provider process
+starts; an oversized compact manifest fails with a fixed error carrying total
+bytes and per-top-level-field byte counts only. Non-sensitive prompt metrics
+(`system_prompt_bytes`, `user_prompt_bytes`, `argv_bytes`,
+`referenced_artifact_count`, `referenced_artifact_bytes`) persist in the
+manager result; referenced artifact bytes are evidence the manager may read and
+are labeled in analysis output as not model-input bytes.
+
+Manager adapters must advertise the fail-closed `manager_workspace_read`
+capability (`HarnessAdapter.manager_workspace_read`) to run reference-only
+manager contexts; the manager system prompt instructs reading the checkpoint
+artifact first, the active/full plan only when needed, and never searching for
+alternate plan files. Reasonix one-shot prompts travel on stdin
+(`prompt_mode="stdin"`), never in argv, so a prompt cannot fail `execve` with
+`E2BIG`; `--print` remains a final-output flag.
 At a clean controller-proposed `END`—a transition without operational failure,
 scope pressure, or max-turn terminal handling—Lite eligibility omits `stop`.
 An ineligible or invalid Lite response, including `stop`, and an explicit Lite

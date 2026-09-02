@@ -3,10 +3,14 @@
 ## How A Run Works
 
 Each workflow step launches one fresh harness process.
-Codex receives its combined system and user prompt through standard input, so
-large Full-manager contexts and implementation prompts are not constrained by
-the operating system's per-argument size limit. Durable prompt artifacts still
-record the exact effective prompt.
+Codex and Reasonix receive their combined system and user prompt through
+standard input, so large Full-manager contexts and implementation prompts are
+not constrained by the operating system's per-argument size limit. Reasonix
+one-shot invocations are flags-only on argv (`reasonix run --dir <repo>
+--model <model> [--effort <effort>]` and `--print` for final output); the exact
+prompt is supplied as `stdin_text`, never as an argv element, so a prompt can
+never fail `execve` with `E2BIG`. Durable prompt artifacts still record the
+exact effective prompt, and owned Reasonix ACP sessions are unchanged.
 
 At a high level:
 
@@ -65,6 +69,44 @@ clients can pass a deterministic probe when they want the boundary exercised.
 Process-creation races after a successful preflight still use the existing
 126/127 launch-error normalization. The guardian remains the fallback for
 legacy runs and failures outside the safe local preflight boundary.
+
+## Manager Contexts and Evidence Budget
+
+Manager contexts are versioned. Selectors below 4 rebuild historical schema
+v1/v2 shapes exactly; new runtime boundaries use `context_schema_version = 4`
+and produce reference-only schema-v3 contexts.
+
+Before a live schema-v3 boundary, the controller captures the exact active
+plan and current checkpoint into the run-local content-addressed evidence
+store (`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md`);
+equal active/original bytes share one artifact and unchanged bytes create no
+new files on later decisions. Historical rebuilds never write evidence and
+disclose content as unavailable when the exact bytes are not already stored.
+The inline manager manifest carries repository-relative artifact paths,
+SHA-256 hashes, byte sizes, and checkpoint line/byte ranges instead of plan
+bodies, base64 evidence, or reviewer transcripts. Reviewer stdout is
+referenced through its durable turn artifact.
+
+- The exact UTF-8 inline user prompt targets 16 KiB (`MANAGER_INLINE_CONTEXT_TARGET_BYTES`)
+  and is hard-limited to 32 KiB (`MANAGER_INLINE_CONTEXT_MAX_BYTES`) before any
+  provider process starts. Exceeding the hard limit fails closed with a fixed
+  error containing total bytes and per-top-level-field byte counts only.
+- Bounded semantic fields (results, reasons, rejection summaries, diagnostic
+  excerpts) are capped at 2,000 characters (`MANAGER_SUMMARY_MAX_CHARS`) with
+  one shared deterministic truncation marker; the run extract is limited to the
+  12 newest records.
+- Non-sensitive prompt metrics persist in the manager result:
+  `system_prompt_bytes`, `user_prompt_bytes`, `argv_bytes`,
+  `referenced_artifact_count`, `referenced_artifact_bytes`. Referenced
+  artifact bytes are evidence the manager may read from disk; they are not
+  model-input bytes and analysis output labels them as such.
+- Managers need repository reads: an adapter must advertise the fail-closed
+  `manager_workspace_read` capability (`HarnessAdapter.manager_workspace_read`)
+  or the manager boundary fails before invocation. The manager system prompt
+  instructs reading the referenced checkpoint artifact first, reading the
+  referenced active/full plan only when needed for the legal decision, treating
+  evidence as controller-declared (no searching for alternate plan files), and
+  remaining read-only.
 
 ## Lifecycle and Worktrees
 

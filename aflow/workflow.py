@@ -36,6 +36,7 @@ from .manager import (
     build_manager_prompts,
     build_repartition_prompts,
     eligible_implementation_upgrade,
+    manager_prompt_metrics,
     parse_manager_decision,
     render_manager_stop_report,
     resolve_manager_role,
@@ -44,6 +45,7 @@ from .manager import (
     validate_manager_note_correction,
 )
 from .manager_context import (
+    MANAGER_CONTEXT_SCHEMA_VERSION_V3,
     build_manager_context,
     build_manager_note_scope,
     summarize_repair_plan,
@@ -65,7 +67,11 @@ from .harnesses.preflight import (
     OSHarnessPreflightProbe,
     evaluate_harness_environment,
 )
-from .harnesses.base import HarnessAdapter, HarnessInvocation
+from .harnesses.base import (
+    HarnessAdapter,
+    HarnessInvocation,
+    adapter_manager_workspace_read,
+)
 from .plan import (
     ParsedPlan,
     PlanParseError,
@@ -199,6 +205,18 @@ class _ManagerCallExecutor:
             captured_active_plan = _exec_plan_path(manager_plan_path, self.execution_context).read_text(encoding="utf-8")
         except OSError:
             pass
+        captured_original_plan: str | None = None
+        original_capture_path = (
+            Path(boundary.original_plan_path)
+            if isinstance(boundary.original_plan_path, str)
+            else original_plan_path
+        )
+        try:
+            captured_original_plan = _exec_plan_path(
+                original_capture_path, self.execution_context
+            ).read_text(encoding="utf-8")
+        except OSError:
+            pass
 
         def note_scope_for(plan_path: Path | None) -> dict[str, object] | None:
             if plan_path is None:
@@ -223,6 +241,7 @@ class _ManagerCallExecutor:
         boundary_payload = {
             **boundary.__dict__,
             "active_plan_content": captured_active_plan,
+            "original_plan_content": captured_original_plan,
             "manager_note_scope": proposed_note_scope,
             "retry_manager_note_scope": retry_note_scope,
             "workspace_state": {
@@ -240,6 +259,7 @@ class _ManagerCallExecutor:
             run_metadata=metadata,
             boundary=boundary_payload,
             active_plan_content=captured_active_plan,
+            capture_evidence=True,
         )
         if boundary.context_schema_version >= 3:
             controller_state = context.get("controller_state")
@@ -285,6 +305,16 @@ class _ManagerCallExecutor:
             )
             manager_profile = resolve_profile(role_resolution.selector, self.workflow_config, step_path="manager")
             manager_adapter = self.adapter or get_adapter(manager_profile.harness_name)
+            if (
+                boundary.context_schema_version >= 4
+                and not adapter_manager_workspace_read(manager_adapter)
+            ):
+                raise ManagerDecisionError(
+                    "manager adapter "
+                    f"'{getattr(manager_adapter, 'name', type(manager_adapter).__name__)}' "
+                    "does not advertise manager_workspace_read; reference-only manager "
+                    "contexts require repository workspace-read capability"
+                )
             manager_invocation = manager_adapter.build_invocation(
                 repo_root=self.execution_repo_root,
                 model=manager_profile.model,
@@ -310,6 +340,15 @@ class _ManagerCallExecutor:
                 "label": manager_invocation.label,
                 "argv": list(manager_invocation.argv),
             }
+            if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3:
+                # Non-sensitive prompt metrics; artifact bytes are referenced
+                # (not model input) and are labeled as such in analysis output.
+                result_payload["prompt_metrics"] = manager_prompt_metrics(
+                    context,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    argv=manager_invocation.argv,
+                )
             if self.runner is None:
                 completed = _run_process(manager_invocation, self.execution_repo_root, self.banner, self.state)
             else:
@@ -605,16 +644,20 @@ class _RepartitionCycleExecutor:
         envelope_bytes = load_scope_envelope_for_resume(self.run_paths.run_dir, scope)
         try:
             envelope = parse_envelope_bytes(envelope_bytes)
+            resolved_envelope_plan_text = _resolved_envelope_plan_text(
+                self.run_paths, envelope,
+            )
             source_path = _exec_plan_path(original_plan_path, self.execution_context)
             source_plan_text = source_path.read_bytes().decode("utf-8", "strict")
             drift = validate_envelope_boundary_drift(
                 envelope=envelope, boundary_plan_text=source_plan_text,
+                resolved_plan_text=resolved_envelope_plan_text,
             )
             if not drift.allowed:
                 raise ValueError(
                     "boundary source plan drift is not allowed: " + "; ".join(drift.issues)
                 )
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
+        except (OSError, UnicodeDecodeError, ValueError, WorkflowError) as exc:
             self.fail_manager_gate(
                 decision_context,
                 reason=f"cannot capture repartition boundary artifacts: {exc}",
@@ -856,6 +899,7 @@ class _RepartitionCycleExecutor:
                     partition_ids=partition_ids,
                     repair_evidence_blocks=repair_evidence,
                     repair_evidence_artifact_references=evidence_references,
+                    resolved_envelope_plan_text=resolved_envelope_plan_text,
                 )
                 mechanical = validate_candidate_mechanically(
                     source_plan_text=source_plan_text,
@@ -866,6 +910,7 @@ class _RepartitionCycleExecutor:
                     repair_evidence_artifact_references=evidence_references,
                     expected_generation_id=generation_id,
                     expected_partition_ids=partition_ids,
+                    resolved_envelope_plan_text=resolved_envelope_plan_text,
                 )
                 mechanical_payload = mechanical.to_dict()
                 mechanical_findings = mechanical.issues
@@ -1536,12 +1581,16 @@ class _ManagerGateCoordinator:
                     run_paths.run_dir, scope,
                 )
                 eligible_envelope = parse_envelope_bytes(envelope_bytes)
+                eligible_resolved = _resolved_envelope_plan_text(
+                    run_paths, eligible_envelope,
+                )
                 eligible_source = _exec_plan_path(
                     original_plan_path, self.execution_context,
                 ).read_bytes().decode("utf-8", "strict")
                 eligible_drift = validate_envelope_boundary_drift(
                     envelope=eligible_envelope,
                     boundary_plan_text=eligible_source,
+                    resolved_plan_text=eligible_resolved,
                 )
                 if eligible_drift.allowed:
                     base_eligible.add("repartition_current_checkpoint")
@@ -2066,18 +2115,62 @@ def _capture_scope_envelope(
             raise ValueError("provided plan text does not match primary plan bytes")
         resolved_repo_root = (repo_root or primary_plan_path.parent).resolve()
         from .repartition import (
-            create_envelope,
+            EvidenceArtifactReferenceV2,
+            create_envelope_v2,
             parse_envelope_bytes,
+            slice_checkpoint_source,
             write_envelope_atomic,
         )
+        from .runlog import RunPaths
 
         checkpoint_index = scope.checkpoint_index if scope.checkpoint_index is not None else 0
-        envelope = create_envelope(
+        source_slice = slice_checkpoint_source(
+            decoded_plan_text, checkpoint_index=checkpoint_index,
+        )
+        if source_slice is None:
+            raise ValueError(
+                f"Checkpoint index {checkpoint_index} not found in plan text"
+            )
+        # New scopes write reference-only v2 envelopes: exact plan and
+        # checkpoint bytes are captured once into the run-local evidence
+        # store and the envelope carries only identities, hashes, and spans.
+        evidence_paths = RunPaths(
+            repo_root=resolved_repo_root,
+            runs_root=resolved_repo_root / ".aflow" / "runs",
+            run_dir=run_dir,
+            turns_dir=run_dir / "turns",
+            manager_dir=run_dir / "manager",
+            run_json=run_dir / "run.json",
+        )
+        from .runlog import (
+            capture_checkpoint_evidence,
+            capture_plan_evidence,
+        )
+
+        plan_evidence = capture_plan_evidence(evidence_paths, decoded_plan_text)
+        checkpoint_evidence = capture_checkpoint_evidence(
+            evidence_paths, source_slice.full_text,
+        )
+        plan_ref = EvidenceArtifactReferenceV2(
+            kind=plan_evidence.kind,
+            path=plan_evidence.path,
+            sha256=plan_evidence.sha256,
+            byte_size=plan_evidence.byte_size,
+        )
+        checkpoint_ref = EvidenceArtifactReferenceV2(
+            kind=checkpoint_evidence.kind,
+            path=checkpoint_evidence.path,
+            sha256=checkpoint_evidence.sha256,
+            byte_size=checkpoint_evidence.byte_size,
+        )
+        envelope = create_envelope_v2(
             scope_id=scope.scope_id,
             original_plan_path=primary_plan_path,
             plan_text=decoded_plan_text,
             checkpoint_index=checkpoint_index,
             repo_root=resolved_repo_root,
+            plan_ref=plan_ref,
+            checkpoint_ref=checkpoint_ref,
         )
         envelope_path = write_envelope_atomic(
             envelope,
@@ -2094,7 +2187,7 @@ def _capture_scope_envelope(
             envelope_canonical_sha256=parsed.canonical_envelope_sha256,
         )
         _validate_scope_envelope_bytes(reference, artifact_bytes)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
         raise WorkflowError(f"cannot capture scope envelope: {exc}") from exc
 
     state.active_implementation_scope = reference
@@ -2197,6 +2290,28 @@ def load_scope_envelope_for_resume(
         raise WorkflowError(f"cannot resume: cannot read scope envelope artifact: {exc}") from exc
     _validate_scope_envelope_bytes(scope, artifact_bytes)
     return artifact_bytes
+
+
+def _resolved_envelope_plan_text(
+    paths: RunPaths,
+    envelope: object,
+) -> str:
+    """Resolve an envelope's authoritative plan text for drift comparison.
+
+    Schema-v1 envelopes embed the bytes; schema-v2 envelopes resolve the
+    referenced plan artifact from this run's evidence store with full
+    fail-closed validation. Raises ``WorkflowError`` when a v2 envelope's
+    referenced evidence is missing, escaping, or hash-mismatched.
+    """
+    try:
+        from .runlog import resolve_envelope_texts
+
+        plan_text, _ = resolve_envelope_texts(paths, envelope)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise WorkflowError(
+            f"cannot resolve envelope plan evidence: {exc}"
+        ) from exc
+    return plan_text
 
 
 def _validate_existing_scope_envelope(

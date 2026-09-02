@@ -2599,8 +2599,9 @@ class EnvelopeCaptureTests(unittest.TestCase):
             - [ ] step one
         """)
         with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            plan_path = run_dir / "plan.md"
+            repo_root = Path(tmpdir)
+            run_dir = repo_root / ".aflow" / "runs" / "run-1"
+            plan_path = repo_root / "plan.md"
             plan_path.write_text(text, encoding="utf-8")
 
             state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
@@ -2618,6 +2619,7 @@ class EnvelopeCaptureTests(unittest.TestCase):
                 primary_plan_path=plan_path,
                 run_dir=run_dir,
                 exec_ctx=None,
+                repo_root=repo_root,
             )
 
             scope = state.active_implementation_scope
@@ -2627,12 +2629,24 @@ class EnvelopeCaptureTests(unittest.TestCase):
             assert scope.envelope_artifact_path.startswith("scopes/")
             assert scope.envelope_artifact_path.endswith("/envelope.json")
 
-            # Verify the artifact is readable
+            # Verify the artifact is readable and reference-only (v2).
             artifact_path = run_dir / scope.envelope_artifact_path
             assert artifact_path.is_file()
             loaded = read_envelope(artifact_path)
             assert loaded is not None
             assert loaded.scope_id == "plan.md::checkpoint-1::first"
+            assert loaded.schema_version == SCOPE_ENVELOPE_SCHEMA_VERSION_V2
+            payload = json.loads(artifact_path.read_bytes())
+            for key in (
+                "plan_text", "plan_bytes_b64", "checkpoint_text",
+                "checkpoint_bytes_b64",
+            ):
+                assert key not in payload
+            assert payload["plan_ref"]["path"].startswith(
+                ".aflow/runs/run-1/evidence/plans/"
+            )
+            assert (run_dir / "evidence" / "plans").is_dir()
+            assert (run_dir / "evidence" / "checkpoints").is_dir()
 
 
     def _source_scope(self, root: Path) -> tuple[ActiveImplementationScope, Path, bytes]:
@@ -2752,8 +2766,9 @@ class EnvelopeCaptureTests(unittest.TestCase):
             **Goal:** test
         """)
         with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            plan_path = run_dir / "plan.md"
+            repo_root = Path(tmpdir)
+            run_dir = repo_root / ".aflow" / "runs" / "run-1"
+            plan_path = repo_root / "plan.md"
             plan_path.write_text(text, encoding="utf-8")
 
             state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
@@ -2768,23 +2783,28 @@ class EnvelopeCaptureTests(unittest.TestCase):
             # First capture
             _capture_scope_envelope(
                 state, plan_text=text, primary_plan_path=plan_path,
-                run_dir=run_dir, exec_ctx=None,
+                run_dir=run_dir, exec_ctx=None, repo_root=repo_root,
             )
             first_path = state.active_implementation_scope.envelope_artifact_path
+            plan_evidence_files = sorted(
+                (run_dir / "evidence" / "plans").iterdir()
+            )
 
             # Second capture (simulates repair overlay keeping same scope)
             _capture_scope_envelope(
                 state, plan_text=text, primary_plan_path=plan_path,
-                run_dir=run_dir, exec_ctx=None,
+                run_dir=run_dir, exec_ctx=None, repo_root=repo_root,
             )
             second_path = state.active_implementation_scope.envelope_artifact_path
 
             assert first_path == second_path
+            # Unchanged bytes create no additional evidence artifacts.
+            assert sorted((run_dir / "evidence" / "plans").iterdir()) == plan_evidence_files
             (run_dir / second_path).write_bytes(b"{tampered")
             with pytest.raises(WorkflowError, match="bytes hash mismatch"):
                 _capture_scope_envelope(
                     state, plan_text=text, primary_plan_path=plan_path,
-                    run_dir=run_dir, exec_ctx=None,
+                    run_dir=run_dir, exec_ctx=None, repo_root=repo_root,
                 )
 
     def test_capture_noop_when_no_active_scope(self) -> None:
@@ -2810,8 +2830,9 @@ class EnvelopeCaptureTests(unittest.TestCase):
         from aflow.workflow import _capture_scope_envelope
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            plan_path = run_dir / "plan.md"
+            repo_root = Path(tmpdir)
+            run_dir = repo_root / ".aflow" / "runs" / "run-1"
+            plan_path = repo_root / "plan.md"
             plan_path.write_text(text, encoding="utf-8")
 
             state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
@@ -2824,7 +2845,7 @@ class EnvelopeCaptureTests(unittest.TestCase):
             )
             _capture_scope_envelope(
                 state, plan_text=text, primary_plan_path=plan_path,
-                run_dir=run_dir, exec_ctx=None,
+                run_dir=run_dir, exec_ctx=None, repo_root=repo_root,
             )
 
             # Serialize and restore state
@@ -2839,16 +2860,18 @@ class EnvelopeCaptureTests(unittest.TestCase):
             artifact_path = run_dir / scope.envelope_artifact_path
             assert artifact_path.is_file()
 
-            # The restored artifact should validate
+            # The restored artifact should validate as reference-only v2
             loaded = read_envelope(artifact_path)
             assert loaded is not None
             assert loaded.scope_id == "plan.md::checkpoint-1::first"
+            assert loaded.schema_version == SCOPE_ENVELOPE_SCHEMA_VERSION_V2
 
 
 # Scope-envelope v2: reference-only metadata manifest
 import textwrap
 
 from aflow.repartition import (
+    SCOPE_ENVELOPE_SCHEMA_VERSION_V2,
     EvidenceArtifactReferenceV2,
     ScopeEnvelopeV2,
     create_envelope_v2,

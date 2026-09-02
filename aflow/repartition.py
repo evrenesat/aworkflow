@@ -1965,17 +1965,65 @@ _BLOCK_METADATA_KEYS = {
 }
 
 
+
+
+def materialized_envelope_source_blocks(
+    envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2,
+    *,
+    resolved_plan_text: str | None,
+) -> tuple[SourceBlock, ...]:
+    """Return envelope source blocks with exact text for candidate rendering.
+
+    Schema-v1 blocks already carry their text. Schema-v2 blocks are
+    reference-only identity records: their exact text is re-derived from the
+    resolved evidence plan bytes at the stored byte spans and verified
+    against each block content hash before any text is used.
+    """
+    if isinstance(envelope, ScopeEnvelopeV1):
+        return envelope.source_blocks
+    if resolved_plan_text is None:
+        raise ValueError(
+            "v2 envelope requires resolved plan evidence before source blocks "
+            "can be materialized"
+        )
+    blocks: list[SourceBlock] = []
+    for block in envelope.source_blocks:
+        start = _text_index_at_utf8_boundary(resolved_plan_text, block.byte_start)
+        end = _text_index_at_utf8_boundary(resolved_plan_text, block.byte_end)
+        text = resolved_plan_text[start:end]
+        if _sha256_hex(text.encode("utf-8")) != block.content_sha256:
+            raise ValueError(
+                f"source block {block.block_id} bytes do not match its content hash"
+            )
+        blocks.append(SourceBlock(
+            block_id=block.block_id,
+            text=text,
+            byte_start=block.byte_start,
+            byte_end=block.byte_end,
+            line_start=block.line_start,
+            line_end=block.line_end,
+            section_label=block.section_label,
+            content_sha256=block.content_sha256,
+        ))
+    return tuple(blocks)
+
+
 def render_candidate_plan(
     *,
-    envelope: ScopeEnvelopeV1,
+    envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2,
     proposal: RepartitionProposalV1,
     source_plan_text: str,
     generation_id: str,
     partition_ids: tuple[str, ...],
     repair_evidence_blocks: tuple[SourceBlock, ...] = (),
     repair_evidence_artifact_references: Mapping[str, str] | None = None,
+    resolved_envelope_plan_text: str | None = None,
 ) -> str:
-    """Render a candidate from verified bytes; never use a byte span as text index."""
+    """Render a candidate from verified bytes; never use a byte span as text index.
+
+    Reference-only v2 envelopes require ``resolved_envelope_plan_text`` (the
+    evidence-store bytes) for drift validation; v1 envelopes embed it.
+    """
     issues = validate_envelope(envelope)
     if issues:
         raise ValueError("Cannot render with invalid envelope: " + "; ".join(issues))
@@ -1993,6 +2041,7 @@ def render_candidate_plan(
     plan_bytes = source_plan_text.encode("utf-8")
     drift = validate_envelope_boundary_drift(
         envelope=envelope, boundary_plan_text=source_plan_text,
+        resolved_plan_text=resolved_envelope_plan_text,
     )
     if not drift.allowed:
         raise ValueError(
@@ -2004,9 +2053,12 @@ def render_candidate_plan(
     )
     if boundary_slice is None or boundary_slice.checkpoint_name != envelope.checkpoint_name:
         raise ValueError("source plan checkpoint identity does not match envelope")
-    source_by_id = {block.block_id: block for block in envelope.source_blocks}
+    materialized_sources = materialized_envelope_source_blocks(
+        envelope, resolved_plan_text=resolved_envelope_plan_text,
+    )
+    source_by_id = {block.block_id: block for block in materialized_sources}
     repair_by_id = {block.block_id: block for block in repair_evidence_blocks}
-    if len(source_by_id) != len(envelope.source_blocks) or len(repair_by_id) != len(repair_evidence_blocks):
+    if len(source_by_id) != len(materialized_sources) or len(repair_by_id) != len(repair_evidence_blocks):
         raise ValueError("source or repair evidence block IDs are not unique")
     artifact_references = dict(repair_evidence_artifact_references or {})
     if set(artifact_references) - set(repair_by_id):
@@ -2186,12 +2238,13 @@ def validate_candidate_mechanically(
     *,
     source_plan_text: str,
     candidate_plan_text: str,
-    envelope: ScopeEnvelopeV1,
+    envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2,
     proposal: RepartitionProposalV1,
     repair_evidence_blocks: tuple[SourceBlock, ...] = (),
     repair_evidence_artifact_references: Mapping[str, str],
     expected_generation_id: str,
     expected_partition_ids: tuple[str, ...],
+    resolved_envelope_plan_text: str | None = None,
 ) -> MechanicalValidationResult:
     """Conservatively validate one candidate from its bytes, not model claims."""
     issues: list[str] = []
@@ -2229,6 +2282,7 @@ def validate_candidate_mechanically(
         issues.extend(f"invalid_envelope:{issue}" for issue in envelope_issues)
     drift = validate_envelope_boundary_drift(
         envelope=envelope, boundary_plan_text=source_plan_text,
+        resolved_plan_text=resolved_envelope_plan_text,
     )
     if not drift.allowed:
         issues.extend(f"source_plan_drift:{issue}" for issue in drift.issues)
@@ -2299,12 +2353,15 @@ def validate_candidate_mechanically(
     if not all_unchecked and not any(issue.startswith("child_is_checked:") for issue in issues):
         issues.append("children_not_all_unchecked")
 
-    source_by_id = {block.block_id: block for block in envelope.source_blocks}
+    materialized_sources = materialized_envelope_source_blocks(
+        envelope, resolved_plan_text=resolved_envelope_plan_text,
+    )
+    source_by_id = {block.block_id: block for block in materialized_sources}
     repair_by_id = {block.block_id: block for block in repair_evidence_blocks}
-    source_coverage = {block.block_id: False for block in envelope.source_blocks}
+    source_coverage = {block.block_id: False for block in materialized_sources}
     evidence_coverage = {block.block_id: False for block in repair_evidence_blocks}
     shared_ids = tuple(
-        block.block_id for block in envelope.source_blocks
+        block.block_id for block in materialized_sources
         if block.section_label is not None and block.section_label.casefold().startswith(("**goal", "**context"))
     )
     child_newline = "\r\n" if b"\r\n" in candidate_bytes else "\n"

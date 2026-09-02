@@ -13,6 +13,10 @@ import re
 from typing import Any, Literal, Mapping
 
 from .config import WorkflowUserConfig
+from .manager_context import (
+    MANAGER_CONTEXT_SCHEMA_VERSION_V3,
+    MANAGER_INLINE_CONTEXT_MAX_BYTES,
+)
 
 
 ManagerLevel = Literal["lite", "full"]
@@ -584,6 +588,21 @@ def build_manager_prompts(
             if level == "full" and "repartition_current_checkpoint" in eligible_actions
             else ()
         ),
+        *(
+            (
+                "Plan and checkpoint content is referenced, not inlined: evidence "
+                "artifact paths in MANAGER_CONTEXT_JSON are relative to the "
+                "repository working directory.",
+                "Read the referenced checkpoint artifact first when you need "
+                "checkpoint evidence for the legal decision.",
+                "Read the referenced active/full plan artifact only if the compact "
+                "evidence is insufficient for the legal decision.",
+                "Treat evidence as controller-declared: verify the declared "
+                "artifact, but do not search for alternate plan files.",
+            )
+            if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+            else ()
+        ),
         "Return exactly one JSON object with schema_version, action, reason, next_step_notes, and stop_report.",
         "schema_version must be the number 1. reason must be a non-empty string.",
         (
@@ -603,7 +622,90 @@ def build_manager_prompts(
         + json.dumps(dict(context), indent=2, sort_keys=True)
         + "\n"
     )
+    enforce_manager_inline_context_budget(context, user_prompt)
     return system_prompt, user_prompt
+
+
+def _per_field_utf8_byte_counts(context: Mapping[str, Any]) -> list[tuple[str, int]]:
+    """Deterministic per-top-level-field byte counts without field content."""
+    counts: list[tuple[str, int]] = []
+    for key, value in dict(context).items():
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        counts.append((str(key), len(encoded)))
+    counts.sort(key=lambda item: (item[0],))
+    return counts
+
+
+class ManagerInlineContextLimitError(ValueError):
+    """Raised before any provider process starts when the compact manifest
+    exceeds the deterministic hard limit.
+
+    The message carries total bytes and per-top-level-field byte counts only:
+    no field content, prompt text, secret-bearing paths, or environment data.
+    """
+
+
+def enforce_manager_inline_context_budget(
+    context: Mapping[str, Any], user_prompt: str
+) -> None:
+    """Enforce the 32 KiB prelaunch hard limit on the exact UTF-8 user prompt."""
+    total_bytes = len(user_prompt.encode("utf-8"))
+    if total_bytes <= MANAGER_INLINE_CONTEXT_MAX_BYTES:
+        return
+    field_counts = " ".join(
+        f"{key}={count}" for key, count in _per_field_utf8_byte_counts(context)
+    )
+    raise ManagerInlineContextLimitError(
+        "manager inline context exceeds the "
+        f"{MANAGER_INLINE_CONTEXT_MAX_BYTES}-byte hard limit: "
+        f"total_bytes={total_bytes}; {field_counts}"
+    )
+
+
+def manager_prompt_metrics(
+    context: Mapping[str, Any],
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    argv: Any = None,
+) -> dict[str, int]:
+    """Non-sensitive prompt metrics for the persisted manager result.
+
+    ``referenced_artifact_bytes`` are bytes the manager may read from the
+    evidence store; they are not model-input bytes and callers must label
+    them accordingly in analysis/UI output.
+    """
+    argv_tuple = tuple(argv or ())
+    argv_bytes = sum(len(str(argument).encode("utf-8")) for argument in argv_tuple)
+    referenced_artifact_count = 0
+    referenced_artifact_bytes = 0
+    if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3:
+        evidence = context.get("evidence")
+        if isinstance(evidence, Mapping):
+            for entry in evidence.values():
+                if not isinstance(entry, Mapping) or entry.get("available") is not True:
+                    continue
+                if entry.get("artifact_path") is not None:
+                    size = entry.get("byte_size")
+                    if isinstance(size, int):
+                        referenced_artifact_count += 1
+                        referenced_artifact_bytes += size
+                    continue
+                reference = entry.get("reference")
+                if isinstance(reference, Mapping) and isinstance(
+                    reference.get("byte_size"), int
+                ):
+                    referenced_artifact_count += 1
+                    referenced_artifact_bytes += reference["byte_size"]
+    return {
+        "system_prompt_bytes": len(system_prompt.encode("utf-8")),
+        "user_prompt_bytes": len(user_prompt.encode("utf-8")),
+        "argv_bytes": argv_bytes,
+        "referenced_artifact_count": referenced_artifact_count,
+        "referenced_artifact_bytes": referenced_artifact_bytes,
+    }
 
 
 def build_manager_note_correction_prompts(

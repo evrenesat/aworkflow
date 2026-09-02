@@ -466,21 +466,68 @@ def compact_turn(turn: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _manager_summary(run_json: dict[str, Any]) -> dict[str, Any]:
+def _labeled_manager_prompt_metrics(
+    run_dir: Path | None, artifact_path: Any
+) -> dict[str, Any] | None:
+    """Load non-sensitive prompt metrics from one decision result artifact.
+
+    ``referenced_artifact_bytes`` counts evidence bytes the manager may read
+    from the evidence store; they are not model-input bytes and are labeled
+    as such in analysis output.
+    """
+    if run_dir is None or not isinstance(artifact_path, str) or not artifact_path:
+        return None
+    result_path = run_dir / artifact_path / "result.json"
+    try:
+        if not result_path.is_file():
+            return None
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    metrics = payload.get("prompt_metrics")
+    if not isinstance(metrics, dict):
+        return None
+    labeled = {
+        key: value
+        for key, value in metrics.items()
+        if key
+        in {
+            "system_prompt_bytes",
+            "user_prompt_bytes",
+            "argv_bytes",
+            "referenced_artifact_count",
+            "referenced_artifact_bytes",
+        }
+    }
+    if "referenced_artifact_bytes" in labeled:
+        labeled["referenced_artifact_bytes_are_not_model_input"] = True
+    return labeled or None
+
+
+def _manager_summary(
+    run_json: dict[str, Any], run_dir: Path | None = None
+) -> dict[str, Any]:
     """Return durable manager metadata without exposing prompts or contexts."""
     history = run_json.get("manager_history")
-    normalized_history = [
-        {
-            "decision_number": item.get("decision_number"),
-            "level": item.get("level"),
-            "trigger": item.get("trigger"),
-            "action": item.get("action"),
-            "reason": item.get("reason"),
-            "artifact_path": item.get("artifact_path"),
-        }
-        for item in history
-        if isinstance(item, dict)
-    ] if isinstance(history, list) else []
+    normalized_history: list[dict[str, Any]] = []
+    if isinstance(history, list):
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            entry: dict[str, Any] = {
+                "decision_number": item.get("decision_number"),
+                "level": item.get("level"),
+                "trigger": item.get("trigger"),
+                "action": item.get("action"),
+                "reason": item.get("reason"),
+                "artifact_path": item.get("artifact_path"),
+            }
+            metrics = _labeled_manager_prompt_metrics(
+                run_dir, item.get("artifact_path")
+            )
+            if metrics is not None:
+                entry["prompt_metrics"] = metrics
+            normalized_history.append(entry)
     return {
         "decision_count": int(run_json.get("manager_decision_number", len(normalized_history)) or 0),
         "history": normalized_history,
@@ -751,7 +798,7 @@ def summarize_run(run_dir: Path, run_json: dict[str, Any], turns: list[dict[str,
         },
         "recovery_history": recovery_history,
         "recovery_summary": recovery_summary,
-        "manager": _manager_summary(run_json),
+        "manager": _manager_summary(run_json, run_dir),
         "hotplug": _hotplug_summary(run_json),
         "run_id": run_dir.name,
         "selected_start_step": run_json.get("selected_start_step"),

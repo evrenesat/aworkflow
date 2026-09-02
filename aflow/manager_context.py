@@ -539,14 +539,20 @@ def _capture_v3_evidence(
             embedded = validated_envelope.get("plan_text")
             original_text = embedded if isinstance(embedded, str) else None
     if original_text is None and envelope_plan_ref is None:
-        original_value = (
-            boundary.get("original_plan_path")
-            or run_json.get("original_plan_path")
-            or run_json.get("plan_path")
-        )
-        original_candidate = _path_from_metadata(run_dir, original_value)
-        if original_candidate is not None:
-            original_text = _read_text(original_candidate) or None
+        # The boundary persists the exact original bytes captured at runtime
+        # so historical rebuilds never depend on later file mutations.
+        boundary_original = boundary.get("original_plan_content")
+        if isinstance(boundary_original, str):
+            original_text = boundary_original
+        else:
+            original_value = (
+                boundary.get("original_plan_path")
+                or run_json.get("original_plan_path")
+                or run_json.get("plan_path")
+            )
+            original_candidate = _path_from_metadata(run_dir, original_value)
+            if original_candidate is not None:
+                original_text = _read_text(original_candidate) or None
 
     active_plan_entry = unavailable_plan
     if active_text is not None:

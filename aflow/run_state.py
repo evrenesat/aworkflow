@@ -608,7 +608,7 @@ class FinalizedTurnBoundary:
     original_plan_path: str | None
     active_plan_path: str | None
     checkpoint_identity: str | None
-    context_schema_version: int = 3
+    context_schema_version: int = 4
     safely_retryable: bool = False
     operational_failure: bool = False
     backup_team: str | None = None

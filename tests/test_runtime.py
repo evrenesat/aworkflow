@@ -283,6 +283,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             class CapturingAdapter:
                 name = 'codex'
                 supports_effort = True
+                manager_workspace_read = True
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
                     captured.append((system_prompt, user_prompt))
@@ -357,6 +358,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             class CapturingAdapter:
                 name = 'codex'
                 supports_effort = True
+                manager_workspace_read = True
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
                     captured.append((model, system_prompt))
@@ -2892,6 +2894,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             class CapturingAdapter:
                 name = 'codex'
                 supports_effort = False
+                manager_workspace_read = True
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
                     captured_user_prompts.append(user_prompt)
@@ -4629,6 +4632,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             class TrackingAdapter:
                 name = 'codex'
                 supports_effort = True
+                manager_workspace_read = True
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
                     models.append(model)
@@ -7141,6 +7145,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             class TrackingAdapter:
                 name = 'codex'
                 supports_effort = True
+                manager_workspace_read = True
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
                     captured_repo_roots.append(str(repo_root))
@@ -9710,8 +9715,10 @@ class StopMarkerTests(unittest.TestCase):
                 envelope = read_envelope(artifact)
                 observed_first_worker.append(
                     envelope is not None
+                    and envelope.schema_version == 2
                     and envelope.original_plan_path == "plan.md"
-                    and envelope.plan_text.encode("utf-8") == original_plan_bytes
+                    and envelope.plan_ref.sha256
+                    == hashlib.sha256(original_plan_bytes).hexdigest()
                     and captured_scope["envelope_artifact_sha256"]
                     == hashlib.sha256(artifact.read_bytes()).hexdigest()
                 )
@@ -9928,6 +9935,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             class TrackingAdapter:
                 name = 'codex'
                 supports_effort = True
+                manager_workspace_read = True
 
                 def build_invocation(self, *, repo_root, model, system_prompt, user_prompt, effort=None):
                     if call_count[0] == 0:
@@ -10245,7 +10253,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             boundary_payload = json.loads(
                 (decision_dir / 'boundary.json').read_text(encoding='utf-8')
             )
-            assert boundary_payload['boundary']['context_schema_version'] == 3
+            assert boundary_payload['boundary']['context_schema_version'] == 4
             assert boundary_payload['boundary']['captured_plan_state'] == json.loads(
                 (decision_dir / 'context.json').read_text(encoding='utf-8')
             )['plan_state']
@@ -10265,6 +10273,129 @@ class LifecycleBootstrapTests(unittest.TestCase):
             ))
             stored = json.loads((decision_dir / 'context.json').read_text(encoding='utf-8'))
             assert rebuilt == stored
+
+    def test_incident_shaped_64kib_plan_manager_prompt_is_compact(self) -> None:
+        """The 2026-09-02 incident shape: a 64 KiB active plan must yield a
+        compact reference-only manager prompt and can never fail execve with
+        E2BIG."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            plan_text = (
+                "# Plan\n\n### [ ] Checkpoint 1: Incident shape\n\n**Steps:**\n"
+                + "PLAN-BODY-SENTINEL-1f2e3d\n"
+                + "\n".join(f"- [ ] filler row {index:05d} body" for index in range(2_400))
+                + "\n"
+            )
+            completed_plan_text = (
+                "# Plan\n\n### [x] Checkpoint 1: Incident shape\n\n**Steps:**\n"
+                + "PLAN-BODY-SENTINEL-1f2e3d\n"
+                + "\n".join(f"- [x] filler row {index:05d} body" for index in range(2_400))
+                + "\n"
+            )
+            assert 60_000 <= len(plan_text.encode('utf-8')) <= 68_000
+            assert 60_000 <= len(completed_plan_text.encode('utf-8')) <= 68_000
+            _write_plan(plan_path, plan_text)
+            workflow = WorkflowConfig(
+                steps={'impl': WorkflowStepConfig(
+                    role='architect', prompts=('p',),
+                    go=(GoTransition(to='END', when='DONE'),),
+                )},
+                first_step='impl',
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'architect': 'codex.default',
+                    'manager_lite': 'codex.manager-lite',
+                    'manager_full': 'codex.manager-full',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'),
+                    'manager-lite': HarnessProfileConfig(model='manager-lite'),
+                    'manager-full': HarnessProfileConfig(model='manager-full'),
+                })},
+                workflows={'managed': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(
+                    enabled=True,
+                    lite_role='manager_lite',
+                    full_role='manager_full',
+                ),
+            )
+            manager_prompts: list[str] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index('--model') + 1]
+                if model == 'manager-lite' or model == 'manager-full':
+                    prompt = _runner_prompt(argv, kwargs)
+                    manager_prompts.append(prompt)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        'schema_version': 1,
+                        'action': 'continue',
+                        'reason': 'Compact evidence supports the proposed END.',
+                        'next_step_notes': [],
+                        'stop_report': None,
+                    }), '')
+                _write_plan(Path(kwargs['cwd']) / 'plan.md', completed_plan_text)
+                return subprocess.CompletedProcess(argv, 0, 'work complete', '')
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                ),
+                wf_config,
+                'managed',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+            run_dir = result.run_dir
+            # The active plan remains the incident-shaped 64 KiB plan, and the
+            # manager was invoked exactly once with compact stdin.
+            assert len(manager_prompts) == 1
+            prompt = manager_prompts[0]
+            assert 'MANAGER_CONTEXT_JSON:\n' in prompt
+            user_manifest = prompt.split('MANAGER_CONTEXT_JSON:\n', 1)[1]
+            assert len(user_manifest.encode('utf-8')) <= 16_384
+            assert 'PLAN-BODY-SENTINEL' not in prompt
+            assert 'filler row' not in prompt
+            decision_dir = run_dir / 'manager' / 'decision-001'
+            context = json.loads(
+                (decision_dir / 'context.json').read_text(encoding='utf-8')
+            )
+            serialized = json.dumps(context, sort_keys=True)
+            assert context['schema_version'] == 3
+            assert 'PLAN-BODY-SENTINEL' not in serialized
+            assert 'filler row' not in serialized
+            assert context['plan_content_disclosure']['active_plan'] == 'referenced'
+            plan_ref = context['evidence']['active_plan']['reference']
+            assert plan_ref['sha256'] == hashlib.sha256(
+                completed_plan_text.encode('utf-8')
+            ).hexdigest()
+            artifact = repo_root / plan_ref['path']
+            assert artifact.is_file()
+            assert artifact.read_text(encoding='utf-8') == completed_plan_text
+            user_prompt_text = (decision_dir / 'user-prompt.txt').read_text(
+                encoding='utf-8'
+            )
+            assert len(user_prompt_text.encode('utf-8')) <= 16_384
+            assert 'PLAN-BODY-SENTINEL' not in user_prompt_text
+            result_payload = json.loads(
+                (decision_dir / 'result.json').read_text(encoding='utf-8')
+            )
+            assert result_payload['status'] == 'accepted'
+            assert result_payload['action'] == 'continue'
+            metrics = result_payload['prompt_metrics']
+            assert metrics['user_prompt_bytes'] <= 16_384
+            # The completed plan is complete, so only the active plan artifact
+            # is referenced at this boundary (no live checkpoint remains).
+            assert metrics['referenced_artifact_count'] >= 1
+            assert metrics['referenced_artifact_bytes'] >= len(
+                plan_text.encode('utf-8')
+            )
+            assert 'PLAN-BODY-SENTINEL' not in json.dumps(
+                result_payload['invocation']['argv']
+            )
 
     def test_manager_gate_and_executor_use_live_team_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -10631,23 +10762,55 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert second_result["status"] == "accepted"
             assert len(second_result["next_step_notes"]) == 8
             assert fourth_result["level"] == "full"
-            assert fourth["schema_version"] == 2
-            envelope = fourth["envelope"]
-            assert envelope["validated"] is True
-            assert envelope["available"] is True
-            assert envelope["plan_text"] == original_plan_text
-            assert envelope["plan_sha256"] == hashlib.sha256(
+            assert fourth["schema_version"] == 3
+            # Reference-only schema-v3 contexts carry no plan bodies.
+            assert "active_plan_content" not in fourth
+            assert "original_plan_content" not in fourth
+            assert "envelope" not in fourth
+            assert original_plan_text not in json.dumps(fourth)
+            evidence = fourth["evidence"]
+            assert evidence["active_plan"]["available"] is True
+            original = evidence["original_plan"]
+            if "shared_with" in original:
+                assert evidence["active_plan"]["reference"]["sha256"] == hashlib.sha256(
+                    original_plan_text.encode("utf-8")
+                ).hexdigest()
+            else:
+                assert original["reference"]["sha256"] == hashlib.sha256(
+                    original_plan_text.encode("utf-8")
+                ).hexdigest()
+            checkpoint = evidence["checkpoint"]
+            assert checkpoint["available"] is True
+            assert checkpoint["checkpoint_index"] == 1
+            # The referenced checkpoint is the live active plan's checkpoint
+            # (repair overlays legitimately rename it), never inlined text.
+            assert checkpoint["checkpoint_name"].startswith("Checkpoint 1:")
+            assert checkpoint["byte_start"] < checkpoint["byte_end"]
+            summary = fourth["controller_state"]["repartition_evidence"][
+                "envelope_summary"
+            ]
+            assert summary["validated"] is True
+            assert summary["schema_version"] == 2
+            assert summary["plan_ref"]["sha256"] == hashlib.sha256(
                 original_plan_text.encode("utf-8")
             ).hexdigest()
-            assert envelope["checkpoint_text"] == (
-                "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
+            assert summary["checkpoint_ref"]["sha256"] == hashlib.sha256(
+                (  # checkpoint body from the plan's first checkpoint slice
+                    "### [ ] Checkpoint 1: First\n- [ ] step one\n\n"
+                ).encode("utf-8")
+            ).hexdigest()
+            assert summary["checkpoint_line_start"] == 3
+            assert summary["checkpoint_line_end"] == 6
+            assert summary["checkpoint_byte_start"] < summary["checkpoint_byte_end"]
+            # Prompt metrics persist without any evidence/prompt bodies.
+            assert fourth_result["prompt_metrics"]["referenced_artifact_count"] >= 2
+            assert fourth_result["prompt_metrics"]["user_prompt_bytes"] <= 16_384
+            assert "user_prompt" not in fourth_result["prompt_metrics"]
+            # Artifact bytes are referenced evidence, not inline model input.
+            assert fourth_result["prompt_metrics"]["referenced_artifact_count"] >= 2
+            assert fourth_result["prompt_metrics"]["referenced_artifact_bytes"] >= (
+                len(original_plan_text.encode("utf-8"))
             )
-            assert envelope["checkpoint_line_start"] == 3
-            assert envelope["checkpoint_line_end"] == 6
-            assert envelope["checkpoint_byte_start"] < envelope["checkpoint_byte_end"]
-            assert envelope["heading_prefix"] == "### [ ] Checkpoint 1: First\n"
-            assert envelope["source_blocks"]
-            assert fourth["original_plan_content"] == original_plan_text
             first_rejection = json.loads(
                 (result.run_dir / "turns" / "turn-002" / "result.json").read_text()
             )["review_rejection"]
@@ -10674,7 +10837,14 @@ class LifecycleBootstrapTests(unittest.TestCase):
             ] == [1, 2]
             latest_rejection = fourth["controller_state"]["latest_full_rejection"]
             assert latest_rejection["rejection_number"] == 2
-            assert latest_rejection["exact_reviewer_output"] == "synthetic workflow result"
+            # Schema-v3 references the reviewer transcript artifact instead of
+            # embedding exact reviewer output.
+            assert "exact_reviewer_output" not in latest_rejection
+            stdout_artifact = repo_root / latest_rejection[
+                "review_stdout_artifact_path"
+            ]
+            assert stdout_artifact.is_file()
+            assert stdout_artifact.read_text() == "synthetic workflow result"
             assert [
                 attempt["turn_number"]
                 for attempt in fourth["implementation_attempts"]["attempts"]
@@ -10835,7 +11005,13 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert first_context["controller_state"]["scope_pressure_reason"] == (
                 "scope needs Full review"
             )
-            assert first_context["envelope"]["validated"] is True
+            summary = first_context["controller_state"]["repartition_evidence"][
+                "envelope_summary"
+            ]
+            assert summary["validated"] is True
+            assert summary["available"] is True
+            assert "plan_text" not in json.dumps(summary)
+            assert first_context["evidence"]["active_plan"]["available"] is True
 
     def test_repartition_full_cycle_applies_routes_review_and_resets_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -12465,12 +12641,16 @@ class LifecycleBootstrapTests(unittest.TestCase):
             diagnostics = context["finished_turn"]["diagnostics"]  # type: ignore[index]
             assert diagnostics["signals"] == []
             assert diagnostics["signal_provenance"] == []
-            assert context["plan_content_disclosure"] == {
-                "active_plan_content": "intentionally_omitted",
-                "original_plan_content": "intentionally_omitted",
-            }
-            assert context["active_plan_content"] is None
-            assert context["original_plan_content"] is None
+            # Schema-v3 Lite references content instead of embedding or
+            # redacting it inline.
+            assert "active_plan_content" not in context
+            assert "original_plan_content" not in context
+            disclosure = context["plan_content_disclosure"]  # type: ignore[index]
+            assert set(disclosure) == {"active_plan", "original_plan", "checkpoint"}
+            assert all(
+                value in {"referenced", "unavailable"}
+                for value in disclosure.values()
+            )
             assert context["controller_state"]["proposed_next_step"] == (  # type: ignore[index]
                 "review_cp_implementation"
             )
@@ -12630,7 +12810,13 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 "accepted.txt", "aflow/workflow.py", "tests/test_runtime.py",
             ]
             assert manager_contexts[2]["plan_state"]["active_plan_path"].endswith("plan-repair.md")
-            assert manager_contexts[2]["active_plan_content"] is None
+            # Schema-v3 Lite references content instead of embedding or redacting it.
+            assert "active_plan_content" not in manager_contexts[2]
+            assert (
+                manager_contexts[2]["plan_content_disclosure"]["active_plan"]
+                == "referenced"
+            )
+            assert manager_contexts[2]["evidence"]["active_plan"]["available"] is True
             assert manager_models[:3] == ["manager-lite", "manager-lite", "manager-full"]
             assert worker_prompts[1].find(invalid_note) == -1
             assert compatible_note in worker_prompts[1]
@@ -12708,7 +12894,10 @@ class LifecycleBootstrapTests(unittest.TestCase):
             manager_argv = calls[1]
             assert "--dir" in manager_argv
             assert "--print" in manager_argv
-            assert manager_argv.index("--print") < len(manager_argv) - 1
+            # Reasonix receives one-shot prompts on stdin; --print stays a flag
+            # and no prompt text ever enters argv.
+            assert manager_argv[-1] == "--print"
+            assert not any("MANAGER_CONTEXT_JSON" in argument for argument in manager_argv)
             decision = json.loads(
                 (result.run_dir / "manager" / "decision-001" / "result.json").read_text()
             )
