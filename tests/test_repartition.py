@@ -12,7 +12,6 @@ from pathlib import Path
 
 from aflow.repartition import (
     CheckpointSourceSlice,
-    DriftValidationResult,
     MechanicalValidationResult,
     PartitionSpecV1,
     RepartitionProposalV1,
@@ -2177,10 +2176,6 @@ class ReviewRejectionRegressionTests(unittest.TestCase):
         close_end = close_start + len(marker)
         fence_block = candidate[opener.start():close_end + 1]
 
-        # Find the metadata line end (the \n\n after the JSON comment).
-        meta_prefix = "<!-- aflow-repartition-metadata "
-        meta_start = candidate.index(meta_prefix)
-        meta_end = candidate.index("\n", meta_start)
         # Insert the fence block at a position well after metadata but still
         # before ``**Narrow Goal:**``, with extra blank lines in between.
         narrow_idx = candidate.index("\n**Narrow Goal:**")
@@ -2848,3 +2843,283 @@ class EnvelopeCaptureTests(unittest.TestCase):
             loaded = read_envelope(artifact_path)
             assert loaded is not None
             assert loaded.scope_id == "plan.md::checkpoint-1::first"
+
+
+# Scope-envelope v2: reference-only metadata manifest
+import textwrap
+
+from aflow.repartition import (
+    EvidenceArtifactReferenceV2,
+    ScopeEnvelopeV2,
+    create_envelope_v2,
+    parse_envelope_bytes,
+    validate_envelope_v2,
+)
+from aflow.run_state import ControllerConfig
+from aflow.runlog import (
+    capture_checkpoint_evidence,
+    capture_plan_evidence,
+    create_run_paths,
+    evidence_artifact_dir,
+    resolve_envelope_texts,
+)
+
+_PLAN_V2 = textwrap.dedent("""\
+    # Plan
+
+    ### [ ] Checkpoint 1: First
+
+    **Goal:**
+
+    Do something.
+
+    **Done criteria:**
+
+    - [ ] works
+""")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _v2_refs(plan_text: str, checkpoint_text: str, run_id: str) -> tuple[EvidenceArtifactReferenceV2, EvidenceArtifactReferenceV2]:
+    plan_sha = _sha256(plan_text.encode("utf-8"))
+    checkpoint_sha = _sha256(checkpoint_text.encode("utf-8"))
+    plan_ref = EvidenceArtifactReferenceV2(
+        kind="plan",
+        path=f".aflow/runs/{run_id}/evidence/plans/{plan_sha}.md",
+        sha256=plan_sha,
+        byte_size=len(plan_text.encode("utf-8")),
+    )
+    checkpoint_ref = EvidenceArtifactReferenceV2(
+        kind="checkpoint",
+        path=f".aflow/runs/{run_id}/evidence/checkpoints/{checkpoint_sha}.md",
+        sha256=checkpoint_sha,
+        byte_size=len(checkpoint_text.encode("utf-8")),
+    )
+    return plan_ref, checkpoint_ref
+
+
+def _slice_checkpoint(plan_text: str) -> str:
+    sliced = slice_checkpoint_source(plan_text, checkpoint_index=1)
+    assert sliced is not None
+    return sliced.full_text
+
+
+def test_envelope_v2_contains_no_prohibited_body_fields(tmp_path: Path) -> None:
+    plan_text = _PLAN_V2
+    checkpoint_text = _slice_checkpoint(plan_text)
+    plan_ref, checkpoint_ref = _v2_refs(plan_text, checkpoint_text, "run-1")
+    envelope = create_envelope_v2(
+        scope_id="scope-v2",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+    )
+    payload = envelope.to_dict()
+    for key in (
+        "plan_text", "plan_bytes_b64", "checkpoint_text", "checkpoint_bytes_b64",
+    ):
+        assert key not in payload
+    assert "plan_ref" in payload and "checkpoint_ref" in payload
+    for block in payload["source_blocks"]:
+        assert "text" not in block
+    assert envelope.schema_version == 2
+    assert envelope.checkpoint_name == "Checkpoint 1: First"
+    assert envelope.checkpoint_index == 1
+    assert envelope.checkpoint_ref.sha256 == envelope.checkpoint_ref.path.rsplit("/", 1)[1][:-3]
+
+
+def test_envelope_v2_refuses_refs_mismatching_captured_content() -> None:
+    plan_text = _PLAN_V2
+    checkpoint_text = _slice_checkpoint(plan_text)
+    plan_ref, checkpoint_ref = _v2_refs(plan_text, checkpoint_text, "run-1")
+    wrong_plan = EvidenceArtifactReferenceV2(
+        kind="plan",
+        path=plan_ref.path,
+        sha256=plan_ref.sha256,
+        byte_size=plan_ref.byte_size + 7,
+    )
+    with pytest.raises(ValueError, match="byte_size"):
+        create_envelope_v2(
+            scope_id="scope-v2",
+            original_plan_path="plan.md",
+            plan_text=plan_text,
+            checkpoint_index=1,
+            plan_ref=wrong_plan,
+            checkpoint_ref=checkpoint_ref,
+        )
+    displaced_sha = _sha256(b"different")
+    displaced = EvidenceArtifactReferenceV2(
+        kind="plan",
+        path=f".aflow/runs/run-1/evidence/plans/{displaced_sha}.md",
+        sha256=displaced_sha,
+        byte_size=5,
+    )
+    with pytest.raises(ValueError, match="sha256"):
+        create_envelope_v2(
+            scope_id="scope-v2",
+            original_plan_path="plan.md",
+            plan_text=plan_text,
+            checkpoint_index=1,
+            plan_ref=displaced,
+            checkpoint_ref=checkpoint_ref,
+        )
+
+
+def test_envelope_v1_and_v2_derive_equivalent_semantic_scope_evidence() -> None:
+    plan_text = _PLAN_V2
+    checkpoint_text = _slice_checkpoint(plan_text)
+    v1 = create_envelope(
+        scope_id="scope-eq",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+    )
+    plan_ref, checkpoint_ref = _v2_refs(plan_text, checkpoint_text, "run-1")
+    v2 = create_envelope_v2(
+        scope_id="scope-eq",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+    )
+    assert v2.scope_digest == v1.scope_digest == hashlib.sha256(b"scope-eq").hexdigest()
+    assert v2.checkpoint_index == v1.checkpoint_index
+    assert v2.checkpoint_name == v1.checkpoint_name
+    assert (v2.checkpoint_line_start, v2.checkpoint_line_end) == (
+        v1.checkpoint_line_start, v1.checkpoint_line_end,
+    )
+    assert (v2.checkpoint_byte_start, v2.checkpoint_byte_end) == (
+        v1.checkpoint_byte_start, v1.checkpoint_byte_end,
+    )
+    assert v2.plan_ref.sha256 == v1.plan_sha256
+    assert v2.checkpoint_ref.sha256 == v1.checkpoint_sha256
+    assert v2.plan_ref.byte_size == len(plan_text.encode("utf-8"))
+    assert len(v2.source_blocks) == len(v1.source_blocks)
+    assert [(b.block_id, b.byte_start, b.byte_end, b.line_start, b.line_end, b.section_label, b.content_sha256) for b in v2.source_blocks] == [
+        (b.block_id, b.byte_start, b.byte_end, b.line_start, b.line_end, b.section_label, b.content_sha256) for b in v1.source_blocks
+    ]
+
+
+def test_envelope_v2_roundtrip_and_canonical_digest_stability() -> None:
+    plan_text = _PLAN_V2
+    checkpoint_text = _slice_checkpoint(plan_text)
+    plan_ref, checkpoint_ref = _v2_refs(plan_text, checkpoint_text, "run-1")
+    envelope = create_envelope_v2(
+        scope_id="scope-rt",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+    )
+    payload = dict(envelope.to_dict())
+    payload["canonical_envelope_sha256"] = envelope.canonical_envelope_sha256
+    reparsed = parse_envelope_bytes(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    )
+    assert isinstance(reparsed, ScopeEnvelopeV2)
+    assert reparsed == envelope
+    assert validate_envelope_v2(reparsed) == []
+    assert validate_envelope(reparsed) == []
+    tampered = dict(payload)
+    tampered["checkpoint_name"] = "Checkpoint 1: Renamed"
+    with pytest.raises(ValueError, match="canonical_envelope_sha256 mismatch"):
+        parse_envelope_bytes(json.dumps(tampered, sort_keys=True).encode("utf-8"))
+
+
+def test_envelope_parse_dispatches_by_exact_schema_version(tmp_path: Path) -> None:
+    plan_text = _PLAN_V2
+    checkpoint_text = _slice_checkpoint(plan_text)
+    v1 = create_envelope(
+        scope_id="scope-dispatch",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+    )
+    plan_ref, checkpoint_ref = _v2_refs(plan_text, checkpoint_text, "run-1")
+    v2 = create_envelope_v2(
+        scope_id="scope-dispatch",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+    )
+    v1_payload = dict(v1.to_dict())
+    v1_payload["canonical_envelope_sha256"] = v1.canonical_envelope_sha256
+    v2_payload = dict(v2.to_dict())
+    v2_payload["canonical_envelope_sha256"] = v2.canonical_envelope_sha256
+    assert isinstance(parse_envelope_bytes(json.dumps(v1_payload).encode()), ScopeEnvelopeV1)
+    assert isinstance(parse_envelope_bytes(json.dumps(v2_payload).encode()), ScopeEnvelopeV2)
+    unsupported = dict(v1_payload, schema_version=3)
+    with pytest.raises(ValueError, match="Unsupported envelope schema_version"):
+        parse_envelope_bytes(json.dumps(unsupported).encode())
+
+
+def test_envelope_v2_resolves_referenced_evidence_bytes(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(_PLAN_V2, encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=3)
+    paths = create_run_paths(config)
+    checkpoint_text = _slice_checkpoint(_PLAN_V2)
+    plan_ref = capture_plan_evidence(paths, _PLAN_V2)
+    checkpoint_ref = capture_checkpoint_evidence(paths, checkpoint_text)
+    envelope = create_envelope_v2(
+        scope_id="scope-evidence",
+        original_plan_path="plan.md",
+        plan_text=_PLAN_V2,
+        checkpoint_index=1,
+        plan_ref=EvidenceArtifactReferenceV2(
+            kind="plan", path=plan_ref.path, sha256=plan_ref.sha256, byte_size=plan_ref.byte_size
+        ),
+        checkpoint_ref=EvidenceArtifactReferenceV2(
+            kind="checkpoint", path=checkpoint_ref.path,
+            sha256=checkpoint_ref.sha256, byte_size=checkpoint_ref.byte_size,
+        ),
+    )
+    plan_text, resolved_checkpoint = resolve_envelope_texts(paths, envelope)
+    assert plan_text == _PLAN_V2
+    assert resolved_checkpoint == checkpoint_text
+
+    # Mutating evidence bytes fails closed on later resolution.
+    destination = evidence_artifact_dir(paths, "checkpoint") / f"{checkpoint_ref.sha256}.md"
+    destination.write_bytes(b"tampered")
+    with pytest.raises(ValueError):
+        resolve_envelope_texts(paths, envelope)
+
+
+def test_envelope_v2_drift_requires_resolved_plan_evidence() -> None:
+    plan_text = _PLAN_V2
+    checkpoint_text = _slice_checkpoint(plan_text)
+    plan_ref, checkpoint_ref = _v2_refs(plan_text, checkpoint_text, "run-1")
+    envelope = create_envelope_v2(
+        scope_id="scope-drift",
+        original_plan_path="plan.md",
+        plan_text=plan_text,
+        checkpoint_index=1,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+    )
+    unresolved = validate_envelope_boundary_drift(
+        envelope=envelope, boundary_plan_text=plan_text
+    )
+    assert unresolved.allowed is False
+    assert "v2_envelope_requires_resolved_plan_evidence" in unresolved.issues
+    resolved_identical = validate_envelope_boundary_drift(
+        envelope=envelope, boundary_plan_text=plan_text, resolved_plan_text=plan_text
+    )
+    assert resolved_identical.allowed is True
+    drift_line = plan_text + "# extra trailing section not in the envelope\n"
+    drifted = validate_envelope_boundary_drift(
+        envelope=envelope,
+        boundary_plan_text=drift_line,
+        resolved_plan_text=plan_text,
+    )
+    assert drifted.allowed is False
+    assert drifted.issues == ("structural_line_change_not_allowed",)

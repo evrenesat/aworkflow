@@ -665,6 +665,58 @@ def capture_checkpoint_evidence(paths: RunPaths, checkpoint_text: str) -> Eviden
     return capture_text_evidence(paths, kind="checkpoint", text=checkpoint_text)
 
 
+def _evidence_reference_from_envelope_ref(
+    paths: RunPaths, value: object, label: str
+) -> EvidenceReference:
+    """Adapt one envelope v2 artifact reference to the runlog evidence reader."""
+    from .repartition import EvidenceArtifactReferenceV2
+
+    if not isinstance(value, EvidenceArtifactReferenceV2):
+        raise ValueError(f"{label} is not a valid envelope evidence reference")
+    return EvidenceReference(
+        kind=value.kind,
+        path=value.path,
+        sha256=value.sha256,
+        byte_size=value.byte_size,
+    )
+
+
+def resolve_envelope_texts(
+    paths: RunPaths, envelope: object
+) -> tuple[str, str]:
+    """Resolve the authoritative (plan_text, checkpoint_text) for an envelope.
+
+    Schema-v1 envelopes embed the exact bytes. Schema-v2 envelopes are
+    reference-only: the referenced plan and checkpoint evidence artifacts are
+    resolved from this run's evidence store with full fail-closed validation
+    (containment, regular file, digest and byte-size match). The checkpoint
+    text must additionally equal the plan bytes at the stored byte span.
+    """
+    from .repartition import ScopeEnvelopeV1, ScopeEnvelopeV2
+
+    if isinstance(envelope, ScopeEnvelopeV1):
+        return envelope.plan_text, envelope.checkpoint_text
+    if not isinstance(envelope, ScopeEnvelopeV2):
+        raise ValueError("envelope must be schema v1 or v2")
+    plan_ref = _evidence_reference_from_envelope_ref(paths, envelope.plan_ref, "plan_ref")
+    checkpoint_ref = _evidence_reference_from_envelope_ref(
+        paths, envelope.checkpoint_ref, "checkpoint_ref"
+    )
+    plan_text = resolve_evidence_artifact(paths, plan_ref).decode("utf-8", "strict")
+    checkpoint_text = resolve_evidence_artifact(paths, checkpoint_ref).decode(
+        "utf-8", "strict"
+    )
+    plan_bytes = plan_text.encode("utf-8")
+    span = plan_bytes[envelope.checkpoint_byte_start : envelope.checkpoint_byte_end]
+    if span != checkpoint_text.encode("utf-8"):
+        raise ValueError(
+            "checkpoint evidence does not equal the plan bytes at the stored span"
+        )
+    if len(checkpoint_text.encode("utf-8")) != envelope.checkpoint_ref.byte_size:
+        raise ValueError("checkpoint evidence byte size does not match its reference")
+    return plan_text, checkpoint_text
+
+
 def _snapshot_payload(snapshot: PlanSnapshot | None) -> dict[str, object] | None:
     if snapshot is None:
         return None

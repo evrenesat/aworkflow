@@ -567,6 +567,12 @@ def _make_source_block(
 # 3. Scope envelope
 # ---------------------------------------------------------------------------
 
+SCOPE_ENVELOPE_SCHEMA_VERSION_V1 = 1
+SCOPE_ENVELOPE_SCHEMA_VERSION_V2 = 2
+_EVIDENCE_REFERENCE_PATH_RE = re.compile(
+    r"^\.aflow/runs/[^/]+/evidence/(plans|checkpoints)/[0-9a-f]{64}\.md$"
+)
+
 @dataclass(frozen=True)
 class ScopeEnvelopeV1:
     """Immutable authoritative capture of a checkpoint scope at opening time."""
@@ -849,7 +855,25 @@ def _compute_canonical_envelope_hash(envelope: ScopeEnvelopeV1) -> str:
     return _sha256_hex(json_bytes)
 
 
-def validate_envelope(envelope: ScopeEnvelopeV1) -> list[str]:
+def validate_envelope(envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2) -> list[str]:
+    """Validate every persisted envelope field without normalizing authority.
+
+    Dispatch is exact by stored schema version: v1 rules remain strict and
+    unchanged; v2 is structurally validated as a reference-only manifest.
+    """
+    if (
+        isinstance(envelope, ScopeEnvelopeV2)
+        or getattr(envelope, "schema_version", 1) == SCOPE_ENVELOPE_SCHEMA_VERSION_V2
+    ):
+        if not isinstance(envelope, ScopeEnvelopeV2):
+            raise ValueError("Envelope schema/type mismatch for v2 validation")
+        return validate_envelope_v2(envelope)
+    if not isinstance(envelope, ScopeEnvelopeV1):
+        raise ValueError("Envelope must be schema v1 or v2")
+    return _validate_envelope_v1(envelope)
+
+
+def _validate_envelope_v1(envelope: ScopeEnvelopeV1) -> list[str]:
     """Validate every persisted envelope field without normalizing authority."""
     issues: list[str] = []
 
@@ -948,7 +972,9 @@ def envelope_artifact_dir(run_dir: Path, scope_digest: str) -> Path:
     return run_dir / "scopes" / scope_digest
 
 
-def write_envelope_atomic(envelope: ScopeEnvelopeV1, artifact_dir: Path) -> Path:
+def write_envelope_atomic(
+    envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2, artifact_dir: Path
+) -> Path:
     """Create an immutable envelope artifact without clobbering an existing one."""
     issues = validate_envelope(envelope)
     if issues:
@@ -1012,7 +1038,7 @@ def write_envelope_atomic(envelope: ScopeEnvelopeV1, artifact_dir: Path) -> Path
     return envelope_path
 
 
-def read_envelope(envelope_path: Path) -> ScopeEnvelopeV1 | None:
+def read_envelope(envelope_path: Path) -> ScopeEnvelopeV1 | ScopeEnvelopeV2 | None:
     """Read a validated envelope; only an absent artifact returns ``None``."""
     if not envelope_path.exists():
         return None
@@ -1022,20 +1048,483 @@ def read_envelope(envelope_path: Path) -> ScopeEnvelopeV1 | None:
         raise ValueError(f"Invalid envelope artifact {envelope_path}: {exc}") from exc
 
 
-def parse_envelope_bytes(raw: bytes) -> ScopeEnvelopeV1:
-    """Parse validated immutable envelope bytes without newline conversion."""
+def parse_envelope_bytes(raw: bytes) -> ScopeEnvelopeV1 | ScopeEnvelopeV2:
+    """Parse validated immutable envelope bytes without newline conversion.
+
+    Parsing and validation dispatch on the exact stored schema version:
+    v1 rebuilds with the strict v1 rules; v2 uses the reference-only rules.
+    """
     try:
         text = raw.decode("utf-8", "strict")
         data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("Envelope JSON must be an object")
-        envelope = ScopeEnvelopeV1.from_dict(data)
+        schema_version = data.get("schema_version")
+        if schema_version == SCOPE_ENVELOPE_SCHEMA_VERSION_V1:
+            envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2 = ScopeEnvelopeV1.from_dict(data)
+        elif schema_version == SCOPE_ENVELOPE_SCHEMA_VERSION_V2:
+            envelope = ScopeEnvelopeV2.from_dict(data)
+        else:
+            raise ValueError(f"Unsupported envelope schema_version: {schema_version!r}")
         issues = validate_envelope(envelope)
         if issues:
             raise ValueError("Envelope validation failed: " + "; ".join(issues))
         return envelope
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Invalid envelope bytes: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# 3b. Scope-envelope v2: reference-only metadata manifest
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EvidenceArtifactReferenceV2:
+    """One content-addressed evidence reference inside a v2 envelope.
+
+    ``path`` is the repository-relative POSIX form also used by manager
+    contexts; the digest-addressed evidence file is the content authority.
+    """
+
+    kind: str
+    path: str
+    sha256: str
+    byte_size: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "path": self.path,
+            "sha256": self.sha256,
+            "byte_size": self.byte_size,
+        }
+
+    @staticmethod
+    def from_dict(data: Mapping[str, object], label: str) -> EvidenceArtifactReferenceV2:
+        if not isinstance(data, Mapping):
+            raise ValueError(f"{label} must be an object")
+        expected = {"kind", "path", "sha256", "byte_size"}
+        if set(data) != expected:
+            raise ValueError(f"{label} does not match the evidence reference schema")
+        kind = data["kind"]
+        path = data["path"]
+        sha256 = data["sha256"]
+        byte_size = data["byte_size"]
+        if kind not in ("plan", "checkpoint"):
+            raise ValueError(f"{label}.kind must be 'plan' or 'checkpoint'")
+        if (
+            not isinstance(path, str)
+            or not isinstance(sha256, str)
+            or not isinstance(byte_size, int)
+            or isinstance(byte_size, bool)
+        ):
+            raise ValueError(f"{label} fields must have exact types")
+        match = _EVIDENCE_REFERENCE_PATH_RE.fullmatch(path)
+        if match is None:
+            raise ValueError(f"{label}.path is not a digest-addressed evidence path")
+        if not _is_valid_sha256_hex(sha256) or sha256 != path.rsplit("/", 1)[1][:-3]:
+            raise ValueError(f"{label}.sha256 must match the digest-addressed path")
+        dirname = "plans" if kind == "plan" else "checkpoints"
+        if match.group(1) != dirname:
+            raise ValueError(f"{label}.kind does not match its evidence subdirectory")
+        if byte_size <= 0:
+            raise ValueError(f"{label}.byte_size must be positive")
+        return EvidenceArtifactReferenceV2(
+            kind=kind, path=path, sha256=sha256, byte_size=byte_size
+        )
+
+
+@dataclass(frozen=True)
+class SourceBlockV2:
+    """Deterministic source-block identity without copied block text."""
+
+    block_id: str
+    byte_start: int
+    byte_end: int
+    line_start: int
+    line_end: int
+    section_label: str | None
+    content_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "block_id": self.block_id,
+            "byte_start": self.byte_start,
+            "byte_end": self.byte_end,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "section_label": self.section_label,
+            "content_sha256": self.content_sha256,
+        }
+
+    @staticmethod
+    def from_dict(data: Mapping[str, object]) -> SourceBlockV2:
+        if not isinstance(data, Mapping):
+            raise ValueError("source block must be an object")
+        expected = {
+            "block_id", "byte_start", "byte_end", "line_start",
+            "line_end", "section_label", "content_sha256",
+        }
+        if set(data) != expected:
+            raise ValueError("source block does not match the v2 schema")
+        section_label = data["section_label"]
+        if section_label is not None and not isinstance(section_label, str):
+            raise ValueError("source block section_label must be string or null")
+        integers: list[int] = []
+        for key in ("byte_start", "byte_end", "line_start", "line_end"):
+            value = data[key]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"source block {key} must be an integer")
+            integers.append(value)
+        block_id = data["block_id"]
+        content_sha256 = data["content_sha256"]
+        if not _is_nonblank_string(block_id) or not _is_valid_sha256_hex(content_sha256):
+            raise ValueError("source block identity or content hash is invalid")
+        return SourceBlockV2(
+            block_id=block_id,
+            byte_start=integers[0],
+            byte_end=integers[1],
+            line_start=integers[2],
+            line_end=integers[3],
+            section_label=section_label,
+            content_sha256=content_sha256,
+        )
+
+
+@dataclass(frozen=True)
+class ScopeEnvelopeV2:
+    """Immutable reference-only scope capture at opening time.
+
+    Holds identities, hashes, checkpoint offsets, and references into the
+    run-local content-addressed evidence store. It contains no plan text,
+    base64 plan bytes, checkpoint text, or copied source-block text.
+    """
+
+    schema_version: int = SCOPE_ENVELOPE_SCHEMA_VERSION_V2
+    scope_id: str = ""
+    scope_digest: str = ""
+    original_plan_path: str = ""
+    plan_ref: EvidenceArtifactReferenceV2 = field(
+        default_factory=lambda: EvidenceArtifactReferenceV2("", "", "", 0)
+    )
+    checkpoint_ref: EvidenceArtifactReferenceV2 = field(
+        default_factory=lambda: EvidenceArtifactReferenceV2("", "", "", 0)
+    )
+    checkpoint_index: int = 0
+    checkpoint_name: str = ""
+    checkpoint_line_start: int = 0
+    checkpoint_line_end: int = 0
+    checkpoint_byte_start: int = 0
+    checkpoint_byte_end: int = 0
+    heading_prefix: str = ""
+    source_blocks: tuple[SourceBlockV2, ...] = ()
+    canonical_envelope_sha256: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialise to a JSON-safe dict, excluding canonical_envelope_sha256."""
+        return {
+            "schema_version": self.schema_version,
+            "scope_id": self.scope_id,
+            "scope_digest": self.scope_digest,
+            "original_plan_path": self.original_plan_path,
+            "plan_ref": self.plan_ref.to_dict(),
+            "checkpoint_ref": self.checkpoint_ref.to_dict(),
+            "checkpoint_index": self.checkpoint_index,
+            "checkpoint_name": self.checkpoint_name,
+            "checkpoint_line_start": self.checkpoint_line_start,
+            "checkpoint_line_end": self.checkpoint_line_end,
+            "checkpoint_byte_start": self.checkpoint_byte_start,
+            "checkpoint_byte_end": self.checkpoint_byte_end,
+            "heading_prefix": self.heading_prefix,
+            "source_blocks": [block.to_dict() for block in self.source_blocks],
+        }
+
+    @staticmethod
+    def from_dict(data: Mapping[str, object]) -> ScopeEnvelopeV2:
+        """Reconstruct a v2 envelope without coercing untrusted JSON values."""
+        if not isinstance(data, Mapping):
+            raise ValueError("Envelope JSON must be an object")
+        expected_keys = {
+            "schema_version", "scope_id", "scope_digest", "original_plan_path",
+            "plan_ref", "checkpoint_ref", "checkpoint_index", "checkpoint_name",
+            "checkpoint_line_start", "checkpoint_line_end", "checkpoint_byte_start",
+            "checkpoint_byte_end", "heading_prefix", "source_blocks",
+            "canonical_envelope_sha256",
+        }
+        actual_keys = set(data)
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)
+            unknown = sorted(actual_keys - expected_keys)
+            raise ValueError(
+                f"Envelope fields do not match schema v2 (missing={missing}, unknown={unknown})"
+            )
+        schema_version = data["schema_version"]
+        if schema_version != SCOPE_ENVELOPE_SCHEMA_VERSION_V2:
+            raise ValueError("Envelope schema_version must be integer 2")
+
+        def required_string(key: str) -> str:
+            value = data[key]
+            if not isinstance(value, str):
+                raise ValueError(f"Envelope field '{key}' must be a string")
+            return value
+
+        def required_int(key: str) -> int:
+            value = data[key]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"Envelope field '{key}' must be an integer")
+            return value
+
+        raw_blocks = data["source_blocks"]
+        if not isinstance(raw_blocks, list):
+            raise ValueError("Envelope field 'source_blocks' must be a list")
+        blocks = tuple(
+            SourceBlockV2.from_dict(raw_block) for raw_block in raw_blocks
+        )
+        return ScopeEnvelopeV2(
+            schema_version=schema_version,
+            scope_id=required_string("scope_id"),
+            scope_digest=required_string("scope_digest"),
+            original_plan_path=required_string("original_plan_path"),
+            plan_ref=EvidenceArtifactReferenceV2.from_dict(data["plan_ref"], "plan_ref"),
+            checkpoint_ref=EvidenceArtifactReferenceV2.from_dict(
+                data["checkpoint_ref"], "checkpoint_ref"
+            ),
+            checkpoint_index=required_int("checkpoint_index"),
+            checkpoint_name=required_string("checkpoint_name"),
+            checkpoint_line_start=required_int("checkpoint_line_start"),
+            checkpoint_line_end=required_int("checkpoint_line_end"),
+            checkpoint_byte_start=required_int("checkpoint_byte_start"),
+            checkpoint_byte_end=required_int("checkpoint_byte_end"),
+            heading_prefix=required_string("heading_prefix"),
+            source_blocks=blocks,
+            canonical_envelope_sha256=required_string("canonical_envelope_sha256"),
+        )
+
+
+def _v2_canonical_dict(envelope: ScopeEnvelopeV2) -> dict[str, object]:
+    """Canonical metadata plus referenced content hashes and sizes."""
+    return {
+        "schema_version": envelope.schema_version,
+        "scope_id": envelope.scope_id,
+        "scope_digest": envelope.scope_digest,
+        "original_plan_path": envelope.original_plan_path,
+        "plan_ref": envelope.plan_ref.to_dict(),
+        "checkpoint_ref": envelope.checkpoint_ref.to_dict(),
+        "checkpoint_index": envelope.checkpoint_index,
+        "checkpoint_name": envelope.checkpoint_name,
+        "checkpoint_line_start": envelope.checkpoint_line_start,
+        "checkpoint_line_end": envelope.checkpoint_line_end,
+        "checkpoint_byte_start": envelope.checkpoint_byte_start,
+        "checkpoint_byte_end": envelope.checkpoint_byte_end,
+        "heading_prefix": envelope.heading_prefix,
+        "source_blocks": [block.to_dict() for block in envelope.source_blocks],
+    }
+
+
+def _compute_v2_canonical_envelope_hash(envelope: ScopeEnvelopeV2) -> str:
+    d = _v2_canonical_dict(envelope)
+    json_bytes = json.dumps(
+        d, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return _sha256_hex(json_bytes)
+
+
+def validate_envelope_v2(envelope: ScopeEnvelopeV2) -> list[str]:
+    """Structurally validate a v2 envelope without resolving evidence bytes.
+
+    The referenced plan/checkpoint artifacts are the content authority;
+    byte-for-byte drift checks resolve those artifacts before comparing.
+    """
+    issues: list[str] = []
+    if (
+        not isinstance(envelope.schema_version, int)
+        or envelope.schema_version != SCOPE_ENVELOPE_SCHEMA_VERSION_V2
+    ):
+        issues.append("schema_version must be integer 2")
+    if not _is_nonblank_string(envelope.scope_id):
+        issues.append("scope_id is empty")
+    if not _is_valid_sha256_hex(envelope.scope_digest):
+        issues.append("scope_digest is not a lowercase SHA-256 hex digest")
+    elif _is_nonblank_string(envelope.scope_id) and envelope.scope_digest != _sha256_hex(
+        envelope.scope_id.encode("utf-8")
+    ):
+        issues.append("scope_digest does not match scope_id")
+    try:
+        _validate_relative_logical_path(envelope.original_plan_path)
+    except ValueError as exc:
+        issues.append(str(exc))
+    if envelope.plan_ref.kind != "plan" or envelope.checkpoint_ref.kind != "checkpoint":
+        issues.append("plan_ref/checkpoint_ref kinds are invalid")
+    if not _is_valid_sha256_hex(envelope.canonical_envelope_sha256):
+        issues.append("canonical_envelope_sha256 is not a lowercase SHA-256 hex digest")
+    if envelope.checkpoint_index < 1:
+        issues.append("checkpoint_index must be positive")
+    if not _is_nonblank_string(envelope.checkpoint_name):
+        issues.append("checkpoint_name is empty")
+    if not (1 <= envelope.checkpoint_line_start < envelope.checkpoint_line_end):
+        issues.append("checkpoint line span is invalid")
+    if not (
+        0
+        <= envelope.checkpoint_byte_start
+        < envelope.checkpoint_byte_end
+        <= envelope.plan_ref.byte_size
+    ):
+        issues.append("checkpoint byte span is invalid")
+    elif (
+        envelope.checkpoint_ref.byte_size
+        != envelope.checkpoint_byte_end - envelope.checkpoint_byte_start
+    ):
+        issues.append(
+            "checkpoint_ref byte size must equal the checkpoint byte span length"
+        )
+    if envelope.checkpoint_ref.byte_size >= envelope.plan_ref.byte_size:
+        issues.append("checkpoint evidence must be strictly smaller than the plan")
+
+    block_ids: list[str] = []
+    previous_end = envelope.checkpoint_byte_start
+    for block in envelope.source_blocks:
+        block_ids.append(block.block_id)
+        if not _is_nonblank_string(block.block_id):
+            issues.append("source block identity is empty")
+        if not (
+            envelope.checkpoint_byte_start
+            <= block.byte_start
+            < block.byte_end
+            <= envelope.checkpoint_byte_end
+        ):
+            issues.append("source block byte span escapes the checkpoint span")
+            continue
+        if block.byte_start < previous_end:
+            issues.append("source block byte spans must not overlap")
+        previous_end = max(previous_end, block.byte_end)
+        if not (1 <= block.line_start < block.line_end):
+            issues.append("source block line span is invalid")
+        if not _is_valid_sha256_hex(block.content_sha256):
+            issues.append("source block content hash is invalid")
+    if len(set(block_ids)) != len(block_ids):
+        issues.append("source block IDs must be unique")
+    try:
+        computed = _compute_v2_canonical_envelope_hash(envelope)
+        if envelope.canonical_envelope_sha256 != computed:
+            issues.append("canonical_envelope_sha256 mismatch")
+    except (TypeError, ValueError) as exc:
+        issues.append(f"canonical envelope encoding failed: {exc}")
+    return issues
+
+
+def _evidence_reference_v2_from_derived(
+    ref: EvidenceArtifactReferenceV2, *, expected_kind: str, expected_sha256: str, byte_size: int, label: str
+) -> EvidenceArtifactReferenceV2:
+    """Cross-validate a caller-supplied reference against derived content hashes."""
+    if ref.kind != expected_kind:
+        raise ValueError(f"{label}.kind must be {expected_kind!r}")
+    if ref.sha256 != expected_sha256:
+        raise ValueError(f"{label}.sha256 does not match the captured content")
+    if ref.byte_size != byte_size:
+        raise ValueError(f"{label}.byte_size does not match the captured content")
+    return ref
+
+
+def create_envelope_v2(
+    *,
+    scope_id: str,
+    original_plan_path: str | Path,
+    plan_text: str,
+    checkpoint_index: int,
+    repo_root: Path | None = None,
+    plan_ref: EvidenceArtifactReferenceV2,
+    checkpoint_ref: EvidenceArtifactReferenceV2,
+) -> ScopeEnvelopeV2:
+    """Build a reference-only v2 envelope from exact source bytes.
+
+    The caller must already have captured the exact plan and checkpoint bytes
+    into the run-local evidence store and passes the two content-addressed
+    references. This factory re-derives every hash, span, and source-block
+    identity from ``plan_text`` and rejects references that do not match the
+    captured content.
+    """
+    resolved_original_plan_path = _resolve_envelope_original_plan_path(
+        original_plan_path,
+        repo_root=repo_root,
+    )
+    plan_bytes = plan_text.encode("utf-8")
+    plan_sha256 = _sha256_hex(plan_bytes)
+    plan_ref = _evidence_reference_v2_from_derived(
+        plan_ref,
+        expected_kind="plan",
+        expected_sha256=plan_sha256,
+        byte_size=len(plan_bytes),
+        label="plan_ref",
+    )
+    scope_digest = _sha256_hex(scope_id.encode("utf-8"))
+    source_slice = slice_checkpoint_source(plan_text, checkpoint_index=checkpoint_index)
+    if source_slice is None:
+        raise ValueError(f"Checkpoint index {checkpoint_index} not found in plan text")
+    checkpoint_bytes = source_slice.full_text.encode("utf-8")
+    checkpoint_sha256 = _sha256_hex(checkpoint_bytes)
+    checkpoint_ref = _evidence_reference_v2_from_derived(
+        checkpoint_ref,
+        expected_kind="checkpoint",
+        expected_sha256=checkpoint_sha256,
+        byte_size=len(checkpoint_bytes),
+        label="checkpoint_ref",
+    )
+    source_blocks_v1 = extract_source_blocks(
+        source_slice,
+        envelope_checkpoint_sha256=checkpoint_sha256,
+        plan_text=plan_text,
+    )
+    source_blocks = tuple(
+        SourceBlockV2(
+            block_id=block.block_id,
+            byte_start=block.byte_start,
+            byte_end=block.byte_end,
+            line_start=block.line_start,
+            line_end=block.line_end,
+            section_label=block.section_label,
+            content_sha256=block.content_sha256,
+        )
+        for block in source_blocks_v1
+    )
+    checkpoint_line_end = _compute_checkpoint_line_end(plan_text, source_slice)
+    envelope = ScopeEnvelopeV2(
+        scope_id=scope_id,
+        scope_digest=scope_digest,
+        original_plan_path=resolved_original_plan_path,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+        checkpoint_index=source_slice.checkpoint_index,
+        checkpoint_name=source_slice.checkpoint_name,
+        checkpoint_line_start=source_slice.heading_line,
+        checkpoint_line_end=checkpoint_line_end,
+        checkpoint_byte_start=source_slice.checkpoint_byte_start,
+        checkpoint_byte_end=source_slice.checkpoint_byte_end,
+        heading_prefix=source_slice.heading_prefix,
+        source_blocks=source_blocks,
+        canonical_envelope_sha256="",
+    )
+    canonical = _compute_v2_canonical_envelope_hash(envelope)
+    completed = ScopeEnvelopeV2(
+        schema_version=envelope.schema_version,
+        scope_id=envelope.scope_id,
+        scope_digest=envelope.scope_digest,
+        original_plan_path=envelope.original_plan_path,
+        plan_ref=envelope.plan_ref,
+        checkpoint_ref=envelope.checkpoint_ref,
+        checkpoint_index=envelope.checkpoint_index,
+        checkpoint_name=envelope.checkpoint_name,
+        checkpoint_line_start=envelope.checkpoint_line_start,
+        checkpoint_line_end=envelope.checkpoint_line_end,
+        checkpoint_byte_start=envelope.checkpoint_byte_start,
+        checkpoint_byte_end=envelope.checkpoint_byte_end,
+        heading_prefix=envelope.heading_prefix,
+        source_blocks=envelope.source_blocks,
+        canonical_envelope_sha256=canonical,
+    )
+    issues = validate_envelope_v2(completed)
+    if issues:
+        raise ValueError(f"Refusing to create invalid scope envelope v2: {'; '.join(issues)}")
+    return completed
 
 
 # ---------------------------------------------------------------------------
@@ -2215,11 +2704,19 @@ _LIVE_TASK_MARKER_RE = re.compile(r"^[-*]\s+\[ \]\s+")
 
 def validate_envelope_boundary_drift(
     *,
-    envelope: ScopeEnvelopeV1,
+    envelope: ScopeEnvelopeV1 | ScopeEnvelopeV2,
     boundary_plan_text: str,
     git_tracking_allowed: bool = True,
+    resolved_plan_text: str | None = None,
 ) -> DriftValidationResult:
-    """Allow only controller fields and forward live markers, despite byte shifts."""
+    """Allow only controller fields and forward live markers, despite byte shifts.
+
+    Schema-v1 envelopes embed the authoritative plan text. Schema-v2
+    envelopes are reference-only: the caller must resolve the referenced
+    plan evidence bytes and pass them as ``resolved_plan_text`` before any
+    plan/checkpoint identity comparison; without resolved bytes the check
+    fails closed.
+    """
     boundary_hash = _sha256_hex(boundary_plan_text.encode("utf-8"))
     envelope_issues = validate_envelope(envelope)
     if envelope_issues:
@@ -2228,10 +2725,26 @@ def validate_envelope_boundary_drift(
             issues=tuple(f"invalid_envelope:{issue}" for issue in envelope_issues),
             boundary_plan_sha256=boundary_hash,
         )
-    if boundary_plan_text == envelope.plan_text:
+    if isinstance(envelope, ScopeEnvelopeV2):
+        if resolved_plan_text is None:
+            return DriftValidationResult(
+                allowed=False,
+                issues=("v2_envelope_requires_resolved_plan_evidence",),
+                boundary_plan_sha256=boundary_hash,
+            )
+        source_plan_text = resolved_plan_text
+    else:
+        if resolved_plan_text is not None and resolved_plan_text != envelope.plan_text:
+            return DriftValidationResult(
+                allowed=False,
+                issues=("resolved_plan_evidence_does_not_match_v1_envelope",),
+                boundary_plan_sha256=boundary_hash,
+            )
+        source_plan_text = envelope.plan_text
+    if boundary_plan_text == source_plan_text:
         return DriftValidationResult(allowed=True, issues=(), boundary_plan_sha256=boundary_hash)
 
-    source_lines = envelope.plan_text.splitlines(keepends=True)
+    source_lines = source_plan_text.splitlines(keepends=True)
     boundary_lines = boundary_plan_text.splitlines(keepends=True)
     issues: list[str] = []
     if len(source_lines) != len(boundary_lines):
