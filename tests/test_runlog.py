@@ -539,6 +539,7 @@ import hashlib
 
 from aflow.runlog import (
     EvidenceReference,
+    RunPaths,
     capture_checkpoint_evidence,
     capture_plan_evidence,
     capture_text_evidence,
@@ -546,6 +547,7 @@ from aflow.runlog import (
     evidence_artifact_path,
     evidence_reference,
     resolve_evidence_artifact,
+    store_evidence_artifact,
 )
 
 
@@ -668,3 +670,65 @@ def test_evidence_store_rejects_absolute_and_traversal_kinds(tmp_path: Path) -> 
         capture_text_evidence(paths, kind="reviewer", text="x\n")
     with pytest.raises(ValueError, match="64 lowercase hex"):
         evidence_artifact_path(paths, "plan", "../escape")
+
+
+def _second_run_paths(repo_root: Path) -> RunPaths:
+    """Create a second run dir under the same repo to host cross-run attacks."""
+    plan_path = repo_root / "plan-b.md"
+    plan_path.write_text("# Plan B\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=7)
+    return create_run_paths(config)
+
+
+def test_evidence_store_rejects_kind_dir_symlinked_into_another_run(tmp_path: Path) -> None:
+    paths_a = _evidence_paths(tmp_path)
+    paths_b = _second_run_paths(tmp_path)
+    # run-a/evidence/plans -> run-b/evidence/plans: writes must never land in
+    # another run's store, and reads must fail closed.
+    victim = evidence_artifact_dir(paths_b, "plan")
+    victim.mkdir(parents=True, exist_ok=True)
+    link = evidence_artifact_dir(paths_a, "plan")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        store_evidence_artifact(paths_a, kind="plan", data=b"CROSS-RUN-SENTINEL\n")
+    assert list(victim.iterdir()) == []
+    assert not (victim / "placeholder").exists()
+    # Fail closed on read as well: a nominally run-a reference must never be
+    # satisfied from run-b's store.
+    digest = hashlib.sha256(b"CROSS-RUN-SENTINEL\n").hexdigest()
+    from aflow.runlog import evidence_reference
+
+    nominal = evidence_reference(paths_a, "plan", digest, 19)
+    with pytest.raises(ValueError):
+        resolve_evidence_artifact(paths_a, nominal)
+
+
+def test_evidence_store_rejects_evidence_parent_symlink_and_run_dir_symlink(
+    tmp_path: Path,
+) -> None:
+    paths = _evidence_paths(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    evidence_link = paths.run_dir / "evidence"
+    evidence_link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        store_evidence_artifact(paths, kind="checkpoint", data=b"x\n")
+    assert list(outside.iterdir()) == []
+
+    # A symlinked run directory (another run's dir) must fail closed too.
+    paths_b = _second_run_paths(tmp_path)
+    other = paths_b.run_dir
+    swapped = paths.run_dir.parent / f"{paths.run_dir.name}-swapped"
+    swapped.symlink_to(other, target_is_directory=True)
+    swapped_paths = RunPaths(
+        repo_root=paths.repo_root,
+        runs_root=paths.runs_root,
+        run_dir=swapped,
+        turns_dir=swapped / "turns",
+        manager_dir=swapped / "manager",
+        run_json=swapped / "run.json",
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        store_evidence_artifact(swapped_paths, kind="plan", data=b"y\n")

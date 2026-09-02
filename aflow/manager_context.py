@@ -496,6 +496,14 @@ def _capture_v3_evidence(
     ``capture`` is true only for live runtime boundaries; historical rebuilds
     never write. Equal active/original bytes share one plan artifact. A
     repair overlay differing from the envelope original gets its own artifact.
+
+    Fail-closed policy: when ``capture`` is true, evidence-store failures
+    (storage, hash mismatch, symlink or containment violations) raise and
+    abort context construction before any provider invocation — they are
+    never downgraded to "unavailable" evidence. "Unavailable" is reserved for
+    read-only historical reconstruction and for content that is legitimately
+    absent at the boundary (no active plan bytes, no live checkpoint slice).
+
     Returns (evidence, plan_content_disclosure, checkpoint_info).
     """
     from .runlog import (
@@ -532,19 +540,24 @@ def _capture_v3_evidence(
                 active_text = _read_text(active_candidate) or None
     original_text: str | None = None
     envelope_plan_ref: Any = None
+    envelope_text_authoritative = False
     if validated_envelope is not None and validated_envelope.get("available"):
         envelope_plan_ref = validated_envelope.get("plan_ref")
         if not isinstance(envelope_plan_ref, Mapping):
             # Schema-v1 envelope payload embeds the immutable plan text.
+            envelope_text_authoritative = True
             embedded = validated_envelope.get("plan_text")
             original_text = embedded if isinstance(embedded, str) else None
-    if original_text is None and envelope_plan_ref is None:
+    if not envelope_text_authoritative and original_text is None:
         # The boundary persists the exact original bytes captured at runtime
-        # so historical rebuilds never depend on later file mutations.
+        # so historical rebuilds never depend on later file mutations. This
+        # also covers v2 envelopes whose referenced evidence cannot be
+        # resolved from this run's store (e.g. a resumed run whose source
+        # evidence was pruned): the durable boundary copy re-captures it.
         boundary_original = boundary.get("original_plan_content")
         if isinstance(boundary_original, str):
             original_text = boundary_original
-        else:
+        elif capture:
             original_value = (
                 boundary.get("original_plan_path")
                 or run_json.get("original_plan_path")
@@ -556,21 +569,19 @@ def _capture_v3_evidence(
 
     active_plan_entry = unavailable_plan
     if active_text is not None:
-        try:
-            active_bytes = active_text.encode("utf-8")
-            if capture:
-                active_ref = capture_plan_evidence(paths, active_text)
-                active_plan_entry = _v3_reference_entry(active_ref)
-            else:
-                digest = hashlib.sha256(active_bytes).hexdigest()
-                from .runlog import evidence_reference
+        if capture:
+            # Live capture failures (storage, hash mismatch, symlink or
+            # containment violation) abort context construction: they are
+            # never downgraded to "unavailable" evidence before a provider.
+            active_ref = capture_plan_evidence(paths, active_text)
+            active_plan_entry = _v3_reference_entry(active_ref)
+        else:
+            digest = hashlib.sha256(active_text.encode("utf-8")).hexdigest()
+            from .runlog import evidence_reference
 
-                active_ref = evidence_reference(paths, "plan", digest, len(active_bytes))
-                resolved = available_reference(active_ref)
-                if resolved is not None:
-                    active_plan_entry = _v3_reference_entry(active_ref)
-        except ValueError as exc:
-            active_plan_entry = _v3_unavailable(str(exc))
+            active_ref = evidence_reference(paths, "plan", digest, len(active_text.encode("utf-8")))
+            if available_reference(active_ref) is not None:
+                active_plan_entry = _v3_reference_entry(active_ref)
 
     # --- Original plan: envelope authority first, then file bytes ---
     original_entry: dict[str, Any] = _v3_unavailable(
@@ -590,31 +601,27 @@ def _capture_v3_evidence(
                 "available": True,
                 "shared_with": "active_plan",
             }
+        elif capture:
+            # Live capture failures propagate (never "unavailable" evidence).
+            original_ref = capture_plan_evidence(paths, original_text)
+            original_entry = {
+                "available": True,
+                "reference": _v3_ref_dict(original_ref),
+                "source": "boundary_plan_file",
+            }
         else:
-            try:
-                if capture:
-                    original_ref = capture_plan_evidence(paths, original_text)
-                    original_entry = {
-                        "available": True,
-                        "reference": _v3_ref_dict(original_ref),
-                        "source": "boundary_plan_file",
-                    }
-                else:
-                    digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()
-                    from .runlog import evidence_reference
+            digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()
+            from .runlog import evidence_reference
 
-                    original_ref = evidence_reference(
-                        paths, "plan", digest, len(original_text.encode("utf-8"))
-                    )
-                    resolved = available_reference(original_ref)
-                    if resolved is not None:
-                        original_entry = {
-                            "available": True,
-                            "reference": _v3_ref_dict(original_ref),
-                            "source": "boundary_plan_file",
-                        }
-            except ValueError as exc:
-                original_entry = _v3_unavailable(str(exc))
+            original_ref = evidence_reference(
+                paths, "plan", digest, len(original_text.encode("utf-8"))
+            )
+            if available_reference(original_ref) is not None:
+                original_entry = {
+                    "available": True,
+                    "reference": _v3_ref_dict(original_ref),
+                    "source": "boundary_plan_file",
+                }
 
     # --- Current checkpoint of the active plan ---
     checkpoint_entry: dict[str, Any] = _v3_unavailable(
@@ -639,80 +646,44 @@ def _capture_v3_evidence(
             source_slice = None
         if source_slice is not None:
             checkpoint_text = source_slice.full_text
-            try:
-                if capture:
-                    checkpoint_ref = capture_checkpoint_evidence(paths, checkpoint_text)
-                    plan_bytes = active_text.encode("utf-8")
-                    line_end = (
-                        plan_bytes[: source_slice.checkpoint_byte_end]
-                        .decode("utf-8", "strict")
-                        .count("\n")
-                        + 1
-                    )
-                    checkpoint_info = {
-                        "checkpoint_index": source_slice.checkpoint_index,
-                        "checkpoint_name": source_slice.checkpoint_name,
-                        "line_start": source_slice.heading_line,
-                        "line_end": line_end,
-                        "byte_start": source_slice.checkpoint_byte_start,
-                        "byte_end": source_slice.checkpoint_byte_end,
-                    }
-                    checkpoint_entry = {
-                        "available": True,
-                        "reference": _v3_ref_dict(checkpoint_ref),
-                        **checkpoint_info,
-                    }
-                else:
-                    digest = hashlib.sha256(checkpoint_text.encode("utf-8")).hexdigest()
-                    from .runlog import evidence_reference
-
-                    checkpoint_ref = evidence_reference(
-                        paths, "checkpoint", digest, len(checkpoint_text.encode("utf-8"))
-                    )
-                    if available_reference(checkpoint_ref) is not None:
-                        plan_bytes = active_text.encode("utf-8")
-                        line_end = (
-                            plan_bytes[: source_slice.checkpoint_byte_end]
-                            .decode("utf-8", "strict")
-                            .count("\n")
-                            + 1
-                        )
-                        checkpoint_info = {
-                            "checkpoint_index": source_slice.checkpoint_index,
-                            "checkpoint_name": source_slice.checkpoint_name,
-                            "line_start": source_slice.heading_line,
-                            "line_end": line_end,
-                            "byte_start": source_slice.checkpoint_byte_start,
-                            "byte_end": source_slice.checkpoint_byte_end,
-                        }
-                        checkpoint_entry = {
-                            "available": True,
-                            "reference": _v3_ref_dict(checkpoint_ref),
-                            **checkpoint_info,
-                        }
-            except (ValueError, UnicodeDecodeError) as exc:
-                checkpoint_entry = _v3_unavailable(str(exc))
-                line_end = (
-                    plan_bytes[: source_slice.checkpoint_byte_end]
-                    .decode("utf-8", "strict")
-                    .count("\n")
-                    + 1
-                )
-                checkpoint_info = {
-                    "checkpoint_index": source_slice.checkpoint_index,
-                    "checkpoint_name": source_slice.checkpoint_name,
-                    "line_start": source_slice.heading_line,
-                    "line_end": line_end,
-                    "byte_start": source_slice.checkpoint_byte_start,
-                    "byte_end": source_slice.checkpoint_byte_end,
-                }
+            plan_bytes = active_text.encode("utf-8")
+            line_end = (
+                plan_bytes[: source_slice.checkpoint_byte_end]
+                .decode("utf-8", "strict")
+                .count("\n")
+                + 1
+            )
+            checkpoint_info = {
+                "checkpoint_index": source_slice.checkpoint_index,
+                "checkpoint_name": source_slice.checkpoint_name,
+                "line_start": source_slice.heading_line,
+                "line_end": line_end,
+                "byte_start": source_slice.checkpoint_byte_start,
+                "byte_end": source_slice.checkpoint_byte_end,
+            }
+            if capture:
+                # Live checkpoint capture failures propagate and abort
+                # context construction instead of marking evidence available
+                # with unbound or partial references.
+                checkpoint_ref = capture_checkpoint_evidence(paths, checkpoint_text)
                 checkpoint_entry = {
                     "available": True,
                     "reference": _v3_ref_dict(checkpoint_ref),
                     **checkpoint_info,
                 }
-            except (ValueError, UnicodeDecodeError) as exc:
-                checkpoint_entry = _v3_unavailable(str(exc))
+            else:
+                digest = hashlib.sha256(checkpoint_text.encode("utf-8")).hexdigest()
+                from .runlog import evidence_reference
+
+                checkpoint_ref = evidence_reference(
+                    paths, "checkpoint", digest, len(checkpoint_text.encode("utf-8"))
+                )
+                if available_reference(checkpoint_ref) is not None:
+                    checkpoint_entry = {
+                        "available": True,
+                        "reference": _v3_ref_dict(checkpoint_ref),
+                        **checkpoint_info,
+                    }
 
     # --- Reviewer stdout: durable turn-artifact reference, never a copy ---
     reviewer_entry: dict[str, Any] | None = None

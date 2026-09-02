@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+
+import pytest
 from pathlib import Path
 
 from aflow.analyzer import extract_aflow_stop
@@ -1484,3 +1486,104 @@ def test_v3_bounds_semantic_summaries_with_shared_marker(tmp_path: Path) -> None
     assert len(result) <= 2_000 + len(TRUNCATION_MARKER)
     record = context["run_extract"][0]
     assert record["semantic_summary"] == result
+
+
+def test_v3_live_capture_hash_mismatch_aborts_context_construction(
+    tmp_path: Path,
+) -> None:
+    """Live capture must never downgrade store failures to unavailable."""
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    digest = hashlib.sha256(plan_text.encode("utf-8")).hexdigest()
+    plan_store = run_dir / "evidence" / "plans"
+    plan_store.mkdir(parents=True)
+    (plan_store / f"{digest}.md").write_bytes(b"tampered bytes\n")
+
+    with pytest.raises(ValueError, match="filename digest"):
+        build_manager_context(
+            run_dir, level="full", boundary=boundary,
+            active_plan_content=plan_text, capture_evidence=True,
+        )
+    # The tampered artifact is never overwritten or reused.
+    assert (plan_store / f"{digest}.md").read_bytes() == b"tampered bytes\n"
+
+    # Historical rebuilds never write and keep reporting unavailable.
+    context = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan_text, capture_evidence=False,
+    )
+    assert context["schema_version"] == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+    assert context["evidence"]["active_plan"]["available"] is False
+
+
+def test_v3_live_capture_symlinked_evidence_store_aborts_context_construction(
+    tmp_path: Path,
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (run_dir / "evidence").mkdir(parents=True)
+    plans_link = run_dir / "evidence" / "plans"
+    plans_link.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        build_manager_context(
+            run_dir, level="full", boundary=boundary,
+            active_plan_content=plan_text, capture_evidence=True,
+        )
+    assert list(outside.iterdir()) == []
+
+
+def test_v3_live_capture_checkpoint_store_failure_propagates_not_crash(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint capture failure must raise, never mark available with
+    unbound references (previous duplicated-handler UnboundLocalError)."""
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    first = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=plan_text, capture_evidence=True,
+    )
+    checkpoint_ref = first["evidence"]["checkpoint"]["reference"]
+    checkpoint_store = (
+        run_dir / "evidence" / "checkpoints" / f"{checkpoint_ref['sha256']}.md"
+    )
+    assert checkpoint_store.is_file()
+    checkpoint_store.write_bytes(b"tampered checkpoint\n")
+
+    with pytest.raises(ValueError, match="filename digest"):
+        build_manager_context(
+            run_dir, level="full", boundary=boundary,
+            active_plan_content=plan_text, capture_evidence=True,
+        )
+
+
+def test_v3_live_capture_absent_checkpoint_slice_stays_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A missing checkpoint slice is legitimate absence, not a store failure."""
+    run_dir, plan = _run(tmp_path)
+    no_checkpoint_text = "# No checkpoints\n\n- [ ] ordinary task\n"
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    boundary["active_plan_content"] = no_checkpoint_text
+
+    context = build_manager_context(
+        run_dir, level="full", boundary=boundary,
+        active_plan_content=no_checkpoint_text, capture_evidence=True,
+    )
+    checkpoint = context["evidence"]["checkpoint"]
+    assert checkpoint["available"] is False
+    assert "unavailable" in checkpoint["reason"]

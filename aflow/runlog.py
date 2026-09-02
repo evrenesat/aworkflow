@@ -542,21 +542,104 @@ def evidence_reference(
     )
 
 
-def _validate_evidence_destination(paths: RunPaths, destination: Path) -> None:
-    """Fail closed unless destination resolves inside this run's evidence store."""
-    if destination.is_symlink():
-        raise ValueError(f"evidence artifact must not be a symlink: {destination}")
+def _run_dir_is_direct_child(paths: RunPaths) -> None:
+    """Fail closed unless the run directory is this run's direct child.
+
+    Rejects a symlinked run directory and any run directory that resolves
+    outside the exact runs root or through another run directory.
+    """
+    if paths.run_dir.is_symlink():
+        raise ValueError(f"run directory must not be a symlink: {paths.run_dir}")
     try:
-        runs_root = paths.runs_root.resolve()
+        runs_root_resolved = paths.runs_root.resolve()
+        run_dir_resolved = paths.run_dir.resolve()
+        relative = run_dir_resolved.relative_to(runs_root_resolved)
     except OSError as exc:
         raise ValueError(f"cannot resolve runs root: {paths.runs_root}") from exc
+    except ValueError as exc:
+        raise ValueError(
+            f"run directory escapes the runs root: {paths.run_dir}"
+        ) from exc
+    if len(relative.parts) != 1 or relative.parts[0] != paths.run_dir.name:
+        raise ValueError(
+            "run directory must be the direct child of the runs root: "
+            f"{paths.run_dir}"
+        )
+
+
+def _evidence_kind_location(paths: RunPaths, kind_dir: Path, dirname: str) -> None:
+    """Fail closed unless ``kind_dir`` is this run's exact evidence-kind dir.
+
+    Every component between the run directory and the artifact must be a real
+    (non-symlink) directory, and the resolved kind directory must sit at
+    exactly ``<this run>/evidence/<dirname>``. A kind directory symlinked to
+    another run's store therefore fails closed instead of redirecting writes.
+    """
+    _run_dir_is_direct_child(paths)
+    current = paths.run_dir
+    for part in (EVIDENCE_DIRNAME, dirname):
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(
+                f"evidence path component must not be a symlink: {current}"
+            )
+        if current.exists() and not current.is_dir():
+            raise ValueError(
+                f"evidence path component is not a directory: {current}"
+            )
     try:
-        resolved = destination.resolve(strict=False)
-        resolved.relative_to(runs_root)
+        relative = kind_dir.resolve(strict=False).relative_to(
+            paths.run_dir.resolve()
+        )
     except (OSError, ValueError) as exc:
         raise ValueError(
-            f"evidence artifact escapes the run evidence store: {destination}"
+            f"evidence directory escapes this run: {kind_dir}"
         ) from exc
+    if relative.parts != (EVIDENCE_DIRNAME, dirname):
+        raise ValueError(
+            f"evidence directory must be the exact {EVIDENCE_DIRNAME}/{dirname} "
+            f"directory of this run: {kind_dir}"
+        )
+
+
+def _ensure_evidence_kind_dir(paths: RunPaths, kind: str) -> Path:
+    """Validate every parent and create the exact evidence-kind directory."""
+    dirname = _evidence_kind_dirname(kind)
+    kind_dir = evidence_artifact_dir(paths, kind)
+    _run_dir_is_direct_child(paths)
+    current = paths.run_dir
+    for part in (EVIDENCE_DIRNAME, dirname):
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(
+                f"evidence path component must not be a symlink: {current}"
+            )
+        if current.exists():
+            if not current.is_dir():
+                raise ValueError(
+                    f"evidence path component is not a directory: {current}"
+                )
+        else:
+            # The controller normally creates the run tree; fixtures and
+            # library callers may capture into a not-yet-materialized tree.
+            current.mkdir(parents=True)
+    _evidence_kind_location(paths, kind_dir, dirname)
+    return kind_dir
+
+
+def _validate_evidence_destination(
+    paths: RunPaths, kind: str, destination: Path
+) -> None:
+    """Fail closed unless the destination is this run's exact evidence file.
+
+    Validates the run directory identity, every parent component, the exact
+    resolved evidence-kind location, and the regular-file type before any
+    caller may read or report the artifact.
+    """
+    dirname = _evidence_kind_dirname(kind)
+    _evidence_kind_location(paths, destination.parent, dirname)
+    if destination.is_symlink():
+        raise ValueError(f"evidence artifact must not be a symlink: {destination}")
     if not destination.is_file():
         raise ValueError(f"evidence artifact is not a regular file: {destination}")
 
@@ -566,22 +649,24 @@ def store_evidence_artifact(
 ) -> EvidenceReference:
     """Store one exact byte sequence at most once per run.
 
-    Writes are idempotent and atomic. If the digest-addressed destination
-    already exists its bytes are verified and reused; mismatched bytes are
-    never overwritten.
+    Writes are idempotent and atomic. Every parent is validated before any
+    open or write: the run directory must be the runs root's direct child,
+    and the destination must resolve inside this run's exact evidence-kind
+    directory. If the digest-addressed destination already exists its bytes
+    are verified and reused; mismatched bytes are never overwritten.
     """
     digest = hashlib.sha256(data).hexdigest()
-    destination = evidence_artifact_path(paths, kind, digest)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    kind_dir = _ensure_evidence_kind_dir(paths, kind)
+    destination = kind_dir / f"{digest}.md"
     if destination.exists():
-        _validate_evidence_destination(paths, destination)
+        _validate_evidence_destination(paths, kind, destination)
         existing = destination.read_bytes()
         if hashlib.sha256(existing).hexdigest() != digest:
             raise ValueError(
                 "existing evidence artifact bytes do not match their filename digest"
             )
         return evidence_reference(paths, kind, digest, len(existing))
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    temporary = kind_dir / f".{digest}.{uuid4().hex}.tmp"
     try:
         with temporary.open("wb") as handle:
             handle.write(data)
@@ -593,7 +678,7 @@ def store_evidence_artifact(
             temporary.unlink()
         except FileNotFoundError:
             pass
-    _validate_evidence_destination(paths, destination)
+    _validate_evidence_destination(paths, kind, destination)
     return evidence_reference(paths, kind, digest, len(data))
 
 
@@ -637,7 +722,7 @@ def resolve_evidence_artifact(
     """
     ref = _coerce_evidence_reference(paths, reference)
     destination = evidence_artifact_path(paths, ref.kind, ref.sha256)
-    _validate_evidence_destination(paths, destination)
+    _validate_evidence_destination(paths, ref.kind, destination)
     data = destination.read_bytes()
     if len(data) != ref.byte_size:
         raise ValueError(
