@@ -5764,7 +5764,15 @@ def run_workflow(
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     run_metadata = RunMetadataWriter(
         paths=run_paths,
-        config=config,
+        # Resume derives the authoritative continuation identity above; the
+        # caller-supplied config omits it, and run.json top-level metadata
+        # must stay consistent with the frozen identity serialized alongside.
+        config=replace(
+            config,
+            continuation_from_branch=continuation_from_branch,
+            continuation_from_head=continuation_from_head,
+            continuation_mode=continuation_mode,
+        ),
         state=state,
         workflow_name=workflow_name,
         resumed_from_run_id=resumed_from_run_id,

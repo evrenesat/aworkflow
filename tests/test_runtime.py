@@ -21,6 +21,7 @@ from aflow.run_state import (
     PendingManagerNotes,
     PendingRepartitionV1,
     PendingTeamOverride,
+    ResumeContext,
     load_override_request,
     manager_resume_fields,
     resolve_resume_override,
@@ -6454,6 +6455,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
         self,
         *,
         move_primary_before_merge: bool = False,
+        fail_invocation: bool = False,
     ) -> tuple[object, Path, str]:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
@@ -6519,6 +6521,10 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
         relative_plan = plan_path.relative_to(root)
 
         def runner(argv, **kwargs):
+            if fail_invocation:
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "planned continuation failure"
+                )
             execution_root = Path(kwargs["cwd"])
             execution_plan = execution_root / relative_plan
             execution_plan.write_text(
@@ -6577,6 +6583,128 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             self._run_current_branch_continuation_fixture(
                 move_primary_before_merge=True,
             )
+
+    def _continuation_resume_context_from_run(
+        self,
+        repo_root: Path,
+        run_dir: Path,
+        workflow_steps: Mapping[str, object],
+    ) -> tuple[ResumeContext, Path]:
+        """Rebuild one resume context through the real current-schema loaders."""
+        from aflow.cli import (
+            _decode_frozen_run_identity,
+            _reconstruct_resume_context,
+            _resume_plan_path,
+        )
+
+        prev_run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        resolved_run_id = Path(run_dir.name)
+        frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
+        plan_path = _resume_plan_path(prev_run, repo_root)
+        assert plan_path is not None
+        resume_context = _reconstruct_resume_context(
+            resolved_run_id=resolved_run_id,
+            run_dir=run_dir,
+            prev_run=prev_run,
+            plan_path=plan_path,
+            frozen_run_identity=frozen_run_identity,
+            reset_scope=False,
+            require_resume=True,
+            workflow_steps=workflow_steps,
+        )
+        assert resume_context is not None
+        return resume_context, plan_path
+
+    def test_current_branch_continuation_identity_survives_two_resumes(self) -> None:
+        with pytest.raises(WorkflowError) as first_error:
+            self._run_current_branch_continuation_fixture(fail_invocation=True)
+        run_a_dir = first_error.value.run_dir
+        assert run_a_dir is not None
+        payload_a = json.loads((run_a_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload_a["continuation_from_branch"] == "accepted"
+        assert payload_a["continuation_mode"] == "current_branch"
+        accepted_head = payload_a["continuation_from_head"]
+        root = Path(payload_a["repo_root"])
+        workflow_config = _make_worktree_wf_config(
+            main_branch="main",
+            worktree_root=str(root.parent / f"worktrees-{root.name}"),
+        )
+        steps = workflow_config.workflows["wt_wf"].steps
+
+        def failing_runner(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 1, "", "planned continuation failure"
+            )
+
+        def completing_runner(argv, **kwargs):
+            execution_root = Path(kwargs["cwd"])
+            execution_plan = execution_root / "plans" / "in-progress" / "continuation.md"
+            execution_plan.write_text(
+                execution_plan.read_text(encoding="utf-8")
+                .replace("### [ ] Checkpoint 2: Next", "### [x] Checkpoint 2: Next")
+                .replace("- [ ] step two", "- [x] step two"),
+                encoding="utf-8",
+            )
+            _git_commit_file(execution_root, execution_plan)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        resume_a, plan_path_a = self._continuation_resume_context_from_run(
+            root, run_a_dir, steps
+        )
+        assert resume_a.continuation_from_branch == "accepted"
+        assert resume_a.continuation_from_head == accepted_head
+        assert resume_a.continuation_mode == "current_branch"
+
+        with pytest.raises(WorkflowError) as second_error:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=root,
+                    plan_path=plan_path_a,
+                    max_turns=1,
+                ),
+                workflow_config,
+                "wt_wf",
+                config_dir=root,
+                adapter=CodexAdapter(),
+                runner=failing_runner,
+                resume=resume_a,
+            )
+        run_b_dir = second_error.value.run_dir
+        assert run_b_dir is not None
+        payload_b = json.loads((run_b_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload_b["resumed_from_run_id"] == run_a_dir.name
+        assert payload_b["continuation_from_branch"] == "accepted"
+        assert payload_b["continuation_from_head"] == accepted_head
+        assert payload_b["continuation_mode"] == "current_branch"
+        assert payload_b["frozen_config"]["continuation_from_head"] == accepted_head
+
+        resume_b, plan_path_b = self._continuation_resume_context_from_run(
+            root, run_b_dir, steps
+        )
+        assert resume_b.continuation_from_branch == "accepted"
+        assert resume_b.continuation_from_head == accepted_head
+        assert resume_b.continuation_mode == "current_branch"
+
+        result_c = run_workflow(
+            ControllerConfig(
+                repo_root=root,
+                plan_path=plan_path_b,
+                max_turns=1,
+            ),
+            workflow_config,
+            "wt_wf",
+            config_dir=root,
+            adapter=CodexAdapter(),
+            runner=completing_runner,
+            resume=resume_b,
+        )
+        payload_c = json.loads((result_c.run_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload_c["resumed_from_run_id"] == run_b_dir.name
+        assert payload_c["continuation_from_branch"] == "accepted"
+        assert payload_c["continuation_from_head"] == accepted_head
+        assert payload_c["continuation_mode"] == "current_branch"
+        assert payload_c["frozen_config"]["continuation_from_head"] == accepted_head
+        assert payload_c["status"] == "completed"
 
     def test_preflight_fails_when_main_branch_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
