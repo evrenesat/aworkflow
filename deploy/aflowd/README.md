@@ -161,3 +161,7 @@ secrets.
 For diagnosis, use `status.sh` and bounded `journalctl -u aflowd.service` output.
 A missing, failed, or ambiguous workflow unit stays `needs_attention`; use the
 existing owner/control-plane lifecycle rather than manually restarting the unit.
+
+Preflight treats a durable `owner_stopped` launch phase as terminal even when
+an older server still projects its historical startup question. Active workflow
+units and controllers continue to block rollout. The question record is preserved.

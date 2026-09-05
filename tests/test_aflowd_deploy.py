@@ -421,7 +421,7 @@ def test_preflight_reads_canonical_state_and_fails_closed_on_unsafe_run(tmp_path
             elif self.path == "/api/control-plane/projects":
                 payload = {"projects": [{"project_id": "project"}]}
             elif self.path.startswith("/api/control-plane/projects/project/runs"):
-                payload = {"runs": [{"run_id": "run-1", "status": run_status["value"], "ownership": "control_plane", "launch_phase": run_status["value"]}], "next_cursor": None}
+                payload = {"runs": [{"run_id": "run-1", "status": run_status["value"], "ownership": "control_plane", "launch_phase": run_status.get("phase", run_status["value"])}], "next_cursor": None}
             else:
                 self.send_response(404); self.end_headers(); return
             data = json.dumps(payload).encode()
@@ -446,6 +446,24 @@ def test_preflight_reads_canonical_state_and_fails_closed_on_unsafe_run(tmp_path
         unsafe = _run(*base_args, "--output-dir", str(tmp_path / "unsafe"), env=env)
         assert unsafe.returncode != 0
         assert json.loads((tmp_path / "unsafe" / "preflight.json").read_text())["safe_to_rollout"] is False
+        run_status.update(value="awaiting_startup_answer", phase="owner_stopped")
+        stopped = _run(*base_args, "--output-dir", str(tmp_path / "stopped"), env=env)
+        assert stopped.returncode == 0, stopped.stderr
+        stopped_state = json.loads((tmp_path / "stopped" / "preflight.json").read_text())
+        assert stopped_state["safe_to_rollout"] is True
+        assert stopped_state["unsafe_runs"] == []
+
+        _write_executable(
+            tools / "systemctl",
+            "#!/bin/sh\n"
+            "if [ \"$1\" = list-units ]; then "
+            "printf 'aflow-run-run-1.service loaded active running fixture\\n'; fi\n",
+        )
+        active = _run(*base_args, "--output-dir", str(tmp_path / "active"), env=env)
+        assert active.returncode != 0
+        active_state = json.loads((tmp_path / "active" / "preflight.json").read_text())
+        assert active_state["safe_to_rollout"] is False
+        assert active_state["active_workflow_units"] == ["aflow-run-run-1.service"]
     finally:
         server.shutdown(); thread.join(timeout=1); server.server_close()
 

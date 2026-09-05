@@ -155,7 +155,9 @@ unsafe_runs = [
     {"project_id": project["project_id"], **run}
     for project in canonical["projects"]
     for run in project["runs"]
-    if run["status"] not in terminal
+    # Older servers can project a saved startup question over a durable owner stop.
+    # Unit/controller checks below still reject any active execution.
+    if run["status"] not in terminal and run.get("launch_phase") != "owner_stopped"
 ]
 project_errors = canonical.get("project_errors")
 safe = canonical.get("ready") is True and not project_errors and not active_units and not controllers and not unsafe_runs
