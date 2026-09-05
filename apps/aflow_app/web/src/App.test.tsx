@@ -66,6 +66,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: [] })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
       schema_version: 1, workflows: [], teams: [], roles: [], controls: [],
+      workflow_details: {}, admitted_role_selectors: {},
       context_levels: ['lite'], team_upgrade_chains: {}, control_safety: {}, service_features: [],
     })
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })

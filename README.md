@@ -230,8 +230,13 @@ calls the same reusable CI workflow before uploading a package.
 The optional remote workflow-control app lives in `apps/aflow_app/` and is
 not included in the published wheel. Its Python 3.12+ server manages registered
 projects, revisioned configuration and Markdown plans, and durable runs through
-REST and MCP. Provider choice stays in normal engine harness profiles; Codex is
-one optional harness adapter.
+REST and MCP. The web client is the interactive dashboard: typed run starts
+(plan, workflow, team, start step, max turns, bounded extra instructions),
+SSE progress with reconnect-safe snapshots, capability-gated compare-and-swap
+controls for max turns/team/selectors, explicit resume, and guided
+stop-then-start workflow changes with `restarted_from_run_id` lineage. Provider
+choice stays in normal engine harness profiles; Codex is one optional harness
+adapter.
 
 ## Documentation
 

@@ -19,6 +19,7 @@ import type {
   RunEventTail,
   RunPage,
   RunStatus,
+  StartRunRequest,
   StartRunResponse,
   StartRunResult,
 } from './types'
@@ -282,13 +283,7 @@ export async function getRunContext(
 
 export async function startControlPlaneRun(
   projectId: string,
-  request: {
-    plan_path: string
-    workflow_name?: string
-    team?: string
-    start_step?: string
-    max_turns?: number
-  },
+  request: StartRunRequest,
   idempotencyKey: string,
 ): Promise<StartRunResponse> {
   return fetchJson<StartRunResponse>(`${controlProjectPath(projectId)}/runs`, {

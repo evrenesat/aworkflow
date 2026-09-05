@@ -35,7 +35,37 @@ Configuration view: two plain-text tabs for `aflow.toml` and `workflows.toml` un
 
 Plans view: lists the `todo`, `in-progress`, and `done` lifecycle sections, creates plans, and edits them as plain Markdown with expected-revision saves and one-step promotion. Local text is preserved on network and revision-conflict failures; the server copy is reloaded only after confirmation. An in-progress plan can be opened in the run dashboard.
 
-Runs view: the existing durable run dashboard (project run list, selected-run status, bounded events, and context). Live controls and restart flows are documented separately when implemented.
+Runs view: the primary interactive dashboard for starting, understanding, and safely adjusting workflow runs. Everything below reads the canonical control-plane REST/SSE contracts; no state is invented client-side.
+
+Project run list and selected-run overview:
+
+- Each run row shows its ID, status, workflow, current step, skipped-step count, and successor marker for runs that record `restarted_from_run_id`.
+- The overview shows status/reason, plan, workflow/team, `restarted_from_run_id` plus any successors visible in the run list (lineage), start time with live elapsed time for nonterminal runs, current step with `selected_start_step` and `skipped_steps`, the workflow's `excluded_steps` from capabilities, checkpoint name/index/count from the bounded plan state, turn/max, unit name with launch phase and reconciliation state, and recent bounded events.
+- A bounded-outcomes section summarizes the latest manager decision, the last finalized harness turn (step, status, exit code, bounded result), and the current live overrides (`max_turns`, `team`, role selectors) read from the latest `control_changed` journal event.
+
+Live event stream (SSE):
+
+- The last durable run snapshot and timeline stay visible whenever the stream is disconnected, and connection state is displayed separately from run state. Events replay from the last seen sequence and duplicates are dropped. A successful reconnect triggers one canonical status refresh; a failed connection never implies completed, stopped, or any other run transition, and an explicit refresh button always re-reads the canonical status.
+
+Start form:
+
+- Typed fields only: plan, workflow, team, start step, max turns, and optional extra instructions (one bounded line per instruction, at most 8 lines of 512 characters). There is no raw argv or shell input anywhere.
+- Start-step choices come from the selected workflow's capability-admitted executable steps, labeled with their 1-based index; the form explains exactly which earlier executable steps will be recorded as skipped. The server accepts the step name or a 1-based numeric string and stores the canonical name.
+- The server answers a start with either a run or a startup question. All three question kinds are handled in the UI: `pick_step` (choose one of the offered steps) and the `confirm_recovery` / `confirm_worktree_dirty` confirmations (explicit confirm/decline sent as booleans). No run is displayed as started while a question is open.
+- Exact retries reuse the same idempotency key; changing the draft replaces the key. Every failure keeps the draft in the form.
+
+Safe live controls:
+
+- Max turns, team, and per-role agent selectors are offered only where capabilities admit them as safe; team and selector values are selects limited to capability-admitted values, never free text.
+- Applications send the expected revision and an idempotency key. The UI reports a control as recorded only after the returned canonical revision, explains that the engine applies it at the next safe boundary between turns, and refreshes from the returned status. A stale revision keeps every local edit in place and re-reads the canonical revision for retry; a `restart_required` reply directs the user to the guided restart instead.
+
+Guided workflow change (restart):
+
+- Selecting a different workflow for a nonterminal owned run is a guided stop-then-start, never an in-place mutation. After explicit confirmation, the UI issues the owner stop with the expected revision, then polls the canonical status until that exact source run reports `owner_stopped` status **and** launch phase (the engine's own precondition) before submitting the preserved typed start draft with `restarted_from_run_id`. The wait is bounded.
+- If the stop is rejected, the revision changes, inactivity cannot be proven, the network fails, or the successor start fails, automation halts: no retry loops, no overlapping units, the draft stays in the form, and the authoritative source state is shown for an explicitly renewed attempt.
+- Explicit resume remains the separate same-workflow action for `needs_attention` runs and never accepts replacement launch choices. Legacy runs are read-only and offer no controls. Owner stop, restart, and Full context keep their existing confirmation and disclosure guards.
+
+End-to-end user journey: register or create a project in the Projects view, validate and save the two configuration documents in the Configuration view until readiness is `ready`, create or select a plan in the Plans view, then open the Runs view: start the run with typed choices, answer any startup question, watch progress over SSE, adjust team or selectors with compare-and-swap controls while it runs, and either let it finish, stop it explicitly, resume a `needs_attention` run in place, or change its workflow through the guided stop-then-start restart with visible lineage.
 
 ## Configuration
 

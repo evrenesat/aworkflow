@@ -129,4 +129,103 @@ describe('workflow control API client', () => {
       detail: { blocking_runs: [{ run_id: 'run-9', status: 'running' }] },
     })
   })
+
+  it('resumes the run event stream from the last sequence and deduplicates replayed events', async () => {
+    api.setAuthToken('test-token')
+    const encoder = new TextEncoder()
+    const streamFor = (frames: string[]) => {
+      let sent = 0
+      return new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent < frames.length) {
+            controller.enqueue(encoder.encode(frames[sent]))
+            sent += 1
+          } else {
+            controller.error(new Error('stream dropped'))
+          }
+        },
+      })
+    }
+    const events = (sequences: number[]) => JSON.stringify({
+      events: sequences.map((sequence) => ({
+        sequence, event_type: `tick_${sequence}`, data: {}, schema_version: 1, timestamp: '2026-01-01T00:00:00Z',
+      })),
+    })
+    vi.mocked(global.fetch)
+      .mockResolvedValueOnce({ ok: true, status: 200, body: streamFor([`data: ${events([1, 2])}\n\n`]) } as unknown as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, body: streamFor([`data: ${events([2, 3])}\n\n`]) } as unknown as Response)
+
+    const batches: number[][] = []
+    const states: api.StreamState[] = []
+    const errors: string[] = []
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1',
+      runId: 'run-1',
+      reconnectDelaysMs: [1],
+      onEvents: (incoming) => batches.push(incoming.map((event) => event.sequence)),
+      onStateChange: (state) => states.push(state),
+      onError: (error) => errors.push(error.message),
+    })
+
+    await waitFor(() => expect(batches.flat()).toEqual([1, 2, 3]))
+    unsubscribe()
+
+    const firstUrl = vi.mocked(global.fetch).mock.calls[0][0] as string
+    const secondUrl = vi.mocked(global.fetch).mock.calls[1][0] as string
+    expect(firstUrl).not.toContain('after_sequence')
+    expect(secondUrl).toContain('after_sequence=2')
+    expect(secondUrl).not.toContain('test-token')
+    // Sequence 2 was replayed by the server after reconnect but delivered once.
+    expect(batches).toEqual([[1, 2], [3]])
+    expect(states).toContain('connected')
+    expect(states).toContain('reconnecting')
+    expect(errors.length).toBeGreaterThan(0)
+  })
+
+  it('reports stream failures as connection state without inventing run state', async () => {
+    api.setAuthToken('test-token')
+    vi.mocked(global.fetch).mockResolvedValue({
+      ok: false, status: 503, text: async () => 'control plane unavailable',
+    } as Response)
+    const states: api.StreamState[] = []
+    const errors: string[] = []
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1',
+      runId: 'run-1',
+      reconnectDelaysMs: [1],
+      onEvents: () => {},
+      onStateChange: (state) => states.push(state),
+      onError: (error) => errors.push(error.message),
+    })
+    await waitFor(() => expect(errors.length).toBeGreaterThanOrEqual(2))
+    unsubscribe()
+    expect(errors[0]).toContain('control plane unavailable')
+    expect(states[states.length - 1]).toBe('stopped')
+    expect(states).not.toContain('connected')
+  })
 })
+
+function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    let lastError: unknown = null
+    const tick = () => {
+      let satisfied = false
+      try {
+        satisfied = predicate()
+      } catch (error) {
+        lastError = error
+      }
+      if (satisfied) {
+        resolve()
+        return
+      }
+      if (Date.now() - started > timeoutMs) {
+        reject(lastError ?? new Error('waitFor timed out'))
+        return
+      }
+      setTimeout(tick, 5)
+    }
+    tick()
+  })
+}

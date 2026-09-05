@@ -18,6 +18,27 @@
   when its durable frozen configuration path is known and differs from the
   canonical project config path. Matching or missing paths remain blocked.
 
+## 2026-09-06 — Run progress, live controls, and guided workflow restart UI
+
+- Rebuilt the web run dashboard on the typed checkpoint-5 contracts: the
+  overview now renders `selected_start_step`/`skipped_steps`,
+  `restarted_from_run_id` lineage, checkpoint name/index/count and bounded
+  manager/harness outcomes from the lite context, and live overrides read from
+  the `control_changed` journal event.
+- The start form gained capability-admitted per-workflow start-step choices
+  with explicit skip explanations, bounded extra-instruction lines, and
+  boolean answers for `confirm_recovery`/`confirm_worktree_dirty` questions;
+  idempotency-key reuse and draft preservation are unchanged.
+- Live controls offer only capability-admitted team/selector values, keep
+  local edits on stale revisions, and describe next-safe-boundary semantics.
+- A workflow change is a guided confirmation, owner stop with CAS, a bounded
+  wait for exact `owner_stopped` status and launch phase, then a successor
+  start with `restarted_from_run_id`; every failure halts automation with the
+  draft preserved and the source state authoritative. No overlap or retries.
+- SSE handling keeps the last snapshot through disconnects, resumes from the
+  last sequence, deduplicates replay, refreshes canonical status once on
+  reconnect, and never maps a network failure to a run transition.
+
 # DEVLOG
 
 ## 2026-09-06 - Stop daemon-owned runs before unit startup

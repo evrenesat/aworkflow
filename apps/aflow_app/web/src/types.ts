@@ -82,12 +82,22 @@ export interface PlanDocument {
 }
 
 /** Versioned REST views returned by the daemon-backed control plane. */
+export interface WorkflowCapability {
+  declared_steps: string[]
+  executable_steps: string[]
+  excluded_steps: string[]
+  first_step: string | null
+  default_team: string | null
+}
+
 export interface ControlPlaneCapabilities {
   schema_version: number
   workflows: string[]
   teams: string[]
   roles: string[]
   controls: string[]
+  workflow_details: Record<string, WorkflowCapability>
+  admitted_role_selectors: Record<string, string[]>
   context_levels: Array<'lite' | 'full'>
   team_upgrade_chains: Record<string, string[]>
   control_safety: Record<string, 'safe' | 'restart_required'>
@@ -119,6 +129,9 @@ export interface RunStatus {
   current_step: string | null
   turns_completed: number | null
   max_turns: number | null
+  selected_start_step: string | null
+  skipped_steps: string[]
+  restarted_from_run_id: string | null
   evidence: Record<string, unknown>
 }
 
@@ -171,6 +184,17 @@ export interface StartRunResult {
   schema_version: number
   manifest_path: string | null
   reason: string | null
+  restarted_from_run_id: string | null
+}
+
+export interface StartRunRequest {
+  plan_path: string
+  workflow_name?: string
+  team?: string
+  start_step?: string
+  max_turns?: number
+  extra_instructions?: string[]
+  restarted_from_run_id?: string
 }
 
 export interface StartRunResponse {
