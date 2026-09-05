@@ -31,7 +31,11 @@ from aflow.control_plane import (
 )
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
 
-from .project_registry import ProjectRegistry, ProjectRegistryError, ProjectRegistryRecord
+from .project_registry import (
+    ProjectRegistry,
+    ProjectRegistryError,
+    ProjectRegistryRecord,
+)
 
 
 class ProjectNotAllowedError(LookupError):
@@ -89,7 +93,11 @@ class ControlPlaneService:
                 raise ValueError("static control-plane projects are not supported")
             self._registry = None
         else:
-            if aflow_executable is None or environment_file is None or release_identity is None:
+            if (
+                aflow_executable is None
+                or environment_file is None
+                or release_identity is None
+            ):
                 raise ValueError("shared daemon release inputs are required")
             self._registry = registry
         self._aflow_executable = aflow_executable
@@ -102,6 +110,13 @@ class ControlPlaneService:
         self._projects: dict[str, _ProjectDaemon] = {}
         self._unavailable: dict[str, str] = {}
         self._lock = RLock()
+        self._project_locks_guard = RLock()
+        self._project_locks: dict[str, RLock] = {}
+
+    def project_lock(self, project_id: str) -> RLock:
+        """Return a project lock before any control-plane or daemon lock."""
+        with self._project_locks_guard:
+            return self._project_locks.setdefault(project_id, RLock())
 
     def _validate_shared_release_inputs(self) -> None:
         """Canonicalize immutable process inputs once for all project daemons."""
@@ -113,7 +128,9 @@ class ControlPlaneService:
             executable = executable_source.resolve(strict=True)
             environment_file = environment_source.resolve(strict=True)
         except OSError as exc:
-            raise ValueError("shared control-plane release inputs are unavailable") from exc
+            raise ValueError(
+                "shared control-plane release inputs are unavailable"
+            ) from exc
         if (
             executable_source.is_symlink()
             or not executable.is_file()
@@ -189,16 +206,16 @@ class ControlPlaneService:
     def capabilities(self, project_id: str):
         return self._project(project_id).daemon.application.capabilities.get()
 
-    def list_plans(self, project_id: str, *, limit: int, cursor: str | None) -> tuple[PlanRecord, ...]:
+    def list_plans(
+        self, project_id: str, *, limit: int, cursor: str | None
+    ) -> tuple[PlanRecord, ...]:
         return self._project(project_id).daemon.application.repository.list_plans(
             limit=limit, cursor=cursor
         )
 
     def list_runs(self, project_id: str, *, limit: int, cursor: str | None) -> RunPage:
         item = self._project(project_id)
-        page = item.daemon.application.repository.list_runs(
-            limit=limit, cursor=cursor
-        )
+        page = item.daemon.application.repository.list_runs(limit=limit, cursor=cursor)
         return RunPage(
             runs=tuple(item.daemon.service.run_status(run.run_id) for run in page.runs),
             next_cursor=page.next_cursor,
@@ -249,22 +266,23 @@ class ControlPlaneService:
         idempotency_key: str | None,
         caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
-        item = self._project(project_id)
-        request = StartupRequest(
-            repo_root=item.root,
-            plan_path=self._plan_path(item.root, plan_path),
-            config_path=item.config_path,
-            workflow_config=WorkflowUserConfig(),
-            workflow_name=workflow_name,
-            start_step=start_step,
-            max_turns=max_turns,
-            team=team,
-        )
-        return item.daemon.service.start(
-            request,
-            caller_scope=self._caller_scope(project_id, caller_scope),
-            idempotency_key=idempotency_key,
-        )
+        with self.project_lock(project_id):
+            item = self._project(project_id)
+            request = StartupRequest(
+                repo_root=item.root,
+                plan_path=self._plan_path(item.root, plan_path),
+                config_path=item.config_path,
+                workflow_config=WorkflowUserConfig(),
+                workflow_name=workflow_name,
+                start_step=start_step,
+                max_turns=max_turns,
+                team=team,
+            )
+            return item.daemon.service.start(
+                request,
+                caller_scope=self._caller_scope(project_id, caller_scope),
+                idempotency_key=idempotency_key,
+            )
 
     def answer_startup(
         self,
@@ -275,12 +293,13 @@ class ControlPlaneService:
         idempotency_key: str | None,
         caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
-        return self._project(project_id).daemon.service.answer_startup(
-            question_id,
-            answer,
-            caller_scope=self._caller_scope(project_id, caller_scope),
-            idempotency_key=idempotency_key,
-        )
+        with self.project_lock(project_id):
+            return self._project(project_id).daemon.service.answer_startup(
+                question_id,
+                answer,
+                caller_scope=self._caller_scope(project_id, caller_scope),
+                idempotency_key=idempotency_key,
+            )
 
     def control(
         self,
@@ -324,14 +343,15 @@ class ControlPlaneService:
         idempotency_key: str | None,
         caller_scope: str = "rest",
     ) -> StartRunResult:
-        return self._project(project_id).daemon.service.resume(
-            run_id,
-            caller_scope=self._caller_scope(project_id, caller_scope),
-            idempotency_key=idempotency_key,
-        )
+        with self.project_lock(project_id):
+            return self._project(project_id).daemon.service.resume(
+                run_id,
+                caller_scope=self._caller_scope(project_id, caller_scope),
+                idempotency_key=idempotency_key,
+            )
 
     def _project(self, project_id: str) -> _ProjectDaemon:
-        with self._lock:
+        with self.project_lock(project_id), self._lock:
             try:
                 record, root, daemon_config = self._resolve(project_id)
             except Exception as exc:
@@ -344,16 +364,22 @@ class ControlPlaneService:
                 if known_record is None:
                     raise ProjectNotAllowedError("project is not allowed") from exc
                 self._unavailable[project_id] = "project_registration_invalid"
-                raise ControlPlaneUnavailableError("project control plane is unavailable") from exc
+                raise ControlPlaneUnavailableError(
+                    "project control plane is unavailable"
+                ) from exc
             item = self._projects.get(project_id)
             if item is not None and item.root != root:
-                raise ControlPlaneUnavailableError("registered project identity changed")
+                raise ControlPlaneUnavailableError(
+                    "registered project identity changed"
+                )
             if self._unavailable.get(project_id) == "project_registration_invalid":
                 self._unavailable.pop(project_id, None)
             if item is None:
                 try:
                     daemon = self._daemon_factory(daemon_config)
-                    item = _ProjectDaemon(record, root, daemon_config.config_path, daemon)
+                    item = _ProjectDaemon(
+                        record, root, daemon_config.config_path, daemon
+                    )
                     daemon.start()
                 except Exception as exc:
                     self._unavailable[project_id] = "project_daemon_start_failed"
@@ -363,7 +389,9 @@ class ControlPlaneService:
                 self._projects[project_id] = item
                 self._unavailable.pop(project_id, None)
             if project_id in self._unavailable or not item.daemon.ready:
-                raise ControlPlaneUnavailableError("project control plane is unavailable")
+                raise ControlPlaneUnavailableError(
+                    "project control plane is unavailable"
+                )
             return item
 
     def owned_run_snapshots(
@@ -394,15 +422,17 @@ class ControlPlaneService:
                 manifest = item.daemon.application.repository.get_launch_manifest(
                     record.run_id
                 )
-                snapshots.append((
-                    status.run_id,
-                    status.status,
-                    status.workflow_name
-                    or (manifest.workflow_name if manifest is not None else None),
-                    manifest.frozen_config_fingerprint
-                    if manifest is not None
-                    else None,
-                ))
+                snapshots.append(
+                    (
+                        status.run_id,
+                        status.status,
+                        status.workflow_name
+                        or (manifest.workflow_name if manifest is not None else None),
+                        manifest.frozen_config_fingerprint
+                        if manifest is not None
+                        else None,
+                    )
+                )
             if page.next_cursor is None:
                 return tuple(snapshots)
             cursor = page.next_cursor
@@ -434,15 +464,17 @@ class ControlPlaneService:
                 if status.ownership != "control_plane":
                     continue
                 manifest = repository.get_launch_manifest(status.run_id)
-                snapshots.append((
-                    status.run_id,
-                    status.status,
-                    status.workflow_name
-                    or (manifest.workflow_name if manifest is not None else None),
-                    manifest.frozen_config_fingerprint
-                    if manifest is not None
-                    else None,
-                ))
+                snapshots.append(
+                    (
+                        status.run_id,
+                        status.status,
+                        status.workflow_name
+                        or (manifest.workflow_name if manifest is not None else None),
+                        manifest.frozen_config_fingerprint
+                        if manifest is not None
+                        else None,
+                    )
+                )
             if page.next_cursor is None:
                 return tuple(snapshots)
             cursor = page.next_cursor
@@ -455,7 +487,7 @@ class ControlPlaneService:
         release inputs and replaces only the cache entry, and only while the
         project proves it owns no active workflow unit.
         """
-        with self._lock:
+        with self.project_lock(project_id), self._lock:
             item = self._projects.get(project_id)
         if item is None:
             # Composed lazily on next use, directly from the committed files.
@@ -475,7 +507,7 @@ class ControlPlaneService:
             raise ControlPlaneUnavailableError(
                 "project control plane is unavailable"
             ) from exc
-        with self._lock:
+        with self.project_lock(project_id), self._lock:
             self._projects[project_id] = _ProjectDaemon(
                 record, root, daemon_config.config_path, daemon
             )
@@ -484,8 +516,10 @@ class ControlPlaneService:
     def unregister(self, project_id: str) -> bool:
         """Remove one registry record only after proving every exact unit inactive."""
         if self._registry is None:
-            raise ProjectRegistryError("static compatibility projects cannot be unregistered")
-        with self._lock:
+            raise ProjectRegistryError(
+                "static compatibility projects cannot be unregistered"
+            )
+        with self.project_lock(project_id), self._lock:
             if self._registry.get(project_id) is None:
                 return False
             was_cached = project_id in self._projects
@@ -525,7 +559,9 @@ class ControlPlaneService:
                 if status.unit_name:
                     observed = item.daemon.application.units.get(status.unit_name)
                     if observed is not None and observed.name != status.unit_name:
-                        raise ProjectRegistryError("workflow unit identity is ambiguous")
+                        raise ProjectRegistryError(
+                            "workflow unit identity is ambiguous"
+                        )
                     if observed is not None and observed.is_active:
                         return True
             if page.next_cursor is None:
@@ -538,7 +574,9 @@ class ControlPlaneService:
             try:
                 return self._registry.list_records()
             except ProjectRegistryError as exc:
-                raise ControlPlaneUnavailableError("project registry is unavailable") from exc
+                raise ControlPlaneUnavailableError(
+                    "project registry is unavailable"
+                ) from exc
         return ()
 
     def _record(self, project_id: str) -> ProjectRegistryRecord | None:
@@ -546,18 +584,24 @@ class ControlPlaneService:
             return self._registry.get(project_id)
         return None
 
-    def _resolve(self, project_id: str) -> tuple[ProjectRegistryRecord, Path, DaemonConfig]:
+    def _resolve(
+        self, project_id: str
+    ) -> tuple[ProjectRegistryRecord, Path, DaemonConfig]:
         if self._registry is not None:
             record, root = self._registry.resolve(project_id)
             config_path = root / ".aflow" / "config" / "aflow.toml"
-            return record, root, DaemonConfig(
-                repo_root=root,
-                config_path=config_path,
-                aflow_executable=self._aflow_executable,
-                environment_file=self._environment_file,
-                release_identity=self._release_identity or "",
-                environment=self._environment,
-            ).validated()
+            return (
+                record,
+                root,
+                DaemonConfig(
+                    repo_root=root,
+                    config_path=config_path,
+                    aflow_executable=self._aflow_executable,
+                    environment_file=self._environment_file,
+                    release_identity=self._release_identity or "",
+                    environment=self._environment,
+                ).validated(),
+            )
         raise ProjectRegistryError("project is not registered")
 
     @staticmethod

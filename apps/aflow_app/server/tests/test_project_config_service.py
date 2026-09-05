@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -92,7 +92,13 @@ def _env(
     monkeypatch: pytest.MonkeyPatch,
     *,
     initial: str | None = "starter",
-) -> tuple[ProjectConfigService, ProjectRegistry, ControlPlaneService, Path, InMemoryUnitManager]:
+) -> tuple[
+    ProjectConfigService,
+    ProjectRegistry,
+    ControlPlaneService,
+    Path,
+    InMemoryUnitManager,
+]:
     managed = tmp_path / "managed"
     managed.mkdir()
     registry = ProjectRegistry(managed, tmp_path / "registry.json")
@@ -101,7 +107,9 @@ def _env(
     _git(root, "init", "-q")
     (root / "keep.txt").write_text("history")
     _git(root, "add", "keep.txt")
-    _git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "prior")
+    _git(
+        root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "prior"
+    )
     if initial == "starter":
         (root / ".aflow" / "config").mkdir(parents=True)
         from aflow.config import bootstrap_project_config
@@ -229,13 +237,17 @@ class TestRead:
     ) -> None:
         service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
         monkeypatch.setattr(project_config_service, "MAX_CONFIG_DOCUMENT_BYTES", 16)
-        (root / ".aflow" / "config" / "aflow.toml").write_text("x" * 64, encoding="utf-8")
+        (root / ".aflow" / "config" / "aflow.toml").write_text(
+            "x" * 64, encoding="utf-8"
+        )
 
         with pytest.raises(ProjectConfigError, match="maximum supported size"):
             service.read(PROJECT_ID)
 
     def test_unsupported_document_names_are_rejected(self) -> None:
-        with pytest.raises(ProjectConfigError, match="unsupported configuration document"):
+        with pytest.raises(
+            ProjectConfigError, match="unsupported configuration document"
+        ):
             document_path(Path("/anywhere"), "secrets.env")
 
 
@@ -249,7 +261,9 @@ class TestValidateCandidate:
         assert "/tmp" not in report.issues[0].message
         assert "<candidate>" not in report.issues[0].message
 
-    def test_validate_reports_cross_document_semantic_errors(self, tmp_path: Path) -> None:
+    def test_validate_reports_cross_document_semantic_errors(
+        self, tmp_path: Path
+    ) -> None:
         aflow_text, _ = _valid_pair()
         broken_workflows = """[workflow.deliver.steps.implement]
 role = "missing-role"
@@ -299,13 +313,13 @@ class TestSave:
         before = service.read(PROJECT_ID)
         aflow_text, workflows_text = _valid_pair()
 
-        snapshot = service.save(
-            PROJECT_ID, aflow_text, workflows_text, before.revision
-        )
+        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
         config_dir = root / ".aflow" / "config"
         assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == aflow_text
-        assert (config_dir / "workflows.toml").read_text(encoding="utf-8") == workflows_text
+        assert (config_dir / "workflows.toml").read_text(
+            encoding="utf-8"
+        ) == workflows_text
         assert snapshot.revision == combined_revision(
             aflow_text.encode("utf-8"), workflows_text.encode("utf-8")
         )
@@ -319,9 +333,7 @@ class TestSave:
         before = service.read(PROJECT_ID)
         aflow_text, workflows_text = _valid_pair()
 
-        snapshot = service.save(
-            PROJECT_ID, aflow_text, workflows_text, before.revision
-        )
+        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
         assert snapshot.revision != before.revision
         assert control.capabilities(PROJECT_ID).workflows == ("deliver",)
@@ -368,10 +380,12 @@ class TestSave:
 
         assert exc_info.value.current_revision == before.revision
         config_dir = root / ".aflow" / "config"
-        assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == before.aflow_toml
-        assert (
-            config_dir / "workflows.toml"
-        ).read_text(encoding="utf-8") == before.workflows_toml
+        assert (config_dir / "aflow.toml").read_text(
+            encoding="utf-8"
+        ) == before.aflow_toml
+        assert (config_dir / "workflows.toml").read_text(
+            encoding="utf-8"
+        ) == before.workflows_toml
 
     def test_save_rejects_paired_semantic_failure_and_preserves_bytes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -406,12 +420,12 @@ class TestSave:
         starter_workflows = (scratch / "workflows.toml").read_text(encoding="utf-8")
 
         with pytest.raises(ProjectConfigError, match="placeholder"):
-            service.save(
-                PROJECT_ID, starter_aflow, starter_workflows, before.revision
-            )
+            service.save(PROJECT_ID, starter_aflow, starter_workflows, before.revision)
 
         config_dir = root / ".aflow" / "config"
-        assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == before.aflow_toml
+        assert (config_dir / "aflow.toml").read_text(
+            encoding="utf-8"
+        ) == before.aflow_toml
 
     def test_save_rejects_malformed_expected_revision(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -452,11 +466,11 @@ class TestSave:
         aflow_text, workflows_text = _valid_pair(model="updated-model")
 
         with pytest.raises(ProjectConfigRunBlocked) as exc_info:
-            service.save(
-                PROJECT_ID, aflow_text, workflows_text, before.revision
-            )
+            service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
-        assert exc_info.value.blocking_runs == ((pending.run_id, "awaiting_startup_answer"),)
+        assert exc_info.value.blocking_runs == (
+            (pending.run_id, "awaiting_startup_answer"),
+        )
         assert service.read(PROJECT_ID).revision == before.revision
 
     def test_save_blocked_while_running_then_allowed_after_owner_stop(
@@ -504,7 +518,10 @@ class TestSave:
         assert pending.run_id is not None
         run_id = pending.run_id
         answered = control.answer_startup(
-            PROJECT_ID, pending.question_id, "implement", idempotency_key="answer-running"
+            PROJECT_ID,
+            pending.question_id,
+            "implement",
+            idempotency_key="answer-running",
         )
         assert isinstance(answered, StartRunResult)
         assert answered.status == "running"
@@ -598,7 +615,9 @@ class TestSave:
 
         monkeypatch.undo()
         config_dir = root / ".aflow" / "config"
-        assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == before.aflow_toml
+        assert (config_dir / "aflow.toml").read_text(
+            encoding="utf-8"
+        ) == before.aflow_toml
         assert (config_dir / "workflows.toml").read_text(
             encoding="utf-8"
         ) == before.workflows_toml
@@ -630,7 +649,9 @@ class TestSave:
 
         monkeypatch.undo()
         assert not (config_dir / "workflows.toml").exists()
-        assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == before.aflow_toml
+        assert (config_dir / "aflow.toml").read_text(
+            encoding="utf-8"
+        ) == before.aflow_toml
         assert service.read(PROJECT_ID).revision == before.revision
 
     def test_concurrent_writers_only_one_wins(
@@ -645,9 +666,7 @@ class TestSave:
             aflow_text, workflows_text = _valid_pair(model=model)
             barrier.wait()
             try:
-                service.save(
-                    PROJECT_ID, aflow_text, workflows_text, before.revision
-                )
+                service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
             except ProjectConfigRevisionConflict:
                 outcomes[tag] = "conflict"
             else:
@@ -676,12 +695,127 @@ class TestSave:
     def test_save_is_serialized_per_project_with_distinct_locks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        service, _, _, _, _ = _env(tmp_path, monkeypatch, initial="valid")
-        first = service._project_lock(PROJECT_ID)
-        second = service._project_lock(PROJECT_ID)
-        other = service._project_lock("beta")
+        service, _, control, _, _ = _env(tmp_path, monkeypatch, initial="valid")
+        first = control.project_lock(PROJECT_ID)
+        second = control.project_lock(PROJECT_ID)
+        other = control.project_lock("beta")
         assert first is second
         assert first is not other
+
+    def test_read_never_observes_torn_pair_during_save(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, _, _, _, _ = _env(tmp_path, monkeypatch, initial="valid")
+        before = service.read(PROJECT_ID)
+        aflow_text, workflows_text = _valid_pair(model="paired-model")
+        first_replaced, release_save, read_finished = Event(), Event(), Event()
+        outcomes: dict[str, object] = {}
+        real_replace = os.replace
+
+        def pausing_replace(src: object, dst: object, *args: object) -> None:
+            real_replace(src, dst)
+            if Path(str(dst)).name == "aflow.toml":
+                first_replaced.set()
+                assert release_save.wait(timeout=30)
+
+        monkeypatch.setattr(project_config_service.os, "replace", pausing_replace)
+        saver = Thread(
+            target=lambda: outcomes.setdefault(
+                "save",
+                service.save(PROJECT_ID, aflow_text, workflows_text, before.revision),
+            )
+        )
+        saver.start()
+        assert first_replaced.wait(timeout=30)
+        reader = Thread(
+            target=lambda: (
+                outcomes.setdefault("read", service.read(PROJECT_ID)),
+                read_finished.set(),
+            )
+        )
+        reader.start()
+        assert not read_finished.wait(timeout=0.1)
+        release_save.set()
+        saver.join(timeout=30)
+        reader.join(timeout=30)
+        assert not saver.is_alive() and not reader.is_alive()
+        snapshot = outcomes["read"]
+        assert isinstance(snapshot, type(before))
+        assert (snapshot.aflow_toml, snapshot.workflows_toml) in {
+            (before.aflow_toml, before.workflows_toml),
+            (aflow_text, workflows_text),
+        }
+
+    def test_start_waits_for_save_after_blocker_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, _, control, root, _ = _env(tmp_path, monkeypatch, initial="valid")
+        plan = root / "plans" / "todo" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\\n\\n### [ ] Checkpoint 1: Do\\n- [ ] step\\n")
+        before = service.read(PROJECT_ID)
+        aflow_text, workflows_text = _valid_pair(model="launch-after-save")
+        blocker_checked, release_save, started = Event(), Event(), Event()
+        outcomes: dict[str, object] = {}
+        original_check = service._assert_no_blocking_runs
+
+        def pausing_check(project_id: str, root: Path) -> None:
+            original_check(project_id, root)
+            blocker_checked.set()
+            assert release_save.wait(timeout=30)
+
+        monkeypatch.setattr(service, "_assert_no_blocking_runs", pausing_check)
+        monkeypatch.setattr(
+            "aflow.daemon.prepare_startup",
+            lambda request: StartupQuestion(
+                kind=StartupQuestionKind.PICK_STEP,
+                message="Choose a step",
+                choices=["implement"],
+            ),
+        )
+        saver = Thread(
+            target=lambda: outcomes.setdefault(
+                "save",
+                service.save(PROJECT_ID, aflow_text, workflows_text, before.revision),
+            )
+        )
+        saver.start()
+        assert blocker_checked.wait(timeout=30)
+
+        def start() -> None:
+            outcomes["start"] = control.start_run(
+                PROJECT_ID,
+                plan_path="plans/todo/plan.md",
+                workflow_name="deliver",
+                team=None,
+                start_step=None,
+                max_turns=None,
+                idempotency_key="blocked-start",
+            )
+            started.set()
+
+        launcher = Thread(target=start)
+        launcher.start()
+        assert not started.wait(timeout=0.1)
+        release_save.set()
+        saver.join(timeout=30)
+        launcher.join(timeout=30)
+        assert not saver.is_alive() and not launcher.is_alive()
+        pending = outcomes["start"]
+        assert hasattr(pending, "question_id")
+        manifest = control._project(
+            PROJECT_ID
+        ).daemon.application.repository.get_launch_manifest(pending.run_id)
+        assert manifest is not None
+        config = load_workflow_config(root / ".aflow" / "config" / "aflow.toml")
+        from aflow.workflow import _freeze_run_identity
+
+        assert (
+            manifest.frozen_config_fingerprint
+            == _freeze_run_identity(
+                "deliver", config, config_dir=root / ".aflow" / "config" / "aflow.toml"
+            ).config_fingerprint
+        )
 
 
 class TestAuditAndReload:
@@ -700,7 +834,10 @@ class TestAuditAndReload:
             service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
         records = _audit_records(tmp_path)
-        assert [record["outcome"] for record in records] == ["saved", "revision_conflict"]
+        assert [record["outcome"] for record in records] == [
+            "saved",
+            "revision_conflict",
+        ]
         audit_path = tmp_path / "state" / "config_audit.jsonl"
         audit_bytes = audit_path.read_text(encoding="utf-8")
         assert marker_model not in audit_bytes
@@ -736,9 +873,7 @@ class TestAuditAndReload:
         stale = service.read(PROJECT_ID)
         broken_workflows = workflows_text.replace('role = "worker"', 'role = "ghost"')
         with pytest.raises(ProjectConfigError, match="invalid"):
-            service.save(
-                PROJECT_ID, aflow_text, broken_workflows, stale.revision
-            )
+            service.save(PROJECT_ID, aflow_text, broken_workflows, stale.revision)
 
         assert control.capabilities(PROJECT_ID).workflows == ("revised",)
 

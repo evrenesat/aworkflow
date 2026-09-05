@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 import re
-from threading import RLock
 import stat as stat_module
 import tempfile
 import tomllib
@@ -47,23 +46,22 @@ _TOML_LINE_RE = re.compile(r"line (\d+)")
 # block a save.  ``failed``/``interrupted`` runs block only while the current
 # on-disk fingerprint still matches their frozen manifest fingerprint, because
 # only then can explicit resume still reach them.
-_CONFIG_BLOCKING_RUN_STATUSES = frozenset({
-    "running",
-    "awaiting_startup_answer",
-    "stopping",
-    "needs_attention",
-    "waiting_for_valid_override",
-    "manifest_only",
-    "launch_requested",
-    "launch_started",
-    "unit_started",
-    "prepared",
-})
+_CONFIG_BLOCKING_RUN_STATUSES = frozenset(
+    {
+        "running",
+        "awaiting_startup_answer",
+        "stopping",
+        "needs_attention",
+        "waiting_for_valid_override",
+        "manifest_only",
+        "launch_requested",
+        "launch_started",
+        "unit_started",
+        "prepared",
+    }
+)
 _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES = frozenset({"failed", "interrupted"})
 _CONFIG_TERMINAL_RUN_STATUSES = frozenset({"completed", "done", "owner_stopped"})
-
-_PROJECT_LOCKS_GUARD = RLock()
-_PROJECT_LOCKS: dict[str, RLock] = {}
 
 _DOCUMENT_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -84,7 +82,9 @@ class ProjectConfigRunBlocked(ProjectConfigError):
     """A nonterminal or still-resumable owned run depends on the current pair."""
 
     def __init__(self, blocking_runs: tuple[tuple[str, str], ...]) -> None:
-        super().__init__("configuration save is blocked by nonterminal or resumable runs")
+        super().__init__(
+            "configuration save is blocked by nonterminal or resumable runs"
+        )
         self.blocking_runs = blocking_runs
 
 
@@ -197,7 +197,9 @@ def check_document_text(name: str, text: str) -> bytes:
     return payload
 
 
-def validate_candidate_pair(aflow_text: str, workflows_text: str) -> ConfigValidationReport:
+def validate_candidate_pair(
+    aflow_text: str, workflows_text: str
+) -> ConfigValidationReport:
     """Validate both candidate documents together through the production loader."""
     check_document_text("aflow.toml", aflow_text)
     check_document_text("workflows.toml", workflows_text)
@@ -274,8 +276,9 @@ class ProjectConfigService:
 
     def read(self, project_id: str) -> ProjectConfigSnapshot:
         """Return the exact committed texts, revision, and validation report."""
-        root = self._project_root(project_id)
-        return self._snapshot(project_id, root)
+        with self._control_plane.project_lock(project_id):
+            root = self._project_root(project_id)
+            return self._snapshot(project_id, root)
 
     def validate_candidate(
         self,
@@ -299,9 +302,12 @@ class ProjectConfigService:
         """Commit both documents as one compare-and-swap, rollback-safe pair."""
         if caller_scope not in {"rest", "mcp"}:
             raise ValueError("unsupported configuration transport scope")
-        if not isinstance(expected_revision, str) or _DOCUMENT_HEX_RE.fullmatch(expected_revision) is None:
+        if (
+            not isinstance(expected_revision, str)
+            or _DOCUMENT_HEX_RE.fullmatch(expected_revision) is None
+        ):
             raise ProjectConfigError("expected_revision must be a SHA-256 hex digest")
-        with self._project_lock(project_id):
+        with self._control_plane.project_lock(project_id):
             revisions: dict[str, str | None] = {"old": None, "new": None}
             try:
                 snapshot = self._save_locked(
@@ -372,7 +378,10 @@ class ProjectConfigService:
         new_revision = combined_revision(aflow_bytes, workflows_bytes)
         self._commit_pair(
             config_dir,
-            previous=(aflow_doc[0] if aflow_doc else None, workflows_doc[0] if workflows_doc else None),
+            previous=(
+                aflow_doc[0] if aflow_doc else None,
+                workflows_doc[0] if workflows_doc else None,
+            ),
             payloads=(aflow_bytes, workflows_bytes),
         )
         committed_aflow, committed_workflows = self._current_documents(config_dir)
@@ -394,19 +403,19 @@ class ProjectConfigService:
             raise ProjectConfigError("project root is unavailable") from exc
         return root
 
-    def _project_lock(self, project_id: str) -> RLock:
-        with _PROJECT_LOCKS_GUARD:
-            return _PROJECT_LOCKS.setdefault(project_id, RLock())
-
     @staticmethod
     def _validated_config_dir(root: Path) -> Path:
         current = root
         for part in (".aflow", "config"):
             current = current / part
             if current.is_symlink():
-                raise ProjectConfigError("configuration directory contains a symlink component")
+                raise ProjectConfigError(
+                    "configuration directory contains a symlink component"
+                )
             if current.exists() and not current.is_dir():
-                raise ProjectConfigError("configuration path component must be a directory")
+                raise ProjectConfigError(
+                    "configuration path component must be a directory"
+                )
         if current.exists() and not current.is_dir():
             raise ProjectConfigError("configuration path must be a directory")
         return current
@@ -483,7 +492,10 @@ class ProjectConfigService:
         if not snapshots:
             return
         config = None
-        if any(status in _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES for _, status, _, _ in snapshots):
+        if any(
+            status in _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES
+            for _, status, _, _ in snapshots
+        ):
             try:
                 config = load_workflow_config(root / ".aflow" / "config" / "aflow.toml")
             except ConfigError:
@@ -510,7 +522,9 @@ class ProjectConfigService:
             raise ProjectConfigRunBlocked(tuple(sorted(blockers)[:MAX_BLOCKING_RUNS]))
 
     @staticmethod
-    def _current_fingerprint(config: object, root: Path, workflow_name: str) -> str | None:
+    def _current_fingerprint(
+        config: object, root: Path, workflow_name: str
+    ) -> str | None:
         from aflow.workflow import _freeze_run_identity
 
         try:
@@ -624,7 +638,9 @@ class ProjectConfigService:
         line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
         try:
             self._audit_path.parent.mkdir(parents=True, exist_ok=True)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            )
             descriptor = os.open(self._audit_path, flags, 0o600)
             try:
                 os.write(descriptor, line)
