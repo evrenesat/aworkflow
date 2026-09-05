@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-05 - Align manager contract and prelaunch failures
+
+- Updated the bundled manager contract and inline precedence rules for live
+  schema-v3 reference-only contexts: read the declared checkpoint evidence
+  first, inspect the active/full plan reference only when needed, and never
+  search alternate plan files.
+- Lite manager contexts now persist the already-supported escalate_to_full
+  action alongside the prompt's effective eligibility; Full routing remains
+  controller-owned and unchanged.
+- Context, evidence-capture, and prompt-budget failures now produce one
+  bounded invalid manager decision artifact before the controller records the
+  truthful run failure. No provider-start event is emitted and failed
+  artifacts do not copy plan bodies.
+
 ## 2026-09-02 — Manager context references and prompt budget
 
 - A 340 KB manager context (incident `20260902t053828z-5cfe3386`, decision

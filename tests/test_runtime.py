@@ -11919,7 +11919,9 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert lite_result['status'] == 'invalid'
             assert "action 'stop' is not eligible" in lite_result['error']
             assert lite_result['finalized_turn_number'] == 1
-            assert lite_context['controller_state']['eligible_actions'] == ['continue']
+            assert lite_context['controller_state']['eligible_actions'] == [
+                'continue', 'escalate_to_full',
+            ]
             assert full_result['level'] == 'full'
             assert full_result['trigger'] == 'lite_invalid'
             assert full_result['status'] == 'accepted'
@@ -13111,8 +13113,12 @@ class LifecycleBootstrapTests(unittest.TestCase):
             full_context = json.loads((
                 run_dir / "manager" / "decision-002" / "context.json"
             ).read_text(encoding="utf-8"))
+            lite_context = json.loads((
+                run_dir / "manager" / "decision-001" / "context.json"
+            ).read_text(encoding="utf-8"))
             assert lite_result["status"] == "accepted"
             assert lite_result["action"] == "escalate_to_full"
+            assert "escalate_to_full" in lite_context["controller_state"]["eligible_actions"]
             assert full_result["level"] == "full"
             assert full_result["trigger"] == "lite_escalation"
             assert full_result["status"] == "accepted"
@@ -13125,6 +13131,79 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert run_json["status"] == "failed"
             assert run_json["failure_reason"] == report
             assert failed_events[0].failure_reason == report  # type: ignore[attr-defined]
+
+    def test_manager_context_failure_writes_one_invalid_decision_without_provider(
+        self,
+    ) -> None:
+        from aflow.manager import ManagerInlineContextLimitError
+        from aflow.manager_context import build_manager_context as actual_build_context
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            build_calls = 0
+            provider_models: list[str] = []
+            failure = (
+                "manager inline context exceeds the 32768-byte hard limit: "
+                "total_bytes=32769; schema_version=3 level=5"
+            )
+
+            def fail_after_selection(*args, **kwargs):
+                nonlocal build_calls
+                build_calls += 1
+                if build_calls == 1:
+                    return actual_build_context(*args, **kwargs)
+                raise ManagerInlineContextLimitError(failure)
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                provider_models.append(model)
+                assert model == "worker", "manager provider launched after prelaunch failure"
+                _write_plan(plan_path, _COMPLETE_PLAN + "\nEVIDENCE-BODY\n")
+                return subprocess.CompletedProcess(argv, 0, "work complete", "")
+
+            with patch(
+                "aflow.workflow.build_manager_context",
+                side_effect=fail_after_selection,
+            ):
+                with pytest.raises(WorkflowError) as raised:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                        ),
+                        _clean_end_manager_workflow_config(),
+                        "managed",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+            assert provider_models == ["worker"]
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            result_paths = sorted(
+                (run_dir / "manager").glob("decision-*/result.json")
+            )
+            assert len(result_paths) == 1
+            result = json.loads(result_paths[0].read_text(encoding="utf-8"))
+            assert result["status"] == "invalid"
+            assert result["error"] == failure
+            stored_context = json.loads(
+                result_paths[0].with_name("context.json").read_text(encoding="utf-8")
+            )
+            serialized = json.dumps(stored_context, sort_keys=True)
+            assert "32769" not in serialized
+            decision_dir = result_paths[0].parent
+            decision_artifacts = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in decision_dir.iterdir()
+                if path.is_file()
+            )
+            assert "EVIDENCE-BODY" not in decision_artifacts
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            assert run_json["status"] == "failed"
+            assert failure in run_json["failure_reason"]
 
     def test_manager_non_end_lite_stop_emits_report_then_stops_banner_before_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

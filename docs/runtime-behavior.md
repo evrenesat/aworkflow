@@ -429,15 +429,17 @@ it does not increase `turns_completed`, consume `max_turns`, create a checkpoint
 commit, or trigger same-step caps.
 
 The manager receives a reproducible, versioned context built from durable
-artifacts. Lite receives semantic results, plan snapshots and structured state,
-controller/routing counters, compact history, and bounded diagnostics. It does
-not receive active-plan content, prompts, or raw trace bodies. Full adds the
-complete active-plan Markdown. Full is chosen directly after consecutive
-unchanged executions of the same workflow step, the second reviewer rejection
-within one open original-checkpoint scope, explicit stop markers, invalid plans,
-and ambiguous failures. Alternating implementation and review steps do not
-select Full merely because their plan snapshots are unchanged. Lite can
-escalate once to Full at the same boundary.
+artifacts. Live schema-v3 Lite and Full contexts carry bounded semantic
+results, plan snapshots and structured state, controller/routing counters,
+compact history, bounded diagnostics, and controller-declared evidence
+references. Neither level receives active-plan or checkpoint content inline,
+prompts, or raw trace bodies; Full may receive richer bounded scope and
+rejection evidence. Full is chosen directly after consecutive unchanged
+executions of the same workflow step, the second reviewer rejection within one
+open original-checkpoint scope, explicit stop markers, invalid plans, and
+ambiguous failures. Alternating implementation and review steps do not select
+Full merely because their plan snapshots are unchanged. Lite can escalate once
+to Full at the same boundary.
 
 The strict manager protocol permits only controller actions: accept the
 proposal, retry, select an eligible implementation upgrade, select an eligible

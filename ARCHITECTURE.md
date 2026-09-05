@@ -87,19 +87,24 @@ prerequisites that cannot be verified safely by product preflight.
 After a workflow turn has durable final artifacts, the controller computes its
 proposed recovery or transition and optionally invokes the interstep manager
 before applying it. This includes a proposed terminal transition: merge and
-teardown begin only after the manager accepts that terminal action. Lite gets
-compact semantic evidence and structured state, while Full additionally gets
-the complete active plan. Manager calls and their exact artifacts live outside
-the workflow turn sequence, so they never affect turn counts or checkpoints.
+teardown begin only after the manager accepts that terminal action.
+Lite and Full get compact semantic evidence and structured state; live schema-v3
+contexts keep plan and checkpoint bodies in run-local evidence references, with
+Full receiving the controller-selected scope and rejection detail. Historical
+v1/v2 analysis retains its stored versioned body fields. Manager calls and
+their exact artifacts live outside the workflow turn sequence, so they never
+affect turn counts or checkpoints.
 Turn-text diagnostics preserve the stream and structured outcome boundary:
 semantic stdout is scanned for text signals, successful zero-return stderr may
 be a harness transcript and remains untrusted context, and stderr becomes a
 failure diagnostic only for a nonzero return code or a failure-like turn
 status. Explicit `AFLOW_STOP` parsing remains independent on both streams.
 Durable plan, branch, worktree, boundary, and turn-outcome fields override
-contradictory transcript text. Lite keeps active and original plan bodies null
-and marks both as intentionally omitted; this redaction is not evidence that a
-plan is missing, while Full can include available plan content.
+contradictory transcript text. Live schema-v3 contexts keep plan and
+checkpoint bodies out of both Lite and Full prompts; both levels use the
+controller-declared evidence references, with Full receiving richer bounded
+scope and rejection detail. Historical v1/v2 contexts retain their stored
+versioned body fields.
 
 ### Run-local evidence store and reference-only manager contexts
 
@@ -304,7 +309,7 @@ Entry point. Exposes three subcommands:
   - With a workflow name, it prints only that workflow plus the roles and teams that apply to it.
 - **`aflow analyze [RUN_ID] [--all] [--manager-context lite|full] [--turn N]`** -- analyzes run logs from `.aflow/runs/`.
   - Single-run mode resolves the target run in `analyzer.py`, and the CLI delegates to `aflow.api.analyze.analyze_runs()` so library callers get the same behavior.
-  - Manager-context mode is read-only and uses the same shared context builder as runtime; Lite excludes plan content and Full includes the active plan.
+  - Manager-context mode is read-only and uses the same shared context builder as runtime; live schema-v3 Lite and Full contexts reference declared evidence artifacts, while historical v1/v2 analysis follows its stored schema.
 
 `main()` resolves `aflow run` startup in this order:
 

@@ -208,15 +208,17 @@ are evidence rather than gates. The Full manager is read-only; the controller
 owns rendering, validation, application, and routing. `AFLOW_STOP` remains
 terminal for semantic, safety, ownership, destructive, and other hard blockers.
 
-Lite is the normal cost-aware supervisor. It receives the finished turn's
-complete semantic result, compact run history, structured plan state, routing
-state, and bounded diagnostic excerpts, but never plan prose or prompt bodies.
-Full receives the same context plus the complete current active-plan Markdown.
+Lite is the normal cost-aware supervisor. Live schema-v3 contexts provide
+bounded semantic results, compact run history, structured plan state, routing
+state, bounded diagnostic excerpts, and controller-declared evidence
+references; neither level receives plan prose or prompt bodies inline. Full
+may provide richer bounded scope and rejection evidence, while plan and
+checkpoint content remains available only through the declared references.
 The controller chooses Full directly after the configured same-step stall
 threshold, after repeated reviewer-to-implementer non-convergence within one
 open checkpoint scope, and for explicit stops, invalid plans, or ambiguous
-failures. Lite
-can also request one immediate Full decision at the same boundary.
+failures. Lite can also request one immediate Full decision at the same
+boundary.
 
 ### Team upgrade routes
 

@@ -185,6 +185,10 @@ class SkillDocsTests(unittest.TestCase):
         assert 'A real `AFLOW_STOP` remains terminal' in normalized
         assert 'controller validates all routing and decides the concrete target' in normalized
         assert "next checkpoint's initial worker" in normalized
+        assert 'schema-v3 manager contexts are reference-only' in normalized.lower()
+        assert 'read the referenced checkpoint artifact first' in normalized.lower()
+        assert 'do not search for alternate plan files' in normalized.lower()
+        assert 'full contexts include the active plan' not in normalized.lower()
 
     def test_repartition_skill_has_strict_read_only_dual_mode_contract(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -222,6 +226,9 @@ class SkillDocsTests(unittest.TestCase):
         assert 'summaries are non-authoritative' in combined
         assert 'Full manager is read-only' in combined
         assert '`AFLOW_STOP` remains terminal' in combined
+        assert 'Full receives the complete active-plan Markdown' not in combined
+        assert 'Full includes the complete active-plan body' not in combined
+        assert 'controller-declared evidence references' in combined
 
     def test_bundled_config_review_implement_review_max_turns_transitions(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

@@ -1148,6 +1148,7 @@ def test_v3_prompt_system_instructions_reference_artifacts_only() -> None:
         "controller_state": {"eligible_actions": ["continue"]},
     }
     system, _ = build_manager_prompts(context)
+    assert "overrides conflicting skill text" in system
     assert (
         "Plan and checkpoint content is referenced, not inlined" in system
     )

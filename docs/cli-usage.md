@@ -171,8 +171,10 @@ Corpus mode flags:
 `--manager-context lite|full` rebuilds the same read-only versioned context
 that manager supervision used for a finalized workflow turn. `--turn N` selects
 that turn and otherwise defaults to the latest finalized turn. These options
-require single-run mode and never invoke a manager or alter run artifacts. Lite
-excludes plan prose; Full includes the complete active-plan body. For a stopped
+require single-run mode and never invoke a manager or alter run artifacts. Live
+schema-v3 Lite and Full contexts keep plan and checkpoint content in declared
+run-local evidence references; Full may provide richer bounded scope and
+rejection evidence. For a stopped
 run, read `.aflow/runs/<RUN_ID>/manager-report.md` first; it is designed to
 explain the incident without requiring raw logs.
 

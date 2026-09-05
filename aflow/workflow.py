@@ -137,6 +137,64 @@ class ManagerCallOutcome:
     context: dict[str, object]
     error: str | None
     correction_consumed: bool = False
+    prelaunch_failure: bool = False
+
+
+def _manager_prelaunch_failure_context(
+    *,
+    run_id: str,
+    decision_number: int,
+    level: str,
+    trigger: str,
+    boundary: FinalizedTurnBoundary,
+    metadata: Mapping[str, object],
+    workspace_state: Mapping[str, object],
+) -> dict[str, object]:
+    """Return a safe minimal context when provider input could not be built."""
+    schema_version = (
+        MANAGER_CONTEXT_SCHEMA_VERSION_V3
+        if boundary.context_schema_version >= 4
+        else boundary.context_schema_version
+    )
+    return {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "decision_number": decision_number,
+        "level": level,
+        "trigger": trigger,
+        "finished_turn": {
+            "turn_number": boundary.finalized_turn_number,
+            "status": "manager-prelaunch-failure",
+            "error": "manager context was unavailable before provider launch",
+            "raw_artifacts": [],
+        },
+        "run_extract": [],
+        "plan_state": {
+            "original_plan_path": metadata.get("original_plan_path"),
+            "active_plan_path": metadata.get("active_plan_path"),
+            "current_checkpoint": None,
+        },
+        "controller_state": {
+            "terminal": boundary.terminal,
+            "proposed_action": boundary.proposed_action,
+            "proposed_next_step": boundary.proposed_transition,
+            "baseline_team": boundary.baseline_team,
+            "eligible_actions": list(boundary.eligible_actions),
+            "workspace_state": dict(workspace_state),
+            "lite_evidence": "manager context was unavailable before provider launch",
+        },
+        "evidence": {
+            "available": False,
+            "reason": "manager context was unavailable before provider launch",
+        },
+        "plan_content_disclosure": {
+            "active_plan": "unavailable",
+            "original_plan": "unavailable",
+            "checkpoint": "unavailable",
+        },
+        "manager_prelaunch_failure": True,
+    }
+
 
 def _manager_repo_fingerprint(
     execution_repo_root: Path,
@@ -251,31 +309,66 @@ class _ManagerCallExecutor:
                 "merge_state": "managed" if self.execution_context is not None and "merge" in self.execution_context.teardown else "none",
             },
         }
-        context = build_manager_context(
-            context_run_dir or self.run_paths.run_dir,
-            level=level,  # type: ignore[arg-type]
-            trigger=boundary.trigger,
-            decision_number=decision_number,
-            run_metadata=metadata,
-            boundary=boundary_payload,
-            active_plan_content=captured_active_plan,
-            capture_evidence=True,
-        )
-        if boundary.context_schema_version >= 3:
-            controller_state = context.get("controller_state")
-            if isinstance(controller_state, dict):
-                controller_state["checkpoint_repartitions"] = list(
-                    boundary.repartition_history
-                )
-        boundary_payload["captured_plan_state"] = context["plan_state"]
         eligible = set(boundary.__dict__.get("eligible_actions", ()))
         if level == "lite":
             eligible.add("escalate_to_full")
-
-        system_prompt, user_prompt = build_manager_prompts(
-            context,
-            skill_name=self.workflow_config.manager.skill,
-        )
+        context: dict[str, object]
+        system_prompt = ""
+        user_prompt = ""
+        prelaunch_failure = False
+        stdout = ""
+        stderr = ""
+        result_payload: dict[str, object] = {
+            "decision_number": decision_number,
+            "finalized_turn_number": boundary.finalized_turn_number,
+            "level": level,
+            "trigger": boundary.trigger,
+            "status": "invalid",
+        }
+        parsed: ManagerDecisionV1 | None = None
+        original_candidate: ManagerDecisionV1 | None = None
+        note_violation: ManagerNoteAuthorityError | None = None
+        error: str | None = None
+        try:
+            context = build_manager_context(
+                context_run_dir or self.run_paths.run_dir,
+                level=level,  # type: ignore[arg-type]
+                trigger=boundary.trigger,
+                decision_number=decision_number,
+                run_metadata=metadata,
+                boundary=boundary_payload,
+                active_plan_content=captured_active_plan,
+                capture_evidence=True,
+            )
+            if boundary.context_schema_version >= 3:
+                controller_state = context.get("controller_state")
+                if isinstance(controller_state, dict):
+                    controller_state["checkpoint_repartitions"] = list(
+                        boundary.repartition_history
+                    )
+            boundary_payload["captured_plan_state"] = context["plan_state"]
+            system_prompt, user_prompt = build_manager_prompts(
+                context,
+                skill_name=self.workflow_config.manager.skill,
+            )
+        except (OSError, UnicodeError, ValueError, WorkflowError) as exc:
+            prelaunch_failure = True
+            error = str(exc)
+            context = _manager_prelaunch_failure_context(
+                run_id=self.state.run_id,
+                decision_number=decision_number,
+                level=level,
+                trigger=boundary.trigger,
+                boundary=boundary,
+                metadata=metadata,
+                workspace_state=boundary_payload["workspace_state"],
+            )
+            result_payload.update({
+                "status": "invalid",
+                "failure_stage": "prelaunch",
+                "error": error,
+            })
+        boundary_payload.setdefault("captured_plan_state", context.get("plan_state", {}))
         artifact_dir = self.run_paths.manager_dir / f"decision-{decision_number:03d}"
         artifact_paths = {
             name: str((artifact_dir / filename).relative_to(self.run_paths.run_dir))
@@ -285,21 +378,16 @@ class _ManagerCallExecutor:
                 "stderr": "stderr.txt", "result": "result.json",
             }.items()
         }
-        target_team = boundary.implementation_upgrade.get("target_team") if boundary.implementation_upgrade else boundary.actual_team
-        stdout = ""
-        stderr = ""
-        result_payload: dict[str, object] = {
-            "decision_number": decision_number, "finalized_turn_number": boundary.finalized_turn_number,
-            "level": level, "trigger": boundary.trigger, "status": "invalid",
-        }
-        parsed: ManagerDecisionV1 | None = None
-        original_candidate: ManagerDecisionV1 | None = None
-        note_violation: ManagerNoteAuthorityError | None = None
-        error: str | None = None
+        target_team = (
+            boundary.implementation_upgrade.get("target_team")
+            if boundary.implementation_upgrade else boundary.actual_team
+        )
         role_resolution = None
         manager_profile = None
         manager_adapter = None
         try:
+            if prelaunch_failure:
+                raise ManagerDecisionError(error or "manager context was unavailable before provider launch")
             role_resolution = resolve_manager_role(
                 self.workflow_config, level=level, baseline_team=baseline_team_name  # type: ignore[arg-type]
             )
@@ -400,6 +488,15 @@ class _ManagerCallExecutor:
             note_violation = None
             error = "manager mutated repository or plan state"
             result_payload.update({"status": "mutation-detected", "error": error})
+        persisted_boundary_payload = dict(boundary_payload)
+        persisted_active_plan_content = captured_active_plan
+        if prelaunch_failure:
+            # Context construction failed before a provider could inspect the
+            # input. Keep the failure artifact useful without copying plan
+            # bodies into the manager decision record.
+            persisted_boundary_payload.pop("active_plan_content", None)
+            persisted_boundary_payload.pop("original_plan_content", None)
+            persisted_active_plan_content = None
         artifacts = write_manager_artifacts(
             self.run_paths, decision_number=decision_number, context=context,
             system_prompt=system_prompt, user_prompt=user_prompt, stdout=stdout, stderr=stderr,
@@ -408,8 +505,8 @@ class _ManagerCallExecutor:
                 "decision_number": decision_number,
                 "trigger": boundary.trigger,
                 "run_metadata": metadata,
-                "boundary": boundary_payload,
-                "active_plan_content": captured_active_plan,
+                "boundary": persisted_boundary_payload,
+                "active_plan_content": persisted_active_plan_content,
             },
         )
         correction_consumed = False
@@ -596,6 +693,7 @@ class _ManagerCallExecutor:
             context=context,
             error=error,
             correction_consumed=correction_consumed,
+            prelaunch_failure=prelaunch_failure,
         )
 
 
@@ -1608,6 +1706,7 @@ class _ManagerGateCoordinator:
         lite_eligible = set(base_eligible)
         if clean_end_boundary:
             lite_eligible.discard("stop")
+        lite_eligible.add("escalate_to_full")
         boundary = FinalizedTurnBoundary(
             finalized_turn_number=(
                 self.state.active_turn
@@ -1698,6 +1797,7 @@ class _ManagerGateCoordinator:
             decision is None
             and level == "lite"
             and not outcome.correction_consumed
+            and not outcome.prelaunch_failure
             and error != "manager mutated repository or plan state"
         ):
             level = "full"
