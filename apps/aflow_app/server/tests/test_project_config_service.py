@@ -542,7 +542,12 @@ class TestSave:
         assert snapshot.revision != before.revision
 
     def _failed_run(
-        self, root: Path, fingerprint: str, *, frozen_config_path: str | None = None
+        self,
+        root: Path,
+        fingerprint: str,
+        *,
+        frozen_config_path: str | None = None,
+        status: str = "failed",
     ) -> str:
         from aflow.control_plane.models import LaunchManifest
 
@@ -556,10 +561,11 @@ class TestSave:
             frozen_config_fingerprint=fingerprint,
         )
         create_launch_manifest(root, manifest)
-        write_launch_phase(root, run_id, "failed")
+        if status == "failed":
+            write_launch_phase(root, run_id, status)
         run_dir = root / ".aflow" / "runs" / run_id
         run_dir.mkdir(parents=True)
-        payload: dict[str, object] = {"status": "failed", "workflow_name": "deliver"}
+        payload: dict[str, object] = {"status": status, "workflow_name": "deliver"}
         if frozen_config_path is not None:
             payload["frozen_config"] = {"config_path": frozen_config_path}
         (run_dir / "run.json").write_text(json.dumps(payload))
@@ -589,6 +595,46 @@ class TestSave:
             service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
         assert exc_info.value.blocking_runs[0][1] == "failed"
+
+    def test_save_handles_uncomposable_owned_run_snapshots(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial=None)
+        config_path = root / ".aflow" / "config" / "aflow.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("[aflow\n", encoding="utf-8")
+        old_config_path = root / "old-global-config" / "aflow.toml"
+        old_config_path.parent.mkdir()
+        old_config_path.write_bytes(config_path.read_bytes())
+        self._failed_run(
+            root,
+            "frozen-fingerprint",
+            frozen_config_path=str(old_config_path.resolve()),
+        )
+        before_revision = combined_revision(config_path.read_bytes(), b"")
+        aflow_text, workflows_text = _valid_pair(model="recovered-model")
+
+        snapshot = service.save(
+            PROJECT_ID, aflow_text, workflows_text, before_revision
+        )
+
+        assert snapshot.validation.state == "ready"
+
+    def test_save_blocks_uncomposable_nonterminal_owned_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial=None)
+        config_path = root / ".aflow" / "config" / "aflow.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("[aflow\n", encoding="utf-8")
+        self._failed_run(root, "frozen-fingerprint", status="running")
+        before_revision = combined_revision(config_path.read_bytes(), b"")
+        aflow_text, workflows_text = _valid_pair(model="blocked-model")
+
+        with pytest.raises(ProjectConfigRunBlocked) as exc_info:
+            service.save(PROJECT_ID, aflow_text, workflows_text, before_revision)
+
+        assert exc_info.value.blocking_runs[0][1] == "running"
 
     def test_save_allows_migrated_identical_config_with_old_frozen_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

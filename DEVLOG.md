@@ -7,6 +7,11 @@
 - Rebuilt the web plan editor around that contract and kept durable run REST,
   SSE, and MCP behavior unchanged.
 
+## 2026-09-06 -- Preserve uncomposable project save guards
+
+- Uncomposable project run snapshots now include the durable frozen config path,
+  keeping failed migrated runs and nonterminal blockers on the same save path.
+
 ## 2026-09-06 -- Preserve historical config-path resume safety
 
 - Project config saves now ignore a failed or interrupted control-plane run only

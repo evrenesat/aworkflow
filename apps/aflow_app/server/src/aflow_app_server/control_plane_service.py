@@ -440,7 +440,7 @@ class ControlPlaneService:
 
     def _uncomposable_run_snapshots(
         self, project_id: str
-    ) -> tuple[tuple[str, str, str | None, str | None], ...]:
+    ) -> tuple[tuple[str, str, str | None, str | None, str | None], ...]:
         """Classify durable run state without a composed daemon.
 
         The repository can classify owned launch phases and legacy history
@@ -474,6 +474,7 @@ class ControlPlaneService:
                         manifest.frozen_config_fingerprint
                         if manifest is not None
                         else None,
+                        repository.get_frozen_config_path(status.run_id),
                     )
                 )
             if page.next_cursor is None:
