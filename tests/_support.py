@@ -33,6 +33,7 @@ from aflow.config import (
 )
 from aflow.workflow import (
     WorkflowError,
+    _backup_active_followup_plan,
     _backup_original_plan,
     _run_process,
     derive_readme_content,

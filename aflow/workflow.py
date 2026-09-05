@@ -3169,17 +3169,23 @@ def _same_file_contents(
     return candidate_identity[1] == source_hash
 
 
-def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
-    if not original_plan_path.is_file():
-        raise WorkflowError(f"original plan file does not exist: {original_plan_path}")
+def _backup_plan_copy(
+    repo_root: Path,
+    source_path: Path,
+    *,
+    base_name: str,
+    suffix: str,
+    subject: str,
+) -> Path:
+    if not source_path.is_file():
+        raise WorkflowError(f"{subject} file does not exist: {source_path}")
 
     backup_dir = repo_root / "plans" / "backups"
-    base_name, suffix = _plan_backup_base_name(original_plan_path)
     base_backup_path = backup_dir / f"{base_name}{suffix}"
     version_pattern = re.compile(
         rf"^{re.escape(base_name)}_v(\d+){re.escape(suffix)}$"
     )
-    source_identity = _file_identity(original_plan_path)
+    source_identity = _file_identity(source_path)
     highest_version = 1
 
     try:
@@ -3187,7 +3193,7 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
 
         if base_backup_path.is_file():
             if _same_file_contents(
-                original_plan_path,
+                source_path,
                 base_backup_path,
                 source_identity=source_identity,
             ):
@@ -3201,7 +3207,7 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
                 continue
             highest_version = max(highest_version, int(match.group(1)))
             if _same_file_contents(
-                original_plan_path,
+                source_path,
                 child,
                 source_identity=source_identity,
             ):
@@ -3216,12 +3222,56 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
                 version += 1
                 target_path = backup_dir / f"{base_name}_v{version:02d}{suffix}"
 
-        shutil.copyfile(original_plan_path, target_path)
+        shutil.copyfile(source_path, target_path)
         return target_path
     except OSError as exc:
         raise WorkflowError(
-            f"failed to back up original plan {original_plan_path} into {backup_dir}: {exc}"
+            f"failed to back up {subject} {source_path} into {backup_dir}: {exc}"
         ) from exc
+
+
+def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
+    if not original_plan_path.is_file():
+        raise WorkflowError(f"original plan file does not exist: {original_plan_path}")
+
+    base_name, suffix = _plan_backup_base_name(original_plan_path)
+    return _backup_plan_copy(
+        repo_root,
+        original_plan_path,
+        base_name=base_name,
+        suffix=suffix,
+        subject="original plan",
+    )
+
+
+def _backup_active_followup_plan(
+    repo_root: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    *,
+    source_path: Path | None = None,
+) -> Path | None:
+    """Back up a non-original active plan before its harness turn runs.
+
+    Reviewer-created follow-up plans can still be deleted from
+    plans/in-progress/ by the approval lifecycle, so the plans/backups/ copy
+    is the durable debugging evidence. Original plans already keep a startup
+    backup and never take this per-turn path. A missing active plan is
+    skipped; backup I/O failures propagate so the turn fails closed.
+    """
+    if active_plan_path == original_plan_path:
+        return None
+    backup_source = source_path if source_path is not None else active_plan_path
+    if not backup_source.is_file():
+        return None
+    base_name, suffix = _plan_backup_base_name(active_plan_path)
+    return _backup_plan_copy(
+        repo_root,
+        backup_source,
+        base_name=base_name,
+        suffix=suffix,
+        subject="active follow-up plan",
+    )
 
 
 def _done_plan_path(repo_root: Path, plan_path: Path) -> Path | None:
@@ -9196,6 +9246,14 @@ def run_workflow(
                     step_name=current_step_name,
                     turn_number=turn_number,
                 )
+                # Must complete before the harness runs: in-progress approval
+                # cleanup may delete the follow-up plan this turn is about to use.
+                _backup_active_followup_plan(
+                    config.repo_root,
+                    original_plan_path,
+                    active_plan_path,
+                    source_path=_exec_plan_path(active_plan_path, exec_ctx),
+                )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":
                     _fail_hotplug_target(exc.summary)
@@ -9505,6 +9563,14 @@ def run_workflow(
                     workflow_turn=turn_number,
                     step_name=current_step_name,
                     turn_number=turn_number,
+                )
+                # Must complete before the harness runs: in-progress approval
+                # cleanup may delete the follow-up plan this turn is about to use.
+                _backup_active_followup_plan(
+                    config.repo_root,
+                    original_plan_path,
+                    active_plan_path,
+                    source_path=_exec_plan_path(active_plan_path, exec_ctx),
                 )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":

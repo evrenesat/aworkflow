@@ -388,21 +388,22 @@ classifier while retaining its backup-plan and active-plan allowances.
    c. Resolve the step's role through the selected team and global role map to get the concrete harness selector.
    d. Render prompt templates with path placeholders.
    e. Build a `HarnessInvocation` via the adapter, using `execution_repo_root` as the subprocess cwd.
-   f. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
-   g. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
-   h. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
-   i. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
-   j. Evaluate `go` transitions using condition symbols (`DONE`, `NEW_PLAN_EXISTS`, `MAX_TURNS_REACHED`).
-   k. Finalize turn artifacts with the active plan that rendered the current
+   f. Before the harness runs, copy a non-original active plan into `plans/backups/` (content-aware, collision-safe naming shared with the startup original-plan backup; identical content deduplicates and changed content gains a `_vNN` version while existing backups and unrelated files are preserved). Original active plans skip this per-turn path because they already have the startup backup, and a missing active plan is skipped, while backup I/O failures fail the turn before the harness starts.
+   g. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
+   h. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
+   i. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
+   j. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
+   k. Evaluate `go` transitions using condition symbols (`DONE`, `NEW_PLAN_EXISTS`, `MAX_TURNS_REACHED`).
+   l. Finalize turn artifacts with the active plan that rendered the current
       prompt, then select the next active plan: a newly created plan wins;
       otherwise `preserve_active_plan = true` retains the current plan; all
       other transitions reset to the original plan. Worktree checks use the
       execution path while persisted controller state uses the primary-checkout
       logical path.
-   l. Update run metadata with the active plan selected for the next turn.
-   m. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The Full manager is read-only: the manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout and current-run fingerprints detect mutation. Its own invocation does not count as a workflow turn.
-   n. Persist accepted one-hop notes, exact selector, target active-plan identity, stable implementation-scope identity, and an eligible implementation-team override before the next step begins. Resume restores the scope and an unconsumed target before launching it, normalizes attempt histories to mutable live lists, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
-   o. Treat `END` as successful only when the post-turn original-plan snapshot
+   m. Update run metadata with the active plan selected for the next turn.
+   n. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The Full manager is read-only: the manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout and current-run fingerprints detect mutation. Its own invocation does not count as a workflow turn.
+   o. Persist accepted one-hop notes, exact selector, target active-plan identity, stable implementation-scope identity, and an eligible implementation-team override before the next step begins. Resume restores the scope and an unconsumed target before launching it, normalizes attempt histories to mutable live lists, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
+   p. Treat `END` as successful only when the post-turn original-plan snapshot
       is complete. An incomplete max-turn or ordinary `END` records the chosen
       transition but fails without a successful `end_reason`.
 

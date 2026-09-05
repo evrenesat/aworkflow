@@ -2410,6 +2410,97 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert second_backup == backup_dir / 'plan_v03.md'
             assert sorted(child.name for child in backup_dir.iterdir()) == ['plan.md', 'plan_v02.md', 'plan_v03.md']
 
+    def test_followup_plan_backup_skips_original_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Plan\n', encoding='utf-8')
+
+            result = _backup_active_followup_plan(repo_root, original, original)
+
+            assert result is None
+            assert not (repo_root / 'plans' / 'backups').exists()
+
+    def test_followup_plan_backup_skips_missing_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+
+            result = _backup_active_followup_plan(repo_root, original, followup)
+
+            assert result is None
+            assert not (repo_root / 'plans' / 'backups').exists()
+
+    def test_followup_plan_backup_copies_nonoriginal_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Original plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+            followup_text = '# Generated follow-up\n'
+            followup.write_text(followup_text, encoding='utf-8')
+
+            backup_path = _backup_active_followup_plan(repo_root, original, followup)
+
+            expected = repo_root / 'plans' / 'backups' / 'plan-cp01-v01.md'
+            assert backup_path == expected
+            assert expected.read_text(encoding='utf-8') == followup_text
+            assert followup.is_file()
+            assert [child.name for child in expected.parent.iterdir()] == ['plan-cp01-v01.md']
+
+    def test_followup_plan_backup_dedupes_identical_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Original plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+            followup.write_text('# Generated follow-up\n', encoding='utf-8')
+            backup_dir = repo_root / 'plans' / 'backups'
+
+            first = _backup_active_followup_plan(repo_root, original, followup)
+            second = _backup_active_followup_plan(repo_root, original, followup)
+
+            assert first == backup_dir / 'plan-cp01-v01.md'
+            assert second == first
+            assert [child.name for child in backup_dir.iterdir()] == ['plan-cp01-v01.md']
+
+    def test_followup_plan_backup_versions_changed_content_and_preserves_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Original plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+            followup.write_text('first follow-up version\n', encoding='utf-8')
+            backup_dir = repo_root / 'plans' / 'backups'
+            backup_dir.mkdir(parents=True)
+            (backup_dir / 'operator-notes.txt').write_text('unrelated\n', encoding='utf-8')
+
+            first_backup = _backup_active_followup_plan(repo_root, original, followup)
+            assert first_backup == backup_dir / 'plan-cp01-v01.md'
+
+            followup.write_text('second follow-up version\n', encoding='utf-8')
+            second_backup = _backup_active_followup_plan(repo_root, original, followup)
+            assert second_backup == backup_dir / 'plan-cp01-v01_v02.md'
+
+            assert (backup_dir / 'plan-cp01-v01.md').read_text(encoding='utf-8') == 'first follow-up version\n'
+            assert (backup_dir / 'plan-cp01-v01_v02.md').read_text(encoding='utf-8') == 'second follow-up version\n'
+            assert (backup_dir / 'operator-notes.txt').read_text(encoding='utf-8') == 'unrelated\n'
+            assert sorted(child.name for child in backup_dir.iterdir()) == [
+                'operator-notes.txt', 'plan-cp01-v01.md', 'plan-cp01-v01_v02.md',
+            ]
+
     def test_condition_parsing_simple_symbols(self) -> None:
         assert evaluate_condition('DONE', done=True, new_plan_exists=False, max_turns_reached=False)
         assert not evaluate_condition('DONE', done=False, new_plan_exists=False, max_turns_reached=False)
@@ -2700,6 +2791,109 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 str(plan_path),
                 str((repo_root / 'plan-fix-cp01-v01.md').resolve()),
             ]
+
+    def test_followup_plan_backup_exists_before_harness_and_dedupes_across_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            config_dir = repo_root
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+            followup_path = repo_root / 'plan-fix-cp01-v01.md'
+            followup_text = '# Generated follow-up\n'
+            backup_dir = repo_root / 'plans' / 'backups'
+            turn_counter = [0]
+
+            def capturing_runner(argv, **kwargs):
+                turn_counter[0] += 1
+                if turn_counter[0] == 1:
+                    followup_path.write_text(followup_text, encoding='utf-8')
+                elif turn_counter[0] == 2:
+                    followup_backup = backup_dir / 'plan-fix-cp01-v01.md'
+                    assert followup_backup.is_file()
+                    assert followup_backup.read_text(encoding='utf-8') == followup_text
+                else:
+                    assert sorted(child.name for child in backup_dir.iterdir()) == [
+                        'plan-fix-cp01-v01.md', 'plan.md',
+                    ]
+                    _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
+                return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
+
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})},
+                workflows={'loop': WorkflowConfig(
+                    steps={
+                        'review': WorkflowStepConfig(
+                            role='architect',
+                            prompts=('review_prompt',),
+                            go=(GoTransition(to='followup', when='NEW_PLAN_EXISTS'), GoTransition(to='END')),
+                        ),
+                        'followup': WorkflowStepConfig(
+                            role='architect',
+                            prompts=('followup_prompt',),
+                            go=(GoTransition(to='followup', when='!DONE', preserve_active_plan=True), GoTransition(to='END')),
+                        ),
+                    },
+                    first_step='review',
+                )},
+                prompts={
+                    'review_prompt': 'Review. Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.',
+                    'followup_prompt': 'Follow up. Active: {ACTIVE_PLAN_PATH}.',
+                },
+            )
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                wf_config,
+                'loop',
+                config_dir=config_dir,
+                adapter=CodexAdapter(),
+                runner=capturing_runner,
+            )
+
+            assert result.turns_completed == 3
+            assert sorted(child.name for child in backup_dir.iterdir()) == [
+                'plan-fix-cp01-v01.md', 'plan.md',
+            ]
+            assert followup_path.is_file()
+
+    def test_original_active_plan_turns_do_not_add_followup_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            config_dir = repo_root
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+            backup_dir = repo_root / 'plans' / 'backups'
+
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})},
+                workflows={'simple': WorkflowConfig(
+                    steps={'implement_plan': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('p',),
+                        go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')),
+                    )},
+                    first_step='implement_plan',
+                )},
+                prompts={'p': 'Work.'},
+            )
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                wf_config,
+                'simple',
+                config_dir=config_dir,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.turns_completed == 1
+            assert [child.name for child in backup_dir.iterdir()] == ['plan.md']
 
     def test_workflow_multistep_review_and_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
