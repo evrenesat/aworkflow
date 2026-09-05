@@ -190,9 +190,20 @@ def _validate_current_branch_continuation(
     request: StartupRequest,
     parsed_plan: object,
     *,
+    workflow_name: str,
     has_completed_checkpoint: bool,
 ) -> tuple[str, str]:
     """Validate the exact branch and HEAD boundary for continuation."""
+    workflow = request.workflow_config.workflows[workflow_name]
+    if (
+        tuple(workflow.setup or ()) != ("worktree", "branch")
+        or tuple(workflow.teardown or ()) != ("merge", "rm_worktree")
+    ):
+        raise StartupError(
+            "current-branch continuation requires lifecycle setup "
+            "[worktree, branch] and teardown [merge, rm_worktree]"
+        )
+
     branch_result = subprocess.run(
         ["git", "symbolic-ref", "--short", "HEAD"],
         cwd=str(request.repo_root),
@@ -448,6 +459,7 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         ) = _validate_current_branch_continuation(
             request,
             parsed_plan,
+            workflow_name=workflow_name,
             has_completed_checkpoint=has_completed_checkpoint,
         )
 

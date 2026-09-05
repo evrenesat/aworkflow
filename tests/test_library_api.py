@@ -333,6 +333,61 @@ class LibraryStartupTests(unittest.TestCase):
         self.assertEqual(result.continuation_from_head, current_head)
         self.assertEqual(result.continuation_mode, "current_branch")
 
+    def test_prepare_startup_current_branch_continuation_requires_worktree_merge_lifecycle(self) -> None:
+        request = self._continuation_request(plan_branch="accepted")
+        workflow = request.workflow_config.workflows["test"]
+        invalid_config = replace(
+            request.workflow_config,
+            workflows={
+                **request.workflow_config.workflows,
+                "test": replace(workflow, setup=(), teardown=()),
+            },
+        )
+
+        with self.assertRaises(StartupError) as raised:
+            prepare_startup(replace(request, workflow_config=invalid_config))
+
+        self.assertIn("requires lifecycle setup", str(raised.exception))
+
+    def test_execute_workflow_rejects_current_branch_head_change_before_allocation(self) -> None:
+        from aflow.api import execute_workflow
+        from aflow.workflow import WorkflowError
+
+        request = self._continuation_request(plan_branch="accepted")
+        prepared = prepare_startup(request)
+        self.assertIsInstance(prepared, PreparedRun)
+        assert isinstance(prepared, PreparedRun)
+
+        request.plan_path.write_text(
+            request.plan_path.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", str(request.plan_path)],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "move accepted head"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+
+        runner_calls: list[int] = []
+
+        def unexpected_runner(*args, **kwargs):
+            runner_calls.append(1)
+            self.fail("worker runner was called")
+
+        with self.assertRaises(WorkflowError) as raised:
+            execute_workflow(prepared, runner=unexpected_runner)
+
+        self.assertIn("HEAD changed after preparation", str(raised.exception))
+        self.assertEqual(runner_calls, [])
+        self.assertFalse((self.repo_root / ".aflow").exists())
+
     def test_prepare_startup_current_branch_continuation_rejects_boundaries(self) -> None:
         cases = (
             ("branch mismatch", {"plan_branch": "wrong"}, "Plan Branch mismatch"),

@@ -4611,6 +4611,49 @@ def _lifecycle_is_bootstrap_eligible(wf: WorkflowConfig, repo_state: RepoState) 
     return bool(wf.setup) and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN)
 
 
+def _validate_current_branch_execution(
+    repo_root: Path,
+    wf: WorkflowConfig,
+    *,
+    continuation_from_branch: str | None,
+    continuation_from_head: str | None,
+    continuation_mode: str | None,
+) -> None:
+    """Revalidate a newly prepared current-branch continuation before allocation."""
+    if continuation_mode != "current_branch":
+        return
+    if not continuation_from_branch or not continuation_from_head:
+        raise WorkflowError(
+            "current-branch continuation requires a recorded branch and HEAD"
+        )
+    if (
+        tuple(wf.setup or ()) != ("worktree", "branch")
+        or tuple(wf.teardown or ()) != ("merge", "rm_worktree")
+    ):
+        raise WorkflowError(
+            "current-branch continuation requires lifecycle setup "
+            "[worktree, branch] and teardown [merge, rm_worktree]"
+        )
+
+    rc, current_branch, branch_error = _run_git(
+        ["symbolic-ref", "--short", "HEAD"], cwd=repo_root
+    )
+    if rc != 0 or current_branch.strip() != continuation_from_branch:
+        raise WorkflowError(
+            "current-branch continuation branch changed after preparation: "
+            f"expected '{continuation_from_branch}', got "
+            f"'{current_branch.strip() or branch_error or 'detached HEAD'}'"
+        )
+
+    rc, current_head, head_error = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
+    if rc != 0 or current_head.strip() != continuation_from_head:
+        raise WorkflowError(
+            "current-branch continuation HEAD changed after preparation: "
+            f"expected '{continuation_from_head}', got "
+            f"'{current_head.strip() or head_error or 'unresolvable HEAD'}'"
+        )
+
+
 _SKIP_SECTION_HEADING_RE = re.compile(
     r"^## (Git Tracking|Done Means|Critical Invariants|Forbidden)"
 )
@@ -5522,6 +5565,15 @@ def run_workflow(
             )
         if resume.resume_team_override is not None:
             config = replace(config, team=resume.resume_team_override)
+
+    if resume is None:
+        _validate_current_branch_execution(
+            config.repo_root,
+            wf,
+            continuation_from_branch=continuation_from_branch,
+            continuation_from_head=continuation_from_head,
+            continuation_mode=continuation_mode,
+        )
 
     original_plan_path = config.plan_path
     repo_state = probe_repo_state(config.repo_root)
