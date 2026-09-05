@@ -4,7 +4,7 @@ import { readinessClass, readinessLabel } from './readiness'
 import { ProjectPicker } from './components/ProjectPicker'
 import { ConfigEditor } from './components/ConfigEditor'
 import { PlanPanel } from './components/PlanPanel'
-import { RunDashboard } from './components/RunDashboard'
+import { RunDashboard, type PendingSuccessorStart } from './components/RunDashboard'
 import * as api from './api'
 
 type View = 'projects' | 'configuration' | 'plans' | 'runs'
@@ -37,6 +37,7 @@ export function App() {
   const [planDirty, setPlanDirty] = useState(false)
   const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
+  const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
 
   useEffect(() => {
     const token = api.getAuthToken()
@@ -45,6 +46,17 @@ export function App() {
       setIsAuthenticated(true)
     }
   }, [])
+
+
+  useEffect(() => {
+    if (!pendingSuccessorStart) return
+    const preventSilentExit = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', preventSilentExit)
+    return () => window.removeEventListener('beforeunload', preventSilentExit)
+  }, [pendingSuccessorStart])
 
   const loadProjects = useCallback(async () => {
     try {
@@ -80,6 +92,7 @@ export function App() {
     setPlanDirty(false)
     setPendingAction(null)
     setRunDashboardPlanPath(null)
+    setPendingSuccessorStart(null)
   }
 
   /**
@@ -209,6 +222,16 @@ export function App() {
         ))}
       </nav>
 
+      {pendingSuccessorStart && view !== 'runs' && (
+        <div className="notice" role="status">
+          A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
+          <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
+            setSelectedProjectId(pendingSuccessorStart.projectId)
+            setView('runs')
+          })}>Resolve pending successor</button>
+        </div>
+      )}
+
       {pendingAction && (
         <div className="card unsaved-guard" role="alertdialog" aria-label="Unsaved editor edits">
           <span className="text-sm">
@@ -286,6 +309,8 @@ export function App() {
                 initialProjectRoot={selectedProject.current_path}
                 initialPlanPath={runDashboardPlanPath}
                 onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
+                pendingSuccessorStart={pendingSuccessorStart}
+                onPendingSuccessorStartChange={setPendingSuccessorStart}
               />
             )}
           </div>

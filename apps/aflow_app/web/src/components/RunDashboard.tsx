@@ -30,6 +30,8 @@ interface RunDashboardProps {
   onInitialPlanHandled: () => void
   /** Test-only override; production callers retain the bounded 1s–30poll wait. */
   restartPollIntervalMs?: number
+  pendingSuccessorStart?: PendingSuccessorStart | null
+  onPendingSuccessorStartChange?: (pending: PendingSuccessorStart | null) => void
 }
 
 function requestKey(prefix: string): string {
@@ -268,7 +270,7 @@ function parseElapsedFrom(iso: string | undefined, nowMs: number): string | null
 
 type RestartPhase = 'confirming' | 'stopping' | 'waiting' | 'starting' | 'failed' | 'unknown'
 
-interface PendingSuccessorStart {
+export interface PendingSuccessorStart {
   projectId: string
   sourceRunId: string
   request: StartRunRequest
@@ -280,7 +282,7 @@ function workflowSteps(capabilities: ControlPlaneCapabilities | null, workflow: 
   return capabilities.workflow_details?.[workflow]?.executable_steps ?? []
 }
 
-export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs }: RunDashboardProps) {
+export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange }: RunDashboardProps) {
   const [projects, setProjects] = useState<ControlPlaneProject[]>([])
   const [projectId, setProjectId] = useState<string | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
@@ -314,7 +316,12 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   const [confirmResume, setConfirmResume] = useState(false)
   const [restartPhase, setRestartPhase] = useState<RestartPhase | null>(null)
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
-  const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
+  const [localPendingSuccessor, setLocalPendingSuccessor] = useState<PendingSuccessorStart | null>(null)
+  const pendingSuccessorStart = suppliedPendingSuccessor === undefined ? localPendingSuccessor : suppliedPendingSuccessor
+  const setPendingSuccessorStart = useCallback((pending: PendingSuccessorStart | null) => {
+    setLocalPendingSuccessor(pending)
+    onPendingSuccessorStartChange?.(pending)
+  }, [onPendingSuccessorStartChange])
   const [elapsedNow, setElapsedNow] = useState(() => Date.now())
   const selectedRunRef = useRef<string | null>(null)
   const controlsForRunRef = useRef<string | null>(null)
@@ -380,10 +387,11 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     setRoleSelectors({})
     setConfirmOwnerStop(false)
     setConfirmResume(false)
-    setRestartPhase(null)
-    setRestartNotice(null)
-    setPendingSuccessorStart(null)
-  }, [selectedRun])
+    if (!pendingSuccessorStart) {
+      setRestartPhase(null)
+      setRestartNotice(null)
+    }
+  }, [selectedRun, pendingSuccessorStart])
 
   // A live elapsed clock only ticks while a nonterminal owned run is selected.
   useEffect(() => {
@@ -580,13 +588,14 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     }
   }
 
-  async function handleStartResponse(response: StartRunResponse, action: string) {
+  async function handleStartResponse(response: StartRunResponse, action: string, responseProjectId = projectId) {
+    if (responseProjectId) setProjectId(responseProjectId)
     if (response.startup_question) {
       setStartupQuestion(response.startup_question)
       setFeedback(`${action} is awaiting a startup answer. No workflow has been started.`)
       return
     }
-    if (!response.result || !projectId) return
+    if (!response.result || !responseProjectId) return
     const result = response.result
     setStartupQuestion(null)
     const lineage = result.restarted_from_run_id
@@ -595,7 +604,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     setFeedback(result.created
       ? `${action} created run ${result.run_id}.${lineage}`
       : `${action} replay returned existing run ${result.run_id}; no duplicate was created.`)
-    await loadDashboard(projectId)
+    await loadDashboard(responseProjectId)
     setSelectedRunId(result.run_id)
   }
 
@@ -748,7 +757,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
       setPendingSuccessorStart(null)
       setRestartPhase(null)
       setRestartNotice(null)
-      await handleStartResponse(response, 'Successor retry')
+      await handleStartResponse(response, 'Successor retry', successorProjectId)
     } catch (restartError) {
       if (successorStartWasRejected(restartError)) {
         clearPendingWriteKey('start', { project_id: successorProjectId, ...request })
@@ -861,7 +870,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
       ? null
       : 'Select a successor workflow and plan in the start form to enable a guided restart of this run.'
   const restartInProgress = restartPhase === 'stopping' || restartPhase === 'waiting' || restartPhase === 'starting'
-  const successorOutcomeUnknown = restartPhase === 'unknown' && pendingSuccessorStart !== null
+  const successorOutcomeUnknown = pendingSuccessorStart !== null && restartPhase !== 'starting'
   const restartDraftFrozen = pendingSuccessorStart !== null
   const restartPendingConfirmation = restartPhase === 'confirming'
   const runSteps = workflowSteps(capabilities, startWorkflow.trim())
@@ -906,6 +915,12 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
 
       {error && <div className="error-message">{error}</div>}
       {feedback && <div className="success-message">{feedback}</div>}
+      {successorOutcomeUnknown && pendingSuccessorStart && (
+        <div className="notice" role="alert">
+          The successor request for {pendingSuccessorStart.sourceRunId} in {pendingSuccessorStart.projectId} is frozen while its outcome is unknown. Do not start a changed replacement.
+          <div className="dashboard-actions"><button className="btn btn-primary" disabled={restartInProgress} onClick={() => void retryPendingSuccessorStart()}>Retry exact successor request</button></div>
+        </div>
+      )}
 
       <label className="dashboard-field">
         <span>Control-plane project</span>
@@ -1033,12 +1048,6 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
             {selectedRun.status === 'needs_attention' && <div className="notice">This run needs attention. A disconnected dashboard did not stop it; explicit resume is required when safe.</div>}
             {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
             {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
-            {successorOutcomeUnknown && pendingSuccessorStart?.sourceRunId === selectedRun.run_id && (
-              <div className="notice" role="alert">
-                The successor request is frozen while its outcome is unknown. Do not start a changed replacement.
-                <div className="dashboard-actions"><button className="btn btn-primary" disabled={restartInProgress} onClick={() => void retryPendingSuccessorStart()}>Retry exact successor request</button></div>
-              </div>
-            )}
 
             <dl className="run-metadata">
               <div><dt>Ownership</dt><dd>{selectedRun.ownership}</dd></div>

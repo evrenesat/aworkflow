@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
 import { RunDashboard } from './RunDashboard'
+import { App } from '../App'
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
@@ -342,7 +343,7 @@ describe('RunDashboard', () => {
     expect(screen.getByText(/records run-owned as its restart source/)).toBeDefined()
   })
 
-  it('retries an unknown successor outcome with the frozen request and no second owner stop', async () => {
+  it('preserves exact successor recovery across run selection and workspace remount', async () => {
     const stopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
     vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue(stopped)
     vi.mocked(api.getControlPlaneRun).mockResolvedValueOnce(ownedRun).mockResolvedValue(stopped)
@@ -352,7 +353,20 @@ describe('RunDashboard', () => {
         result: { run_id: 'run-successor', created: false, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: 'run-owned' },
         startup_question: null,
       })
-    renderDashboard({ restartPollIntervalMs: 1 })
+    const otherRun = { ...ownedRun, run_id: 'run-other', status: 'completed' }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun, otherRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-other'
+      ? otherRun
+      : api.ownerStopControlPlaneRun.mock.calls.length ? stopped : ownedRun)
+    vi.spyOn(api, 'getAuthToken').mockReturnValue('test-token')
+    vi.spyOn(api, 'listProjects').mockResolvedValue([{
+      id: project.project_id, display_name: 'Alpha', current_path: project.root,
+      is_git_root: true, registered_at: '2026-01-01T00:00:00Z', readiness: 'ready',
+    }])
+    render(<App />)
+    fireEvent.click(await screen.findByText('Alpha'))
+    fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
+
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
     fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
@@ -363,9 +377,20 @@ describe('RunDashboard', () => {
     await screen.findByText(/Successor outcome is unknown/)
     expect(screen.getByLabelText('Run workflow').getAttribute('disabled')).not.toBeNull()
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /run-other completed/ }))
+    await screen.findByRole('heading', { name: 'Run run-other' })
+    expect(screen.getByRole('button', { name: 'Retry exact successor request' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
+    await screen.findByText(/Its exact request remains preserved/)
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve pending successor' }))
+    await screen.findByRole('button', { name: 'Retry exact successor request' })
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
 
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(api.startControlPlaneRun.mock.calls[1][0]).toBe(api.startControlPlaneRun.mock.calls[0][0])
     expect(api.startControlPlaneRun.mock.calls[1][1]).toEqual(api.startControlPlaneRun.mock.calls[0][1])
     expect(api.startControlPlaneRun.mock.calls[1][2]).toBe(api.startControlPlaneRun.mock.calls[0][2])
     expect(api.ownerStopControlPlaneRun).toHaveBeenCalledTimes(1)

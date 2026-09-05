@@ -42,6 +42,10 @@
 
 # DEVLOG
 
+## 2026-09-06 - Retain uncertain successor recovery across navigation
+
+- Keep the exact pending successor request in the workspace shell until the server resolves it. Inspecting another run or switching views preserves the original project, request and idempotency key, with a visible route back to recovery.
+
 ## 2026-09-06 - Stop daemon-owned runs before unit startup
 
 - The daemon owner-stop path now creates the standard run artifact directory
