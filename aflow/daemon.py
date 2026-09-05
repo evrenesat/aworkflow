@@ -1418,6 +1418,7 @@ class DaemonService:
             prepared_payload,
             repo_root=self._config.repo_root,
             config_path=self._config.config_path,
+            extra_instructions=self._transient_extra_instructions.get(run_id, ()),
         )
         prepared = replace(
             prepared,

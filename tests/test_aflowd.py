@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+import json
 import subprocess
 from threading import Event
 
@@ -723,6 +724,72 @@ def test_daemon_typed_start_persists_canonical_step_and_redacted_instruction_dig
     assert sentinel not in launch.read_text()
     assert sentinel not in record.read_text()
     assert sentinel not in events.read_text()
+
+
+def test_daemon_exact_retry_restores_transient_instructions_after_prepared_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    sentinel = "private-retry-guidance-7c31"
+    request = replace(request, extra_instructions=(sentinel,))
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+
+    def crash_after_prepare(record, _prepared, *, created):
+        assert created is True
+        assert record["state"] == "prepared"
+        raise RuntimeError("synthetic pre-unit crash")
+
+    monkeypatch.setattr(
+        daemon.service,
+        "_launch_prepared_locked",
+        crash_after_prepare,
+    )
+    with pytest.raises(RuntimeError, match="synthetic pre-unit crash"):
+        daemon.service.start(
+            request,
+            caller_scope="project:one",
+            idempotency_key="prepared-retry",
+        )
+
+    records = list(
+        (request.repo_root / ".aflow" / "start-requests").glob("*.json")
+    )
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert record["state"] == "prepared"
+    run_id = record["run_id"]
+    assert sentinel not in records[0].read_text()
+    launch_path = (
+        request.repo_root / ".aflow" / "launches" / f"{run_id}.json"
+    )
+    assert sentinel not in launch_path.read_text()
+
+    fresh = AflowDaemon(daemon.service._config, units=units)
+    fresh.start()
+    with pytest.raises(DaemonIdempotencyConflict):
+        fresh.service.start(
+            replace(request, extra_instructions=("different guidance",)),
+            caller_scope="project:one",
+            idempotency_key="prepared-retry",
+        )
+
+    retried = fresh.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="prepared-retry",
+    )
+
+    assert retried.run_id == run_id
+    assert retried.created is False
+    assert retried.status == "running"
+    assert units.start_calls[-1][1][-1] == f"--extra-instruction={sentinel}"
+    events_path = (
+        request.repo_root / ".aflow" / "runs" / run_id / "events.jsonl"
+    )
+    assert sentinel not in records[0].read_text()
+    assert sentinel not in launch_path.read_text()
+    assert sentinel not in events_path.read_text()
 
 
 def test_daemon_rejects_excluded_step_before_reserving_run(
