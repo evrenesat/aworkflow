@@ -168,6 +168,238 @@ class LibraryStartupTests(unittest.TestCase):
 
         self.assertIsInstance(result, PreparedRun)
 
+    def _continuation_request(
+        self,
+        *,
+        plan_branch: str,
+        base_head: str | None = None,
+        with_completed_checkpoint: bool = True,
+        complete: bool = False,
+        detached: bool = False,
+    ) -> StartupRequest:
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "core.excludesFile", "/dev/null"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        for key, value in (("user.email", "test@test.com"), ("user.name", "Test")):
+            subprocess.run(
+                ["git", "config", key, value],
+                cwd=self.repo_root,
+                check=True,
+                capture_output=True,
+            )
+        readme = self.repo_root / "README.md"
+        readme.write_text("test\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "accepted"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        first_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        first_marker = "x" if with_completed_checkpoint else " "
+        second_marker = "x" if complete else " "
+        tick = chr(96)
+        plan_path = self.repo_root / "plans" / "in-progress" / "plan.md"
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text(
+            textwrap.dedent(
+                f"""\
+                # Plan
+
+                ## Git Tracking
+
+                - Plan Branch: {tick}{plan_branch}{tick}
+                - Pre-Handoff Base HEAD: {tick}{first_head}{tick}
+
+                ### [{first_marker}] Checkpoint 1: Done
+                - [{first_marker}] step one
+
+                ### [{second_marker}] Checkpoint 2: Next
+                - [{second_marker}] step two
+                """
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", str(plan_path)],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "add plan"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+        )
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if base_head is not None:
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8").replace(
+                    first_head, base_head
+                ),
+                encoding="utf-8",
+            )
+        else:
+            plan_path.write_text(
+                plan_path.read_text(encoding="utf-8").replace(
+                    first_head, current_head
+                ),
+                encoding="utf-8",
+            )
+        if detached:
+            subprocess.run(
+                ["git", "checkout", "--detach", "HEAD"],
+                cwd=self.repo_root,
+                check=True,
+                capture_output=True,
+            )
+        config_path = _write_config(
+            self.home_dir,
+            (
+                '[aflow]\ndefault_workflow = "test"\nteam_lead = "architect"\n\n'
+                '[workflow.test]\nsetup = ["worktree", "branch"]\n'
+                'teardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n\n'
+                '[workflow.test.steps.step1]\nrole = "architect"\n'
+                'prompts = ["p"]\ngo = [{to = "END"}]\n\n'
+                '[harness.opencode.profiles.default]\nmodel = "m"\n\n'
+                '[roles]\narchitect = "opencode.default"\n\n'
+                '[prompts]\np = "do it"\n'
+            ),
+        )
+        workflow_config = load_workflow_config(config_path)
+        return StartupRequest(
+            repo_root=self.repo_root,
+            plan_path=plan_path,
+            config_path=config_path,
+            workflow_config=workflow_config,
+            workflow_name="test",
+            start_step=None,
+            max_turns=None,
+            team=None,
+            extra_instructions=(),
+            dirty_worktree_confirmed=True,
+            continue_from_current=True,
+        )
+
+    def test_prepare_startup_current_branch_continuation_records_identity(self) -> None:
+        request = self._continuation_request(plan_branch="accepted")
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        result = prepare_startup(request)
+
+        self.assertIsInstance(result, PreparedRun)
+        assert isinstance(result, PreparedRun)
+        self.assertEqual(result.continuation_from_branch, "accepted")
+        self.assertEqual(result.continuation_from_head, current_head)
+        self.assertEqual(result.continuation_mode, "current_branch")
+
+    def test_prepare_startup_current_branch_continuation_rejects_boundaries(self) -> None:
+        cases = (
+            ("branch mismatch", {"plan_branch": "wrong"}, "Plan Branch mismatch"),
+            ("blank base", {"base_head": ""}, "Pre-Handoff Base HEAD"),
+            (
+                "pristine plan",
+                {"with_completed_checkpoint": False},
+                "at least one completed and one unchecked checkpoint",
+            ),
+            (
+                "complete plan",
+                {"complete": True},
+                "at least one completed and one unchecked checkpoint",
+            ),
+            ("detached HEAD", {"detached": True}, "detached HEAD"),
+            ("resume combination", {"resume_requested": True}, "combined with resume"),
+        )
+        for name, overrides, message in cases:
+            with self.subTest(name=name):
+                self.temp_dir.cleanup()
+                self.temp_dir = tempfile.TemporaryDirectory()
+                self.home_dir = Path(self.temp_dir.name)
+                self.repo_root = self.home_dir / "repo"
+                self.repo_root.mkdir()
+                request = self._continuation_request(
+                    plan_branch=overrides.get("plan_branch", "accepted"),
+                    base_head=overrides.get("base_head"),
+                    with_completed_checkpoint=overrides.get(
+                        "with_completed_checkpoint", True
+                    ),
+                    complete=overrides.get("complete", False),
+                    detached=overrides.get("detached", False),
+                )
+                if overrides.get("resume_requested"):
+                    request = replace(request, resume_requested=True)
+                with self.assertRaises(StartupError) as raised:
+                    prepare_startup(request)
+                self.assertIn(message, str(raised.exception))
+
+    def test_prepare_startup_current_branch_continuation_rejects_non_plan_dirt(self) -> None:
+        request = self._continuation_request(plan_branch="accepted")
+        (self.repo_root / "unrelated.txt").write_text("outside plan\n", encoding="utf-8")
+
+        with self.assertRaises(StartupError) as raised:
+            prepare_startup(request)
+
+        self.assertIn("non-plan dirtiness", str(raised.exception))
+
+    def test_prepare_startup_current_branch_continuation_rejects_git_operation(self) -> None:
+        request = self._continuation_request(plan_branch="accepted")
+        git_dir = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_dir_path = Path(git_dir)
+        if not git_dir_path.is_absolute():
+            git_dir_path = self.repo_root / git_dir_path
+        (git_dir_path / "MERGE_HEAD").write_text("in-progress\n", encoding="utf-8")
+
+        with self.assertRaises(StartupError) as raised:
+            prepare_startup(request)
+
+        self.assertIn("in-progress Git operation", str(raised.exception))
+
     def test_prepare_startup_requires_valid_workflow(self) -> None:
         config_text = (
             '[aflow]\ndefault_workflow = "test"\n\n'

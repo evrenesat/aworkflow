@@ -3399,6 +3399,7 @@ p = "do it"
         assert '--start-step/-ss' in RUN_HELP
         assert '--team/-t' in RUN_HELP
         assert '--max-turns/-mt' in RUN_HELP
+        assert '--continue-from-current' in RUN_HELP
 
 
 class WorkflowStartupFlowTests(unittest.TestCase):
@@ -3449,6 +3450,81 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 f'impl_prompt = "{implementation_prompt}"\n'
             ),
         )
+
+    def test_cli_continue_from_current_flag_and_resume_mutual_exclusion(self) -> None:
+        parsed = build_parser().parse_args(
+            ["run", "--continue-from-current", "plan.md"]
+        )
+        assert parsed.continue_from_current is True
+
+        import io
+
+        stderr_capture = io.StringIO()
+        with patch("sys.stderr", stderr_capture):
+            result = main(
+                ["run", "--continue-from-current", "--resume", "run-id"]
+            )
+        assert result == 1
+        assert "cannot be combined" in stderr_capture.getvalue()
+
+    def test_cli_continue_from_current_routes_startup_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home_dir = root / "home"
+            home_dir.mkdir()
+            self._write_workflow_config(
+                home_dir,
+                workflow_name="single_step",
+                multi_step=False,
+            )
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+            )
+            plan_path = root / "plan.md"
+            plan_path.write_text("# Plan\n\n### [ ] Checkpoint 1: Next\n- [ ] step\n")
+            captured: list[StartupRequest] = []
+            prepared = PreparedRun(
+                workflow_name="single_step",
+                repo_root=root,
+                plan_path=plan_path,
+                config_path=home_dir / ".config" / "aflow" / "aflow.toml",
+                max_turns=1,
+                team=None,
+                extra_instructions=(),
+                start_step="implement_plan",
+                continuation_from_branch="accepted",
+                continuation_from_head="a" * 40,
+                continuation_mode="current_branch",
+            )
+            env = _workflow_test_env(
+                root,
+                scenario="complete",
+                plan_path=plan_path,
+                count_file=root / "count.txt",
+                home_dir=home_dir,
+            )
+            original_cwd = Path.cwd()
+            try:
+                with patch.dict(os.environ, env, clear=True), patch(
+                    "aflow.cli._handle_startup_questions",
+                    side_effect=lambda request: (captured.append(request) or prepared),
+                ), patch(
+                    "aflow.cli._detect_resume_candidate",
+                    side_effect=AssertionError("continuation must not detect resume"),
+                ), patch(
+                    "aflow.cli.execute_workflow",
+                    return_value=Mock(turns_completed=0, end_reason="transition_end"),
+                ):
+                    os.chdir(root)
+                    result = main(["run", "--continue-from-current", str(plan_path)])
+            finally:
+                os.chdir(original_cwd)
+            assert result == 0
+            assert len(captured) == 1
+            assert captured[0].continue_from_current is True
 
     def test_pick_workflow_step_reprompts_on_invalid_input(self) -> None:
         steps = {

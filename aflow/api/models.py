@@ -51,6 +51,7 @@ class StartupRequest:
     reserved_run_id: str | None = None
     idempotency_key: str | None = None
     caller_scope: str | None = None
+    continue_from_current: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,9 @@ class PreparedRun:
     reserved_run_id: str | None = None
     idempotency_key: str | None = None
     caller_scope: str | None = None
+    continuation_from_branch: str | None = None
+    continuation_from_head: str | None = None
+    continuation_mode: str | None = None
 
 
 # Re-export shared, versioned control-plane models through the public API.

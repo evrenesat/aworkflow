@@ -32,6 +32,9 @@ class FrozenRunIdentity:
     workflow_name: str
     config_path: str
     config_fingerprint: str
+    continuation_from_branch: str | None = None
+    continuation_from_head: str | None = None
+    continuation_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -347,6 +350,9 @@ class ControllerConfig:
     reserved_run_id: str | None = None
     idempotency_key: str | None = None
     caller_scope: str | None = None
+    continuation_from_branch: str | None = None
+    continuation_from_head: str | None = None
+    continuation_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -697,6 +703,9 @@ class ResumeContext:
     # Pending repartition artifacts are copied before create_run_paths may
     # prune the source run (notably with keep_runs = 1).
     repartition_artifact_bytes: Mapping[str, bytes] = field(default_factory=dict)
+    continuation_from_branch: str | None = None
+    continuation_from_head: str | None = None
+    continuation_mode: str | None = None
 
 
 @dataclass

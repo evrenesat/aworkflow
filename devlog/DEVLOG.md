@@ -1,3 +1,13 @@
+# 2026-09-05 — Accepted-branch continuation
+
+- Added explicit `--continue-from-current` startup validation for symbolic
+  branch identity, exact Git Tracking Plan Branch and Pre-Handoff Base HEAD,
+  and partially completed plans.
+- Reused the normal nested lifecycle with the validated branch as the effective
+  main branch, persisting continuation identity in `run.json` and frozen state.
+- Preserved strict schema-v2 resume validation and kept continuation out of
+  historical run lookup.
+
 # 2026-08-31 — Supported harness profile refresh
 
 - Restricted the packaged AFlow configuration to the seven actively supported

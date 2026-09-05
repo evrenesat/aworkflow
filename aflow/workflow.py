@@ -1913,6 +1913,9 @@ def _freeze_run_identity(
     workflow_config: WorkflowUserConfig,
     *,
     config_dir: Path,
+    continuation_from_branch: str | None = None,
+    continuation_from_head: str | None = None,
+    continuation_mode: str | None = None,
 ) -> FrozenRunIdentity:
     """Fingerprint the resolved in-memory inputs used to execute one workflow."""
     selected = {
@@ -1936,6 +1939,9 @@ def _freeze_run_identity(
         workflow_name=workflow_name,
         config_path=str(config_dir.resolve()),
         config_fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        continuation_from_branch=continuation_from_branch,
+        continuation_from_head=continuation_from_head,
+        continuation_mode=continuation_mode,
     )
 
 
@@ -1974,7 +1980,14 @@ def _frozen_identity_mismatch(
     """Describe the persisted identity fields that differ from current config."""
     differences = [
         f"{field} saved '{getattr(saved, field)}' but current '{getattr(current, field)}'"
-        for field in ("workflow_name", "config_path", "config_fingerprint")
+        for field in (
+            "workflow_name",
+            "config_path",
+            "config_fingerprint",
+            "continuation_from_branch",
+            "continuation_from_head",
+            "continuation_mode",
+        )
         if getattr(saved, field) != getattr(current, field)
     ]
     if not differences:
@@ -3848,6 +3861,7 @@ def _lifecycle_preflight(
     repo_state: RepoState,
     *,
     skip_phase_b: bool = False,
+    main_branch_override: str | None = None,
 ) -> _LifecyclePlan | None:
     setup = wf.setup or ()
     teardown = wf.teardown or ()
@@ -3862,7 +3876,7 @@ def _lifecycle_preflight(
         )
 
     # --- Phase A: git-independent validation ---
-    main_branch = wf.main_branch
+    main_branch = main_branch_override or wf.main_branch
     if not main_branch:
         raise WorkflowError(
             "workflow uses lifecycle setup but main_branch is not configured"
@@ -5241,10 +5255,21 @@ def run_workflow(
     if wf.first_step is None:
         raise WorkflowError(f"workflow '{workflow_name}' has no steps")
 
+    continuation_from_branch = config.continuation_from_branch
+    continuation_from_head = config.continuation_from_head
+    continuation_mode = config.continuation_mode
+    if resume is not None:
+        continuation_from_branch = resume.continuation_from_branch
+        continuation_from_head = resume.continuation_from_head
+        continuation_mode = resume.continuation_mode
+
     current_frozen_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
         config_dir=config_dir,
+        continuation_from_branch=continuation_from_branch,
+        continuation_from_head=continuation_from_head,
+        continuation_mode=continuation_mode,
     )
     if resume is not None and resume.frozen_run_identity is not None:
         identity_mismatch = _frozen_identity_mismatch(
@@ -5269,6 +5294,11 @@ def run_workflow(
             workflow_config.aflow,
             repo_state,
             skip_phase_b=needs_bootstrap,
+            main_branch_override=(
+                config.continuation_from_branch
+                if config.continuation_mode == "current_branch"
+                else None
+            ),
         )
 
     try:

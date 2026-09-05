@@ -279,6 +279,15 @@ stdout remains the durable detailed evidence.
 
 ## Module Breakdown
 
+Explicit current-branch continuation validates the symbolic current branch,
+the plan's exact Git Tracking Plan Branch and Pre-Handoff Base HEAD, and a
+partially completed checkpoint snapshot before lifecycle allocation. It uses
+the same nested worktree and teardown path as a fresh run, with the validated
+branch as the effective lifecycle main branch. Continuation identity is
+persisted in top-level run metadata and the frozen run identity; historical
+resume lookup is skipped, and strict existing resume validation remains
+unchanged.
+
 ### `cli.py`
 Entry point. Exposes three subcommands:
 - **`aflow run [plan_or_workflow ...] [-- extra instructions]`** -- runs a workflow.

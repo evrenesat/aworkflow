@@ -120,6 +120,7 @@ Flags:
   --max-turns/-mt N         Maximum turns (default from config).
   --run-id RUN_ID           Canonical pre-reserved run identity (advanced use).
   --resume [RUN_ID]         Resume a saved run; plan and identity are optional when omitted.
+  --continue-from-current   Start a nested run from the accepted current branch recorded in the plan.
 
 Positional arguments:
   [workflow_name] [plan_file]   Either form works:
@@ -136,6 +137,7 @@ Examples:
   aflow run ralph path/to/plan.md
   aflow run --workflow ralph --plan path/to/plan.md
   aflow run --plan path/to/plan.md --start-step my_step
+  aflow run --continue-from-current path/to/plan.md
   aflow run -mt 10 -ss 2 ralph plan.md
   aflow run plan.md -- keep edits small and update docs if behavior changes
 """
@@ -1101,7 +1103,7 @@ def _decode_frozen_run_identity(
             "expected a mapping for schema-versioned metadata",
         )
 
-    values: dict[str, str] = {}
+    values: dict[str, object] = {}
     for field_name in ("workflow_name", "config_path", "config_fingerprint"):
         value = frozen_value.get(field_name)
         if not isinstance(value, str) or not value.strip():
@@ -1109,6 +1111,21 @@ def _decode_frozen_run_identity(
                 run_id,
                 f"frozen_config.{field_name}",
                 "expected a non-empty string",
+            )
+        values[field_name] = value
+    for field_name in (
+        "continuation_from_branch",
+        "continuation_from_head",
+        "continuation_mode",
+    ):
+        value = frozen_value.get(field_name)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise _resume_metadata_error(
+                run_id,
+                f"frozen_config.{field_name}",
+                "expected a non-empty string or null",
             )
         values[field_name] = value
 
@@ -1203,6 +1220,9 @@ def _bootstrap_resume_invocation(
         workflow_name,
         workflow_config,
         config_dir=config_path or (repo_root / "aflow.toml"),
+        continuation_from_branch=frozen_run_identity.continuation_from_branch,
+        continuation_from_head=frozen_run_identity.continuation_from_head,
+        continuation_mode=frozen_run_identity.continuation_mode,
     )
     mismatch = _frozen_identity_mismatch(frozen_run_identity, current_identity)
     if mismatch is not None:
@@ -1727,6 +1747,24 @@ def _reconstruct_resume_context(
     raw_main_branch = prev_run.get("main_branch")
     lifecycle_setup = prev_run.get("lifecycle_setup", [])
     lifecycle_teardown = prev_run.get("lifecycle_teardown", [])
+    continuation_from_branch = prev_run.get("continuation_from_branch")
+    continuation_from_head = prev_run.get("continuation_from_head")
+    continuation_mode = prev_run.get("continuation_mode")
+    for field_name, value in (
+        ("continuation_from_branch", continuation_from_branch),
+        ("continuation_from_head", continuation_from_head),
+        ("continuation_mode", continuation_mode),
+    ):
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            if require_resume:
+                raise _resume_metadata_error(
+                    resolved_run_id,
+                    field_name,
+                    "expected a non-empty string or null",
+                )
+            return None
     if (
         not isinstance(lifecycle_setup, list)
         or not all(isinstance(item, str) for item in lifecycle_setup)
@@ -1883,6 +1921,21 @@ def _reconstruct_resume_context(
         main_branch=main_branch,
         setup=tuple(lifecycle_setup),
         teardown=tuple(lifecycle_teardown),
+        continuation_from_branch=(
+            continuation_from_branch
+            if isinstance(continuation_from_branch, str)
+            else None
+        ),
+        continuation_from_head=(
+            continuation_from_head
+            if isinstance(continuation_from_head, str)
+            else None
+        ),
+        continuation_mode=(
+            continuation_mode
+            if isinstance(continuation_mode, str)
+            else None
+        ),
         active_plan_path=(
             None
             if reset_scope
@@ -2154,6 +2207,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Resume a previous unfinished worktree run. With no RUN_ID, requires a resumable last run "
             "from the current shell context. With RUN_ID, resumes that exact run."
+        ),
+    )
+    run_parser.add_argument(
+        "--continue-from-current",
+        action="store_true",
+        help=(
+            "Start a new worktree run from the currently checked-out accepted "
+            "branch recorded in the plan. Cannot be combined with --resume."
         ),
     )
     run_parser.add_argument(
@@ -2849,6 +2910,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    if (
+        args.command == "run"
+        and args.continue_from_current
+        and (args.resume is not None or args.resume_reset_scope)
+    ):
+        print(
+            "error: --continue-from-current cannot be combined with any --resume option",
+            file=sys.stderr,
+        )
+        return 1
+
     config_path: Path | None = None
     if args.command in (None, "run", "show"):
         config_path, created_paths = _bootstrap_config_files()
@@ -2994,6 +3066,7 @@ def main(argv: list[str] | None = None) -> int:
         team=startup_team,
         extra_instructions=extra_instructions,
         resume_requested=require_resume,
+        continue_from_current=args.continue_from_current,
         reserved_run_id=args.run_id,
     )
 
@@ -3001,24 +3074,27 @@ def main(argv: list[str] | None = None) -> int:
     if prepared_run is None:
         return 1
 
-    try:
-        resume_ctx = _detect_resume_candidate(
-            repo_root=prepared_run.repo_root,
-            workflow_config=workflow_config.workflows[prepared_run.workflow_name],
-            workflow_name=prepared_run.workflow_name,
-            plan_path=prepared_run.plan_path,
-            team=prepared_run.team,
-            selected_start_step=prepared_run.start_step,
-            max_turns=prepared_run.max_turns,
-            extra_instructions=prepared_run.extra_instructions,
-            requested_run_id=requested_resume_run_id,
-            require_resume=require_resume,
-            reset_scope=args.resume_reset_scope,
-            resume_bootstrap=resume_bootstrap,
-        )
-    except ValueError as exc:
-        print(exc, file=sys.stderr)
-        return 1
+    if prepared_run.continuation_mode == "current_branch":
+        resume_ctx = None
+    else:
+        try:
+            resume_ctx = _detect_resume_candidate(
+                repo_root=prepared_run.repo_root,
+                workflow_config=workflow_config.workflows[prepared_run.workflow_name],
+                workflow_name=prepared_run.workflow_name,
+                plan_path=prepared_run.plan_path,
+                team=prepared_run.team,
+                selected_start_step=prepared_run.start_step,
+                max_turns=prepared_run.max_turns,
+                extra_instructions=prepared_run.extra_instructions,
+                requested_run_id=requested_resume_run_id,
+                require_resume=require_resume,
+                reset_scope=args.resume_reset_scope,
+                resume_bootstrap=resume_bootstrap,
+            )
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
 
     workflow_spec = workflow_config.workflows[prepared_run.workflow_name]
     workflow_graph_source = WorkflowGraphSource(

@@ -7,7 +7,12 @@ from pathlib import Path
 from dataclasses import replace
 
 from aflow.git_status import probe_worktree, classify_dirtiness_by_prefix
-from aflow.plan import PlanParseError, load_plan, load_plan_tolerant
+from aflow.plan import (
+    PlanParseError,
+    load_plan,
+    load_plan_tolerant,
+    parse_git_tracking_metadata,
+)
 from aflow.run_state import RetryContext
 from aflow.workflow import (
     _effective_retry_limit,
@@ -181,6 +186,105 @@ def _check_plan_completion(parsed_plan: object, request: StartupRequest) -> tupl
     return is_complete, has_completed_checkpoint
 
 
+def _validate_current_branch_continuation(
+    request: StartupRequest,
+    parsed_plan: object,
+    *,
+    has_completed_checkpoint: bool,
+) -> tuple[str, str]:
+    """Validate the exact branch and HEAD boundary for continuation."""
+    branch_result = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=str(request.repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    branch = branch_result.stdout.strip()
+    if branch_result.returncode != 0 or not branch:
+        raise StartupError(
+            "current-branch continuation requires a symbolic current branch; "
+            "detached HEAD is not accepted"
+        )
+
+    head_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(request.repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    current_head = head_result.stdout.strip()
+    if head_result.returncode != 0 or not current_head:
+        raise StartupError(
+            "current-branch continuation requires a resolvable full current HEAD"
+        )
+
+    git_dir_result = subprocess.run(
+        ["git", "rev-parse", "--git-dir"],
+        cwd=str(request.repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if git_dir_result.returncode == 0:
+        git_dir = Path(git_dir_result.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = request.repo_root / git_dir
+        in_progress_markers = (
+            "MERGE_HEAD",
+            "REBASE_HEAD",
+            "rebase-merge",
+            "rebase-apply",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "sequencer",
+        )
+        active_marker = next(
+            (marker for marker in in_progress_markers if (git_dir / marker).exists()),
+            None,
+        )
+        if active_marker is not None:
+            raise StartupError(
+                "current-branch continuation requires no in-progress Git operation "
+                f"({active_marker} exists)"
+            )
+
+    try:
+        metadata = parse_git_tracking_metadata(
+            request.plan_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise StartupError(str(exc)) from exc
+    if metadata is None or not metadata.plan_branch:
+        raise StartupError(
+            "current-branch continuation requires non-empty Git Tracking Plan Branch metadata"
+        )
+    if metadata.plan_branch != branch:
+        raise StartupError(
+            "current-branch continuation Plan Branch mismatch: "
+            f"plan records '{metadata.plan_branch}', current branch is '{branch}'"
+        )
+    if metadata.pre_handoff_base_head != current_head:
+        raise StartupError(
+            "current-branch continuation Pre-Handoff Base HEAD must equal the "
+            f"full current HEAD '{current_head}'"
+        )
+
+    snapshot = getattr(parsed_plan, "snapshot", None)
+    unchecked_checkpoint_count = getattr(snapshot, "unchecked_checkpoint_count", 0)
+    if (
+        not has_completed_checkpoint
+        or getattr(snapshot, "is_complete", False)
+        or not isinstance(unchecked_checkpoint_count, int)
+        or unchecked_checkpoint_count < 1
+    ):
+        raise StartupError(
+            "current-branch continuation requires at least one completed and one unchecked checkpoint"
+        )
+    return branch, current_head
+
+
 def _build_retry_context(
     workflow_name: str,
     selected_start_step: str,
@@ -305,6 +409,11 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
 
     Raises StartupError if startup cannot proceed due to configuration errors.
     """
+    if request.continue_from_current and request.resume_requested:
+        raise StartupError(
+            "current-branch continuation cannot be combined with resume"
+        )
+
     workflow_name = _resolve_workflow_name(request)
     _validate_start_step(workflow_name, request.start_step, request)
 
@@ -329,6 +438,18 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
     is_complete, has_completed_checkpoint = _check_plan_completion(parsed_plan, request)
     effective_max_turns = _resolve_effective_max_turns(request, workflow_name)
     effective_team = _resolve_effective_team(request, workflow_name)
+
+    continuation_from_branch: str | None = None
+    continuation_from_head: str | None = None
+    if request.continue_from_current:
+        (
+            continuation_from_branch,
+            continuation_from_head,
+        ) = _validate_current_branch_continuation(
+            request,
+            parsed_plan,
+            has_completed_checkpoint=has_completed_checkpoint,
+        )
 
     if is_complete:
         if resolved_start_step is not None and not request.resume_requested:
@@ -438,6 +559,11 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         reserved_run_id=request.reserved_run_id,
         idempotency_key=request.idempotency_key,
         caller_scope=request.caller_scope,
+        continuation_from_branch=continuation_from_branch,
+        continuation_from_head=continuation_from_head,
+        continuation_mode=(
+            "current_branch" if request.continue_from_current else None
+        ),
     )
 
 

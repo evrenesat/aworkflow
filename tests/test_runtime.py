@@ -6256,6 +6256,134 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert 'main' in str(ctx.value)
             assert 'other' in str(ctx.value)
 
+    def _run_current_branch_continuation_fixture(
+        self,
+        *,
+        move_primary_before_merge: bool = False,
+    ) -> tuple[object, Path, str]:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        root = Path(tmpdir.name)
+        _make_lifecycle_git_repo(root, branch="main")
+        subprocess.run(
+            ["git", "config", "core.excludesFile", "/dev/null"],
+            cwd=str(root),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "accepted"],
+            cwd=str(root),
+            check=True,
+            capture_output=True,
+        )
+        plan_path = root / "plans" / "in-progress" / "continuation.md"
+        plan_path.parent.mkdir(parents=True)
+        accepted_before_plan = _run_git_in_test(
+            ["rev-parse", "HEAD"], cwd=root
+        )[1]
+        tick = chr(96)
+        plan_path.write_text(
+            textwrap.dedent(
+                f"""\
+                # Plan
+
+                ## Git Tracking
+
+                - Plan Branch: {tick}accepted{tick}
+                - Pre-Handoff Base HEAD: {tick}{accepted_before_plan}{tick}
+
+                ### [x] Checkpoint 1: Done
+                - [x] step one
+
+                ### [ ] Checkpoint 2: Next
+                - [ ] step two
+                """
+            ),
+            encoding="utf-8",
+        )
+        _git_commit_file(root, plan_path)
+        accepted_head = _run_git_in_test(["rev-parse", "HEAD"], cwd=root)[1]
+        plan_path.write_text(
+            plan_path.read_text(encoding="utf-8").replace(
+                accepted_before_plan, accepted_head
+            ),
+            encoding="utf-8",
+        )
+        if move_primary_before_merge:
+            subprocess.run(
+                ["git", "branch", "other"],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+            )
+        main_head = _run_git_in_test(["rev-parse", "main"], cwd=root)[1]
+        workflow_config = _make_worktree_wf_config(
+            main_branch="main",
+            worktree_root=str(root.parent / f"worktrees-{root.name}"),
+        )
+        relative_plan = plan_path.relative_to(root)
+
+        def runner(argv, **kwargs):
+            execution_root = Path(kwargs["cwd"])
+            execution_plan = execution_root / relative_plan
+            execution_plan.write_text(
+                execution_plan.read_text(encoding="utf-8")
+                .replace("### [ ] Checkpoint 2: Next", "### [x] Checkpoint 2: Next")
+                .replace("- [ ] step two", "- [x] step two"),
+                encoding="utf-8",
+            )
+            _git_commit_file(execution_root, execution_plan)
+            if move_primary_before_merge:
+                subprocess.run(
+                    ["git", "checkout", "--", str(relative_plan)],
+                    cwd=str(root),
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "checkout", "other"],
+                    cwd=str(root),
+                    check=True,
+                    capture_output=True,
+                )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        result = run_workflow(
+            ControllerConfig(
+                repo_root=root,
+                plan_path=plan_path,
+                max_turns=1,
+                continuation_from_branch="accepted",
+                continuation_from_head=accepted_head,
+                continuation_mode="current_branch",
+            ),
+            workflow_config,
+            "wt_wf",
+            config_dir=root,
+            adapter=CodexAdapter(),
+            runner=runner,
+        )
+        return result, root, main_head
+
+    def test_current_branch_continuation_merges_to_accepted_branch(self) -> None:
+        result, root, main_head = self._run_current_branch_continuation_fixture()
+        payload = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload["main_branch"] == "accepted"
+        assert payload["continuation_from_branch"] == "accepted"
+        assert payload["continuation_mode"] == "current_branch"
+        assert payload["frozen_config"]["continuation_from_head"] == (
+            payload["continuation_from_head"]
+        )
+        assert _run_git_in_test(["rev-parse", "main"], cwd=root)[1] == main_head
+        assert _run_git_in_test(["symbolic-ref", "--short", "HEAD"], cwd=root)[1] == "accepted"
+
+    def test_current_branch_continuation_rejects_primary_branch_movement(self) -> None:
+        with pytest.raises(WorkflowError, match="primary checkout"):
+            self._run_current_branch_continuation_fixture(
+                move_primary_before_merge=True,
+            )
+
     def test_preflight_fails_when_main_branch_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

@@ -1138,6 +1138,16 @@ class RunMetadataWriter:
             "turns_completed": turns_completed if turns_completed is not None else (self.state.turns_completed if self.state else 0),
             "last_snapshot": _snapshot_payload(last_snapshot if last_snapshot is not None else (self.state.last_snapshot if self.state else None)),
         }
+        for key in (
+            "continuation_from_branch",
+            "continuation_from_head",
+            "continuation_mode",
+        ):
+            value = getattr(self.config, key)
+            if value is not None:
+                payload[key] = value
+            elif key in previous:
+                payload[key] = previous[key]
         if execution_context is not None:
             payload["execution_repo_root"] = str(execution_context.execution_repo_root)
             payload["feature_branch"] = execution_context.feature_branch
@@ -1229,6 +1239,18 @@ class RunMetadataWriter:
             for field in ("workflow_name", "config_path", "config_fingerprint")
         ):
             raise ValueError("frozen_config must contain current non-empty identity fields")
+        for field in (
+            "continuation_from_branch",
+            "continuation_from_head",
+            "continuation_mode",
+        ):
+            value = frozen_config.get(field)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"frozen_config.{field} must be a non-empty string or null"
+                )
         payload["frozen_config"] = dict(frozen_config)
 
         durable_state = self.state

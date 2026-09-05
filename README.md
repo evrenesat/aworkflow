@@ -141,6 +141,19 @@ lifecycle identity when no plan is supplied. Older run metadata remains
 readable for analysis but is not migrated or resumable. Detailed compatibility,
 recovery, supervision, and next-turn override rules are documented separately.
 
+Use `--continue-from-current` for an accepted, partially completed plan:
+
+```bash
+aflow run --continue-from-current path/to/plan.md
+```
+
+The current symbolic branch must match the plan's Git Tracking Plan Branch, and
+its full HEAD must match Pre-Handoff Base HEAD. The plan must contain both a
+completed and an unchecked checkpoint. AFlow starts a normal nested lifecycle
+from that branch, records the continuation branch and HEAD in `run.json`, and
+merges the generated feature branch back to the same branch. The option is
+explicit and cannot be combined with `--resume` or `--resume-reset-scope`.
+
 ### Live worker role hotplug
 
 An override may change a worker selector at the next safe worker boundary:
