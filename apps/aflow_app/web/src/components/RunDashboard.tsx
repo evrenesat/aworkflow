@@ -266,7 +266,14 @@ function parseElapsedFrom(iso: string | undefined, nowMs: number): string | null
   return `${seconds}s`
 }
 
-type RestartPhase = 'confirming' | 'stopping' | 'waiting' | 'starting' | 'failed'
+type RestartPhase = 'confirming' | 'stopping' | 'waiting' | 'starting' | 'failed' | 'unknown'
+
+interface PendingSuccessorStart {
+  projectId: string
+  sourceRunId: string
+  request: StartRunRequest
+  idempotencyKey: string
+}
 
 function workflowSteps(capabilities: ControlPlaneCapabilities | null, workflow: string): string[] {
   if (!capabilities || !workflow) return []
@@ -307,6 +314,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   const [confirmResume, setConfirmResume] = useState(false)
   const [restartPhase, setRestartPhase] = useState<RestartPhase | null>(null)
   const [restartNotice, setRestartNotice] = useState<string | null>(null)
+  const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
   const [elapsedNow, setElapsedNow] = useState(() => Date.now())
   const selectedRunRef = useRef<string | null>(null)
   const controlsForRunRef = useRef<string | null>(null)
@@ -374,6 +382,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     setConfirmResume(false)
     setRestartPhase(null)
     setRestartNotice(null)
+    setPendingSuccessorStart(null)
   }, [selectedRun])
 
   // A live elapsed clock only ticks while a nonterminal owned run is selected.
@@ -723,8 +732,38 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     return null
   }
 
+  function successorStartWasRejected(error: unknown): boolean {
+    return error instanceof ApiError && error.status >= 400 && error.status < 500
+  }
+
+  async function retryPendingSuccessorStart() {
+    if (!pendingSuccessorStart) return
+    const { projectId: successorProjectId, request, idempotencyKey } = pendingSuccessorStart
+    try {
+      setRestartPhase('starting')
+      setRestartNotice('Retrying the exact successor request with its original idempotency key. The source will not be stopped again.')
+      setError(null)
+      const response = await api.startControlPlaneRun(successorProjectId, request, idempotencyKey)
+      clearPendingWriteKey('start', { project_id: successorProjectId, ...request })
+      setPendingSuccessorStart(null)
+      setRestartPhase(null)
+      setRestartNotice(null)
+      await handleStartResponse(response, 'Successor retry')
+    } catch (restartError) {
+      if (successorStartWasRejected(restartError)) {
+        clearPendingWriteKey('start', { project_id: successorProjectId, ...request })
+        setPendingSuccessorStart(null)
+        setRestartPhase('failed')
+        setRestartNotice(`Successor start was rejected: ${errorMessage(restartError, 'start rejected')}. No successor was started by this request. The source remains owner-stopped.`)
+      } else {
+        setRestartPhase('unknown')
+        setRestartNotice(`Successor outcome remains unknown: ${errorMessage(restartError, 'response was lost')}. Retry only the frozen successor request after reconciliation; the source will not be stopped again.`)
+      }
+    }
+  }
+
   async function handleConfirmedRestart() {
-    if (!projectId || !selectedRun || !startWorkflow.trim()) return
+    if (!projectId || !selectedRun || !selectedRunIsActive || !startWorkflow.trim() || pendingSuccessorStart) return
     const sourceRunId = selectedRun.run_id
     const startRequest = startRequestFromDraft(sourceRunId)
     const stopIntent = {
@@ -754,17 +793,30 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
         setRestartNotice('Source inactivity could not be confirmed (the source is not terminal after owner stop, or the network failed). No successor was started; your draft is preserved below. Use Refresh to see the current source state.')
         return
       }
+      const successorIntent = { project_id: projectId, ...startRequest }
+      const idempotencyKey = getPendingWriteKey('start', successorIntent)
+      const pending = { projectId, sourceRunId, request: startRequest, idempotencyKey }
+      setPendingSuccessorStart(pending)
       setRestartPhase('starting')
       setRestartNotice(`Source ${sourceRunId} is confirmed owner-stopped and inactive. Starting the successor run.`)
-      const response = await api.startControlPlaneRun(
-        projectId,
-        startRequest,
-        getPendingWriteKey('start', { project_id: projectId, ...startRequest }),
-      )
-      clearPendingWriteKey('start', { project_id: projectId, ...startRequest })
-      setRestartPhase(null)
-      setRestartNotice(null)
-      await handleStartResponse(response, 'Successor start')
+      try {
+        const response = await api.startControlPlaneRun(projectId, startRequest, idempotencyKey)
+        clearPendingWriteKey('start', successorIntent)
+        setPendingSuccessorStart(null)
+        setRestartPhase(null)
+        setRestartNotice(null)
+        await handleStartResponse(response, 'Successor start')
+      } catch (restartError) {
+        if (successorStartWasRejected(restartError)) {
+          clearPendingWriteKey('start', successorIntent)
+          setPendingSuccessorStart(null)
+          setRestartPhase('failed')
+          setRestartNotice(`Successor start was rejected: ${errorMessage(restartError, 'start rejected')}. No successor was started by this request. The source remains owner-stopped.`)
+        } else {
+          setRestartPhase('unknown')
+          setRestartNotice(`Successor outcome is unknown: ${errorMessage(restartError, 'response was lost')}. The exact successor request is frozen; reconcile or retry it with the same idempotency key. The source will not be stopped again.`)
+        }
+      }
     } catch (restartError) {
       setRestartPhase('failed')
       if (apiErrorCode(restartError) === 'revision_conflict') {
@@ -809,6 +861,8 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
       ? null
       : 'Select a successor workflow and plan in the start form to enable a guided restart of this run.'
   const restartInProgress = restartPhase === 'stopping' || restartPhase === 'waiting' || restartPhase === 'starting'
+  const successorOutcomeUnknown = restartPhase === 'unknown' && pendingSuccessorStart !== null
+  const restartDraftFrozen = pendingSuccessorStart !== null
   const restartPendingConfirmation = restartPhase === 'confirming'
   const runSteps = workflowSteps(capabilities, startWorkflow.trim())
   const startStepIndex = runSteps.indexOf(startStep.trim())
@@ -894,20 +948,20 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
           <p className="text-sm text-dim">The server owns validation and returns either a run or a startup question.</p>
         </div>
         <label className="dashboard-field"><span>Plan</span>
-          <select className="input" aria-label="Run plan" value={startPlanPath} onChange={(event) => setStartPlanPath(event.target.value)}>
+          <select className="input" aria-label="Run plan" value={startPlanPath} disabled={restartDraftFrozen} onChange={(event) => setStartPlanPath(event.target.value)}>
             <option value="">Select an allowed plan</option>
             {plans.map((plan) => <option key={plan.path} value={plan.path}>{plan.path}</option>)}
           </select>
         </label>
         <div className="dashboard-form-grid">
           <label className="dashboard-field"><span>Workflow</span>
-            <select className="input" aria-label="Run workflow" value={startWorkflow} onChange={(event) => { setStartWorkflow(event.target.value); setStartStep('') }}>
+            <select className="input" aria-label="Run workflow" value={startWorkflow} disabled={restartDraftFrozen} onChange={(event) => { setStartWorkflow(event.target.value); setStartStep('') }}>
               <option value="">Server default</option>
               {capabilities?.workflows.map((workflow) => <option key={workflow} value={workflow}>{workflow}</option>)}
             </select>
           </label>
           <label className="dashboard-field"><span>Team</span>
-            <select className="input" aria-label="Run team" value={startTeam} onChange={(event) => setStartTeam(event.target.value)}>
+            <select className="input" aria-label="Run team" value={startTeam} disabled={restartDraftFrozen} onChange={(event) => setStartTeam(event.target.value)}>
               <option value={startWorkflow && capabilities?.workflow_details?.[startWorkflow]?.default_team
                 ? capabilities.workflow_details[startWorkflow].default_team ?? ''
                 : ''}>
@@ -919,7 +973,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
             </select>
           </label>
           <label className="dashboard-field"><span>Start step</span>
-            <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!startWorkflow}>
+            <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!startWorkflow || restartDraftFrozen}>
               <option value="">{startWorkflow ? 'Workflow first step (default)' : 'Select a workflow first'}</option>
               {runSteps.map((step, index) => (
                 <option key={step} value={step}>{index + 1} · {step}</option>
@@ -927,7 +981,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
             </select>
           </label>
           <label className="dashboard-field"><span>Max turns</span>
-            <input className="input" aria-label="Run max turns" type="number" min="1" value={startMaxTurns} onChange={(event) => setStartMaxTurns(event.target.value)} />
+            <input className="input" aria-label="Run max turns" type="number" min="1" value={startMaxTurns} disabled={restartDraftFrozen} onChange={(event) => setStartMaxTurns(event.target.value)} />
           </label>
         </div>
         {skippedByDraft.length > 0 && (
@@ -940,6 +994,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
           <textarea
             className="input textarea"
             aria-label="Run extra instructions"
+            disabled={restartDraftFrozen}
             value={startExtraInstructions}
             onChange={(event) => setStartExtraInstructions(event.target.value)}
             rows={3}
@@ -949,7 +1004,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
         <button
           className="btn btn-primary"
           onClick={() => void handleStart()}
-          disabled={!projectId || !startPlanPath || busyAction === 'start' || restartInProgress || Boolean(extraInstructionProblem)}
+          disabled={!projectId || !startPlanPath || busyAction === 'start' || restartInProgress || restartDraftFrozen || Boolean(extraInstructionProblem)}
         >
           {busyAction === 'start' ? 'Starting…' : 'Start run'}
         </button>
@@ -978,6 +1033,12 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
             {selectedRun.status === 'needs_attention' && <div className="notice">This run needs attention. A disconnected dashboard did not stop it; explicit resume is required when safe.</div>}
             {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
             {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
+            {successorOutcomeUnknown && pendingSuccessorStart?.sourceRunId === selectedRun.run_id && (
+              <div className="notice" role="alert">
+                The successor request is frozen while its outcome is unknown. Do not start a changed replacement.
+                <div className="dashboard-actions"><button className="btn btn-primary" disabled={restartInProgress} onClick={() => void retryPendingSuccessorStart()}>Retry exact successor request</button></div>
+              </div>
+            )}
 
             <dl className="run-metadata">
               <div><dt>Ownership</dt><dd>{selectedRun.ownership}</dd></div>
@@ -1065,7 +1126,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
               </>}
             </section>
 
-            {canMutate && (
+            {canRestart && (
               <section className="dashboard-section">
                 <div className="section-heading"><h4>Change workflow (guided restart)</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
                 <div className="notice">

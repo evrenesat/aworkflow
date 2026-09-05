@@ -33,8 +33,9 @@
   local edits on stale revisions, and describe next-safe-boundary semantics.
 - A workflow change is a guided confirmation, owner stop with CAS, a bounded
   wait for exact `owner_stopped` status and launch phase, then a successor
-  start with `restarted_from_run_id`; every failure halts automation with the
-  draft preserved and the source state authoritative. No overlap or retries.
+  start with `restarted_from_run_id`; normal guided restart is available only
+  for active owned runs. A lost successor response freezes the exact request and
+  idempotency key for successor-only recovery without another owner stop.
 - SSE handling keeps the last snapshot through disconnects, resumes from the
   last sequence, deduplicates replay, refreshes canonical status once on
   reconnect, and never maps a network failure to a run transition.

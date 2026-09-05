@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '../api'
 import * as api from '../api'
 import { RunDashboard } from './RunDashboard'
 
@@ -296,6 +297,7 @@ describe('RunDashboard', () => {
 
     fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
     fireEvent.change(screen.getByLabelText('Selector for worker'), { target: { value: 'harness/impl-b' } })
+    await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('full'))
     fireEvent.click(screen.getByRole('button', { name: 'Apply safe controls' }))
     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
@@ -338,6 +340,78 @@ describe('RunDashboard', () => {
     )
     await waitFor(() => expect(screen.getByText(/Successor start created run run-successor/)).toBeDefined())
     expect(screen.getByText(/records run-owned as its restart source/)).toBeDefined()
+  })
+
+  it('retries an unknown successor outcome with the frozen request and no second owner stop', async () => {
+    const stopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue(stopped)
+    vi.mocked(api.getControlPlaneRun).mockResolvedValueOnce(ownedRun).mockResolvedValue(stopped)
+    vi.mocked(api.startControlPlaneRun)
+      .mockRejectedValueOnce(new Error('response lost after acceptance'))
+      .mockResolvedValueOnce({
+        result: { run_id: 'run-successor', created: false, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: 'run-owned' },
+        startup_question: null,
+      })
+    renderDashboard({ restartPollIntervalMs: 1 })
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
+    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
+    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+
+    await screen.findByText(/Successor outcome is unknown/)
+    expect(screen.getByLabelText('Run workflow').getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
+
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(api.startControlPlaneRun.mock.calls[1][1]).toEqual(api.startControlPlaneRun.mock.calls[0][1])
+    expect(api.startControlPlaneRun.mock.calls[1][2]).toBe(api.startControlPlaneRun.mock.calls[0][2])
+    expect(api.ownerStopControlPlaneRun).toHaveBeenCalledTimes(1)
+    await screen.findByText(/Successor retry replay returned existing run run-successor/)
+  })
+
+  it('clears an uncertain successor recovery only after a definitive rejection', async () => {
+    const stopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue(stopped)
+    vi.mocked(api.getControlPlaneRun).mockResolvedValueOnce(ownedRun).mockResolvedValue(stopped)
+    vi.mocked(api.startControlPlaneRun)
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockRejectedValueOnce(new ApiError(422, 'invalid successor', 'validation_error'))
+    renderDashboard({ restartPollIntervalMs: 1 })
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
+    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
+    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
+    await screen.findByRole('button', { name: 'Retry exact successor request' })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
+
+    await screen.findByText(/Successor start was rejected: invalid successor/)
+    expect(screen.queryByRole('button', { name: 'Retry exact successor request' })).toBeNull()
+    expect(api.ownerStopControlPlaneRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not expose guided workflow restart for terminal owned runs', async () => {
+    const ownerStopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownerStopped], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownerStopped)
+    const rendered = renderDashboard()
+
+    await screen.findByText('owner stopped')
+    expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
+    rendered.unmount()
+
+    const completed = { ...ownedRun, status: 'completed', launch_phase: 'completed' }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [completed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(completed)
+    renderDashboard()
+    await screen.findByText('completed')
+    expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
   })
 
   it('halts restart automation with the draft preserved when the owner stop fails', async () => {
