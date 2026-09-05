@@ -2802,15 +2802,6 @@ def _maybe_move_completed_plan_to_done(repo_root: Path, plan_path: Path, *, is_c
     return plan_path
 
 
-def _print_renderable(renderable: object) -> None:
-    try:
-        from rich.console import Console
-    except ImportError:
-        print(renderable)
-        return
-    Console(file=sys.stdout).print(renderable)
-
-
 def _add_controller_state_to_analysis(
     payload: object,
     *,
@@ -3085,12 +3076,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: unknown workflow '{workflow_name}'.{suffix}", file=sys.stderr)
             return 1
 
-        renderable = build_workflow_show(
+        print(build_workflow_show(
             config=workflow_config,
             workflow_name=workflow_name,
-        )
-        if renderable is not None:
-            _print_renderable(renderable)
+        ))
         return 0
 
     if args.command != "run":

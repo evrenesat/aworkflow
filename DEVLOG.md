@@ -86,6 +86,28 @@
   tests cover validation, concurrency, lockout, rollback, and capability
   reload.
 
+## 2026-09-05 — Plain append-only CLI status output
+
+- Replaced the Rich live dashboard, alternate-screen viewport, and cbreak
+  terminal input with one plain renderer: append-only `key=value` status
+  records on stderr, emitted on meaningful transitions, turn finalizations,
+  and one final summary, deduplicating identical consecutive snapshots.
+- `aflow show` now prints plain ASCII workflow graphs, roles, and teams with
+  explicit `[executable]`/`[excluded]` step words, `[terminal]` END markers,
+  and `when` transition conditions instead of panels and color.
+- Removed `aflow/terminal_viewport.py`, every Rich import and render object,
+  cursor restoration, background refresh/input threads, and all dual-mode
+  fallbacks. Dropped the direct `rich` dependency from `pyproject.toml`;
+  `rich` remains in the lock only as a transitive dependency of the MCP
+  transport and is never imported by AFlow.
+- Records bound display values without truncating durable artifact references,
+  flatten control bytes, preserve Unicode content, and produce identical
+  ordered output for TTY, redirected, `TERM=dumb`, and narrow terminals.
+  Engine exit codes, stdout machine results, observer events, and workflow
+  state transitions are unchanged. The `BannerRenderer` name is retained
+  because workflow call sites and the `banner_files_limit` config option are
+  unchanged; the implementation is the single plain renderer.
+
 ## 2026-09-02 — Manager context references and prompt budget
 
 - A 340 KB manager context (incident `20260902t053828z-5cfe3386`, decision

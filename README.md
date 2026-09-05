@@ -61,6 +61,13 @@ aflow run path/to/plan.md -- keep changes limited to the requested scope
 If no workflow is named, AFlow uses `aflow.default_workflow` from the
 configuration.
 
+Status and progress are printed as plain, append-only `key=value` records on
+stderr. Interactive terminals, redirected logs, and `TERM=dumb` environments
+receive the same ordered, copyable lines with no cursor movement, ANSI styling,
+or keyboard capture, and one final summary record per run. `aflow show` prints
+plain ASCII workflow graphs, roles, and teams. The CLI is a portable launcher
+and log stream; the remote web application is the interactive dashboard.
+
 ## Run the lightweight local daemon
 
 `aflow daemon` exposes the same 13 control-plane MCP tools without the remote

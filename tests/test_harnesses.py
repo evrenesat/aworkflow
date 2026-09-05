@@ -599,11 +599,64 @@ class RepoStateProbeTests(unittest.TestCase):
             assert 'nonexistent' in str(ctx.value)
 
 
-class GitBannerTests(unittest.TestCase):
+class PlainStatusOutputTests(unittest.TestCase):
+    """Plain append-only status records and ASCII show output."""
 
-    def test_build_banner_renders_git_row_when_clean(self) -> None:
-        from rich.console import Console
+    @staticmethod
+    def _step(role: str, *targets: str):
+        from aflow.config import GoTransition, WorkflowStepConfig
+
+        return WorkflowStepConfig(role=role, go=tuple(GoTransition(to=t) for t in targets))
+
+    def _renderer(self, stream, **kwargs):
+        from aflow.status import BannerRenderer
+
+        defaults = {
+            "config_max_turns": 5,
+            "config_plan_path": Path("plans/demo.md"),
+        }
+        defaults.update(kwargs)
+        return BannerRenderer(stream=stream, **defaults)
+
+    @staticmethod
+    def _records(stream):
+        return [line for line in stream.getvalue().splitlines() if line.startswith("aflow ")]
+
+    def test_records_include_git_rows_and_respect_files_limit(self) -> None:
+        import aflow.git_status as git_status_mod
         from aflow.git_status import GitSummary
+
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        state.run_id = "run-git"
+        summary = GitSummary(
+            modified_count=1,
+            added_count=1,
+            removed_count=0,
+            lines_added=12,
+            lines_removed=3,
+            commit_count=2,
+            changed_paths=tuple(f"src/file{i}.py" for i in range(12)),
+        )
+        stream = io.StringIO()
+        renderer = self._renderer(
+            stream, repo_root=Path("/repo"), workflow_name="managed",
+            config_banner_files_limit=10,
+        )
+        with patch.object(git_status_mod, "capture_baseline", return_value=object()), \
+             patch.object(git_status_mod, "summarize_since_baseline", return_value=summary):
+            renderer.start(state)
+
+        record = self._records(stream)[0]
+        assert 'git="M 1, A 1, D 0 | +12/-3 | 2 commits"' in record
+        files_value = record.split("files=", 1)[1].split(" status=", 1)[0]
+        assert "src/file9.py" in files_value
+        assert "src/file10.py" not in files_value
+        assert "+2 more" in files_value
+
+    def test_records_show_clean_git_state_without_files_row(self) -> None:
+        import aflow.git_status as git_status_mod
+        from aflow.git_status import GitSummary
+
         state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
         summary = GitSummary(
             modified_count=0,
@@ -614,2194 +667,199 @@ class GitBannerTests(unittest.TestCase):
             commit_count=0,
             changed_paths=(),
         )
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
-            git_summary=summary,
-        )
-        assert panel is not None
-        console = Console(record=True, width=100)
-        console.print(panel)
-        text = console.export_text()
-        assert "Git" in text
-        assert "clean since start" in text
+        stream = io.StringIO()
+        renderer = self._renderer(stream, repo_root=Path("/repo"))
+        with patch.object(git_status_mod, "capture_baseline", return_value=object()), \
+             patch.object(git_status_mod, "summarize_since_baseline", return_value=summary):
+            renderer.start(state)
 
-    def test_build_banner_renders_git_row_with_changes(self) -> None:
-        from rich.console import Console
-        from aflow.git_status import GitSummary
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        summary = GitSummary(
-            modified_count=2,
-            added_count=1,
-            removed_count=0,
-            lines_added=10,
-            lines_removed=3,
-            commit_count=1,
-            changed_paths=("foo.py", "bar.py", "baz.py"),
-        )
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
-            git_summary=summary,
-        )
-        assert panel is not None
-        console = Console(record=True, width=120)
-        console.print(panel)
-        text = console.export_text()
-        assert "Git" in text
-        assert "M 2" in text
-        assert "Files" in text
-        assert "foo.py" in text
+        record = self._records(stream)[0]
+        assert 'git="clean since start | +0/-0 | 0 commits"' in record
+        assert "files=" not in record
 
-    def test_build_banner_files_row_respects_config_limit(self) -> None:
-        from rich.console import Console
-        from aflow.git_status import GitSummary
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        summary = GitSummary(
-            modified_count=5,
-            added_count=0,
-            removed_count=0,
-            lines_added=0,
-            lines_removed=0,
-            commit_count=0,
-            changed_paths=("a.py", "b.py", "c.py", "d.py", "e.py"),
-        )
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            config_banner_files_limit=3,
-            state=state,
-            git_summary=summary,
-        )
-        assert panel is not None
-        console = Console(record=True, width=120)
-        console.print(panel)
-        text = console.export_text()
-        assert "+2 more" in text
-        assert "d.py" not in text
-        assert "a.py" in text
-
-    def test_build_banner_no_git_summary_omits_git_rows(self) -> None:
-        from rich.console import Console
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
-        )
-        assert panel is not None
-        console = Console(record=True, width=100)
-        console.print(panel)
-        text = console.export_text()
-        assert "Git" not in text
-        assert "Files" not in text
-
-    def test_build_banner_uses_title_case_plan_stem(self) -> None:
-        from io import StringIO
-        from rich.console import Console
+    def test_git_probe_failure_still_emits_records(self) -> None:
+        import aflow.git_status as git_status_mod
 
         state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        banner = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/config-plan.md"),
-            original_plan_path=Path("/fake/workflow-visualization_show-and_exclusions.md"),
-            state=state,
-        )
-        assert banner is not None
-        output = StringIO()
-        Console(file=output, force_terminal=False).print(banner)
-        assert output.getvalue().splitlines()[0] == "Workflow Visualization Show And Exclusions"
+        state.run_id = "run-git"
+        stream = io.StringIO()
+        renderer = self._renderer(stream, repo_root=Path("/repo"))
+        with patch.object(git_status_mod, "capture_baseline", side_effect=OSError("no git")), \
+             patch.object(git_status_mod, "summarize_since_baseline", side_effect=OSError("no git")):
+            renderer.start(state)
+            renderer.stop(state)
 
-    def test_build_banner_omits_issue_row_when_count_is_zero(self) -> None:
-        from rich.console import Console
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
-        )
-        assert panel is not None
-        console = Console(record=True, width=100)
-        console.print(panel)
-        text = console.export_text()
-        assert "Issues" not in text
-        assert "Harness/Model" not in text
-        assert "Active Plan" not in text
-        assert "Step" not in text
+        records = self._records(stream)
+        assert len(records) == 2
+        assert "git=" not in records[0]
+        assert "event=final" in records[1]
 
-    def test_build_banner_renders_issue_summary_path_when_present(self) -> None:
-        from rich.console import Console
-        state = ControllerState(
-            last_snapshot=PlanSnapshot(None, 0, 0, False),
-            issues_accumulated=1,
-            issues_summary_path=".aflow/runs/20260407T120000Z-00000001/issues.md",
-        )
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
-        )
-        assert panel is not None
-        console = Console(record=True, width=120)
-        console.print(panel)
-        text = console.export_text()
-        assert ".aflow/runs/20260407T120000Z-00000001/issues.md" in text
+    def test_records_carry_run_lineage_and_skipped_step_words(self) -> None:
+        from aflow.status import WorkflowGraphSource
 
-    def test_build_banner_renders_run_id_and_resumed_from(self) -> None:
-        from rich.console import Console
-        state = ControllerState(
-            last_snapshot=PlanSnapshot(None, 0, 0, False),
-            run_id="20260407T120000Z-00000001",
-            resumed_from_run_id="20260407T110000Z-00000000",
-        )
-        panel = build_banner(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
-        )
-        assert panel is not None
-        console = Console(record=True, width=120)
-        console.print(panel)
-        text = console.export_text()
-        assert "Run ID" in text
-        assert "20260407T120000Z-00000001" in text
-        assert "Resumed From" in text
-        assert "20260407T110000Z-00000000" in text
-
-    def test_build_banner_renders_last_step_exits(self) -> None:
-        from rich.console import Console
-        from unittest.mock import patch
-        import aflow.status as status_mod
-
-        steps = {
-            "plan": WorkflowStepConfig(role="planner", go=(GoTransition(to="review"),)),
-            "review": WorkflowStepConfig(
-                role="reviewer",
-                go=(
-                    GoTransition(to="ship", when="DONE"),
-                    GoTransition(to="plan", when="!DONE"),
-                ),
-            ),
-        }
-        source = status_mod.WorkflowGraphSource(
-            declared_steps=steps,
-            executable_steps=steps,
-        )
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        with patch.object(status_mod, "load_workflow_config", side_effect=AssertionError("should not reload")):
-            panel = build_banner(
-                workflow_name="demo",
-                workflow_graph_source=source,
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                state=state,
-            )
-            assert panel is not None
-            console = Console(record=True, width=120)
-            console.print(panel)
-            text = console.export_text()
-        assert "go→ ship" in text
-        assert "[DONE]" in text
-
-    def test_build_banner_renders_excluded_steps_from_explicit_graph_source(self) -> None:
-        from rich.console import Console
-        from unittest.mock import patch
-        import aflow.status as status_mod
-
-        declared_steps = {
-            "plan": WorkflowStepConfig(role="planner", go=(GoTransition(to="review"),)),
-            "review": WorkflowStepConfig(role="reviewer", go=(GoTransition(to="ship"),)),
-            "ship": WorkflowStepConfig(role="shipper"),
-        }
-        source = status_mod.WorkflowGraphSource(
-            declared_steps=declared_steps,
-            executable_steps={
-                "plan": declared_steps["plan"],
-                "ship": declared_steps["ship"],
+        source = WorkflowGraphSource(
+            declared_steps={
+                "plan": self._step("planner", "implement"),
+                "implement": self._step("worker", "review"),
+                "review": self._step("reviewer", "END"),
             },
-            excluded_step_names=("review",),
-        )
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        with patch.object(status_mod, "load_workflow_config", side_effect=AssertionError("should not reload")):
-            panel = build_banner(
-                workflow_name="demo",
-                workflow_graph_source=source,
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                state=state,
-            )
-            assert panel is not None
-            console = Console(record=True, width=120)
-            console.print(panel)
-            text = console.export_text()
-        assert "plan" in text
-        assert "review" in text
-        assert "ship" in text
-
-    def test_build_banner_maximal_state_is_complete_ordered_and_borderless(self) -> None:
-        from rich.console import Console
-        from rich.panel import Panel
-        from aflow.config import GoTransition
-        from aflow.git_status import GitSummary
-        from aflow.run_state import (
-            ActiveImplementationScope,
-            CheckpointRepartitionRecord,
-            FrozenRunIdentity,
-            ManagerDecisionSummary,
-            OverrideResult,
-            PendingManagerNotes,
-            PendingRepartitionV1,
-            PendingTeamOverride,
-            ReviewRejectionRecord,
-        )
-        import aflow.status as status_mod
-
-        now = datetime.now(timezone.utc)
-        steps = {
-            "skipped-step": WorkflowStepConfig(
-                role="role-skipped", go=(GoTransition(to="active-step", when="condition-skipped"),)
-            ),
-            "excluded-step": WorkflowStepConfig(
-                role="role-excluded", go=(GoTransition(to="END", when="condition-excluded"),)
-            ),
-            "active-step": WorkflowStepConfig(
-                role="role-active", go=(GoTransition(to="END", when="condition-active"),)
-            ),
-            "inactive-step": WorkflowStepConfig(role="role-inactive"),
-        }
-        source = status_mod.WorkflowGraphSource(
-            declared_steps=steps,
             executable_steps={
-                "skipped-step": steps["skipped-step"],
-                "active-step": steps["active-step"],
-                "inactive-step": steps["inactive-step"],
+                "implement": self._step("worker", "review"),
+                "review": self._step("reviewer", "END"),
             },
-            excluded_step_names=("excluded-step",),
+            excluded_step_names=("plan",),
         )
-        scope = ActiveImplementationScope(
-            "scope-sentinel", "/plans/original-sentinel.md", 2, "checkpoint-sentinel", 1,
-            current_partition_generation_id="generation-current-sentinel",
-            current_partition_id="partition-current-sentinel",
-        )
-        rejection = ReviewRejectionRecord(
-            scope_id="scope-sentinel", rejection_number=7, source_run_id="run-source-sentinel",
-            review_turn_number=8, review_step_name="review-step-sentinel", reviewer_selector="reviewer-sentinel",
-            checkpoint_index=2, checkpoint_name="checkpoint-sentinel", reviewed_implementation_turn_number=6,
-            reviewed_worker_team="team-reviewed-sentinel", reviewed_worker_selector="worker-reviewed-sentinel",
-            review_summary="review-summary-sentinel", repair_plan_summary="repair-summary-sentinel",
-            review_stdout_artifact_path="review-artifact-sentinel.txt", repair_plan_path="repair-plan-sentinel.md",
-        )
-        turn_history = [
-            TurnRecord(
-                turn_number=1, step_name="review-step-sentinel", step_role="reviewer-sentinel",
-                resolved_harness_name="harness-review-sentinel", resolved_model_display="model-review-sentinel",
-                active_plan_path="active-plan-review-sentinel.md", chosen_transition="active-step",
-                chosen_transition_condition="condition-turn-sentinel", issues_summary_path="issues-turn-sentinel.md",
-                outcome="completed", started_at=now, finished_at=now,
-                stdout_artifact_path="stdout-review-sentinel.txt", stderr_artifact_path="stderr-review-sentinel.txt",
-            ),
-            TurnRecord(
-                turn_number=2, step_name="active-step", step_role="role-active",
-                resolved_harness_name="harness-active-sentinel", resolved_model_display="model-active-sentinel",
-                active_plan_path="active-plan-worker-sentinel.md", outcome="running", started_at=now,
-                triggering_rejection_number=7,
-            ),
-        ]
-        state = ControllerState(
-            last_snapshot=PlanSnapshot("checkpoint-sentinel", 2, 1, False, 4, 2),
-            run_id="run-current-sentinel", resumed_from_run_id="run-resumed-sentinel",
-            turns_completed=1, issues_accumulated=3, issues_summary_path="issues-summary-sentinel.md",
-            run_started_at=now, active_turn=2, current_turn_started_at=now,
-            status_message="completed", end_reason="done", selected_start_step="active-step",
-            turn_history=turn_history, manager_history=[ManagerDecisionSummary(
-                decision_number=9, level="full", trigger="trigger-manager-sentinel",
-                action="action-manager-sentinel", reason="manager-reason-sentinel",
-                artifact_path="manager-artifact-sentinel.md",
-            )],
-            active_implementation_scope=scope, review_rejection_history=[rejection],
-            pending_manager_notes=PendingManagerNotes("manager-target-sentinel", ("private-note",), 9),
-            pending_step_team_override=PendingTeamOverride(
-                target_step="override-target-sentinel", role="override-role-sentinel",
-                source_team="override-source-sentinel", target_team="override-team-sentinel",
-                selector="override-selector-sentinel", checkpoint_identity="checkpoint-sentinel", decision_number=9,
-            ),
-            pending_repartition=PendingRepartitionV1(
-                schema_version=1, decision_number=10, scope_id="scope-sentinel",
-                stage="repartition-stage-sentinel", envelope_sha256="envelope-hash-sentinel",
-                source_plan_sha256="source-plan-hash-sentinel", failed_stage="failed-stage-sentinel",
-            ),
-            repartition_history=[CheckpointRepartitionRecord(
-                schema_version=1, decision_number=10, scope_id="scope-sentinel",
-                generation_id="generation-sentinel", envelope_sha256="envelope-history-sentinel",
-                envelope_artifact_sha256="envelope-artifact-hash-sentinel", source_plan_sha256="source-history-sentinel",
-                proposal_sha256="proposal-hash-sentinel", candidate_plan_sha256="candidate-hash-sentinel",
-                partition_ids=("partition-one-sentinel", "partition-two-sentinel"),
-                child_summaries=("child-one-sentinel", "child-two-sentinel"),
-                current_disposition="disposition-sentinel", resolved_target_step="target-step-sentinel",
-                resolved_target_role="target-role-sentinel", current_partition_id="partition-current-sentinel",
-                scope_pressure_reason="pressure-history-sentinel", envelope_artifact_path="envelope-sentinel.json",
-                proposal_artifact_path="proposal-sentinel.json", candidate_artifact_path="candidate-sentinel.md",
-                mechanical_validation_artifact_path="mechanical-sentinel.json",
-                semantic_verdict_artifact_path="verdict-sentinel.json",
-            )],
-            scope_pressure_reason="pressure-sentinel", last_manager_report_path="manager-report-sentinel.md",
-            frozen_run_identity=FrozenRunIdentity(
-                workflow_name="workflow-sentinel", config_path="config-sentinel.toml",
-                config_fingerprint="fingerprint-sentinel-123456",
-            ),
-            override_result=OverrideResult(
-                status="rejected", digest="digest-sentinel", message="override-message-sentinel",
-                source_text='notes = ["private-note"]',
-            ),
-            effective_max_turns=9, override_file_present=True,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            generated_plan = Path(tmpdir) / "generated-plan-sentinel.md"
-            generated_plan.write_text("generated", encoding="utf-8")
-            banner = build_banner(
-                workflow_name="workflow-sentinel", current_step_name="active-step", workflow_graph_source=source,
-                config_harness="harness-config-sentinel", config_model="model-config-sentinel",
-                config_effort="effort-config-sentinel", config_max_turns=12,
-                config_plan_path=Path("config-plan-sentinel.md"), original_plan_path=Path("original-plan-sentinel.md"),
-                active_plan_path=Path("active-plan-sentinel.md"), new_plan_path=generated_plan,
-                config_banner_files_limit=2, state=state,
-                git_summary=GitSummary(
-                    modified_count=2, added_count=1, removed_count=1, lines_added=12, lines_removed=4,
-                    commit_count=3, changed_paths=("git-one-sentinel", "git-two-sentinel", "git-three-sentinel"),
-                ),
-            )
-        assert banner is not None
-        assert not isinstance(banner, Panel)
-        assert not any(isinstance(item, Panel) for item in getattr(banner, "renderables", ()))
-
-        for width in (42, 140):
-            console = Console(record=True, width=width, force_terminal=False)
-            console.print(banner)
-            text = console.export_text()
-            assert not any(glyph in text for glyph in "╭╮╰╯┌┐└┘")
-            assert text.index("Current checkpoint review history") < text.index("Turn history")
-            assert text.index("Turn history") < text.index("Workflow graph")
-            assert text.index("Workflow graph") < text.index("Summary")
-            for label in ("[active]", "[inactive]", "[excluded]", "[skipped]"):
-                assert label in text
-            assert "git-one-sentinel" in text
-            assert "git-two-sentinel" in text
-            assert "git-three-sentinel" not in text
-
-        console = Console(record=True, width=140, force_terminal=False)
-        console.print(banner)
-        text = console.export_text()
-        for sentinel in (
-            "run-current-sentinel", "run-resumed-sentinel", "checkpoint-sentinel", "review-summary-sentinel",
-            "review-artifact-sentinel.txt", "repair-plan-sentinel.md", "active-plan-worker-sentinel.md",
-            "condition-turn-sentinel", "stdout-review-sentinel.txt", "stderr-review-sentinel.txt",
-            "workflow-sentinel", "original-plan-sentinel.md", "generated-plan-sentinel.md",
-            "generation-sentinel", "child-one-sentinel", "child-two-sentinel",
-            "manager-report-sentinel.md", "issues-summary-sentinel.md", "override-message-sentinel",
-            "fingerprint-", "pressure-sentinel", "git-one-sentinel", "git-two-sentinel",
-        ):
-            assert text.count(sentinel) == 1, sentinel
-        assert text.count("repair-summary-sentinel") == 2
-
-    def test_turn_panels_render_transition_and_active_plan(self) -> None:
-        from rich.console import Console
-        import aflow.status as status_mod
-
-        steps = {
-            "review": WorkflowStepConfig(role="reviewer", go=(GoTransition(to="implement_plan", when="NEW_PLAN_EXISTS || !DONE"),)),
-        }
-        source = status_mod.WorkflowGraphSource(
-            declared_steps=steps,
-            executable_steps=steps,
-        )
-        record = TurnRecord(
-            turn_number=1,
-            step_name="review",
-            step_role="reviewer",
-            resolved_harness_name="codex",
-            resolved_model_display="codex / gpt-5.4",
-            active_plan_path="/fake/plan.md",
-            chosen_transition="implement_plan",
-            chosen_transition_condition="NEW_PLAN_EXISTS || !DONE",
-            issues_summary_path=".aflow/runs/20260407T120000Z-00000001/issues.md",
-            outcome="completed",
-            started_at=datetime.now(timezone.utc),
-            finished_at=datetime.now(timezone.utc),
-        )
-        state = ControllerState(
-            last_snapshot=PlanSnapshot(None, 0, 0, False),
-            turn_history=[record],
-        )
-        panel = build_banner(
-            workflow_name="demo",
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False, 3, 1))
+        state.run_id = "run-lineage"
+        state.resumed_from_run_id = "run-source"
+        state.selected_start_step = "review"
+        stream = io.StringIO()
+        renderer = self._renderer(
+            stream,
+            workflow_name="managed",
             workflow_graph_source=source,
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=state,
         )
-        assert panel is not None
-        console = Console(record=True, width=120)
-        console.print(panel)
-        text = console.export_text()
-        assert "review" in text
-        assert "Harness/Model" in text
-        assert "codex / gpt-5.4" in text
-        assert "Active Plan" in text
-        assert "go→ implement_plan" in text
-        assert "[NEW_PLAN_EXISTS || !DONE]" in text
-        assert ".aflow/runs/20260407T120000Z-00000001/issues.md" in text
+        renderer.start(state)
 
-    def test_banner_renders_scoped_rejection_history_as_plain_text(self) -> None:
-        from rich.console import Console
-        from aflow.run_state import ActiveImplementationScope, ReviewRejectionRecord
+        record = self._records(stream)[0]
+        assert "run=run-lineage" in record
+        assert "resumed_from=run-source" in record
+        assert "start_step=review" in record
+        assert "skipped=implement" in record
+        assert "skipped=plan" not in record
 
-        scope = ActiveImplementationScope("scope-1", "/fake/plan.md", 1, "Context", 1)
-        rejection = ReviewRejectionRecord(
-            scope_id="scope-1", rejection_number=1, source_run_id="previous-run",
-            review_turn_number=2, review_step_name="review", reviewer_selector="codex.review",
-            checkpoint_index=1, checkpoint_name="Context", reviewed_implementation_turn_number=1,
-            reviewed_worker_team="base", reviewed_worker_selector="codex.worker",
-            review_summary="Use [red] literally", repair_plan_summary="Repair `this` first",
-            review_stdout_artifact_path=".aflow/runs/old/turns/turn-002/stdout.txt",
-            repair_plan_path="plans/repair.md",
-        )
-        worker = TurnRecord(
-            turn_number=3, step_name="implement", step_role="worker",
-            resolved_harness_name="codex", resolved_model_display="codex / worker",
-            outcome="running", started_at=datetime.now(timezone.utc),
-            triggering_rejection_number=1,
-        )
-        state = ControllerState(
-            last_snapshot=PlanSnapshot(
-                "Context", 1, 1, False, current_checkpoint_index=1
-            ), run_id="new-run",
-            active_turn=3, current_turn_started_at=datetime.now(timezone.utc),
-            active_implementation_scope=scope, review_rejection_history=[rejection], turn_history=[worker],
-        )
-        panel = build_banner(config_max_turns=5, config_plan_path=Path("/fake/plan.md"), state=state)
-        assert panel is not None
-        console = Console(record=True, width=120)
-        console.print(panel)
-        text = console.export_text()
-        assert "Current checkpoint review history" in text
-        assert "Rejection 1 · review turn 2 · run previous-run" in text
-        assert "Use [red] literally" in text
-        assert "after rejection 1" in text
-        assert "Repair `this` first" in text
+    def test_turn_finalization_records_transition_words(self) -> None:
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        state.turn_history.append(TurnRecord(
+            turn_number=2,
+            step_name="implement",
+            resolved_harness_name="claude",
+            resolved_model_display="claude / opus",
+            chosen_transition="review",
+            chosen_transition_condition="tests_pass",
+            outcome="completed",
+        ))
+        state.turn_history.append(TurnRecord(
+            turn_number=3,
+            step_name="review",
+            resolved_harness_name="claude",
+            resolved_model_display="claude / opus",
+            chosen_transition="END",
+            outcome="completed",
+        ))
+        stream = io.StringIO()
+        renderer = self._renderer(stream, workflow_name="managed")
+        renderer.update(state)
 
-    def test_shared_step_classification_distinguishes_active_inactive_excluded_and_skipped(self) -> None:
+        record = self._records(stream)[0]
+        assert "step=review" in record
+        assert "transition=END" in record
+        assert "outcome=completed" in record
+
+    def test_set_context_feeds_next_record_without_emitting(self) -> None:
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+        stream = io.StringIO()
+        renderer = self._renderer(stream, workflow_name="managed")
+        renderer.set_context(
+            current_step_name="implement",
+            active_plan_path=Path("plans/in-progress/demo.md"),
+            config_harness="claude",
+        )
+        assert self._records(stream) == []
+        renderer.update(state)
+
+        record = self._records(stream)[0]
+        assert "step=implement" in record
+        assert "active_plan=plans/in-progress/demo.md" in record
+        assert "harness=claude" in record
+
+    def test_workflow_show_renders_end_transitions_and_excluded_words(self) -> None:
         import aflow.status as status_mod
+        from aflow.config import TeamConfig, WorkflowConfig, WorkflowUserConfig
 
-        steps = {
-            "plan": WorkflowStepConfig(role="planner"),
-            "review": WorkflowStepConfig(role="reviewer"),
-            "ship": WorkflowStepConfig(role="shipper"),
-            "deploy": WorkflowStepConfig(role="deployer"),
-        }
-        source = status_mod.WorkflowGraphSource(
-            declared_steps=steps,
-            executable_steps={"plan": steps["plan"], "ship": steps["ship"], "deploy": steps["deploy"]},
-            excluded_step_names=("review",),
+        active = self._step("worker", "review", "END")
+        excluded = self._step("reviewer", "END")
+        workflow = WorkflowConfig(
+            declared_steps={"implement": active, "review": excluded},
+            steps={"implement": active},
+            excluded_steps=("review",),
         )
+        config = WorkflowUserConfig(
+            roles={"worker": "codex.default", "reviewer": "claude.opus"},
+            teams={"base": TeamConfig(roles={"worker": "codex.default"})},
+            workflows={"managed": workflow},
+        )
+        output = status_mod.build_workflow_show(config=config)
+
+        assert "step implement [executable] role=worker" in output
+        assert "step review [excluded] role=reviewer" in output
+        assert "go -> review" in output
+        assert "go -> END [terminal]" in output
+        assert "\x1b" not in output
+        assert not any(True for ch in output if ord(ch) < 0x20 and ch != "\n")
+
+    def test_workflow_show_lists_shared_roles_and_every_workflow_in_order(self) -> None:
+        import aflow.status as status_mod
+        from aflow.config import WorkflowConfig, WorkflowUserConfig
+
+        first = self._step("worker", "END")
+        second = self._step("architect", "END")
+        config = WorkflowUserConfig(
+            roles={"worker": "codex.default", "architect": "claude.opus"},
+            teams={
+                "zteam": TeamConfig(roles={"worker": "codex.default"}),
+                "ateam": TeamConfig(roles={"architect": "claude.opus"}),
+            },
+            workflows={"alpha": WorkflowConfig(
+                declared_steps={"work": first}, steps={"work": first},
+            )},
+        )
+        config.workflows["beta"] = WorkflowConfig(
+            declared_steps={"ship": second}, steps={"ship": second},
+        )
+        output = status_mod.build_workflow_show(config=config)
+
+        roles_index = output.index("Roles / Teams")
+        alpha_index = output.index("workflow alpha")
+        beta_index = output.index("workflow beta")
+        assert roles_index < alpha_index < beta_index
+        assert "role worker -> codex.default" in output
+        assert "role architect -> claude.opus" in output
+        assert "team ateam: architect -> claude.opus" in output
+        assert "team zteam: worker -> codex.default" in output
+        assert "workflow alpha" in output
+        assert "workflow beta" in output
+
+    def test_skipped_step_names_respect_exclusions_and_selected_start(self) -> None:
+        import aflow.status as status_mod
+        from aflow.status import WorkflowGraphSource
+
+        source = WorkflowGraphSource(
+            declared_steps={
+                "plan": self._step("planner", "implement"),
+                "implement": self._step("worker", "review"),
+                "review": self._step("reviewer", "END"),
+                "extra": self._step("worker", "END"),
+            },
+            executable_steps={
+                "implement": self._step("worker", "review"),
+                "review": self._step("reviewer", "END"),
+            },
+            excluded_step_names=("extra",),
+        )
+        skipped = status_mod._visual_start_skipped_step_names(
+            declared_steps=source.declared_steps,
+            executable_steps=source.executable_steps,
+            excluded_step_names=source.excluded_step_names,
+            selected_start_step="review",
+        )
+        assert skipped == ("implement",)
         assert status_mod._visual_start_skipped_step_names(
             declared_steps=source.declared_steps,
             executable_steps=source.executable_steps,
             excluded_step_names=source.excluded_step_names,
-            selected_start_step="ship",
-        ) == ("plan",)
-        context = status_mod.WorkflowGraphContext(
-            source=source,
-            visual_start_step_skipped_step_names=("plan",),
-            current_step_name="ship",
-            current_turn_is_running=True,
-        )
-        assert status_mod._workflow_step_kind(step_name="plan", context=context) == "skipped"
-        assert status_mod._workflow_step_kind(step_name="review", context=context) == "excluded"
-        assert status_mod._workflow_step_kind(step_name="ship", context=context) == "active"
-        assert status_mod._workflow_step_kind(step_name="deploy", context=context) == "inactive"
-        assert status_mod._workflow_transition_target_kind(target_name="END", context=context) == "terminal"
-        assert status_mod._workflow_transition_target_kind(target_name="review", context=context) == "excluded"
-        assert status_mod._workflow_step_style("active") == "bold green"
-        assert status_mod._workflow_step_style("inactive") == "green"
-        assert status_mod._workflow_step_style("excluded") == "grey50"
-        assert status_mod._workflow_transition_style(source_kind="active", target_kind="terminal") == "white"
-        assert status_mod._workflow_transition_style(source_kind="inactive", target_kind="terminal") == "green"
-        assert status_mod._workflow_transition_style(source_kind="skipped", target_kind="terminal") == "grey50"
-        assert status_mod._workflow_transition_style(source_kind="active", target_kind="inactive") == "white"
-        assert status_mod._workflow_transition_style(source_kind="inactive", target_kind="inactive") == "green"
-        assert status_mod._workflow_transition_style(source_kind="excluded", target_kind="inactive") == "grey50"
-        assert status_mod._workflow_transition_style(source_kind="inactive", target_kind="excluded") == "grey50"
-
-    def test_build_banner_renders_end_transitions_with_runtime_styles(self) -> None:
-        from rich.console import Console
-        from datetime import datetime, timezone
-        import aflow.status as status_mod
-
-        def transition_segments(console: Console, panel: object) -> list[object]:
-            return [
-                segment
-                for segment in console.render(panel)
-                if not segment.control and ("├─go→" in segment.text or "END" in segment.text)
-            ]
-
-        active_steps = {
-            "go": WorkflowStepConfig(role="worker", go=(GoTransition(to="END"),)),
-        }
-        active_source = status_mod.WorkflowGraphSource(
-            declared_steps=active_steps,
-            executable_steps=active_steps,
-        )
-        active_record = TurnRecord(
-            turn_number=1,
-            step_name="go",
-            step_role="worker",
-            resolved_harness_name="codex",
-            resolved_model_display="codex / gpt-5.4",
-            outcome="running",
-            started_at=datetime.now(timezone.utc),
-        )
-        active_state = ControllerState(
-            last_snapshot=PlanSnapshot(None, 0, 0, False),
-            turn_history=[active_record],
-            current_turn_started_at=datetime.now(timezone.utc),
-            active_turn=1,
-        )
-        active_panel = build_banner(
-            workflow_name="demo",
-            workflow_graph_source=active_source,
-            current_step_name="go",
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=active_state,
-        )
-        assert active_panel is not None
-        active_console = Console(width=120)
-        active_segments = transition_segments(active_console, active_panel)
-        assert "├─go→ END" in "".join(segment.text for segment in active_segments)
-        active_arrow = next(segment for segment in active_segments if "├─go→" in segment.text)
-        active_end = next(segment for segment in active_segments if "END" in segment.text)
-        assert active_arrow.style.color.name == "white"
-        assert active_end.style.bold is True
-
-        skipped_steps = {
-            "prep": WorkflowStepConfig(role="worker", go=(GoTransition(to="END"),)),
-            "go": WorkflowStepConfig(role="worker"),
-        }
-        skipped_source = status_mod.WorkflowGraphSource(
-            declared_steps=skipped_steps,
-            executable_steps=skipped_steps,
-        )
-        skipped_state = ControllerState(
-            last_snapshot=PlanSnapshot(None, 0, 0, False),
-            selected_start_step="go",
-        )
-        skipped_panel = build_banner(
-            workflow_name="demo",
-            workflow_graph_source=skipped_source,
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            state=skipped_state,
-        )
-        assert skipped_panel is not None
-        skipped_console = Console(width=120)
-        skipped_segments = transition_segments(skipped_console, skipped_panel)
-        assert "├─go→ END" in "".join(segment.text for segment in skipped_segments)
-        skipped_arrow = next(segment for segment in skipped_segments if "├─go→" in segment.text)
-        skipped_end = next(segment for segment in skipped_segments if "END" in segment.text)
-        assert skipped_arrow.style.color.name == "grey50"
-        assert skipped_end.style.color.name == "grey50"
-        assert skipped_end.style.bold is True
-
-    def test_workflow_show_renders_end_transition_with_included_style(self) -> None:
-        from rich.console import Console
-        import aflow.status as status_mod
-        from aflow.config import WorkflowConfig, WorkflowUserConfig
-
-        steps = {
-            "go": WorkflowStepConfig(role="worker", go=(GoTransition(to="END"),)),
-        }
-        config = WorkflowUserConfig(
-            workflows={
-                "demo": WorkflowConfig(
-                    declared_steps=steps,
-                    steps=steps,
-                    first_step="go",
-                ),
-            },
-        )
-        renderable = status_mod.build_workflow_show(config=config, workflow_name="demo")
-        assert renderable is not None
-        console = Console(record=True, width=120, force_terminal=True, color_system="standard")
-        console.print(renderable)
-        text = console.export_text(styles=True)
-        assert "\x1b[32m  ├─go→ \x1b[0m\x1b[1;32mEND\x1b[0m" in text
-
-    def test_workflow_show_renders_shared_roles_and_all_workflows(self) -> None:
-        from rich.console import Console
-        import aflow.status as status_mod
-        from aflow.config import GoTransition, TeamConfig, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
-
-        alpha_steps = {
-            "plan": WorkflowStepConfig(role="architect", go=(GoTransition(to="END"),)),
-        }
-        beta_steps = {
-            "ship": WorkflowStepConfig(role="worker", go=(GoTransition(to="END"),)),
-        }
-        config = WorkflowUserConfig(
-            roles={
-                "architect": "codex.default",
-                "worker": "codex.default",
-            },
-            teams={
-                "7teen": TeamConfig(roles={"worker": "codex.nano"}),
-            },
-            workflows={
-                "alpha": WorkflowConfig(
-                    declared_steps=alpha_steps,
-                    steps=alpha_steps,
-                    first_step="plan",
-                ),
-                "beta": WorkflowConfig(
-                    declared_steps=beta_steps,
-                    steps=beta_steps,
-                    first_step="ship",
-                ),
-            },
-        )
-        renderable = status_mod.build_workflow_show(config=config)
-        assert renderable is not None
-        console = Console(record=True, width=120)
-        console.print(renderable)
-        text = console.export_text()
-        assert "Roles / Teams" in text
-        assert "architect" in text
-        assert "worker" in text
-        assert "7teen" in text
-        assert "alpha" in text
-        assert "beta" in text
-
-    def test_workflow_show_single_filters_applicable_roles_and_teams(self) -> None:
-        from rich.console import Console
-        import aflow.status as status_mod
-        from aflow.config import GoTransition, TeamConfig, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
-
-        declared_steps = {
-            "review": WorkflowStepConfig(role="reviewer", go=(GoTransition(to="implement"),)),
-            "implement": WorkflowStepConfig(role="architect", go=(GoTransition(to="END"),)),
-        }
-        config = WorkflowUserConfig(
-            roles={
-                "reviewer": "claude.opus",
-                "architect": "codex.default",
-            },
-            teams={
-                "7teen": TeamConfig(roles={"worker": "codex.nano"}),
-                "reviewers": TeamConfig(roles={"reviewer": "claude.opus"}),
-            },
-            workflows={
-                "alpha": WorkflowConfig(
-                    declared_steps=declared_steps,
-                    steps={"implement": declared_steps["implement"]},
-                    first_step="implement",
-                    excluded_steps=("review",),
-                    team="7teen",
-                ),
-            },
-        )
-        renderable = status_mod.build_workflow_show(config=config, workflow_name="alpha")
-        assert renderable is not None
-        assert status_mod._workflow_effective_role_names(config.workflows["alpha"]) == ("architect",)
-        assert status_mod._workflow_applicable_team_names(
-            config=config,
-            workflow=config.workflows["alpha"],
-            role_names=("architect",),
-        ) == ("7teen",)
-        console = Console(record=True, width=120)
-        console.print(renderable)
-        text = console.export_text()
-        assert "Roles / Teams" in text
-        assert "architect" in text
-        assert "7teen" in text
-        assert "reviewers" not in text
-        assert "review" in text
-        assert "implement" in text
-
-    def test_banner_renderer_refresh_thread_is_manual_and_coalesces_updates(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import MagicMock, patch
-
-        class FakeLive:
-            def __init__(self) -> None:
-                self.update_calls: list[tuple[object, bool]] = []
-                self.refresh_calls = 0
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                self.update_calls.append((panel, refresh))
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-
-        class FakeStopEvent:
-            def __init__(self) -> None:
-                self.wait_calls: list[float] = []
-
-            def is_set(self) -> bool:
-                return False
-
-            def wait(self, *, timeout: float) -> bool:
-                self.wait_calls.append(timeout)
-                if len(self.wait_calls) == 1:
-                    clock[0] += timeout
-                    return False
-                return True
-
-        clock = [100.0]
-        first_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        latest_state = ControllerState(last_snapshot=PlanSnapshot("latest", 1, 1, False))
-        live = FakeLive()
-        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
-             patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                git_poll_interval_seconds=9999.0,
-            )
-            renderer._live = live
-            renderer._stop_event = FakeStopEvent()
-            renderer.update(first_state)
-            renderer.update(latest_state)
-            renderer.set_context(current_step_name="latest-step")
-            assert live.update_calls == []
-            build = MagicMock(
-                side_effect=lambda state, git_summary=None: (state, renderer._current_step_name)
-            )
-            with patch.object(renderer, "_build", build):
-                renderer._refresh_loop()
-
-        assert renderer._stop_event.wait_calls == [3.0, 3.0]
-        assert renderer._refresh_interval_seconds == 3.0
-        build.assert_called_once_with(latest_state, None)
-        assert live.update_calls == [((latest_state, "latest-step"), False)]
-        assert live.refresh_calls == 1
-
-    def test_banner_renderer_start_resume_and_stop_use_manual_live_lifecycle(self) -> None:
-        import aflow.status as status_mod
-        import threading
-        from unittest.mock import patch
-
-        class ControllableStopEvent:
-            def __init__(self) -> None:
-                self._event = threading.Event()
-                self.wait_started = threading.Event()
-
-            def clear(self) -> None:
-                self._event.clear()
-                self.wait_started.clear()
-
-            def is_set(self) -> bool:
-                return self._event.is_set()
-
-            def set(self) -> None:
-                self._event.set()
-
-            def wait(self, *, timeout: float) -> bool:
-                del timeout
-                self.wait_started.set()
-                self._event.wait()
-                return True
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                self.initial_panel = panel
-                self.kwargs = kwargs
-                self.update_calls: list[tuple[object, bool]] = []
-                self.refresh_calls = 0
-                self.calls: list[str] = []
-                self.started = False
-                self.stopped = False
-                self.instances.append(self)
-
-            def start(self) -> None:
-                self.started = True
-                self.calls.append("start")
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                self.update_calls.append((panel, refresh))
-                self.calls.append("update")
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-                self.calls.append("refresh")
-
-            def stop(self) -> None:
-                self.refresh()
-                self.stopped = True
-                self.calls.append("stop")
-
-        initial_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        paused_state = ControllerState(last_snapshot=PlanSnapshot("paused", 1, 1, False))
-        resumed_state = ControllerState(last_snapshot=PlanSnapshot("resumed", 2, 2, False))
-        final_state = ControllerState(last_snapshot=PlanSnapshot("final", 3, 3, False))
-        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
-             patch.object(status_mod, "Live", FakeLive):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                current_step_name="initial-step",
-                git_poll_interval_seconds=9999.0,
-            )
-            stop_event = ControllableStopEvent()
-            renderer._stop_event = stop_event
-            with patch.object(
-                renderer,
-                "_build",
-                side_effect=lambda state, git_summary=None: (state, renderer._current_step_name),
-            ) as build:
-                renderer.start(initial_state)
-                first_live = FakeLive.instances[-1]
-                first_thread = renderer._refresh_thread
-                assert first_thread is not None
-                assert stop_event.wait_started.wait(timeout=1.0)
-                renderer.update(paused_state)
-                renderer.set_context(current_step_name="latest-step")
-                assert first_live.update_calls == []
-                renderer.pause()
-                paused_calls = list(first_live.calls)
-                renderer.update(resumed_state)
-                assert first_live.calls == paused_calls
-                renderer.resume(resumed_state)
-                resumed_live = FakeLive.instances[-1]
-                resumed_thread = renderer._refresh_thread
-                assert resumed_thread is not None
-                assert stop_event.wait_started.wait(timeout=1.0)
-                renderer.stop(final_state)
-                stopped_calls = list(resumed_live.calls)
-                renderer.update(initial_state)
-                assert resumed_live.calls == stopped_calls
-
-        assert first_live.started is True
-        assert first_live.stopped is True
-        assert first_live.initial_panel == (initial_state, "initial-step")
-        assert first_live.update_calls == [((paused_state, "latest-step"), False)]
-        assert first_thread.is_alive() is False
-        assert first_live.calls == ["start", "update", "refresh", "stop"]
-        assert first_live.refresh_calls == 1
-        assert resumed_live.started is True
-        assert resumed_live.stopped is True
-        assert resumed_thread.is_alive() is False
-        assert resumed_live.calls == ["start", "update", "refresh", "stop"]
-        assert resumed_live.initial_panel == (resumed_state, "latest-step")
-        assert [live.kwargs["auto_refresh"] for live in FakeLive.instances] == [False, False]
-        assert all("refresh_per_second" not in live.kwargs for live in FakeLive.instances)
-        assert resumed_live.update_calls == [((final_state, "latest-step"), False)]
-        assert resumed_live.refresh_calls == 1
-        assert build.call_count == 4
-
-    def test_banner_renderer_interactive_viewport_owns_actions_on_render_thread(self) -> None:
-        import aflow.status as status_mod
-        import threading
-        import time
-        from unittest.mock import patch
-
-        class FakeConsole:
-            is_terminal = True
-
-            def __init__(self) -> None:
-                self.printed: list[object] = []
-
-            def print(self, renderable: object) -> None:
-                self.printed.append(renderable)
-
-        class FakeInputSession:
-            instances: list["FakeInputSession"] = []
-
-            def __init__(self, console: object, *, wake_event: threading.Event) -> None:
-                del console
-                self.wake_event = wake_event
-                self.events: list[object] = []
-                self.events_lock = threading.Lock()
-                self.input_thread_id: int | None = None
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def emit_from_input_thread(self, event: object) -> None:
-                def enqueue() -> None:
-                    self.input_thread_id = threading.get_ident()
-                    with self.events_lock:
-                        self.events.append(event)
-                    self.wake_event.set()
-
-                thread = threading.Thread(target=enqueue)
-                thread.start()
-                thread.join()
-
-            def drain_events(self) -> tuple[object, ...]:
-                with self.events_lock:
-                    events = tuple(self.events)
-                    self.events.clear()
-                self.wake_event.clear()
-                return events
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-
-            def close(self) -> None:
-                self.close_calls += 1
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                self.initial_panel = panel
-                self.kwargs = kwargs
-                self.calls: list[tuple[str, int]] = []
-                self.update_calls: list[tuple[object, bool]] = []
-                self.refresh_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                self.calls.append(("start", threading.get_ident()))
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                self.calls.append(("update", threading.get_ident()))
-                self.update_calls.append((panel, refresh))
-
-            def refresh(self) -> None:
-                self.calls.append(("refresh", threading.get_ident()))
-                self.refresh_calls += 1
-
-            def stop(self) -> None:
-                self.calls.append(("stop", threading.get_ident()))
-
-        console = FakeConsole()
-        initial_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        latest_state = ControllerState(last_snapshot=PlanSnapshot("latest", 1, 1, False))
-        final_state = ControllerState(last_snapshot=PlanSnapshot("final", 2, 2, False))
-        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
-             patch.object(status_mod, "TerminalInputSession", FakeInputSession), \
-             patch.object(status_mod, "Live", FakeLive):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                console=console,
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            with patch.object(
-                renderer,
-                "_build",
-                side_effect=lambda state, git_summary=None: (state, git_summary),
-            ):
-                renderer.start(initial_state)
-                live = FakeLive.instances[-1]
-                session = FakeInputSession.instances[-1]
-                assert live.kwargs == {
-                    "console": console,
-                    "auto_refresh": False,
-                    "screen": True,
-                    "vertical_overflow": "crop",
-                }
-                renderer.update(latest_state)
-                session.emit_from_input_thread(status_mod.ViewportAction.LINE_DOWN)
-                deadline = time.monotonic() + 1.0
-                while time.monotonic() < deadline and not live.update_calls:
-                    time.sleep(0.01)
-                assert len(live.update_calls) == 1
-                assert live.refresh_calls == 1
-                assert session.input_thread_id is not None
-                render_threads = {
-                    thread_id
-                    for name, thread_id in live.calls
-                    if name in {"update", "refresh"}
-                }
-                assert session.input_thread_id not in render_threads
-                renderer.pause()
-                resumed_state = ControllerState(
-                    last_snapshot=PlanSnapshot("resumed", 2, 2, False),
-                )
-                renderer.resume(resumed_state)
-                resumed_live = FakeLive.instances[-1]
-                resumed_session = FakeInputSession.instances[-1]
-                assert resumed_live.kwargs["screen"] is True
-                assert resumed_live.kwargs["vertical_overflow"] == "crop"
-                assert resumed_session is not session
-                renderer.stop(final_state)
-                renderer.stop(final_state)
-
-        assert [name for name, _ in live.calls] == [
-            "start", "update", "refresh", "update", "refresh", "stop",
-        ]
-        assert [name for name, _ in resumed_live.calls] == [
-            "start", "update", "refresh", "stop",
-        ]
-        assert live.kwargs["screen"] is True
-        assert session.stop_reader_calls >= 1
-        assert session.close_calls == 1
-        assert resumed_session.close_calls == 1
-        assert len(console.printed) == 2
-
-    def test_banner_renderer_interaction_wakes_do_not_starve_git_or_duplicate_repaint(self) -> None:
-        import aflow.git_status as git_status_mod
-        import aflow.status as status_mod
-        from unittest.mock import MagicMock, patch
-
-        class ContinuousWake:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def wait(self, *, timeout: float) -> bool:
-                del timeout
-                self.calls += 1
-                clock[0] += 1.0
-                return True
-
-        class StopAfterWakes:
-            def is_set(self) -> bool:
-                return wake.calls >= 7
-
-        class InputSession:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def drain_events(self) -> tuple[object, ...]:
-                self.calls += 1
-                if self.calls % 2:
-                    return (status_mod.ViewportAction.LINE_DOWN,)
-                return (status_mod.ViewportEvent.RESIZE,)
-
-        class FakeLive:
-            def __init__(self) -> None:
-                self.update_calls: list[tuple[object, bool]] = []
-                self.refresh_calls = 0
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                self.update_calls.append((panel, refresh))
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-
-        clock = [0.0]
-        wake = ContinuousWake()
-        poll_times: list[float] = []
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        live = FakeLive()
-        renderer = status_mod.BannerRenderer(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            repo_root=Path("/fake/repo"),
-            refresh_interval_seconds=3.0,
-            git_poll_interval_seconds=2.0,
-        )
-        renderer._live = live
-        renderer._input_session = InputSession()
-        renderer._render_wake = wake
-        renderer._stop_event = StopAfterWakes()
-        renderer.update(state)
-        build = MagicMock(side_effect=lambda _state, git_summary=None: (clock[0], git_summary))
-
-        def summarize(_repo_root: Path, _baseline: object) -> object:
-            poll_times.append(clock[0])
-            return f"git-{clock[0]:.0f}"
-
-        with patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(renderer, "_build", build), \
-             patch.object(git_status_mod, "capture_baseline", return_value=object()), \
-             patch.object(git_status_mod, "summarize_since_baseline", side_effect=summarize):
-            renderer._refresh_loop()
-
-        assert poll_times == [2.0, 4.0, 6.0]
-        assert len(live.update_calls) == 6
-        assert live.refresh_calls == 6
-        assert all(refresh is False for _, refresh in live.update_calls)
-        assert live.update_calls[1][0] == (2.0, "git-2")
-        assert live.update_calls[3][0] == (4.0, "git-4")
-        assert live.update_calls[5][0] == (6.0, "git-6")
-
-    def test_banner_renderer_background_failure_detaches_and_cleans_up_idempotently(self) -> None:
-        import aflow.status as status_mod
-        import threading
-        import time
-        from unittest.mock import patch
-
-        class FakeConsole:
-            is_terminal = True
-
-            def __init__(self) -> None:
-                self.printed: list[object] = []
-
-            def print(self, renderable: object) -> None:
-                self.printed.append(renderable)
-
-        class FakeSession:
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: threading.Event) -> None:
-                del console
-                self.wake_event = wake_event
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-
-            def drain_events(self) -> tuple[object, ...]:
-                self.wake_event.clear()
-                return (status_mod.ViewportAction.LINE_DOWN,)
-
-            def close(self) -> None:
-                self.close_calls += 1
-
-        class FailingLive:
-            instances: list["FailingLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                del kwargs
-                self.panel = panel
-                self.update_calls = 0
-                self.refresh_calls = 0
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-                self.update_calls += 1
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-                raise RuntimeError("synthetic refresh failure")
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        console = FakeConsole()
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", FailingLive):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                console=console,
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            with patch.object(renderer, "_build", return_value="last-document"):
-                renderer.start(state)
-                refresh_thread = renderer._refresh_thread
-                assert refresh_thread is not None
-                FakeSession.instances[0].wake_event.set()
-                deadline = time.monotonic() + 1.0
-                while time.monotonic() < deadline and renderer._live is not None:
-                    time.sleep(0.01)
-                renderer.stop(state)
-
-        session = FakeSession.instances[0]
-        live = FailingLive.instances[0]
-        assert refresh_thread.is_alive() is False
-        assert renderer._refresh_thread is None
-        assert renderer._live is None
-        assert renderer._input_session is None
-        assert renderer._viewport is None
-        assert renderer._interactive is False
-        assert live.update_calls == 1
-        assert live.refresh_calls == 1
-        assert live.stop_calls == 1
-        assert session.stop_reader_calls == 1
-        assert session.close_calls == 1
-        assert console.printed == ["last-document"]
-
-    def test_banner_renderer_base_exception_finishes_cleanup_before_propagating(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import patch
-
-        class FakeConsole:
-            is_terminal = True
-
-            def __init__(self) -> None:
-                self.printed: list[object] = []
-                self.controls: list[str] = []
-
-            def print(self, renderable: object) -> None:
-                self.printed.append(renderable)
-
-            def show_cursor(self, visible: bool) -> None:
-                assert visible is True
-                self.controls.append("show_cursor")
-
-            def set_alt_screen(self, enabled: bool) -> None:
-                assert enabled is False
-                self.controls.append("leave_alt_screen")
-
-        class FakeSession:
-            def __init__(self, failure: str) -> None:
-                self.failure = failure
-                self.interrupt = KeyboardInterrupt(f"{failure} interrupt")
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self._thread: object | None = object()
-                self._restored = False
-                self._atexit_registered = True
-                self._started = True
-
-            @property
-            def thread(self) -> object | None:
-                return self._thread
-
-            @property
-            def is_restored(self) -> bool:
-                return self._restored
-
-            @property
-            def is_started(self) -> bool:
-                return self._started
-
-            @property
-            def is_settled(self) -> bool:
-                return (
-                    self._thread is None
-                    and self._restored
-                    and not self._atexit_registered
-                    and not self._started
-                )
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-                if self.failure == "session_reader" and self.stop_reader_calls == 1:
-                    raise self.interrupt
-                self._thread = None
-
-            def close(self) -> None:
-                self.close_calls += 1
-                if self.failure == "session_restore" and self.close_calls == 1:
-                    raise self.interrupt
-                if self.failure == "session_unregister" and self.close_calls == 1:
-                    self._thread = None
-                    self._restored = True
-                    raise self.interrupt
-                self._thread = None
-                self._restored = True
-                self._atexit_registered = False
-                self._started = False
-
-        class FakeViewport:
-            renderable: object | None = None
-
-        class FakeLive:
-            def __init__(self, failure: str) -> None:
-                self.failure = failure
-                self.interrupt = KeyboardInterrupt(f"{failure} interrupt")
-                self.update_calls = 0
-                self.refresh_calls = 0
-                self.stop_calls = 0
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-                self.update_calls += 1
-                if self.failure == "live_update":
-                    raise self.interrupt
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-                if self.failure == "live_refresh":
-                    raise self.interrupt
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-                if self.failure == "live_stop":
-                    raise self.interrupt
-
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        for failure in (
-            "live_update",
-            "live_refresh",
-            "live_stop",
-            "session_reader",
-            "session_restore",
-            "session_unregister",
-        ):
-            console = FakeConsole()
-            session = FakeSession(failure)
-            live = FakeLive(failure)
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                console=console,
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            viewport = FakeViewport()
-            renderer._live = live
-            renderer._input_session = session
-            renderer._viewport = viewport
-            renderer._interactive = True
-            renderer._last_panel = "last-panel"
-            renderer._emergency_cleanup_registered = True
-            renderer._emergency_cleanup_callback = object()
-
-            with patch.object(renderer, "_build", return_value="final-panel"), \
-                 patch.object(status_mod.atexit, "unregister") as unregister:
-                with self.assertRaises(KeyboardInterrupt) as raised:
-                    renderer.stop(state)
-
-                renderer.stop(state)
-                renderer._emergency_cleanup()
-
-            expected_interrupt = (
-                live.interrupt if failure.startswith("live_") else session.interrupt
-            )
-            assert raised.exception is expected_interrupt
-            assert live.update_calls == 1
-            assert live.refresh_calls == (0 if failure == "live_update" else 1)
-            assert live.stop_calls == 1
-            assert session.stop_reader_calls == (2 if failure == "session_reader" else 1)
-            assert session.close_calls == (2 if failure in {"session_restore", "session_unregister"} else 1)
-            assert unregister.call_count == 1
-            assert console.printed == ["final-panel"]
-            assert session.thread is None
-            assert session.is_restored
-            assert session._atexit_registered is False
-            assert session.is_started is False
-            assert session.is_settled
-            assert renderer._live is None
-            assert renderer._viewport is None
-            assert renderer._input_session is None
-            assert renderer._interactive is False
-            assert renderer._emergency_cleanup_registered is False
-            assert renderer._cleanup_in_progress is False
-            if failure == "live_stop":
-                assert console.controls == ["show_cursor", "leave_alt_screen"]
-            else:
-                assert console.controls == []
-
-    def test_banner_renderer_interrupted_start_unwinds_without_fallback(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import patch
-
-        class FakeConsole:
-            is_terminal = True
-
-            def __init__(self) -> None:
-                self.controls: list[str] = []
-
-            def show_cursor(self, visible: bool) -> None:
-                assert visible is True
-                self.controls.append("show_cursor")
-
-            def set_alt_screen(self, enabled: bool) -> None:
-                assert enabled is False
-                self.controls.append("leave_alt_screen")
-
-        class FakeSession:
-            thread = None
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: object) -> None:
-                del console, wake_event
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-
-            def close(self) -> None:
-                self.close_calls += 1
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                del panel
-                self.kwargs = kwargs
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-                raise KeyboardInterrupt("cleanup interrupt")
-
-        console = FakeConsole()
-        renderer = status_mod.BannerRenderer(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            console=console,
-            refresh_interval_seconds=60.0,
-            git_poll_interval_seconds=9999.0,
-        )
-        startup_interrupt = KeyboardInterrupt("startup interrupt")
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-
-        def fail_refresh_thread() -> None:
-            raise startup_interrupt
-
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", FakeLive), \
-             patch.object(status_mod.atexit, "register"), \
-             patch.object(status_mod.atexit, "unregister"), \
-             patch.object(renderer, "_build", return_value="panel"), \
-             patch.object(renderer, "_start_refresh_thread", side_effect=fail_refresh_thread):
-            with self.assertRaises(KeyboardInterrupt) as raised:
-                renderer.start(state)
-
-        assert raised.exception is startup_interrupt
-        assert len(FakeLive.instances) == 1
-        assert FakeLive.instances[0].kwargs["screen"] is True
-        session = FakeSession.instances[0]
-        assert session.stop_reader_calls == 1
-        assert session.close_calls == 1
-        assert FakeLive.instances[0].stop_calls == 1
-        assert console.controls == ["show_cursor", "leave_alt_screen"]
-        assert renderer._live is None
-        assert renderer._input_session is None
-        assert renderer._viewport is None
-        assert renderer._interactive is False
-        assert renderer._cleanup_in_progress is False
-
-    def test_banner_renderer_unattached_start_retries_interrupted_session_close(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import patch
-
-        startup_interrupt = KeyboardInterrupt("startup interrupt")
-        close_interrupt = KeyboardInterrupt("session close interrupt")
-
-        class FakeConsole:
-            is_terminal = True
-
-        class FakeSession:
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: object) -> None:
-                del console, wake_event
-                self.close_calls = 0
-                self._thread: object | None = object()
-                self._restored = False
-                self._atexit_registered = True
-                self._started = True
-                self.instances.append(self)
-
-            @property
-            def thread(self) -> object | None:
-                return self._thread
-
-            @property
-            def is_restored(self) -> bool:
-                return self._restored
-
-            @property
-            def is_started(self) -> bool:
-                return self._started
-
-            @property
-            def is_settled(self) -> bool:
-                return (
-                    self._thread is None
-                    and self._restored
-                    and not self._atexit_registered
-                    and not self._started
-                )
-
-            def start(self) -> None:
-                return
-
-            def close(self) -> None:
-                self.close_calls += 1
-                if self.close_calls == 1:
-                    raise close_interrupt
-                self._thread = None
-                self._restored = True
-                self._atexit_registered = False
-                self._started = False
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                del panel
-                self.kwargs = kwargs
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                raise startup_interrupt
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-
-        renderer = status_mod.BannerRenderer(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            console=FakeConsole(),
-            refresh_interval_seconds=60.0,
-            git_poll_interval_seconds=9999.0,
-        )
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", FakeLive), \
-             patch.object(renderer, "_build", return_value="panel"):
-            with self.assertRaises(KeyboardInterrupt) as raised:
-                renderer.start(state)
-
-        session = FakeSession.instances[0]
-        live = FakeLive.instances[0]
-        assert raised.exception is startup_interrupt
-        assert session.close_calls == 2
-        assert session.thread is None
-        assert session.is_restored
-        assert session.is_started is False
-        assert session.is_settled
-        assert live.stop_calls == 1
-        assert len(FakeLive.instances) == 1
-        assert renderer._live is None
-        assert renderer._input_session is None
-        assert renderer._viewport is None
-        assert renderer._interactive is False
-        assert renderer._cleanup_in_progress is False
-
-    def test_banner_renderer_failed_interactive_start_closes_session_before_fallback(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import patch
-
-        class FakeSession:
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: object) -> None:
-                del console, wake_event
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-
-            def close(self) -> None:
-                self.close_calls += 1
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                self.panel = panel
-                self.kwargs = kwargs
-                self.start_calls = 0
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                self.start_calls += 1
-                if self.kwargs["screen"]:
-                    raise RuntimeError("synthetic interactive start failure")
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-
-            def refresh(self) -> None:
-                return
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", FakeLive):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            with patch.object(renderer, "_build", return_value="panel"):
-                renderer.start(state)
-                renderer.stop(state)
-
-        session = FakeSession.instances[0]
-        interactive_live, fallback_live = FakeLive.instances
-        assert interactive_live.kwargs["screen"] is True
-        assert interactive_live.stop_calls == 1
-        assert session.stop_reader_calls == 0
-        assert session.close_calls == 1
-        assert fallback_live.kwargs["screen"] is False
-        assert fallback_live.kwargs["vertical_overflow"] == "visible"
-        assert fallback_live.stop_calls == 1
-
-    def test_banner_renderer_concurrent_cleanup_handoff_does_not_deadlock_rich_failure(self) -> None:
-        import aflow.status as status_mod
-        import threading
-        import time
-        from unittest.mock import patch
-
-        class FakeConsole:
-            is_terminal = True
-
-            def __init__(self) -> None:
-                self.printed: list[object] = []
-
-            def print(self, renderable: object) -> None:
-                self.printed.append(renderable)
-
-        class FakeSession:
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: threading.Event) -> None:
-                del console
-                self.wake_event = wake_event
-                self.stop_reader_started = threading.Event()
-                self.release_stop_reader = threading.Event()
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def stop_reader(self) -> None:
-                self.stop_reader_started.set()
-                assert self.release_stop_reader.wait(timeout=1.0)
-                self.stop_reader_calls += 1
-
-            def drain_events(self) -> tuple[object, ...]:
-                self.wake_event.clear()
-                return (status_mod.ViewportAction.LINE_DOWN,)
-
-            def close(self) -> None:
-                self.close_calls += 1
-
-        class CoordinatedLive:
-            instances: list["CoordinatedLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                del kwargs
-                self.panel = panel
-                self.update_calls = 0
-                self.refresh_calls = 0
-                self.refresh_entered = threading.Event()
-                self.release_refresh = threading.Event()
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-                self.update_calls += 1
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-                if self.refresh_calls == 1:
-                    self.refresh_entered.set()
-                    assert self.release_refresh.wait(timeout=1.0)
-                    raise RuntimeError("synthetic coordinated refresh failure")
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        console = FakeConsole()
-        renderer = status_mod.BannerRenderer(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            console=console,
-            refresh_interval_seconds=60.0,
-            git_poll_interval_seconds=9999.0,
-        )
-        stop_thread: threading.Thread | None = None
-        refresh_thread: threading.Thread | None = None
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", CoordinatedLive), \
-             patch.object(renderer, "_build", return_value="final-snapshot"):
-            renderer.start(state)
-            session = FakeSession.instances[0]
-            live = CoordinatedLive.instances[0]
-            refresh_thread = renderer._refresh_thread
-            assert refresh_thread is not None
-
-            session.wake_event.set()
-            assert live.refresh_entered.wait(timeout=1.0)
-            stop_thread = threading.Thread(target=renderer.stop, args=(state,), daemon=True)
-            stop_thread.start()
-            assert session.stop_reader_started.wait(timeout=1.0)
-            assert renderer._cleanup_in_progress is True
-
-            live.release_refresh.set()
-            session.release_stop_reader.set()
-            stop_thread.join(timeout=1.0)
-            refresh_thread.join(timeout=1.0)
-
-        assert stop_thread is not None and stop_thread.is_alive() is False
-        assert refresh_thread is not None and refresh_thread.is_alive() is False
-        renderer.stop(state)
-        assert renderer._live is None
-        assert renderer._input_session is None
-        assert renderer._viewport is None
-        assert renderer._refresh_thread is None
-        assert renderer._interactive is False
-        assert renderer._emergency_cleanup_registered is False
-        assert renderer._cleanup_in_progress is False
-        assert live.stop_calls == 1
-        assert session.close_calls == 1
-        assert console.printed == ["final-snapshot"]
-
-    def test_banner_renderer_failed_render_thread_start_restores_interactive_before_fallback(self) -> None:
-        import aflow.status as status_mod
-        import threading
-        from unittest.mock import patch
-
-        lifecycle_events: list[str] = []
-
-        class FakeConsole:
-            is_terminal = True
-
-            def print(self, renderable: object) -> None:
-                del renderable
-
-        class FakeSession:
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: object) -> None:
-                del console, wake_event
-                self.events: list[str] = []
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                lifecycle_events.append("session.start")
-                self.events.append("session.start")
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-                lifecycle_events.append("session.stop_reader")
-                self.events.append("session.stop_reader")
-
-            def close(self) -> None:
-                self.close_calls += 1
-                lifecycle_events.append("session.close")
-                self.events.append("session.close")
-
-        class FakeThread:
-            instances: list["FakeThread"] = []
-
-            def __init__(self, *, target: object, daemon: bool, name: str) -> None:
-                del target, daemon, name
-                self.started = False
-                self.join_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                self.started = True
-                if len(self.instances) == 1:
-                    raise RuntimeError("synthetic interactive render-thread start failure")
-
-            def is_alive(self) -> bool:
-                return False
-
-            def join(self) -> None:
-                self.join_calls += 1
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                self.panel = panel
-                self.kwargs = kwargs
-                self.events: list[str] = []
-                self.start_calls = 0
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                self.start_calls += 1
-                lifecycle_events.append(
-                    "interactive.live.start" if self.kwargs["screen"] else "fallback.live.start"
-                )
-                self.events.append("live.start")
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-
-            def refresh(self) -> None:
-                return
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-                lifecycle_events.append(
-                    "interactive.live.stop" if self.kwargs["screen"] else "fallback.live.stop"
-                )
-                self.events.append("live.stop")
-
-        atexit_events: list[str] = []
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", FakeLive), \
-             patch.object(status_mod.threading, "Thread", FakeThread), \
-             patch.object(status_mod.atexit, "register", side_effect=lambda callback: (atexit_events.append("register"), lifecycle_events.append("atexit.register"))), \
-             patch.object(status_mod.atexit, "unregister", side_effect=lambda callback: (atexit_events.append("unregister"), lifecycle_events.append("atexit.unregister"))):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                console=FakeConsole(),
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            with patch.object(renderer, "_build", return_value="panel"):
-                renderer.start(state)
-
-                interactive_live, fallback_live = FakeLive.instances
-                session = FakeSession.instances[0]
-                assert interactive_live.stop_calls == 1
-                assert session.close_calls == 1
-                assert atexit_events == ["register", "unregister"]
-                assert lifecycle_events.index("interactive.live.stop") < lifecycle_events.index("fallback.live.start")
-                assert lifecycle_events.index("session.close") < lifecycle_events.index("fallback.live.start")
-                assert lifecycle_events.index("atexit.unregister") < lifecycle_events.index("fallback.live.start")
-                assert renderer._emergency_cleanup_registered is False
-                assert renderer._input_session is None
-                assert renderer._viewport is None
-                assert renderer._interactive is False
-                assert renderer._live is fallback_live
-                assert atexit_events.index("unregister") < len(atexit_events)
-                assert fallback_live.start_calls == 1
-
-                renderer.stop(state)
-
-        assert FakeLive.instances[0].events == ["live.start", "live.stop"]
-        assert FakeLive.instances[1].stop_calls == 1
-        assert session.stop_reader_calls == 1
-        assert renderer._live is None
-        assert renderer._refresh_thread is None
-
-    def test_banner_renderer_failed_render_thread_start_unwinds_both_attempts(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import patch
-
-        class FakeConsole:
-            is_terminal = True
-
-            def __init__(self) -> None:
-                self.printed: list[object] = []
-
-            def print(self, renderable: object) -> None:
-                self.printed.append(renderable)
-
-        class FakeSession:
-            instances: list["FakeSession"] = []
-
-            def __init__(self, console: object, *, wake_event: object) -> None:
-                del console, wake_event
-                self.stop_reader_calls = 0
-                self.close_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def stop_reader(self) -> None:
-                self.stop_reader_calls += 1
-
-            def close(self) -> None:
-                self.close_calls += 1
-
-        class FakeThread:
-            instances: list["FakeThread"] = []
-
-            def __init__(self, *, target: object, daemon: bool, name: str) -> None:
-                del target, daemon, name
-                self.instances.append(self)
-
-            def start(self) -> None:
-                raise RuntimeError("synthetic render-thread start failure")
-
-            def is_alive(self) -> bool:
-                return False
-
-            def join(self) -> None:
-                raise AssertionError("unstarted render thread must not be joined")
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                self.panel = panel
-                self.kwargs = kwargs
-                self.start_calls = 0
-                self.stop_calls = 0
-                self.instances.append(self)
-
-            def start(self) -> None:
-                self.start_calls += 1
-
-            def stop(self) -> None:
-                self.stop_calls += 1
-
-        atexit_events: list[str] = []
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        console = FakeConsole()
-        with patch.object(status_mod, "TerminalInputSession", FakeSession), \
-             patch.object(status_mod, "Live", FakeLive), \
-             patch.object(status_mod.threading, "Thread", FakeThread), \
-             patch.object(status_mod.atexit, "register", side_effect=lambda callback: atexit_events.append("register")), \
-             patch.object(status_mod.atexit, "unregister", side_effect=lambda callback: atexit_events.append("unregister")):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                console=console,
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            with patch.object(renderer, "_build", return_value="never-printed"):
-                with pytest.raises(RuntimeError, match="render-thread start failure"):
-                    renderer.start(state)
-
-        assert len(FakeLive.instances) == 2
-        assert FakeLive.instances[0].kwargs["screen"] is True
-        assert FakeLive.instances[1].kwargs["screen"] is False
-        assert [live.stop_calls for live in FakeLive.instances] == [1, 1]
-        assert FakeSession.instances[0].stop_reader_calls == 1
-        assert FakeSession.instances[0].close_calls == 1
-        assert atexit_events == ["register", "unregister"]
-        assert renderer._live is None
-        assert renderer._input_session is None
-        assert renderer._viewport is None
-        assert renderer._refresh_thread is None
-        assert renderer._interactive is False
-        assert renderer._startup_complete is False
-        assert renderer._emergency_cleanup_registered is False
-        assert renderer._emergency_cleanup_callback is None
-        assert renderer._cleanup_in_progress is False
-        assert console.printed == []
-
-    def test_banner_renderer_falls_back_when_interactive_setup_fails(self) -> None:
-        import aflow.status as status_mod
-        from unittest.mock import patch
-
-        class FailingSession:
-            def __init__(self, console: object, *, wake_event: object) -> None:
-                del console, wake_event
-                self.closed = False
-
-            def start(self) -> None:
-                raise OSError("synthetic terminal setup failure")
-
-            def close(self) -> None:
-                self.closed = True
-
-        class FakeConsole:
-            is_terminal = True
-
-        class FakeLive:
-            instances: list["FakeLive"] = []
-
-            def __init__(self, panel: object, **kwargs: object) -> None:
-                self.panel = panel
-                self.kwargs = kwargs
-                self.instances.append(self)
-
-            def start(self) -> None:
-                return
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-
-            def refresh(self) -> None:
-                return
-
-            def stop(self) -> None:
-                return
-
-        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
-        with patch.object(status_mod, "_RICH_AVAILABLE", True), \
-             patch.object(status_mod, "TerminalInputSession", FailingSession), \
-             patch.object(status_mod, "Live", FakeLive):
-            renderer = status_mod.BannerRenderer(
-                config_max_turns=10,
-                config_plan_path=Path("/fake/plan.md"),
-                console=FakeConsole(),
-                refresh_interval_seconds=60.0,
-                git_poll_interval_seconds=9999.0,
-            )
-            with patch.object(renderer, "_build", return_value=state):
-                renderer.start(state)
-                renderer.stop(state)
-
-        assert len(FakeLive.instances) == 1
-        assert FakeLive.instances[0].kwargs["screen"] is False
-        assert FakeLive.instances[0].kwargs["vertical_overflow"] == "visible"
-
-    def test_banner_renderer_stop_cancels_due_refresh_after_git_poll(self) -> None:
-        import aflow.git_status as git_status_mod
-        import aflow.status as status_mod
-        import threading
-        from unittest.mock import MagicMock, patch
-
-        class PollStopEvent:
-            def __init__(self) -> None:
-                self._event = threading.Event()
-                self.wait_calls: list[float] = []
-                self.stop_requested = threading.Event()
-
-            def clear(self) -> None:
-                self._event.clear()
-
-            def is_set(self) -> bool:
-                return self._event.is_set()
-
-            def set(self) -> None:
-                self._event.set()
-                self.stop_requested.set()
-
-            def wait(self, *, timeout: float) -> bool:
-                self.wait_calls.append(timeout)
-                if len(self.wait_calls) == 1:
-                    clock[0] += timeout
-                    return False
-                self._event.wait()
-                return True
-
-        class FakeLive:
-            def __init__(self) -> None:
-                self.update_calls: list[tuple[object, bool]] = []
-                self.refresh_calls = 0
-                self.stopped = False
-
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                self.update_calls.append((panel, refresh))
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-
-            def stop(self) -> None:
-                self.refresh()
-                self.stopped = True
-
-        clock = [100.0]
-        poll_started = threading.Event()
-        release_poll = threading.Event()
-        state = ControllerState(last_snapshot=PlanSnapshot("state", 1, 1, False))
-        live = FakeLive()
-        stop_event = PollStopEvent()
-        renderer = status_mod.BannerRenderer(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            repo_root=Path("/fake/repo"),
-            refresh_interval_seconds=999.0,
-            git_poll_interval_seconds=1.0,
-        )
-        renderer._live = live
-        renderer._state = state
-        renderer._stop_event = stop_event
-        build = MagicMock(return_value="periodic")
-
-        def summarize(_repo_root: Path, _baseline: object) -> object:
-            poll_started.set()
-            assert release_poll.wait(timeout=1.0)
-            return "summary"
-
-        with patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(renderer, "_build", build), \
-             patch.object(git_status_mod, "capture_baseline", return_value=object()), \
-             patch.object(git_status_mod, "summarize_since_baseline", side_effect=summarize):
-            renderer._start_refresh_thread()
-            refresh_thread = renderer._refresh_thread
-            assert refresh_thread is not None
-            assert poll_started.wait(timeout=1.0)
-
-            stop_thread = threading.Thread(
-                target=renderer.stop,
-                args=(state,),
-                daemon=True,
-            )
-            stop_thread.start()
-            assert stop_event.stop_requested.wait(timeout=1.0)
-            release_poll.set()
-            stop_thread.join(timeout=1.0)
-
-        assert stop_thread.is_alive() is False
-        assert refresh_thread.is_alive() is False
-        assert build.call_count == 1
-        assert build.call_args.args == (state, None)
-        assert live.update_calls == [("periodic", False)]
-        assert live.refresh_calls == 1
-        assert live.stopped is True
-
-    def test_banner_renderer_git_poll_waits_for_its_own_deadline(self) -> None:
-        import aflow.git_status as git_status_mod
-        import aflow.status as status_mod
-        from unittest.mock import MagicMock, patch
-
-        class DeadlineStopEvent:
-            def __init__(self) -> None:
-                self.wait_calls: list[float] = []
-
-            def is_set(self) -> bool:
-                return False
-
-            def wait(self, *, timeout: float) -> bool:
-                self.wait_calls.append(timeout)
-                if len(self.wait_calls) <= 4:
-                    clock[0] += timeout
-                    return False
-                return True
-
-        class FakeLive:
-            def update(self, panel: object, *, refresh: bool = False) -> None:
-                del panel, refresh
-
-            def refresh(self) -> None:
-                pass
-
-        clock = [100.0]
-        poll_times: list[float] = []
-        state = ControllerState(last_snapshot=PlanSnapshot("latest", 1, 1, False))
-        renderer = status_mod.BannerRenderer(
-            config_max_turns=10,
-            config_plan_path=Path("/fake/plan.md"),
-            repo_root=Path("/fake/repo"),
-            refresh_interval_seconds=3.0,
-            git_poll_interval_seconds=10.0,
-        )
-        renderer._live = FakeLive()
-        renderer._stop_event = DeadlineStopEvent()
-        renderer.update(state)
-        renderer.set_context(current_step_name="latest-step")
-        build = MagicMock(return_value="panel")
-
-        def summarize(_repo_root: Path, _baseline: object) -> object:
-            poll_times.append(clock[0])
-            return "summary"
-
-        with patch.object(status_mod.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(renderer, "_build", build), \
-             patch.object(git_status_mod, "capture_baseline", return_value=object()), \
-             patch.object(git_status_mod, "summarize_since_baseline", side_effect=summarize):
-            renderer._refresh_loop()
-
-        assert poll_times == [110.0]
-        assert renderer._stop_event.wait_calls == [3.0, 3.0, 3.0, 1.0, 2.0]
-        assert build.call_count == 3
+            selected_start_step=None,
+        ) == ()
 
 
 class _FakePreflightProbe:

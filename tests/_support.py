@@ -76,7 +76,6 @@ from aflow.run_state import (
     TurnRecord,
 )
 from aflow.runlog import prune_old_runs
-from aflow.status import build_banner
 import pytest
 
 

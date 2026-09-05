@@ -3671,8 +3671,8 @@ def _run_process(
             list(invocation.argv),
             cwd=str(repo_root),
             env={**os.environ, **invocation.env},
-            # Pipe explicit prompt text; otherwise close child stdin so the
-            # dashboard retains exclusive ownership of terminal input.
+            # Pipe explicit prompt text; otherwise close child stdin so a
+            # harness child can never read interactive terminal input.
             stdin=(
                 subprocess.PIPE
                 if invocation.stdin_text is not None

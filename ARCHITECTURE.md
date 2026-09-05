@@ -28,7 +28,7 @@ flowchart TD
     Transition["workflow.py — evaluate_condition() + proposed transition"]
     Manager["workflow.py — optional manager gate"]
     RunLog["runlog.py — write run metadata & turn artifacts"]
-    Banner["status.py — Rich live banner on stderr"]
+    Banner["status.py — plain append-only status records on stderr"]
 
     User --> CLI
     CLI --> Config
@@ -352,7 +352,7 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - **`[prompts]`** section: named prompt templates.
 - Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) inherited by all workflows that don't override them. Not a runnable workflow.
 - **`[workflow.<name>]`** tables in `workflows.toml`: concrete workflows define `steps`, alias workflows use `extends` and optional `team`. Both may override lifecycle defaults with `setup`, `teardown`, `main_branch`, and `merge_prompt`.
-- Concrete and alias workflows may also set `exclude = ["step_name"]` to remove declared steps from the executable graph while keeping them visible to `aflow show` and the live banner. Alias exclusions are applied after inheritance.
+- Concrete and alias workflows may also set `exclude = ["step_name"]` to remove declared steps from the executable graph while keeping them visible to `aflow show` and status records. Alias exclusions are applied after inheritance.
 - **`[workflow.<name>.steps.<step>]`** tables: `role` (global role key), `prompts` (list of prompt keys), `go` (transition array with `to` and optional `when` condition).
 
 Lifecycle validation enforces that `(setup, teardown)` is one of three accepted tuples: `([], [])`, `(["branch"], ["merge"])`, or `(["worktree", "branch"], ["merge", "rm_worktree"])`. Any other combination is rejected at load time with the exact workflow path.
@@ -605,51 +605,36 @@ Git snapshot helpers used by the banner and CLI. Provides three public data clas
 All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
 
 ### `status.py`
-Rich-based live banner rendered to stderr during a run. The live dashboard is
-a borderless, deterministic single-column document ordered as the plan title,
-current-scope review history, chronological turns, workflow graph, and summary
-status. It shows elapsed time, run id, resumed-from run id when present,
-workflow/step name, harness, model, checkpoint progress, turn count, issues,
-plan paths, git summary (if available), schema/frozen-config identity, safe
-override diagnostics, and status.
-When the active implementation scope has rejected reviews, it also shows every
-current-scope rejection before the chronological turn cards and labels the next
-worker as a re-implementation with its compact rejection reason.
-Workflow steps carry explicit plain-text active, inactive, excluded, or skipped
-labels; color is only additional reinforcement. Controller-owned values use
-literal `Text` renderables so Rich markup-like content remains unchanged. The
-module also owns the shared workflow-graph classification helpers used by both
-the live banner and `aflow show`; only the live branch is flattened, while
-`build_workflow_show()` retains its panel-based presentation.
+Plain append-only status output rendered to stderr during a run. Meaningful
+state transitions, turn finalizations, and the final summary each emit one
+deterministic `key=value` record line prefixed with `aflow time=` and
+`event=start|update|final`. Identical consecutive snapshots are deduplicated,
+display values are bounded (durable artifact references are never truncated),
+control bytes are flattened, and dynamic Unicode content remains readable.
+Output is identical for interactive and redirected streams: no terminal-size or
+input dependence, no ANSI styling, and no cursor or alternate-screen sequences.
+Records carry run identity and lineage, status and end reason (including live
+hotplug stage, selector transition, and capability), workflow, step, checkpoint
+index/count/name, turn/max, team, role selector, harness/model, chosen
+transition and outcome, skipped start-step names, safe override diagnostics,
+manager and review-rejection pointers, repartition summaries, git summary since
+start with a bounded changed-file list, and artifact links (stdout, issues,
+manager report, review evidence).
 
-`BannerRenderer` owns a background daemon thread that waits for the first
-`refresh_interval_seconds` deadline and then performs one explicit
-`Live.update(..., refresh=False)` plus `Live.refresh()` per periodic repaint
-(default 3 s). Rich automatic refresh is disabled, and ordinary
-`update(...)`/`set_context(...)` calls only replace the newest state/context
-for the next tick. Git collection remains independently due every
-`git_poll_interval_seconds` (default 10 s), while lifecycle paints are kept
-explicit and bounded so manager reports can follow the stopped banner. Input
-wakes are drained within the same scheduler cycle, before due Git collection,
-so continuous navigation cannot starve Git and coincident work causes one
-repaint.
-On a supported POSIX TTY, `BannerRenderer` also creates one
-`TerminalInputSession` and one `ScrollableViewport`. The session owns cbreak
-input and a bounded `select()` reader, but only enqueues decoded navigation or
-resize work; the render thread applies all queued work and is the only
-background caller of `Live.update()`/`Live.refresh()`. Interactive `Live`
-instances use `screen=True`, `auto_refresh=False`, and cropped viewport output;
-all other consoles retain the borderless, non-interactive fallback. `k`/Up,
-`j`/Down, `b`/PageUp, `f`/Space/PageDown, `g`/Home, and `G`/End provide
-line/page/top/bottom navigation, with bottom restoring follow-tail. Pause and
-stop join the input and render threads, stop `Live`, restore terminal
-attributes, and then print one full borderless snapshot to normal scrollback
-only when alternate-screen mode was active. Background renderer failures and
-interpreter exit use the same idempotent renderer-owned cleanup, including
-Rich cursor/alternate-screen restoration and the session's termios restore.
-During a live run, real harness children receive closed stdin because every
-configured adapter already places its effective prompt in argv or a CLI flag;
-the dashboard/controller therefore has exclusive ownership of terminal input.
+`BannerRenderer` is the single renderer. It keeps the historical name because
+the workflow call sites and the `banner_files_limit` configuration option are
+unchanged. It owns no background threads, terminal input, alternate screen, or
+atexit cleanup: `start`/`update`/`stop`/`set_context` only maintain renderer
+state and write records, and a failed stderr disables further output instead of
+failing the run. Git statistics are captured from a start-of-run baseline at
+record time, so pre-existing dirty state is excluded.
+
+The module also owns the shared workflow-graph source helpers used by both the
+records and `aflow show`. `build_workflow_show()` renders plain ASCII: roles
+and applicable teams, then each declared step labeled `[executable]` or
+`[excluded]`, with `go ->` transitions marked `[terminal]` for END and
+`when <condition>` annotations. Skipped start-step names appear in status
+records as words.
 
 ### `skill_installer.py`
 Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, muse, and pi all use `~/.agents/skills`).
@@ -726,7 +711,7 @@ Startup models (`models.py`):
 **CLI-as-adapter boundary:**
 - `cli.py` consumes the public `aflow.api` surface for startup preparation and workflow execution.
 - Terminal rendering in `cli.py` and `status.py` is implemented as an `ExecutionObserver` over structured library events.
-- CLI-specific behavior (TTY-only prompts, Rich banner rendering, exit codes) lives entirely in `cli.py`, while startup decisions, execution state, and plan mutations are owned by the library.
+- CLI-specific behavior (TTY-only prompts, status record rendering, exit codes) lives entirely in `cli.py`, while startup decisions, execution state, and plan mutations are owned by the library.
 - Non-CLI callers can import from `aflow` or `aflow.api` directly and use the same startup and runner APIs without invoking `aflow.cli.main()` or requiring terminal access.
 
 **Typed control-plane launches:**
@@ -785,7 +770,6 @@ aflow/
   recovery.py          # harness failure classification and recovery
   scope_pressure.py    # structural scope-pressure signal parsing
   stop_marker.py       # explicit AFLOW_STOP parsing
-  terminal_viewport.py # terminal viewport and navigation helpers
   control_plane/       # shared daemon application, persistence, and units
     application.py     # canonical lifecycle application boundary
     capabilities.py    # versioned capability descriptions
@@ -804,7 +788,7 @@ aflow/
   run_state.py         # runtime data classes
   repartition.py       # immutable envelopes, strict split protocol, validation
   runlog.py            # run/turn artifact persistence
-  status.py            # Rich live banner with AFlow-owned refresh thread
+  status.py            # plain append-only status records on stderr
   git_status.py        # git snapshot helpers (probe, baseline, summary)
   skill_installer.py   # bundled skill installer
   aflow.toml           # global config, harness profiles, roles, teams, prompts
@@ -862,7 +846,7 @@ default `dev` dependency group rather than the installed runtime package.
 
 - **Plan as source of truth.** The Markdown plan file on disk is authoritative. The engine re-reads it before and after every turn because the agent subprocess may modify it (checking off steps/checkpoints).
 - **Harness-agnostic.** The engine doesn't know how any specific agent CLI works. Adapters translate a uniform interface into CLI-specific argv/env. Adding a new harness means one ~30-line adapter file.
-- **Library-first architecture.** All startup preparation and workflow execution logic lives in the `aflow.api` public surface. The CLI is a thin terminal adapter that renders library-provided questions and events for interactive use. Non-CLI callers can import and use the same library APIs without terminal access or Rich dependencies.
+- **Library-first architecture.** All startup preparation and workflow execution logic lives in the `aflow.api` public surface. The CLI is a thin terminal adapter that renders library-provided questions and events for interactive use. Non-CLI callers can import and use the same library APIs without terminal access or rendering dependencies.
 - **Interactive startup decisions are structured.** Startup decisions that require human input are represented as `StartupQuestion` objects with a `kind` enum, prompt text, and metadata. The CLI renders these as TTY prompts; library callers can present them in any UI or handle them programmatically via `prepare_startup_with_answer()`.
 - **Condition-based transitions.** Step transitions use a small expression language over three boolean symbols rather than hardcoded control flow. This keeps workflow definitions declarative.
 - **Structured run logging.** Every turn's prompts, outputs, and snapshots are persisted to `.aflow/runs/` for debugging and auditability. Old runs are pruned automatically.

@@ -277,8 +277,6 @@ def _run_manager_report_cli_case(
     *,
     invalid_managers: bool,
 ) -> tuple[int, str, Path]:
-    from rich.console import Console
-
     import aflow.cli as cli_module
 
     repo_root = tmp_path / "repo"
@@ -364,16 +362,7 @@ def _run_manager_report_cli_case(
         )
 
     def banner_factory(**kwargs):
-        return RealBannerRenderer(
-            **kwargs,
-            console=Console(
-                file=stderr,
-                force_terminal=True,
-                color_system=None,
-                width=120,
-            ),
-            refresh_interval_seconds=0.01,
-        )
+        return RealBannerRenderer(**kwargs)
 
     with redirect_stderr(stderr), \
          patch.object(cli_module, "_bootstrap_config_files", return_value=(config_path, ())), \
@@ -411,8 +400,8 @@ def test_manager_report_remains_visible_once_after_real_banner_and_cli(
     assert "## Evidence" in stderr
     assert "## Next actions" in stderr
     assert "## Artifact references" in stderr
-    assert "Manager Report" in stderr
-    assert stderr.index("Manager Report") < stderr.index(report)
+    assert "manager_report=manager-report.md" in stderr
+    assert stderr.index("manager_report=manager-report.md") < stderr.index(report)
     assert stderr.index(report) < stderr.index("Aflow exited with status 1.")
     assert run_json["failure_reason"] == report
     assert run_json["last_manager_report_path"] == "manager-report.md"
@@ -3110,6 +3099,11 @@ p = "do it"
             assert 'reviewers' in output
             assert 'alpha' in output
             assert 'beta' in output
+            assert 'step review [excluded] role=reviewer' in output
+            assert 'step implement [executable] role=architect' in output
+            assert 'go -> implement' in output
+            assert 'go -> END [terminal]' in output
+            assert '\x1b' not in output
 
     def test_cli_show_single_workflow_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

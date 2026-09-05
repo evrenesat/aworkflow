@@ -250,16 +250,41 @@ quota, provider health, model availability, or arbitrary dependency health.
 The guardian remains the fallback for older runs and unanticipated failures
 outside the safe preflight contract.
 
+## Status Output
+
+`aflow run` writes plain, append-only status records to stderr while a workflow
+executes. Each meaningful state transition, turn finalization, and the final
+summary produces one deterministic `key=value` record line:
+
+```text
+aflow time=2026-09-05T12:00:00Z event=update run=20260905T120000Z-abc123 status="running turn 3" workflow=managed step=implement checkpoint=2/5 checkpoint_name="Checkpoint 2: Implement" turn=3/10 team=base role=worker:codex.default transition=review outcome=completed git="M 1, A 0, D 0 | +12/-3 | 2 commits" artifact=.aflow/runs/<run-id>/turns/0003/stdout.txt
+```
+
+Identical consecutive snapshots are deduplicated. Output is the same ordered,
+copyable stream for interactive terminals and redirected logs, with no ANSI
+styling, cursor movement, or keyboard capture; only startup questions remain
+interactive. Display values are bounded, but durable artifact references are
+never truncated, and control bytes are flattened so pasted logs stay safe.
+Engine exit codes and final success/failure messages on stdout are unchanged.
+
 ## Show
 
-`aflow show` prints workflow diagrams and the role/team relationships they use.
+`aflow show` prints workflow graphs and the role/team relationships they use as
+plain ASCII text.
 
 ```bash
 aflow show
 aflow show review_implement_cp_review
 ```
 
-With no workflow argument, it prints a shared roles/teams section followed by every workflow in config order. With a workflow name, it prints only that workflow plus the roles and teams that apply to it. Steps listed in `exclude = [...]` stay visible in gray because `aflow show` uses the declared graph, not only the executable step map.
+With no workflow argument, it prints a shared roles/teams section followed by
+every workflow in config order. With a workflow name, it prints only that
+workflow plus the roles and teams that apply to it (the workflow's default team
+is marked `(default)`). Each declared step is labeled `[executable]` or
+`[excluded]` with words rather than color, so steps listed in
+`exclude = [...]` stay visible in the declared graph. Transitions print as
+`go -> <target>`, with `[terminal]` marking END and `when <condition>` shown
+after conditional transitions.
 
 ## Plan Format
 
