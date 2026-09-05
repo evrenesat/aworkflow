@@ -25,6 +25,18 @@ AFLOW_APP_TOKEN=secret uv run --project apps/aflow_app/server aflow-app-server
 
 The server binds to `127.0.0.1:8765` by default and serves the built web client from the same origin.
 
+## Web workspace
+
+The web client is a bearer-authenticated, same-origin workspace for exactly one selected registered project at a time. Navigation is Projects, Configuration, Plans, and Runs. The bearer token is kept in memory only and sent as a header; no token, project path, or editor content is persisted in the browser.
+
+Projects view: lists only registry-backed projects with a readiness state (`ready`, `configuration_required`, or `blocked`). A create/register form accepts a normalized relative path beneath the managed root, an optional display name, main branch, optional initial workflow and team, and — for register mode — an explicit initialize-Git confirmation for empty non-Git directories and an optional starter-config initialization that never overwrites existing documents. Unregister removes only the registry record after an inline confirmation that states files, Git history, and plans are preserved. Project-list failures surface a retry instead of local filesystem choices.
+
+Configuration view: two plain-text tabs for `aflow.toml` and `workflows.toml` under one displayed combined SHA-256 revision. Validate checks the candidate pair without saving; Save commits both documents atomically with `expected_revision`. Stale-revision conflicts keep the local text in the editor and reload the server copy only after an explicit discard confirmation. When runs block saving, the blocking run IDs and statuses are listed. Unsaved edits show an indicator, confirm navigation away, and guard page reload. A save that leaves the configuration valid links on to the Plans view.
+
+Plans view: lists the `todo`, `in-progress`, and `done` lifecycle sections, creates plans, and edits them as plain Markdown with expected-revision saves and one-step promotion. Local text is preserved on network and revision-conflict failures; the server copy is reloaded only after confirmation. An in-progress plan can be opened in the run dashboard.
+
+Runs view: the existing durable run dashboard (project run list, selected-run status, bounded events, and context). Live controls and restart flows are documented separately when implemented.
+
 ## Configuration
 
 The server reads `~/.config/aflow/config.toml` and these environment overrides:

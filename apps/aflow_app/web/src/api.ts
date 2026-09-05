@@ -1,6 +1,12 @@
 import type {
+  ConfigValidation,
   PlanDocument,
   PlanStatus,
+  ProjectConfig,
+  ProjectConfigSaveRequest,
+  ProjectConfigValidateRequest,
+  ProjectCreateRequest,
+  ProjectCreateResult,
   ProjectInfo,
   ControlPlaneCapabilities,
   ControlPlanePlan,
@@ -125,6 +131,43 @@ export async function updateProject(
     method: 'PATCH',
     body: JSON.stringify(request),
   })
+}
+
+export async function createProject(request: ProjectCreateRequest): Promise<ProjectCreateResult> {
+  return fetchJson<ProjectCreateResult>(`${API_BASE}/projects`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })
+}
+
+export async function unregisterProject(projectId: string): Promise<void> {
+  await fetchJson<void>(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, {
+    method: 'DELETE',
+  })
+}
+
+export async function getProjectConfig(projectId: string): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/config`)
+}
+
+export async function saveProjectConfig(
+  projectId: string,
+  request: ProjectConfigSaveRequest,
+): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/config`, {
+    method: 'PUT',
+    body: JSON.stringify(request),
+  })
+}
+
+export async function validateProjectConfig(
+  projectId: string,
+  request: ProjectConfigValidateRequest,
+): Promise<ConfigValidation> {
+  return fetchJson<ConfigValidation>(
+    `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/validate`,
+    { method: 'POST', body: JSON.stringify(request) },
+  )
 }
 
 export async function listProjectPlans(projectId: string, status?: PlanStatus): Promise<PlanDocument[]> {
@@ -440,36 +483,5 @@ export async function checkHealth(): Promise<{ status: string }> {
   if (!response.ok) {
     throw new Error('Health check failed')
   }
-  return response.json()
-}
-
-export async function transcribeAudio(audioFile: File): Promise<{ text: string }> {
-  const formData = new FormData()
-  formData.append('file', audioFile)
-
-  const token = getAuthToken()
-  const headers: HeadersInit = {}
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`
-  }
-
-  const response = await fetch(`${API_BASE}/transcribe`, {
-    method: 'POST',
-    headers,
-    body: formData,
-  })
-
-  if (!response.ok) {
-    const text = await response.text()
-    let message = text
-    try {
-      const json = JSON.parse(text)
-      message = json.detail || json.message || text
-    } catch {
-      // Use text as-is
-    }
-    throw new ApiError(response.status, message)
-  }
-
   return response.json()
 }

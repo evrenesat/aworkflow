@@ -51,4 +51,82 @@ describe('workflow control API client', () => {
     await expect(api.updateProjectPlan('project-1', 'todo', 'demo.md', { content: 'x', expected_revision: 'a'.repeat(64) }))
       .rejects.toMatchObject({ status: 409, code: 'revision_conflict' })
   })
+
+  it('creates and unregisters projects through the registry-scoped contract', async () => {
+    api.setAuthToken('test-token')
+    mockOkJson({
+      id: 'beta', display_name: 'Beta', relative_root: 'beta', root: '/srv/code/beta',
+      created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required',
+    }, 201)
+    const created = await api.createProject({
+      mode: 'register', path: 'beta', display_name: 'Beta', main_branch: 'main',
+      initial_workflow: 'starter', initial_team: null, initialize_git: true, initialize_config: false,
+    })
+    expect(created.id).toBe('beta')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'register', path: 'beta', display_name: 'Beta', main_branch: 'main',
+        initial_workflow: 'starter', initial_team: null, initialize_git: true, initialize_config: false,
+      }),
+    }))
+
+    mockOkJson(undefined, 204)
+    await api.unregisterProject('beta')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('reads, validates, and revision-saves the canonical configuration pair', async () => {
+    api.setAuthToken('test-token')
+    const validation = {
+      state: 'configuration_required', issues: [], placeholders: ['harness.starter.profiles.default.model'],
+      workflows: ['starter'], teams: [], roles: [],
+    }
+    mockOkJson({
+      project_id: 'beta', revision: 'a'.repeat(64), documents: ['aflow.toml', 'workflows.toml'],
+      aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', validation,
+    })
+    const config = await api.getProjectConfig('beta')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config', expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+    }))
+    expect(config.revision).toBe('a'.repeat(64))
+
+    mockOkJson(validation)
+    await api.validateProjectConfig('beta', { aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config/validate', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' }),
+    }))
+
+    mockOkJson({ ...config, revision: 'b'.repeat(64) })
+    await api.saveProjectConfig('beta', {
+      aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', expected_revision: 'a'.repeat(64),
+    })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({
+        aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', expected_revision: 'a'.repeat(64),
+      }),
+    }))
+  })
+
+  it('carries config conflict and blocker detail through ApiError', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false, status: 409,
+      text: async () => JSON.stringify({
+        detail: {
+          code: 'config_save_blocked',
+          blocking_runs: [{ run_id: 'run-9', status: 'running' }],
+        },
+      }),
+    } as Response)
+    await expect(api.saveProjectConfig('beta', {
+      aflow_toml: 'x', workflows_toml: 'y', expected_revision: 'a'.repeat(64),
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'config_save_blocked',
+      detail: { blocking_runs: [{ run_id: 'run-9', status: 'running' }] },
+    })
+  })
 })

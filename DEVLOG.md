@@ -71,6 +71,27 @@
   preserving strict resume checks, idempotency, unit exclusivity, and frozen
   configuration controls.
 
+## 2026-09-05 — Project, config, and plan web workspace
+
+- Rebuilt the web shell around one canonical registered project with
+  Projects / Configuration / Plans / Runs navigation, registry-backed
+  readiness pills (`ready`, `configuration_required`, `blocked`), and guided
+  setup: a new or newly registered project lands in the configuration view,
+  and a ready configuration links on to plan selection.
+- Added typed create/register and non-destructive unregister flows: relative
+  managed-root path, display name, main branch, optional initial
+  workflow/team, explicit initialize-Git confirmation for register mode, and
+  confirmations that state files, history, and plans are preserved.
+- Added a two-tab plain-text editor for `aflow.toml` / `workflows.toml` with
+  the shared combined revision, validate-only and atomic save calls,
+  stale-revision recovery that keeps local text until an explicit
+  discard-and-reload, active-run blocker lists, and unsaved-edit guards
+  (navigation confirmation and beforeunload).
+- Plan create/read/edit/promote now recover from revision conflicts the same
+  way, and every failure path preserves the local draft.
+- Removed the dead `transcribeAudio` client method that targeted the deleted
+  transcription route; no session/provider/audio UI remains.
+
 ## 2026-09-05 - Add revisioned remote project configuration
 
 - Added the authenticated two-document project configuration contract for

@@ -1,10 +1,72 @@
+export type ProjectReadiness = 'ready' | 'configuration_required' | 'blocked'
+
 export interface ProjectInfo {
   id: string
   display_name: string
   current_path: string
   is_git_root: boolean
   registered_at: string
-  readiness: 'ready' | 'configuration_required' | 'blocked'
+  readiness: ProjectReadiness
+}
+
+export interface ProjectCreateRequest {
+  mode: 'create' | 'register'
+  path: string
+  display_name?: string | null
+  main_branch?: string
+  initial_workflow?: string | null
+  initial_team?: string | null
+  initialize_git?: boolean
+  initialize_config?: boolean
+}
+
+export interface ProjectCreateResult {
+  id: string
+  display_name: string
+  relative_root: string
+  root: string
+  created_at: string
+  readiness: ProjectReadiness
+}
+
+export interface ConfigValidationIssue {
+  document: string | null
+  line: number | null
+  message: string
+}
+
+export interface ConfigValidation {
+  state: 'ready' | 'configuration_required' | 'invalid'
+  issues: ConfigValidationIssue[]
+  placeholders: string[]
+  workflows: string[]
+  teams: string[]
+  roles: string[]
+}
+
+export interface ProjectConfig {
+  project_id: string
+  revision: string
+  documents: string[]
+  aflow_toml: string
+  workflows_toml: string
+  validation: ConfigValidation
+}
+
+export interface ProjectConfigSaveRequest {
+  aflow_toml: string
+  workflows_toml: string
+  expected_revision: string
+}
+
+export interface ProjectConfigValidateRequest {
+  aflow_toml: string
+  workflows_toml: string
+}
+
+export interface ConfigBlockedRun {
+  run_id: string
+  status: string
 }
 
 export type PlanStatus = 'todo' | 'in_progress' | 'done'

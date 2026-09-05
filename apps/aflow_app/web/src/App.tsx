@@ -1,17 +1,40 @@
-import { useEffect, useState } from 'react'
-import type { ProjectInfo } from './types'
+import { useCallback, useEffect, useState } from 'react'
+import type { ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
+import { readinessClass, readinessLabel } from './readiness'
 import { ProjectPicker } from './components/ProjectPicker'
+import { ConfigEditor } from './components/ConfigEditor'
 import { PlanPanel } from './components/PlanPanel'
 import { RunDashboard } from './components/RunDashboard'
 import * as api from './api'
 
-type View = 'plans' | 'runs'
+type View = 'projects' | 'configuration' | 'plans' | 'runs'
+
+const NAV_ITEMS: Array<{ view: View; label: string; needsProject: boolean }> = [
+  { view: 'projects', label: 'Projects', needsProject: false },
+  { view: 'configuration', label: 'Configuration', needsProject: true },
+  { view: 'plans', label: 'Plans', needsProject: true },
+  { view: 'runs', label: 'Runs', needsProject: true },
+]
+
+const readinessGuidance: Record<string, string> = {
+  configuration_required:
+    'This project needs explicit configuration before workflows can start. '
+    + 'Review both documents, then validate and save the pair.',
+  blocked:
+    'The registered root is not currently a usable Git project root. '
+    + 'Fix the directory (a valid Git commit HEAD is required), then re-check the project.',
+}
 
 export function App() {
   const [authToken, setAuthTokenState] = useState('')
   const [isAuthenticated, setIsAuthenticated] = useState(false)
-  const [selectedProject, setSelectedProject] = useState<ProjectInfo | null>(null)
-  const [currentView, setCurrentView] = useState<View>('plans')
+  const [projects, setProjects] = useState<ProjectInfo[]>([])
+  const [projectsLoading, setProjectsLoading] = useState(false)
+  const [projectsError, setProjectsError] = useState<string | null>(null)
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
+  const [view, setView] = useState<View>('projects')
+  const [configDirty, setConfigDirty] = useState(false)
+  const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
 
   useEffect(() => {
@@ -21,6 +44,22 @@ export function App() {
       setIsAuthenticated(true)
     }
   }, [])
+
+  const loadProjects = useCallback(async () => {
+    try {
+      setProjectsLoading(true)
+      setProjectsError(null)
+      setProjects(await api.listProjects())
+    } catch (err) {
+      setProjectsError(err instanceof Error ? err.message : 'Failed to load registered projects')
+    } finally {
+      setProjectsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (isAuthenticated) void loadProjects()
+  }, [isAuthenticated, loadProjects])
 
   function handleLogin() {
     if (!authToken.trim()) return
@@ -32,19 +71,72 @@ export function App() {
     api.clearAuthToken()
     setIsAuthenticated(false)
     setAuthTokenState('')
-    setSelectedProject(null)
-    setCurrentView('plans')
+    setProjects([])
+    setProjectsError(null)
+    setSelectedProjectId(null)
+    setView('projects')
+    setConfigDirty(false)
+    setPendingAction(null)
     setRunDashboardPlanPath(null)
   }
 
-  function handleSelectProject(project: ProjectInfo) {
-    setSelectedProject(project)
-    setCurrentView('plans')
+  /**
+   * Guards navigation away from unsaved configuration text: the requested
+   * action only runs after an explicit confirmation.
+   */
+  function requestGuarded(description: string, run: () => void) {
+    if (configDirty) setPendingAction({ description, run })
+    else run()
   }
+
+  function confirmPendingAction() {
+    if (!pendingAction) return
+    setConfigDirty(false)
+    pendingAction.run()
+    setPendingAction(null)
+  }
+
+  function switchView(next: View) {
+    if (next === view) return
+    if (NAV_ITEMS.find((item) => item.view === next)?.needsProject && !selectedProject) return
+    requestGuarded(`leave the configuration editor for ${next}`, () => setView(next))
+  }
+
+  function selectProject(project: ProjectInfo) {
+    if (project.id === selectedProjectId) return
+    requestGuarded(`open ${project.display_name} with unsaved configuration edits`, () => {
+      setSelectedProjectId(project.id)
+      setRunDashboardPlanPath(null)
+    })
+  }
+
+  async function handleCreateProject(request: ProjectCreateRequest): Promise<ProjectCreateResult> {
+    const created = await api.createProject(request)
+    const refreshed = await api.listProjects()
+    setProjects(refreshed)
+    const ready = refreshed.find((project) => project.id === created.id)?.readiness === 'ready'
+    setSelectedProjectId(created.id)
+    setView(ready ? 'plans' : 'configuration')
+    return created
+  }
+
+  async function handleUnregister(projectId: string) {
+    await api.unregisterProject(projectId)
+    if (selectedProjectId === projectId) {
+      setSelectedProjectId(null)
+      setView('projects')
+    }
+    await loadProjects()
+  }
+
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
+
+  const handleConfigDirty = useCallback((dirty: boolean) => setConfigDirty(dirty), [])
+  const handleConfigReady = useCallback(() => setView('plans'), [])
 
   function handleOpenRunDashboard(planPath: string) {
     setRunDashboardPlanPath(planPath)
-    setCurrentView('runs')
+    setView('runs')
   }
 
   if (!isAuthenticated) {
@@ -64,44 +156,107 @@ export function App() {
   }
 
   return (
-    <div style={{ minHeight: '100%', display: 'flex', flexDirection: 'column' }}>
-      <header style={{ padding: 'var(--spacing-md)', borderBottom: '1px solid var(--color-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 'var(--spacing-md)' }}>
+    <div className="app-shell">
+      <header className="app-header">
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>aflow</h1>
-          <div className="text-xs text-dim truncate">Registered projects, plans, configuration, and daemon-owned runs</div>
+          <div className="text-xs text-dim truncate">Registered projects, configuration, plans, and daemon-owned runs</div>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={handleLogout}>Logout</button>
       </header>
 
-      <main style={{ flex: 1, display: 'grid', gridTemplateColumns: selectedProject ? 'minmax(280px, 360px) minmax(0, 1fr)' : 'minmax(0, 1fr)', gap: 'var(--spacing-md)', padding: 'var(--spacing-md)', minHeight: 0, alignItems: 'stretch', overflow: 'hidden' }}>
-        <aside style={{ minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <ProjectPicker selectedProjectId={selectedProject?.id ?? null} onSelectProject={handleSelectProject} />
-        </aside>
-        <section style={{ minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)', overflow: 'hidden' }}>
-          {selectedProject ? (
-            <>
-              <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-sm)' }}>
-                <div style={{ fontWeight: 600 }}>{selectedProject.display_name}</div>
-                <div className="text-xs text-dim mono">{selectedProject.current_path}</div>
-                <div style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
-                  <button className="btn btn-secondary btn-sm" onClick={() => setCurrentView('plans')}>Plans</button>
-                  <button className="btn btn-secondary btn-sm" onClick={() => setCurrentView('runs')}>Runs</button>
+      <nav className="workspace-nav" aria-label="Workspace views">
+        {NAV_ITEMS.map((item) => (
+          <button
+            key={item.view}
+            className={`nav-tab ${view === item.view ? 'active' : ''}`}
+            aria-current={view === item.view ? 'page' : undefined}
+            disabled={item.needsProject && !selectedProject}
+            title={item.needsProject && !selectedProject ? 'Select a project first' : undefined}
+            onClick={() => switchView(item.view)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </nav>
+
+      {pendingAction && (
+        <div className="card unsaved-guard" role="alertdialog" aria-label="Unsaved configuration edits">
+          <span className="text-sm">
+            You have unsaved configuration edits. Leave anyway to continue?
+          </span>
+          <div className="dashboard-actions">
+            <button className="btn btn-danger btn-sm" onClick={confirmPendingAction}>Leave anyway</button>
+            <button className="btn btn-secondary btn-sm" onClick={() => setPendingAction(null)}>Stay</button>
+          </div>
+        </div>
+      )}
+
+      <main className="workspace-main">
+        {view === 'projects' && (
+          <ProjectPicker
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            loading={projectsLoading}
+            error={projectsError}
+            onSelectProject={selectProject}
+            onRefresh={() => void loadProjects()}
+            onCreate={handleCreateProject}
+            onUnregister={handleUnregister}
+          />
+        )}
+
+        {view !== 'projects' && !selectedProject && (
+          <div className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60%' }}>
+            <div className="text-sm text-dim">Select a registered project in the Projects view first.</div>
+          </div>
+        )}
+
+        {view !== 'projects' && selectedProject && (
+          <div className="workspace-content">
+            <div className="card selected-project-bar">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-xs)', minWidth: 0 }}>
+                <div className="content-button-row">
+                  <strong style={{ overflowWrap: 'anywhere' }}>{selectedProject.display_name}</strong>
+                  <span className={readinessClass(selectedProject.readiness)}>
+                    {readinessLabel(selectedProject.readiness)}
+                  </span>
                 </div>
+                <span className="text-xs text-dim mono" style={{ overflowWrap: 'anywhere' }}>
+                  {selectedProject.current_path}
+                </span>
               </div>
-              <div style={{ minHeight: 0, flex: 1 }}>
-                {currentView === 'plans' && <PlanPanel project={selectedProject} onOpenRunDashboard={handleOpenRunDashboard} />}
-                {currentView === 'runs' && (
-                  <RunDashboard initialProjectRoot={selectedProject.current_path} initialPlanPath={runDashboardPlanPath}
-                    onInitialPlanHandled={() => setRunDashboardPlanPath(null)} />
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="card" style={{ minHeight: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', padding: 'var(--spacing-lg)' }}>
-              <div><strong>Select a registered project</strong><div className="text-sm text-dim">Plan and run tools will appear here.</div></div>
+              {readinessGuidance[selectedProject.readiness] && (
+                <div className="readiness-guidance">
+                  <p className="text-sm">{readinessGuidance[selectedProject.readiness]}</p>
+                  {selectedProject.readiness === 'configuration_required' && view !== 'configuration' && (
+                    <button className="btn btn-secondary btn-sm" onClick={() => switchView('configuration')}>
+                      Open configuration
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
-          )}
-        </section>
+
+            {view === 'configuration' && (
+              <ConfigEditor
+                project={selectedProject}
+                onDirtyChange={handleConfigDirty}
+                onReady={handleConfigReady}
+              />
+            )}
+            {view === 'plans' && (
+              <PlanPanel project={selectedProject} onOpenRunDashboard={handleOpenRunDashboard} />
+            )}
+            {view === 'runs' && (
+              <RunDashboard
+                initialProjectRoot={selectedProject.current_path}
+                initialPlanPath={runDashboardPlanPath}
+                onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
+              />
+            )}
+          </div>
+        )}
       </main>
     </div>
   )
