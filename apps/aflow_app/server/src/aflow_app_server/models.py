@@ -311,6 +311,41 @@ class OwnerStopPayload(CanonicalTransportModel):
     expected_revision: int = Field(ge=0)
 
 
+class ConfigValidationIssueModel(CanonicalTransportModel):
+    document: str | None = None
+    line: int | None = None
+    message: str
+
+
+class ConfigValidationModel(CanonicalTransportModel):
+    state: Literal["ready", "configuration_required", "invalid"]
+    issues: tuple[ConfigValidationIssueModel, ...]
+    placeholders: tuple[str, ...]
+    workflows: tuple[str, ...]
+    teams: tuple[str, ...]
+    roles: tuple[str, ...]
+
+
+class ProjectConfigResponse(CanonicalTransportModel):
+    project_id: str
+    revision: str
+    documents: tuple[str, ...]
+    aflow_toml: str
+    workflows_toml: str
+    validation: ConfigValidationModel
+
+
+class ProjectConfigSavePayload(CanonicalTransportModel):
+    aflow_toml: str
+    workflows_toml: str
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ProjectConfigValidatePayload(CanonicalTransportModel):
+    aflow_toml: str
+    workflows_toml: str
+
+
 def canonical_contract_payloads() -> dict[str, dict[str, Any]]:
     """Expose field names used by API tests to guard canonical-model drift."""
     samples = {

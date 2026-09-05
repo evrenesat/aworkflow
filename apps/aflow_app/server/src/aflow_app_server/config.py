@@ -114,6 +114,9 @@ class ServerConfig:
     project_registry_path: Path = field(
         default_factory=lambda: Path("~/.config/aflow/projects.json").expanduser()
     )
+    config_audit_path: Path = field(
+        default_factory=lambda: Path("~/.config/aflow/config_audit.jsonl").expanduser()
+    )
     aflow_executable: Path = field(default_factory=lambda: Path("/usr/bin/aflow"))
     release_identity: str = "unconfigured"
     environment_file: Path = field(default_factory=lambda: Path("/etc/aflowd.env"))
@@ -323,6 +326,14 @@ class ServerConfig:
                     "AFLOW_PROJECT_REGISTRY_PATH",
                     control_plane_section.get(
                         "project_registry_path", str(config_dir / "projects.json")
+                    ),
+                )
+            ).expanduser(),
+            config_audit_path=Path(
+                os.environ.get(
+                    "AFLOW_CONFIG_AUDIT_PATH",
+                    control_plane_section.get(
+                        "config_audit_path", str(config_dir / "config_audit.jsonl")
                     ),
                 )
             ).expanduser(),

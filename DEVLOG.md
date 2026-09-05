@@ -28,6 +28,21 @@
   for pending routing state and `resumed_from_team`/`resume_team_override`
   provenance. Automatic and ordinary resumes retain strict team matching.
 
+## 2026-09-05 - Add revisioned remote project configuration
+
+- Added the authenticated two-document project configuration contract for
+  aflow.toml and workflows.toml, with combined revisions, private-pair
+  validation, bounded diagnostics, placeholder readiness, and redacted audit
+  metadata.
+- Saves use per-project compare-and-swap locking and rollback-safe staged
+  replacement. Control-plane-owned active or resume-compatible runs block
+  edits; terminal and legacy history remain read-only and do not block idle
+  configuration.
+- Successful saves reload future-run capabilities while preserving existing
+  workflow units and durable run state. Focused server/API and frozen-config
+  tests cover validation, concurrency, lockout, rollback, and capability
+  reload.
+
 ## 2026-09-02 — Manager context references and prompt budget
 
 - A 340 KB manager context (incident `20260902t053828z-5cfe3386`, decision

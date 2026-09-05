@@ -376,3 +376,24 @@ reported as `configuration_required` until explicit role selectors and harness
 profiles replace the placeholder; `aflow` and the remote app classify readiness
 through the normal loader and placeholder detection, not a second validator.
 Existing configuration documents are never overwritten.
+
+## Remote project configuration
+
+The remote workflow control app edits the complete project configuration as one
+revisioned pair under the project .aflow/config directory:
+
+- GET /api/projects/{project_id}/config returns the exact UTF-8 text of
+  aflow.toml and workflows.toml, their combined SHA-256 revision, and bounded
+  readiness details.
+- POST /api/projects/{project_id}/config/validate validates a candidate pair
+  without writing it. Diagnostics include only document names, line numbers,
+  and bounded semantic messages; prompts, tokens, and filesystem paths are
+  excluded.
+- PUT /api/projects/{project_id}/config requires both complete documents and
+  the revision returned by the read. A stale revision, invalid pair,
+  placeholder selector, or owned nonterminal/resume-compatible run rejects the
+  write before either file changes.
+- A successful write stages and fsyncs both documents, replaces them with
+  rollback handling, appends redacted revision metadata to server state, and
+  reloads capabilities for future runs. Existing workflow units and run
+  records retain their current configuration and controls.

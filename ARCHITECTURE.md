@@ -904,6 +904,28 @@ workflow execution through `aflow.api`, SSE execution events, token
 authentication, and optional audio transcription. Configuration is loaded from
 environment variables and `~/.config/aflow/config.toml`.
 
+- `project_config_service.py` owns exactly the two project configuration
+  documents, `.aflow/config/aflow.toml` and `.aflow/config/workflows.toml`,
+  addressed by document name only. Reads resolve the exact registered root,
+  reject symlink/hard-link/non-regular files, oversized text, and invalid
+  UTF-8, and return the exact bytes plus a combined SHA-256 revision and a
+  bounded validation report (state, document/line diagnostics, parsed
+  workflow/team/role names; never prompts, secrets, or filesystem paths).
+- Candidate pairs validate together in a private temporary directory through
+  the production loader, semantic validator, and placeholder detection before
+  any live byte changes. A save enforces compare-and-swap on the combined
+  revision under a per-project write lock, stages and fsyncs both files, and
+  replaces them as one rollback-safe transaction that restores the previous
+  valid bytes if the second replacement fails. Bounded, redacted audit records
+  (project ID, revisions, time, caller scope, outcome) append to server state.
+- Saves are rejected while any control-plane-owned run of that project is
+  nonterminal, awaiting startup input, stopping, `needs_attention`, or still
+  resume-compatible; `failed`/`interrupted` runs block only while the current
+  on-disk configuration still matches their frozen manifest fingerprint, and
+  terminal runs never block. A committed pair reloads future-run capabilities
+  through daemon recomposition without touching durable run state; general
+  config edits affect future runs only, and live changes remain run controls.
+
 ### Web Client (`apps/aflow_app/web/`)
 
 The React client uses only provider-neutral project and planning-session

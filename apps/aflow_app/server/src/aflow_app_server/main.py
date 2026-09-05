@@ -46,6 +46,8 @@ from .control_plane_service import (
 from .mcp_adapter import create_control_plane_mcp
 from .models import (
     CapabilityResponse,
+    ConfigValidationIssueModel,
+    ConfigValidationModel,
     ContextResponse,
     ControlResponse,
     EventResponse,
@@ -54,6 +56,9 @@ from .models import (
     OwnerStopPayload,
     PlanListResponse,
     PlanResponse,
+    ProjectConfigResponse,
+    ProjectConfigSavePayload,
+    ProjectConfigValidatePayload,
     ProjectListResponse,
     ProjectResponse,
     RunControlPayload,
@@ -70,6 +75,14 @@ from .planning import AttachmentStore, PlanningService, ProviderRegistry
 from .planning.providers import CodexProvider
 from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
+from .project_config_service import (
+    ConfigValidationReport,
+    ProjectConfigError,
+    ProjectConfigService,
+    ProjectConfigRevisionConflict,
+    ProjectConfigRunBlocked,
+    ProjectConfigSnapshot,
+)
 from .project_registry import ProjectRegistry, ProjectRegistryCatalog, ProjectRegistryError
 from .project_service import (
     ProjectRequest,
@@ -87,6 +100,7 @@ _project_catalog: ProjectCatalog | ProjectRegistryCatalog | None = None
 _project_registry: ProjectRegistry | None = None
 _service: AflowService | None = None
 _control_plane_service: ControlPlaneService | None = None
+_project_config_service: ProjectConfigService | None = None
 _transcription_client: TranscriptionClient | None = None
 _planning_registry: ProviderRegistry | None = None
 _planning_service: PlanningService | None = None
@@ -250,6 +264,16 @@ def get_control_plane_service() -> ControlPlaneService:
     return _control_plane_service
 
 
+def get_project_config_service() -> ProjectConfigService:
+    """Return the registry-backed config text service."""
+    if _project_config_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "control_plane_unavailable"},
+        )
+    return _project_config_service
+
+
 def get_transcription_client() -> TranscriptionClient:
     """Get the transcription client."""
     if _transcription_client is None:
@@ -386,7 +410,7 @@ class _MCPMount(Mount):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize server state on startup."""
-    global _config, _project_catalog, _project_registry, _service, _control_plane_service, _transcription_client
+    global _config, _project_catalog, _project_registry, _service, _control_plane_service, _project_config_service, _transcription_client
     global _planning_registry, _planning_service
 
     _config = ServerConfig.from_env()
@@ -409,6 +433,11 @@ async def lifespan(app: FastAPI):
         environment=_config.control_plane_environment,
     ))
     _control_plane_service.start()
+    _project_config_service = ProjectConfigService(
+        project_registry,
+        _control_plane_service,
+        audit_path=_config.config_audit_path,
+    )
     _transcription_client = create_transcription_client(
         _config.transcription_url,
         _config.transcription_token,
@@ -469,6 +498,7 @@ async def lifespan(app: FastAPI):
         _project_registry = None
         _service = None
         _control_plane_service = None
+        _project_config_service = None
         _transcription_client = None
 
 
@@ -569,6 +599,31 @@ async def restart_required_handler(_: Request, exc: RestartRequiredControlError)
     )
 
 
+@app.exception_handler(ProjectConfigRevisionConflict)
+async def config_revision_conflict_handler(
+    _: Request, exc: ProjectConfigRevisionConflict
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT,
+        "revision_conflict",
+        current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(ProjectConfigRunBlocked)
+async def config_save_blocked_handler(
+    _: Request, exc: ProjectConfigRunBlocked
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT,
+        "config_save_blocked",
+        blocking_runs=[
+            {"run_id": run_id, "status": run_status}
+            for run_id, run_status in exc.blocking_runs
+        ],
+    )
+
+
 @app.exception_handler(DaemonAuthorizationError)
 @app.exception_handler(ServiceAuthorizationError)
 async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse:
@@ -581,6 +636,7 @@ async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse
 @app.exception_handler(ValueError)
 @app.exception_handler(ProjectRegistryError)
 @app.exception_handler(ProjectServiceError)
+@app.exception_handler(ProjectConfigError)
 async def rejected_operation_handler(_: Request, __: Exception) -> JSONResponse:
     return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "operation_rejected")
 
@@ -1056,6 +1112,89 @@ async def update_project(
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project.to_dict()
+
+
+# Project configuration endpoints.  Exactly two documents are addressable;
+# no route, payload, or response field can name a third file.
+def _config_validation_response(report: ConfigValidationReport) -> ConfigValidationModel:
+    return ConfigValidationModel(
+        state=report.state,  # type: ignore[arg-type]
+        issues=tuple(
+            ConfigValidationIssueModel(
+                document=issue.document, line=issue.line, message=issue.message
+            )
+            for issue in report.issues
+        ),
+        placeholders=report.placeholders,
+        workflows=report.workflows,
+        teams=report.teams,
+        roles=report.roles,
+    )
+
+
+def _config_response(snapshot: ProjectConfigSnapshot) -> ProjectConfigResponse:
+    return ProjectConfigResponse(
+        project_id=snapshot.project_id,
+        revision=snapshot.revision,
+        documents=snapshot.documents,
+        aflow_toml=snapshot.aflow_toml,
+        workflows_toml=snapshot.workflows_toml,
+        validation=_config_validation_response(snapshot.validation),
+    )
+
+
+@app.get(
+    "/api/projects/{project_id}/config",
+    response_model=ProjectConfigResponse,
+    tags=["projects"],
+)
+def get_project_config(
+    project_id: str,
+    _: str = Depends(verify_token),
+    service: ProjectConfigService = Depends(get_project_config_service),
+) -> ProjectConfigResponse:
+    """Return both exact configuration texts with their combined revision."""
+    return _config_response(service.read(project_id))
+
+
+@app.put(
+    "/api/projects/{project_id}/config",
+    response_model=ProjectConfigResponse,
+    tags=["projects"],
+)
+def save_project_config(
+    project_id: str,
+    payload: ProjectConfigSavePayload,
+    _: str = Depends(verify_token),
+    service: ProjectConfigService = Depends(get_project_config_service),
+) -> ProjectConfigResponse:
+    """Validate and atomically commit both documents as one revisioned pair."""
+    return _config_response(
+        service.save(
+            project_id,
+            payload.aflow_toml,
+            payload.workflows_toml,
+            payload.expected_revision,
+            caller_scope="rest",
+        )
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/config/validate",
+    response_model=ConfigValidationModel,
+    tags=["projects"],
+)
+def validate_project_config(
+    project_id: str,
+    payload: ProjectConfigValidatePayload,
+    _: str = Depends(verify_token),
+    service: ProjectConfigService = Depends(get_project_config_service),
+) -> ConfigValidationModel:
+    """Validate a candidate pair through the production loader without saving."""
+    return _config_validation_response(
+        service.validate_candidate(project_id, payload.aflow_toml, payload.workflows_toml)
+    )
 
 
 # Plan endpoints
