@@ -354,6 +354,8 @@ def create_control_plane_mcp(
         team: str | None = None,
         start_step: str | None = None,
         max_turns: int | None = None,
+        extra_instructions: list[str] | None = None,
+        restarted_from_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Reserve and start one daemon-owned workflow, or return its startup question."""
         return tool_result(
@@ -365,6 +367,8 @@ def create_control_plane_mcp(
                     team=team,
                     start_step=start_step,
                     max_turns=max_turns,
+                    extra_instructions=tuple(extra_instructions or ()),
+                    restarted_from_run_id=restarted_from_run_id,
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
                 )
@@ -377,6 +381,8 @@ def create_control_plane_mcp(
                 "team": team,
                 "start_step": start_step,
                 "max_turns": max_turns,
+                "extra_instructions": extra_instructions,
+                "restarted_from_run_id": restarted_from_run_id,
             },
         )
 

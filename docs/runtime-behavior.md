@@ -395,6 +395,21 @@ after reconciliation reports `needs_attention`. Do not restart an exact
 workflow unit to recover it: the daemon records the ambiguity and an explicit
 resume creates a new linked continuation. An owner stop is terminal.
 
+REST and MCP fresh starts share one typed StartupRequest. Capability discovery
+lists each workflow's declared, executable, and excluded steps, canonical first
+step, default team, configured roles/teams, admitted selectors, and public
+status vocabulary. A numeric start-step input resolves against executable
+steps and only its canonical name is durable. Earlier executable steps appear
+as skipped in status and run events.
+
+A workflow change uses a fresh successor start with restarted_from_run_id.
+The daemon accepts that lineage only after the same-project, same-caller source
+has explicit owner-stop evidence and its exact unit is inactive. The successor
+gets a new run ID and normal frozen-config validation. Resume remains strict
+continuation of the saved invocation. Bounded extra instructions affect the
+request digest and worker prompt but their text is omitted from control-plane
+manifests, start records, events, and status.
+
 `aflow-guard-development-run` remains opt-in supervision for the exact run a
 user explicitly asks it to guard, particularly normal direct-CLI and legacy
 workflows. It is not a second daemon controller, a release-health monitor, or

@@ -175,8 +175,8 @@ def _prepared(request) -> PreparedRun:
         config_path=request.config_path,
         max_turns=request.max_turns or 15,
         team=request.team,
-        extra_instructions=(),
-        start_step=request.start_step or "implement",
+        extra_instructions=request.extra_instructions,
+        start_step=("implement" if request.start_step in {None, "1"} else request.start_step),
     )
 
 
@@ -724,3 +724,78 @@ def test_project_config_save_blocked_while_run_active_then_allowed_after_stop(
     assert saved.status_code == 200
     assert saved.json()["revision"] != before["revision"]
     assert saved.json()["validation"]["state"] == "ready"
+
+
+def test_rest_typed_successor_start_exposes_lineage_and_keeps_instruction_text_transient(
+    control_client,
+) -> None:
+    client, root, units, monkeypatch = control_client
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    source_response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "rest-source"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "start_step": "1",
+            "max_turns": 2,
+        },
+    )
+    assert source_response.status_code == 201
+    source_id = source_response.json()["result"]["run_id"]
+    stopped = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/owner-stop",
+        headers={"Idempotency-Key": "rest-source-stop"},
+        json={"expected_revision": 0},
+    )
+    assert stopped.status_code == 200
+
+    sentinel = "private-rest-guidance-91ac"
+    successor_response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "rest-successor"},
+        json={
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+            "start_step": "1",
+            "max_turns": 3,
+            "extra_instructions": [sentinel],
+            "restarted_from_run_id": source_id,
+        },
+    )
+
+    assert successor_response.status_code == 201
+    successor = successor_response.json()["result"]
+    assert successor["run_id"] != source_id
+    assert successor["restarted_from_run_id"] == source_id
+    status = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{successor['run_id']}"
+    )
+    assert status.status_code == 200
+    assert status.json()["selected_start_step"] == "implement"
+    assert status.json()["restarted_from_run_id"] == source_id
+    assert units.start_calls[-1][1][-1] == f"--extra-instruction={sentinel}"
+    durable = [
+        root / ".aflow" / "launches" / f"{successor['run_id']}.json",
+        root / ".aflow" / "start-requests" / f"{successor['run_id']}.json",
+        root / ".aflow" / "runs" / successor["run_id"] / "events.jsonl",
+    ]
+    assert all(sentinel not in path.read_text() for path in durable)
+    source_events = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/events"
+    )
+    assert source_events.status_code == 200
+    assert any(
+        event["event_type"] == "restart_successor_requested"
+        and event["data"]["successor_run_id"] == successor["run_id"]
+        for event in source_events.json()["events"]
+    )
+
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "unknown_launch_option": True,
+        },
+    )
+    assert rejected.status_code == 422

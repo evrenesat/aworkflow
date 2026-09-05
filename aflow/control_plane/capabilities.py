@@ -7,7 +7,7 @@ from pathlib import Path
 from aflow.config import WorkflowUserConfig, load_workflow_config
 from aflow.harnesses import ADAPTERS
 
-from .models import CapabilitySet
+from .models import CapabilitySet, WorkflowCapability
 
 
 class CapabilityError(ValueError):
@@ -46,12 +46,50 @@ class CapabilityService:
         roles = set(config.roles)
         for team in config.teams.values():
             roles.update(team.roles)
+        admitted: dict[str, set[str]] = {
+            role: {selector} for role, selector in config.roles.items()
+        }
+        for team in config.teams.values():
+            for role, selector in team.roles.items():
+                admitted.setdefault(role, set()).add(selector)
+        workflow_details = {
+            name: WorkflowCapability(
+                declared_steps=tuple(workflow.declared_steps or workflow.steps),
+                executable_steps=tuple(workflow.steps),
+                excluded_steps=tuple(workflow.excluded_steps),
+                first_step=workflow.first_step,
+                default_team=workflow.team,
+            )
+            for name, workflow in sorted(config.workflows.items())
+        }
         controls = ("max_turns", "owner_stop", "team", "role_selectors")
         return CapabilitySet(
             workflows=tuple(sorted(config.workflows)),
             teams=tuple(sorted(config.teams)),
             roles=tuple(sorted(roles)),
             controls=controls,
+            workflow_details=workflow_details,
+            admitted_role_selectors={
+                role: tuple(sorted(selectors))
+                for role, selectors in sorted(admitted.items())
+            },
+            status_values=(
+                "manifest_only",
+                "launch_requested",
+                "launch_started",
+                "unit_started",
+                "awaiting_startup_answer",
+                "initializing",
+                "running",
+                "waiting_for_valid_override",
+                "waiting_for_hotplug_recovery",
+                "needs_attention",
+                "completed",
+                "done",
+                "failed",
+                "interrupted",
+                "owner_stopped",
+            ),
             team_upgrade_chains=team_chains,
             control_safety={
                 "max_turns": "safe",
@@ -62,6 +100,8 @@ class CapabilityService:
                 "plan": "restart_required",
                 "repository": "restart_required",
                 "lifecycle": "restart_required",
+                "start_step": "restart_required",
+                "extra_instructions": "restart_required",
             },
             service_features=tuple(
                 sorted(

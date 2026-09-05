@@ -398,6 +398,27 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
     )
     assert stopped["launch_phase"] == "owner_stopped"
 
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    successor = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+            "start_step": "1",
+            "max_turns": 4,
+            "extra_instructions": ["mcp-runtime-guidance"],
+            "restarted_from_run_id": resumed_id,
+            "idempotency_key": "mcp-successor-1",
+        },
+    )
+    assert successor["result"]["restarted_from_run_id"] == resumed_id
+    assert (
+        units.start_calls[-1][1][-1]
+        == "--extra-instruction=mcp-runtime-guidance"
+    )
+
 
 def test_mcp_client_template_is_secret_free_and_requires_write_approval() -> None:
     import tomllib

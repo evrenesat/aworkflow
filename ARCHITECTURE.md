@@ -729,6 +729,21 @@ Startup models (`models.py`):
 - CLI-specific behavior (TTY-only prompts, Rich banner rendering, exit codes) lives entirely in `cli.py`, while startup decisions, execution state, and plan mutations are owned by the library.
 - Non-CLI callers can import from `aflow` or `aflow.api` directly and use the same startup and runner APIs without invoking `aflow.cli.main()` or requiring terminal access.
 
+**Typed control-plane launches:**
+
+- REST and MCP adapt into one StartupRequest; transport models reject unknown
+  fields and the daemon resolves numeric start steps before run reservation.
+- Immutable launch manifests carry canonical step, skipped-step, frozen-config,
+  and optional restarted_from_run_id metadata. Extra-instruction text stays
+  transient while its digest binds idempotency.
+- A restart successor is a normal fresh launch with a new run ID. Its source
+  must have same-project control-plane ownership, an explicit owner-stop
+  terminal event, and an inactive exact unit. Resume remains the separate,
+  strict saved-invocation continuation path.
+- The server's per-project lock covers config lookup, predecessor validation,
+  and successor reservation/unit start. It is released after the unit is
+  active and is never held across workflow execution.
+
 ## Workflow Configuration
 
 Workflows are state machines defined in `workflows.toml`. Each step has:

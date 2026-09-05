@@ -263,7 +263,9 @@ class ControlPlaneService:
         team: str | None,
         start_step: str | None,
         max_turns: int | None,
-        idempotency_key: str | None,
+        extra_instructions: tuple[str, ...] = (),
+        restarted_from_run_id: str | None = None,
+        idempotency_key: str | None = None,
         caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
         with self.project_lock(project_id):
@@ -277,6 +279,8 @@ class ControlPlaneService:
                 start_step=start_step,
                 max_turns=max_turns,
                 team=team,
+                extra_instructions=extra_instructions,
+                restarted_from_run_id=restarted_from_run_id,
             )
             return item.daemon.service.start(
                 request,
@@ -317,7 +321,7 @@ class ControlPlaneService:
             caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
-        return result, item.daemon.application.repository.get_run_status(run_id)
+        return result, item.daemon.service.run_status(run_id)
 
     def owner_stop(
         self,
@@ -328,12 +332,13 @@ class ControlPlaneService:
         idempotency_key: str | None,
         caller_scope: str = "rest",
     ) -> RunStatus:
-        return self._project(project_id).daemon.service.owner_stop(
-            run_id,
-            expected_revision=expected_revision,
-            caller_scope=self._caller_scope(project_id, caller_scope),
-            idempotency_key=idempotency_key,
-        )
+        with self.project_lock(project_id):
+            return self._project(project_id).daemon.service.owner_stop(
+                run_id,
+                expected_revision=expected_revision,
+                caller_scope=self._caller_scope(project_id, caller_scope),
+                idempotency_key=idempotency_key,
+            )
 
     def resume(
         self,

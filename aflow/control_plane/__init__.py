@@ -13,6 +13,7 @@ from .models import (
     RunStatus,
     StartupQuestionRecord,
     StartRunResult,
+    WorkflowCapability,
 )
 from .application import ControlPlaneApplication, compose_control_plane
 from .capabilities import CapabilityError, CapabilityService
@@ -68,6 +69,7 @@ __all__ = [
     "RunStatus",
     "StartupQuestionRecord",
     "StartRunResult",
+    "WorkflowCapability",
     "ControlPlaneApplication",
     "compose_control_plane",
     "CapabilityError",

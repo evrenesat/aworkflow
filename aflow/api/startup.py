@@ -554,6 +554,14 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         hasattr(parsed_plan, "snapshot")
         and getattr(parsed_plan.snapshot, "is_complete", False)
     )
+    executable_steps = tuple(
+        request.workflow_config.workflows[workflow_name].steps
+    )
+    skipped_steps = (
+        ()
+        if request.resume_requested
+        else executable_steps[: executable_steps.index(selected_start_step)]
+    )
 
     return PreparedRun(
         workflow_name=workflow_name,
@@ -576,6 +584,8 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         continuation_mode=(
             "current_branch" if request.continue_from_current else None
         ),
+        restarted_from_run_id=request.restarted_from_run_id,
+        skipped_steps=skipped_steps,
     )
 
 

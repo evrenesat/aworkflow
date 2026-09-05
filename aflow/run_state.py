@@ -353,6 +353,8 @@ class ControllerConfig:
     continuation_from_branch: str | None = None
     continuation_from_head: str | None = None
     continuation_mode: str | None = None
+    restarted_from_run_id: str | None = None
+    skipped_steps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

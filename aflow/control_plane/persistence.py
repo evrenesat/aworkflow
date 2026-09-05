@@ -18,6 +18,8 @@ from uuid import uuid4
 
 from .models import (
     CONTROL_PLANE_SCHEMA_VERSION,
+    MAX_SERIALIZED_ITEMS,
+    MAX_SERIALIZED_TEXT,
     ContextBundle,
     LaunchManifest,
     RunControlRequest,
@@ -184,6 +186,8 @@ def normalized_request_digest(manifest: LaunchManifest) -> str:
         "extra_instructions": list(manifest.extra_instructions),
         "caller_scope": manifest.caller_scope,
         "frozen_config_fingerprint": manifest.frozen_config_fingerprint,
+        "restarted_from_run_id": manifest.restarted_from_run_id,
+        "skipped_steps": list(manifest.skipped_steps),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -251,6 +255,22 @@ def _write_atomic_bytes(path: Path, payload: bytes) -> None:
             pass
 
 
+def _manifest_step_names(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) > MAX_SERIALIZED_ITEMS
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > MAX_SERIALIZED_TEXT
+            for item in value
+        )
+        or len(set(value)) != len(value)
+    ):
+        raise PersistenceError("invalid launch manifest skipped steps")
+    return tuple(value)
+
+
 def _manifest_from_payload(payload: Mapping[str, Any]) -> LaunchManifest:
     try:
         manifest = LaunchManifest(
@@ -275,6 +295,12 @@ def _manifest_from_payload(payload: Mapping[str, Any]) -> LaunchManifest:
                 else None
             ),
             intended_unit=(str(payload["intended_unit"]) if payload.get("intended_unit") is not None else None),
+            restarted_from_run_id=(
+                validate_run_id(str(payload["restarted_from_run_id"]))
+                if payload.get("restarted_from_run_id") is not None
+                else None
+            ),
+            skipped_steps=_manifest_step_names(payload.get("skipped_steps", ())),
             created_at=str(payload["created_at"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -296,6 +322,9 @@ def _same_idempotent_request(existing: LaunchManifest, requested: LaunchManifest
 def create_launch_manifest(repo_root: Path, manifest: LaunchManifest) -> StartRunResult:
     """Exclusively create immutable launch intent, or return an identical replay."""
     run_id = validate_run_id(manifest.run_id)
+    if manifest.restarted_from_run_id is not None:
+        validate_run_id(manifest.restarted_from_run_id)
+    _manifest_step_names(manifest.skipped_steps)
     run_dir = _safe_run_dir(repo_root, run_id)
     launches = _launches_root(repo_root)
     path = launches / f"{run_id}.json"

@@ -5540,6 +5540,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert len(run_dirs_numeric) == 1
             run_json_numeric = json.loads((run_dirs_numeric[0] / 'run.json').read_text(encoding='utf-8'))
             selected_step_numeric = run_json_numeric['selected_start_step']
+            numeric_events = [
+                json.loads(line)['event_type']
+                for line in (run_dirs_numeric[0] / 'events.jsonl').read_text(encoding='utf-8').splitlines()
+            ]
+            assert 'launch_requested' in numeric_events
+            assert 'steps_skipped' in numeric_events
 
             # Clean up runs directory
             import shutil

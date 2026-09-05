@@ -65,6 +65,8 @@ class WorkflowRunner:
             reserved_run_id=prepared.reserved_run_id,
             idempotency_key=prepared.idempotency_key,
             caller_scope=prepared.caller_scope,
+            restarted_from_run_id=prepared.restarted_from_run_id,
+            skipped_steps=prepared.skipped_steps,
         )
 
         parsed_plan: ParsedPlan | None = None

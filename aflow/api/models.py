@@ -52,6 +52,7 @@ class StartupRequest:
     idempotency_key: str | None = None
     caller_scope: str | None = None
     continue_from_current: bool = False
+    restarted_from_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,8 @@ class PreparedRun:
     continuation_from_branch: str | None = None
     continuation_from_head: str | None = None
     continuation_mode: str | None = None
+    restarted_from_run_id: str | None = None
+    skipped_steps: tuple[str, ...] = ()
 
 
 # Re-export shared, versioned control-plane models through the public API.
@@ -119,6 +122,7 @@ from aflow.control_plane.models import (  # noqa: E402
     RunEvent,
     RunStatus,
     StartRunResult,
+    WorkflowCapability,
 )
 
 __all__ = [
@@ -135,4 +139,5 @@ __all__ = [
     "RunEvent",
     "RunStatus",
     "StartRunResult",
+    "WorkflowCapability",
 ]

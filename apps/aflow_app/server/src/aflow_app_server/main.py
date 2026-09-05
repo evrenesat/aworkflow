@@ -815,6 +815,8 @@ def start_run(
         team=payload.team,
         start_step=payload.start_step,
         max_turns=payload.max_turns,
+        extra_instructions=payload.extra_instructions,
+        restarted_from_run_id=payload.restarted_from_run_id,
         idempotency_key=idempotency_key,
     )
     adapted = _start_response(result)

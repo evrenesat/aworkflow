@@ -182,6 +182,9 @@ class RunRepository:
             current_step=_optional_text(metadata.get("current_step_name")),
             turns_completed=_optional_int(metadata.get("turns_completed")),
             max_turns=_optional_int(metadata.get("max_turns")) or manifest.max_turns,
+            selected_start_step=manifest.start_step,
+            skipped_steps=manifest.skipped_steps,
+            restarted_from_run_id=manifest.restarted_from_run_id,
             evidence={
                 "has_run_metadata": bool(metadata),
                 "manifest_created_at": manifest.created_at,
@@ -319,6 +322,12 @@ class RunRepository:
                 request_digest=_optional_text(payload.get("request_digest")),
                 frozen_config_fingerprint=_optional_text(payload.get("frozen_config_fingerprint")),
                 intended_unit=_optional_text(payload.get("intended_unit")),
+                restarted_from_run_id=(
+                    validate_run_id(str(payload["restarted_from_run_id"]))
+                    if payload.get("restarted_from_run_id") is not None
+                    else None
+                ),
+                skipped_steps=_manifest_step_names(payload.get("skipped_steps", ())),
                 created_at=str(payload["created_at"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -381,6 +390,17 @@ class RunRepository:
         except (OSError, RuntimeError, ValueError) as exc:
             raise RepositoryError("repository artifact escapes project root") from exc
         return resolved
+
+
+def _manifest_step_names(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) > 128
+        or any(not isinstance(item, str) or not item or len(item) > 4_096 for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise RepositorySchemaError("launch manifest skipped steps are invalid")
+    return tuple(value)
 
 
 def _optional_text(value: object) -> str | None:

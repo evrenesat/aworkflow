@@ -209,7 +209,9 @@ class LocalControlPlaneService:
         team: str | None,
         start_step: str | None,
         max_turns: int | None,
-        idempotency_key: str | None,
+        extra_instructions: tuple[str, ...] = (),
+        restarted_from_run_id: str | None = None,
+        idempotency_key: str | None = None,
         caller_scope: str = "mcp",
     ) -> StartRunResult | StartupQuestionRecord:
         self._assert_project(project_id)
@@ -222,6 +224,8 @@ class LocalControlPlaneService:
             start_step=start_step,
             max_turns=max_turns,
             team=team,
+            extra_instructions=extra_instructions,
+            restarted_from_run_id=restarted_from_run_id,
         )
         return self._daemon.service.start(
             request,

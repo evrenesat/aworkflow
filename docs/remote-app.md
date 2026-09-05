@@ -86,6 +86,15 @@ The web client lists all three states, creates and edits plans with revisions, p
 
 The durable control-plane surface remains under `/api/control-plane`. It provides capabilities, plans, runs, event snapshots and streams, bounded context, startup answers, compare-and-swap controls, owner stop, and resume. State-changing retries use the `Idempotency-Key` header.
 
+A start request accepts typed plan_path, workflow_name, team, start_step,
+max_turns, bounded extra_instructions, and restarted_from_run_id. Unknown fields
+fail validation. Capabilities expose the ordered declared/executable/excluded
+workflow steps and admitted selectors so a client can construct valid choices.
+A restart predecessor must first be stopped through owner stop and have no
+active exact unit; a successful request creates a new run and exposes immutable
+predecessor lineage. Resume continues the saved invocation and does not accept
+replacement launch choices.
+
 The `/mcp` streamable HTTP endpoint exposes the same canonical operations and bearer policy. The lightweight `aflow daemon` exposes the shared MCP contract without the web app.
 
 ## Development checks

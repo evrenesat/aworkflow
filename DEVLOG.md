@@ -59,6 +59,18 @@
   for pending routing state and `resumed_from_team`/`resume_team_override`
   provenance. Automatic and ordinary resumes retain strict team matching.
 
+## 2026-09-06 — Add typed workflow starts and successor lineage
+
+- Added canonical launch options across REST, MCP, daemon, and worker boundaries,
+  including validated workflow steps, bounded ephemeral instructions, and
+  durable request digests without prompt content.
+- Expanded capabilities and status with declared, executable, excluded, and
+  skipped steps plus configured teams, roles, admitted selectors, and the
+  public status vocabulary.
+- Added owner-stopped successor starts with immutable predecessor lineage while
+  preserving strict resume checks, idempotency, unit exclusivity, and frozen
+  configuration controls.
+
 ## 2026-09-05 - Add revisioned remote project configuration
 
 - Added the authenticated two-document project configuration contract for

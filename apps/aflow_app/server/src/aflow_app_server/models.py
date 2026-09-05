@@ -27,12 +27,23 @@ class CanonicalTransportModel(BaseModel):
         return cls.model_validate(value.to_dict())
 
 
+class WorkflowCapabilityResponse(CanonicalTransportModel):
+    declared_steps: tuple[str, ...]
+    executable_steps: tuple[str, ...]
+    excluded_steps: tuple[str, ...]
+    first_step: str | None = None
+    default_team: str | None = None
+
+
 class CapabilityResponse(CanonicalTransportModel):
     schema_version: int
     workflows: tuple[str, ...]
     teams: tuple[str, ...]
     roles: tuple[str, ...]
     controls: tuple[str, ...]
+    workflow_details: Mapping[str, WorkflowCapabilityResponse]
+    admitted_role_selectors: Mapping[str, tuple[str, ...]]
+    status_values: tuple[str, ...]
     context_levels: tuple[Literal["lite", "full"], ...]
     team_upgrade_chains: Mapping[str, tuple[str, ...]]
     control_safety: Mapping[str, Literal["safe", "restart_required"]]
@@ -53,6 +64,9 @@ class RunStatusResponse(CanonicalTransportModel):
     current_step: str | None = None
     turns_completed: int | None = None
     max_turns: int | None = None
+    selected_start_step: str | None = None
+    skipped_steps: tuple[str, ...] = ()
+    restarted_from_run_id: str | None = None
     evidence: Mapping[str, Any]
 
 
@@ -63,6 +77,7 @@ class StartRunResponse(CanonicalTransportModel):
     schema_version: int
     manifest_path: str | None = None
     reason: str | None = None
+    restarted_from_run_id: str | None = None
 
 
 class StartupQuestionResponse(CanonicalTransportModel):
@@ -162,6 +177,8 @@ class StartRunPayload(CanonicalTransportModel):
     team: str | None = Field(default=None, max_length=128)
     start_step: str | None = Field(default=None, max_length=128)
     max_turns: int | None = Field(default=None, ge=1)
+    extra_instructions: tuple[str, ...] = Field(default=(), max_length=8)
+    restarted_from_run_id: str | None = Field(default=None, max_length=64)
 
 
 class StartupAnswerPayload(CanonicalTransportModel):

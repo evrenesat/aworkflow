@@ -2355,6 +2355,12 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_worker_parser.add_argument("--repo-root", required=True, type=Path)
     daemon_worker_parser.add_argument("--config", required=True, type=Path)
     daemon_worker_parser.add_argument("--run-id", required=True)
+    daemon_worker_parser.add_argument(
+        "--extra-instruction",
+        action="append",
+        default=[],
+        help=argparse.SUPPRESS,
+    )
 
     install_parser = subparsers.add_parser(
         "install-skills",
@@ -2905,6 +2911,7 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=args.repo_root,
             config_path=args.config,
             run_id=args.run_id,
+            extra_instructions=tuple(args.extra_instruction),
         )
 
     if args.command == "daemon":

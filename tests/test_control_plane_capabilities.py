@@ -7,6 +7,7 @@ from aflow.config import (
     TeamConfig,
     WorkflowConfig,
     WorkflowHarnessConfig,
+    WorkflowStepConfig,
     WorkflowUserConfig,
 )
 from aflow.control_plane import CapabilityError, CapabilityService
@@ -21,7 +22,18 @@ def test_capabilities_are_derived_from_config_with_full_upgrade_chains() -> None
             "strong": TeamConfig(roles={"reviewer": "codex.high"}, upgrade_to="max"),
             "max": TeamConfig(roles={"lead": "codex.high"}),
         },
-        workflows={"managed": WorkflowConfig(first_step="implement")},
+        workflows={
+            "managed": WorkflowConfig(
+                declared_steps={
+                    "plan": WorkflowStepConfig(role="worker"),
+                    "implement": WorkflowStepConfig(role="worker"),
+                },
+                steps={"implement": WorkflowStepConfig(role="worker")},
+                first_step="implement",
+                excluded_steps=("plan",),
+                team="base",
+            )
+        },
     )
 
     capabilities = CapabilityService(config).get()
@@ -30,6 +42,14 @@ def test_capabilities_are_derived_from_config_with_full_upgrade_chains() -> None
     assert capabilities.roles == ("lead", "reviewer", "worker")
     assert capabilities.team_upgrade_chains["base"] == ("base", "strong", "max")
     assert capabilities.control_safety["workflow"] == "restart_required"
+    details = capabilities.workflow_details["managed"]
+    assert details.declared_steps == ("plan", "implement")
+    assert details.executable_steps == ("implement",)
+    assert details.excluded_steps == ("plan",)
+    assert details.first_step == "implement"
+    assert details.default_team == "base"
+    assert capabilities.admitted_role_selectors["worker"] == ("codex.high",)
+    assert "owner_stopped" in capabilities.status_values
     assert "adapter:codex" in capabilities.service_features
 
 

@@ -59,6 +59,12 @@ When two bare positional arguments are given, `aflow` resolves them by checking 
 
 Extra CLI instructions after `--` are appended to the rendered step prompt.
 
+REST and MCP starts use the same typed choices: plan path, workflow, team,
+start step, max turns, bounded extra instructions, and an optional stopped-run
+predecessor. Numeric start steps remain 1-based and are stored as canonical
+step names. Selecting a later executable step reports the earlier executable
+steps as skipped.
+
 ## Startup Prompts
 
 If you omit `--start-step` and the plan is partly complete, `aflow` prompts you to pick a step when the workflow has more than one step.
@@ -93,6 +99,12 @@ the plan, workflow, team, start step, max-turns, or extra instructions only
 when the value is compatible with the saved invocation; conflicting values
 fail without creating a new run. Fresh `aflow run` invocations still require a
 plan.
+
+A remote successor restart is separate from resume. It creates a fresh run
+with normal startup validation and records restarted_from_run_id; the source
+must be daemon-owned, explicitly owner-stopped, and have no active exact unit.
+Use resume to continue the saved invocation without changing its launch
+identity.
 
 Only schema-version `2` run metadata is resumable. Older, missing, boolean,
 string, and future schema values are readable for inspection but are rejected

@@ -2063,6 +2063,7 @@ def _daemon_manifest_matches_execution(existing: object, expected: object) -> bo
         "idempotency_key",
         "caller_scope",
         "frozen_config_fingerprint",
+        "restarted_from_run_id",
     )
     if any(getattr(existing, field, None) != getattr(expected, field, None) for field in fields):
         return False
@@ -2070,7 +2071,13 @@ def _daemon_manifest_matches_execution(existing: object, expected: object) -> bo
         return False
     existing_start_step = getattr(existing, "start_step", None)
     expected_start_step = getattr(expected, "start_step", None)
-    return existing_start_step is None or existing_start_step == expected_start_step
+    if existing_start_step is None:
+        return True
+    return (
+        existing_start_step == expected_start_step
+        and getattr(existing, "skipped_steps", ())
+        == getattr(expected, "skipped_steps", ())
+    )
 
 
 def _frozen_identity_mismatch(
@@ -5646,6 +5653,8 @@ def run_workflow(
             idempotency_key=config.idempotency_key,
             caller_scope=config.caller_scope,
             frozen_config_fingerprint=current_frozen_identity.config_fingerprint,
+            restarted_from_run_id=config.restarted_from_run_id,
+            skipped_steps=config.skipped_steps,
         )
         existing_manifest = (
             RunRepository(config.repo_root).get_launch_manifest(reserved_run_id)
@@ -5735,7 +5744,24 @@ def run_workflow(
             {"run_id": reserved_run_id, "manifest_path": launch_result.manifest_path},
         )
         write_launch_phase(config.repo_root, reserved_run_id, "launch_requested")
-        append_run_event(run_paths.run_dir, "launch_requested", {"resumed": resume is not None})
+    if config.skipped_steps:
+        append_run_event(
+            run_paths.run_dir,
+            "steps_skipped",
+            {"steps": list(config.skipped_steps), "selected_start_step": config.start_step},
+        )
+    if config.restarted_from_run_id is not None:
+        append_run_event(
+            run_paths.run_dir,
+            "restart_successor",
+            {"restarted_from_run_id": config.restarted_from_run_id},
+        )
+    if launch_result.created:
+        append_run_event(
+            run_paths.run_dir,
+            "launch_requested",
+            {"resumed": resume is not None},
+        )
     write_launch_phase(config.repo_root, reserved_run_id, "launch_started")
     append_run_event(run_paths.run_dir, "launch_started", {"resumed": resume is not None})
     if resume is not None:
