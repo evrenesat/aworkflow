@@ -15,7 +15,7 @@ interface ConfigEditorProps {
   /** Reports unsaved text so the shell can guard navigation. */
   onDirtyChange: (dirty: boolean) => void
   /** Invoked after a save that leaves the project configuration ready. */
-  onReady?: () => void
+  onReady?: (saved: ProjectConfig) => void
 }
 
 interface ConflictState {
@@ -335,7 +335,7 @@ export function ConfigEditor({ project, onDirtyChange, onReady }: ConfigEditorPr
           <div className="section-heading">
             <strong className="text-sm">{stateText(validation.state)}</strong>
             {validation.state === 'ready' && onReady && (
-              <button className="btn btn-primary btn-sm" onClick={onReady}>
+              <button className="btn btn-primary btn-sm" onClick={() => onReady(snapshot)}>
                 Go to plans
               </button>
             )}

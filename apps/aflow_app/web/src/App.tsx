@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
+import type { ProjectConfig, ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
 import { readinessClass, readinessLabel } from './readiness'
 import { ProjectPicker } from './components/ProjectPicker'
 import { ConfigEditor } from './components/ConfigEditor'
@@ -34,6 +34,7 @@ export function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
   const [view, setView] = useState<View>('projects')
   const [configDirty, setConfigDirty] = useState(false)
+  const [planDirty, setPlanDirty] = useState(false)
   const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
 
@@ -76,22 +77,24 @@ export function App() {
     setSelectedProjectId(null)
     setView('projects')
     setConfigDirty(false)
+    setPlanDirty(false)
     setPendingAction(null)
     setRunDashboardPlanPath(null)
   }
 
   /**
-   * Guards navigation away from unsaved configuration text: the requested
+   * Guards navigation away from unsaved editor text: the requested
    * action only runs after an explicit confirmation.
    */
   function requestGuarded(description: string, run: () => void) {
-    if (configDirty) setPendingAction({ description, run })
+    if (configDirty || planDirty) setPendingAction({ description, run })
     else run()
   }
 
   function confirmPendingAction() {
     if (!pendingAction) return
     setConfigDirty(false)
+    setPlanDirty(false)
     pendingAction.run()
     setPendingAction(null)
   }
@@ -112,11 +115,28 @@ export function App() {
 
   async function handleCreateProject(request: ProjectCreateRequest): Promise<ProjectCreateResult> {
     const created = await api.createProject(request)
-    const refreshed = await api.listProjects()
-    setProjects(refreshed)
-    const ready = refreshed.find((project) => project.id === created.id)?.readiness === 'ready'
+    const createdProject: ProjectInfo = {
+      id: created.id,
+      display_name: created.display_name,
+      current_path: created.root,
+      is_git_root: true,
+      registered_at: created.created_at,
+      readiness: created.readiness,
+    }
+    setProjects((current) => [...current.filter((project) => project.id !== created.id), createdProject])
     setSelectedProjectId(created.id)
-    setView(ready ? 'plans' : 'configuration')
+    setView(created.readiness === 'ready' ? 'plans' : 'configuration')
+    try {
+      const refreshed = await api.listProjects()
+      const canonical = refreshed.find((project) => project.id === created.id)
+      setProjects([...refreshed.filter((project) => project.id !== created.id), canonical ?? createdProject])
+    } catch (err) {
+      setProjectsError(
+        `Project ${created.display_name} was created, but the project list could not refresh. ${
+          err instanceof Error ? err.message : 'Retry the refresh to update the list.'
+        }`,
+      )
+    }
     return created
   }
 
@@ -132,11 +152,20 @@ export function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
 
   const handleConfigDirty = useCallback((dirty: boolean) => setConfigDirty(dirty), [])
-  const handleConfigReady = useCallback(() => setView('plans'), [])
+  const handlePlanDirty = useCallback((dirty: boolean) => setPlanDirty(dirty), [])
+  const handleConfigReady = useCallback((saved: ProjectConfig) => {
+    if (saved.validation.state !== 'ready') return
+    setProjects((current) => current.map((project) => (
+      project.id === saved.project_id ? { ...project, readiness: 'ready' } : project
+    )))
+    setView('plans')
+  }, [])
 
   function handleOpenRunDashboard(planPath: string) {
-    setRunDashboardPlanPath(planPath)
-    setView('runs')
+    requestGuarded('leave the plan editor for the run dashboard', () => {
+      setRunDashboardPlanPath(planPath)
+      setView('runs')
+    })
   }
 
   if (!isAuthenticated) {
@@ -181,9 +210,9 @@ export function App() {
       </nav>
 
       {pendingAction && (
-        <div className="card unsaved-guard" role="alertdialog" aria-label="Unsaved configuration edits">
+        <div className="card unsaved-guard" role="alertdialog" aria-label="Unsaved editor edits">
           <span className="text-sm">
-            You have unsaved configuration edits. Leave anyway to continue?
+            You have unsaved editor edits. Leave anyway to continue?
           </span>
           <div className="dashboard-actions">
             <button className="btn btn-danger btn-sm" onClick={confirmPendingAction}>Leave anyway</button>
@@ -246,7 +275,11 @@ export function App() {
               />
             )}
             {view === 'plans' && (
-              <PlanPanel project={selectedProject} onOpenRunDashboard={handleOpenRunDashboard} />
+              <PlanPanel
+                project={selectedProject}
+                onDirtyChange={handlePlanDirty}
+                onOpenRunDashboard={handleOpenRunDashboard}
+              />
             )}
             {view === 'runs' && (
               <RunDashboard

@@ -89,6 +89,10 @@
   (navigation confirmation and beforeunload).
 - Plan create/read/edit/promote now recover from revision conflicts the same
   way, and every failure path preserves the local draft.
+- Plan drafts now use the same shell navigation guard as configuration edits;
+  list return requires an explicit discard, and lifecycle moves stay disabled
+  until the draft is saved. Project creation and ready-config navigation keep
+  their successful server result when a follow-up registry refresh fails.
 - Removed the dead `transcribeAudio` client method that targeted the deleted
   transcription route; no session/provider/audio UI remains.
 

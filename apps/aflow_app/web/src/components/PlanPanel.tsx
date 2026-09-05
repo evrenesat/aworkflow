@@ -5,6 +5,8 @@ import type { PlanDocument, ProjectInfo } from '../types'
 
 interface PlanPanelProps {
   project: ProjectInfo
+  /** Reports unsaved text so the shell can guard navigation. */
+  onDirtyChange: (dirty: boolean) => void
   onOpenRunDashboard: (planPath: string) => void
 }
 
@@ -21,21 +23,41 @@ function shortRevision(revision: string): string {
  * preserved on every network or conflict failure; the server copy is only
  * reloaded after an explicit confirmation.
  */
-export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
+export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPanelProps) {
   const [plans, setPlans] = useState<PlanDocument[]>([])
   const [selected, setSelected] = useState<PlanDocument | null>(null)
   const [content, setContent] = useState('')
+  const [savedContent, setSavedContent] = useState('')
   const [newName, setNewName] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [conflict, setConflict] = useState<ConflictState | null>(null)
   const [confirmReload, setConfirmReload] = useState(false)
+  const [confirmClose, setConfirmClose] = useState(false)
+  const dirty = selected !== null && content !== savedContent
+
+  useEffect(() => {
+    onDirtyChange(dirty)
+    return () => onDirtyChange(false)
+  }, [dirty, onDirtyChange])
+
+  useEffect(() => {
+    if (!dirty) return
+    const guard = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', guard)
+    return () => window.removeEventListener('beforeunload', guard)
+  }, [dirty])
 
   useEffect(() => {
     setSelected(null)
     setContent('')
+    setSavedContent('')
     setConflict(null)
     setConfirmReload(false)
+    setConfirmClose(false)
     void refresh()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.id])
@@ -56,7 +78,9 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
       setConfirmReload(false)
       const loaded = await api.readProjectPlan(project.id, plan.status, plan.name)
       setSelected(loaded)
-      setContent(loaded.content ?? '')
+      const loadedContent = loaded.content ?? ''
+      setContent(loadedContent)
+      setSavedContent(loadedContent)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load plan')
     }
@@ -89,6 +113,7 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
         expected_revision: selected.revision,
       })
       setSelected(updated)
+      setSavedContent(content)
       setConflict(null)
       setConfirmReload(false)
       await refresh()
@@ -106,7 +131,7 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
   }
 
   async function promotePlan() {
-    if (!selected || selected.status === 'done') return
+    if (!selected || selected.status === 'done' || dirty) return
     try {
       setBusy(true)
       setError(null)
@@ -117,7 +142,9 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
         { expected_revision: selected.revision },
       )
       setSelected(promoted)
-      setContent(promoted.content ?? content)
+      const promotedContent = promoted.content ?? content
+      setContent(promotedContent)
+      setSavedContent(promotedContent)
       setConflict(null)
       setConfirmReload(false)
       await refresh()
@@ -144,6 +171,7 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
       if (!match) {
         setSelected(null)
         setContent('')
+        setSavedContent('')
         setConflict(null)
         setConfirmReload(false)
         setError(`Plan ${selected.name} is no longer present in the project lifecycle.`)
@@ -152,7 +180,9 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
       }
       const loaded = await api.readProjectPlan(project.id, match.status, match.name)
       setSelected(loaded)
-      setContent(loaded.content ?? '')
+      const loadedContent = loaded.content ?? ''
+      setContent(loadedContent)
+      setSavedContent(loadedContent)
       setConflict(null)
       setConfirmReload(false)
     } catch (err) {
@@ -162,11 +192,20 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
     }
   }
 
+  function closePlan() {
+    setSelected(null)
+    setContent('')
+    setSavedContent('')
+    setConflict(null)
+    setConfirmReload(false)
+    setConfirmClose(false)
+  }
+
   if (selected) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--spacing-md)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
-          <button className="btn btn-secondary btn-sm" onClick={() => setSelected(null)}>← All plans</button>
+          <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← All plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
           <span className="text-xs text-dim mono" title={selected.revision}>
             Revision {shortRevision(selected.revision)}
@@ -197,6 +236,15 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
             )}
           </div>
         )}
+        {confirmClose && (
+          <div className="error-message" role="alertdialog" aria-label="Unsaved plan edits">
+            <p>Your unsaved plan edits will be lost. Save the plan or discard the edits to return to all plans.</p>
+            <div className="dashboard-actions">
+              <button className="btn btn-danger btn-sm" onClick={closePlan}>Discard edits</button>
+              <button className="btn btn-secondary btn-sm" onClick={() => setConfirmClose(false)}>Keep editing</button>
+            </div>
+          </div>
+        )}
         <textarea
           className="input mono"
           aria-label="Plan content"
@@ -207,7 +255,7 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
         <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
           {selected.status !== 'done' && (
-            <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy}>
+            <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy || dirty}>
               Move to {selected.status === 'todo' ? 'in-progress' : 'done'}
             </button>
           )}
@@ -217,6 +265,7 @@ export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
             </button>
           )}
         </div>
+        {dirty && <div className="text-sm text-dim">Save this draft before moving it through the lifecycle.</div>}
       </div>
     )
   }

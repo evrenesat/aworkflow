@@ -48,7 +48,7 @@ describe('PlanPanel', () => {
   })
 
   it('groups contained plans by lifecycle status and reads the selected plan', async () => {
-    render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await screen.findByText('Todo')
     expect(screen.getByText('In progress')).toBeDefined()
     expect(screen.getByText('Done')).toBeDefined()
@@ -62,7 +62,7 @@ describe('PlanPanel', () => {
     const created: PlanDocument = { ...todoPlan, size_bytes: 8 }
     vi.mocked(api.createProjectPlan).mockResolvedValue(created)
     vi.mocked(api.readProjectPlan).mockResolvedValue({ ...created, content: '# Plan\n\n' })
-    render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     fireEvent.change(screen.getByLabelText('New plan filename'), { target: { value: 'plan-a.md' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create plan' }))
 
@@ -78,7 +78,7 @@ describe('PlanPanel', () => {
   it('saves edits with the expected revision and refreshes lifecycle status', async () => {
     const updated: PlanDocument = { ...todoPlan, revision: 'c'.repeat(64) }
     vi.mocked(api.updateProjectPlan).mockResolvedValue(updated)
-    render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await openPlan(todoPlan, '# Original\n')
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Edited\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -95,7 +95,7 @@ describe('PlanPanel', () => {
     vi.mocked(api.updateProjectPlan).mockRejectedValue(
       new ApiError(409, 'conflict', 'revision_conflict', { current_revision: 'd'.repeat(64) }),
     )
-    render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await openPlan(todoPlan, '# Original\n')
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Mine\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -113,7 +113,7 @@ describe('PlanPanel', () => {
 
   it('keeps the draft text when the network fails during save', async () => {
     vi.mocked(api.updateProjectPlan).mockRejectedValue(new Error('connection lost'))
-    render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await openPlan(todoPlan, '# Original\n')
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Unsent\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -122,10 +122,34 @@ describe('PlanPanel', () => {
     expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Unsent\n')
   })
 
+  it('requires an explicit discard before returning to all plans with a dirty draft', async () => {
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await openPlan(todoPlan, '# Original\n')
+    fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Draft\n' } })
+    fireEvent.click(screen.getByRole('button', { name: '← All plans' }))
+
+    expect(screen.getByRole('alertdialog', { name: 'Unsaved plan edits' })).toBeDefined()
+    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Draft\n')
+    fireEvent.click(screen.getByRole('button', { name: 'Discard edits' }))
+    await screen.findByLabelText('New plan filename')
+  })
+
+  it('does not promote a plan while its current draft is unsaved', async () => {
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await openPlan(todoPlan, '# Original\n')
+    fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Draft\n' } })
+
+    const promote = screen.getByRole('button', { name: 'Move to in-progress' })
+    expect(promote).toHaveProperty('disabled', true)
+    fireEvent.click(promote)
+    expect(api.promoteProjectPlan).not.toHaveBeenCalled()
+    expect(screen.getByText(/Save this draft before moving it/)).toBeDefined()
+  })
+
   it('promotes a todo plan through the lifecycle with its current revision', async () => {
     const promoted: PlanDocument = { ...todoPlan, status: 'in_progress', path: 'plans/in-progress/plan-a.md' }
     vi.mocked(api.promoteProjectPlan).mockResolvedValue(promoted)
-    render(<PlanPanel project={project} onOpenRunDashboard={vi.fn()} />)
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await openPlan(todoPlan, '# Plan A\n')
     fireEvent.click(screen.getByRole('button', { name: 'Move to in-progress' }))
 

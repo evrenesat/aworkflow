@@ -141,6 +141,62 @@ describe('App workspace shell', () => {
     expect(screen.getByText(/needs explicit configuration/)).toBeDefined()
   })
 
+  it('keeps a successful creation selected when the refresh read fails', async () => {
+    vi.mocked(api.createProject).mockResolvedValue({
+      id: 'beta', display_name: 'Beta', relative_root: 'beta',
+      root: '/srv/code/beta', created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required',
+    })
+    vi.mocked(api.listProjects).mockResolvedValueOnce([]).mockRejectedValueOnce(new Error('refresh unavailable'))
+    render(<App />)
+    await screen.findByLabelText('Relative project path')
+    fireEvent.change(screen.getByLabelText('Relative project path'), { target: { value: 'beta' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create project' }))
+
+    await screen.findByLabelText('aflow.toml contents')
+    expect(screen.queryByText(/Failed to create or register/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
+    await screen.findByText(/Project Beta was created, but the project list could not refresh/)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(3))
+    expect(api.createProject).toHaveBeenCalledTimes(1)
+  })
+
+  it('guards shell navigation away from an unsaved plan draft', async () => {
+    const todoPlan = {
+      project_id: 'alpha', name: 'draft.md', path: 'plans/todo/draft.md',
+      status: 'todo' as const, revision: 'c'.repeat(64), size_bytes: 7, content: '# Draft\n',
+    }
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    vi.mocked(api.listProjectPlans).mockResolvedValue([todoPlan])
+    vi.mocked(api.readProjectPlan).mockResolvedValue(todoPlan)
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
+    fireEvent.click(await screen.findByRole('button', { name: /draft\.md/ }))
+    fireEvent.change(await screen.findByLabelText('Plan content'), { target: { value: '# Unsaved\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Configuration' }))
+
+    expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+    expect(screen.getByLabelText('Plan content')).toBeDefined()
+  })
+
+  it('updates selected readiness from a successful ready configuration save', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([configProject])
+    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready'))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /Beta Project/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Configuration' }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# ready\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save both files' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Go to plans' }))
+
+    await screen.findByLabelText('New plan filename')
+    expect(screen.getByText('Ready')).toBeDefined()
+    expect(screen.queryByText(/needs explicit configuration/)).toBeNull()
+  })
+
   it('shows project load errors and offers retry without inventing choices', async () => {
     vi.mocked(api.listProjects).mockRejectedValue(new Error('connection refused'))
     render(<App />)
@@ -183,7 +239,7 @@ describe('App workspace shell', () => {
     await screen.findByText(/Unsaved edits/)
 
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
-    expect(screen.getByText(/You have unsaved configuration edits/)).toBeDefined()
+    expect(screen.getByText(/You have unsaved editor edits/)).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
     expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
 
