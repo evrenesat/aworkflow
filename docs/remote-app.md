@@ -179,29 +179,62 @@ tokens must never appear in URLs, logs, browser history, or MCP arguments.
 
 ## Projects
 
-The project catalog merges three sources:
+The one durable project registry (`project_registry_path`, schema version 1) is the
+exact runtime allowlist. Each record stores a slug id, display name, and a root
+relative to `managed_projects_root`; requests resolve exact registered roots only.
+There is no filesystem discovery, no alias table, and no per-project executable or
+environment override. Newly registered projects become usable immediately without
+restarting the server.
 
-- local git roots discovered under `projects_home`
-- working directories reported by configured planning providers
-- persisted overrides in `project_overrides.json`
+### Creating and registering projects
 
-Project records have stable IDs. Display names, current paths, and aliases are stored in the overrides file.
+Authenticated `POST /api/projects` accepts typed fields only:
 
-Important behaviors:
+- `mode`: `create` or `register`
+- `path`: relative directory path beneath the managed root (or a slug)
+- `display_name`, `main_branch`, `initial_workflow`, optional `initial_team`
+- `initialize_git` / `initialize_config` opt-in booleans (register mode)
 
-- Linked git worktrees are canonicalized back to their primary checkout when git can identify the common directory.
-- Moving a project path keeps the old path as a historical alias.
-- Historical aliases are used before current-path matching so existing planning sessions remain linked after a project move.
-- Planning-session enumeration is failure-isolated. An unavailable provider does not hide local projects or sessions from healthy providers.
-- Project paths are server-authoritative. Starting a session uses the selected project's current path; clients cannot choose an arbitrary working directory. Resume and fork operations also move provider activity to that current path after ownership is checked against the current path and historical aliases.
-- The older repo registry file (`repos.json`) is migrated into `project_overrides.json` when the overrides file does not yet exist.
+It never accepts an executable, environment file, absolute path, README body, or
+raw Git arguments.
 
-Project detection source values:
+- `create` builds the project in a uniquely named temporary sibling of the target
+  (beneath the target's parent directory, which must already exist; nested paths
+  never create missing parent trees) using fixed Git argv
+  (`git init -b <validated branch>`, `add`, `commit`) with
+  bounded timeouts, writes a minimal `README.md` and a `.gitignore` ignoring
+  `.aflow/`, configures only missing repository-local identity, verifies branch,
+  HEAD, and a clean worktree, writes the starter configuration, then atomically
+  renames the sibling to the unused target and inserts the registry record.
+- `register` requires an existing directory beneath the managed root whose Git
+  HEAD resolves to a real commit (unborn repositories are rejected) and never
+  modifies a repository with existing commits. With explicit `initialize_git` it
+  applies the same bootstrap in place, and only into an empty directory. With
+  explicit `initialize_config` it writes the starter pair but refuses to
+  overwrite existing configuration documents.
+- Every failure leaves no registry record, removes only what that request
+  created — the temporary sibling, the freshly renamed directory, or the
+  bootstrap/config entries written for an in-place registration — and preserves
+  any pre-existing target, repository, and history byte-for-byte. Request
+  fields, including the display name, are validated before any mutation.
 
-- `local_git_root`
-- `planning_session_cwd`
-- `local_git_root+planning_session_cwd`
-- `override`
+### Initial `configuration_required` state
+
+New project configuration is provider-neutral: the starter pair
+(`.aflow/config/aflow.toml` and `workflows.toml`) records the chosen initial
+workflow as `aflow.default_workflow` and the optional named team on the starter
+workflow, includes one generic workflow definition, and intentionally selects no
+harness provider. A placeholder profile keeps the project reported as
+`configuration_required` until explicit role selectors and harness profiles are
+configured through normal configuration editing. Projects whose configuration
+already parses, validates, and contains no placeholders report `ready`;
+unavailable roots report `blocked`.
+
+### Unregister
+
+`DELETE /api/projects/{project_id}` removes only the registry record. It is
+rejected while the project owns an active workflow unit, and it never deletes
+project files or Git history.
 
 ## Plans
 
@@ -363,6 +396,8 @@ Health:
 Projects:
 
 - `GET /api/projects`
+- `POST /api/projects` (create or register; typed fields only)
+- `DELETE /api/projects/{project_id}` (non-destructive unregister)
 - `GET /api/projects/{project_id}`
 - `PATCH /api/projects/{project_id}`
 - `GET /api/projects/{project_id}/plans`

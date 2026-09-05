@@ -7,6 +7,7 @@ import io
 import logging
 import os
 from pathlib import Path
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -65,35 +66,39 @@ def _set_server_state(
     from aflow_app_server import main as main_module
     from aflow_app_server.aflow_service import AflowService
     from aflow_app_server.control_plane_service import ControlPlaneService
+    from aflow_app_server.project_registry import ProjectRegistry, ProjectRegistryCatalog
 
+    registry = ProjectRegistry(config.managed_projects_root, config.project_registry_path)
     main_module._config = config
-    main_module._project_catalog = ProjectCatalog(
-        config.projects_home,
-        config.project_overrides_path,
-        legacy_registry_path=config.repo_registry_path,
-    )
+    main_module._project_registry = registry
+    main_module._project_catalog = ProjectRegistryCatalog(registry)
     main_module._service = service if service is not None else AflowService()
-    main_module._control_plane_service = ControlPlaneService(())
+    main_module._control_plane_service = ControlPlaneService(
+        registry,
+        aflow_executable=config.aflow_executable,
+        environment_file=config.environment_file,
+        release_identity=config.release_identity,
+    )
     main_module._control_plane_service.start()
     main_module._planning_service = planning_service
 
 
 def _create_git_project(projects_home: Path, name: str = "test_repo") -> Path:
-    """Create a git repository under the configured projects home."""
+    """Create and register a git repository under the managed projects root."""
+    from aflow_app_server import main as main_module
+
     project_path = projects_home / name
     project_path.mkdir(parents=True, exist_ok=True)
-    (project_path / ".git").mkdir(exist_ok=True)
+    subprocess.run(("git", "init", "-q", str(project_path)), check=True)
+    assert main_module._project_registry is not None
+    project_id = name.replace("_", "-")
+    main_module._project_registry.register(project_id, name.replace("-", " ").title(), name)
     return project_path
 
 
 def _project_id_for_path(client: TestClient, project_path: Path) -> str:
-    """Look up the discovered project id for a current path."""
-    response = client.get("/api/projects")
-    assert response.status_code == 200
-    for project in response.json():
-        if project["current_path"] == str(project_path):
-            return project["id"]
-    raise AssertionError(f"Project not found for path: {project_path}")
+    """Registered project ids are the slug of their relative root."""
+    return project_path.name.replace("_", "-")
 
 
 def test_lifespan_owns_shared_attachment_store_for_codex(
@@ -150,6 +155,7 @@ def client_with_config(test_config: ServerConfig, test_token: str) -> TestClient
     finally:
         main_module._config = None
         main_module._project_catalog = None
+        main_module._project_registry = None
         main_module._service = None
         main_module._control_plane_service = None
         main_module._planning_service = None
@@ -172,6 +178,7 @@ class TestHealthEndpoint:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
 
@@ -192,6 +199,7 @@ class TestAuth:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
     def test_invalid_token(self, test_config: ServerConfig, test_token: str) -> None:
@@ -208,6 +216,7 @@ class TestAuth:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
     def test_query_token_is_rejected(self, test_config: ServerConfig, test_token: str) -> None:
@@ -224,6 +233,7 @@ class TestAuth:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
 
@@ -235,14 +245,13 @@ class TestProjectCatalogBootstrap:
         test_config: ServerConfig,
         tmp_path: Path,
     ) -> None:
-        """Test that the startup catalog can discover projects under the configured home."""
+        """Test that the startup catalog lists registered projects only."""
         from aflow_app_server import main as main_module
-        from aflow_app_server.aflow_service import AflowService
 
         projects_home = tmp_path / "code"
         project_path = projects_home / "catalog-repo"
         project_path.mkdir(parents=True)
-        (project_path / ".git").mkdir()
+        subprocess.run(("git", "init", "-q", str(project_path)), check=True)
 
         config = ServerConfig(
             bind_host=test_config.bind_host,
@@ -255,18 +264,27 @@ class TestProjectCatalogBootstrap:
             transcription_token=None,
             projects_home=projects_home,
             project_overrides_path=tmp_path / "project_overrides.json",
+            managed_projects_root=projects_home,
+            project_registry_path=tmp_path / "projects.json",
+            aflow_executable=test_config.aflow_executable,
+            environment_file=test_config.environment_file,
+            release_identity=test_config.release_identity,
         )
 
         _set_server_state(config)
 
         try:
+            assert main_module.get_project_catalog().list_projects() == []
+            assert main_module._project_registry is not None
+            main_module._project_registry.register("catalog-repo", "Catalog Repo", "catalog-repo")
             projects = main_module.get_project_catalog().list_projects()
             assert len(projects) == 1
             assert projects[0].current_path == project_path
-            assert projects[0].detection_source == "local_git_root"
+            assert projects[0].detection_source == "registry"
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
 
@@ -322,6 +340,7 @@ class TestLogging:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
             main_module._seen_plugin_probe_fingerprints.clear()
 
@@ -363,6 +382,7 @@ class TestLogging:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
             main_module._seen_plugin_probe_fingerprints.clear()
 
@@ -389,6 +409,7 @@ class TestWebAppServing:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
     def test_unknown_frontend_route_falls_back_to_index(
@@ -415,6 +436,7 @@ class TestWebAppServing:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
 
 
@@ -427,18 +449,26 @@ class TestProjectEndpoints:
         assert response.status_code == 200
         assert response.json() == []
 
-    def test_list_projects_discovers_projects_without_manual_registration(
+    def test_list_projects_lists_only_registered_projects(
         self,
         client_with_config: TestClient,
         test_config: ServerConfig,
     ) -> None:
-        """Test that a git project under projects_home is visible before updating overrides."""
-        project_path = _create_git_project(test_config.projects_home, "discovered-repo")
+        """Test that only registry records are listed, never scanned candidates."""
+        unregistered = test_config.projects_home / "unregistered-repo"
+        unregistered.mkdir(parents=True)
+        subprocess.run(("git", "init", "-q", str(unregistered)), check=True)
 
         response = client_with_config.get("/api/projects")
         assert response.status_code == 200
+        assert response.json() == []
+
+        _create_git_project(test_config.projects_home, "registered-repo")
+        response = client_with_config.get("/api/projects")
+        assert response.status_code == 200
         projects = response.json()
-        assert any(project["current_path"] == str(project_path) for project in projects)
+        assert [project["id"] for project in projects] == ["registered-repo"]
+        assert projects[0]["readiness"] == "configuration_required"
 
     def test_get_project(self, client_with_config: TestClient, test_config: ServerConfig) -> None:
         """Test getting a specific project."""
@@ -455,20 +485,16 @@ class TestProjectEndpoints:
         assert response.status_code == 404
 
     def test_update_project(self, client_with_config: TestClient, test_config: ServerConfig) -> None:
-        """Test updating a project override."""
-        project_path = _create_git_project(test_config.projects_home, "project-two")
-        project_id = _project_id_for_path(client_with_config, project_path)
-        renamed_path = test_config.projects_home / "renamed-project-two"
-        project_path.rename(renamed_path)
+        """Test updating a registered project's display name."""
+        _create_git_project(test_config.projects_home, "project-two")
 
         response = client_with_config.patch(
-            f"/api/projects/{project_id}",
-            json={"display_name": "updated-name", "current_path": str(renamed_path)},
+            "/api/projects/project-two",
+            json={"display_name": "updated-name"},
         )
         assert response.status_code == 200
         payload = response.json()
         assert payload["display_name"] == "updated-name"
-        assert payload["current_path"] == str(renamed_path)
 
     def test_update_project_not_found(self, client_with_config: TestClient) -> None:
         """Test updating a non-existent project."""
@@ -759,6 +785,11 @@ class TestTranscriptionEndpoint:
             transcription_token="test-transcription-token",
             projects_home=test_config.projects_home,
             project_overrides_path=test_config.project_overrides_path,
+            managed_projects_root=test_config.projects_home,
+            project_registry_path=test_config.project_registry_path,
+            aflow_executable=test_config.aflow_executable,
+            environment_file=test_config.environment_file,
+            release_identity=test_config.release_identity,
         )
 
         _set_server_state(config_with_transcription)
@@ -782,6 +813,7 @@ class TestTranscriptionEndpoint:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
             main_module._transcription_client = None
 
@@ -800,6 +832,11 @@ class TestTranscriptionEndpoint:
             transcription_token="test-transcription-token",
             projects_home=test_config.projects_home,
             project_overrides_path=test_config.project_overrides_path,
+            managed_projects_root=test_config.projects_home,
+            project_registry_path=test_config.project_registry_path,
+            aflow_executable=test_config.aflow_executable,
+            environment_file=test_config.environment_file,
+            release_identity=test_config.release_identity,
         )
 
         _set_server_state(config_with_transcription)
@@ -821,6 +858,7 @@ class TestTranscriptionEndpoint:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
             main_module._transcription_client = None
 
@@ -839,6 +877,11 @@ class TestTranscriptionEndpoint:
             transcription_token="test-transcription-token",
             projects_home=test_config.projects_home,
             project_overrides_path=test_config.project_overrides_path,
+            managed_projects_root=test_config.projects_home,
+            project_registry_path=test_config.project_registry_path,
+            aflow_executable=test_config.aflow_executable,
+            environment_file=test_config.environment_file,
+            release_identity=test_config.release_identity,
         )
 
         _set_server_state(config_with_transcription)
@@ -857,5 +900,6 @@ class TestTranscriptionEndpoint:
         finally:
             main_module._config = None
             main_module._project_catalog = None
+            main_module._project_registry = None
             main_module._service = None
             main_module._transcription_client = None

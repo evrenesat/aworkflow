@@ -356,3 +356,23 @@ The recovery handoff expects strict JSON with:
 - `reason`
 - `suggested_keywords`
 - `suggested_action`
+
+## Project Starter Configuration
+
+When the remote app creates a project or explicitly initializes configuration for
+a registered one, it writes a provider-neutral starter pair under
+`<project>/.aflow/config/`:
+
+- `aflow.toml` records the chosen initial workflow as `aflow.default_workflow`
+  and, when given, the named initial team under `[teams."<team>".roles]`.
+- `workflows.toml` defines one generic single-step workflow, wired to that team
+  when one was named, and records the request's validated `main_branch` in the
+  `[workflow]` lifecycle defaults (`main` when not specified).
+
+The starter deliberately selects no harness provider. It declares a placeholder
+harness profile with `model = "FILL_IN_MODEL"`, which the engine loader accepts
+only while every profile of that harness remains a placeholder. The project is
+reported as `configuration_required` until explicit role selectors and harness
+profiles replace the placeholder; `aflow` and the remote app classify readiness
+through the normal loader and placeholder detection, not a second validator.
+Existing configuration documents are never overwritten.

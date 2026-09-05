@@ -71,6 +71,12 @@ from .planning.providers import CodexProvider
 from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
 from .project_registry import ProjectRegistry, ProjectRegistryCatalog, ProjectRegistryError
+from .project_service import (
+    ProjectRequest,
+    ProjectService,
+    ProjectServiceError,
+    project_readiness,
+)
 from .plan_store import PlanStore
 from .transcription import TranscriptionClient, TranscriptionError, create_transcription_client
 
@@ -78,6 +84,7 @@ from .transcription import TranscriptionClient, TranscriptionError, create_trans
 # Global state
 _config: ServerConfig | None = None
 _project_catalog: ProjectCatalog | ProjectRegistryCatalog | None = None
+_project_registry: ProjectRegistry | None = None
 _service: AflowService | None = None
 _control_plane_service: ControlPlaneService | None = None
 _transcription_client: TranscriptionClient | None = None
@@ -313,6 +320,16 @@ def get_plan_store_factory(project_catalog: ProjectCatalog = Depends(get_project
     return _get_plan_store
 
 
+def get_project_service() -> ProjectService:
+    """Return the registry-backed create/register/unregister service."""
+    if _project_registry is None or _control_plane_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "control_plane_unavailable"},
+        )
+    return ProjectService(_project_registry, _control_plane_service)
+
+
 def _get_web_dist_dir() -> Path:
     """Resolve the built web app directory."""
     override = os.environ.get("AFLOW_APP_WEB_DIST")
@@ -369,7 +386,7 @@ class _MCPMount(Mount):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize server state on startup."""
-    global _config, _project_catalog, _service, _control_plane_service, _transcription_client
+    global _config, _project_catalog, _project_registry, _service, _control_plane_service, _transcription_client
     global _planning_registry, _planning_service
 
     _config = ServerConfig.from_env()
@@ -381,6 +398,7 @@ async def lifespan(app: FastAPI):
         _config.managed_projects_root,
         _config.project_registry_path,
     )
+    _project_registry = project_registry
     _project_catalog = ProjectRegistryCatalog(project_registry)
     _service = AflowService()
     _control_plane_service = ControlPlaneService(ControlPlaneServiceConfig(
@@ -448,6 +466,7 @@ async def lifespan(app: FastAPI):
         _planning_registry = None
         _config = None
         _project_catalog = None
+        _project_registry = None
         _service = None
         _control_plane_service = None
         _transcription_client = None
@@ -561,6 +580,7 @@ async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse
 @app.exception_handler(DaemonError)
 @app.exception_handler(ValueError)
 @app.exception_handler(ProjectRegistryError)
+@app.exception_handler(ProjectServiceError)
 async def rejected_operation_handler(_: Request, __: Exception) -> JSONResponse:
     return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "operation_rejected")
 
@@ -930,18 +950,77 @@ class UpdateProjectRequest(BaseModel):
     alias: str | None = None
 
 
+class ProjectCreateRequest(BaseModel):
+    """Typed create/register contract with no executable, path, or argv fields."""
+
+    mode: str
+    path: str
+    display_name: str | None = None
+    main_branch: str = "main"
+    initial_workflow: str | None = None
+    initial_team: str | None = None
+    initialize_git: bool = False
+    initialize_config: bool = False
+
+
 # Project endpoints
 @app.get("/api/projects")
 async def list_projects(
     _: str = Depends(verify_token),
     project_catalog: ProjectCatalog = Depends(get_project_catalog),
 ) -> list[dict[str, Any]]:
-    """List all discovered projects."""
+    """List the registry-backed projects with linked sessions and readiness."""
     sessions = ()
     if _planning_service is not None:
         sessions, _ = await _planning_service.list_sessions()
     projects = project_catalog.list_projects(sessions=sessions)
-    return [project.to_dict() for project in projects]
+    return [
+        {
+            **project.to_dict(),
+            "readiness": project_readiness(
+                project.current_path, is_git_root=project.is_git_root
+            ),
+        }
+        for project in projects
+    ]
+
+
+@app.post("/api/projects", status_code=status.HTTP_201_CREATED)
+async def create_project(
+    request: ProjectCreateRequest,
+    _: str = Depends(verify_token),
+    project_service: ProjectService = Depends(get_project_service),
+) -> dict[str, Any]:
+    """Create or register one project beneath the managed root."""
+    if request.mode not in {"create", "register"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "unsupported_project_mode"},
+        )
+    return project_service.create_or_register(
+        ProjectRequest(
+            mode=request.mode,  # type: ignore[arg-type]
+            relative_path=request.path,
+            display_name=request.display_name,
+            main_branch=request.main_branch,
+            initial_workflow=request.initial_workflow,
+            initial_team=request.initial_team,
+            initialize_git=request.initialize_git,
+            initialize_config=request.initialize_config,
+        )
+    )
+
+
+@app.delete("/api/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def unregister_project(
+    project_id: str,
+    _: str = Depends(verify_token),
+    project_service: ProjectService = Depends(get_project_service),
+) -> Response:
+    """Remove only the registry record; never delete project files or history."""
+    if not project_service.unregister(project_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/api/projects/{project_id}")

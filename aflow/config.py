@@ -945,18 +945,25 @@ def _parse_workflow_user_config(
         harnesses_table = _require_table(raw["harness"], path=f"{path}.harness")
         for harness_name, harness_value in harnesses_table.items():
             harness_key = _require_text(harness_name, path=f"{path}.harness key")
-            if harness_key not in ADAPTERS:
-                supported = ", ".join(sorted(ADAPTERS))
-                raise ConfigError(
-                    f"unsupported harness '{harness_key}' in {path}, "
-                    f"supported harnesses are: {supported}"
-                )
             harness_table = _require_table(
                 harness_value, path=f"{path}.harness.{harness_key}"
             )
-            harnesses[harness_key] = _parse_workflow_harness(
+            harness = _parse_workflow_harness(
                 harness_table, path=f"{path}.harness.{harness_key}"
             )
+            if harness_key not in ADAPTERS:
+                # A non-adapter harness is allowed only as provider-neutral
+                # starter scaffolding: every profile must stay a placeholder.
+                if harness_key != "starter" or not harness.profiles or any(
+                    profile.model != "FILL_IN_MODEL"
+                    for profile in harness.profiles.values()
+                ):
+                    supported = ", ".join(sorted(ADAPTERS))
+                    raise ConfigError(
+                        f"unsupported harness '{harness_key}' in {path}, "
+                        f"supported harnesses are: {supported}"
+                    )
+            harnesses[harness_key] = harness
     roles: dict[str, str] = {}
     role_prompts: dict[str, str] = {}
     if "roles" in raw:
@@ -1120,6 +1127,125 @@ def _bootstrap_config_files(config_path: Path | None = None) -> tuple[Path, tupl
 def bootstrap_config(config_path: Path | None = None) -> Path:
     path, _ = _bootstrap_config_files(config_path)
     return path
+
+
+STARTER_DEFAULT_WORKFLOW = "implement"
+STARTER_DEFAULT_MAIN_BRANCH = "main"
+_STARTER_WORKFLOW_SENTINEL = "__STARTER_WORKFLOW__"
+_STARTER_TEAM_SENTINEL = "__STARTER_TEAM_LINE__"
+_STARTER_MAIN_BRANCH_SENTINEL = "__STARTER_MAIN_BRANCH__"
+_STARTER_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
+_STARTER_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+
+
+def validate_starter_name(name: str) -> str:
+    """Validate a workflow-safe starter name (workflow or team identifier)."""
+    if not isinstance(name, str) or _STARTER_NAME_RE.fullmatch(name) is None:
+        raise ConfigError("initial workflow/team must be a workflow-safe name")
+    return name
+
+
+def validate_starter_main_branch(branch: str) -> str:
+    """Validate a Git-safe starter main branch name."""
+    if (
+        not isinstance(branch, str)
+        or _STARTER_BRANCH_RE.fullmatch(branch) is None
+        or branch.startswith("-")
+        or ".." in branch
+        or "//" in branch
+        or branch.endswith("/")
+        or branch.endswith(".lock")
+        or "@{" in branch
+    ):
+        raise ConfigError("main_branch must be a valid Git branch name")
+    return branch
+
+
+def bootstrap_project_config(
+    config_path: Path | str | None = None,
+    *,
+    initial_workflow: str | None = None,
+    initial_team: str | None = None,
+    main_branch: str = STARTER_DEFAULT_MAIN_BRANCH,
+) -> tuple[Path, Path]:
+    """Write the provider-neutral project starter configuration pair.
+
+    The starter records the chosen initial workflow as ``aflow.default_workflow``
+    and, when given, the named initial team on the starter workflow definition.
+    ``main_branch`` names the repository trunk the workflow lifecycle targets and
+    defaults to ``main`` for compatibility. It never selects a real harness
+    provider: the placeholder profile keeps the project
+    ``configuration_required`` until explicit selectors are configured.
+    Existing documents are never overwritten, and both documents are validated
+    through the production loader before the write is left in place.
+    """
+    validate_starter_main_branch(main_branch)
+    if initial_workflow is not None:
+        validate_starter_name(initial_workflow)
+    if initial_team is not None:
+        validate_starter_name(initial_team)
+    path = Path(config_path) if config_path is not None else _config_path()
+    workflow_name = initial_workflow or STARTER_DEFAULT_WORKFLOW
+    aflow_text = (
+        resources.files("aflow")
+        .joinpath("starter/aflow.toml")
+        .read_text(encoding="utf-8")
+        .replace(_STARTER_WORKFLOW_SENTINEL, workflow_name)
+    )
+    if initial_team is not None:
+        aflow_text += (
+            f"\n# Initial team recorded during project creation or registration.\n"
+            f'[teams."{initial_team}".roles]\nworker = "starter.default"\n'
+        )
+    team_line = f'team = "{initial_team}"\n' if initial_team is not None else ""
+    workflows_text = (
+        resources.files("aflow")
+        .joinpath("starter/workflows.toml")
+        .read_text(encoding="utf-8")
+        .replace(_STARTER_MAIN_BRANCH_SENTINEL, main_branch)
+        .replace(_STARTER_WORKFLOW_SENTINEL, workflow_name)
+        .replace(_STARTER_TEAM_SENTINEL + "\n", team_line)
+    )
+    workflows_path = path.with_name("workflows.toml")
+    if path.exists() or workflows_path.exists():
+        raise ConfigError("project configuration already exists; refusing overwrite")
+    created: list[Path] = []
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(aflow_text, encoding="utf-8")
+        created.append(path)
+        workflows_path.write_text(workflows_text, encoding="utf-8")
+        created.append(workflows_path)
+        load_workflow_config(path)
+    except Exception:
+        for written in created:
+            try:
+                written.unlink()
+            except OSError:
+                pass
+        raise
+    return path, workflows_path
+
+
+def project_configuration_state(
+    config_path: Path | str | None = None,
+) -> Literal["ready", "configuration_required"]:
+    """Classify one project configuration without a second validator.
+
+    Uses the production loader and placeholder detection: a project is
+    ``ready`` only when both documents parse, pass semantic validation, and
+    contain no placeholder model selectors.
+    """
+    path = Path(config_path) if config_path is not None else _config_path()
+    if not path.exists():
+        return "configuration_required"
+    try:
+        config = load_workflow_config(path)
+    except ConfigError:
+        return "configuration_required"
+    if find_placeholders(config):
+        return "configuration_required"
+    return "ready"
 
 
 def find_placeholders(config: WorkflowUserConfig) -> list[str]:

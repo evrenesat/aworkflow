@@ -1,0 +1,14 @@
+# Provider-neutral starter workflow definitions. Lifecycle setup/teardown is
+# intentionally empty; edit this document to enable branch or worktree flows.
+[workflow]
+main_branch = "__STARTER_MAIN_BRANCH__"
+
+[workflow.__STARTER_WORKFLOW__]
+__STARTER_TEAM_LINE__
+[workflow.__STARTER_WORKFLOW__.steps.implement_plan]
+role = "worker"
+prompts = ["implementation"]
+go = [
+  { to = "END", when = "DONE || MAX_TURNS_REACHED" },
+  { to = "implement_plan" },
+]
