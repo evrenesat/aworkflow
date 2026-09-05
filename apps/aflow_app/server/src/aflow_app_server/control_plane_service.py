@@ -409,7 +409,7 @@ class ControlPlaneService:
             item = self._project(project_id)
         except ControlPlaneUnavailableError:
             return self._uncomposable_run_snapshots(project_id)
-        snapshots: list[tuple[str, str, str | None, str | None]] = []
+        snapshots: list[tuple[str, str, str | None, str | None, str | None]] = []
         cursor: str | None = None
         while True:
             page = item.daemon.application.repository.list_runs(
@@ -431,6 +431,7 @@ class ControlPlaneService:
                         manifest.frozen_config_fingerprint
                         if manifest is not None
                         else None,
+                        item.daemon.application.repository.get_frozen_config_path(status.run_id),
                     )
                 )
             if page.next_cursor is None:
@@ -456,7 +457,7 @@ class ControlPlaneService:
                 "project registration is unavailable"
             ) from exc
         repository = RunRepository(root)
-        snapshots: list[tuple[str, str, str | None, str | None]] = []
+        snapshots: list[tuple[str, str, str | None, str | None, str | None]] = []
         cursor: str | None = None
         while True:
             page = repository.list_runs(limit=1_000, cursor=cursor)

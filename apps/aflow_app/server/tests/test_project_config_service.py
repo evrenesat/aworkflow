@@ -541,7 +541,9 @@ class TestSave:
         snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
         assert snapshot.revision != before.revision
 
-    def _failed_run(self, root: Path, fingerprint: str) -> str:
+    def _failed_run(
+        self, root: Path, fingerprint: str, *, frozen_config_path: str | None = None
+    ) -> str:
         from aflow.control_plane.models import LaunchManifest
 
         run_id = reserve_run_id(root, "failed-run-probe")
@@ -557,9 +559,10 @@ class TestSave:
         write_launch_phase(root, run_id, "failed")
         run_dir = root / ".aflow" / "runs" / run_id
         run_dir.mkdir(parents=True)
-        (run_dir / "run.json").write_text(
-            json.dumps({"status": "failed", "workflow_name": "deliver"})
-        )
+        payload: dict[str, object] = {"status": "failed", "workflow_name": "deliver"}
+        if frozen_config_path is not None:
+            payload["frozen_config"] = {"config_path": frozen_config_path}
+        (run_dir / "run.json").write_text(json.dumps(payload))
         return run_id
 
     def test_save_blocked_by_failed_run_with_matching_fingerprint(
@@ -572,7 +575,13 @@ class TestSave:
         identity = _freeze_run_identity(
             "deliver", config, config_dir=root / ".aflow" / "config" / "aflow.toml"
         )
-        self._failed_run(root, identity.config_fingerprint)
+        self._failed_run(
+            root,
+            identity.config_fingerprint,
+            frozen_config_path=str(
+                root.resolve() / ".aflow" / "config" / "aflow.toml"
+            ),
+        )
         before = service.read(PROJECT_ID)
         aflow_text, workflows_text = _valid_pair(model="next-model")
 
@@ -580,6 +589,38 @@ class TestSave:
             service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
         assert exc_info.value.blocking_runs[0][1] == "failed"
+
+    def test_save_allows_migrated_identical_config_with_old_frozen_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from aflow.workflow import _freeze_run_identity
+
+        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
+        config_path = root / ".aflow" / "config" / "aflow.toml"
+        config = load_workflow_config(config_path)
+        identity = _freeze_run_identity(
+            "deliver", config, config_dir=config_path
+        )
+        old_config_path = root / "old-global-config" / "aflow.toml"
+        old_config_path.parent.mkdir()
+        old_config_path.write_bytes(config_path.read_bytes())
+        run_id = self._failed_run(
+            root,
+            identity.config_fingerprint,
+            frozen_config_path=str(old_config_path.resolve()),
+        )
+        run_dir = root / ".aflow" / "runs" / run_id
+        manifest_path = root / ".aflow" / "launches" / f"{run_id}.json"
+        manifest_before = manifest_path.read_bytes()
+        run_before = (run_dir / "run.json").read_bytes()
+        before = service.read(PROJECT_ID)
+        aflow_text, workflows_text = _valid_pair(model="migrated-model")
+
+        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
+
+        assert snapshot.revision != before.revision
+        assert manifest_path.read_bytes() == manifest_before
+        assert (run_dir / "run.json").read_bytes() == run_before
 
     def test_save_allowed_when_failed_run_fingerprint_no_longer_matches(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -491,21 +491,30 @@ class ProjectConfigService:
         snapshots = self._control_plane.owned_run_snapshots(project_id)
         if not snapshots:
             return
+        current_config_path = str(root.resolve() / ".aflow" / "config" / "aflow.toml")
         config = None
         if any(
             status in _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES
-            for _, status, _, _ in snapshots
+            for _, status, _, _, _ in snapshots
         ):
             try:
                 config = load_workflow_config(root / ".aflow" / "config" / "aflow.toml")
             except ConfigError:
                 config = None
         blockers: list[tuple[str, str]] = []
-        for run_id, status, workflow_name, manifest_fingerprint in snapshots:
+        for (
+            run_id,
+            status,
+            workflow_name,
+            manifest_fingerprint,
+            frozen_config_path,
+        ) in snapshots:
             if status in _CONFIG_BLOCKING_RUN_STATUSES:
                 blockers.append((run_id, status))
                 continue
             if status in _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES:
+                if frozen_config_path and frozen_config_path != current_config_path:
+                    continue
                 if (
                     config is not None
                     and workflow_name is not None

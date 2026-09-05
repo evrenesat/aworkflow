@@ -7,6 +7,12 @@
 - Rebuilt the web plan editor around that contract and kept durable run REST,
   SSE, and MCP behavior unchanged.
 
+## 2026-09-06 -- Preserve historical config-path resume safety
+
+- Project config saves now ignore a failed or interrupted control-plane run only
+  when its durable frozen configuration path is known and differs from the
+  canonical project config path. Matching or missing paths remain blocked.
+
 # DEVLOG
 
 ## 2026-09-06 - Stop daemon-owned runs before unit startup
