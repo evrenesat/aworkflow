@@ -18,7 +18,7 @@ from aflow.runlog import (
 )
 from aflow.workflow import (
     _freeze_run_identity, _rebase_scope_envelope_evidence,
-    load_scope_evidence_for_resume,
+    load_scope_evidence_for_resume, resolve_role_selector,
 )
 
 
@@ -46,8 +46,13 @@ def relocated(tmp_path: Path):
     git(root, "worktree", "add", "-b", "feature/saved", str(worktree))
     config = WorkflowUserConfig(
         aflow=AflowSection(default_workflow="managed", team_lead="worker"),
-        harnesses={"codex": WorkflowHarnessConfig(profiles={"test": HarnessProfileConfig(model="fixture")})},
-        roles={"worker": "codex.test"}, teams={"base": TeamConfig(), "other": TeamConfig()},
+        harnesses={"codex": WorkflowHarnessConfig(profiles={
+            "test": HarnessProfileConfig(model="fixture"), "other": HarnessProfileConfig(model="other"),
+        })},
+        roles={"worker": "codex.test", "reviewer": "codex.test", "manager": "codex.test"},
+        teams={"base": TeamConfig(), "other": TeamConfig(roles={
+            "worker": "codex.other", "reviewer": "codex.other", "manager": "codex.other",
+        })},
         prompts={"p": "Work from {ACTIVE_PLAN_PATH}"},
         workflows={"managed": WorkflowConfig(
             steps={"implement": WorkflowStepConfig(role="worker", prompts=("p",), go=(GoTransition("END"),))},
@@ -164,6 +169,56 @@ def test_rehome_does_not_rewrite_prose_frozen_config_or_external_history(relocat
     assert source["pending_manager_notes"]["target_plan_identity"].startswith("/old/")
 
 
+def test_rehome_rejects_plan_branch_mismatch_before_allocation(relocated):
+    root, worktree, _, _, run, source = relocated
+    plan = root / "plan.md"
+    plan.write_text(plan.read_text().replace("feature/saved", "feature/other"))
+    before = hashes(source)
+    with pytest.raises(ValueError, match="Plan Branch"):
+        prepare_resume_relocation(run, source_run_id="saved-run", current_repo_root=root,
+                                  replacement_worktree=worktree)
+    assert hashes(source) == before
+
+
+def test_rehome_rejects_base_outside_feature_history_before_allocation(relocated):
+    root, worktree, _, _, run, source = relocated
+    orphan = git(root, "commit-tree", git(root, "write-tree"), "-m", "orphan")
+    plan = root / "plan.md"
+    plan.write_text(plan.read_text().replace(git(root, "rev-parse", "HEAD~1"), orphan))
+    before = hashes(source)
+    with pytest.raises(ValueError, match=r"Git verification failed \(merge-base\)"):
+        prepare_resume_relocation(run, source_run_id="saved-run", current_repo_root=root,
+                                  replacement_worktree=worktree)
+    assert hashes(source) == before
+
+
+def test_rehome_accepts_full_sha256_git_base(tmp_path: Path):
+    root = tmp_path / "sha256-repo"
+    root.mkdir()
+    try:
+        git(root, "init", "--object-format=sha256", "-b", "main")
+    except subprocess.CalledProcessError:
+        pytest.skip("Git does not support SHA-256 repositories")
+    git(root, "config", "user.name", "AFlow Test")
+    git(root, "config", "user.email", "aflow-test@example.invalid")
+    (root / "README.md").write_text("Test\n")
+    git(root, "add", "README.md")
+    git(root, "commit", "-m", "Initial")
+    base = git(root, "rev-parse", "HEAD")
+    assert len(base) == 64
+    (root / "plan.md").write_text(
+        "# Plan\n\n## Git Tracking\n\n- Plan Branch: `feature/saved`\n"
+        f"- Pre-Handoff Base HEAD: `{base}`\n"
+    )
+    worktree = tmp_path / "sha256-worktree"
+    git(root, "worktree", "add", "-b", "feature/saved", str(worktree))
+    source = {"lifecycle_setup": ["worktree"], "repo_root": "/old/repo", "worktree_path": "/old/worktree",
+              "main_branch": "main", "feature_branch": "feature/saved", "original_plan_path": "/old/repo/plan.md"}
+    relocation = prepare_resume_relocation(source, source_run_id="saved-run", current_repo_root=root,
+                                           replacement_worktree=worktree)
+    assert relocation.current_repo_root == root.resolve()
+
+
 def test_rehome_preserved_source_is_not_pruned_with_keep_runs_one(relocated):
     root, _, _, _, _, source = relocated
     before = hashes(source)
@@ -181,6 +236,26 @@ def test_named_resume_can_override_configured_team_and_records_provenance(reloca
     assert result.resume_context.resume_team_override == "other"
     assert result.resume_context.frozen_run_identity.config_path == str(config_path.resolve())
     assert result.run_json["team"] == "base"
+    assert json.loads((source / "run.json").read_text()) == run
+
+
+def test_named_resume_team_override_rebinds_every_future_role(relocated):
+    root, worktree, _, config, run, source = relocated
+    run["role_selectors"] = {"worker": "codex.test", "reviewer": "codex.test", "manager": "codex.test"}
+    run["active_role_sessions"] = [{
+        "schema_version": 1, "session_id": "old-worker", "role": "worker", "selector": "codex.test",
+        "harness": "codex", "profile": "test", "model_display": "fixture", "status": "active",
+    }]
+    (source / "run.json").write_text(json.dumps(run))
+    before = hashes(source)
+    result = bootstrap(relocated, team_arg="other")
+    context = result.resume_context
+    assert context.role_selectors == {}
+    assert context.active_role_sessions == ()
+    for role in ("worker", "reviewer", "manager"):
+        assert resolve_role_selector(role, result.team, config,
+                                     run_local_role_selectors=context.role_selectors) == "codex.other"
+    assert hashes(source) == before
     assert json.loads((source / "run.json").read_text()) == run
 
 

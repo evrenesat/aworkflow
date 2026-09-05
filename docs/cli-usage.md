@@ -172,7 +172,9 @@ aflow run --resume RUN_ID --team TEAM_NAME
 `pending_boundary_decision`, `pending_repartition`, hotplug state, or unapplied
 owner routing state is present. The continuation records
 `resumed_from_team` and `resume_team_override`; historical selectors and source
-metadata are retained.
+metadata are retained. Applied run-local selectors and active native sessions
+are not carried into the continuation, so the target team's worker, reviewer,
+and manager selectors govern future turns.
 
 ## Analyze
 

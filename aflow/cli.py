@@ -2015,6 +2015,12 @@ def _reconstruct_resume_context(
         if require_resume:
             raise ValueError(f"error: run '{run_id}' has invalid hotplug state: {exc}") from exc
         return None
+    if resume_team_override is not None:
+        # A named baseline-team change governs every future role. Completed
+        # hotplug history stays durable, but its applied selectors and native
+        # sessions must not take precedence over the target team's selectors.
+        hotplug_fields["role_selectors"] = {}
+        hotplug_fields["active_role_sessions"] = ()
 
     return ResumeContext(
         resumed_from_run_id=run_id,

@@ -172,8 +172,14 @@ def prepare_resume_relocation(
     relocation = ResumeRelocation(source_run_id, old_repo, old_worktree, repo, worktree)
     plan = relocation.map_path(source.get("original_plan_path"))
     parsed = parse_git_tracking_metadata(plan.read_text(encoding="utf-8"))
+    plan_branch = parsed.plan_branch if parsed is not None else None
     base = parsed.pre_handoff_base_head if parsed is not None else None
-    if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{7,40}", base) is None:
+    if plan_branch != feature:
+        raise ValueError("resume relocation requires Plan Branch to match the recorded feature branch")
+    # A full Git object ID is 40 hex characters for SHA-1 and 64 for SHA-256.
+    # Git still verifies both object existence and commit type below.
+    if not isinstance(base, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", base) is None:
         raise ValueError("resume relocation requires a recorded Pre-Handoff Base HEAD commit")
     _git(repo, "cat-file", "-e", f"{base}^{{commit}}")
+    _git(repo, "merge-base", "--is-ancestor", base, feature)
     return relocation
