@@ -147,14 +147,18 @@ sudo deploy/aflowd/serve-private-https.sh --rollback \
   --snapshot /root/code/evidence/aflowd-rollout/preflight/tailscale-serve.before.json \
   --expected-current /root/code/evidence/aflowd-rollout/serve/tailscale-serve.after-config.json \
   --apply
-sudo deploy/aflowd/rollback.sh --release PRIOR_40_CHARACTER_COMMIT
+sudo /opt/aflowd/releases/FULL_40_CHARACTER_COMMIT/src/deploy/aflowd/rollback.sh \
+  --release PRIOR_40_CHARACTER_COMMIT \
+  --service-snapshot /root/code/evidence/aflowd-rollout/preflight/aflowd.service.before
 sudo /opt/aflowd/releases/FULL_40_CHARACTER_COMMIT/src/deploy/aflowd/migrate-registry.py rollback \
   --transaction /var/lib/aflowd/migrations/EXACT_TRANSACTION --apply
 ```
 
 Migration rollback refuses to overwrite a changed registry or changed/new
 project config content. Release rollback validates the selected manifest and
-restarts only `aflowd.service`. `uninstall-emergency.sh` stops and disables only
+that the preflight unit snapshot pins its executable and config to that release,
+then atomically restores the exact unit bytes and `current` link before restarting
+only `aflowd.service`. `uninstall-emergency.sh` stops and disables only
 the daemon; it never deletes releases, registry state, runs, plans, projects, or
 secrets.
 

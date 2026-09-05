@@ -519,19 +519,210 @@ else echo '{"Self":{"DNSName":"node.tailnet.ts.net."}}'; fi
     assert stale.returncode != 0 and "snapshot is stale" in stale.stderr
 
 
-def test_rollback_rewrites_service_only_to_a_valid_selected_release(tmp_path: Path) -> None:
+def _add_release_file(release: Path, relative: str, content: str, *, executable: bool = False) -> Path:
+    path = release / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    if executable:
+        path.chmod(0o755)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with (release / "release-manifest.sha256").open("a") as manifest:
+        manifest.write(f"{digest}  {relative}\n")
+    return path
+
+
+def _service_unit(release: Path, *, legacy: bool) -> str:
+    if legacy:
+        project_args = (
+            "--project-root /root/code/aflow-control-plane-proof-20260811 "
+            "--project-config /root/code/aflow-control-plane-proof-20260811/aflow/aflow.toml"
+        )
+        bind_address = "100.103.69.9"
+        write_paths = "/root/code/aflow-control-plane-proof-20260811 /var/lib/aflowd"
+    else:
+        project_args = (
+            "--managed-projects-root /root/code "
+            "--project-registry-path /var/lib/aflowd/projects.json"
+        )
+        bind_address = "127.0.0.1"
+        write_paths = "/root/code /var/lib/aflowd"
+    return (
+        "[Unit]\n"
+        "Description=AFlow daemon-backed control plane\n"
+        f"Documentation=file:{release}/src/deploy/aflowd/README.md\n"
+        "[Service]\n"
+        f"WorkingDirectory={release}\n"
+        f"Environment=AFLOW_APP_CONFIG_DIR={release}/config\n"
+        f"Environment=AFLOW_APP_WEB_DIST={release}/src/apps/aflow_app/web/dist\n"
+        f"Environment=AFLOW_APP_HOST={bind_address}\n"
+        f"Environment=PATH={release}/bin:/usr/bin:/bin\n"
+        f"ExecStartPre=/usr/bin/env {release}/src/deploy/aflowd/validate-runtime.sh "
+        f"--release {release} --config {release}/config/config.toml "
+        f"--environment-file /etc/aflowd/aflowd.env {project_args} "
+        f"--interface tailscale0 --bind-address {bind_address}\n"
+        f"ExecStart=/usr/bin/env {release}/bin/aflow-app-server\n"
+        f"ReadWritePaths={write_paths}\n"
+    )
+
+
+def test_rollback_restores_exact_legacy_service_snapshot(tmp_path: Path) -> None:
     state_root = tmp_path / "aflowd"
-    old_release = _release_fixture(state_root, "a" * 40)
+    active_release = _release_fixture(state_root, "a" * 40)
     selected_release = _release_fixture(state_root, "b" * 40)
-    (state_root / "current").symlink_to(old_release)
+    _add_release_file(
+        active_release,
+        "src/deploy/aflowd/validate-runtime.sh",
+        "#!/bin/sh\nexit 0\n",
+        executable=True,
+    )
+    _add_release_file(
+        selected_release,
+        "src/deploy/aflowd/validate-runtime.sh",
+        """#!/bin/sh
+case " $* " in
+  *" --managed-projects-root "*|*" --project-registry-path "*) exit 91 ;;
+esac
+case " $* " in *" --project-root "*" --project-config "*) ;; *) exit 92 ;; esac
+case " $* " in *" --bind-address 100.103.69.9 "*) ;; *) exit 93 ;; esac
+printf '%s\n' "$*" >"$VALIDATOR_ARGS"
+""",
+        executable=True,
+    )
+    (state_root / "current").symlink_to(active_release)
     service_path = state_root / "aflowd.service"
-    service_path.write_text(f"ExecStart={old_release}/bin/aflow-app-server\n")
-    tools = tmp_path / "tools"; tools.mkdir()
-    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
-    result = _run("bash", str(DEPLOY / "rollback.sh"), "--root", str(state_root), "--service-path", str(service_path), "--release", selected_release.name, env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"})
+    service_path.write_text(_service_unit(active_release, legacy=False))
+    snapshot = tmp_path / "aflowd.service.before"
+    snapshot.write_text(_service_unit(selected_release, legacy=True))
+    validator_args = tmp_path / "validator-args.txt"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _write_executable(
+        tools / "systemctl",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "restart" ]]; then
+  command=$(sed -n 's/^ExecStartPre=//p' "$SERVICE_PATH")
+  bash -c "$command"
+fi
+""",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{tools}:{os.environ['PATH']}",
+        "SERVICE_PATH": str(service_path),
+        "VALIDATOR_ARGS": str(validator_args),
+    }
+    result = _run(
+        "bash",
+        str(DEPLOY / "rollback.sh"),
+        "--root",
+        str(state_root),
+        "--service-path",
+        str(service_path),
+        "--release",
+        selected_release.name,
+        "--service-snapshot",
+        str(snapshot),
+        env=env,
+    )
     assert result.returncode == 0, result.stderr
     assert (state_root / "current").resolve() == selected_release.resolve()
-    assert str(selected_release) in service_path.read_text() and str(old_release) not in service_path.read_text()
+    assert service_path.read_bytes() == snapshot.read_bytes()
+    assert "--project-root" in validator_args.read_text()
+    assert "--managed-projects-root" not in validator_args.read_text()
+    assert "--bind-address 100.103.69.9" in validator_args.read_text()
+
+
+def test_rollback_failure_restores_pre_attempt_service_and_link(tmp_path: Path) -> None:
+    state_root = tmp_path / "aflowd"
+    active_release = _release_fixture(state_root, "a" * 40)
+    selected_release = _release_fixture(state_root, "b" * 40)
+    for release in (active_release, selected_release):
+        _add_release_file(
+            release,
+            "src/deploy/aflowd/validate-runtime.sh",
+            "#!/bin/sh\nexit 0\n",
+            executable=True,
+        )
+    (state_root / "current").symlink_to(active_release)
+    service_path = state_root / "aflowd.service"
+    original_service = _service_unit(active_release, legacy=False)
+    service_path.write_text(original_service)
+    snapshot = tmp_path / "aflowd.service.before"
+    snapshot.write_text(_service_unit(selected_release, legacy=True))
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _write_executable(
+        tools / "systemctl",
+        """#!/usr/bin/env bash
+if [[ "$1" == "restart" ]] && grep -Fq "$SELECTED_RELEASE" "$SERVICE_PATH"; then
+  exit 1
+fi
+exit 0
+""",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{tools}:{os.environ['PATH']}",
+        "SERVICE_PATH": str(service_path),
+        "SELECTED_RELEASE": str(selected_release),
+    }
+    result = _run(
+        "bash",
+        str(DEPLOY / "rollback.sh"),
+        "--root",
+        str(state_root),
+        "--service-path",
+        str(service_path),
+        "--release",
+        selected_release.name,
+        "--service-snapshot",
+        str(snapshot),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "restored" in result.stderr
+    assert (state_root / "current").resolve() == active_release.resolve()
+    assert service_path.read_text() == original_service
+
+
+def test_rollback_rejects_service_snapshot_for_another_release(tmp_path: Path) -> None:
+    state_root = tmp_path / "aflowd"
+    active_release = _release_fixture(state_root, "a" * 40)
+    selected_release = _release_fixture(state_root, "b" * 40)
+    for release in (active_release, selected_release):
+        _add_release_file(
+            release,
+            "src/deploy/aflowd/validate-runtime.sh",
+            "#!/bin/sh\nexit 0\n",
+            executable=True,
+        )
+    (state_root / "current").symlink_to(active_release)
+    service_path = state_root / "aflowd.service"
+    original_service = _service_unit(active_release, legacy=False)
+    service_path.write_text(original_service)
+    snapshot = tmp_path / "aflowd.service.before"
+    snapshot.write_text(original_service)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 99\n")
+    result = _run(
+        "bash",
+        str(DEPLOY / "rollback.sh"),
+        "--root",
+        str(state_root),
+        "--service-path",
+        str(service_path),
+        "--release",
+        selected_release.name,
+        "--service-snapshot",
+        str(snapshot),
+        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
+    )
+    assert result.returncode != 0
+    assert "snapshot is not pinned" in result.stderr
+    assert (state_root / "current").resolve() == active_release.resolve()
+    assert service_path.read_text() == original_service
 
 
 @pytest.mark.parametrize("name", ("install.sh", "rollback.sh", "status.sh", "uninstall-emergency.sh", "validate-runtime.sh", "preflight.sh", "serve-private-https.sh", "migrate-registry.py", "validate-serve-status.py"))
