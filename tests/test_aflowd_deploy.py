@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import argparse
+from datetime import datetime, timezone
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
+import json
 import os
 from pathlib import Path
-import http.client
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import socket
 import subprocess
 import sys
 from threading import Thread
@@ -18,12 +21,31 @@ DEPLOY = ROOT / "deploy" / "aflowd"
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
-    reason="aflowd deployment scripts require Linux systemd, GNU tools, and Tailscale networking",
+    reason="aflowd deployment scripts require Linux systemd and GNU tools",
 )
 
 
 def _run(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, check=False)
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(content)
+    path.chmod(0o755)
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "README.md").write_text("fixture\n")
+    for command in (
+        ("git", "init", "-q", str(path)),
+        ("git", "-C", str(path), "config", "user.email", "test@example.invalid"),
+        ("git", "-C", str(path), "config", "user.name", "AFlow Test"),
+        ("git", "-C", str(path), "add", "."),
+        ("git", "-C", str(path), "commit", "-qm", "fixture"),
+    ):
+        assert _run(*command).returncode == 0
+    return path
 
 
 def _git_source(tmp_path: Path) -> tuple[Path, str]:
@@ -35,21 +57,9 @@ def _git_source(tmp_path: Path) -> tuple[Path, str]:
     (source / "apps" / "aflow_app" / "web" / "package.json").write_text("{}\n")
     (source / "apps" / "aflow_app" / "web" / "package-lock.json").write_text("{}\n")
     _write_executable(source / "deploy" / "aflowd" / "validate-runtime.sh", "#!/bin/sh\nexit 0\n")
-    for command in (
-        ("git", "init", "-q", str(source)),
-        ("git", "-C", str(source), "config", "user.email", "test@example.invalid"),
-        ("git", "-C", str(source), "config", "user.name", "AFlow Test"),
-        ("git", "-C", str(source), "add", "."),
-        ("git", "-C", str(source), "commit", "-qm", "fixture"),
-    ):
-        assert _run(*command).returncode == 0
+    _git_repo(source)
     commit = _run("git", "-C", str(source), "rev-parse", "HEAD").stdout.strip()
     return source, commit
-
-
-def _write_executable(path: Path, content: str) -> None:
-    path.write_text(content)
-    path.chmod(0o755)
 
 
 def _fake_build_tools(tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -83,26 +93,22 @@ fi
     return tools, {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "AFLOWD_READINESS_DELAY_SECONDS": "0"}
 
 
-def _project_and_token(tmp_path: Path) -> tuple[Path, Path, Path]:
-    project = tmp_path / "project"
-    config = project / "aflow" / "aflow.toml"
-    config.parent.mkdir(parents=True)
-    config.write_text("[aflow]\n")
-    token = tmp_path / "aflowd.env"
+def _project_and_token(tmp_path: Path, name: str = "project") -> tuple[Path, Path, Path, Path]:
+    managed = tmp_path / "managed"
+    project = _git_repo(managed / name)
+    legacy = project / "legacy-config"
+    legacy.mkdir()
+    aflow = legacy / "aflow.toml"
+    workflows = legacy / "workflows.toml"
+    aflow.write_text("[aflow]\nworkflow = 'default'\n")
+    workflows.write_text("[workflows.default]\nsteps = ['implement']\n")
+    token = tmp_path / f"{name}.env"
     token.write_text("AFLOW_APP_TOKEN=opaque-token\n")
     token.chmod(0o600)
-    return project, config, token
+    return project, aflow, workflows, token
 
 
-def _install_args(
-    source: Path,
-    commit: str,
-    state_root: Path,
-    project: Path,
-    config: Path,
-    token: Path,
-    tools: Path,
-) -> list[str]:
+def _install_args(source: Path, commit: str, state_root: Path, managed: Path, token: Path, tools: Path) -> list[str]:
     return [
         "bash", str(DEPLOY / "install.sh"),
         "--source", str(source),
@@ -110,85 +116,120 @@ def _install_args(
         "--root", str(state_root),
         "--service-path", str(state_root / "aflowd.service"),
         "--environment-file", str(token),
-        "--project-root", str(project),
-        "--project-config", str(config),
+        "--managed-projects-root", str(managed),
+        "--project-registry-path", str(state_root / "projects.json"),
         "--uv", str(tools / "uv"),
         "--npm", str(tools / "npm"),
     ]
 
 
-def test_installer_dry_run_names_every_live_target_without_writing(tmp_path: Path) -> None:
+def _release_fixture(tmp_path: Path, release_id: str = "b" * 40) -> Path:
+    release = tmp_path / "releases" / release_id
+    (release / "bin").mkdir(parents=True)
+    (release / "config").mkdir()
+    (release / "src" / "apps" / "aflow_app" / "web" / "dist").mkdir(parents=True)
+    for entrypoint in ("aflow", "aflowd", "aflow-app-server"):
+        _write_executable(release / "bin" / entrypoint, "#!/bin/sh\nexit 0\n")
+    (release / "config" / "config.toml").write_text("[server]\n")
+    (release / "src" / "apps" / "aflow_app" / "web" / "dist" / "index.html").write_text("ok\n")
+    manifest = [f"source_commit={release_id}"]
+    for relative in (
+        "bin/aflow", "bin/aflowd", "bin/aflow-app-server", "config/config.toml", "src/apps/aflow_app/web/dist/index.html"
+    ):
+        digest = hashlib.sha256((release / relative).read_bytes()).hexdigest()
+        manifest.append(f"{digest}  {relative}")
+    (release / "release-manifest.sha256").write_text("\n".join(manifest) + "\n")
+    return release
+
+
+def _registry_record(project_id: str, relative_root: str) -> dict[str, object]:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    return {
+        "schema_version": 1,
+        "id": project_id,
+        "display_name": project_id.title(),
+        "relative_root": relative_root,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+def _preflight_snapshot(path: Path, current_release: str | None) -> Path:
+    path.mkdir()
+    (path / "preflight.json").write_text(json.dumps({
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "current_release": current_release,
+        "active_workflow_units": [],
+        "active_controllers": [],
+        "unsafe_runs": [],
+        "project_errors": {},
+        "safe_to_rollout": True,
+    }))
+    return path
+
+
+def test_installer_dry_run_names_registry_and_loopback_without_writing(tmp_path: Path) -> None:
     source, commit = _git_source(tmp_path)
     state_root = tmp_path / "aflowd"
-
-    result = _run(
-        "bash", str(DEPLOY / "install.sh"),
-        "--source", str(source),
-        "--commit", commit,
-        "--root", str(state_root),
-    )
-
+    result = _run("bash", str(DEPLOY / "install.sh"), "--source", str(source), "--commit", commit, "--root", str(state_root))
     assert result.returncode == 0, result.stderr
-    assert f"release source: {source}@{commit}" in result.stdout
     assert f"release destination: {state_root}/releases/{commit}" in result.stdout
-    assert "service name: aflowd.service" in result.stdout
-    assert "bind address: 100.103.69.9:8765 on tailscale0" in result.stdout
-    assert "allowlist path: /root/code/aflow-control-plane" in result.stdout
-    assert "rollback target:" in result.stdout
+    assert "backend bind: 127.0.0.1:8765 (Tailscale Serve target)" in result.stdout
+    assert "managed projects root: /root/code" in result.stdout
+    assert "project registry: /var/lib/aflowd/projects.json" in result.stdout
+    assert "Tailscale mappings" in result.stdout
     assert not state_root.exists()
 
 
-def test_staged_install_uses_release_realpaths_and_atomic_current(tmp_path: Path) -> None:
+def test_fresh_install_is_immutable_and_registry_backed(tmp_path: Path) -> None:
     source, commit = _git_source(tmp_path)
     tools, env = _fake_build_tools(tmp_path)
-    project, config, token = _project_and_token(tmp_path)
+    project, _, _, token = _project_and_token(tmp_path)
     state_root = tmp_path / "aflowd"
-
-    result = _run(
-        *_install_args(source, commit, state_root, project, config, token, tools),
-        "--apply", "--skip-service", "--skip-readiness",
-        env=env,
-    )
-
+    staged = _run(*_install_args(source, commit, state_root, project.parent, token, tools), "--stage-only", "--apply", env=env)
+    assert staged.returncode == 0, staged.stderr
+    assert not (state_root / "current").exists()
+    result = _run(*_install_args(source, commit, state_root, project.parent, token, tools), "--apply", "--skip-service", "--skip-readiness", env=env)
     assert result.returncode == 0, result.stderr
     release = state_root / "releases" / commit
     assert (state_root / "current").resolve() == release.resolve()
-    assert "source_commit=" + commit in (release / "release-manifest.sha256").read_text()
-    rendered = (release / "config" / "config.toml").read_text()
-    parsed = tomllib.loads(rendered)
-    control_plane = parsed["control_plane"]
-    assert "projects" not in control_plane
-    assert control_plane["managed_projects_root"] == str(project.parent)
-    assert control_plane["project_registry_path"] == str(state_root / "projects.json")
-    assert control_plane["aflow_executable"] == f"{release}/bin/aflow"
-    assert control_plane["environment_file"] == str(token)
-    assert control_plane["release_identity"] == commit
-    assert control_plane["environment"] == {
-        "HOME": "/root",
-        "PATH": f"{release}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    }
-    assert f'aflow_executable = "{release}/bin/aflow"' in rendered
-    assert f'release_identity = "{commit}"' in rendered
-    assert "/current/" not in rendered
-    for entrypoint in ("aflow", "aflowd", "aflow-app-server"):
-        path = release / "bin" / entrypoint
-        assert path.is_file() and os.access(path, os.X_OK) and not path.is_symlink()
-        assert ' -P -c ' in path.read_text()
-
-    (release / "bin" / "aflow").write_text("#!/bin/sh\nexit 1\n")
-    corrupted = _run(
-        *_install_args(source, commit, state_root, project, config, token, tools),
-        "--apply", "--skip-service", "--skip-readiness",
-        env=env,
-    )
-    assert corrupted.returncode != 0
-    assert "hashes do not match manifest" in corrupted.stderr
+    parsed = tomllib.loads((release / "config" / "config.toml").read_text())
+    assert parsed["server"] == {"bind_host": "127.0.0.1", "bind_port": 8765}
+    assert "project_catalog" not in parsed and "planning" not in parsed
+    assert parsed["control_plane"]["managed_projects_root"] == str(project.parent)
+    assert parsed["control_plane"]["project_registry_path"] == str(state_root / "projects.json")
+    assert parsed["control_plane"]["aflow_executable"] == f"{release}/bin/aflow"
+    assert parsed["control_plane"]["release_identity"] == commit
+    assert "/current/" not in (release / "config" / "config.toml").read_text()
+    (release / "bin" / "aflow").write_text("corrupt\n")
+    stale = _run(*_install_args(source, commit, state_root, project.parent, token, tools), "--apply", "--skip-service", "--skip-readiness", env=env)
+    assert stale.returncode != 0
+    assert "release snapshot hashes are stale" in stale.stderr
 
 
-def test_failed_authenticated_readiness_restores_prior_current_and_service(tmp_path: Path) -> None:
+def test_install_validates_a_multiseed_registry_and_rejects_invalid_inventory(tmp_path: Path) -> None:
     source, commit = _git_source(tmp_path)
     tools, env = _fake_build_tools(tmp_path)
-    project, config, token = _project_and_token(tmp_path)
+    first, _, _, token = _project_and_token(tmp_path, "first")
+    second = _git_repo(first.parent / "second")
+    state_root = tmp_path / "aflowd"
+    state_root.mkdir()
+    registry = state_root / "projects.json"
+    registry.write_text(json.dumps({"schema_version": 1, "projects": [_registry_record("first", "first"), _registry_record("second", "second")]}) + "\n")
+    result = _run(*_install_args(source, commit, state_root, first.parent, token, tools), "--apply", "--skip-service", "--skip-readiness", env=env)
+    assert result.returncode == 0, result.stderr
+    registry.write_text("{broken\n")
+    invalid = _run(*_install_args(source, commit, state_root, first.parent, token, tools), "--apply", "--skip-service", "--skip-readiness", env=env)
+    assert invalid.returncode != 0
+    assert "project registry is invalid" in invalid.stderr
+    assert second.exists()
+
+
+def test_service_rollout_requires_preflight_and_rolls_back_failed_readiness(tmp_path: Path) -> None:
+    source, commit = _git_source(tmp_path)
+    tools, env = _fake_build_tools(tmp_path)
+    project, _, _, token = _project_and_token(tmp_path)
     state_root = tmp_path / "aflowd"
     old_release = state_root / "releases" / ("a" * 40)
     old_release.mkdir(parents=True)
@@ -196,147 +237,42 @@ def test_failed_authenticated_readiness_restores_prior_current_and_service(tmp_p
     service_path = state_root / "aflowd.service"
     service_path.write_text("old service\n")
     _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
-    _write_executable(tools / "ip", "#!/bin/sh\necho '1: tailscale0    inet 100.103.69.9/32'\n")
-    curl_config_path = tmp_path / "curl-config-path"
-    _write_executable(
-        tools / "curl",
-        """#!/usr/bin/env bash
-set -euo pipefail
-while (($#)); do
-  case "$1" in
-    --config) printf '%s' "$2" >"$AFLOWD_TEST_CURL_CONFIG_PATH"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-exit 22
-""",
-    )
-
-    result = _run(
-        *_install_args(source, commit, state_root, project, config, token, tools),
-        "--apply",
-        env={**env, "AFLOWD_TEST_CURL_CONFIG_PATH": str(curl_config_path)},
-    )
-
-    assert result.returncode != 0
+    _write_executable(tools / "curl", "#!/bin/sh\nexit 22\n")
+    missing = _run(*_install_args(source, commit, state_root, project.parent, token, tools), "--apply", env=env)
+    assert missing.returncode != 0 and "preflight" in missing.stderr
+    snapshot = _preflight_snapshot(tmp_path / "preflight", str(old_release.resolve()))
+    failed = _run(*_install_args(source, commit, state_root, project.parent, token, tools), "--preflight-snapshot", str(snapshot), "--apply", env=env)
+    assert failed.returncode != 0
     assert (state_root / "current").resolve() == old_release.resolve()
     assert service_path.read_text() == "old service\n"
-    assert "rolled back" in result.stderr
-    assert not Path(curl_config_path.read_text()).exists()
+    assert "rolled back" in failed.stderr
 
 
-def test_readiness_retries_until_server_is_available(tmp_path: Path) -> None:
-    source, commit = _git_source(tmp_path)
-    tools, env = _fake_build_tools(tmp_path)
-    project, config, token = _project_and_token(tmp_path)
-    state_root = tmp_path / "aflowd"
-    counter = tmp_path / "readiness-attempts"
-    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
-    _write_executable(tools / "ip", "#!/bin/sh\necho '1: tailscale0    inet 100.103.69.9/32'\n")
-    _write_executable(
-        tools / "curl",
-        """#!/usr/bin/env bash
-set -euo pipefail
-attempt=0
-if [[ -f "$AFLOWD_TEST_READINESS_COUNTER" ]]; then
-  read -r attempt <"$AFLOWD_TEST_READINESS_COUNTER"
-fi
-attempt=$((attempt + 1))
-printf '%s\n' "$attempt" >"$AFLOWD_TEST_READINESS_COUNTER"
-(( attempt >= 3 ))
-""",
-    )
-
-    result = _run(
-        *_install_args(source, commit, state_root, project, config, token, tools),
-        "--apply",
-        env={**env, "AFLOWD_TEST_READINESS_COUNTER": str(counter)},
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert counter.read_text().strip() == "3"
-
-def test_non_default_install_renders_a_service_for_the_selected_paths(tmp_path: Path) -> None:
-    source, commit = _git_source(tmp_path)
-    tools, env = _fake_build_tools(tmp_path)
-    project, config, token = _project_and_token(tmp_path)
-    state_root = tmp_path / "non-default-aflowd"
-    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
-    _write_executable(tools / "ip", "#!/bin/sh\necho '1: tailscale0    inet 100.103.69.9/32'\n")
-    _write_executable(tools / "curl", "#!/bin/sh\nexit 0\n")
-
-    result = _run(*_install_args(source, commit, state_root, project, config, token, tools), "--apply", env=env)
-
-    assert result.returncode == 0, result.stderr
-    release = state_root / "releases" / commit
-    service = (state_root / "aflowd.service").read_text()
-    assert f"Documentation=file:{release}/src/deploy/aflowd/README.md" in service
-    assert f"WorkingDirectory={release}" in service
-    assert f"Environment=AFLOW_APP_CONFIG_DIR={release}/config" in service
-    assert f"Environment=AFLOW_APP_WEB_DIST={release}/src/apps/aflow_app/web/dist" in service
-    assert f"Environment=PATH={release}/bin:" in service
-    assert f"EnvironmentFile={token}" in service
-    assert f"--release {release} --config {release}/config/config.toml" in service
-    assert f"--environment-file {token} --project-root {project} --project-config {config}" in service
-    assert f"ExecStart=/usr/bin/env {release}/bin/aflow-app-server" in service
-    assert f"ConditionPathIsDirectory={project}" in service
-    assert "StateDirectory=aflowd" in service
-    assert f"ReadWritePaths={project} /var/lib/aflowd" in service
-    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" in service
-    for default_path in ("/opt/aflowd/releases", "/etc/aflowd/aflowd.env", "/root/code/aflow-control-plane"):
-        assert default_path not in service
+def test_service_template_uses_exact_writable_paths_and_loopback(tmp_path: Path) -> None:
+    service = (DEPLOY / "aflowd.service").read_text()
+    assert "Environment=AFLOW_APP_HOST=127.0.0.1" in service
+    assert "ConditionPathIsDirectory=@MANAGED_PROJECTS_ROOT@" in service
+    assert "ReadWritePaths=@MANAGED_PROJECTS_ROOT@ /var/lib/aflowd" in service
+    assert "/@" not in service
+    assert "100.103.69.9" not in service and "tailscale0" not in service
+    assert "NoNewPrivileges=yes" in service and "ProtectSystem=strict" in service
+    assert "@RELEASE_DIR@/bin/aflow-app-server" in service
+    example = DEPLOY / "aflow-control-plane.mcp.example.toml"
+    assert _run("python3", str(DEPLOY / "validate-mcp-config.py"), str(example)).returncode == 0
+    unsafe = tmp_path / "unsafe.toml"
+    unsafe.write_text(example.read_text().replace("https://", "http://"))
+    rejected = _run("python3", str(DEPLOY / "validate-mcp-config.py"), str(unsafe))
+    assert rejected.returncode != 0 and "MagicDNS HTTPS" in rejected.stderr
 
 
-def test_failed_same_commit_reinstall_restores_the_active_release_config(tmp_path: Path) -> None:
-    source, commit = _git_source(tmp_path)
-    tools, env = _fake_build_tools(tmp_path)
-    first_project, first_config, first_token = _project_and_token(tmp_path)
-    second_project = tmp_path / "second-project"
-    second_config = second_project / "aflow" / "aflow.toml"
-    second_config.parent.mkdir(parents=True)
-    second_config.write_text("[aflow]\n")
-    second_token = tmp_path / "second-aflowd.env"
-    second_token.write_text("AFLOW_APP_TOKEN=second-opaque-token\n")
-    second_token.chmod(0o600)
-    state_root = tmp_path / "aflowd"
-    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
-    _write_executable(tools / "ip", "#!/bin/sh\necho '1: tailscale0    inet 100.103.69.9/32'\n")
-    _write_executable(tools / "curl", "#!/bin/sh\nexit 0\n")
-
-    initial = _run(
-        *_install_args(source, commit, state_root, first_project, first_config, first_token, tools),
-        "--apply",
-        env=env,
-    )
-    assert initial.returncode == 0, initial.stderr
-    release = state_root / "releases" / commit
-    previous_config = (release / "config" / "config.toml").read_text()
-    previous_service = (state_root / "aflowd.service").read_text()
-
-    _write_executable(tools / "curl", "#!/bin/sh\nexit 22\n")
-    failed = _run(
-        *_install_args(source, commit, state_root, second_project, second_config, second_token, tools),
-        "--apply",
-        env=env,
-    )
-
-    assert failed.returncode != 0
-    assert (state_root / "current").resolve() == release.resolve()
-    assert (state_root / "aflowd.service").read_text() == previous_service
-    assert (release / "config" / "config.toml").read_text() == previous_config
-    assert str(second_project) not in previous_config
-    assert str(second_token) not in previous_config
-
-
-def test_runtime_validator_rejects_non_private_token_and_current_indirection(tmp_path: Path) -> None:
-    release = tmp_path / ("b" * 40)
-    (release / "bin").mkdir(parents=True)
-    for entrypoint in ("aflow", "aflowd", "aflow-app-server"):
-        _write_executable(release / "bin" / entrypoint, "#!/bin/sh\nexit 0\n")
-    project, project_config, token = _project_and_token(tmp_path)
-    config = tmp_path / "config.toml"
+def test_runtime_validator_checks_loopback_registry_and_release_snapshot(tmp_path: Path) -> None:
+    release = _release_fixture(tmp_path)
+    project, _, _, token = _project_and_token(tmp_path)
     registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"schema_version": 1, "projects": [_registry_record("project", "project")]}) + "\n")
+    config = release / "config" / "config.toml"
     config.write_text(
+        "[server]\nbind_host = '127.0.0.1'\nbind_port = 8765\n"
         "[control_plane]\n"
         f'managed_projects_root = "{project.parent}"\n'
         f'project_registry_path = "{registry}"\n'
@@ -345,150 +281,241 @@ def test_runtime_validator_rejects_non_private_token_and_current_indirection(tmp
         f'release_identity = "{release.name}"\n'
         'environment = { HOME = "/root" }\n'
     )
+    _rewrite_manifest(release)
+    args = ["bash", str(DEPLOY / "validate-runtime.sh"), "--release", str(release), "--config", str(config), "--environment-file", str(token), "--managed-projects-root", str(project.parent), "--project-registry-path", str(registry)]
+    assert _run(*args).returncode == 0
+    invalid_bind = _run(*args, "--bind-address", "0.0.0.0")
+    assert invalid_bind.returncode != 0 and "127.0.0.1" in invalid_bind.stderr
+    (release / "bin" / "aflow").write_text("stale\n")
+    stale = _run(*args)
+    assert stale.returncode != 0 and "snapshot hashes are stale" in stale.stderr
 
-    success = _run(
-        "bash", str(DEPLOY / "validate-runtime.sh"),
-        "--release", str(release), "--config", str(config),
-        "--environment-file", str(token), "--project-root", str(project),
-        "--project-config", str(project_config), "--skip-interface-check",
+
+def _rewrite_manifest(release: Path) -> None:
+    lines = [f"source_commit={release.name}"]
+    for relative in ("bin/aflow", "bin/aflowd", "bin/aflow-app-server", "config/config.toml", "src/apps/aflow_app/web/dist/index.html"):
+        lines.append(f"{hashlib.sha256((release / relative).read_bytes()).hexdigest()}  {relative}")
+    (release / "release-manifest.sha256").write_text("\n".join(lines) + "\n")
+
+
+def _migration_args(release: Path, project: Path, aflow: Path, workflows: Path, registry: Path, backup_root: Path) -> list[str]:
+    return [
+        "python3", str(DEPLOY / "migrate-registry.py"), "prepare",
+        "--release", str(release), "--managed-projects-root", str(project.parent),
+        "--project-root", str(project), "--project-id", project.name,
+        "--display-name", project.name.title(), "--source-aflow-config", str(aflow),
+        "--source-workflows-config", str(workflows), "--registry-path", str(registry),
+        "--backup-root", str(backup_root),
+    ]
+
+
+def test_migration_publishes_config_and_registry_then_rolls_back_without_runs_or_plans(tmp_path: Path) -> None:
+    release = _release_fixture(tmp_path)
+    project, aflow, workflows, _ = _project_and_token(tmp_path)
+    (project / ".aflow" / "runs" / "run-1").mkdir(parents=True)
+    (project / ".aflow" / "runs" / "run-1" / "state.json").write_text("keep\n")
+    (project / "plans" / "in-progress").mkdir(parents=True)
+    (project / "plans" / "in-progress" / "plan.md").write_text("keep\n")
+    registry = tmp_path / "state" / "projects.json"
+    registry.parent.mkdir()
+    result = _run(*_migration_args(release, project, aflow, workflows, registry, tmp_path / "backups"), "--apply")
+    assert result.returncode == 0, result.stderr
+    assert (project / ".aflow" / "config" / "aflow.toml").read_bytes() == aflow.read_bytes()
+    assert json.loads(registry.read_text())["projects"][0]["relative_root"] == project.name
+    transaction = Path(next(line.split(": ", 1)[1] for line in result.stdout.splitlines() if line.startswith("migration transaction:")))
+    rollback = _run("python3", str(DEPLOY / "migrate-registry.py"), "rollback", "--transaction", str(transaction), "--apply")
+    assert rollback.returncode == 0, rollback.stderr
+    assert not registry.exists() and not (project / ".aflow" / "config").exists()
+    assert (project / ".aflow" / "runs" / "run-1" / "state.json").read_text() == "keep\n"
+    assert (project / "plans" / "in-progress" / "plan.md").read_text() == "keep\n"
+
+
+def test_migration_appends_to_multiseed_registry_and_refuses_overwrite(tmp_path: Path) -> None:
+    release = _release_fixture(tmp_path)
+    project, aflow, workflows, _ = _project_and_token(tmp_path, "second")
+    _git_repo(project.parent / "first")
+    registry = tmp_path / "state" / "projects.json"
+    registry.parent.mkdir()
+    registry.write_text(json.dumps({"schema_version": 1, "projects": [_registry_record("first", "first")]}) + "\n")
+    result = _run(*_migration_args(release, project, aflow, workflows, registry, tmp_path / "backups"), "--apply")
+    assert result.returncode == 0, result.stderr
+    assert [item["id"] for item in json.loads(registry.read_text())["projects"]] == ["first", "second"]
+    (project / ".aflow" / "config" / "aflow.toml").write_text("different\n")
+    before = registry.read_bytes()
+    refused = _run(*_migration_args(release, project, aflow, workflows, registry, tmp_path / "more-backups"), "--apply")
+    assert refused.returncode != 0
+    assert registry.read_bytes() == before
+
+
+def test_migration_rejects_invalid_source_config_without_publishing(tmp_path: Path) -> None:
+    release = _release_fixture(tmp_path)
+    project, aflow, workflows, _ = _project_and_token(tmp_path, "invalid")
+    aflow.write_text("broken = [\n")
+    registry = tmp_path / "state" / "projects.json"
+    registry.parent.mkdir()
+    result = _run(*_migration_args(release, project, aflow, workflows, registry, tmp_path / "backups"), "--apply")
+    assert result.returncode != 0
+    assert "valid UTF-8 TOML" in result.stderr
+    assert not registry.exists()
+    assert not (project / ".aflow" / "config").exists()
+
+
+def test_interrupted_migration_automatically_removes_only_published_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = importlib.util.spec_from_file_location("aflowd_migration", DEPLOY / "migrate-registry.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    release = _release_fixture(tmp_path)
+    project, aflow, workflows, _ = _project_and_token(tmp_path)
+    (project / ".aflow" / "runs").mkdir(parents=True)
+    (project / ".aflow" / "runs" / "keep").write_text("keep\n")
+    registry = tmp_path / "state" / "projects.json"
+    registry.parent.mkdir()
+    original = module._write_atomic
+    failed = False
+
+    def interrupt(path: Path, data: bytes, mode: int = 0o600) -> None:
+        nonlocal failed
+        if Path(path) == registry and not failed:
+            failed = True
+            raise OSError("simulated interruption")
+        original(path, data, mode)
+
+    monkeypatch.setattr(module, "_write_atomic", interrupt)
+    args = argparse.Namespace(
+        release=str(release), managed_projects_root=str(project.parent), project_root=str(project),
+        project_id=project.name, display_name="Project", source_aflow_config=str(aflow),
+        source_workflows_config=str(workflows), registry_path=str(registry),
+        backup_root=str(tmp_path / "backups"), apply=True,
     )
-    assert success.returncode == 0, success.stderr
-
-    valid_config = config.read_text()
-    config.write_text(valid_config + "broken = [\n")
-    invalid_toml = _run(
-        "bash", str(DEPLOY / "validate-runtime.sh"),
-        "--release", str(release), "--config", str(config),
-        "--environment-file", str(token), "--project-root", str(project),
-        "--project-config", str(project_config), "--skip-interface-check",
-    )
-    assert invalid_toml.returncode != 0
-    assert "valid TOML" in invalid_toml.stderr
-    config.write_text(valid_config)
-
-    token.chmod(0o640)
-    private_failure = _run(
-        "bash", str(DEPLOY / "validate-runtime.sh"),
-        "--release", str(release), "--config", str(config),
-        "--environment-file", str(token), "--project-root", str(project),
-        "--project-config", str(project_config), "--skip-interface-check",
-    )
-    assert private_failure.returncode != 0
-    assert "mode 0600" in private_failure.stderr
-
-    token.chmod(0o600)
-    config.write_text(config.read_text() + 'aflow_current = "/opt/aflowd/current/bin/aflow"\n')
-    current_failure = _run(
-        "bash", str(DEPLOY / "validate-runtime.sh"),
-        "--release", str(release), "--config", str(config),
-        "--environment-file", str(token), "--project-root", str(project),
-        "--project-config", str(project_config), "--skip-interface-check",
-    )
-    assert current_failure.returncode != 0
-    assert "current" in current_failure.stderr
-
-    wildcard_failure = _run(
-        "bash", str(DEPLOY / "validate-runtime.sh"),
-        "--release", str(release), "--config", str(config),
-        "--environment-file", str(token), "--project-root", "/*",
-        "--project-config", str(project_config), "--skip-interface-check",
-    )
-    assert wildcard_failure.returncode != 0
-    assert "non-wildcard" in wildcard_failure.stderr
+    with pytest.raises(OSError, match="simulated interruption"):
+        module.prepare(args)
+    assert not registry.exists() and not (project / ".aflow" / "config").exists()
+    assert (project / ".aflow" / "runs" / "keep").read_text() == "keep\n"
 
 
-def test_service_template_and_mcp_example_are_hardened_and_credential_free(tmp_path: Path) -> None:
-    service = (DEPLOY / "aflowd.service").read_text()
-    assert "Restart=always" in service
-    assert "Restart=no" not in service
-    assert "100.103.69.9" in service and "tailscale0" in service
-    assert "/@RELEASE_DIR@/bin/aflow-app-server" in service
-    assert "/opt/aflowd/current" not in service
-    assert "NoNewPrivileges=yes" in service and "ProtectSystem=strict" in service
-    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" in service
-    assert "StateDirectory=aflowd" in service
-    assert "ReadWritePaths=/@PROJECT_ROOT@ /var/lib/aflowd" in service
-    assert "Environment=AFLOW_APP_HOST=100.103.69.9" in service
-    assert "--interface tailscale0" in service
-
-    example = DEPLOY / "aflow-control-plane.mcp.example.toml"
-    valid = _run("python3", str(DEPLOY / "validate-mcp-config.py"), str(example))
-    assert valid.returncode == 0, valid.stderr
-    unsafe = tmp_path / "unsafe-mcp.toml"
-    unsafe.write_text(example.read_text().replace("/mcp\"", "/mcp?token=literal\""))
-    rejected = _run("python3", str(DEPLOY / "validate-mcp-config.py"), str(unsafe))
-    assert rejected.returncode != 0
-    assert "credential-free" in rejected.stderr
-
-
-def test_tailscale_only_smoke_rejects_loopback_and_eth0_and_requires_bearer() -> None:
-    class ReadyHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            if self.path != "/ready":
-                self.send_error(404)
-            elif self.headers.get("Authorization") == "Bearer deployment-test-token":
-                self.send_response(200)
-                self.end_headers()
-            else:
-                self.send_response(401)
-                self.end_headers()
-
-        def log_message(self, _format: str, *_args: object) -> None:
-            pass
-
-    server = ThreadingHTTPServer(("100.103.69.9", 0), ReadyHandler)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        port = server.server_port
-        connection = http.client.HTTPConnection("100.103.69.9", port, timeout=1)
-        connection.request("GET", "/ready", headers={"Authorization": "Bearer deployment-test-token"})
-        assert connection.getresponse().status == 200
-        connection.close()
-        missing = http.client.HTTPConnection("100.103.69.9", port, timeout=1)
-        missing.request("GET", "/ready")
-        assert missing.getresponse().status == 401
-        missing.close()
-        for address in ("127.0.0.1", "192.168.1.63"):
-            with pytest.raises(OSError):
-                socket.create_connection((address, port), timeout=0.25)
-    finally:
-        server.shutdown()
-        thread.join(timeout=1)
-        server.server_close()
-
-
-def test_rollback_rewrites_the_pinned_service_to_the_selected_release(tmp_path: Path) -> None:
-    state_root = tmp_path / "aflowd"
-    old_release = state_root / "releases" / ("a" * 40)
-    selected_release = state_root / "releases" / ("b" * 40)
-    for release in (old_release, selected_release):
-        (release / "bin").mkdir(parents=True)
-        (release / "config").mkdir()
-        _write_executable(release / "bin" / "aflow-app-server", "#!/bin/sh\nexit 0\n")
-        (release / "config" / "config.toml").write_text("[server]\n")
-    (state_root / "current").symlink_to(old_release)
-    service_path = state_root / "aflowd.service"
-    service_path.write_text(f"ExecStart={old_release}/bin/aflow-app-server\n")
+def test_preflight_reads_canonical_state_and_fails_closed_on_unsafe_run(tmp_path: Path) -> None:
+    project, aflow, workflows, token = _project_and_token(tmp_path)
+    config_root = project / ".aflow" / "config"
+    config_root.mkdir(parents=True)
+    config_root.joinpath("aflow.toml").write_bytes(aflow.read_bytes())
+    config_root.joinpath("workflows.toml").write_bytes(workflows.read_bytes())
+    state_root = tmp_path / "state"
+    release = _release_fixture(state_root)
+    (state_root / "current").symlink_to(release)
+    service = tmp_path / "aflowd.service"
+    service.write_text("fixture\n")
     tools = tmp_path / "tools"
     tools.mkdir()
     _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
+    _write_executable(tools / "pgrep", "#!/bin/sh\nexit 1\n")
+    _write_executable(tools / "tailscale", "#!/bin/sh\nprintf '{}\\n'\n")
+    run_status = {"value": "completed"}
 
-    result = _run(
-        "bash", str(DEPLOY / "rollback.sh"),
-        "--root", str(state_root),
-        "--service-path", str(service_path),
-        "--release", selected_release.name,
-        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
-    )
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.headers.get("Authorization") != "Bearer opaque-token":
+                self.send_response(401); self.end_headers(); return
+            if self.path == "/ready":
+                payload = {"ready": True, "project_errors": {}}
+            elif self.path == "/api/control-plane/projects":
+                payload = {"projects": [{"project_id": "project"}]}
+            elif self.path.startswith("/api/control-plane/projects/project/runs"):
+                payload = {"runs": [{"run_id": "run-1", "status": run_status["value"], "ownership": "control_plane", "launch_phase": run_status["value"]}], "next_cursor": None}
+            else:
+                self.send_response(404); self.end_headers(); return
+            data = json.dumps(payload).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
 
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    base_args = [
+        "bash", str(DEPLOY / "preflight.sh"), "--current-backend-url", f"http://127.0.0.1:{server.server_port}",
+        "--root", str(state_root), "--service-path", str(service), "--environment-file", str(token),
+        "--registry-path", str(tmp_path / "missing-registry.json"), "--project-config-root", str(config_root),
+    ]
+    env = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
+    try:
+        safe = _run(*base_args, "--output-dir", str(tmp_path / "safe"), env=env)
+        assert safe.returncode == 0, safe.stderr
+        canonical = (tmp_path / "safe" / "canonical-state.json").read_text()
+        assert "opaque-token" not in canonical
+        run_status["value"] = "needs_attention"
+        unsafe = _run(*base_args, "--output-dir", str(tmp_path / "unsafe"), env=env)
+        assert unsafe.returncode != 0
+        assert json.loads((tmp_path / "unsafe" / "preflight.json").read_text())["safe_to_rollout"] is False
+    finally:
+        server.shutdown(); thread.join(timeout=1); server.server_close()
+
+
+def test_private_serve_restore_refuses_drift_and_restores_exact_snapshot(tmp_path: Path) -> None:
+    tools = tmp_path / "tools"; tools.mkdir()
+    state = tmp_path / "serve-state.json"
+    before = tmp_path / "before.json"; before.write_text('{"before": 1}\n'); state.write_bytes(before.read_bytes())
+    post = tmp_path / "post.json"; post.write_text('{"https": {"443": "http://127.0.0.1:8765"}}\n')
+    serve_status = tmp_path / "serve-status.json"; serve_status.write_text('{"HTTPS": {"443": {"Proxy": "http://127.0.0.1:8765"}}}\n')
+    tailscale_status = tmp_path / "tailscale-status.json"; tailscale_status.write_text('{"Self": {"DNSName": "node.tailnet.ts.net."}}\n')
+    _write_executable(tools / "tailscale", """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "serve --bg --https=443 127.0.0.1:8765" ]]; then cp "$POST" "$STATE"
+elif [[ "$*" == "serve get-config --all" ]]; then cat "$STATE"
+elif [[ "$*" == "serve status --json" ]]; then cat "$SERVE_STATUS"
+elif [[ "$*" == "status --json" ]]; then cat "$TAILSCALE_STATUS"
+elif [[ "$1 $2 $3" == "serve set-config --all" ]]; then cp "$4" "$STATE"
+else exit 2
+fi
+""")
+    env = {**os.environ, "STATE": str(state), "POST": str(post), "SERVE_STATUS": str(serve_status), "TAILSCALE_STATUS": str(tailscale_status)}
+    evidence = tmp_path / "evidence"
+    applied = _run("bash", str(DEPLOY / "serve-private-https.sh"), "--snapshot", str(before), "--evidence-dir", str(evidence), "--tailscale", str(tools / "tailscale"), "--apply", env=env)
+    assert applied.returncode == 0, applied.stderr
+    expected = evidence / "tailscale-serve.after-config.json"
+    state.write_text('{"unrelated": "drift"}\n')
+    drift = _run("bash", str(DEPLOY / "serve-private-https.sh"), "--rollback", "--snapshot", str(before), "--expected-current", str(expected), "--tailscale", str(tools / "tailscale"), "--apply", env=env)
+    assert drift.returncode != 0 and "drifted" in drift.stderr
+    assert json.loads(state.read_text()) == {"unrelated": "drift"}
+    state.write_bytes(expected.read_bytes())
+    restored = _run("bash", str(DEPLOY / "serve-private-https.sh"), "--rollback", "--snapshot", str(before), "--expected-current", str(expected), "--tailscale", str(tools / "tailscale"), "--apply", env=env)
+    assert restored.returncode == 0, restored.stderr
+    assert json.loads(state.read_text()) == {"before": 1}
+
+
+def test_status_rejects_stale_release_snapshot(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    release = _release_fixture(state_root)
+    (state_root / "current").symlink_to(release)
+    tools = tmp_path / "tools"; tools.mkdir()
+    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
+    _write_executable(tools / "ss", "#!/bin/sh\necho 'LISTEN 0 128 127.0.0.1:8765 0.0.0.0:*'\n")
+    _write_executable(tools / "tailscale", """#!/bin/sh
+if [ "$1 $2 $3" = "serve status --json" ]; then echo '{"HTTPS":{"443":{"Proxy":"http://127.0.0.1:8765"}}}'
+else echo '{"Self":{"DNSName":"node.tailnet.ts.net."}}'; fi
+""")
+    env = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
+    ok = _run("bash", str(DEPLOY / "status.sh"), "--root", str(state_root), "--tailscale", str(tools / "tailscale"), env=env)
+    assert ok.returncode == 0, ok.stderr
+    (release / "bin" / "aflow").write_text("stale\n")
+    stale = _run("bash", str(DEPLOY / "status.sh"), "--root", str(state_root), "--tailscale", str(tools / "tailscale"), env=env)
+    assert stale.returncode != 0 and "snapshot is stale" in stale.stderr
+
+
+def test_rollback_rewrites_service_only_to_a_valid_selected_release(tmp_path: Path) -> None:
+    state_root = tmp_path / "aflowd"
+    old_release = _release_fixture(state_root, "a" * 40)
+    selected_release = _release_fixture(state_root, "b" * 40)
+    (state_root / "current").symlink_to(old_release)
+    service_path = state_root / "aflowd.service"
+    service_path.write_text(f"ExecStart={old_release}/bin/aflow-app-server\n")
+    tools = tmp_path / "tools"; tools.mkdir()
+    _write_executable(tools / "systemctl", "#!/bin/sh\nexit 0\n")
+    result = _run("bash", str(DEPLOY / "rollback.sh"), "--root", str(state_root), "--service-path", str(service_path), "--release", selected_release.name, env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"})
     assert result.returncode == 0, result.stderr
     assert (state_root / "current").resolve() == selected_release.resolve()
-    rendered = service_path.read_text()
-    assert str(selected_release) in rendered
-    assert str(old_release) not in rendered
+    assert str(selected_release) in service_path.read_text() and str(old_release) not in service_path.read_text()
 
 
-@pytest.mark.parametrize("name", ("install.sh", "rollback.sh", "status.sh", "uninstall-emergency.sh", "validate-runtime.sh"))
+@pytest.mark.parametrize("name", ("install.sh", "rollback.sh", "status.sh", "uninstall-emergency.sh", "validate-runtime.sh", "preflight.sh", "serve-private-https.sh", "migrate-registry.py", "validate-serve-status.py"))
 def test_deploy_scripts_are_executable(name: str) -> None:
     assert os.access(DEPLOY / name, os.X_OK)

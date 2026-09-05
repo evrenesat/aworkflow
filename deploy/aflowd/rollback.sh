@@ -23,6 +23,10 @@ release_dir="$state_root/releases/$release_id"
 [[ -d "$release_dir" && ! -L "$release_dir" ]] || exit 1
 [[ -x "$release_dir/bin/aflow-app-server" ]] || exit 1
 [[ -f "$release_dir/config/config.toml" && ! -L "$release_dir/config/config.toml" ]] || exit 1
+manifest="$release_dir/release-manifest.sha256"
+[[ -f "$manifest" && ! -L "$manifest" ]] || exit 1
+grep -Fxq "source_commit=$release_id" "$manifest" || exit 1
+tail -n +2 "$manifest" | (cd "$release_dir" && sha256sum --check --status) || exit 1
 [[ -f "$service_path" && ! -L "$service_path" ]] || exit 1
 
 previous_target=$(realpath -e -- "$state_root/current")
