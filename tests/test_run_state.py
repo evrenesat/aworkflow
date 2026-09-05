@@ -21,6 +21,7 @@ from aflow.control_plane import (
     compare_and_swap_overrides,
     read_events,
 )
+from aflow.control_plane.persistence import PersistenceError
 from aflow.run_state import load_override_request
 from aflow.run_state import ControllerConfig
 from aflow.workflow import WorkflowError, run_workflow
@@ -96,6 +97,21 @@ def test_concurrent_control_writes_allow_one_revision_winner(tmp_path: Path) -> 
         outcomes = list(pool.map(write, range(2, 10)))
     assert outcomes.count("written") == 1
     assert outcomes.count("conflict") == 7
+
+
+def test_generic_control_cas_rejects_a_missing_run_without_allocating_it(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / ".aflow" / "runs" / "missing-run"
+
+    with pytest.raises(PersistenceError, match="does not exist"):
+        compare_and_swap_overrides(
+            tmp_path,
+            "missing-run",
+            RunControlRequest(expected_revision=0, owner_stop=True),
+        )
+
+    assert not run_dir.exists()
 
 
 def test_owner_stop_is_a_valid_revisioned_override(tmp_path: Path) -> None:

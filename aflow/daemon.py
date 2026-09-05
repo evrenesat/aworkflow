@@ -399,9 +399,17 @@ class DaemonService:
                     "legacy runs are read-only and cannot be stopped by the daemon"
                 )
             self._assert_manifest_caller(run_id, caller_scope)
+            artifact_path = (
+                self._config.repo_root
+                / ".aflow"
+                / "runs"
+                / validate_run_id(run_id)
+            )
+            if artifact_path.is_symlink():
+                raise DaemonError("run artifact path is unsafe")
             run_dir = self._application.repository.run_directory(run_id)
             if not run_dir.is_dir():
-                if run_dir.exists() or run_dir.is_symlink():
+                if run_dir.exists():
                     raise DaemonError("run artifact path is unsafe")
                 if expected_revision != 0:
                     raise ControlConflictError(0)
@@ -543,6 +551,8 @@ class DaemonService:
     def run_status(self, run_id: str) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
         status = self._application.repository.get_run_status(run_id)
+        if status.status == "owner_stopped":
+            return status
         if status.ownership != "control_plane":
             return status
         try:
@@ -849,6 +859,9 @@ class DaemonService:
     def _replay_manifest(self, manifest: LaunchManifest) -> StartRunResult:
         run_id = manifest.run_id
         unit_name = _unit_name(run_id)
+        status = self._application.repository.get_run_status(run_id)
+        if status.status == "owner_stopped":
+            return self._existing_start_result(run_id)
         observed = self._application.units.get(unit_name)
         if observed is not None and observed.name != unit_name:
             return StartRunResult(
@@ -859,7 +872,6 @@ class DaemonService:
             )
         if observed is not None and observed.is_active:
             return StartRunResult(run_id=run_id, created=False, status="running")
-        status = self._application.repository.get_run_status(run_id)
         if status.launch_phase not in _REPLAYABLE_PHASES:
             return StartRunResult(
                 run_id=run_id,
@@ -1286,6 +1298,14 @@ class DaemonService:
                 status="needs_attention",
                 reason="durable startup record has no immutable launch manifest",
             )
+        status = self._application.repository.get_run_status(run_id)
+        if status.status == "owner_stopped":
+            return StartRunResult(
+                run_id=run_id,
+                created=False,
+                status=status.status,
+                reason=status.reason,
+            )
         observed = self._application.units.get(unit_name)
         if observed is not None and observed.name != unit_name:
             return StartRunResult(
@@ -1296,8 +1316,7 @@ class DaemonService:
             )
         if observed is not None and observed.is_active:
             return StartRunResult(run_id=run_id, created=False, status="running")
-        status = self._application.repository.get_run_status(run_id)
-        if status.status in {"completed", "failed", "interrupted", "owner_stopped"}:
+        if status.status in {"completed", "failed", "interrupted"}:
             return StartRunResult(
                 run_id=run_id,
                 created=False,

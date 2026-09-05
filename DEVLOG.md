@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-06 - Stop daemon-owned runs before unit startup
+
+- The daemon owner-stop path now creates the standard run artifact directory
+  only after an exact control-plane manifest, caller scope, and initial
+  revision are verified. It then uses the existing revisioned control,
+  event-journal, unit-stop, and terminal launch-phase path without fabricating
+  run metadata.
+- An owner-stopped launch phase remains authoritative over a persisted startup
+  question during status reads, idempotent start replay, and later answers, so
+  a stopped pre-start run cannot create a workflow unit.
+
 ## 2026-09-05 - Align manager contract and prelaunch failures
 
 - Updated the bundled manager contract and inline precedence rules for live

@@ -10,7 +10,13 @@ import pytest
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind, StartupRequest
 from aflow.config import GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
-from aflow.control_plane import InMemoryUnitManager, create_launch_manifest, read_events
+from aflow.control_plane import (
+    ControlConflictError,
+    InMemoryUnitManager,
+    RepositoryNotFoundError,
+    create_launch_manifest,
+    read_events,
+)
 from aflow.daemon import (
     AflowDaemon,
     DaemonConfig,
@@ -628,3 +634,167 @@ def test_daemon_owner_stop_persists_terminal_phase_and_requires_event_authorizat
     assert stopped.status == "owner_stopped"
     assert units.stop_calls == [f"aflow-run-{started.run_id}.service"]
     assert daemon.service.poll_events(started.run_id, authorizer=lambda action, status: True)
+
+def test_daemon_owner_stop_manifest_only_requires_exact_owner_and_revision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    run_id = "manifest-only-stop"
+    manifest = daemon.service._initial_manifest_for(
+        run_id=run_id,
+        request=request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+    create_launch_manifest(request.repo_root, manifest)
+    manifest_path = request.repo_root / ".aflow" / "launches" / f"{run_id}.json"
+    run_dir = request.repo_root / ".aflow" / "runs" / run_id
+    plan_bytes = request.plan_path.read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+
+    with pytest.raises(ControlConflictError) as conflict:
+        daemon.service.owner_stop(
+            run_id,
+            expected_revision=1,
+            caller_scope="project:one",
+            idempotency_key="stale-stop",
+        )
+    assert conflict.value.current_revision == 0
+    assert not run_dir.exists()
+
+    with pytest.raises(PermissionError):
+        daemon.service.owner_stop(
+            run_id,
+            expected_revision=0,
+            caller_scope="project:other",
+            idempotency_key="unauthorized-stop",
+        )
+    assert not run_dir.exists()
+
+    unrelated_run_dir = request.repo_root / ".aflow" / "runs" / "other-run"
+    unrelated_run_dir.mkdir()
+    marker = unrelated_run_dir / "keep.txt"
+    marker.write_text("keep me\n")
+    run_dir.symlink_to(unrelated_run_dir, target_is_directory=True)
+    with pytest.raises(DaemonError, match="run artifact path is unsafe"):
+        daemon.service.owner_stop(
+            run_id,
+            expected_revision=0,
+            caller_scope="project:one",
+            idempotency_key="symlink-stop",
+        )
+    assert marker.read_text() == "keep me\n"
+    assert not (unrelated_run_dir / "overrides.toml").exists()
+    run_dir.unlink()
+    marker.unlink()
+    unrelated_run_dir.rmdir()
+
+    missing_run_dir = request.repo_root / ".aflow" / "runs" / "missing-manifest"
+    with pytest.raises(RepositoryNotFoundError):
+        daemon.service.owner_stop(
+            "missing-manifest",
+            expected_revision=0,
+            caller_scope="project:one",
+            idempotency_key="missing-stop",
+        )
+    assert not missing_run_dir.exists()
+
+    stopped = daemon.service.owner_stop(
+        run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="stop-1",
+    )
+    replayed_stop = daemon.service.owner_stop(
+        run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="stop-1",
+    )
+    replayed_start = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+
+    assert stopped.status == "owner_stopped"
+    assert stopped.revision == 1
+    assert replayed_stop.status == "owner_stopped"
+    assert replayed_stop.revision == 1
+    assert replayed_start.status == "owner_stopped"
+    assert run_dir.is_dir()
+    assert (run_dir / "overrides.toml").is_file()
+    assert not (run_dir / "run.json").exists()
+    assert not (
+        request.repo_root / ".aflow" / "start-requests" / f"{run_id}.json"
+    ).exists()
+    assert units.start_calls == []
+    assert units.stop_calls == []
+    assert request.plan_path.read_bytes() == plan_bytes
+    assert manifest_path.read_bytes() == manifest_bytes
+
+
+def test_daemon_owner_stop_pending_question_remains_terminal_for_reads_and_answers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    question = StartupQuestion(
+        kind=StartupQuestionKind.PICK_STEP,
+        message="Choose a step",
+        choices=["implement"],
+    )
+    monkeypatch.setattr("aflow.daemon.prepare_startup", lambda value: question)
+    pending = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+    assert pending.run_id is not None
+    assert pending.question_id is not None
+    run_dir = request.repo_root / ".aflow" / "runs" / pending.run_id
+    record_path = (
+        request.repo_root / ".aflow" / "start-requests" / f"{pending.run_id}.json"
+    )
+    manifest_path = (
+        request.repo_root / ".aflow" / "launches" / f"{pending.run_id}.json"
+    )
+    record_bytes = record_path.read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+    plan_bytes = request.plan_path.read_bytes()
+    assert not run_dir.exists()
+
+    stopped = daemon.service.owner_stop(
+        pending.run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="stop-1",
+    )
+    monkeypatch.setattr(
+        "aflow.daemon.prepare_startup_with_answer",
+        lambda *args: pytest.fail("a stopped startup question must not be answered"),
+    )
+    status = daemon.service.run_status(pending.run_id)
+    replayed_start = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+    replayed_answer = daemon.service.answer_startup(
+        pending.question_id,
+        "implement",
+        caller_scope="project:one",
+        idempotency_key="answer-1",
+    )
+
+    assert stopped.status == "owner_stopped"
+    assert status.status == "owner_stopped"
+    assert replayed_start.status == "owner_stopped"
+    assert replayed_answer.status == "owner_stopped"
+    assert record_path.read_bytes() == record_bytes
+    assert manifest_path.read_bytes() == manifest_bytes
+    assert request.plan_path.read_bytes() == plan_bytes
+    assert not (run_dir / "run.json").exists()
+    assert units.start_calls == []
+    assert units.stop_calls == []
