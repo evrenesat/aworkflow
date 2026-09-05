@@ -2405,6 +2405,94 @@ def load_scope_envelope_for_resume(
     return artifact_bytes
 
 
+def load_scope_evidence_for_resume(
+    source_run_dir: Path,
+    scope: ActiveImplementationScope,
+    envelope_bytes: bytes,
+) -> dict[str, bytes]:
+    """Bind schema-v2 evidence bytes before a resume may prune its source."""
+    try:
+        from .repartition import ScopeEnvelopeV2, parse_envelope_bytes
+        from .runlog import (
+            RunPaths,
+            evidence_artifact_path,
+            resolve_envelope_texts,
+            resolve_evidence_artifact,
+        )
+
+        envelope = parse_envelope_bytes(envelope_bytes)
+        if not isinstance(envelope, ScopeEnvelopeV2):
+            return {}
+        source_root = source_run_dir.resolve(strict=True)
+        repo_root = source_root.parent.parent.parent
+        paths = RunPaths(
+            repo_root=repo_root,
+            runs_root=source_root.parent,
+            run_dir=source_root,
+            turns_dir=source_root / "turns",
+            manager_dir=source_root / "manager",
+            run_json=source_root / "run.json",
+        )
+        # Resolve both references through the source runlog validator. This
+        # checks containment, digest, byte size, UTF-8, and checkpoint span.
+        resolve_envelope_texts(paths, envelope)
+        artifacts: dict[str, bytes] = {}
+        for reference in (envelope.plan_ref, envelope.checkpoint_ref):
+            data = resolve_evidence_artifact(
+                paths,
+                {
+                    "kind": reference.kind,
+                    "path": reference.path,
+                    "sha256": reference.sha256,
+                    "byte_size": reference.byte_size,
+                },
+            )
+            destination = evidence_artifact_path(
+                paths, reference.kind, reference.sha256
+            )
+            relative = destination.resolve().relative_to(source_root).as_posix()
+            existing = artifacts.get(relative)
+            if existing is not None and existing != data:
+                raise ValueError(
+                    f"source evidence path {relative} resolves to conflicting bytes"
+                )
+            artifacts[relative] = data
+        return artifacts
+    except WorkflowError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise WorkflowError(
+            f"cannot bind scope envelope evidence for resume: {exc}"
+        ) from exc
+
+
+def _rebase_scope_envelope_evidence(
+    paths: RunPaths,
+    envelope: object,
+) -> object:
+    """Rebase only in-memory v2 evidence paths to the current run."""
+    from .repartition import ScopeEnvelopeV2
+    from .runlog import evidence_reference
+
+    if not isinstance(envelope, ScopeEnvelopeV2):
+        return envelope
+
+    def rebase(reference: object) -> object:
+        expected = evidence_reference(
+            paths,
+            reference.kind,
+            reference.sha256,
+            reference.byte_size,
+        )
+        return replace(reference, path=expected.path)
+
+    return replace(
+        envelope,
+        plan_ref=rebase(envelope.plan_ref),
+        checkpoint_ref=rebase(envelope.checkpoint_ref),
+    )
+
+
 def _resolved_envelope_plan_text(
     paths: RunPaths,
     envelope: object,
@@ -2419,6 +2507,7 @@ def _resolved_envelope_plan_text(
     try:
         from .runlog import resolve_envelope_texts
 
+        envelope = _rebase_scope_envelope_evidence(paths, envelope)
         plan_text, _ = resolve_envelope_texts(paths, envelope)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise WorkflowError(
@@ -5431,6 +5520,8 @@ def run_workflow(
                 "resume frozen configuration mismatch: "
                 f"{identity_mismatch}"
             )
+        if resume.resume_team_override is not None:
+            config = replace(config, team=resume.resume_team_override)
 
     original_plan_path = config.plan_path
     repo_state = probe_repo_state(config.repo_root)
@@ -5579,7 +5670,10 @@ def run_workflow(
             config,
             keep_runs=(config.keep_runs + 1) if preserve_resume_override_source else config.keep_runs,
             reserved_run_id=reserved_run_id,
-        )
+        ),
+        **({"preserved_run_ids": frozenset({resume.resumed_from_run_id})}
+           if resume is not None and (resume.resume_relocation is not None or resume.resume_team_override is not None)
+           else {}),
     )
     journal = EventJournal(run_paths.run_dir)
     if launch_result.created:
@@ -5622,6 +5716,15 @@ def run_workflow(
         state=state,
         workflow_name=workflow_name,
         resumed_from_run_id=resumed_from_run_id,
+        resume_provenance=(
+            {
+                **({"resume_relocation": dict(resume.resume_relocation)}
+                   if resume.resume_relocation is not None else {}),
+                **({"resumed_from_team": resume.resumed_from_team,
+                    "resume_team_override": resume.resume_team_override}
+                   if resume.resume_team_override is not None else {}),
+            } if resume is not None else None
+        ),
     )
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
@@ -6073,8 +6176,40 @@ def run_workflow(
             else:
                 _atomic_replace_bytes(destination, artifact_bytes)
 
-        # Carry the fully validated source artifact into the new run before
-        # any harness or manager call.  Do not consult the old source path.
+        # Carry the fully validated v2 evidence into the new run before any
+        # harness or manager call. Do not consult the old source path.
+        for relative_path, artifact_bytes in resume.scope_evidence_artifact_bytes.items():
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise WorkflowError(
+                    "cannot resume: scope evidence path must be relative to the new run: "
+                    f"{relative_path}"
+                )
+            raw_destination = run_paths.run_dir / relative
+            destination = raw_destination.resolve()
+            try:
+                destination.relative_to(run_paths.run_dir.resolve())
+            except ValueError as exc:
+                raise WorkflowError(
+                    "cannot resume: scope evidence path escapes the new run directory: "
+                    f"{relative_path}"
+                ) from exc
+            if raw_destination.is_symlink():
+                raise WorkflowError(
+                    "cannot resume: scope evidence destination must not be a symlink: "
+                    f"{relative_path}"
+                )
+            if destination.exists():
+                if destination.read_bytes() != artifact_bytes:
+                    raise WorkflowError(
+                        "cannot resume: scope evidence artifact already exists with "
+                        f"different bytes: {relative_path}"
+                    )
+            else:
+                _atomic_replace_bytes(destination, artifact_bytes)
+
+        # Carry the fully validated source envelope into the new run before
+        # any harness or manager call. Do not consult the old source path.
         if resumed_envelope_bytes is not None and state.active_implementation_scope is not None:
             scope = state.active_implementation_scope
             reference = _scope_envelope_reference(scope)

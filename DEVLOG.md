@@ -14,6 +14,20 @@
   truthful run failure. No provider-start event is emitted and failed
   artifacts do not copy plan bodies.
 
+## 2026-09-05 -- Complete explicit resume rehome and team continuation
+
+- Added the fail-closed `--resume RUN_ID --resume-rehome-worktree PATH` path.
+  It validates the current primary branch, recorded feature branch and base
+  commit, exact registered replacement worktree, and Git operation state before
+  allocation. Only contained resume paths are remapped; the source run remains
+  byte-identical and the continuation records `resume_relocation`.
+- Bound schema-v2 plan/checkpoint evidence before `keep_runs` pruning and
+  copied it into the continuation with in-memory reference rebasing, preserving
+  envelope bytes, hashes, scope IDs, and source artifacts.
+- Added the named configured `--team` continuation override with exact blockers
+  for pending routing state and `resumed_from_team`/`resume_team_override`
+  provenance. Automatic and ordinary resumes retain strict team matching.
+
 ## 2026-09-02 — Manager context references and prompt budget
 
 - A 340 KB manager context (incident `20260902t053828z-5cfe3386`, decision

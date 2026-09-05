@@ -143,6 +143,37 @@ implementation scope, scoped stall/rejection counters, pending
 notes/upgrades/boundary decisions, and stale manager-report pointer. The
 explicit run id prevents an accidental reset of an implicitly selected run.
 
+### Rehome and baseline-team continuation
+
+A copied run can be resumed under a new absolute repository root only with an
+explicit source id and a supplied replacement worktree:
+
+```bash
+aflow run --resume RUN_ID --resume-rehome-worktree /path/to/registered-worktree
+```
+
+The current primary checkout must be on the saved main branch. The replacement
+must already be registered by that checkout, use the saved feature branch, and
+be free of merge, rebase, cherry-pick, and revert operations. AFlow does not
+create branches or worktrees and does not infer relocation for `AUTO`. Only
+paths inside the recorded repository or worktree roots are remapped. The source
+run, plans, manager artifacts, and envelope bytes remain unchanged; schema-v2
+plan/checkpoint evidence is validated before pruning and copied into the
+continuation.
+
+The same named resume may explicitly change the future baseline team:
+
+```bash
+aflow run --resume RUN_ID --team TEAM_NAME
+```
+
+`TEAM_NAME` must be configured. The change is rejected before allocation when
+`pending_manager_notes`, `pending_step_team_override`, `pending_finalized_turn`,
+`pending_boundary_decision`, `pending_repartition`, hotplug state, or unapplied
+owner routing state is present. The continuation records
+`resumed_from_team` and `resume_team_override`; historical selectors and source
+metadata are retained.
+
 ## Analyze
 
 `aflow analyze` inspects run logs under `.aflow/runs/`.

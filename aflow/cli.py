@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -35,6 +35,7 @@ from .config import (
     WorkflowStepConfig,
 )
 from .manager_context import scoped_reviewer_rejection_count
+from .resume_relocation import ResumeRelocation, prepare_resume_relocation
 from .plan import PlanSnapshot
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
@@ -104,6 +105,7 @@ from .workflow import (
     _scope_envelope_reference,
     _validate_scope_envelope_bytes,
     load_scope_envelope_for_resume,
+    load_scope_evidence_for_resume,
     move_completed_plan_to_done,
 )
 from .repartition import derive_generation_id
@@ -121,6 +123,8 @@ Flags:
   --run-id RUN_ID           Canonical pre-reserved run identity (advanced use).
   --resume [RUN_ID]         Resume a saved run; plan and identity are optional when omitted.
   --continue-from-current   Start a nested run from the accepted current branch recorded in the plan.
+  --resume-rehome-worktree PATH
+                            Rehome an explicitly named resume onto a registered worktree.
 
 Positional arguments:
   [workflow_name] [plan_file]   Either form works:
@@ -1159,6 +1163,7 @@ def _bootstrap_resume_invocation(
     extra_instructions_arg: tuple[str, ...],
     extra_instructions_provided: bool,
     reset_scope: bool = False,
+    rehome_worktree: str | Path | None = None,
 ) -> ResumeBootstrap:
     """Resolve one durable run and reconstruct omitted resume identity read-only."""
     resolved_run_id, _source = resolve_run_id(requested_run_id, repo_root)
@@ -1183,6 +1188,26 @@ def _bootstrap_resume_invocation(
         resolved_run_id,
         reset_scope=reset_scope,
     )
+    relocation = None
+    if rehome_worktree is not None:
+        if not requested_run_id or reset_scope:
+            raise ValueError("resume relocation requires explicit --resume RUN_ID without --resume-reset-scope")
+        relocation = prepare_resume_relocation(
+            prev_run, source_run_id=run_id, current_repo_root=repo_root,
+            replacement_worktree=rehome_worktree,
+        )
+        prev_run = relocation.payload(prev_run)
+        # Relocation changes only the in-memory identity path when the saved
+        # config was inside a recorded source root. Fingerprint/workflow stay
+        # byte-for-byte authoritative; external paths remain mismatched.
+        frozen_run_identity = replace(
+            frozen_run_identity,
+            config_path=str(
+                relocation.map_frozen_config_path(
+                    frozen_run_identity.config_path
+                )
+            ),
+        )
     plan_path = _resume_plan_path(prev_run, repo_root)
     plan_field = "original_plan_path"
     if plan_path is None:
@@ -1295,11 +1320,27 @@ def _bootstrap_resume_invocation(
             )
 
     effective_saved_team = saved_team
+    resume_team_override: str | None = None
+    resumed_from_team: str | None = None
     if team_arg is not None and team_arg != effective_saved_team:
-        raise ValueError(
-            f"error: resume team mismatch: requested '{team_arg}', "
-            f"but run '{resolved_run_id.name}' saved '{effective_saved_team}'."
-        )
+        if requested_run_id is None:
+            raise ValueError(
+                "error: resume team override requires explicit --resume RUN_ID"
+            )
+        configured_teams = getattr(workflow_config, "teams", {})
+        if not isinstance(configured_teams, Mapping) or team_arg not in configured_teams:
+            raise ValueError(
+                f"error: resume team mismatch: requested '{team_arg}' is an "
+                "unknown team; the target team must be configured."
+            )
+        blocker = _resume_team_override_blocker(run_dir, prev_run)
+        if blocker is not None:
+            raise ValueError(
+                f"error: resume team override blocked by {blocker}."
+            )
+        resumed_from_team = saved_team
+        resume_team_override = team_arg
+        effective_saved_team = team_arg
 
     if start_step_arg is not None:
         resolved_start_step, start_step_error = _resolve_numeric_start_step(
@@ -1336,6 +1377,7 @@ def _bootstrap_resume_invocation(
         saved_start_step,
         max_turns,
         saved_extra,
+        allow_team_override=resume_team_override is not None,
     )
     if mismatch_reason is not None:
         raise ValueError(
@@ -1352,6 +1394,9 @@ def _bootstrap_resume_invocation(
         reset_scope=reset_scope,
         require_resume=True,
         workflow_steps=workflow_spec.steps,
+        relocation=relocation,
+        resumed_from_team=resumed_from_team,
+        resume_team_override=resume_team_override,
     )
     assert resume_context is not None
 
@@ -1361,7 +1406,7 @@ def _bootstrap_resume_invocation(
         run_json=prev_run,
         plan_path=plan_path,
         workflow_name=workflow_name,
-        team=saved_team,
+        team=effective_saved_team,
         start_step=saved_start_step,
         max_turns=max_turns,
         extra_instructions=saved_extra,
@@ -1380,6 +1425,8 @@ def _resume_candidate_mismatch_reason(
     current_selected_start_step: str | None,
     current_max_turns: int | None,
     current_extra_instructions: tuple[str, ...],
+    *,
+    allow_team_override: bool = False,
 ) -> str | None:
     """Check if the previous run is a valid resume candidate for the current invocation.
 
@@ -1453,10 +1500,10 @@ def _resume_candidate_mismatch_reason(
     prev_team = prev_run.get("team")
     prev_team_none_or_absent = prev_team is None or (isinstance(prev_team, str) and not prev_team.strip())
     current_team_none_or_absent = current_team is None or not current_team.strip()
-    if prev_team_none_or_absent != current_team_none_or_absent:
+    if prev_team_none_or_absent != current_team_none_or_absent and not allow_team_override:
         return "its effective team does not match this invocation"
     if not prev_team_none_or_absent and not current_team_none_or_absent:
-        if prev_team != current_team:
+        if prev_team != current_team and not allow_team_override:
             return "its effective team does not match this invocation"
 
     prev_selected_start_step = prev_run.get("selected_start_step")
@@ -1687,6 +1734,42 @@ def _pending_finalized_resume_turn(
     )
 
 
+def _resume_team_override_blocker(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+) -> str | None:
+    """Return the first durable state field that makes team rebinding unsafe."""
+    for field in (
+        "pending_manager_notes",
+        "pending_step_team_override",
+        "pending_boundary_decision",
+        "pending_repartition",
+        "current_hotplug_transaction",
+        "pending_hotplug_transaction",
+    ):
+        if prev_run.get(field) is not None:
+            return field
+    if _pending_finalized_resume_turn(run_dir, prev_run) is not None:
+        return "pending_finalized_turn"
+    pending_override_notes = prev_run.get("pending_override_notes")
+    if isinstance(pending_override_notes, list) and pending_override_notes:
+        return "pending_override_notes"
+    persisted = prev_run.get("override_result")
+    resolution = resolve_resume_override(
+        run_dir,
+        persisted if isinstance(persisted, Mapping) else None,
+    )
+    if resolution.override_result is not None:
+        if (
+            resolution.override_result.status != "accepted"
+            or not resolution.override_result.applied
+        ):
+            return "override_result"
+    if resolution.source_run_dir is not None:
+        return "overrides.toml"
+    return None
+
+
 def _manager_resume_fields_for_scope(
     prev_run: Mapping[str, object],
     *,
@@ -1731,6 +1814,9 @@ def _reconstruct_resume_context(
     reset_scope: bool,
     require_resume: bool,
     workflow_steps: Mapping[str, object] | None = None,
+    relocation: ResumeRelocation | None = None,
+    resumed_from_team: str | None = None,
+    resume_team_override: str | None = None,
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
@@ -1815,6 +1901,12 @@ def _reconstruct_resume_context(
         if reset_scope
         else _pending_finalized_resume_turn(run_dir, prev_run)
     )
+    if relocation is not None and pending_finalized_turn is not None:
+        pending_finalized_turn = replace(
+            pending_finalized_turn,
+            active_plan_path=relocation.map_path(pending_finalized_turn.active_plan_path),
+            new_plan_path=relocation.map_path(pending_finalized_turn.new_plan_path),
+        )
     manager_fields = _manager_resume_fields_for_scope(
         prev_run,
         reset_scope=reset_scope,
@@ -1833,6 +1925,7 @@ def _reconstruct_resume_context(
         manager_fields["pending_repartition"] = None
     scope_envelope_source_path: str | None = None
     scope_envelope_bytes: bytes | None = None
+    scope_evidence_artifact_bytes: dict[str, bytes] = {}
     active_scope = manager_fields.get("active_implementation_scope")
     if not reset_scope and active_scope is not None:
         try:
@@ -1848,6 +1941,15 @@ def _reconstruct_resume_context(
         scope_envelope_source_path = str(
             run_dir / active_scope.envelope_artifact_path
         )
+        try:
+            scope_evidence_artifact_bytes = load_scope_evidence_for_resume(
+                run_dir, active_scope, scope_envelope_bytes
+            )
+        except WorkflowError as exc:
+            raise ValueError(
+                f"error: run '{run_id}' has invalid scope evidence reference: "
+                f"{exc.summary}"
+            ) from exc
     pending_repartition, repartition_artifact_bytes = (
         _validate_pending_repartition_resume_state(
             raw_pending_repartition=(
@@ -1963,7 +2065,11 @@ def _reconstruct_resume_context(
         terminal_integration_only=terminal_integration_only,
         scope_envelope_bytes=scope_envelope_bytes,
         scope_envelope_source_path=scope_envelope_source_path,
+        scope_evidence_artifact_bytes=scope_evidence_artifact_bytes,
         repartition_artifact_bytes=repartition_artifact_bytes,
+        resume_relocation=relocation.provenance() if relocation is not None else None,
+        resumed_from_team=resumed_from_team,
+        resume_team_override=resume_team_override,
         **hotplug_fields,
         **manager_fields,
     )
@@ -2036,6 +2142,10 @@ def _detect_resume_candidate(
         selected_start_step,
         max_turns,
         extra_instructions,
+        allow_team_override=(
+            resume_bootstrap is not None
+            and resume_bootstrap.resume_context.resume_team_override is not None
+        ),
     )
     if reason is not None:
         if require_resume:
@@ -2216,6 +2326,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Start a new worktree run from the currently checked-out accepted "
             "branch recorded in the plan. Cannot be combined with --resume."
         ),
+    )
+    run_parser.add_argument(
+        "--resume-rehome-worktree",
+        metavar="PATH",
+        help="With an explicit --resume RUN_ID, validate and reuse a relocated registered worktree.",
     )
     run_parser.add_argument(
         "--resume-reset-scope",
@@ -2920,6 +3035,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if args.command == "run" and args.resume_rehome_worktree is not None:
+        if args.resume in (None, "AUTO") or args.resume_reset_scope:
+            print("error: --resume-rehome-worktree requires an explicit --resume RUN_ID without --resume-reset-scope", file=sys.stderr)
+            return 1
 
     config_path: Path | None = None
     if args.command in (None, "run", "show"):
@@ -3033,6 +3152,7 @@ def main(argv: list[str] | None = None) -> int:
                 extra_instructions_arg=extra_instructions,
                 extra_instructions_provided=extra_instructions_provided,
                 reset_scope=args.resume_reset_scope,
+                rehome_worktree=args.resume_rehome_worktree,
             )
         except ValueError as exc:
             print(exc, file=sys.stderr)

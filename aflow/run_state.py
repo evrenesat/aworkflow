@@ -700,12 +700,19 @@ class ResumeContext:
     # Retained as diagnostic provenance for existing callers.  Workflow
     # resume must use scope_envelope_bytes, never reopen this path.
     scope_envelope_source_path: str | None = None
+    # Schema-v2 envelopes reference content-addressed evidence by the source
+    # run's repository-relative path. Bind the exact bytes before a new run
+    # may prune that source, then restore them beneath the continuation.
+    scope_evidence_artifact_bytes: Mapping[str, bytes] = field(default_factory=dict)
     # Pending repartition artifacts are copied before create_run_paths may
     # prune the source run (notably with keep_runs = 1).
     repartition_artifact_bytes: Mapping[str, bytes] = field(default_factory=dict)
     continuation_from_branch: str | None = None
     continuation_from_head: str | None = None
     continuation_mode: str | None = None
+    resume_relocation: Mapping[str, object] | None = None
+    resumed_from_team: str | None = None
+    resume_team_override: str | None = None
 
 
 @dataclass

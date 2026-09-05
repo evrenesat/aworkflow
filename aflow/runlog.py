@@ -415,7 +415,9 @@ def write_last_run_id(repo_root: Path, run_id: str) -> None:
     shell_file.write_text(run_id, encoding="utf-8")
 
 
-def create_run_paths(config: ControllerConfig) -> RunPaths:
+def create_run_paths(
+    config: ControllerConfig, *, preserved_run_ids: frozenset[str] = frozenset(),
+) -> RunPaths:
     runs_root = config.repo_root / ".aflow" / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
     # A control-plane caller may reserve a canonical identity before launch;
@@ -444,7 +446,7 @@ def create_run_paths(config: ControllerConfig) -> RunPaths:
         manager_dir=manager_dir,
         run_json=run_json,
     )
-    prune_old_runs(runs_root, config.keep_runs)
+    prune_old_runs(runs_root, config.keep_runs, preserved_run_ids=preserved_run_ids)
     write_last_run_id(config.repo_root, run_dir.name)
     return paths
 
@@ -454,8 +456,10 @@ def _run_dir_sort_key(path: Path) -> tuple[int, str]:
     return (stat_result.st_mtime_ns, path.name)
 
 
-def prune_old_runs(runs_root: Path, keep_runs: int) -> None:
-    run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
+def prune_old_runs(
+    runs_root: Path, keep_runs: int, *, preserved_run_ids: frozenset[str] = frozenset(),
+) -> None:
+    run_dirs = [path for path in runs_root.iterdir() if path.is_dir() and path.name not in preserved_run_ids]
     run_dirs.sort(key=_run_dir_sort_key)
     while len(run_dirs) > keep_runs:
         doomed = run_dirs.pop(0)
@@ -1043,6 +1047,7 @@ class RunMetadataWriter:
     state: ControllerState | None
     workflow_name: str
     resumed_from_run_id: str | None = None
+    resume_provenance: Mapping[str, object] | None = None
 
     def write(
         self,
@@ -1148,6 +1153,8 @@ class RunMetadataWriter:
                 payload[key] = value
             elif key in previous:
                 payload[key] = previous[key]
+        if self.resume_provenance is not None:
+            payload.update(self.resume_provenance)
         if execution_context is not None:
             payload["execution_repo_root"] = str(execution_context.execution_repo_root)
             payload["feature_branch"] = execution_context.feature_branch

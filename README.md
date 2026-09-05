@@ -154,6 +154,29 @@ from that branch, records the continuation branch and HEAD in `run.json`, and
 merges the generated feature branch back to the same branch. The option is
 explicit and cannot be combined with `--resume` or `--resume-reset-scope`.
 
+For a repository and registered managed worktree copied under new absolute
+paths, relocation is explicit and fail-closed:
+
+```bash
+aflow run --resume RUN_ID --resume-rehome-worktree /path/to/registered-worktree
+aflow run --resume RUN_ID --team TEAM_NAME
+```
+
+The first command requires the current primary checkout on the recorded main
+branch, the recorded feature branch and pre-handoff commit to exist, and the
+replacement path to be the exact registered feature worktree. AFlow remaps
+only repository-owned resume paths, carries validated scope-v2 evidence into
+the continuation, preserves the source run byte-for-byte, and records
+`resume_relocation` in the new `run.json`. It never discovers or creates a
+replacement worktree.
+
+A different baseline team is accepted only for an explicitly named resume and
+a configured team. Pending manager notes, team-step overrides, finalized turns,
+boundary or repartition transactions, hotplug transactions, and unapplied
+owner routing changes name the blocking field and stop before allocation. The
+continuation records `resumed_from_team` and `resume_team_override`; automatic
+and same-team resumes retain strict team equality.
+
 ### Live worker role hotplug
 
 An override may change a worker selector at the next safe worker boundary:

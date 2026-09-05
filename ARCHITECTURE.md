@@ -450,6 +450,25 @@ classifier while retaining its backup-plan and active-plan allowances.
    scope/attempt index; the linked source run retains the immutable attempt
    audit.
 
+   An explicit `--resume RUN_ID --resume-rehome-worktree PATH` is the only
+   relocation path. It verifies the current primary main branch, recorded
+   feature branch and base commit, and the exact registered replacement
+   worktree before allocating a continuation. It remaps only contained schema
+   paths; external paths, selectors, hashes, scope IDs, and source artifacts
+   remain unchanged. Scope-v2 evidence is bound from the source run and copied
+   under the continuation so digest-addressed envelope references still resolve.
+   The continuation records `resume_relocation` and protects the selected source
+   run from `keep_runs` pruning.
+
+   A named resume may pass `--team TEAM_NAME` to change the baseline for future
+   turns when the team is configured and no pending manager note, step-team
+   override, finalized turn, boundary, repartition, hotplug, or unapplied
+   owner-routing state exists. The exact blocking field is reported before
+   allocation. The continuation records `resumed_from_team` and
+   `resume_team_override`, while historical selectors and manager history stay
+   authoritative. Automatic and ordinary same-team resumes retain strict team
+   equality.
+
 ### `repartition.py`
 
 Captures the complete original-plan and current-checkpoint bytes in a versioned,
