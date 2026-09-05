@@ -935,16 +935,22 @@ project-scoped `/api/control-plane/projects/{project_id}/...` routes. REST and
 MCP delegate to the same durable control-plane application and services;
 neither transport infers a project by scanning daemons. `aflowd.service` runs
 the release-pinned remote-app server on its configured private bind address. Its
-`ControlPlaneService` owns the static project allowlist and calls the AFlow
-daemon for every lifecycle operation; the transport layer neither launches
-subprocesses nor reads or writes `.aflow` artifacts directly.
+`ControlPlaneService` owns one versioned project registry beneath operator
+state and calls the AFlow daemon for every lifecycle operation. Registry roots
+are relative to one canonical managed-projects directory; exact containment,
+non-symlink Git roots, and non-overlap are validated before daemon composition.
+The service lazily creates and caches one daemon per registered project from
+shared release inputs and that project's `.aflow/config/aflow.toml`. Registry
+changes are visible without a server restart, while an unhealthy project's
+bounded readiness error does not hide healthy peers. The transport layer
+neither launches subprocesses nor reads or writes `.aflow` artifacts directly.
 
 ```text
 Browser UI / REST client / MCP client
                 |  bearer header; write approval for MCP
                 v
 aflowd.service (one immutable /opt/aflowd/releases/<commit>)
-                |  static allowlisted project only
+                |  exact dynamic registry record only
                 v
 AFlow daemon -> launch manifest / ordered events / revisioned overrides
                 |                         |

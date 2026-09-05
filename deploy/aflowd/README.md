@@ -3,7 +3,7 @@
 This is an environment-specific operator runbook for the existing p100 host,
 not a portable installation guide or part of AFlow's public setup path. The
 scripts and templates intentionally encode its Tailscale interface, bind
-address, service account, filesystem layout, and default project allowlist.
+address, service account, filesystem layout, and default managed-project root.
 Audit and adapt the implementation before using it on another host.
 
 install.sh creates one immutable, commit-addressed release under
@@ -17,14 +17,16 @@ does not restart or stop a workflow.
 
 Keep /etc/aflowd/aflowd.env outside the repository, owned by the service user,
 mode 0600, and containing one opaque AFLOW_APP_TOKEN=... line. The default
-allowlist is exactly /root/code/aflow-control-plane with
-/root/code/aflow-control-plane/aflow/aflow.toml.
+managed-project root is /root/code, while the existing explicit project and
+workflow-config inputs remain installer preflight and service-containment
+boundaries. The dynamic registry is `/var/lib/aflowd/projects.json`; this
+installer does not seed or migrate it.
 
     deploy/aflowd/install.sh --source /path/to/reviewed/aflow --commit <40-char-commit>
     sudo deploy/aflowd/install.sh --source /path/to/reviewed/aflow --commit <40-char-commit> --apply
 
 The dry-run prints the exact source, release destination, service, bind
-address, allowlist, and rollback target. --apply verifies that 100.103.69.9 is
+address, project boundary, and rollback target. --apply verifies that 100.103.69.9 is
 on tailscale0, builds the server and web app in the staged release, validates
 all three entrypoints and their hashes, renders a release-pinned config/service,
 switches current atomically, and then polls an authenticated /ready request.

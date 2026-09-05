@@ -75,6 +75,8 @@ git -C "$source_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "s
 [[ -n "$commit" ]] || commit=HEAD
 commit=$(git -C "$source_root" rev-parse --verify "$commit^{commit}") || fail "commit cannot be resolved"
 release_root="$state_root/releases"
+managed_projects_root=$(dirname -- "$project_root")
+project_registry_path="$state_root/projects.json"
 release_dir="$release_root/$commit"
 current_link="$state_root/current"
 previous_target=""
@@ -203,7 +205,7 @@ done
 render_template() {
   source=$1
   target=$2
-  RELEASE_DIR="$release_dir" RELEASE_ID="$commit" PROJECT_ROOT="$project_root" PROJECT_CONFIG="$project_config" ENVIRONMENT_FILE="$environment_file" python3 - "$source" "$target" <<'PY'
+  RELEASE_DIR="$release_dir" RELEASE_ID="$commit" PROJECT_ROOT="$project_root" PROJECT_CONFIG="$project_config" MANAGED_PROJECTS_ROOT="$managed_projects_root" PROJECT_REGISTRY_PATH="$project_registry_path" ENVIRONMENT_FILE="$environment_file" python3 - "$source" "$target" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -214,12 +216,16 @@ values = {
     "/@RELEASE_DIR@": os.environ["RELEASE_DIR"],
     "/@PROJECT_ROOT@": os.environ["PROJECT_ROOT"],
     "/@PROJECT_CONFIG@": os.environ["PROJECT_CONFIG"],
+    "/@MANAGED_PROJECTS_ROOT@": os.environ["MANAGED_PROJECTS_ROOT"],
+    "/@PROJECT_REGISTRY_PATH@": os.environ["PROJECT_REGISTRY_PATH"],
     "/@ENVIRONMENT_FILE@": os.environ["ENVIRONMENT_FILE"],
     "@RELEASE_DIR@": os.environ["RELEASE_DIR"],
     "@RELEASE_ID@": os.environ["RELEASE_ID"],
     "RELEASE_ID": os.environ["RELEASE_ID"],
     "@PROJECT_ROOT@": os.environ["PROJECT_ROOT"],
     "@PROJECT_CONFIG@": os.environ["PROJECT_CONFIG"],
+    "@MANAGED_PROJECTS_ROOT@": os.environ["MANAGED_PROJECTS_ROOT"],
+    "@PROJECT_REGISTRY_PATH@": os.environ["PROJECT_REGISTRY_PATH"],
     "@ENVIRONMENT_FILE@": os.environ["ENVIRONMENT_FILE"],
 }
 rendered = source.read_text(encoding="utf-8")

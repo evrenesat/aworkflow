@@ -81,6 +81,19 @@
   that notification; all unknown response IDs remain terminal mismatches.
 - Added focused coverage for new-session and resumed-session negotiation.
 
+## 2026-09-01 — Canonical dynamic project registry
+
+- Replaced runtime static control-plane project tables and broad catalog
+  discovery with one atomic, versioned exact-root registry under a canonical
+  managed-projects directory.
+- Centralized release executable, identity, environment file, and child
+  environment at server composition; project records can no longer override
+  process inputs.
+- Made project daemons lazy and isolated per-project readiness failures so a
+  registry update is usable without restarting the remote server.
+- Restored exact-root validation clears transient registration failures, so a
+  temporarily unavailable cached project recovers without a server restart.
+
 ## 2026-09-01 — Audit public documentation scope and accuracy
 
 - Removed the host-specific p100 deployment from public README navigation and

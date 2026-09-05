@@ -146,10 +146,8 @@ def unexpected_provider_http_error(provider_id: str | None = None) -> HTTPExcept
     )
 
 
-def _project(project_id: str, catalog: ProjectCatalog, *, fast: bool = True):
-    project = (
-        catalog.get_project_fast(project_id) if fast else catalog.get_project(project_id)
-    )
+def _project(project_id: str, catalog: ProjectCatalog):
+    project = catalog.get_project_fast(project_id)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
     return project
@@ -596,7 +594,7 @@ async def delete_attachment(
 # Plan-draft URLs intentionally remain unchanged; they are not provider operations.
 @router.post("/api/projects/{project_id}/plans/drafts", status_code=status.HTTP_201_CREATED)
 async def save_draft(project_id: str, request: SaveDraftRequest, catalog: ProjectCatalog = Depends(_get_project_catalog)) -> dict[str, Any]:
-    project = _project(project_id, catalog, fast=False)
+    project = _project(project_id, catalog)
     try:
         path = PlanStore(project.current_path).save_draft(request.name, request.content)
         return {"name": request.name, "path": str(path), "status": "draft"}
@@ -606,13 +604,13 @@ async def save_draft(project_id: str, request: SaveDraftRequest, catalog: Projec
 
 @router.get("/api/projects/{project_id}/plans/drafts")
 async def list_drafts(project_id: str, catalog: ProjectCatalog = Depends(_get_project_catalog)) -> list[str]:
-    project = _project(project_id, catalog, fast=False)
+    project = _project(project_id, catalog)
     return PlanStore(project.current_path).list_drafts()
 
 
 @router.get("/api/projects/{project_id}/plans/drafts/{name}")
 async def load_draft(project_id: str, name: str, catalog: ProjectCatalog = Depends(_get_project_catalog)) -> dict[str, str]:
-    project = _project(project_id, catalog, fast=False)
+    project = _project(project_id, catalog)
     try:
         return {"name": name, "content": PlanStore(project.current_path).load_draft(name)}
     except PlanStoreError as exc:
@@ -621,14 +619,14 @@ async def load_draft(project_id: str, name: str, catalog: ProjectCatalog = Depen
 
 @router.delete("/api/projects/{project_id}/plans/drafts/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_draft(project_id: str, name: str, catalog: ProjectCatalog = Depends(_get_project_catalog)) -> None:
-    project = _project(project_id, catalog, fast=False)
+    project = _project(project_id, catalog)
     if not PlanStore(project.current_path).delete_draft(name):
         raise HTTPException(status_code=404, detail="Draft not found")
 
 
 @router.post("/api/projects/{project_id}/plans/promote")
 async def promote_plan(project_id: str, request: PromotePlanRequest, catalog: ProjectCatalog = Depends(_get_project_catalog)) -> dict[str, Any]:
-    project = _project(project_id, catalog, fast=False)
+    project = _project(project_id, catalog)
     try:
         path = PlanStore(project.current_path).promote_to_in_progress(request.draft_name, request.target_name)
         return {"name": path.stem, "path": str(path), "status": "in_progress"}
@@ -638,5 +636,5 @@ async def promote_plan(project_id: str, request: PromotePlanRequest, catalog: Pr
 
 @router.get("/api/projects/{project_id}/plans/in-progress")
 async def list_in_progress(project_id: str, catalog: ProjectCatalog = Depends(_get_project_catalog)) -> list[str]:
-    project = _project(project_id, catalog, fast=False)
+    project = _project(project_id, catalog)
     return PlanStore(project.current_path).list_in_progress()

@@ -13,10 +13,8 @@ project_overrides_path = "/var/lib/aflowd/project_overrides.json"
 attachment_root = "/var/lib/aflowd/attachments"
 
 [control_plane]
-[[control_plane.projects]]
-id = "aflow-control-plane"
-root = "@PROJECT_ROOT@"
-config_path = "@PROJECT_CONFIG@"
+managed_projects_root = "@MANAGED_PROJECTS_ROOT@"
+project_registry_path = "@PROJECT_REGISTRY_PATH@"
 aflow_executable = "@RELEASE_DIR@/bin/aflow"
 environment_file = "@ENVIRONMENT_FILE@"
 release_identity = "@RELEASE_ID@"

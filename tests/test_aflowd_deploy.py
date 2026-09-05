@@ -156,8 +156,14 @@ def test_staged_install_uses_release_realpaths_and_atomic_current(tmp_path: Path
     assert "source_commit=" + commit in (release / "release-manifest.sha256").read_text()
     rendered = (release / "config" / "config.toml").read_text()
     parsed = tomllib.loads(rendered)
-    assert parsed["control_plane"]["projects"][0]["release_identity"] == commit
-    assert parsed["control_plane"]["projects"][0]["environment"] == {
+    control_plane = parsed["control_plane"]
+    assert "projects" not in control_plane
+    assert control_plane["managed_projects_root"] == str(project.parent)
+    assert control_plane["project_registry_path"] == str(state_root / "projects.json")
+    assert control_plane["aflow_executable"] == f"{release}/bin/aflow"
+    assert control_plane["environment_file"] == str(token)
+    assert control_plane["release_identity"] == commit
+    assert control_plane["environment"] == {
         "HOME": "/root",
         "PATH": f"{release}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     }
@@ -329,9 +335,15 @@ def test_runtime_validator_rejects_non_private_token_and_current_indirection(tmp
         _write_executable(release / "bin" / entrypoint, "#!/bin/sh\nexit 0\n")
     project, project_config, token = _project_and_token(tmp_path)
     config = tmp_path / "config.toml"
+    registry = tmp_path / "projects.json"
     config.write_text(
-        f'root = "{project}"\nconfig_path = "{project_config}"\n'
-        f'aflow_executable = "{release}/bin/aflow"\nrelease_identity = "{release.name}"\n'
+        "[control_plane]\n"
+        f'managed_projects_root = "{project.parent}"\n'
+        f'project_registry_path = "{registry}"\n'
+        f'aflow_executable = "{release}/bin/aflow"\n'
+        f'environment_file = "{token}"\n'
+        f'release_identity = "{release.name}"\n'
+        'environment = { HOME = "/root" }\n'
     )
 
     success = _run(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,6 +29,10 @@ from aflow_app_server.planning import (
     TurnStatus,
 )
 from aflow_app_server.project_catalog import ProjectCatalog
+from aflow_app_server.project_registry import (
+    ProjectRegistry,
+    ProjectRegistryCatalog,
+)
 
 
 TOKEN = "planning-test-token"
@@ -227,6 +232,128 @@ def test_session_collection_preserves_historical_alias_continuity(
 
     assert response.status_code == 200
     assert response.json()["sessions"][0]["cwd"] == str(historical_path)
+
+
+def test_registry_catalog_authorizes_only_exact_registered_session_root(
+    planning_client, tmp_path: Path
+) -> None:
+    from aflow_app_server import main
+
+    client, service, _, path = planning_client
+    (path / ".git").rmdir()
+    subprocess.run(("git", "init", "-q", str(path)), check=True)
+    registry = ProjectRegistry(path.parent, tmp_path / "registry.json")
+    registry.register("registered", "Registered", path.name)
+    second = path.parent / "second"
+    subprocess.run(("git", "init", "-q", str(second)), check=True)
+    registry.register("second", "Second", second.name)
+    catalog = ProjectRegistryCatalog(registry)
+    main._project_catalog = catalog
+    project = catalog.get_project_fast("registered")
+    assert project is not None
+    descendant = path / "descendant"
+    descendant.mkdir()
+    outside = tmp_path / "outside"
+    subprocess.run(("git", "init", "-q", str(outside)), check=True)
+    linked = path.parent / "linked"
+    linked.symlink_to(path, target_is_directory=True)
+    exact = _session(path, provider_session_id="exact")
+    other = _session(second, provider_session_id="other")
+    descendant_session = _session(descendant, provider_session_id="descendant")
+    hidden = _session(outside, provider_session_id="unregistered")
+    linked_session = _session(linked, provider_session_id="linked")
+    service.list_sessions = AsyncMock(
+        return_value=(
+            (hidden, linked_session, descendant_session, other, exact),
+            (_readiness("codex"),),
+        )
+    )
+
+    response = client.get(f"/api/projects/{project.id}/planning/sessions")
+
+    assert response.status_code == 200
+    assert [item["key"]["provider_session_id"] for item in response.json()["sessions"]] == [
+        "exact"
+    ]
+    projects = {item["id"]: item for item in client.get("/api/projects").json()}
+    assert set(projects) == {"registered", "second"}
+    assert projects["registered"]["linked_session_count"] == 1
+    assert projects["second"]["linked_session_count"] == 1
+    detail_project = client.get(f"/api/projects/{project.id}")
+    assert detail_project.status_code == 200
+    assert detail_project.json()["linked_session_count"] == 1
+
+    detail = f"/api/projects/{project.id}/planning/providers/codex/sessions/exact"
+    service.read_session = AsyncMock(return_value=exact)
+    assert client.get(detail).status_code == 200
+    service.read_session = AsyncMock(return_value=hidden)
+    assert client.get(detail).status_code == 404
+
+
+def test_registry_operations_reject_out_of_root_symlink_replacement(
+    planning_client, tmp_path: Path
+) -> None:
+    from aflow_app_server import main
+
+    client, service, _, path = planning_client
+    (path / ".git").rmdir()
+    subprocess.run(("git", "init", "-q", str(path)), check=True)
+    registry = ProjectRegistry(path.parent, tmp_path / "registry.json")
+    registry.register("registered", "Registered", path.name)
+    main._project_catalog = ProjectRegistryCatalog(registry)
+    service.start_session = AsyncMock(return_value=_session(path))
+    safe_content = "# Safe\n\n### [ ] Checkpoint 1: Safe\n- [ ] step\n"
+
+    started = client.post(
+        "/api/projects/registered/planning/sessions",
+        json={"provider_id": "codex"},
+    )
+    saved = client.post(
+        "/api/projects/registered/plans/drafts",
+        json={"name": "safe", "content": safe_content},
+    )
+    listed = client.get("/api/projects/registered/plans")
+
+    assert started.status_code == 201
+    assert saved.status_code == 201
+    assert listed.status_code == 200
+    assert service.start_session.await_count == 1
+
+    moved = tmp_path / "moved-original"
+    path.rename(moved)
+    outside = tmp_path / "outside"
+    subprocess.run(("git", "init", "-q", str(outside)), check=True)
+    outside_drafts = outside / "plans" / "drafts"
+    outside_drafts.mkdir(parents=True)
+    outside_plan = outside_drafts / "outside.md"
+    outside_plan.write_text("outside data")
+    path.symlink_to(outside, target_is_directory=True)
+    service.list_sessions = AsyncMock(
+        return_value=((_session(outside),), (_readiness("codex"),))
+    )
+
+    rejected_start = client.post(
+        "/api/projects/registered/planning/sessions",
+        json={"provider_id": "codex"},
+    )
+    rejected_save = client.post(
+        "/api/projects/registered/plans/drafts",
+        json={"name": "escaped", "content": "must not write"},
+    )
+    rejected_drafts = client.get("/api/projects/registered/plans/drafts")
+    rejected_plans = client.get("/api/projects/registered/plans")
+
+    assert rejected_start.status_code == 404
+    assert rejected_save.status_code == 404
+    assert rejected_drafts.status_code == 404
+    assert rejected_plans.status_code == 404
+    assert service.start_session.await_count == 1
+    assert outside_plan.read_text() == "outside data"
+    assert not (outside_drafts / "escaped.md").exists()
+    visible = client.get("/api/projects").json()
+    assert [item["id"] for item in visible] == ["registered"]
+    assert visible[0]["is_git_root"] is False
+    assert visible[0]["linked_session_count"] == 0
 
 
 def test_start_session_uses_catalog_path_and_rejects_client_cwd(planning_client) -> None:

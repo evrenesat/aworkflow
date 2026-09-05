@@ -275,6 +275,7 @@ class GlobalCapabilitiesResponse(CanonicalTransportModel):
 class ReadinessResponse(CanonicalTransportModel):
     ready: bool
     projects: tuple[str, ...]
+    project_errors: Mapping[str, str] = Field(default_factory=dict)
 
 
 class PlanResponse(CanonicalTransportModel):

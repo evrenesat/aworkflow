@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 from pathlib import Path
+import subprocess
 from threading import Thread
 import time
 from types import SimpleNamespace
@@ -17,9 +18,9 @@ from fastapi.testclient import TestClient
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
 from aflow.control_plane import CapabilitySet, ContextBundle, RunControlRequest, RunStatus, StartRunResult
 from aflow.control_plane.persistence import append_run_event
-from aflow.control_plane.units import InMemoryUnitManager
+from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import AflowDaemon
-from aflow_app_server.config import ControlPlaneProjectConfig, ServerConfig
+from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.main import app
 from aflow_app_server.models import (
@@ -30,7 +31,11 @@ from aflow_app_server.models import (
     StartRunResponse,
     canonical_contract_payloads,
 )
-from aflow_app_server.project_catalog import ProjectCatalog
+from aflow_app_server.project_registry import (
+    ProjectRegistry,
+    ProjectRegistryCatalog,
+    ProjectRegistryError,
+)
 
 
 TOKEN = "control-plane-test-token"
@@ -103,13 +108,14 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     root = tmp_path / "project"
     root.mkdir()
-    (root / ".git").mkdir()
+    subprocess.run(("git", "init", "-q", str(root)), check=True)
     plan = root / "plans" / "todo" / "test-plan.md"
     plan.parent.mkdir(parents=True)
     plan.write_text("# Test\n\n### [ ] Checkpoint 1: Test\n- [ ] step\n")
     second_plan = root / "plans" / "todo" / "second-plan.md"
     second_plan.write_text("# Second\n\n### [ ] Checkpoint 1: Test\n- [ ] step\n")
-    config_path = root / "aflow.toml"
+    config_path = root / ".aflow" / "config" / "aflow.toml"
+    config_path.parent.mkdir(parents=True)
     _write_workflow_config(config_path)
     environment_file = root / "aflowd.env"
     environment_file.write_text("AFLOWD_MODE=test\n")
@@ -119,16 +125,13 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     executable.chmod(0o755)
     units = InMemoryUnitManager()
 
-    project = ControlPlaneProjectConfig(
-        id=PROJECT_ID,
-        root=root,
-        config_path=config_path,
+    registry = ProjectRegistry(tmp_path, tmp_path / "registry.json")
+    registry.register(PROJECT_ID, "Test project", "project")
+    control_service = ControlPlaneService(
+        registry,
         aflow_executable=executable,
         environment_file=environment_file,
         release_identity="test-release",
-    )
-    control_service = ControlPlaneService(
-        (project,),
         daemon_factory=lambda config: AflowDaemon(config, units=units),
     )
     control_service.start()
@@ -144,14 +147,14 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         projects_home=tmp_path / "code",
         project_overrides_path=tmp_path / "projects.json",
         attachment_root=tmp_path / "attachments",
-        control_plane_projects=(project,),
+        managed_projects_root=tmp_path,
+        project_registry_path=registry.path,
+        aflow_executable=executable,
+        environment_file=environment_file,
+        release_identity="test-release",
     )
     main._config = config
-    main._project_catalog = ProjectCatalog(
-        config.projects_home,
-        config.project_overrides_path,
-        legacy_registry_path=config.repo_registry_path,
-    )
+    main._project_catalog = ProjectRegistryCatalog(registry)
     main._control_plane_service = control_service
     main._service = None
     main._planning_service = None
@@ -213,6 +216,129 @@ def _answer_pending(
     return response.json()
 
 
+def test_unregister_refuses_to_invalidate_daemon_with_active_unit(control_client) -> None:
+    from aflow_app_server import main
+
+    client, _, _, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    _answer_pending(client, pending, monkeypatch)
+    service = main._control_plane_service
+    assert service is not None
+
+    with pytest.raises(ProjectRegistryError, match="active workflow unit"):
+        service.unregister(PROJECT_ID)
+
+    assert service.projects()[0].project_id == PROJECT_ID
+
+
+def _fresh_control_service(root: Path, units: InMemoryUnitManager) -> ControlPlaneService:
+    from aflow_app_server import main
+
+    config = main._config
+    assert config is not None
+    registry = ProjectRegistry(config.managed_projects_root, config.project_registry_path)
+    service = ControlPlaneService(
+        registry,
+        aflow_executable=config.aflow_executable,
+        environment_file=config.environment_file,
+        release_identity=config.release_identity,
+        daemon_factory=lambda daemon_config: AflowDaemon(daemon_config, units=units),
+    )
+    service.start()
+    assert service._projects == {}
+    assert registry.resolve(PROJECT_ID)[1] == root.resolve()
+    return service
+
+
+def test_unregister_uncached_project_still_observes_active_exact_unit(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    result = started["result"]
+    assert isinstance(result, dict)
+    run_id = str(result["run_id"])
+    assert units.get(f"aflow-run-{run_id}.service").is_active  # type: ignore[union-attr]
+    fresh = _fresh_control_service(root, units)
+
+    with pytest.raises(ProjectRegistryError, match="active workflow unit"):
+        fresh.unregister(PROJECT_ID)
+
+    assert fresh.projects()[0].project_id == PROJECT_ID
+
+
+def test_unregister_uncached_inactive_project_removes_only_requested_state(control_client) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    result = started["result"]
+    assert isinstance(result, dict)
+    run_id = str(result["run_id"])
+    unit_name = f"aflow-run-{run_id}.service"
+    units.units[unit_name] = UnitState(
+        name=unit_name,
+        active_state="inactive",
+        sub_state="dead",
+        result="success",
+    )
+    config = main._config
+    assert config is not None
+    second = root.parent / "second-project"
+    subprocess.run(("git", "init", "-q", str(second)), check=True)
+    second_config = second / ".aflow" / "config" / "aflow.toml"
+    second_config.parent.mkdir(parents=True)
+    _write_workflow_config(second_config)
+    registry = ProjectRegistry(config.managed_projects_root, config.project_registry_path)
+    registry.register("second-project", "Second project", "second-project")
+    fresh = _fresh_control_service(root, units)
+    assert fresh.capabilities("second-project").workflows == ("managed",)
+
+    assert fresh.unregister(PROJECT_ID) is True
+    assert [project.project_id for project in fresh.projects()] == ["second-project"]
+    assert set(fresh._projects) == {"second-project"}
+
+
+def test_registry_project_editor_shape_renames_but_never_moves_root(control_client) -> None:
+    from aflow_app_server import main
+
+    client, root, _, _ = control_client
+    config = main._config
+    assert config is not None
+    registry_path = config.project_registry_path
+    before = json.loads(registry_path.read_text())
+
+    renamed = client.patch(
+        f"/api/projects/{PROJECT_ID}",
+        json={"display_name": "Renamed project", "current_path": str(root.resolve())},
+    )
+
+    assert renamed.status_code == 200
+    assert renamed.json()["display_name"] == "Renamed project"
+    assert renamed.json()["current_path"] == str(root.resolve())
+    after_rename = json.loads(registry_path.read_text())
+    assert after_rename["projects"][0]["relative_root"] == "project"
+    assert after_rename["projects"][0]["updated_at"] != before["projects"][0]["updated_at"]
+
+    stable_bytes = registry_path.read_bytes()
+    rejected = client.patch(
+        f"/api/projects/{PROJECT_ID}",
+        json={"display_name": "Must not persist", "current_path": str(root.parent / "other")},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": {"code": "operation_rejected"}}
+    assert registry_path.read_bytes() == stable_bytes
+
+    alias_rejected = client.patch(
+        f"/api/projects/{PROJECT_ID}",
+        json={"alias": str(root)},
+    )
+    assert alias_rejected.status_code == 422
+    assert alias_rejected.json() == {"detail": {"code": "operation_rejected"}}
+    assert registry_path.read_bytes() == stable_bytes
+
+
 def test_transport_models_match_canonical_control_plane_models() -> None:
     payloads = canonical_contract_payloads()
     assert set(payloads["capability"]) == set(CapabilitySet().to_dict())
@@ -266,7 +392,11 @@ def test_deprecated_execution_routes_are_not_registered() -> None:
 def test_control_plane_reads_pending_start_and_idempotency(control_client) -> None:
     client, _, units, monkeypatch = control_client
     assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/ready").json() == {"ready": True, "projects": [PROJECT_ID]}
+    assert client.get("/ready").json() == {
+        "ready": True,
+        "projects": [PROJECT_ID],
+        "project_errors": {},
+    }
     assert client.get("/api/control-plane/projects").json()["projects"][0]["project_id"] == PROJECT_ID
     assert client.get("/api/control-plane/capabilities").status_code == 200
     assert client.get(f"/api/control-plane/projects/{PROJECT_ID}/plans").status_code == 200

@@ -27,6 +27,14 @@ def test_token() -> str:
 @pytest.fixture
 def test_config(tmp_path: Path, test_token: str) -> ServerConfig:
     """Create a test configuration."""
+    projects_home = tmp_path / "code"
+    projects_home.mkdir()
+    executable = tmp_path / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    environment_file = tmp_path / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n")
     return ServerConfig(
         bind_host="127.0.0.1",
         bind_port=8765,
@@ -36,9 +44,14 @@ def test_config(tmp_path: Path, test_token: str) -> ServerConfig:
         codex_app_server_token=None,
         transcription_url=None,
         transcription_token=None,
-        projects_home=tmp_path / "code",
+        projects_home=projects_home,
         project_overrides_path=tmp_path / "project_overrides.json",
         attachment_root=tmp_path / "attachments",
+        managed_projects_root=projects_home,
+        project_registry_path=tmp_path / "projects.json",
+        aflow_executable=executable,
+        environment_file=environment_file,
+        release_identity="test-release",
     )
 
 

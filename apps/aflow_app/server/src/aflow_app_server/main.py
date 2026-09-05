@@ -38,6 +38,7 @@ import aflow_app_server.planning_routes as planning_routes_module
 from .aflow_service import AflowService
 from .config import ServerConfig
 from .control_plane_service import (
+    ControlPlaneServiceConfig,
     ControlPlaneService,
     ControlPlaneUnavailableError,
     ProjectNotAllowedError,
@@ -69,13 +70,14 @@ from .planning import AttachmentStore, PlanningService, ProviderRegistry
 from .planning.providers import CodexProvider
 from .planning.registry import UnavailablePlanningProvider
 from .project_catalog import ProjectCatalog
+from .project_registry import ProjectRegistry, ProjectRegistryCatalog, ProjectRegistryError
 from .plan_store import PlanStore
 from .transcription import TranscriptionClient, TranscriptionError, create_transcription_client
 
 
 # Global state
 _config: ServerConfig | None = None
-_project_catalog: ProjectCatalog | None = None
+_project_catalog: ProjectCatalog | ProjectRegistryCatalog | None = None
 _service: AflowService | None = None
 _control_plane_service: ControlPlaneService | None = None
 _transcription_client: TranscriptionClient | None = None
@@ -301,7 +303,7 @@ async def verify_token(
 def get_plan_store_factory(project_catalog: ProjectCatalog = Depends(get_project_catalog)):
     """Factory for creating plan stores."""
     def _get_plan_store(project_id: str) -> PlanStore:
-        project = project_catalog.get_project(project_id)
+        project = project_catalog.get_project_fast(project_id)
         if project is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -375,13 +377,19 @@ async def lifespan(app: FastAPI):
     if errors:
         raise RuntimeError(f"Configuration errors: {', '.join(errors)}")
 
-    _project_catalog = ProjectCatalog(
-        _config.projects_home,
-        _config.project_overrides_path,
-        legacy_registry_path=_config.repo_registry_path,
+    project_registry = ProjectRegistry(
+        _config.managed_projects_root,
+        _config.project_registry_path,
     )
+    _project_catalog = ProjectRegistryCatalog(project_registry)
     _service = AflowService()
-    _control_plane_service = ControlPlaneService(_config.control_plane_projects)
+    _control_plane_service = ControlPlaneService(ControlPlaneServiceConfig(
+        registry=project_registry,
+        aflow_executable=_config.aflow_executable,
+        environment_file=_config.environment_file,
+        release_identity=_config.release_identity,
+        environment=_config.control_plane_environment,
+    ))
     _control_plane_service.start()
     _transcription_client = create_transcription_client(
         _config.transcription_url,
@@ -552,6 +560,7 @@ async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse
 @app.exception_handler(PersistenceError)
 @app.exception_handler(DaemonError)
 @app.exception_handler(ValueError)
+@app.exception_handler(ProjectRegistryError)
 async def rejected_operation_handler(_: Request, __: Exception) -> JSONResponse:
     return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "operation_rejected")
 
@@ -584,6 +593,11 @@ def ready(
     return ReadinessResponse(
         ready=service.ready,
         projects=tuple(project.project_id for project in service.projects()),
+        project_errors={
+            project_id: error
+            for project_id, error in service.readiness().items()
+            if error is not None
+        },
     )
 
 
@@ -598,10 +612,8 @@ def global_capabilities(
 ) -> GlobalCapabilitiesResponse:
     return GlobalCapabilitiesResponse(
         projects={
-            project.project_id: CapabilityResponse.from_canonical(
-                service.capabilities(project.project_id)
-            )
-            for project in service.projects()
+            project_id: CapabilityResponse.from_canonical(capabilities)
+            for project_id, capabilities in service.ready_capabilities().items()
         }
     )
 
@@ -976,7 +988,7 @@ async def list_plans(
     service: AflowService = Depends(get_service),
 ) -> list[dict[str, Any]]:
     """List all plan files for a project."""
-    project = project_catalog.get_project(project_id)
+    project = project_catalog.get_project_fast(project_id)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
