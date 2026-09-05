@@ -19,7 +19,6 @@ from aflow_app_server.control_plane_service import (
 )
 from aflow_app_server.project_registry import (
     ProjectRegistry,
-    ProjectRegistryCatalog,
     ProjectRegistryError,
 )
 
@@ -226,37 +225,6 @@ def test_unavailable_project_does_not_hide_healthy_project(tmp_path: Path) -> No
     assert service.readiness()["broken"] is not None
 
 
-def test_registry_catalog_owns_only_current_exact_registered_root(tmp_path: Path) -> None:
-    managed = tmp_path / "managed"
-    managed.mkdir()
-    alpha = _git_project(managed, "alpha")
-    beta = _git_project(managed, "beta")
-    former = _git_project(managed, "former")
-    descendant = alpha / "nested"
-    descendant.mkdir()
-    linked = managed / "alpha-link"
-    linked.symlink_to(alpha, target_is_directory=True)
-    registry = ProjectRegistry(managed, tmp_path / "projects.json")
-    registry.register("alpha", "Alpha", "alpha")
-    registry.register("beta", "Beta", "beta")
-    catalog = ProjectRegistryCatalog(registry)
-    stale = catalog.get_project_fast("alpha")
-    assert stale is not None
-
-    registry.rename("alpha", "Renamed Alpha")
-    project = catalog.get_project_fast("alpha")
-    assert project is not None
-
-    assert not catalog.project_owns_path(stale, alpha)
-    assert catalog.project_owns_path(project, alpha.resolve())
-    assert not catalog.project_owns_path(project, beta)
-    assert not catalog.project_owns_path(project, descendant)
-    assert not catalog.project_owns_path(project, former)
-    assert not catalog.project_owns_path(project, alpha / "missing")
-    assert not catalog.project_owns_path(project, linked)
-    assert not catalog.project_owns_path(project, alpha / ".." / "alpha")
-
-
 def test_unregistered_project_is_rejected_before_daemon_composition(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     managed.mkdir()
@@ -311,71 +279,6 @@ def test_two_projects_keep_independent_run_roots_and_unregister_cache(
     with pytest.raises(ProjectNotAllowedError):
         service.capabilities("first")
     assert service.capabilities("second").workflows == ("managed",)
-
-
-class _Session:
-    """Minimal planning-session stand-in exposing only a ``cwd`` attribute."""
-
-    def __init__(self, cwd: object) -> None:
-        self.cwd = cwd
-
-
-def test_catalog_session_counts_are_exact_and_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    managed = tmp_path / "managed"
-    managed.mkdir()
-    alpha = _git_project(managed, "alpha")
-    beta = _git_project(managed, "beta")
-    gamma = _git_project(managed, "gamma")
-    (alpha / "nested").mkdir()
-    (managed / "plain").mkdir()
-    (managed / "linked").symlink_to(alpha, target_is_directory=True)
-    registry = ProjectRegistry(managed, tmp_path / "projects.json")
-    registry.register("alpha", "Alpha", "alpha")
-    registry.register("beta", "Beta", "beta")
-    registry.register("gamma", "Gamma", "gamma")
-    catalog = ProjectRegistryCatalog(registry)
-
-    sessions = (
-        _Session(alpha),  # exact registered root
-        _Session(beta),  # exact registered root
-        _Session(alpha / "nested"),  # descendant of a registered root
-        _Session(managed / "plain"),  # existing but unregistered directory
-        _Session(managed / "linked"),  # symlink alias of a registered root
-        _Session(managed / "missing"),  # nonexistent path
-        _Session("relative/path"),  # relative path
-        _Session(alpha / ".." / "alpha"),  # traversing path
-    )
-
-    calls: list[str] = []
-    original_resolve = ProjectRegistry.resolve
-
-    def counting_resolve(self: ProjectRegistry, project_id: str):
-        calls.append(project_id)
-        return original_resolve(self, project_id)
-
-    monkeypatch.setattr(ProjectRegistry, "resolve", counting_resolve)
-
-    projects = {item.id: item for item in catalog.list_projects(sessions=sessions)}
-
-    # One resolution per project regardless of the number of sessions: the
-    # snapshot never performs project-by-session resolution or Git work.
-    assert calls == ["alpha", "beta", "gamma"]
-    assert projects["alpha"].linked_session_count == 1
-    assert projects["beta"].linked_session_count == 1
-    assert projects["gamma"].linked_session_count == 0
-    assert {item.is_git_root for item in projects.values()} == {True}
-
-    calls.clear()
-    detail = catalog.get_project("alpha", sessions=sessions)
-    assert detail is not None
-    assert calls == ["alpha"]
-    assert detail.linked_session_count == 1
-
-    calls.clear()
-    assert catalog.get_project("unknown", sessions=sessions) is None
-    assert calls == []
 
 
 def test_registration_ignores_unavailable_peers_but_keeps_identity_strict(

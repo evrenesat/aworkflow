@@ -33,10 +33,10 @@ from aflow_app_server.models import (
 )
 from aflow_app_server.project_registry import (
     ProjectRegistry,
-    ProjectRegistryCatalog,
     ProjectRegistryError,
 )
 from aflow_app_server.project_config_service import ProjectConfigService
+from aflow_app_server.plan_service import PlanService
 
 
 TOKEN = "control-plane-test-token"
@@ -140,14 +140,6 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         bind_host="127.0.0.1",
         bind_port=8765,
         auth_token=TOKEN,
-        repo_registry_path=tmp_path / "repos.json",
-        codex_app_server_url=None,
-        codex_app_server_token=None,
-        transcription_url=None,
-        transcription_token=None,
-        projects_home=tmp_path / "code",
-        project_overrides_path=tmp_path / "projects.json",
-        attachment_root=tmp_path / "attachments",
         managed_projects_root=tmp_path,
         project_registry_path=registry.path,
         aflow_executable=executable,
@@ -155,26 +147,24 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         release_identity="test-release",
     )
     main._config = config
-    main._project_catalog = ProjectRegistryCatalog(registry)
+    main._project_registry = registry
+    main._plan_service = PlanService(registry)
     main._control_plane_service = control_service
     main._project_config_service = ProjectConfigService(
         registry,
         control_service,
         audit_path=tmp_path / "config_audit.jsonl",
     )
-    main._service = None
-    main._planning_service = None
     client = TestClient(app)
     client.headers["Authorization"] = f"Bearer {TOKEN}"
     try:
         yield client, root, units, monkeypatch
     finally:
         main._config = None
-        main._project_catalog = None
+        main._project_registry = None
+        main._plan_service = None
         main._control_plane_service = None
         main._project_config_service = None
-        main._service = None
-        main._planning_service = None
 
 
 def _prepared(request) -> PreparedRun:

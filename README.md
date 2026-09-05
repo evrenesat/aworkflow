@@ -220,10 +220,11 @@ all core tests. Pull requests and pushes to `main` run Python 3.11 on Ubuntu
 and macOS, and the package build waits for both platform test jobs. Publication
 calls the same reusable CI workflow before uploading a package.
 
-The optional remote management app lives in `apps/aflow_app/` and is not
-included in the published wheel. Its server requires Python 3.12+ and exposes a
-provider-neutral planning-session API; Codex integration is implemented through
-`codex-app-server-sdk` behind that boundary.
+The optional remote workflow-control app lives in `apps/aflow_app/` and is
+not included in the published wheel. Its Python 3.12+ server manages registered
+projects, revisioned configuration and Markdown plans, and durable runs through
+REST and MCP. Provider choice stays in normal engine harness profiles; Codex is
+one optional harness adapter.
 
 ## Documentation
 

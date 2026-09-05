@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 import subprocess
 
 import pytest
@@ -476,8 +475,6 @@ class TestRejectionsAndRollback:
     def test_pre_existing_target_byte_identical_after_failed_create(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from aflow_app_server import project_service as project_service_module
-
         service, _, managed = _service(tmp_path)
         before = _create(service, "alpha")
         assert before["id"] == "alpha"
@@ -535,11 +532,6 @@ class TestAuthenticatedApi:
             bind_host="127.0.0.1",
             bind_port=8765,
             auth_token="test-token",
-            repo_registry_path=tmp_path / "repos.json",
-            codex_app_server_url=None,
-            codex_app_server_token=None,
-            transcription_url=None,
-            transcription_token=None,
             managed_projects_root=managed,
             project_registry_path=tmp_path / "projects.json",
             aflow_executable=executable,
@@ -549,9 +541,6 @@ class TestAuthenticatedApi:
         registry = ProjectRegistry(config.managed_projects_root, config.project_registry_path)
         main_module._config = config
         main_module._project_registry = registry
-        from aflow_app_server.project_registry import ProjectRegistryCatalog
-
-        main_module._project_catalog = ProjectRegistryCatalog(registry)
         main_module._control_plane_service = ControlPlaneService(
             registry,
             aflow_executable=executable,
@@ -559,17 +548,14 @@ class TestAuthenticatedApi:
             release_identity="test-release",
         )
         main_module._control_plane_service.start()
-        main_module._planning_service = None
         client = TestClient(main_module.app, raise_server_exceptions=False)
         client.headers["Authorization"] = "Bearer test-token"
         try:
             yield client
         finally:
             main_module._config = None
-            main_module._project_catalog = None
             main_module._project_registry = None
             main_module._control_plane_service = None
-            main_module._planning_service = None
 
     def test_create_register_unregister_end_to_end(
         self, client: TestClient, tmp_path: Path

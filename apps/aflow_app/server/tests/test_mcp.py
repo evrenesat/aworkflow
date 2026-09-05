@@ -15,7 +15,12 @@ from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
 from aflow_app_server.main import app
-from test_control_plane_api import PROJECT_ID, TOKEN, _prepared, control_client
+from test_control_plane_api import (
+    PROJECT_ID,
+    TOKEN,
+    _prepared,
+    control_client as _control_client_fixture,  # noqa: F401
+)
 
 MCP_PROTOCOL_VERSION = "2025-11-25"
 MCP_HEADERS = {
@@ -66,20 +71,16 @@ def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> N
 
 
 @pytest.fixture
-def mcp_client(control_client, monkeypatch: pytest.MonkeyPatch):
+def mcp_client(_control_client_fixture, monkeypatch: pytest.MonkeyPatch):  # noqa: F811
     """Run the mounted MCP transport with the daemon fixture from REST tests."""
     from aflow_app_server import main
 
-    _, root, units, _ = control_client
+    _, root, units, _ = _control_client_fixture
     config = main._config
     control_service = main._control_plane_service
     assert config is not None
     assert control_service is not None
-    test_config = replace(
-        config,
-        planning_providers=(),
-        default_planning_provider_id=None,
-    )
+    test_config = replace(config)
     monkeypatch.setattr(main.ServerConfig, "from_env", classmethod(lambda _cls: test_config))
     monkeypatch.setattr(main, "ControlPlaneService", lambda _projects: control_service)
 

@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 
 from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService
+from aflow_app_server.project_registry import ProjectRegistry
 from aflow_app_server.main import AccessLogPathFilter, app
-from aflow_app_server.project_catalog import ProjectCatalog
 
 
 @pytest.fixture
@@ -24,34 +24,21 @@ def auth_client(tmp_path, monkeypatch: pytest.MonkeyPatch):
         bind_port=8765,
         auth_token="",
         auth_token_file=token_file,
-        repo_registry_path=tmp_path / "repos.json",
-        codex_app_server_url=None,
-        codex_app_server_token=None,
-        transcription_url=None,
-        transcription_token=None,
-        projects_home=tmp_path / "code",
-        project_overrides_path=tmp_path / "projects.json",
-        attachment_root=tmp_path / "attachments",
     )
     main._config = config
-    main._project_catalog = ProjectCatalog(
-        config.projects_home,
-        config.project_overrides_path,
-        legacy_registry_path=config.repo_registry_path,
-    )
+    managed = tmp_path / "code"
+    managed.mkdir()
+    registry = ProjectRegistry(managed, tmp_path / "projects.json")
+    main._project_registry = registry
     main._control_plane_service = ControlPlaneService(())
     main._control_plane_service.start()
-    main._service = None
-    main._planning_service = None
     client = TestClient(app, follow_redirects=False)
     try:
         yield client, token_file, monkeypatch
     finally:
         main._config = None
-        main._project_catalog = None
+        main._project_registry = None
         main._control_plane_service = None
-        main._service = None
-        main._planning_service = None
 
 
 def _bearer(token: str) -> dict[str, str]:

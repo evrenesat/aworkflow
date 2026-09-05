@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { PlanInfo, ProjectInfo } from '../types'
+import type { PlanDocument, ProjectInfo } from '../types'
 import * as api from '../api'
 
 interface PlanPanelProps {
@@ -8,215 +8,162 @@ interface PlanPanelProps {
 }
 
 export function PlanPanel({ project, onOpenRunDashboard }: PlanPanelProps) {
-  const [plans, setPlans] = useState<PlanInfo[]>([])
-  const [drafts, setDrafts] = useState<string[]>([])
-  const [loading, setLoading] = useState(true)
+  const [plans, setPlans] = useState<PlanDocument[]>([])
+  const [selected, setSelected] = useState<PlanDocument | null>(null)
+  const [content, setContent] = useState('')
+  const [newName, setNewName] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [selectedDraft, setSelectedDraft] = useState<string | null>(null)
-  const [draftContent, setDraftContent] = useState('')
-  const [promoteTargetName, setPromoteTargetName] = useState('')
-  const [viewingDraft, setViewingDraft] = useState(false)
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    void loadPlans()
-    void loadDrafts()
+    setSelected(null)
+    setContent('')
+    void refresh()
   }, [project.id])
 
-  async function loadPlans() {
+  async function refresh() {
     try {
-      setLoading(true)
       setError(null)
-      const data = await api.listProjectPlans(project.id)
-      setPlans(data)
+      setPlans(await api.listProjectPlans(project.id))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load plans')
+    }
+  }
+
+  async function openPlan(plan: PlanDocument) {
+    try {
+      setError(null)
+      const loaded = await api.readProjectPlan(project.id, plan.status, plan.name)
+      setSelected(loaded)
+      setContent(loaded.content ?? '')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load plan')
+    }
+  }
+
+  async function createPlan() {
+    const name = newName.trim()
+    if (!name) return
+    try {
+      setBusy(true)
+      setError(null)
+      const created = await api.createProjectPlan(project.id, { name, content: '# Plan\n\n' })
+      setNewName('')
+      await refresh()
+      await openPlan(created)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create plan')
     } finally {
-      setLoading(false)
+      setBusy(false)
     }
   }
 
-  async function loadDrafts() {
+  async function savePlan() {
+    if (!selected) return
     try {
-      const data = await api.listPlanDrafts(project.id)
-      setDrafts(data)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load drafts')
-    }
-  }
-
-  async function handleViewDraft(name: string) {
-    try {
+      setBusy(true)
       setError(null)
-      const draft = await api.loadPlanDraft(project.id, name)
-      setDraftContent(draft.content)
-      setSelectedDraft(draft.name)
-      setPromoteTargetName(draft.name)
-      setViewingDraft(true)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load draft')
-    }
-  }
-
-  async function handlePromoteDraft() {
-    if (!selectedDraft) return
-
-    try {
-      setError(null)
-      await api.promotePlanDraft(project.id, {
-        draft_name: selectedDraft,
-        target_name: promoteTargetName.trim() || null,
+      const updated = await api.updateProjectPlan(project.id, selected.status, selected.name, {
+        content,
+        expected_revision: selected.revision,
       })
-      setViewingDraft(false)
-      setSelectedDraft(null)
-      setDraftContent('')
-      setPromoteTargetName('')
-      await loadPlans()
-      await loadDrafts()
+      setSelected(updated)
+      await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to promote draft')
+      setError(err instanceof Error ? err.message : 'Failed to save plan')
+    } finally {
+      setBusy(false)
     }
   }
 
-  async function handleDeleteDraft() {
-    if (!selectedDraft) return
-
+  async function promotePlan() {
+    if (!selected || selected.status === 'done') return
     try {
+      setBusy(true)
       setError(null)
-      await api.deletePlanDraft(project.id, selectedDraft)
-      setViewingDraft(false)
-      setSelectedDraft(null)
-      setDraftContent('')
-      setPromoteTargetName('')
-      await loadDrafts()
+      const promoted = await api.promoteProjectPlan(
+        project.id,
+        selected.status,
+        selected.name,
+        { expected_revision: selected.revision },
+      )
+      setSelected(promoted)
+      setContent(promoted.content ?? content)
+      await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete draft')
+      setError(err instanceof Error ? err.message : 'Failed to promote plan')
+    } finally {
+      setBusy(false)
     }
   }
 
-  if (loading) {
+  if (selected) {
     return (
-      <div style={{ padding: 'var(--spacing-lg)', textAlign: 'center' }}>
-        <div className="spinner" />
-      </div>
-    )
-  }
-
-  if (viewingDraft && selectedDraft) {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-        <div
-          style={{
-            padding: 'var(--spacing-md)',
-            borderBottom: '1px solid var(--color-border)',
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            gap: 'var(--spacing-sm)',
-          }}
-        >
-          <button className="btn btn-secondary btn-sm" onClick={() => setViewingDraft(false)}>
-            ← Back
-          </button>
-          <div className="text-sm truncate" style={{ flex: 1, marginLeft: 'var(--spacing-md)' }}>
-            {selectedDraft}
-          </div>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--spacing-md)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)' }}>
+          <button className="btn btn-secondary btn-sm" onClick={() => setSelected(null)}>← All plans</button>
+          <strong className="mono text-sm">{selected.path}</strong>
         </div>
-
-        {error && (
-          <div style={{ padding: 'var(--spacing-md)' }}>
-            <div className="error-message">{error}</div>
-          </div>
-        )}
-
-        <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--spacing-md)', display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
-          <div className="card" style={{ minHeight: '320px', overflowY: 'auto' }}>
-            <div className="text-xs text-dim" style={{ marginBottom: 'var(--spacing-sm)' }}>
-              Draft content
-            </div>
-            <pre className="mono" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>
-              {draftContent}
-            </pre>
-          </div>
-          <label style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-xs)' }}>
-            <span className="text-xs text-dim">Promote as</span>
-            <input className="input" value={promoteTargetName} onChange={(e) => setPromoteTargetName(e.target.value)} />
-          </label>
-        </div>
-
-        <div style={{ padding: 'var(--spacing-md)', borderTop: '1px solid var(--color-border)', display: 'flex', gap: 'var(--spacing-sm)' }}>
-          <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => void handlePromoteDraft()}>
-            Promote to in-progress
-          </button>
-          <button className="btn btn-danger" onClick={() => void handleDeleteDraft()}>
-            Delete
-          </button>
+        {error && <div className="error-message">{error}</div>}
+        <textarea
+          className="input mono"
+          aria-label="Plan content"
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          style={{ flex: 1, minHeight: '360px', resize: 'vertical' }}
+        />
+        <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
+          <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
+          {selected.status !== 'done' && (
+            <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy}>
+              Move to {selected.status === 'todo' ? 'in-progress' : 'done'}
+            </button>
+          )}
+          {selected.status === 'in_progress' && (
+            <button className="btn btn-primary" onClick={() => onOpenRunDashboard(selected.path)}>
+              Open run dashboard
+            </button>
+          )}
         </div>
       </div>
     )
   }
-
-  const inProgressPlans = plans.filter((plan) => plan.status === 'in_progress')
 
   return (
-    <div style={{ padding: 'var(--spacing-md)', display: 'flex', flexDirection: 'column', gap: 'var(--spacing-lg)' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-lg)', height: '100%', overflowY: 'auto' }}>
       {error && <div className="error-message">{error}</div>}
-
-      <div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 'var(--spacing-sm)', marginBottom: 'var(--spacing-md)' }}>
-          <h3 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Plan drafts</h3>
-          <span className="text-xs text-dim mono">{project.current_path}</span>
-        </div>
-        {drafts.length === 0 ? (
-          <div className="card text-dim text-sm">No drafts</div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-sm)' }}>
-            {drafts.map((draft) => (
-              <button
-                key={draft}
-                className="card card-interactive"
-                style={{
-                  textAlign: 'left',
-                  width: '100%',
-                  border: 'none',
-                  background: 'transparent',
-                  color: 'inherit',
-                }}
-                onClick={() => void handleViewDraft(draft)}
-              >
-                <div className="mono text-sm" style={{ fontWeight: 500 }}>
-                  {draft}
+      <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)' }}>
+        <input
+          className="input mono"
+          aria-label="New plan filename"
+          placeholder="new-plan.md"
+          value={newName}
+          onChange={(event) => setNewName(event.target.value)}
+        />
+        <button className="btn btn-primary" onClick={() => void createPlan()} disabled={busy || !newName.trim()}>
+          Create plan
+        </button>
+      </div>
+      {(['todo', 'in_progress', 'done'] as const).map((status) => {
+        const matching = plans.filter((plan) => plan.status === status)
+        return (
+          <section key={status}>
+            <h3 style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
+              {status === 'in_progress' ? 'In progress' : status[0].toUpperCase() + status.slice(1)}
+            </h3>
+            {matching.length === 0 ? (
+              <div className="card text-dim text-sm">No plans</div>
+            ) : matching.map((plan) => (
+              <button key={plan.path} className="card card-interactive content-button" onClick={() => void openPlan(plan)}>
+                <div className="content-button-row">
+                  <span className="mono text-sm">{plan.name}</span>
+                  <span className="text-xs text-dim">{plan.size_bytes} bytes</span>
                 </div>
               </button>
             ))}
-          </div>
-        )}
-      </div>
-
-      <div>
-        <h3 style={{ fontSize: '1.125rem', fontWeight: 600, marginBottom: 'var(--spacing-md)' }}>In-progress plans</h3>
-        {inProgressPlans.length === 0 ? (
-          <div className="card text-dim text-sm">No in-progress plans</div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-sm)' }}>
-            {inProgressPlans.map((plan) => (
-              <div key={plan.path} className="card" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-sm)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 'var(--spacing-sm)' }}>
-                  <div className="mono text-sm" style={{ fontWeight: 500 }}>
-                    {plan.name}
-                  </div>
-                  {plan.is_complete && <span className="text-xs" style={{ color: 'var(--color-success)' }}>Complete</span>}
-                </div>
-                <div className="text-xs text-dim">
-                  {plan.checkpoint_count} checkpoints, {plan.unchecked_count} remaining
-                </div>
-                <button className="btn btn-primary btn-sm" onClick={() => onOpenRunDashboard(plan.path)}>
-                  Open run dashboard
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+          </section>
+        )
+      })}
     </div>
   )
 }

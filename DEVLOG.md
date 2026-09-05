@@ -1,3 +1,12 @@
+## 2026-09-06 — Remove remote agent planning and retain plan management
+
+- Removed the remote provider client, interactive planning surface, and its
+  transport dependencies; provider choice remains an engine harness concern.
+- Added registry-scoped Markdown plan CRUD with SHA-256 expected revisions,
+  bounded regular-file checks, atomic updates, and one-way lifecycle moves.
+- Rebuilt the web plan editor around that contract and kept durable run REST,
+  SSE, and MCP behavior unchanged.
+
 # DEVLOG
 
 ## 2026-09-06 - Stop daemon-owned runs before unit startup

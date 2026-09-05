@@ -1,480 +1,98 @@
-# Remote App
+# Remote workflow control app
 
-The remote app is a mobile-first FastAPI/React interface for managing AFlow workflows across local projects. It lives under `apps/aflow_app/` and is separate from the published `aworkflow` wheel.
+The optional app in `apps/aflow_app/` controls registered AFlow projects through authenticated REST, MCP, and a compact web client. It manages project registration, the two canonical configuration documents, Markdown plans, and durable workflow runs. The app is a separate subproject and is not included in the `aworkflow` wheel.
 
-It is designed for authenticated desktop-hosted local/LAN use, not direct internet exposure.
+Agent providers are selected by normal AFlow harness profiles when a workflow runs. Codex remains available as one optional engine harness adapter; the remote server has no provider-specific client or interactive chat surface.
 
-## Capabilities
+## Boundaries
 
-- Discover local git projects under a configured projects home.
-- Associate provider-qualified planning sessions with projects by current path and historical aliases.
-- Discover planning providers and their readiness, models, reasoning controls, and optional capabilities.
-- Start, resume, fork, rename, archive, and send turns to planning sessions when the selected provider supports those actions.
-- Review pending approvals, interrupt active turns, and stage file or image attachments when supported.
-- Save plans from planning-session turns as drafts.
-- Load, delete, and promote drafts into executable in-progress plans.
-- Start AFlow executions from in-progress plans.
-- Stream execution events over Server-Sent Events.
-- Optionally transcribe browser-recorded audio with an OpenAI-compatible Whisper endpoint.
+- Every project is an exact Git root explicitly recorded in the versioned project registry.
+- Project paths are selected server-side from that registry. Requests cannot submit arbitrary roots.
+- Plan routes edit only direct regular `.md` files under `plans/todo`, `plans/in-progress`, and `plans/done`.
+- Configuration routes address only `.aflow/config/aflow.toml` and `.aflow/config/workflows.toml` as one revisioned pair.
+- Run REST and MCP routes delegate to the same durable control-plane service.
+- All API and MCP operations require an `Authorization: Bearer ...` header. Credentials in URLs or MCP payloads are rejected.
+- `/health` reports process liveness. Authenticated `/ready` reports control-plane readiness.
 
-## Project Structure
+## Run locally
 
-```text
-apps/aflow_app/
-├── server/                    # FastAPI backend
-│   ├── src/aflow_app_server/
-│   │   ├── config.py          # server configuration
-│   │   ├── project_catalog.py # project discovery and planning-session association
-│   │   ├── project_overrides.py # persistent names, moved paths, aliases
-│   │   ├── aflow_service.py   # read-only legacy run summaries
-│   │   ├── control_plane_service.py # daemon-backed lifecycle operations
-│   │   ├── mcp_adapter.py     # shared MCP registry mounted in FastAPI
-│   │   ├── planning_routes.py # provider-neutral planning and plan-draft routes
-│   │   ├── planning/          # service, provider registry, models, attachments
-│   │   │   └── providers/
-│   │   │       └── codex.py   # SDK-backed Codex provider adapter
-│   │   ├── plan_store.py      # draft and in-progress plan files
-│   │   ├── transcription.py   # optional audio transcription
-│   │   └── main.py            # FastAPI app and static frontend serving
-│   └── tests/
-└── web/                       # React/Vite frontend
-    ├── src/
-    │   ├── components/
-    │   ├── api.ts
-    │   ├── types.ts
-    │   ├── App.tsx
-    │   └── main.tsx
+```bash
+npm --prefix apps/aflow_app/web install
+npm --prefix apps/aflow_app/web run build
+uv sync --project apps/aflow_app/server
+AFLOW_APP_TOKEN=secret uv run --project apps/aflow_app/server aflow-app-server
 ```
+
+The server binds to `127.0.0.1:8765` by default and serves the built web client from the same origin.
 
 ## Configuration
 
-Configuration is loaded from environment variables and `~/.config/aflow/config.toml`. Environment variables override file values.
+The server reads `~/.config/aflow/config.toml` and these environment overrides:
 
-| Environment variable | Config key | Default | Description |
-|----------------------|------------|---------|-------------|
-| `AFLOW_APP_CONFIG_DIR` | - | `~/.config/aflow` | Directory containing `config.toml`. |
-| `AFLOW_APP_HOST` | `server.bind_host` | `127.0.0.1` | Bind host. |
-| `AFLOW_APP_PORT` | `server.bind_port` | `8765` | Bind port. |
-| `AFLOW_APP_TOKEN` | `server.auth_token` | - | Required auth token. |
-| `AFLOW_APP_TOKEN_FILE` | `server.auth_token_file` | - | Optional bearer-token file reread for every request. |
-| `AFLOW_APP_REGISTRY_PATH` | `server.repo_registry_path` | `<config_dir>/repos.json` | Legacy repo registry path used for migration. |
-| `AFLOW_APP_PROJECTS_HOME` | `project_catalog.projects_home` or `projects.projects_home` | `~/code` | Root scanned recursively for git repositories. |
-| `AFLOW_APP_PROJECT_OVERRIDES_PATH` | `project_catalog.project_overrides_path` or `projects.project_overrides_path` | `<config_dir>/project_overrides.json` | Persistent project metadata store. |
-| `AFLOW_APP_WEB_DIST` | - | `apps/aflow_app/web/dist` | Override directory for built frontend assets. |
-| `AFLOW_PLANNING_PROVIDERS` | `planning.providers` | default Codex provider | JSON provider list; replaces the file provider list when set. |
-| `AFLOW_PLANNING_DEFAULT_PROVIDER` | `planning.default_provider_id` | `codex` when present | Provider used when a new-session request omits `provider_id`. |
-| `AFLOW_PLANNING_CODEX_URL` | Codex entry in `planning.providers` | - | Preferred environment override for the Codex provider endpoint. |
-| `AFLOW_PLANNING_CODEX_TOKEN` | Codex entry in `planning.providers` | - | Preferred environment override for the Codex provider token. |
-| `AFLOW_PLANNING_OPERATION_TIMEOUT_SECONDS` | `planning.operation_timeout_seconds` | `30` | Timeout for bounded provider operations. |
-| `AFLOW_PLANNING_EXECUTION_POLICY` | `planning.execution_policy` | `full_access` | Server-owned execution policy; currently only `full_access` is valid. |
-| `AFLOW_PLANNING_ATTACHMENT_ROOT` | `planning.attachment_root` | `<config_dir>/attachments` | Shared attachment storage root outside project repositories. |
-| `AFLOW_PLANNING_ATTACHMENT_MAX_FILE_SIZE_BYTES` | `planning.attachment_max_file_size_bytes` | `26214400` | Maximum size of one attachment. |
-| `AFLOW_PLANNING_ATTACHMENT_MAX_COUNT_PER_TURN` | `planning.attachment_max_count_per_turn` | `10` | Maximum attachment references in one turn. |
-| `AFLOW_PLANNING_ATTACHMENT_MAX_TOTAL_SIZE_BYTES_PER_TURN` | `planning.attachment_max_total_size_bytes_per_turn` | `52428800` | Maximum total attachment bytes referenced by one turn. |
-| `AFLOW_CONTROL_PLANE_PROJECTS` | `control_plane.projects` | - | JSON project allowlist override. |
-| `AFLOW_CODEX_APP_SERVER_URL`, `AFLOW_CODEX_URL` | `codex_app_server.server_url`, `codex.url` | - | Legacy compatibility inputs for the default Codex entry. |
-| `AFLOW_CODEX_APP_SERVER_TOKEN`, `AFLOW_CODEX_TOKEN` | `codex_app_server.server_token`, `codex.token` | - | Legacy compatibility inputs for the default Codex entry. |
-| `AFLOW_TRANSCRIPTION_URL` | `transcription.server_url` | - | Optional transcription service URL. |
-| `AFLOW_TRANSCRIPTION_TOKEN` | `transcription.server_token` | - | Optional transcription service token. |
-| `AFLOW_APP_LOG_PLUGIN_PROBES` | - | disabled | Log one fingerprint for each unique local plugin probe while debugging. |
+- `AFLOW_APP_TOKEN` or `AFLOW_APP_TOKEN_FILE`
+- `AFLOW_APP_HOST` and `AFLOW_APP_PORT`
+- `AFLOW_MANAGED_PROJECTS_ROOT`
+- `AFLOW_PROJECT_REGISTRY_PATH`
+- `AFLOW_CONFIG_AUDIT_PATH`
+- `AFLOW_EXECUTABLE`
+- `AFLOW_RELEASE_IDENTITY`
+- `AFLOW_ENVIRONMENT_FILE`
 
-Provider ids must be unique path-safe slugs, and the default must name an enabled provider. New planning environment values override new planning file values; provider-neutral configuration takes precedence over the legacy Codex compatibility reads. Attachment limits must be positive. Attachment storage is rejected if it overlaps an authorized project repository.
-
-Example:
+A token file is reread per request so rotation does not require a restart. The managed root, registry, executable, release identity, and environment file are server-owned launch inputs. Per-project workflow settings live in the canonical project configuration pair.
 
 ```toml
 [server]
 bind_host = "127.0.0.1"
 bind_port = 8765
-auth_token = "your-secret-token"
+auth_token_file = "/etc/aflowd/token"
 
-[project_catalog]
-projects_home = "~/code"
-project_overrides_path = "~/.config/aflow/project_overrides.json"
-
-[planning]
-default_provider_id = "codex"
-attachment_root = "~/.config/aflow/attachments"
-operation_timeout_seconds = 30
-execution_policy = "full_access"
-
-[[planning.providers]]
-id = "codex"
-kind = "codex"
-display_name = "Codex"
-server_url = "ws://localhost:8080"
-server_token = "provider-token"
-
-[transcription]
-server_url = "https://api.openai.com/v1"
-server_token = "openai-api-key"
+[control_plane]
+managed_projects_root = "/srv/code"
+project_registry_path = "/var/lib/aflowd/projects.json"
+config_audit_path = "/var/lib/aflowd/config-audit.jsonl"
+aflow_executable = "/opt/aflowd/current/bin/aflow"
+release_identity = "reviewed-commit"
+environment_file = "/etc/aflowd/worker.env"
 ```
 
-## Running
-
-Build the web app once:
-
-```bash
-cd apps/aflow_app/web
-npm install
-npm run build
-```
-
-Run the backend:
-
-```bash
-cd apps/aflow_app/server
-uv sync
-AFLOW_APP_TOKEN=secret uv run aflow-app-server
-```
-
-Open:
-
-```text
-http://127.0.0.1:8765/
-```
-
-The backend serves the built frontend from `apps/aflow_app/web/dist`, so a separate frontend server is not needed for normal use. If the frontend has not been built, `/` and SPA routes return a clear 404 telling you to run `npm run build`.
-
-Frontend development:
-
-```bash
-cd apps/aflow_app/web
-npm install
-npm run dev
-npm run build
-npm run preview
-npm test -- --run
-```
-
-`npm run dev` starts Vite on `http://localhost:3000` and proxies API requests to `http://127.0.0.1:8765`.
-
-Server tests:
-
-```bash
-cd apps/aflow_app/server
-uv run --extra dev pytest -q
-```
-
-## Authentication
-
-All functional API and MCP endpoints require the configured token. `/health`
-is unauthenticated process liveness, static frontend assets are public, and
-`POST /api/plugin/events` is an unauthenticated local-probe no-op that always
-returns `204`.
-
-Normal requests use:
-
-```text
-Authorization: Bearer <token>
-```
-
-The built web client keeps the entered token in memory for the page lifetime and
-sends it only in the `Authorization` header. Logout clears it; a page refresh
-requires re-entry.
-
-All authenticated routes, including SSE and MCP, use the same header-only
-bearer check. Credential-like query parameters are rejected before routing, so
-tokens must never appear in URLs, logs, browser history, or MCP arguments.
-
-## Projects
-
-The one durable project registry (`project_registry_path`, schema version 1) is the
-exact runtime allowlist. Each record stores a slug id, display name, and a root
-relative to `managed_projects_root`; requests resolve exact registered roots only.
-There is no filesystem discovery, no alias table, and no per-project executable or
-environment override. Newly registered projects become usable immediately without
-restarting the server.
-
-### Creating and registering projects
-
-Authenticated `POST /api/projects` accepts typed fields only:
-
-- `mode`: `create` or `register`
-- `path`: relative directory path beneath the managed root (or a slug)
-- `display_name`, `main_branch`, `initial_workflow`, optional `initial_team`
-- `initialize_git` / `initialize_config` opt-in booleans (register mode)
-
-It never accepts an executable, environment file, absolute path, README body, or
-raw Git arguments.
-
-- `create` builds the project in a uniquely named temporary sibling of the target
-  (beneath the target's parent directory, which must already exist; nested paths
-  never create missing parent trees) using fixed Git argv
-  (`git init -b <validated branch>`, `add`, `commit`) with
-  bounded timeouts, writes a minimal `README.md` and a `.gitignore` ignoring
-  `.aflow/`, configures only missing repository-local identity, verifies branch,
-  HEAD, and a clean worktree, writes the starter configuration, then atomically
-  renames the sibling to the unused target and inserts the registry record.
-- `register` requires an existing directory beneath the managed root whose Git
-  HEAD resolves to a real commit (unborn repositories are rejected) and never
-  modifies a repository with existing commits. With explicit `initialize_git` it
-  applies the same bootstrap in place, and only into an empty directory. With
-  explicit `initialize_config` it writes the starter pair but refuses to
-  overwrite existing configuration documents.
-- Every failure leaves no registry record, removes only what that request
-  created — the temporary sibling, the freshly renamed directory, or the
-  bootstrap/config entries written for an in-place registration — and preserves
-  any pre-existing target, repository, and history byte-for-byte. Request
-  fields, including the display name, are validated before any mutation.
-
-### Initial `configuration_required` state
-
-New project configuration is provider-neutral: the starter pair
-(`.aflow/config/aflow.toml` and `workflows.toml`) records the chosen initial
-workflow as `aflow.default_workflow` and the optional named team on the starter
-workflow, includes one generic workflow definition, and intentionally selects no
-harness provider. A placeholder profile keeps the project reported as
-`configuration_required` until explicit role selectors and harness profiles are
-configured through normal configuration editing. Projects whose configuration
-already parses, validates, and contains no placeholders report `ready`;
-unavailable roots report `blocked`.
-
-### Unregister
-
-`DELETE /api/projects/{project_id}` removes only the registry record. It is
-rejected while the project owns an active workflow unit, and it never deletes
-project files or Git history.
-
-## Plans
-
-The app recognizes plan files in:
-
-- `plans/drafts/*.md`
-- `plans/in-progress/*.md`
-
-Draft behavior:
-
-- Saving a draft writes content verbatim to `plans/drafts/<name>.md`.
-- Draft names cannot be empty and cannot contain `/` or `\`.
-- `.md` is added automatically when omitted.
-- Listing drafts returns sorted stems without `.md`.
-- Promoting a draft copies the draft content into `plans/in-progress/<target>.md`.
-- Promotion does not delete the source draft.
-- If no promotion target is supplied, the draft name is reused.
-- Existing target files are overwritten by promotion.
-
-Plan listing parses each plan with AFlow's normal plan parser. Invalid plan files are silently omitted from the plan list rather than shown as broken entries.
-
-The frontend shows a `Save plan draft` action on session turns only when the rendered turn text looks like plan Markdown. The current heuristic requires at least one `# ...` heading and at least one `## ...` heading. Saving from a session uses an automatic name like `plan-YYYY-MM-DDTHH-MM-SS`.
-
-Draft storage and workflow execution remain app-owned project features. They are not owned by, or stored in, a planning provider.
-
-## Planning Sessions
-
-Planning is exposed through a provider-neutral API. Each session is identified by the pair `provider_id` and `provider_session_id`; provider-local ids are never treated as globally unique. Provider discovery reports readiness plus capabilities such as models, reasoning levels and summaries, fork, archive, approvals, interruption, output schemas, and supported attachment kinds. A failed or disabled provider reports bounded status without suppressing healthy providers.
-
-Session collection routes are project-scoped. The server lists provider sessions and keeps only those whose reported working directory belongs to the project's current path or a historical alias. Active and archived sessions are separate views, sorted by `updated_at` with provider-qualified identity as the deterministic tie-breaker. Existing sessions therefore remain discoverable across project moves and across devices.
-
-Starting a session accepts an optional provider id, model, and provider-advertised reasoning level. The configured default provider is used when no provider is supplied. The server supplies the project's current path; session and turn requests do not accept path or execution-policy overrides. Resume and fork similarly use the server-authorized current project path.
-
-Frontend controls are derived from the selected provider's advertised capabilities:
-
-- model and reasoning selectors show provider-advertised values while preserving a historical session model for display;
-- active and archived list modes make both Archive and Unarchive reachable;
-- pending command or file-change approvals can be accepted, declined, or cancelled;
-- an active turn can be interrupted when the provider advertises interruption;
-- file upload controls appear only for advertised `file` or `image` kinds, and failed uploads are not silently submitted with a turn.
-
-Attachments are multipart uploads staged in the shared aflow-managed attachment store and scoped to the exact project/provider/session namespace. A turn references uploaded `attachment_id` values; cross-session, missing, duplicate, deleted, over-count, and over-size references are rejected before provider work starts. Attachments survive archive/unarchive, explicit deletion is blocked while an attachment is leased by an in-flight turn, and the client may list or delete staged items.
-
-Codex is the first concrete provider. Its adapter uses `codex-app-server-sdk` for session lifecycle, turns, models, approvals, interruption, and archive operations. Because the SDK turn helper is text-first, Codex file and image attachments are not presented as native SDK transport: the adapter appends a deterministic, id-sorted manifest containing the staged paths and untrusted metadata to the user's unchanged text.
-
-Sending a turn supports Cmd/Ctrl+Enter. The UI polls the selected session while work is active, refreshes approvals when supported, and treats `completed`, `failed`, and `interrupted` turns as terminal.
-
-## Daemon-backed control plane
-
-The run dashboard, project-scoped REST API, and MCP server delegate to the same
-durable control-plane application and services. The HTTP process does not own
-workflow processes, an in-memory execution map, or a second run database. Each
-served project must be present in `[control_plane].projects`; a request cannot
-supply an arbitrary root, executable, environment file, or plan location.
-Lifecycle REST routes are project-scoped under `/api/control-plane` and carry
-`project_id`; clients do not rely on a cross-project run lookup. The former
-unscoped execution routes no longer exist, and no redirect or compatibility
-alias is provided.
-
-Start requests name one allowlisted project and a safe project-relative plan.
-They may select `workflow_name`, `team`, `start_step`, and `max_turns`. A ready
-start creates one durable run identity and an independent `systemd-run`
-workflow unit. If startup needs an answer, the service returns
-`awaiting_startup_answer` instead; no workflow unit exists before the accepted
-answer. The answer is journaled under the same durable idempotency scope and
-then creates at most one unit.
-
-Writes (`start`, `startup-answer`, `control`, `owner-stop`, and `resume`) accept
-`Idempotency-Key`. Replaying the same request returns its recorded effect;
-reusing a key for different input is rejected. Controls also require an
-`expected_revision` compare-and-swap value. The dashboard renders only controls
-advertised as safe by the server; a restart-required setting is information,
-not a live control. Owner stop is an explicit destructive operation, not a
-generic control flag.
-
-Loss of the client, MCP connection, or SSH transport has no lifecycle effect.
-The daemon service may restart while a workflow unit continues. A failed or
-ambiguous exact workflow unit is reported as `needs_attention` and is never
-automatically restarted; explicit resume creates one linked continuation with a
-new run id. A legacy run without the control-plane manifest is read-only and
-reported as legacy/interrupted rather than guessed into a mutable state.
-
-Read operations return bounded pages, event tails, and context snapshots. The
-authenticated SSE endpoint is
-`/api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`; browser
-code uses `fetch` with its bearer header rather than query-token `EventSource`.
-
-### REST, MCP, and deployment use
-
-`GET /ready` confirms daemon-backed projects after bearer authentication.
-`GET /api/control-plane/capabilities` and the per-project capability endpoint
-provide valid team/worker upgrade chains and the availability of control and
-context features. Project, plan, run, ordered-event, and context reads are
-scoped to the allowlist.
-
-The stateless MCP endpoint is `/mcp`. It exposes the same bounded reads plus
-start, startup-answer, control, owner-stop, and resume tools. MCP write tools
-are configured for explicit client approval; credentials belong only in the
-client bearer-token environment variable, never in a tool argument or URL.
-Keep the bearer in the client's environment or secret storage, use a private
-authenticated URL, and require explicit approval for every write tool.
-
-The MCP server ("AFlow Control Plane", version 1) exposes:
-
-- Read tools: `get_capabilities`, `list_projects`,
-  `get_project_capabilities(project_id)`, `list_plans(project_id, limit,
-  cursor)`, `list_runs(project_id, limit, cursor)`, `get_run(project_id,
-  run_id)`, `get_run_events(project_id, run_id, ...)`,
-  `get_run_context(project_id, run_id, ...)`. Pages are bounded (limit
-  1–1000, default 100) with bounded cursors.
-- Write tools (idempotency-keyed, approval-gated):
-  `start_run(project_id, plan_path, idempotency_key, workflow_name, team,
-  start_step, max_turns)`, `answer_startup(project_id, question_id, answer,
-  idempotency_key)`, `control_run(project_id, run_id, expected_revision,
-  idempotency_key, max_turns, team, role_selectors, unsafe_changes)`,
-  `owner_stop(project_id, run_id, expected_revision, idempotency_key)`,
-  `resume_run(project_id, run_id, idempotency_key)`.
-- Resources: `AFlow project capabilities`, `AFlow run state`,
-  `AFlow lite run context`.
-- Stable error codes: `project_not_found`, `control_plane_unavailable`,
-  `run_not_found`, `idempotency_conflict`, `revision_conflict`,
-  `restart_required`, `operation_forbidden`, `operation_rejected`,
-  `internal_error`.
-
-A client configuration uses `[mcp_servers.aflow_control_plane]` with a private
-`url`, `bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"`, and
-`approval_mode = "approve"` for each write tool. The full surface is also
-documented in the `aflow-assistant` skill reference
-(`references/engine-features.md`, section 15).
-
-Deployment is intentionally not prescribed by this public app guide. A secure
-deployment must use an explicit project allowlist, a private bind address,
-header-only bearer authentication, release-pinned executables, and operator-
-tested readiness, rotation, rollback, and containment procedures. The
-repository's `deploy/aflowd/` directory is a host-specific Linux/systemd
-reference, not a portable installer.
-
-## Audio Transcription
-
-Audio transcription is optional. When transcription is not configured, text input remains functional and `/api/transcribe` returns `503`.
-
-When configured, the transcription client supports OpenAI-compatible Whisper-style APIs. Uploaded audio is written to a temporary file for transcription and deleted afterward.
-
-The frontend records browser audio as `audio/webm` with `MediaRecorder`. The record button is visible even when the server is not configured for transcription; in that case the upload fails with a user-facing "not configured" message. Successful transcription appends the returned text to the composer input.
-
-Configure with:
-
-```bash
-export AFLOW_TRANSCRIPTION_URL="https://api.openai.com/v1"
-export AFLOW_TRANSCRIPTION_TOKEN="your-openai-api-key"
-```
-
-## API Reference
-
-Health:
-
-- `GET /health` - health check, no auth required.
-
-Projects:
+## Project and configuration API
 
 - `GET /api/projects`
-- `POST /api/projects` (create or register; typed fields only)
-- `DELETE /api/projects/{project_id}` (non-destructive unregister)
+- `POST /api/projects`
 - `GET /api/projects/{project_id}`
 - `PATCH /api/projects/{project_id}`
+- `DELETE /api/projects/{project_id}`
+- `GET /api/projects/{project_id}/config`
+- `PUT /api/projects/{project_id}/config`
+- `POST /api/projects/{project_id}/config/validate`
+
+Project creation and registration accept only normalized paths relative to the managed root. Unregister removes the registry record after active-unit checks and never deletes repository files.
+
+Configuration reads return both exact texts, a combined SHA-256 revision, and bounded validation results. Saves require `expected_revision`, validate both candidates through the production loader, and atomically commit or restore the pair. New launches and configuration commits use the same per-project lock.
+
+## Plan API
+
 - `GET /api/projects/{project_id}/plans`
+- `POST /api/projects/{project_id}/plans`
+- `GET /api/projects/{project_id}/plans/{status}/{name}`
+- `PUT /api/projects/{project_id}/plans/{status}/{name}`
+- `POST /api/projects/{project_id}/plans/{status}/{name}/promote`
 
-Planning providers:
+`status` is `todo`, `in_progress`, or `done`; filesystem directories remain `todo`, `in-progress`, and `done`. Creation starts in `todo`. Promotion follows `todo → in_progress → done`. Updates and promotion require the current SHA-256 revision. Each file is UTF-8 Markdown at most 256 KiB. Unsafe names, nesting, links, non-regular files, stale revisions, and occupied move targets are rejected without changing the source bytes.
 
-- `GET /api/planning/providers`
-- `GET /api/planning/providers/{provider_id}/models`
-- `GET /api/planning/providers/{provider_id}/reasoning-options`
+The web client lists all three states, creates and edits plans with revisions, promotes them through the lifecycle, and opens in-progress plans in the run dashboard.
 
-Planning sessions:
+## Run control
 
-- `GET /api/projects/{project_id}/planning/sessions?archived={boolean}`
-- `POST /api/projects/{project_id}/planning/sessions`
-- `GET /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/resume`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/fork`
-- `PATCH /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/archive`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/unarchive`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/turns`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/turns/{turn_id}/interrupt`
-- `GET /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/approvals`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/approvals/{approval_id}`
-- `GET /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/attachments`
-- `POST /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/attachments`
-- `DELETE /api/projects/{project_id}/planning/providers/{provider_id}/sessions/{provider_session_id}/attachments/{attachment_id}`
+The durable control-plane surface remains under `/api/control-plane`. It provides capabilities, plans, runs, event snapshots and streams, bounded context, startup answers, compare-and-swap controls, owner stop, and resume. State-changing retries use the `Idempotency-Key` header.
 
-Plan drafts:
+The `/mcp` streamable HTTP endpoint exposes the same canonical operations and bearer policy. The lightweight `aflow daemon` exposes the shared MCP contract without the web app.
 
-- `GET /api/projects/{project_id}/plans/drafts`
-- `POST /api/projects/{project_id}/plans/drafts`
-- `GET /api/projects/{project_id}/plans/drafts/{name}`
-- `DELETE /api/projects/{project_id}/plans/drafts/{name}`
-- `POST /api/projects/{project_id}/plans/promote`
-- `GET /api/projects/{project_id}/plans/in-progress`
+## Development checks
 
-Daemon control plane:
-
-- `GET /ready`
-- `GET /api/control-plane/capabilities`
-- `GET /api/control-plane/projects`
-- `GET /api/control-plane/projects/{project_id}/capabilities`
-- `GET /api/control-plane/projects/{project_id}/plans`
-- `GET /api/control-plane/projects/{project_id}/runs`
-- `GET /api/control-plane/projects/{project_id}/runs/{run_id}`
-- `GET /api/control-plane/projects/{project_id}/runs/{run_id}/events`
-- `GET /api/control-plane/projects/{project_id}/runs/{run_id}/events/stream`
-- `GET /api/control-plane/projects/{project_id}/runs/{run_id}/context`
-- `POST /api/control-plane/projects/{project_id}/runs`
-- `POST /api/control-plane/projects/{project_id}/startup-answers/{question_id}`
-- `PATCH /api/control-plane/projects/{project_id}/runs/{run_id}/control`
-- `POST /api/control-plane/projects/{project_id}/runs/{run_id}/owner-stop`
-- `POST /api/control-plane/projects/{project_id}/runs/{run_id}/resume`
-
-Transcription:
-
-- `POST /api/transcribe`
-
-Static frontend:
-
-- `GET /`
-- `GET /{path:path}`
-
-Local probe handling:
-
-- `POST /api/plugin/events` returns `204` and is intentionally suppressed from normal access logs. Set `AFLOW_APP_LOG_PLUGIN_PROBES=1` to log one fingerprint per unique probe while debugging.
-
-## Security Notes
-
-- The server requires a bearer token in the `Authorization` header for every
-  functional API and MCP operation. `/health`, static assets, and the inert
-  `/api/plugin/events` probe are the only unauthenticated routes; query
-  credentials and credential-like MCP arguments are rejected.
-- Do not expose the server to the internet without additional security controls.
-- Browser bearer material is never placed in persistent browser storage. It
-  remains in memory for the page lifetime; logout clears it and refresh requires
-  re-entry.
-- Bind to `127.0.0.1` unless you intentionally need private-network access and
-  have matching network and authentication controls.
+```bash
+uv run --project apps/aflow_app/server pytest -q
+npm --prefix apps/aflow_app/web test -- --run
+npm --prefix apps/aflow_app/web run build
+uv run ruff check apps/aflow_app/server/src apps/aflow_app/server/tests
+```

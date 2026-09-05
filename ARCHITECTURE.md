@@ -857,151 +857,44 @@ default `dev` dependency group rather than the installed runtime package.
 
 ## Remote App (Separate Subproject)
 
-The `apps/aflow_app/` directory contains a mobile-first remote management
-application that imports `aflow` as a library. It is not included in the
-published `aworkflow` wheel.
+The optional `apps/aflow_app/` application imports AFlow as a library and is
+excluded from the published wheel. Its FastAPI server and React client expose
+four product areas: registered projects, the canonical configuration pair,
+filesystem plans, and durable workflow runs.
 
-### Server (`apps/aflow_app/server/`)
+The versioned project registry is the sole project authority beneath one
+managed root. `project_service.py` creates, registers, renames, and safely
+unregisters exact Git roots. The server does not discover projects from local
+filesystem scans or agent-client state.
 
-The Python 3.12+ FastAPI server owns project identity, plan drafts, workflow
-execution, and the application-facing planning-session API. Its main boundaries
-are:
+`plan_service.py` resolves each project through that registry and addresses
+only direct regular UTF-8 Markdown files under `plans/todo`,
+`plans/in-progress`, and `plans/done`. It returns SHA-256 revisions, requires an
+expected revision for edits and moves, writes through fsynced temporary files,
+and permits only `todo -> in_progress -> done` promotion. Rejected validation,
+stale edits, and occupied destinations leave the original bytes in place.
+`plan_routes.py` provides the authenticated project-scoped REST adapter. The web
+client uses this same contract for plan creation, editing, promotion, and run
+dashboard launch.
 
-- `main.py` owns application-lifespan state: configuration, the project
-  catalog, one long-lived planning provider registry, the planning service, and
-  the shared attachment store.
-- `project_catalog.py` discovers local projects and associates provider
-  sessions by current working directory and stored historical aliases. Project
-  paths remain server-authoritative.
-- `planning/models.py`, `provider.py`, `registry.py`, and `service.py`
-  define the provider-neutral session, capability, error, lifecycle, and
-  operation contracts. Session identity is always the pair
-  `(provider_id, provider_session_id)`.
-- `planning_routes.py` exposes provider discovery and project-scoped session
-  routes under
-  `/api/projects/{project_id}/planning/providers/{provider_id}/sessions`.
-  The same router retains the existing project plan-draft URLs, which are not
-  provider operations.
-- `planning/providers/codex.py` is the concrete Codex adapter. It uses the
-  public `codex-app-server-sdk` API for session lifecycle, turns, model
-  discovery, archive state, approvals, and interruption. Codex protocol models
-  and errors are normalized before they reach the app boundary.
-- `planning/attachment_store.py` stores uploaded bytes beneath shared
-  aflow-managed configuration storage, outside project repositories. It
-  validates provider-qualified namespaces, limits, containment, and in-flight
-  leases. The Codex adapter supplies staged file/image metadata to turns through
-  deterministic prompt augmentation because the SDK helpers do not provide
-  equivalent native rich-attachment input.
+`project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
+`.aflow/config/workflows.toml` as one validated revisioned pair. Configuration
+reads, commits, capability loads, and launch reservation share one per-project
+lock so a launch cannot freeze a torn or superseded pair.
 
-Provider capabilities drive available models, reasoning values, attachment
-kinds, and optional operations. A provider failure is reported through bounded,
-provider-neutral readiness/error models and does not suppress healthy providers.
-The default execution policy is configured server-side as full access; it is
-not selected by browser requests.
-
-The server also provides repository/project discovery, plan persistence,
-workflow execution through `aflow.api`, SSE execution events, token
-authentication, and optional audio transcription. Configuration is loaded from
-environment variables and `~/.config/aflow/config.toml`.
-
-- `project_config_service.py` owns exactly the two project configuration
-  documents, `.aflow/config/aflow.toml` and `.aflow/config/workflows.toml`,
-  addressed by document name only. Reads resolve the exact registered root,
-  reject symlink/hard-link/non-regular files, oversized text, and invalid
-  UTF-8, and return the exact bytes plus a combined SHA-256 revision and a
-  bounded validation report (state, document/line diagnostics, parsed
-  workflow/team/role names; never prompts, secrets, or filesystem paths).
-- Candidate pairs validate together in a private temporary directory through
-  the production loader, semantic validator, and placeholder detection before
-  any live byte changes. A save enforces compare-and-swap on the combined
-  revision under a per-project write lock, stages and fsyncs both files, and
-  replaces them as one rollback-safe transaction that restores the previous
-  valid bytes if the second replacement fails. Bounded, redacted audit records
-  (project ID, revisions, time, caller scope, outcome) append to server state.
-- Saves are rejected while any control-plane-owned run of that project is
-  nonterminal, awaiting startup input, stopping, `needs_attention`, or still
-  resume-compatible; `failed`/`interrupted` runs block only while the current
-  on-disk configuration still matches their frozen manifest fingerprint, and
-  terminal runs never block. A committed pair reloads future-run capabilities
-  through daemon recomposition without touching durable run state; general
-  config edits affect future runs only, and live changes remain run controls.
-
-### Web Client (`apps/aflow_app/web/`)
-
-The React client uses only provider-neutral project and planning-session
-vocabulary. It supports provider selection, capability-derived model and
-reasoning controls, separate active/archived session lists, resume/fork/archive
-operations, approvals, interruption, attachment upload/delete, plan drafts, and
-workflow execution. React keys and API requests carry `provider_id` and
-`provider_session_id` separately.
-
-### Daemon-backed control plane
-
-There are two transport/lifetime adapters over the same durable control-plane
-application. The lightweight `aflow daemon` CLI owns one project and uses
-`SubprocessUnitManager`: each `daemon-worker` is launched without a shell in a
-new process group, and daemon shutdown terminates and reaps every owned group.
-Stdio MCP runs attached by default; optional streamable HTTP binds to
-`127.0.0.1`. Its atomic mode-0600 pidfile includes process-birth identity, so a
-stale or reused PID cannot authorize a signal. It has no REST or web surface.
-
-The 13 MCP tools and three resource templates are registered in
-`aflow.mcp_control_plane`. The remote app's `mcp_adapter` is a compatibility
-wrapper that adds app-specific safe error mappings. Its FastAPI `/mcp` mount
-retains the server-owned header bearer check; registry sharing does not move
-authorization into a client or URL.
-
-The systemd-backed remote control plane separates durable workflow ownership
-from its browser REST, UI, and MCP transports. Browser lifecycle REST uses only
-project-scoped `/api/control-plane/projects/{project_id}/...` routes. REST and
-MCP delegate to the same durable control-plane application and services;
-neither transport infers a project by scanning daemons. `aflowd.service` runs
-the release-pinned remote-app server on its configured private bind address. Its
-`ControlPlaneService` owns one versioned project registry beneath operator
-state and calls the AFlow daemon for every lifecycle operation. Registry roots
-are relative to one canonical managed-projects directory; exact containment,
-non-symlink Git roots, and non-overlap are validated before daemon composition.
-The service lazily creates and caches one daemon per registered project from
-shared release inputs and that project's `.aflow/config/aflow.toml`. Registry
-changes are visible without a server restart, while an unhealthy project's
-bounded readiness error does not hide healthy peers. The transport layer
-neither launches subprocesses nor reads or writes `.aflow` artifacts directly.
+The REST control-plane routes and `/mcp` mount delegate to the same durable
+`ControlPlaneService`. The HTTP layer does not own workflow processes. Bearer
+credentials are accepted only in headers, while project roots and executable
+inputs remain server-owned. The remote application has no agent-provider client;
+provider selection occurs only through configured engine harness profiles.
 
 ```text
-Browser UI / REST client / MCP client
-                |  bearer header; write approval for MCP
-                v
-aflowd.service (one immutable /opt/aflowd/releases/<commit>)
-                |  exact dynamic registry record only
-                v
-AFlow daemon -> launch manifest / ordered events / revisioned overrides
-                |                         |
-                v                         v
-independent systemd-run workflow    existing .aflow/runs/<run-id>
+browser -> authenticated project/config/plan routes -> exact project registry
+       \-> authenticated run REST or MCP -----------> control-plane service
+                                                       |
+                                                       v
+                                              durable project daemon
 ```
-
-`aflowd` has `Restart=always`; workflow units have `Restart=no` and retain an
-absolute executable from the release selected at launch. A daemon restart,
-client disconnect, or SSH disconnect therefore cannot restart or stop a
-workflow. Reconciliation is observational: a missing, failed, or ambiguously
-collected exact unit becomes `needs_attention`, never completion evidence or an
-automatic restart. A user must explicitly resume an eligible non-legacy run,
-which creates a linked continuation with a distinct run id. Owner stop is a
-separate, durably recorded terminal operation.
-
-Starts, startup answers, controls, owner stops, and resumes are scoped by
-idempotency evidence. Mutable controls also require an `expected_revision`
-compare-and-swap value. A startup question leaves the launch manifest in
-`awaiting_startup_answer` and creates no workflow unit until an accepted,
-idempotent answer. Older runs without control-plane manifests remain readable
-as legacy/interrupted data but cannot be mutated or resumed through this API.
-
-The repository's environment-specific Linux deployment example stages a Git
-commit under `/opt/aflowd/releases/<commit>`, validates release entrypoint
-hashes and a mode-0600 token environment file, switches the `current` symlink
-atomically, then performs authenticated readiness. A failed readiness check
-restores the previous service and release target. It is an operator reference,
-not a portable installer or part of the public package setup path.
 
 ### Live worker hotplug boundary
 

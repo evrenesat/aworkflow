@@ -31,7 +31,7 @@ export function ProjectPicker({ selectedProjectId, onSelectProject }: ProjectPic
     }
   }
 
-  async function handleSaveProject(projectId: string, request: { display_name: string; current_path: string }) {
+  async function handleSaveProject(projectId: string, request: { display_name: string }) {
     const updated = await api.updateProject(projectId, request)
     setProjects((prev) => prev.map((project) => (project.id === projectId ? updated : project)))
     setEditingProjectId(null)
@@ -53,7 +53,7 @@ export function ProjectPicker({ selectedProjectId, onSelectProject }: ProjectPic
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 'var(--spacing-md)', minWidth: 0 }}>
         <div>
           <h2 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Projects</h2>
-          <div className="text-sm text-dim">Detected under your configured projects root and from planning sessions.</div>
+          <div className="text-sm text-dim">Explicitly registered beneath the managed projects root.</div>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={() => void loadProjects()}>
           Refresh
@@ -64,7 +64,7 @@ export function ProjectPicker({ selectedProjectId, onSelectProject }: ProjectPic
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-sm)', minHeight: 0, flex: 1, overflowY: 'auto', paddingRight: 'var(--spacing-xs)' }}>
         {projects.length === 0 ? (
-          <div className="card text-dim text-sm">No projects found under the configured projects root.</div>
+          <div className="card text-dim text-sm">No registered projects.</div>
         ) : (
           projects.map((project) => {
             const isSelected = selectedProjectId === project.id
@@ -86,13 +86,9 @@ export function ProjectPicker({ selectedProjectId, onSelectProject }: ProjectPic
                 >
                   <div className="content-button-row">
                     <div style={{ fontWeight: 600, overflowWrap: 'anywhere', wordBreak: 'break-word', minWidth: 0 }}>{project.display_name}</div>
-                    <span className="text-xs text-dim">{project.linked_session_count} sessions</span>
                   </div>
                   <div className="text-sm text-dim" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
                     {project.current_path}
-                  </div>
-                  <div className="text-xs text-dim" style={{ marginTop: 'var(--spacing-xs)', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-                    {project.detection_source}
                   </div>
                 </button>
 
