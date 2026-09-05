@@ -273,6 +273,31 @@ def test_turn_record_finalization_fields_appear_in_records() -> None:
     assert "artifact=.aflow/runs/r/turns/0003/stdout.txt" in record
 
 
+def test_failed_turn_final_record_preserves_untruncated_stderr_artifact() -> None:
+    state = _basic_state()
+    state.status_message = "failed"
+    state.end_reason = "harness-failed"
+    stderr_path = ".aflow/runs/failure-run/" + "deep/" * 40 + "turns/0001/stderr.txt"
+    state.turn_history.append(TurnRecord(
+        turn_number=1,
+        step_name="implement",
+        resolved_harness_name="reasonix",
+        resolved_model_display="reasonix / flash",
+        outcome="harness-failed",
+        stderr_artifact_path=stderr_path,
+    ))
+    stream = io.StringIO()
+    renderer = _renderer(stream)
+    renderer.start(state)
+    renderer.stop(state)
+
+    final_record = _records(stream)[-1]
+    assert "event=final" in final_record
+    assert "outcome=harness-failed" in final_record
+    assert f"stderr_artifact={stderr_path}" in final_record
+    assert " artifact=" not in final_record
+
+
 def test_control_bytes_flattened_and_unicode_content_remains_readable() -> None:
     state = _basic_state()
     state.status_message = "running 中文 ✓\nnext\x1b[31mred\x1b[0m line\r\nend"

@@ -86,6 +86,11 @@
   tests cover validation, concurrency, lockout, rollback, and capability
   reload.
 
+## 2026-09-06 - Preserve failed-turn logs in plain output
+
+- Emit the complete stderr artifact path in final plain status records, including
+  failures with no stdout artifact. Added a failed-turn regression with a long path.
+
 ## 2026-09-05 — Plain append-only CLI status output
 
 - Replaced the Rich live dashboard, alternate-screen viewport, and cbreak

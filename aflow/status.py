@@ -488,6 +488,12 @@ class BannerRenderer:
                 last_turn.stdout_artifact_path,
                 limit=None,
             ))
+        if last_turn is not None and last_turn.stderr_artifact_path is not None:
+            add(_record_field(
+                "stderr_artifact",
+                last_turn.stderr_artifact_path,
+                limit=None,
+            ))
         if state.issues_summary_path is not None:
             add(_record_field("issues", state.issues_summary_path, limit=None))
 
