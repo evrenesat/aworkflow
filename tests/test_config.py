@@ -1,7 +1,12 @@
 from tests._support import *  # noqa: F401,F403
 from aflow.workflow import resolve_role_prompt
 from aflow.run_state import load_override_request
-from aflow.config import bootstrap_project_config, find_placeholders, project_configuration_state
+from aflow.config import (
+    bootstrap_project_config,
+    find_placeholders,
+    project_configuration_state,
+    render_starter_documents,
+)
 
 
 def test_daemon_config_defaults_and_valid_overrides(tmp_path: Path) -> None:
@@ -1490,3 +1495,53 @@ class TestBootstrapProjectConfig:
                 encoding="utf-8",
             )
             assert project_configuration_state(config_path) == "ready"
+
+
+class TestRenderStarterDocuments:
+    """Pure starter rendering shares bootstrap's exact bytes and behavior."""
+
+    def test_render_matches_bootstrap_bytes_for_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            rendered_aflow, rendered_workflows = render_starter_documents()
+            assert rendered_aflow == (config_path).read_text(encoding="utf-8")
+            assert rendered_workflows == (
+                Path(tmpdir) / "workflows.toml"
+            ).read_text(encoding="utf-8")
+
+    def test_render_matches_bootstrap_bytes_for_explicit_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(
+                config_path,
+                initial_workflow="build",
+                initial_team="crew",
+                main_branch="trunk",
+            )
+            rendered_aflow, rendered_workflows = render_starter_documents(
+                "build", "crew", "trunk"
+            )
+            assert rendered_aflow == config_path.read_text(encoding="utf-8")
+            assert rendered_workflows == (
+                Path(tmpdir) / "workflows.toml"
+            ).read_text(encoding="utf-8")
+
+    def test_render_is_pure_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            before = set(os.listdir(tmpdir))
+            rendered_aflow, rendered_workflows = render_starter_documents(
+                "solo", None, "release"
+            )
+            assert set(os.listdir(tmpdir)) == before
+        assert rendered_aflow.startswith("# Provider-neutral starter")
+        assert "solo" in rendered_aflow
+        assert 'main_branch = "release"' in rendered_workflows
+
+    def test_render_validates_inputs_like_bootstrap(self) -> None:
+        with pytest.raises(ConfigError, match="valid Git branch name"):
+            render_starter_documents(main_branch="-evil")
+        with pytest.raises(ConfigError, match="workflow-safe name"):
+            render_starter_documents(initial_workflow="../escape")
+        with pytest.raises(ConfigError, match="workflow-safe name"):
+            render_starter_documents(initial_team="bad name")

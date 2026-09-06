@@ -774,3 +774,8 @@
 ### 2026-09-06 — Report applied live turn limits
 
 - HTTPS browser verification found that status retained the initial turn limit after a safe override. Control-plane projections now use the engine-recorded effective limit; pending override writes alone do not change the reported value.
+
+## 2026-09-06: Combine guided settings with rolling login
+
+- Integrated approved guided configuration backend e59721c with deployed browser login 6076caf. Retained both session routes and guided-form routes when resolving their shared insertion point.
+- Verified the combined server suite (204 passed), engine configuration tests (135 passed, 7 subtests), and Ruff. UI and deployment automation integration remain pending.

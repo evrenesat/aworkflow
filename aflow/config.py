@@ -1161,30 +1161,23 @@ def validate_starter_main_branch(branch: str) -> str:
     return branch
 
 
-def bootstrap_project_config(
-    config_path: Path | str | None = None,
-    *,
+def render_starter_documents(
     initial_workflow: str | None = None,
     initial_team: str | None = None,
     main_branch: str = STARTER_DEFAULT_MAIN_BRANCH,
-) -> tuple[Path, Path]:
-    """Write the provider-neutral project starter configuration pair.
+) -> tuple[str, str]:
+    """Purely render the provider-neutral starter configuration pair.
 
-    The starter records the chosen initial workflow as ``aflow.default_workflow``
-    and, when given, the named initial team on the starter workflow definition.
-    ``main_branch`` names the repository trunk the workflow lifecycle targets and
-    defaults to ``main`` for compatibility. It never selects a real harness
-    provider: the placeholder profile keeps the project
-    ``configuration_required`` until explicit selectors are configured.
-    Existing documents are never overwritten, and both documents are validated
-    through the production loader before the write is left in place.
+    Returns the exact ``aflow.toml`` and ``workflows.toml`` template texts for
+    an explicit initial workflow, optional initial team, and validated
+    ``main_branch``. This helper never touches the filesystem; writing remains
+    the sole responsibility of :func:`bootstrap_project_config`.
     """
     validate_starter_main_branch(main_branch)
     if initial_workflow is not None:
         validate_starter_name(initial_workflow)
     if initial_team is not None:
         validate_starter_name(initial_team)
-    path = Path(config_path) if config_path is not None else _config_path()
     workflow_name = initial_workflow or STARTER_DEFAULT_WORKFLOW
     aflow_text = (
         resources.files("aflow")
@@ -1205,6 +1198,31 @@ def bootstrap_project_config(
         .replace(_STARTER_MAIN_BRANCH_SENTINEL, main_branch)
         .replace(_STARTER_WORKFLOW_SENTINEL, workflow_name)
         .replace(_STARTER_TEAM_SENTINEL + "\n", team_line)
+    )
+    return aflow_text, workflows_text
+
+
+def bootstrap_project_config(
+    config_path: Path | str | None = None,
+    *,
+    initial_workflow: str | None = None,
+    initial_team: str | None = None,
+    main_branch: str = STARTER_DEFAULT_MAIN_BRANCH,
+) -> tuple[Path, Path]:
+    """Write the provider-neutral project starter configuration pair.
+
+    The starter records the chosen initial workflow as ``aflow.default_workflow``
+    and, when given, the named initial team on the starter workflow definition.
+    ``main_branch`` names the repository trunk the workflow lifecycle targets and
+    defaults to ``main`` for compatibility. It never selects a real harness
+    provider: the placeholder profile keeps the project
+    ``configuration_required`` until explicit selectors are configured.
+    Existing documents are never overwritten, and both documents are validated
+    through the production loader before the write is left in place.
+    """
+    path = Path(config_path) if config_path is not None else _config_path()
+    aflow_text, workflows_text = render_starter_documents(
+        initial_workflow, initial_team, main_branch
     )
     workflows_path = path.with_name("workflows.toml")
     if path.exists() or workflows_path.exists():
