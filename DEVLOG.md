@@ -779,3 +779,17 @@
 
 - Integrated approved guided configuration backend e59721c with deployed browser login 6076caf. Retained both session routes and guided-form routes when resolving their shared insertion point.
 - Verified the combined server suite (204 passed), engine configuration tests (135 passed, 7 subtests), and Ruff. UI and deployment automation integration remain pending.
+
+### 2026-09-06 — Dashboard changes participate in CI
+
+- CI gained a required Ubuntu dashboard job (Python 3.12, Node 22 with npm cache
+  keyed to the web lockfile) so main's success also covers the shipped app server
+  and web UI.
+- The job runs the server's frozen dev sync and full pytest suite, then npm ci,
+  the full vitest suite, and the production web build in their project
+  directories; it runs for PRs, main pushes, and reusable workflow calls.
+- Existing engine test matrix and package build job are unchanged; no publishing
+  trigger or credentials were added.
+- Local verification baseline: server `uv run pytest -q` 163 passed (3 known
+  deprecation warnings); web tests 87 passed with known React `act(...)` stderr
+  notices; `npm run build` and `git diff --check` clean.

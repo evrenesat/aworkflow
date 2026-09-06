@@ -51,6 +51,49 @@ jobs:
       - name: Compile Python sources
         run: uv run python -m compileall -q aflow apps/aflow_app/server/src
 
+  dashboard:
+    name: Dashboard (server, web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/aflow_app/web/package-lock.json
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install server dependencies
+        working-directory: apps/aflow_app/server
+        run: uv sync --frozen --group dev
+
+      - name: Run server tests
+        working-directory: apps/aflow_app/server
+        run: uv run pytest -q
+
+      - name: Install web dependencies
+        working-directory: apps/aflow_app/web
+        run: npm ci
+
+      - name: Run web tests
+        working-directory: apps/aflow_app/web
+        run: npm test -- --run
+
+      - name: Build web app
+        working-directory: apps/aflow_app/web
+        run: npm run build
+
   build:
     name: Build package
     needs: test
