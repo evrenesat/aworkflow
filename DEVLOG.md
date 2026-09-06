@@ -1,3 +1,5 @@
+# DEVLOG
+
 ## 2026-09-06 — Remove remote agent planning and retain plan management
 
 - Removed the remote provider client, interactive planning surface, and its
@@ -40,7 +42,6 @@
   last sequence, deduplicates replay, refreshes canonical status once on
   reconnect, and never maps a network failure to a run transition.
 
-# DEVLOG
 
 ## 2026-09-06 - Retain uncertain successor recovery across navigation
 
@@ -163,6 +164,20 @@
   state transitions are unchanged. The `BannerRenderer` name is retained
   because workflow call sites and the `banner_files_limit` config option are
   unchanged; the implementation is the single plain renderer.
+
+## 2026-09-06 — Native ZCode harness adapter
+
+- Registered ZCode for noninteractive workflow turns with explicit workspace,
+  yolo mode, plaintext final output, and literal prompt arguments.
+- ZCode 0.16.5 has no per-invocation model/effort flag. Empty AFlow profiles use
+  ZCode's own project configuration; unsupported overrides fail validation and
+  direct invocation construction rather than silently selecting another model.
+- Verified the public runner with a fixture CLI, configuration rejection,
+  literal prompt arguments, and recorded turn identity. Full suite: 1,403 tests
+  plus 216 subtests; production Ruff, compilation, and wheel/sdist build pass.
+  This does not claim a paid live provider or model-selection test.
+- Provider usage accounting and the delegation benchmark remain separate work.
+
 
 ## 2026-09-02 — Manager context references and prompt budget
 

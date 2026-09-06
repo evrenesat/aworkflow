@@ -397,3 +397,31 @@ revisioned pair under the project .aflow/config directory:
   rollback handling, appends redacted revision metadata to server state, and
   reloads capabilities for future runs. Existing workflow units and run
   records retain their current configuration and controls.
+
+
+## ZCode profiles
+
+Install and authenticate the native ZCode CLI first. Configure the desired
+provider, model, and reasoning in ZCode itself, for example in the execution
+repository's .zcode/config.json. AFlow does not create or overwrite that file
+or copy credentials. Ensure this configuration is available in the actual
+execution worktree when using a Git lifecycle.
+
+Use an empty profile and select it for the worker role:
+
+```toml
+[harness.zcode.profiles.default]
+# ZCode owns the model and reasoning settings.
+
+[roles]
+worker = "zcode.default"
+```
+
+Omit model and effort from the AFlow profile: the verified 0.16.5 CLI exposes
+no per-call overrides for either setting. AFlow rejects unsupported overrides
+instead of silently selecting another model.
+
+The adapter invokes zcode with --cwd, --mode yolo, --no-color, and --prompt.
+It captures plain final output and does not open the interactive TUI. It does
+not claim native session resume, usage accounting, or model identity beyond
+the selected ZCode configuration. Keep secrets out of tracked project config.

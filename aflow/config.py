@@ -1263,6 +1263,15 @@ def validate_workflow_config(
     config: WorkflowUserConfig,
 ) -> list[str]:
     errors: list[str] = []
+    zcode = config.harnesses.get("zcode")
+    if zcode is not None:
+        for profile_name, profile in zcode.profiles.items():
+            if profile.model is not None or profile.effort is not None:
+                errors.append(
+                    f"harness.zcode.profiles.{profile_name}: configure model and "
+                    "reasoning in ZCode's project configuration; AFlow model/effort "
+                    "overrides are not supported by the ZCode CLI"
+                )
     if config.aflow.default_workflow is not None:
         if config.aflow.default_workflow not in config.workflows:
             errors.append(

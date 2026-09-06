@@ -512,7 +512,7 @@ The condition evaluator is a full recursive-descent parser supporting `&&`, `||`
 Prompt templates support `file://` references (absolute, config-relative, or cwd-relative).
 
 ### `harnesses/`
-Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Nine adapters:
+Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to produce a `HarnessInvocation` (argv, env, prompt texts). Ten adapters:
 
 | Harness    | CLI binary  | Prompt mode                    | Effort support |
 |------------|-------------|--------------------------------|----------------|
@@ -525,6 +525,12 @@ Adapter layer. Each harness implements `HarnessAdapter.build_invocation()` to pr
 | `opencode` | `opencode`  | system prefixed into user prompt | No           |
 | `reasonix` | `reasonix`  | system prefixed into user prompt | Yes          |
 | `pi`       | `pi`        | `--system-prompt` flag         | Yes            |
+| `zcode`    | `zcode`     | system prefixed into user prompt | No           |
+
+ZCode runs with an explicit workspace, yolo mode, no color, and a literal
+prompt argument. It uses ZCode's own model/reasoning configuration. AFlow
+profile model/effort overrides are rejected rather than silently ignored.
+The adapter does not modify provider configuration or claim native resume.
 
 All harnesses run in non-interactive, auto-approve mode with full tool access.
 Most adapters deliver effective prompts through argv or explicit prompt flags,

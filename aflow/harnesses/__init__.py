@@ -10,6 +10,7 @@ from .muse import MuseAdapter
 from .opencode import OpencodeAdapter
 from .pi import PiAdapter
 from .reasonix import ReasonixAdapter
+from .zcode import ZcodeAdapter
 
 
 ADAPTERS: dict[str, HarnessAdapter] = {
@@ -22,6 +23,7 @@ ADAPTERS: dict[str, HarnessAdapter] = {
     "opencode": OpencodeAdapter(),
     "pi": PiAdapter(),
     "reasonix": ReasonixAdapter(),
+    "zcode": ZcodeAdapter(),
 }
 
 __all__ = ["ADAPTERS", "HarnessAdapter", "HarnessInvocation", "get_adapter"]
