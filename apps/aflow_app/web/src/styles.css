@@ -300,6 +300,49 @@ a {
   flex-wrap: wrap;
 }
 
+.header-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.run-progress-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.run-progress-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-lg);
+  margin: 0;
+}
+
+.run-progress-strip div {
+  min-width: 0;
+}
+
+.run-progress-strip dt {
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+}
+
+.run-progress-strip dd {
+  margin: var(--spacing-xs) 0 0;
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.run-technical-details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--spacing-md);
+}
+
 .run-dashboard h2,
 .run-dashboard h3,
 .run-dashboard h4,

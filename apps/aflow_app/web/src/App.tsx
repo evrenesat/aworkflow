@@ -6,10 +6,17 @@ import { ProjectPicker } from './components/ProjectPicker'
 import { ProjectOverview } from './components/ProjectOverview'
 import { ConfigEditor } from './components/ConfigEditor'
 import { PlanPanel } from './components/PlanPanel'
-import { RunDashboard, type PendingSuccessorStart } from './components/RunDashboard'
+import { RunDashboard, type PendingSuccessorStart, type RunSelectionChange } from './components/RunDashboard'
 import * as api from './api'
+import {
+  normalizeWorkspaceQuery,
+  parseWorkspaceQuery,
+  sameWorkspaceQuery,
+  workspaceHref,
+  type WorkspaceQuery,
+} from './urlState'
 
-type View = 'projects' | 'overview' | 'settings' | 'plans' | 'runs'
+type View = WorkspaceQuery['view']
 
 type ProjectView = 'overview' | 'settings' | 'plans' | 'runs'
 
@@ -33,6 +40,10 @@ const readinessGuidance: Record<string, string> = {
     + 'Fix the directory (a valid Git commit HEAD is required), then re-check the project.',
 }
 
+function initialWorkspaceQuery(): WorkspaceQuery {
+  return normalizeWorkspaceQuery(parseWorkspaceQuery(window.location.search))
+}
+
 export function App() {
   const [authGate, setAuthGate] = useState<AuthGate>('checking')
   const [restoreAttempt, setRestoreAttempt] = useState(0)
@@ -44,15 +55,20 @@ export function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([])
   const [projectsLoading, setProjectsLoading] = useState(true)
   const [projectsError, setProjectsError] = useState<string | null>(null)
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
-  const [view, setView] = useState<View>('projects')
+  const [query, setQuery] = useState<WorkspaceQuery>(initialWorkspaceQuery)
+  const [staleLinkTarget, setStaleLinkTarget] = useState<string | null>(null)
   const [configDirty, setConfigDirty] = useState(false)
   const [planDirty, setPlanDirty] = useState(false)
-  const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void } | null>(null)
+  const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void; onCancel?: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
   const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
   // Bumped on logout so late responses cannot restore signed-in UI.
   const authEpoch = useRef(0)
+
+  const queryRef = useRef(query)
+  queryRef.current = query
+  const dirtyRef = useRef(false)
+  dirtyRef.current = configDirty || planDirty
 
   // On load, ask the server whether the browser session cookie is still
   // valid. Only a definitive 401 shows Login; a network/server failure
@@ -132,6 +148,70 @@ export function App() {
     if (authGate === 'signedIn') void loadProjects()
   }, [authGate, loadProjects])
 
+  /**
+   * Applies the next workspace query to state and the browser history entry.
+   * User navigation pushes a history entry; validation fixes and passive
+   * selection/status syncs replace, so refreshes never flood the stack.
+   */
+  const applyQuery = useCallback((next: WorkspaceQuery, mode: 'push' | 'replace') => {
+    const href = workspaceHref(next)
+    const stateMatches = sameWorkspaceQuery(queryRef.current, next)
+    const urlMatches = window.location.search === href && window.location.hash === ''
+    if (stateMatches && urlMatches) return
+    if (!urlMatches) {
+      const url = `${window.location.pathname}${href}`
+      if (mode === 'push') window.history.pushState(null, '', url)
+      else window.history.replaceState(null, '', url)
+    }
+    if (!stateMatches) setQuery(next)
+  }, [])
+
+  // Browser back/forward is navigation like any other: it passes the same
+  // unsaved-edits guard, and cancelling restores the prior visible URL.
+  useEffect(() => {
+    const onPopState = () => {
+      const target = normalizeWorkspaceQuery(parseWorkspaceQuery(window.location.search))
+      const current = queryRef.current
+      if (sameWorkspaceQuery(target, current)) return
+      const apply = () => applyQuery(target, 'replace')
+      if (dirtyRef.current) {
+        setPendingAction({
+          description: 'follow the browser navigation',
+          run: apply,
+          onCancel: () => {
+            window.history.pushState(null, '', `${window.location.pathname}${workspaceHref(current)}`)
+          },
+        })
+      } else {
+        apply()
+      }
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [applyQuery])
+
+  // After the registry fetch the public identifiers are validated: the
+  // registered project id is the sole project authority. An unknown project
+  // clears the scoped link with guidance instead of a substitute; a missing
+  // or unknown view normalizes to Overview; run ids are validated inside the
+  // Runs dashboard through the project-scoped direct run endpoint.
+  useEffect(() => {
+    if (authGate !== 'signedIn' || projectsLoading || projectsError) return
+    if (query.project === null) {
+      applyQuery({ project: null, view: 'projects', run: null }, 'replace')
+      return
+    }
+    if (!projects.some((project) => project.id === query.project)) {
+      setStaleLinkTarget(query.project)
+      applyQuery({ project: null, view: 'projects', run: null }, 'replace')
+      return
+    }
+    setStaleLinkTarget(null)
+    // Rewrite the address to the concrete workspace state (a missing or
+    // unknown view becomes overview; stray parameters are dropped).
+    applyQuery(query, 'replace')
+  }, [applyQuery, authGate, projects, projectsError, projectsLoading, query])
+
   async function handleLogin() {
     const token = loginDraft.trim()
     if (!token || loginPending) return
@@ -157,8 +237,8 @@ export function App() {
   function resetWorkspace() {
     setProjects([])
     setProjectsError(null)
-    setSelectedProjectId(null)
-    setView('projects')
+    setStaleLinkTarget(null)
+    applyQuery({ project: null, view: 'projects', run: null }, 'replace')
     setConfigDirty(false)
     setPlanDirty(false)
     setPendingAction(null)
@@ -195,8 +275,8 @@ export function App() {
    * Guards navigation away from unsaved editor text: the requested
    * action only runs after an explicit confirmation.
    */
-  function requestGuarded(description: string, run: () => void) {
-    if (configDirty || planDirty) setPendingAction({ description, run })
+  function requestGuarded(description: string, run: () => void, onCancel?: () => void) {
+    if (configDirty || planDirty) setPendingAction({ description, run, onCancel })
     else run()
   }
 
@@ -208,17 +288,24 @@ export function App() {
     setPendingAction(null)
   }
 
+  /** Stays in the current view; restores the URL the visible state came from. */
+  function cancelPendingAction() {
+    if (!pendingAction) return
+    const onCancel = pendingAction.onCancel
+    setPendingAction(null)
+    onCancel?.()
+  }
+
   function switchView(next: View) {
-    if (next === view) return
+    if (next === query.view) return
     if (NAV_ITEMS.find((item) => item.view === next)?.needsProject && !selectedProject) return
-    requestGuarded(`leave the editor for ${next}`, () => setView(next))
+    requestGuarded(`leave the editor for ${next}`, () => applyQuery({ ...queryRef.current, view: next, run: null }, 'push'))
   }
 
   function openProject(project: ProjectInfo) {
     requestGuarded(`open ${project.display_name} with unsaved edits`, () => {
-      setSelectedProjectId(project.id)
       setRunDashboardPlanPath(null)
-      setView('overview')
+      applyQuery({ project: project.id, view: 'overview', run: null }, 'push')
     })
   }
 
@@ -236,8 +323,7 @@ export function App() {
     }
     setProjects((current) => [...current.filter((project) => project.id !== created.id), createdProject])
     if (authEpoch.current !== epoch) return created
-    setSelectedProjectId(created.id)
-    setView(created.readiness === 'ready' ? 'plans' : 'settings')
+    applyQuery({ project: created.id, view: created.readiness === 'ready' ? 'plans' : 'settings', run: null }, 'push')
     try {
       const refreshed = await api.listProjects()
       if (authEpoch.current !== epoch) return created
@@ -256,14 +342,14 @@ export function App() {
 
   async function handleUnregister(projectId: string) {
     await api.unregisterProject(projectId)
-    if (selectedProjectId === projectId) {
-      setSelectedProjectId(null)
-      setView('projects')
+    if (queryRef.current.project === projectId) {
+      applyQuery({ project: null, view: 'projects', run: null }, 'replace')
     }
     await loadProjects()
   }
 
-  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
+  const selectedProject = projects.find((project) => project.id === query.project) ?? null
+  const view = query.view
 
   const handleConfigDirty = useCallback((dirty: boolean) => setConfigDirty(dirty), [])
   const handlePlanDirty = useCallback((dirty: boolean) => setPlanDirty(dirty), [])
@@ -279,15 +365,24 @@ export function App() {
     setProjects((current) => current.map((project) => (
       project.id === saved.project_id ? { ...project, readiness: 'ready' } : project
     )))
-    setView('plans')
-  }, [])
+    applyQuery({ ...queryRef.current, view: 'plans', run: null }, 'push')
+  }, [applyQuery])
 
   function handleOpenRunDashboard(planPath: string) {
     requestGuarded('leave the plan editor for the run dashboard', () => {
       setRunDashboardPlanPath(planPath)
-      setView('runs')
+      applyQuery({ ...queryRef.current, view: 'runs', run: null }, 'push')
     })
   }
+
+  /** Run selection reports from the dashboard become passive replaces or user pushes. */
+  const handleRunSelectionChange = useCallback((change: RunSelectionChange) => {
+    const current = queryRef.current
+    if (current.view !== 'runs') return
+    if (change.userInitiated) applyQuery({ ...current, run: change.runId }, 'push')
+    else if (change.missingRunId) applyQuery({ ...current, run: null }, 'replace')
+    else applyQuery({ ...current, run: change.runId }, 'replace')
+  }, [applyQuery])
 
   if (authGate !== 'signedIn') {
     return (
@@ -388,7 +483,7 @@ export function App() {
           </div>
           <button
             className="btn btn-secondary btn-sm"
-            onClick={() => requestGuarded('return to the project list', () => setView('projects'))}
+            onClick={() => requestGuarded('return to the project list', () => applyQuery({ ...queryRef.current, project: null, view: 'projects', run: null }, 'push'))}
           >
             Change project
           </button>
@@ -405,12 +500,11 @@ export function App() {
         </div>
       )}
 
-      {pendingSuccessorStart && (view !== 'runs' || selectedProjectId !== pendingSuccessorStart.projectId) && (
+      {pendingSuccessorStart && (view !== 'runs' || query.project !== pendingSuccessorStart.projectId) && (
         <div className="notice" role="status">
           A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
           <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
-            setSelectedProjectId(pendingSuccessorStart.projectId)
-            setView('runs')
+            applyQuery({ project: pendingSuccessorStart.projectId, view: 'runs', run: null }, 'push')
           })}>Resolve pending successor</button>
         </div>
       )}
@@ -422,12 +516,19 @@ export function App() {
           </span>
           <div className="dashboard-actions">
             <button className="btn btn-danger btn-sm" onClick={confirmPendingAction}>Leave anyway</button>
-            <button className="btn btn-secondary btn-sm" onClick={() => setPendingAction(null)}>Stay</button>
+            <button className="btn btn-secondary btn-sm" onClick={cancelPendingAction}>Stay</button>
           </div>
         </div>
       )}
 
       <main className="workspace-main">
+        {staleLinkTarget && view === 'projects' && (
+          <div className="notice" role="alert">
+            The link pointed to project <span className="mono">{staleLinkTarget}</span>, which is not in the
+            registered project list. Its scoped link was cleared — open or add the project below.
+          </div>
+        )}
+
         {view === 'projects' && !selectedProject && (
           <p className="text-xs text-dim no-project-hint" role="note">
             Overview, Settings, Plans, and Runs become available after you open a project below.
@@ -437,7 +538,7 @@ export function App() {
         {view === 'projects' && (
           <ProjectPicker
             projects={projects}
-            selectedProjectId={selectedProjectId}
+            selectedProjectId={query.project}
             loading={projectsLoading}
             error={projectsError}
             onSelectProject={openProject}
@@ -447,7 +548,14 @@ export function App() {
           />
         )}
 
-        {view !== 'projects' && !selectedProject && (
+        {view !== 'projects' && !selectedProject && query.project !== null && projectsLoading && (
+          <div className="card choose-project-state">
+            <div className="spinner" />
+            <p className="text-sm text-dim">Opening the linked project…</p>
+          </div>
+        )}
+
+        {view !== 'projects' && !selectedProject && !(query.project !== null && projectsLoading) && (
           <div className="card choose-project-state">
             <h2 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Choose a project first</h2>
             <p className="text-sm text-dim">
@@ -455,7 +563,7 @@ export function App() {
               project list to continue.
             </p>
             <div className="dashboard-actions">
-              <button className="btn btn-primary btn-sm" onClick={() => setView('projects')}>
+              <button className="btn btn-primary btn-sm" onClick={() => applyQuery({ project: null, view: 'projects', run: null }, 'push')}>
                 Go to Projects
               </button>
             </div>
@@ -489,6 +597,8 @@ export function App() {
               <RunDashboard
                 key={selectedProject.id}
                 projectId={selectedProject.id}
+                requestedRunId={query.run}
+                onRunSelectionChange={handleRunSelectionChange}
                 initialPlanPath={runDashboardPlanPath}
                 onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
                 pendingSuccessorStart={pendingSuccessorStart}

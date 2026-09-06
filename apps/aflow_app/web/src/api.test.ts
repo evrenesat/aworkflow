@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from './api'
-import { consumeActivityMarker, markUserActivity, resetActivityMarker } from './activity'
+import { markUserActivity, resetActivityMarker } from './activity'
 
 function mockOkJson<T>(value: T, status = 200) {
   vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status, json: async () => value } as Response)

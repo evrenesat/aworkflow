@@ -16,6 +16,7 @@ import type {
 import { ApiError } from '../api'
 import * as api from '../api'
 import { Combobox } from './Combobox'
+import { workspaceHref } from '../urlState'
 
 const MAX_TIMELINE_EVENTS = 100
 /** Bounded wait for exact source inactivity before a successor start. */
@@ -27,9 +28,26 @@ const MAX_EXTRA_INSTRUCTION_ITEMS = 8
 const MAX_EXTRA_INSTRUCTION_LENGTH = 512
 const MAX_EXTRA_INSTRUCTIONS_TOTAL = 4_096
 
+/** A run-selection report used to keep the public URL truthful. */
+export interface RunSelectionChange {
+  /** The run now displayed; null when nothing is selected. */
+  runId: string | null
+  /** True for an explicit user pick (a history push); false for a passive sync. */
+  userInitiated: boolean
+  /** Set when a URL-requested run does not exist in this project. */
+  missingRunId?: string
+}
+
 interface RunDashboardProps {
   /** The registered project whose runs are shown; its sole project authority. */
   projectId: string
+  /**
+   * The run requested through the public URL, if any.  Each new request is
+   * selected and validated through the direct project-scoped run endpoint; a
+   * missing request never selects a substitute.
+   */
+  requestedRunId?: string | null
+  onRunSelectionChange?: (change: RunSelectionChange) => void
   initialPlanPath: string | null
   onInitialPlanHandled: () => void
   /** Test-only override; production callers retain the bounded 1s–30poll wait. */
@@ -398,7 +416,7 @@ function configuredWorkflowSteps(
   return []
 }
 
-export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
+export function RunDashboard({ projectId, requestedRunId = null, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
   const [projectAvailable, setProjectAvailable] = useState<boolean | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
@@ -407,7 +425,8 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
   const [committed, setCommitted] = useState<CommittedProjection | null>(null)
   const [committedError, setCommittedError] = useState<string | null>(null)
   const [runs, setRuns] = useState<RunStatus[]>([])
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(requestedRunId)
+  const [missingRunId, setMissingRunId] = useState<string | null>(null)
   const [events, setEvents] = useState<RunEvent[]>([])
   const [context, setContext] = useState<RunContext | null>(null)
   const [contextLevel, setContextLevel] = useState<'lite' | 'full'>('lite')
@@ -444,11 +463,18 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
   // no runs exist, or when a frozen successor draft needs attention.
   const [newRunOpen, setNewRunOpen] = useState(initialPlanPath !== null)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [technicalOpen, setTechnicalOpen] = useState(false)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [refreshNonce, setRefreshNonce] = useState(0)
-  const selectedRunRef = useRef<string | null>(null)
+  const selectedRunRef = useRef<string | null>(selectedRunId)
+  const requestedRunRef = useRef<string | null>(requestedRunId)
+  const missingRunRef = useRef<string | null>(null)
   const snapshotRequestRef = useRef(0)
   const controlsForRunRef = useRef<string | null>(null)
   const previousStreamStateRef = useRef<api.StreamState>('stopped')
+  const onRunSelectionChangeRef = useRef(onRunSelectionChange)
+  onRunSelectionChangeRef.current = onRunSelectionChange
+  missingRunRef.current = missingRunId
   const { getKey: getPendingWriteKey, clearKey: clearPendingWriteKey, clearAll: clearPendingWriteKeys } = usePendingWriteKeys()
 
   const selectedRun = useMemo(
@@ -492,6 +518,24 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
   useEffect(() => {
     selectedRunRef.current = selectedRunId
   }, [selectedRunId])
+
+  // The public URL is authoritative for a requested run: every new request
+  // selects exactly that run and is validated through the direct
+  // project-scoped endpoint. Clearing the request keeps the visible
+  // selection; the dashboard reports it back so the URL is re-synced.
+  useEffect(() => {
+    if (requestedRunId === requestedRunRef.current) return
+    requestedRunRef.current = requestedRunId
+    if (requestedRunId !== null) {
+      setMissingRunId(null)
+      setSelectedRunId(requestedRunId)
+    }
+  }, [requestedRunId])
+
+  // Clipboard feedback describes one link; a new selection starts a new one.
+  useEffect(() => {
+    setCopyState('idle')
+  }, [projectId, selectedRunId])
 
   useEffect(() => {
     clearPendingWriteKeys()
@@ -652,12 +696,28 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
       setCapabilities(nextCapabilities)
       setPlans(nextPlans)
       setPlansLoaded(true)
-      // The repository pages by ascending identity, not newest first.
       const orderedRuns = newestRunsFirst(page.runs)
-      setRuns(orderedRuns)
-      setSelectedRunId((current) => orderedRuns.some((run) => run.run_id === current)
-        ? current
-        : orderedRuns[0]?.run_id ?? null)
+      setRuns((current) => {
+        // The first page never silently displaces a run that was fetched
+        // directly (a requested link target or the current selection): it is
+        // retained until the page itself carries it again.
+        const pageIds = new Set(page.runs.map((run) => run.run_id))
+        const pinned = current.filter((run) => !pageIds.has(run.run_id)
+          && (run.run_id === requestedRunRef.current || run.run_id === selectedRunRef.current))
+        return [...orderedRuns, ...pinned]
+      })
+      // Default to the newest returned run only when there is no requested
+      // or current selection: a linked run is validated separately through
+      // the direct endpoint and is never silently substituted.
+      const newestId = orderedRuns[0]?.run_id ?? null
+      const currentSelection = selectedRunRef.current
+      if (requestedRunRef.current === null && missingRunRef.current === null
+        && currentSelection === null) {
+        setSelectedRunId(newestId)
+        if (newestId !== null && newestId !== currentSelection) {
+          onRunSelectionChangeRef.current?.({ runId: newestId, userInitiated: false })
+        }
+      }
       if (page.runs.length === 0) setNewRunOpen(true)
       // The launch form projects the committed pair through the pure form
       // endpoint; a projection failure only blocks launch, never the runs.
@@ -704,13 +764,41 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
       setEvents((current) => mergeEvents(current, tail))
       setContext((current) => preserveFullContext && current?.level === 'full' ? current : liteContext)
     } catch (loadError) {
-      if (isActive() && selectedRunRef.current === runId && requestNumber === snapshotRequestRef.current) setError(errorMessage(loadError, 'Failed to load run details'))
+      if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
+      if (loadError instanceof ApiError && loadError.status === 404) {
+        // A linked run that does not exist selects no substitute: the Runs
+        // view keeps its list and New run offer, and the URL drops the id.
+        setMissingRunId(runId)
+        setSelectedRunId(null)
+        onRunSelectionChangeRef.current?.({ runId: null, userInitiated: false, missingRunId: runId })
+        return
+      }
+      setError(errorMessage(loadError, 'Failed to load run details'))
     }
   }
 
   async function refreshSelectedRun() {
     if (!projectId || !selectedRunId) return
     await loadSelectedRun(projectId, selectedRunId)
+  }
+
+  /** An explicit run pick: cleared stale-link guidance and a history push report. */
+  function selectRun(runId: string) {
+    setMissingRunId(null)
+    setSelectedRunId(runId)
+    onRunSelectionChangeRef.current?.({ runId, userInitiated: true })
+  }
+
+  /** Copy only project/run identities confirmed by the server, never ambient URL data. */
+  async function handleCopyLink() {
+    try {
+      const href = workspaceHref({ project: projectId, view: 'runs', run: selectedRun?.run_id ?? null })
+      const url = new URL(window.location.pathname + href, window.location.origin)
+      await navigator.clipboard.writeText(url.href)
+      setCopyState('copied')
+    } catch {
+      setCopyState('failed')
+    }
   }
 
   function hasSafeControl(control: string): boolean {
@@ -820,8 +908,11 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
       ? `${action} created run ${result.run_id}.${lineage}`
       : `${action} replay returned existing run ${result.run_id}; no duplicate was created.`)
     setNewRunOpen(false)
+    setMissingRunId(null)
     await loadDashboard(projectId)
     setSelectedRunId(result.run_id)
+    // Passive URL update: the dashboard link now identifies the returned run.
+    onRunSelectionChangeRef.current?.({ runId: result.run_id, userInitiated: false })
   }
 
   async function handleStartupAnswer(answer: string | number | boolean) {
@@ -1066,8 +1157,11 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
         ? `Continuation ${continuation.run_id} was created from source run ${sourceRun}. The source remains separate.`
         : `Replay returned continuation ${continuation.run_id} from source run ${sourceRun}; no duplicate was created. The source remains separate.`)
       setConfirmResume(false)
+      setMissingRunId(null)
       await loadDashboard(projectId)
       setSelectedRunId(continuation.run_id)
+      // Passive URL update: the dashboard link now identifies the continuation.
+      onRunSelectionChangeRef.current?.({ runId: continuation.run_id, userInitiated: false })
     } catch (resumeError) {
       setError(errorMessage(resumeError, 'Failed to resume run'))
     } finally {
@@ -1210,6 +1304,11 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
       ? textEvidence(selectedRun, 'plan_path')
       : planPathFromContext(context))
     : 'Not reported'
+  // The header names the plan file; the full relative path stays under
+  // Technical details.
+  const selectedPlanFileName = selectedPlanPath !== 'Not reported'
+    ? selectedPlanPath.split('/').pop() || selectedPlanPath
+    : 'Not reported'
   const roleChoices = capabilities?.roles ?? []
 
   if (loading) {
@@ -1223,17 +1322,29 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
           <h2>Run dashboard</h2>
           <p className="text-sm text-dim">Persistent server records remain visible if the daemon connection is interrupted.</p>
         </div>
-        <button className="btn btn-secondary btn-sm" onClick={() => setRefreshNonce((nonce) => nonce + 1)} disabled={refreshing || loading}>
-          {refreshing ? 'Refreshing…' : 'Refresh'}
-        </button>
+        <div className="header-actions">
+          <button className="btn btn-secondary btn-sm" onClick={() => void handleCopyLink()}>Copy link</button>
+          <button className="btn btn-secondary btn-sm" onClick={() => setRefreshNonce((nonce) => nonce + 1)} disabled={refreshing || loading}>
+            {refreshing ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
+      {copyState === 'copied' && <div className="success-message" role="status">Link copied to the clipboard.</div>}
+      {copyState === 'failed' && <div className="notice" role="status">Clipboard access failed — copy the address from the browser address bar instead.</div>}
       {error && <div className="error-message">{error}</div>}
       {feedback && <div className="success-message">{feedback}</div>}
       {successorOutcomeUnknown && pendingSuccessorStart && (
         <div className="notice" role="alert">
           The successor request for {pendingSuccessorStart.sourceRunId} in {pendingSuccessorStart.projectId} is frozen while its outcome is unknown. Do not start a changed replacement.
           <div className="dashboard-actions"><button className="btn btn-primary" disabled={restartInProgress || pendingSuccessorStart.projectId !== projectId} onClick={() => void retryPendingSuccessorStart()}>Retry exact successor request</button></div>
+        </div>
+      )}
+
+      {projectAvailable && missingRunId !== null && !selectedRun && (
+        <div className="notice" role="alert">
+          The linked run <span className="mono">{missingRunId}</span> is not recorded for this project. Nothing else
+          was selected in its place — choose from the current runs below or start a New run.
         </div>
       )}
 
@@ -1279,6 +1390,208 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
             ))}
           </div>
         </section>
+      )}
+
+      {projectAvailable && (
+        <div className="dashboard-columns">
+          <section className="card run-list" aria-label="Project runs">
+            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{runs.length} recorded</span></div>
+            {runs.length === 0 ? <p className="text-sm text-dim">No runs are recorded for this project.</p> : runs.map((run) => (
+              <button className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
+                <span className="mono">{run.run_id}</span>
+                <span className="status-pill">{statusLabel(run)}</span>
+                <span className="text-xs text-dim">
+                  {run.restarted_from_run_id ? '↻ successor · ' : ''}
+                  {run.workflow_name ?? 'workflow not reported'} · {run.current_step ?? 'step not reported'}
+                  {run.skipped_steps.length > 0 ? ` · ${run.skipped_steps.length} skipped` : ''}
+                </span>
+              </button>
+            ))}
+          </section>
+
+          <section className="card run-detail" aria-label="Run details">
+            {!selectedRun ? <p className="text-sm text-dim">Select a recorded run to inspect its server status and events.</p> : <>
+              <div className="run-progress-header">
+                <div className="section-heading">
+                  <div>
+                    <h3>Run {selectedRun.run_id}</h3>
+                    <p className="text-sm text-dim">Plan: <span className="mono">{selectedPlanFileName}</span></p>
+                  </div>
+                  <span className="status-pill">{statusLabel(selectedRun)}</span>
+                </div>
+                <dl className="run-progress-strip">
+                  <div><dt>Current step / turns</dt><dd>{selectedRun.current_step ?? 'Not reported'} · {selectedRun.turns_completed ?? '0'} / {selectedRun.max_turns ?? 'Not reported'}</dd></div>
+                  <div><dt>Workflow / team</dt><dd>{selectedRun.workflow_name ?? 'Not reported'} · {selectedRun.team ?? 'Not reported'}</dd></div>
+                  <div><dt>Start / elapsed</dt><dd>{startTime === 'Not reported' ? 'Not reported' : timestamp(startTime)}{elapsed ? ` · running for ${elapsed}` : ''}</dd></div>
+                  <div><dt>Stream</dt><dd>{streamLabel}</dd></div>
+                </dl>
+              </div>
+              {selectedRun.ownership === 'legacy' && <div className="notice">Legacy record classified as interrupted and read-only. It is never treated as a live workflow.</div>}
+              {selectedRun.status === 'needs_attention' && <div className="notice">This run needs attention. A disconnected dashboard did not stop it; explicit resume is required when safe.</div>}
+              {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
+              {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
+
+              <section className="dashboard-section">
+                <div className="section-heading"><h4>Latest bounded outcomes</h4><span className="text-xs text-dim">manager · checkpoint · live overrides</span></div>
+                <div className="text-sm">
+                  <div>Checkpoint: <span>{checkpoints
+                    ? checkpoints.complete ? `All ${checkpoints.count} checkpoints complete` : `${checkpoints.name ?? 'unnamed'} (${checkpoints.index ?? '?'} of ${checkpoints.count})`
+                    : 'Not reported'}</span></div>
+                  <div>{outcome?.decision ?? 'No manager decision reported yet.'}</div>
+                  <div>{outcome?.finishedTurn ? `Last finalized turn: ${outcome.finishedTurn}` : 'No finalized turn reported yet.'}</div>
+                  {outcome?.resultText && <pre className="dashboard-payload">{outcome.resultText}</pre>}
+                  <div className="text-xs text-dim">
+                    Live overrides: max turns {overrideText(controlOverride, 'max_turns')} · team {overrideText(controlOverride, 'team')}
+                    {Object.keys(overrideRoles(controlOverride)).length
+                      ? ` · selectors ${Object.entries(overrideRoles(controlOverride)).map(([role, selector]) => `${role}=${selector}`).join(', ')}`
+                      : ' · no selector overrides'}
+                  </div>
+                </div>
+              </section>
+
+              <section className="dashboard-section">
+                <div className="section-heading"><h4>Safe controls</h4><span className="text-xs text-dim">Server capability and revision gated</span></div>
+                {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
+                <div className="notice">
+                  Changes are saved now and applied between turns. They remain marked Pending until the run
+                  confirms them. To use a profile outside this run's available choices, restart the run.
+                </div>
+                {capabilities && Object.entries(capabilities.control_safety).filter(([, safety]) => safety === 'restart_required').map(([control]) => (
+                  <div className="text-xs text-dim" key={control}>{control.replace(/_/g, ' ')} requires restart; it is not offered as a live control.</div>
+                ))}
+                <div className="dashboard-form-grid">
+                  <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>
+                  <label className="dashboard-field"><span>Team</span><select className="input" aria-label="Control team" value={controlTeam} disabled={!canMutate || !hasSafeControl('team')} onChange={(event) => setControlTeam(event.target.value)}><option value="">No team</option>{capabilities?.teams.map((team) => <option key={team} value={team}>{team}</option>)}</select></label>
+                </div>
+                {roleChoices.map((role) => {
+                  const admitted = capabilities?.admitted_role_selectors?.[role] ?? []
+                  return (
+                    <label className="dashboard-field" key={role}>
+                      <span>Selector for {role}{overrideRoles(controlOverride)[role] ? ` (current override: ${overrideRoles(controlOverride)[role]})` : ''}</span>
+                      <select
+                        className="input"
+                        aria-label={`Selector for ${role}`}
+                        value={roleSelectors[role] ?? ''}
+                        disabled={!canMutate || !hasSafeControl('role_selectors') || admitted.length === 0}
+                        onChange={(event) => setRoleSelectors((current) => ({ ...current, [role]: event.target.value }))}
+                      >
+                        <option value="">No change</option>
+                        {admitted.map((selector) => <option key={selector} value={selector}>{selector}</option>)}
+                      </select>
+                    </label>
+                  )
+                })}
+                <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Apply safe controls'}</button></div>
+              </section>
+
+              <section className="dashboard-section dashboard-actions">
+                {hasSafeControl('owner_stop') && canMutate && <>
+                  {!confirmOwnerStop ? <button className="btn btn-danger" disabled={restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Owner stop…</button> : <div className="confirmation"><span>Confirm owner stop for {selectedRun.run_id}. This control is recorded by the server.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Confirm stop</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
+                </>}
+                {canResume && <>
+                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and frozen configuration.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
+                </>}
+              </section>
+
+              {canRestart && (
+                <section className="dashboard-section">
+                  <div className="section-heading"><h4>Change workflow (guided restart)</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
+                  <div className="notice">
+                    A workflow change is never applied in place. Confirming performs an owner stop of{' '}
+                    <span className="mono">{selectedRun.run_id}</span>, waits until the canonical status proves that
+                    exact unit is inactive and terminal, and only then starts a fresh run from the typed draft in the
+                    New run form with <span className="mono">restarted_from_run_id</span> lineage. If the stop, the
+                    wait, or the successor start fails, automation halts: the draft is preserved and the source state
+                    above stays authoritative. Explicit resume stays a separate same-workflow action.
+                  </div>
+                  {restartDraftHint
+                    ? <div className="text-xs text-dim">{restartDraftHint}</div>
+                    : !restartPendingConfirmation && !restartInProgress && (
+                      <div className="dashboard-actions"><button className="btn btn-danger" onClick={() => setRestartPhase('confirming')}>Change workflow: stop and restart…</button></div>
+                    )}
+                  {restartPendingConfirmation && !restartDraftReady && (
+                    <div className="text-xs text-dim">Select a successor workflow and plan in the New run form before confirming.</div>
+                  )}
+                  {restartPendingConfirmation && restartDraftReady && (
+                    <div className="confirmation">
+                      <span>
+                        Stop <span className="mono">{selectedRun.run_id}</span> (revision {selectedRun.revision}) and start
+                        successor workflow <strong>{restartDraftWorkflow}</strong>
+                        {startStep.trim() ? <> at step <strong>{startStep.trim()}</strong></> : null}
+                        {startPlanPath ? <> with plan <span className="mono">{startPlanPath.trim()}</span></> : null}? The successor records this run as its restart source.
+                      </span>
+                      <button className="btn btn-danger" disabled={busyAction !== null || restartInProgress} onClick={() => void handleConfirmedRestart()}>Confirm stop and start successor</button>
+                      <button className="btn btn-secondary" onClick={() => setRestartPhase(null)}>Cancel restart</button>
+                    </div>
+                  )}
+                  {restartInProgress && (
+                    <div className="status-pill status-awaiting">
+                      {restartPhase === 'stopping' && 'Stopping the source run…'}
+                      {restartPhase === 'waiting' && 'Waiting for exact source inactivity…'}
+                      {restartPhase === 'starting' && 'Starting the successor run…'}
+                    </div>
+                  )}
+                </section>
+              )}
+
+              <section className="dashboard-section">
+                <div className="section-heading"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} bounded events</span></div><button className="btn btn-secondary btn-sm" onClick={() => void refreshSelectedRun()}>Refresh status</button></div>
+                {streamNotice && <div className="notice">{streamNotice}</div>}
+                {events.length === 0 ? <p className="text-sm text-dim">No bounded events are available yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{event.event_type.replace(/_/g, ' ')}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
+              </section>
+
+              <section className="dashboard-section">
+                <h4>
+                  <button
+                    type="button"
+                    className="disclosure-toggle"
+                    aria-expanded={technicalOpen}
+                    aria-controls="run-technical-details"
+                    onClick={() => setTechnicalOpen((open) => !open)}
+                  >
+                    Technical details
+                  </button>
+                </h4>
+                {technicalOpen && (
+                  <div id="run-technical-details" className="run-technical-details">
+                    <dl className="run-metadata">
+                      <div><dt>Revision</dt><dd>{selectedRun.revision}</dd></div>
+                      <div><dt>Ownership</dt><dd>{selectedRun.ownership}</dd></div>
+                      <div><dt>Unit / reconciliation</dt><dd className="mono">{selectedRun.unit_name ?? 'Not reported'} · {selectedRun.launch_phase ?? 'phase not reported'} · {selectedRun.evidence.reconciled ? 'reconciled' : 'not reconciled'}</dd></div>
+                      <div><dt>Upgrade chain</dt><dd>{selectedRun.team ? capabilities?.team_upgrade_chains[selectedRun.team]?.join(' → ') || 'Not reported' : 'Not reported'}</dd></div>
+                      <div><dt>Start step / skipped</dt><dd>{selectedRun.selected_start_step ?? 'Not reported'} · {selectedRun.skipped_steps.length ? selectedRun.skipped_steps.join(', ') : 'none skipped'}</dd></div>
+                      <div><dt>Excluded steps</dt><dd>{selectedRun.workflow_name && capabilities?.workflow_details?.[selectedRun.workflow_name]?.excluded_steps.length
+                        ? capabilities.workflow_details[selectedRun.workflow_name].excluded_steps.join(', ')
+                        : 'none'}</dd></div>
+                      <div><dt>Lineage</dt><dd className="mono">
+                        {selectedRun.restarted_from_run_id ? <div>successor of {selectedRun.restarted_from_run_id}</div> : null}
+                        {successorRunIds.length ? <div>source of {successorRunIds.join(', ')}</div> : null}
+                        {!selectedRun.restarted_from_run_id && !successorRunIds.length ? 'no restart lineage' : null}
+                      </dd></div>
+                      <div><dt>Plan path</dt><dd className="mono">{selectedPlanPath}</dd></div>
+                      <div><dt>Worktree</dt><dd className="mono">{textEvidence(selectedRun, 'worktree_path') !== 'Not reported' ? textEvidence(selectedRun, 'worktree_path') : contextText(context, 'worktree_path')}</dd></div>
+                      <div><dt>Branch</dt><dd className="mono">{textEvidence(selectedRun, 'branch') !== 'Not reported' ? textEvidence(selectedRun, 'branch') : contextText(context, 'branch')}</dd></div>
+                      <div><dt>Recorded at</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at ?? selectedRun.evidence.updated_at)}</dd></div>
+                    </dl>
+
+                    <section className="dashboard-section">
+                      <div className="section-heading"><h4>Context</h4><span className="text-xs text-dim">{context?.level ?? 'not loaded'}</span></div>
+                      <div className="dashboard-actions"><button className={`btn btn-sm ${contextLevel === 'lite' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => void selectContextLevel('lite')}>Lite — bounded operational summary</button><button className={`btn btn-sm ${contextLevel === 'full' ? 'btn-primary' : 'btn-secondary'}`} disabled={!capabilities?.context_levels.includes('full')} onClick={() => void selectContextLevel('full')}>Full — disclosed scoped detail</button></div>
+                      {contextLevel === 'full' && <label className="context-disclosure"><input type="checkbox" checked={fullContextAcknowledged} onChange={(event) => setFullContextAcknowledged(event.target.checked)} /> I understand Full context may expose additional bounded run metadata and request it for this authenticated session only.</label>}
+                      <div className="dashboard-actions"><button className="btn btn-secondary btn-sm" disabled={busyAction === 'context' || (contextLevel === 'full' && !fullContextAcknowledged)} onClick={() => void loadContext()}>Load {contextLevel} context</button></div>
+                      {context && <pre className="dashboard-payload">{JSON.stringify(context.data, null, 2)}</pre>}
+                    </section>
+
+                    <section className="dashboard-section">
+                      <div className="section-heading"><h4>Raw event payloads</h4><span className="text-xs text-dim">canonical event data</span></div>
+                      {events.length === 0 ? <p className="text-sm text-dim">No bounded event payloads are available yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><span className="text-xs text-dim">#{event.sequence}</span><pre>{JSON.stringify(event.data, null, 2)}</pre></article>)}</div>}
+                    </section>
+                  </div>
+                )}
+              </section>
+            </>}
+          </section>
+        </div>
       )}
 
       {projectAvailable && (
@@ -1468,173 +1781,6 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
         </section>
       )}
 
-      {projectAvailable && (
-        <div className="dashboard-columns">
-          <section className="card run-list" aria-label="Project runs">
-          <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{runs.length} recorded</span></div>
-          {runs.length === 0 ? <p className="text-sm text-dim">No runs are recorded for this project.</p> : runs.map((run) => (
-            <button className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => setSelectedRunId(run.run_id)}>
-              <span className="mono">{run.run_id}</span>
-              <span className="status-pill">{statusLabel(run)}</span>
-              <span className="text-xs text-dim">
-                {run.restarted_from_run_id ? '↻ successor · ' : ''}
-                {run.workflow_name ?? 'workflow not reported'} · {run.current_step ?? 'step not reported'}
-                {run.skipped_steps.length > 0 ? ` · ${run.skipped_steps.length} skipped` : ''}
-              </span>
-            </button>
-          ))}
-        </section>
-
-        <section className="card run-detail" aria-label="Run details">
-          {!selectedRun ? <p className="text-sm text-dim">Select a recorded run to inspect its server status and events.</p> : <>
-            <div className="section-heading"><div><h3>Run {selectedRun.run_id}</h3><p className="text-sm text-dim">Canonical identity · revision {selectedRun.revision}</p></div><span className="status-pill">{statusLabel(selectedRun)}</span></div>
-            {selectedRun.ownership === 'legacy' && <div className="notice">Legacy record classified as interrupted and read-only. It is never treated as a live workflow.</div>}
-            {selectedRun.status === 'needs_attention' && <div className="notice">This run needs attention. A disconnected dashboard did not stop it; explicit resume is required when safe.</div>}
-            {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
-            {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
-
-            <dl className="run-metadata">
-              <div><dt>Ownership</dt><dd>{selectedRun.ownership}</dd></div>
-              <div><dt>Unit / reconciliation</dt><dd className="mono">{selectedRun.unit_name ?? 'Not reported'} · {selectedRun.launch_phase ?? 'phase not reported'} · {selectedRun.evidence.reconciled ? 'reconciled' : 'not reconciled'}</dd></div>
-              <div><dt>Workflow / team</dt><dd>{selectedRun.workflow_name ?? 'Not reported'} · {selectedRun.team ?? 'Not reported'}</dd></div>
-              <div><dt>Upgrade chain</dt><dd>{selectedRun.team ? capabilities?.team_upgrade_chains[selectedRun.team]?.join(' → ') || 'Not reported' : 'Not reported'}</dd></div>
-              <div><dt>Current step / turns</dt><dd>{selectedRun.current_step ?? 'Not reported'} · {selectedRun.turns_completed ?? '0'} / {selectedRun.max_turns ?? 'Not reported'}</dd></div>
-              <div><dt>Start step / skipped</dt><dd>{selectedRun.selected_start_step ?? 'Not reported'} · {selectedRun.skipped_steps.length ? selectedRun.skipped_steps.join(', ') : 'none skipped'}</dd></div>
-              <div><dt>Excluded steps</dt><dd>{selectedRun.workflow_name && capabilities?.workflow_details?.[selectedRun.workflow_name]?.excluded_steps.length
-                ? capabilities.workflow_details[selectedRun.workflow_name].excluded_steps.join(', ')
-                : 'none'}</dd></div>
-              <div><dt>Checkpoint</dt><dd>{checkpoints
-                ? checkpoints.complete ? `All ${checkpoints.count} checkpoints complete` : `${checkpoints.name ?? 'unnamed'} (${checkpoints.index ?? '?'} of ${checkpoints.count})`
-                : 'Not reported'}</dd></div>
-              <div><dt>Start / elapsed</dt><dd>{startTime === 'Not reported' ? 'Not reported' : timestamp(startTime)}{elapsed ? ` · running for ${elapsed}` : ''}</dd></div>
-              <div><dt>Lineage</dt><dd className="mono">
-                {selectedRun.restarted_from_run_id ? <div>successor of {selectedRun.restarted_from_run_id}</div> : null}
-                {successorRunIds.length ? <div>source of {successorRunIds.join(', ')}</div> : null}
-                {!selectedRun.restarted_from_run_id && !successorRunIds.length ? 'no restart lineage' : null}
-              </dd></div>
-              <div><dt>Plan</dt><dd className="mono">{selectedPlanPath}</dd></div>
-              <div><dt>Worktree</dt><dd className="mono">{textEvidence(selectedRun, 'worktree_path') !== 'Not reported' ? textEvidence(selectedRun, 'worktree_path') : contextText(context, 'worktree_path')}</dd></div>
-              <div><dt>Branch</dt><dd className="mono">{textEvidence(selectedRun, 'branch') !== 'Not reported' ? textEvidence(selectedRun, 'branch') : contextText(context, 'branch')}</dd></div>
-              <div><dt>Recorded at</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at ?? selectedRun.evidence.updated_at)}</dd></div>
-            </dl>
-
-            <section className="dashboard-section">
-              <div className="section-heading"><h4>Latest bounded outcomes</h4><span className="text-xs text-dim">manager · harness · live overrides</span></div>
-              <div className="text-sm">
-                <div>{outcome?.decision ?? 'No manager decision reported yet.'}</div>
-                <div>{outcome?.finishedTurn ? `Last finalized turn: ${outcome.finishedTurn}` : 'No finalized turn reported yet.'}</div>
-                {outcome?.resultText && <pre className="dashboard-payload">{outcome.resultText}</pre>}
-                <div className="text-xs text-dim">
-                  Live overrides: max turns {overrideText(controlOverride, 'max_turns')} · team {overrideText(controlOverride, 'team')}
-                  {Object.keys(overrideRoles(controlOverride)).length
-                    ? ` · selectors ${Object.entries(overrideRoles(controlOverride)).map(([role, selector]) => `${role}=${selector}`).join(', ')}`
-                    : ' · no selector overrides'}
-                </div>
-              </div>
-            </section>
-
-            <section className="dashboard-section">
-              <div className="section-heading"><h4>Safe controls</h4><span className="text-xs text-dim">Server capability and revision gated</span></div>
-              {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
-              <div className="notice">
-                Changes are saved now and applied between turns. They remain marked Pending until the run
-                confirms them. To use a profile outside this run's available choices, restart the run.
-              </div>
-              {capabilities && Object.entries(capabilities.control_safety).filter(([, safety]) => safety === 'restart_required').map(([control]) => (
-                <div className="text-xs text-dim" key={control}>{control.replace(/_/g, ' ')} requires restart; it is not offered as a live control.</div>
-              ))}
-              <div className="dashboard-form-grid">
-                <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>
-                <label className="dashboard-field"><span>Team</span><select className="input" aria-label="Control team" value={controlTeam} disabled={!canMutate || !hasSafeControl('team')} onChange={(event) => setControlTeam(event.target.value)}><option value="">No team</option>{capabilities?.teams.map((team) => <option key={team} value={team}>{team}</option>)}</select></label>
-              </div>
-              {roleChoices.map((role) => {
-                const admitted = capabilities?.admitted_role_selectors?.[role] ?? []
-                return (
-                  <label className="dashboard-field" key={role}>
-                    <span>Selector for {role}{overrideRoles(controlOverride)[role] ? ` (current override: ${overrideRoles(controlOverride)[role]})` : ''}</span>
-                    <select
-                      className="input"
-                      aria-label={`Selector for ${role}`}
-                      value={roleSelectors[role] ?? ''}
-                      disabled={!canMutate || !hasSafeControl('role_selectors') || admitted.length === 0}
-                      onChange={(event) => setRoleSelectors((current) => ({ ...current, [role]: event.target.value }))}
-                    >
-                      <option value="">No change</option>
-                      {admitted.map((selector) => <option key={selector} value={selector}>{selector}</option>)}
-                    </select>
-                  </label>
-                )
-              })}
-              <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Apply safe controls'}</button></div>
-            </section>
-
-            <section className="dashboard-section dashboard-actions">
-              {hasSafeControl('owner_stop') && canMutate && <>
-                {!confirmOwnerStop ? <button className="btn btn-danger" disabled={restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Owner stop…</button> : <div className="confirmation"><span>Confirm owner stop for {selectedRun.run_id}. This control is recorded by the server.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Confirm stop</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
-              </>}
-              {canResume && <>
-                {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and frozen configuration.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
-              </>}
-            </section>
-
-            {canRestart && (
-              <section className="dashboard-section">
-                <div className="section-heading"><h4>Change workflow (guided restart)</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
-                <div className="notice">
-                  A workflow change is never applied in place. Confirming performs an owner stop of{' '}
-                  <span className="mono">{selectedRun.run_id}</span>, waits until the canonical status proves that
-                  exact unit is inactive and terminal, and only then starts a fresh run from the typed draft in the
-                  New run form with <span className="mono">restarted_from_run_id</span> lineage. If the stop, the
-                  wait, or the successor start fails, automation halts: the draft is preserved and the source state
-                  above stays authoritative. Explicit resume stays a separate same-workflow action.
-                </div>
-                {restartDraftHint
-                  ? <div className="text-xs text-dim">{restartDraftHint}</div>
-                  : !restartPendingConfirmation && !restartInProgress && (
-                    <div className="dashboard-actions"><button className="btn btn-danger" onClick={() => setRestartPhase('confirming')}>Change workflow: stop and restart…</button></div>
-                  )}
-                {restartPendingConfirmation && !restartDraftReady && (
-                  <div className="text-xs text-dim">Select a successor workflow and plan in the New run form before confirming.</div>
-                )}
-                {restartPendingConfirmation && restartDraftReady && (
-                  <div className="confirmation">
-                    <span>
-                      Stop <span className="mono">{selectedRun.run_id}</span> (revision {selectedRun.revision}) and start
-                      successor workflow <strong>{restartDraftWorkflow}</strong>
-                      {startStep.trim() ? <> at step <strong>{startStep.trim()}</strong></> : null}
-                      {startPlanPath ? <> with plan <span className="mono">{startPlanPath.trim()}</span></> : null}? The successor records this run as its restart source.
-                    </span>
-                    <button className="btn btn-danger" disabled={busyAction !== null || restartInProgress} onClick={() => void handleConfirmedRestart()}>Confirm stop and start successor</button>
-                    <button className="btn btn-secondary" onClick={() => setRestartPhase(null)}>Cancel restart</button>
-                  </div>
-                )}
-                {restartInProgress && (
-                  <div className="status-pill status-awaiting">
-                    {restartPhase === 'stopping' && 'Stopping the source run…'}
-                    {restartPhase === 'waiting' && 'Waiting for exact source inactivity…'}
-                    {restartPhase === 'starting' && 'Starting the successor run…'}
-                  </div>
-                )}
-              </section>
-            )}
-
-            <section className="dashboard-section">
-              <div className="section-heading"><h4>Context</h4><span className="text-xs text-dim">{context?.level ?? 'not loaded'}</span></div>
-              <div className="dashboard-actions"><button className={`btn btn-sm ${contextLevel === 'lite' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => void selectContextLevel('lite')}>Lite — bounded operational summary</button><button className={`btn btn-sm ${contextLevel === 'full' ? 'btn-primary' : 'btn-secondary'}`} disabled={!capabilities?.context_levels.includes('full')} onClick={() => void selectContextLevel('full')}>Full — disclosed scoped detail</button></div>
-              {contextLevel === 'full' && <label className="context-disclosure"><input type="checkbox" checked={fullContextAcknowledged} onChange={(event) => setFullContextAcknowledged(event.target.checked)} /> I understand Full context may expose additional bounded run metadata and request it for this authenticated session only.</label>}
-              <div className="dashboard-actions"><button className="btn btn-secondary btn-sm" disabled={busyAction === 'context' || (contextLevel === 'full' && !fullContextAcknowledged)} onClick={() => void loadContext()}>Load {contextLevel} context</button></div>
-              {context && <pre className="dashboard-payload">{JSON.stringify(context.data, null, 2)}</pre>}
-            </section>
-
-            <section className="dashboard-section">
-              <div className="section-heading"><div><h4>Event timeline</h4><span className="text-xs text-dim">{events.length} bounded events · {streamLabel}</span></div><button className="btn btn-secondary btn-sm" onClick={() => void refreshSelectedRun()}>Refresh status</button></div>
-              {streamNotice && <div className="notice">{streamNotice}</div>}
-              {events.length === 0 ? <p className="text-sm text-dim">No bounded events are available yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{event.event_type.replace(/_/g, ' ')}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div><pre>{JSON.stringify(event.data, null, 2)}</pre></article>)}</div>}
-            </section>
-          </>}
-        </section>
-        </div>
-      )}
     </div>
   )
 }
