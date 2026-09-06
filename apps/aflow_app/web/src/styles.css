@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --color-bg: #0f0f0f;
   --color-surface: #1a1a1a;
   --color-surface-hover: #242424;
@@ -64,7 +65,7 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
-input, textarea {
+input, select, textarea {
   font-family: inherit;
   font-size: inherit;
   color: inherit;
