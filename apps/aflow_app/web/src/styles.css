@@ -802,6 +802,21 @@ a {
 }
 
 @media (max-width: 640px) {
+  .project-context-bar .content-button-row {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+  }
+
+  .project-context-bar .content-button-row > strong {
+    flex: 1;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .project-context-bar .content-button-row > .mono {
+    flex-basis: 100%;
+  }
+
   .workspace-nav {
     padding: var(--spacing-sm);
   }

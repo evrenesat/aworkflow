@@ -836,3 +836,5 @@
 - Deployment owner repair: all timed-out poller subprocesses now terminate their process group, including children left after parent exit; focused regressions cover TERM-ignoring descendants and both error/deferral results.
 
 - Browser preview found that pure empty-draft validation could override missing-file readiness. The settings report now preserves saved readiness for unchanged documents and explains the starter/save step before offering Plans.
+
+- Browser acceptance repairs: label ZCode models as externally configured, distinguish unspecified values from missing profiles, and preserve the selected project name on narrow screens.

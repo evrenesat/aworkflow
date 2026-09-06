@@ -62,7 +62,9 @@ function selectorModelEffort(
   harnesses: Record<string, Record<string, GuidedProfileSummary>>,
 ): string {
   const summary = selectorSummary(selector, harnesses)
-  return summary.split(' · ').slice(1).join(' · ')
+  if (!summary) return ''
+  if (selector.startsWith('zcode.')) return 'Configured in ZCode'
+  return summary.split(' · ').slice(1).join(' · ') || 'Not specified'
 }
 
 /**

@@ -114,6 +114,25 @@ describe('GuidedConfigForm', () => {
     vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse())
   })
 
+  it('distinguishes externally configured and unspecified models from missing profiles', async () => {
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
+      form: {
+        ...configuredForm,
+        harnesses: {
+          zcode: { default: { model: null, effort: null } },
+          codex: { default: { model: null, effort: null } },
+        },
+        roles: { worker: 'zcode.default', reviewer: 'codex.default', missing: 'codex.absent' },
+        teams: {},
+        workflow_default_teams: {},
+      },
+    }))
+    setup()
+    expect((await screen.findAllByText('Configured in ZCode')).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Not specified').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('unknown profile').length).toBeGreaterThan(0)
+  })
+
   it('builds a starter draft from the empty pair using detected Git defaults', async () => {
     vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
       aflow_toml: '',
