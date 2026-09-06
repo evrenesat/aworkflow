@@ -850,3 +850,5 @@
 - Plan promotion buttons now use the same Ready/Done names as the surrounding guidance; settings explain the shared save in plain language.
 
 - Run setup and live-control help now explain Ready plans, available choices, and Pending changes in plain language.
+
+- Run lists now show the newest returned run first using canonical launch time (or the timestamp in older run IDs), while refresh preserves an explicit selection. The API itself remains stably paginated in ascending identity order.

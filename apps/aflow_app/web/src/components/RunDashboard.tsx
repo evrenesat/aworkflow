@@ -111,6 +111,24 @@ function selectorModelEffortText(
     .join(' · ')
 }
 
+/** Prefer canonical launch time, then the UTC timestamp in legacy run ids. */
+function runCreatedAt(run: RunStatus): number {
+  const created = run.evidence.manifest_created_at
+  if (typeof created === 'string') {
+    const timestamp = Date.parse(created)
+    if (Number.isFinite(timestamp)) return timestamp
+  }
+  const match = /^(\d{4})(\d{2})(\d{2})t(\d{2})(\d{2})(\d{2})z(?:-|$)/i.exec(run.run_id)
+  if (!match) return 0
+  const [, year, month, day, hour, minute, second] = match
+  const timestamp = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`)
+  return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+function newestRunsFirst(runs: RunStatus[]): RunStatus[] {
+  return [...runs].sort((left, right) => runCreatedAt(right) - runCreatedAt(left))
+}
+
 function requestKey(prefix: string): string {
   const identifier = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -634,10 +652,12 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
       setCapabilities(nextCapabilities)
       setPlans(nextPlans)
       setPlansLoaded(true)
-      setRuns(page.runs)
-      setSelectedRunId((current) => page.runs.some((run) => run.run_id === current)
+      // The repository pages by ascending identity, not newest first.
+      const orderedRuns = newestRunsFirst(page.runs)
+      setRuns(orderedRuns)
+      setSelectedRunId((current) => orderedRuns.some((run) => run.run_id === current)
         ? current
-        : page.runs[0]?.run_id ?? null)
+        : orderedRuns[0]?.run_id ?? null)
       if (page.runs.length === 0) setNewRunOpen(true)
       // The launch form projects the committed pair through the pure form
       // endpoint; a projection failure only blocks launch, never the runs.

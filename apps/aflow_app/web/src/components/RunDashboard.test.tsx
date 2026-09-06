@@ -153,6 +153,29 @@ describe('RunDashboard', () => {
     vi.mocked(api.subscribeToRunEvents).mockReturnValue(() => {})
   })
 
+  it.each(['manifest', 'legacy id'] as const)('selects the newest returned run using %s and preserves an explicit selection', async (source) => {
+    const oldest = { ...ownedRun, run_id: '20240101t000000z-11111111', evidence: source === 'manifest' ? { manifest_created_at: '2024-01-01T00:00:00Z' } : {} }
+    const newest = { ...ownedRun, run_id: '20240102t000000z-22222222', evidence: source === 'manifest' ? { manifest_created_at: '2024-01-02T00:00:00Z' } : {} }
+    const later = { ...ownedRun, run_id: '20240103t000000z-33333333', evidence: source === 'manifest' ? { manifest_created_at: '2024-01-03T00:00:00Z' } : {} }
+    const byId = new Map([oldest, newest, later].map((run) => [run.run_id, run]))
+    vi.mocked(api.listControlPlaneRuns)
+      .mockResolvedValueOnce({ runs: [oldest, newest], next_cursor: null, schema_version: 1 })
+      .mockResolvedValueOnce({ runs: [oldest, newest, later], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => byId.get(runId)!)
+    vi.mocked(api.getRunContext).mockImplementation(async (_projectId, runId) => ({
+      run_id: runId, level: 'lite', data: { status: 'running' }, schema_version: 1,
+    }))
+    renderDashboard()
+
+    await screen.findByRole('heading', { name: 'Run ' + newest.run_id })
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(oldest.run_id) }))
+    await screen.findByRole('heading', { name: 'Run ' + oldest.run_id })
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(2))
+    await screen.findByRole('button', { name: new RegExp(later.run_id) })
+    expect(screen.getByRole('heading', { name: 'Run ' + oldest.run_id })).toBeDefined()
+  })
+
   it('keeps the server snapshot visible through a failed daemon refresh', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValueOnce({ runs: [ownedRun], next_cursor: null, schema_version: 1 }).mockRejectedValueOnce(new Error('daemon unavailable'))
     renderDashboard()
