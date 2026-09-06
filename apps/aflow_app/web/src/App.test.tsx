@@ -19,6 +19,7 @@ vi.mock('./api', () => ({
   checkSession: vi.fn(), loginSession: vi.fn(), logoutSession: vi.fn(), setSessionExpiredHandler: vi.fn(),
   listProjects: vi.fn(), getProjectDiscovery: vi.fn(), getProject: vi.fn(), createProject: vi.fn(), unregisterProject: vi.fn(),
   getProjectConfig: vi.fn(), saveProjectConfig: vi.fn(), validateProjectConfig: vi.fn(),
+  postProjectConfigForm: vi.fn(),
   listProjectPlans: vi.fn(), createProjectPlan: vi.fn(), readProjectPlan: vi.fn(),
   updateProjectPlan: vi.fn(), promoteProjectPlan: vi.fn(),
   listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(),
@@ -67,6 +68,33 @@ const configPayload = (state: 'ready' | 'configuration_required' | 'invalid' = '
   },
 })
 
+function guidedFormResponse(validation = configPayload().validation) {
+  return {
+    aflow_toml: '# aflow config\n',
+    workflows_toml: '# workflows\n',
+    changed: false,
+    validation,
+    form: {
+      default_workflow: null,
+      max_turns: null,
+      harnesses: {},
+      roles: {},
+      teams: {},
+      workflow_default_teams: {},
+      workflows: {},
+    },
+    syntax_issues: [],
+    choices: { harnesses: [], profiles: {}, selectors: [], roles: [], teams: [], workflows: [] },
+    suggestions: {
+      label: 'suggestion',
+      harnesses: [{ name: 'codex', supports_effort: false, custom_model_supported: true }],
+      profiles: [],
+      note: 'Bundled values are labeled suggestions.',
+    },
+    starter_defaults: null,
+  }
+}
+
 describe('App workspace shell', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -77,6 +105,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.listProjects).mockResolvedValue([])
     vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
     vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload())
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse())
     vi.mocked(api.listProjectPlans).mockResolvedValue([])
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: [] })
@@ -354,6 +383,9 @@ describe('App workspace shell', () => {
   it('updates selected readiness from a successful ready configuration save', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([configProject])
     vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready'))
+    // One server validates one pair one way: the projection of the committed
+    // texts agrees with the ready save result.
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /Beta Project/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
@@ -368,6 +400,41 @@ describe('App workspace shell', () => {
     await screen.findByLabelText('New plan filename')
     expect(screen.getByText('Ready')).toBeDefined()
     expect(screen.queryByText(/needs explicit configuration/)).toBeNull()
+  })
+
+  it('keeps a dirty guided draft behind the navigation guard until a ready save', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
+    // The committed snapshot is ready, but the guided candidate is not: the
+    // report follows the candidate and offers no Go to plans shortcut.
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse())
+    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready'))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(await screen.findByText('Configuration required — set explicit model selectors before starting workflows.')).toBeDefined()
+    expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
+    expect(screen.getByText('Defaults')).toBeDefined()
+
+    // The dirty draft cannot bypass the unsaved-changes navigation guard.
+    // The reprojection of the edited pair echoes the edited texts.
+    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce({ ...guidedFormResponse(), aflow_toml: '# mine\n' })
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# mine\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
+    expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+    expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
+
+    // Only a successful ready save navigates to Plans.
+    fireEvent.click(screen.getByRole('button', { name: 'Guided settings' }))
+    await screen.findByText('Defaults')
+    fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
+    await screen.findByLabelText('New plan filename')
+    expect(api.saveProjectConfig).toHaveBeenCalledWith('alpha', expect.objectContaining({
+      aflow_toml: '# mine\n',
+      expected_revision: configPayload('ready').revision,
+    }))
   })
 
   it('shows project load errors and offers retry without inventing choices', async () => {

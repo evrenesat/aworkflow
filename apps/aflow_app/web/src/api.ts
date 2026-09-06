@@ -3,6 +3,8 @@ import type {
   PlanDocument,
   PlanStatus,
   ProjectConfig,
+  ProjectConfigFormRequest,
+  ProjectConfigFormResponse,
   ProjectConfigSaveRequest,
   ProjectConfigValidateRequest,
   ProjectCreateRequest,
@@ -224,6 +226,21 @@ export async function validateProjectConfig(
   return fetchJson<ConfigValidation>(
     `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/validate`,
     { method: 'POST', body: JSON.stringify(request) },
+  )
+}
+
+/**
+ * Transform one candidate pair (plus at most one typed action) through the
+ * pure guided form.  The endpoint never saves: no revision is sent.
+ */
+export async function postProjectConfigForm(
+  projectId: string,
+  request: ProjectConfigFormRequest,
+  options: { signal?: AbortSignal } = {},
+): Promise<ProjectConfigFormResponse> {
+  return fetchJson<ProjectConfigFormResponse>(
+    `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/form`,
+    { method: 'POST', body: JSON.stringify(request), signal: options.signal },
   )
 }
 

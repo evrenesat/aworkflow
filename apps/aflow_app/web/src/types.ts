@@ -90,6 +90,93 @@ export interface ConfigBlockedRun {
   status: string
 }
 
+/** Guided-config contract mirroring the server's pure form endpoint. */
+export interface GuidedProfileSummary {
+  model: string | null
+  effort: string | null
+}
+
+export interface GuidedWorkflowStepSummaries {
+  declared_steps: string[]
+  first_step: string | null
+  executable_steps: string[] | null
+  first_executable_step: string | null
+}
+
+export interface GuidedFormProjection {
+  default_workflow: string | null
+  max_turns: number | null
+  harnesses: Record<string, Record<string, GuidedProfileSummary>>
+  roles: Record<string, string>
+  teams: Record<string, { roles: Record<string, string> }>
+  workflow_default_teams: Record<string, string | null>
+  workflows: Record<string, GuidedWorkflowStepSummaries>
+}
+
+export interface GuidedConfiguredChoices {
+  harnesses: string[]
+  profiles: Record<string, string[]>
+  selectors: string[]
+  roles: string[]
+  teams: string[]
+  workflows: string[]
+}
+
+export interface GuidedHarnessSuggestion {
+  name: string
+  supports_effort: boolean
+  custom_model_supported: boolean
+}
+
+export interface GuidedProfileSuggestion {
+  harness: string
+  profile: string
+  model: string | null
+  effort: string | null
+}
+
+export interface GuidedSuggestions {
+  label: string
+  harnesses: GuidedHarnessSuggestion[]
+  profiles: GuidedProfileSuggestion[]
+  note: string
+}
+
+export interface GuidedStarterDefaults {
+  workflow: string
+  team: null
+  main_branch: string
+  main_branch_source: 'git_head' | 'fallback'
+}
+
+export type GuidedConfigAction =
+  | { type: 'build_starter'; workflow: string; main_branch: string; team?: string | null }
+  | { type: 'set_default_workflow'; value: string }
+  | { type: 'set_max_turns'; value: number | null }
+  | { type: 'upsert_profile'; harness: string; profile: string; model?: string | null; effort?: string | null }
+  | { type: 'set_global_role'; role: string; selector: string }
+  | { type: 'add_team'; team: string }
+  | { type: 'set_team_role'; team: string; role: string; selector: string }
+  | { type: 'set_workflow_default_team'; workflow: string; team: string | null }
+
+export interface ProjectConfigFormRequest {
+  aflow_toml: string
+  workflows_toml: string
+  action?: GuidedConfigAction | null
+}
+
+export interface ProjectConfigFormResponse {
+  aflow_toml: string
+  workflows_toml: string
+  changed: boolean
+  validation: ConfigValidation
+  form: GuidedFormProjection | null
+  syntax_issues: ConfigValidationIssue[]
+  choices: GuidedConfiguredChoices
+  suggestions: GuidedSuggestions
+  starter_defaults: GuidedStarterDefaults | null
+}
+
 export type PlanStatus = 'todo' | 'in_progress' | 'done'
 
 export interface PlanDocument {
