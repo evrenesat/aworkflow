@@ -18,6 +18,33 @@ describe('workflow control API client', () => {
     expect(window.localStorage.length).toBe(0)
   })
 
+  it('reads bounded project discovery with authentication only as a header', async () => {
+    api.setAuthToken('test-token')
+    mockOkJson({
+      schema_version: 1,
+      managed_root: '/srv/code',
+      candidates: [
+        {
+          relative_path: 'tools/kilo',
+          display_name: 'Kilo',
+          registered_project_id: null,
+          addable: true,
+          add_blocker: null,
+        },
+      ],
+      visited_entries: 4,
+      skipped_unreadable: 1,
+      truncated: false,
+      limits: { max_visited_entries: 500, max_candidates: 100 },
+    })
+    const discovery = await api.getProjectDiscovery()
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/project-discovery', expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+    }))
+    expect(discovery.candidates[0].relative_path).toBe('tools/kilo')
+    expect(discovery.candidates[0].addable).toBe(true)
+  })
+
   it('uses revisioned project plan routes', async () => {
     mockOkJson({ project_id: 'project-1', name: 'demo.md', path: 'plans/todo/demo.md', status: 'todo', revision: 'a'.repeat(64), size_bytes: 6 }, 201)
     await api.createProjectPlan('project-1', { name: 'demo.md', content: '# Plan' })

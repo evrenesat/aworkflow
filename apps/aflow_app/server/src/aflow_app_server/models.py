@@ -224,6 +224,24 @@ class ProjectConfigValidatePayload(CanonicalTransportModel):
     workflows_toml: str
 
 
+class ProjectDiscoveryCandidateModel(CanonicalTransportModel):
+    relative_path: str
+    display_name: str
+    registered_project_id: str | None = None
+    addable: bool
+    add_blocker: str | None = None
+
+
+class ProjectDiscoveryResponse(CanonicalTransportModel):
+    schema_version: int
+    managed_root: str
+    candidates: tuple[ProjectDiscoveryCandidateModel, ...]
+    visited_entries: int
+    skipped_unreadable: int
+    truncated: bool
+    limits: Mapping[str, int]
+
+
 def canonical_contract_payloads() -> dict[str, dict[str, Any]]:
     """Expose field names used by API tests to guard canonical-model drift."""
     samples = {

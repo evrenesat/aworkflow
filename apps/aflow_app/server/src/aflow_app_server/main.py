@@ -56,6 +56,7 @@ from .models import (
     ProjectConfigResponse,
     ProjectConfigSavePayload,
     ProjectConfigValidatePayload,
+    ProjectDiscoveryResponse,
     ProjectListResponse,
     ProjectResponse,
     RunControlPayload,
@@ -83,6 +84,7 @@ from .project_config_service import (
     ProjectConfigRunBlocked,
     ProjectConfigSnapshot,
 )
+from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
 from .project_registry import ProjectRegistry, ProjectRegistryError
 from .project_service import (
     ProjectRequest,
@@ -972,6 +974,26 @@ def list_projects(
 ) -> list[dict[str, Any]]:
     """List only explicitly registered projects."""
     return [payload for record in registry.list_records() if (payload := _project_payload(registry, record.id))]
+
+
+@app.get(
+    "/api/project-discovery",
+    response_model=ProjectDiscoveryResponse,
+    tags=["projects"],
+)
+def get_project_discovery(
+    _: str = Depends(verify_token),
+    registry: ProjectRegistry = Depends(get_project_registry),
+) -> ProjectDiscoveryResponse:
+    """List bounded existing Git roots; read-only and never an allowlist."""
+    try:
+        payload = discover_projects(registry)
+    except ProjectDiscoveryUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "discovery_unavailable"},
+        )
+    return ProjectDiscoveryResponse.model_validate(payload)
 
 
 @app.post("/api/projects", status_code=status.HTTP_201_CREATED)

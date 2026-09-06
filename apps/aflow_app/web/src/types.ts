@@ -29,6 +29,27 @@ export interface ProjectCreateResult {
   readiness: ProjectReadiness
 }
 
+export interface ProjectDiscoveryCandidate {
+  relative_path: string
+  display_name: string
+  registered_project_id: string | null
+  addable: boolean
+  add_blocker: string | null
+}
+
+export interface ProjectDiscovery {
+  schema_version: number
+  managed_root: string
+  candidates: ProjectDiscoveryCandidate[]
+  visited_entries: number
+  skipped_unreadable: number
+  truncated: boolean
+  limits: {
+    max_visited_entries: number
+    max_candidates: number
+  }
+}
+
 export interface ConfigValidationIssue {
   document: string | null
   line: number | null

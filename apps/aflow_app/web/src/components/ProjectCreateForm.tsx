@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import type { ProjectCreateRequest, ProjectCreateResult } from '../types'
+import type { ProjectCreateRequest, ProjectCreateResult, ProjectDiscoveryCandidate } from '../types'
 
 interface ProjectCreateFormProps {
+  suggestions: ProjectDiscoveryCandidate[]
   onSubmit: (request: ProjectCreateRequest) => Promise<ProjectCreateResult>
   onCancel: () => void
 }
@@ -9,9 +10,11 @@ interface ProjectCreateFormProps {
 /**
  * Typed create/register form for one canonical registered project.  Every
  * field maps to the server contract; there is no free-form filesystem input
- * beyond the managed-root relative path the registry accepts.
+ * beyond the managed-root relative path the registry accepts.  In register
+ * mode, discovered candidates act as an accessible suggestion list while the
+ * relative path stays manually editable for deeper projects.
  */
-export function ProjectCreateForm({ onSubmit, onCancel }: ProjectCreateFormProps) {
+export function ProjectCreateForm({ suggestions, onSubmit, onCancel }: ProjectCreateFormProps) {
   const [mode, setMode] = useState<'create' | 'register'>('create')
   const [path, setPath] = useState('')
   const [displayName, setDisplayName] = useState('')
@@ -25,13 +28,16 @@ export function ProjectCreateForm({ onSubmit, onCancel }: ProjectCreateFormProps
 
   async function handleSubmit() {
     if (!path.trim() || busy) return
+    // Hidden starter fields must never be submitted: register mode without
+    // configuration initialization writes no starter values at all.
+    const sendStarterValues = mode !== 'register' || initializeConfig
     const request: ProjectCreateRequest = {
       mode,
       path: path.trim(),
       display_name: displayName.trim() || null,
       main_branch: mainBranch.trim() || 'main',
-      initial_workflow: initialWorkflow.trim() || null,
-      initial_team: initialTeam.trim() || null,
+      initial_workflow: sendStarterValues ? initialWorkflow.trim() || null : null,
+      initial_team: sendStarterValues ? initialTeam.trim() || null : null,
     }
     if (mode === 'register') {
       request.initialize_git = initializeGit
@@ -47,6 +53,8 @@ export function ProjectCreateForm({ onSubmit, onCancel }: ProjectCreateFormProps
       setBusy(false)
     }
   }
+
+  const showStarterSettings = mode === 'create' || initializeConfig
 
   return (
     <form
@@ -89,9 +97,36 @@ export function ProjectCreateForm({ onSubmit, onCancel }: ProjectCreateFormProps
         </p>
       ) : (
         <p className="text-xs text-dim">
-          Registering records an existing directory beneath the managed root. Existing
+          Adding records an existing directory beneath the managed root. Existing
           commits, files, and configuration are never modified.
         </p>
+      )}
+
+      {mode === 'register' && suggestions.length > 0 && (
+        <fieldset className="form-fieldset">
+          <legend className="text-sm text-dim">Discovered candidates</legend>
+          <ul className="suggestion-list" aria-label="Discovered project candidates">
+            {suggestions.map((candidate) => (
+              <li key={candidate.relative_path}>
+                <button
+                  type="button"
+                  className="suggestion-option"
+                  onClick={() => {
+                    setPath(candidate.relative_path)
+                    if (!displayName.trim()) setDisplayName(candidate.display_name)
+                  }}
+                >
+                  <span style={{ fontWeight: 600 }}>{candidate.display_name}</span>
+                  <span className="text-xs text-dim mono">{candidate.relative_path}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+          <p className="text-xs text-dim">
+            Discovery scans two directory levels beneath the managed root; deeper projects
+            can be entered by relative path below.
+          </p>
+        </fieldset>
       )}
 
       <label className="dashboard-field">
@@ -128,25 +163,29 @@ export function ProjectCreateForm({ onSubmit, onCancel }: ProjectCreateFormProps
             onChange={(event) => setMainBranch(event.target.value)}
           />
         </label>
-        <label className="dashboard-field">
-          <span>Initial workflow (optional)</span>
-          <input
-            className="input mono"
-            aria-label="Initial workflow"
-            value={initialWorkflow}
-            onChange={(event) => setInitialWorkflow(event.target.value)}
-          />
-          <span className="text-xs text-dim">Starter default when empty.</span>
-        </label>
-        <label className="dashboard-field">
-          <span>Initial team (optional)</span>
-          <input
-            className="input mono"
-            aria-label="Initial team"
-            value={initialTeam}
-            onChange={(event) => setInitialTeam(event.target.value)}
-          />
-        </label>
+        {showStarterSettings && (
+          <>
+            <label className="dashboard-field">
+              <span>Initial workflow (optional)</span>
+              <input
+                className="input mono"
+                aria-label="Initial workflow"
+                value={initialWorkflow}
+                onChange={(event) => setInitialWorkflow(event.target.value)}
+              />
+              <span className="text-xs text-dim">Starter default when empty.</span>
+            </label>
+            <label className="dashboard-field">
+              <span>Initial team (optional)</span>
+              <input
+                className="input mono"
+                aria-label="Initial team"
+                value={initialTeam}
+                onChange={(event) => setInitialTeam(event.target.value)}
+              />
+            </label>
+          </>
+        )}
       </div>
 
       {mode === 'register' && (
@@ -176,6 +215,7 @@ export function ProjectCreateForm({ onSubmit, onCancel }: ProjectCreateFormProps
           </label>
           <p className="text-xs text-dim">
             Never overwrites existing <code>aflow.toml</code> / <code>workflows.toml</code>.
+            Optional starter settings appear only when this is chosen.
           </p>
         </div>
       )}

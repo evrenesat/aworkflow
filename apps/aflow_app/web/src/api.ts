@@ -7,6 +7,7 @@ import type {
   ProjectConfigValidateRequest,
   ProjectCreateRequest,
   ProjectCreateResult,
+  ProjectDiscovery,
   ProjectInfo,
   ControlPlaneCapabilities,
   ControlPlanePlan,
@@ -118,6 +119,10 @@ function buildQuery(params: Record<string, string | number | boolean | string[] 
 
 export async function listProjects(): Promise<ProjectInfo[]> {
   return fetchJson<ProjectInfo[]>(`${API_BASE}/projects`)
+}
+
+export async function getProjectDiscovery(): Promise<ProjectDiscovery> {
+  return fetchJson<ProjectDiscovery>(`${API_BASE}/project-discovery`)
 }
 
 export async function getProject(projectId: string): Promise<ProjectInfo> {

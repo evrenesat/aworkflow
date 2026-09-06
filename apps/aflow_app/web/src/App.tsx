@@ -299,7 +299,7 @@ export function App() {
             loading={projectsLoading}
             error={projectsError}
             onSelectProject={openProject}
-            onRefresh={() => void loadProjects()}
+            onRefresh={loadProjects}
             onCreate={handleCreateProject}
             onUnregister={handleUnregister}
           />
