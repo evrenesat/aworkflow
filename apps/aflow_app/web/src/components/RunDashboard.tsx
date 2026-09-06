@@ -183,7 +183,7 @@ function managerOutcome(context: RunContext | null): ManagerOutcome | null {
   if (!managerContext) return null
   let decision: string | null = null
   const extract = Array.isArray(managerContext.run_extract) ? managerContext.run_extract : []
-  const decisions = Array.isArray(managerContext.manager_decisions)
+  const decisions = Array.isArray(managerContext.manager_decisions) && managerContext.manager_decisions.length > 0
     ? managerContext.manager_decisions
     : extract.filter((entry) => typeof entry === 'object' && entry !== null && entry.kind === 'manager_decision')
       .map((entry) => ({

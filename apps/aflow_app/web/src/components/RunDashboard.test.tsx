@@ -104,6 +104,7 @@ describe('RunDashboard', () => {
             checkpoints: [{ index: 1, name: 'Setup' }, { index: 2, name: 'Build' }],
             current_checkpoint: { index: 2, name: 'Build' },
           },
+          manager_decisions: [],
           run_extract: [{ kind: 'manager_decision', number: 4, routing: { action: 'transition' }, semantic_summary: 'implementation finished' }],
           finished_turn: { turn_number: 3, step_name: 'implement', status: 'completed', returncode: 0, semantic_result: { result: 'implemented the feature' } },
         },
@@ -503,7 +504,7 @@ describe('RunDashboard', () => {
     })
     vi.mocked(api.getRunContext).mockResolvedValue({
       run_id: 'run-owned', level: 'lite', schema_version: 1,
-      data: { manager_context: { plan_state: { is_complete: true, checkpoints: [{ index: 1, name: 'Done' }], current_checkpoint: null }, run_extract: [
+      data: { manager_context: { manager_decisions: [], plan_state: { is_complete: true, checkpoints: [{ index: 1, name: 'Done' }], current_checkpoint: null }, run_extract: [
         { kind: 'manager_decision', number: 1, routing: { action: 'continue' }, semantic_summary: 'checkpoint complete' },
       ] } },
     })
