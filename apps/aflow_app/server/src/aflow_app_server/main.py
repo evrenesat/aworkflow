@@ -13,6 +13,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
@@ -33,6 +34,12 @@ from aflow.control_plane import (
 from aflow.control_plane.persistence import PersistenceError
 from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict
 
+from .browser_session import (
+    SESSION_COOKIE_NAME,
+    SESSION_MAX_AGE_SECONDS,
+    encode_session,
+    verify_session,
+)
 from .config import ServerConfig
 from .control_plane_service import (
     ControlPlaneServiceConfig,
@@ -274,7 +281,13 @@ security = HTTPBearer(auto_error=False)
 
 
 def _verify_bearer_token(provided_token: str | None, config: ServerConfig) -> str:
-    """Verify a header bearer credential for every authenticated transport."""
+    """Verify a header bearer credential and return the matched token value.
+
+    Returning the exact value that passed the constant-time comparison lets
+    callers that mint derived credentials (the browser session) use the same
+    token epoch that authenticated the request, instead of rereading the
+    possibly rotated deployment token.
+    """
     try:
         expected = config.current_auth_token()
     except ValueError:
@@ -285,7 +298,7 @@ def _verify_bearer_token(provided_token: str | None, config: ServerConfig) -> st
             detail={"code": "unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return "authenticated"
+    return expected
 
 
 def _bearer_token_from_header(authorization: str | None) -> str | None:
@@ -298,16 +311,80 @@ def _bearer_token_from_header(authorization: str | None) -> str | None:
 
 
 async def verify_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     config: ServerConfig = Depends(get_config),
 ) -> str:
-    """Verify one header-only bearer token using constant-time comparison."""
-    provided_token = (
-        credentials.credentials
-        if credentials and credentials.scheme.lower() == "bearer"
-        else None
+    """Authenticate a request by explicit header bearer or browser session.
+
+    A supplied Authorization header must be a valid bearer credential; an
+    invalid or malformed header is rejected rather than falling back to the
+    cookie. A session cookie is accepted only without an Authorization header,
+    and cookie-authenticated unsafe methods additionally require an exact
+    same-origin Origin header. MCP transports keep header-only authentication.
+    """
+    authorization = request.headers.get("authorization")
+    if authorization is not None:
+        return _verify_bearer_token(_bearer_token_from_header(authorization), config)
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    if not cookie:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "unauthorized"},
+        )
+    try:
+        auth_token = config.current_auth_token()
+    except ValueError:
+        auth_token = ""
+    try:
+        if not auth_token:
+            raise ValueError("authentication token unavailable")
+        verify_session(cookie, auth_token)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "unauthorized"},
+        )
+    if request.method in _UNSAFE_METHODS and not _same_origin(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "origin_required"},
+        )
+    return "authenticated"
+
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _same_origin(request: Request) -> bool:
+    """Require an Origin header exactly matching the request's own origin."""
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        return False
+    parsed = urlsplit(origin)
+    if not parsed.scheme or not parsed.hostname:
+        return False
+    url = request.url
+    default_ports = {"http": 80, "https": 443}
+    origin_port = parsed.port or default_ports.get(parsed.scheme)
+    request_port = url.port or default_ports.get(url.scheme)
+    return (
+        parsed.scheme == url.scheme
+        and parsed.hostname == url.hostname
+        and origin_port == request_port
     )
-    return _verify_bearer_token(provided_token, config)
+
+
+def _set_session_cookie(response: Response, value: str, max_age: int) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        value,
+        max_age=max_age,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
 
 
 def get_project_service() -> ProjectService:
@@ -455,6 +532,41 @@ async def block_local_plugin_probe(request: Request, call_next):
             _maybe_log_plugin_probe(request, body)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     return await call_next(request)
+
+@app.middleware("http")
+async def renew_browser_session(request: Request, call_next):
+    """Roll a valid session cookie forward on marked user activity.
+
+    Only a cookie-authenticated response that explicitly carries
+    X-AFlow-Activity: 1 is renewed, so background polling and SSE traffic
+    never extend an unattended session. Failed authentication, logout, and
+    MCP transports are never renewed.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if (
+        request.headers.get("x-aflow-activity") == "1"
+        and not path.startswith("/api/session")
+        and not (path == "/mcp" or path.startswith("/mcp/"))
+        and response.status_code < status.HTTP_400_BAD_REQUEST
+    ):
+        cookie = request.cookies.get(SESSION_COOKIE_NAME)
+        config = _config
+        if cookie and config is not None:
+            try:
+                auth_token = config.current_auth_token()
+            except ValueError:
+                auth_token = ""
+            if auth_token:
+                try:
+                    verify_session(cookie, auth_token)
+                except ValueError:
+                    return response
+                _set_session_cookie(
+                    response, encode_session(auth_token), SESSION_MAX_AGE_SECONDS
+                )
+    return response
+
 
 app.dependency_overrides[plan_routes_module._get_plan_service] = get_plan_service
 app.include_router(plan_routes_module.router, dependencies=[Depends(verify_token)])
@@ -1142,6 +1254,63 @@ def validate_project_config(
     """Validate a candidate pair through the production loader without saving."""
     return _config_validation_response(
         service.validate_candidate(project_id, payload.aflow_toml, payload.workflows_toml)
+    )
+
+
+# Browser session endpoints. Login exchanges the deployment bearer for a
+# signed HttpOnly cookie; logout always clears it. No-store on all of them.
+@app.post("/api/session")
+def login_session(
+    request: Request,
+    response: Response,
+    verified_token: str = Depends(verify_token),
+) -> dict[str, bool]:
+    """Verify a bearer login credential and start a rolling browser session.
+
+    The cookie is signed with the exact token value that authenticated the
+    submitted bearer, so a rotation concurrent with login can only issue a
+    session for the submitted epoch, which the rotation itself invalidates.
+    """
+    if request.headers.get("authorization") is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "unauthorized"},
+        )
+    if not _same_origin(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "origin_required"},
+        )
+    response.headers["Cache-Control"] = "no-store"
+    _set_session_cookie(response, encode_session(verified_token), SESSION_MAX_AGE_SECONDS)
+    return {"authenticated": True}
+
+
+@app.get("/api/session")
+def session_status(
+    response: Response,
+    _: str = Depends(verify_token),
+) -> dict[str, bool]:
+    """Report an authenticated header bearer or browser session."""
+    response.headers["Cache-Control"] = "no-store"
+    return {"authenticated": True}
+
+
+@app.delete("/api/session", status_code=status.HTTP_204_NO_CONTENT)
+def logout_session(request: Request, response: Response) -> None:
+    """Expire the browser session cookie; idempotent for absent sessions."""
+    if not _same_origin(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "origin_required"},
+        )
+    response.headers["Cache-Control"] = "no-store"
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        secure=True,
+        samesite="strict",
     )
 
 
