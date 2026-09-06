@@ -88,6 +88,13 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
     && validationPair.aflow === aflowText
     && validationPair.workflows === workflowsText
 
+  // A pure candidate projection cannot know whether the files exist on disk.
+  // For the unchanged saved pair, retain the server snapshot's readiness.
+  const validationReport = !dirty && validationCurrent && snapshot
+    && snapshot.documents.length < 2 && validation?.state === 'ready'
+    ? snapshot.validation
+    : validation
+
   const hasUnsavedWork = dirty || guidedActionPending
 
   useEffect(() => {
@@ -419,11 +426,13 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         )}
       </div>
 
-      {validation && (
+      {validationReport && (
         <div className="card validation-report" aria-label="Configuration validation report">
           <div className="section-heading">
-            <strong className="text-sm">{stateText(validation.state)}</strong>
-            {validation.state === 'ready' && onReady && !dirty && validationCurrent && (
+            <strong className="text-sm">{validationReport.state === 'configuration_required' && !dirty && snapshot.documents.length < 2
+              ? 'Configuration required — build a starter draft, then save both files.'
+              : stateText(validationReport.state)}</strong>
+            {validationReport.state === 'ready' && onReady && !dirty && validationCurrent && (
               <button className="btn btn-primary btn-sm" disabled={busy !== null || guidedActionPending} onClick={() => onReady(snapshot)}>
                 Go to plans
               </button>
@@ -434,9 +443,9 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
               This report is out of date for the edited draft — validate again to refresh it.
             </p>
           )}
-          {validation.issues.length > 0 && (
+          {validationReport.issues.length > 0 && (
             <ul className="validation-issues">
-              {validation.issues.map((issue, index) => (
+              {validationReport.issues.map((issue, index) => (
                 <li key={index} className="text-sm">
                   <span className="mono">
                     {issue.document ?? 'config'}{issue.line !== null ? `:${issue.line}` : ''}
@@ -446,15 +455,15 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
               ))}
             </ul>
           )}
-          {validation.placeholders.length > 0 && (
+          {validationReport.placeholders.length > 0 && (
             <p className="text-sm text-dim">
               Placeholder selectors to replace:{' '}
-              <span className="mono">{validation.placeholders.join(', ')}</span>
+              <span className="mono">{validationReport.placeholders.join(', ')}</span>
             </p>
           )}
           <p className="text-xs text-dim">
-            Workflows: {validation.workflows.join(', ') || 'none'} · Teams:{' '}
-            {validation.teams.join(', ') || 'none'} · Roles: {validation.roles.join(', ') || 'none'}
+            Workflows: {validationReport.workflows.join(', ') || 'none'} · Teams:{' '}
+            {validationReport.teams.join(', ') || 'none'} · Roles: {validationReport.roles.join(', ') || 'none'}
           </p>
         </div>
       )}

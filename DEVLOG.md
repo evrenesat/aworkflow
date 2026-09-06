@@ -834,3 +834,5 @@
   notices; `npm run build` and `git diff --check` clean.
 
 - Deployment owner repair: all timed-out poller subprocesses now terminate their process group, including children left after parent exit; focused regressions cover TERM-ignoring descendants and both error/deferral results.
+
+- Browser preview found that pure empty-draft validation could override missing-file readiness. The settings report now preserves saved readiness for unchanged documents and explains the starter/save step before offering Plans.

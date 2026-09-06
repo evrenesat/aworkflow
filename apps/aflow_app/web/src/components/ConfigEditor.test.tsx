@@ -102,6 +102,32 @@ describe('ConfigEditor', () => {
     expect(screen.getByLabelText('aflow.toml contents').parentElement?.getAttribute('hidden')).not.toBeNull()
   })
 
+  it('keeps missing saved files unready when the pure empty draft validates', async () => {
+    const empty = {
+      ...configPayload(),
+      documents: [],
+      aflow_toml: '',
+      workflows_toml: '',
+      validation: {
+        ...configPayload().validation, placeholders: [], workflows: [], roles: [],
+      },
+    }
+    vi.mocked(api.getProjectConfig).mockResolvedValue(empty)
+    const candidate = { ...empty.validation, state: 'ready' as const }
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formPayload({
+      aflow_toml: '', workflows_toml: '', validation: candidate,
+    }))
+    vi.mocked(api.validateProjectConfig).mockResolvedValue(candidate)
+    renderEditor()
+    await screen.findByText('Set up this project')
+    expect(screen.getByText(/build a starter draft, then save both files/)).toBeDefined()
+    expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
+    await waitFor(() => expect(api.validateProjectConfig).toHaveBeenCalled())
+    expect(screen.queryByText(/the project configuration is ready/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
+  })
+
   it('shows a load error with retry instead of inventing configuration text', async () => {
     vi.mocked(api.getProjectConfig).mockRejectedValue(new Error('operation_rejected'))
     renderEditor()
