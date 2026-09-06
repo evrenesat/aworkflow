@@ -2,16 +2,20 @@ import { useCallback, useEffect, useState } from 'react'
 import type { ProjectConfig, ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
 import { readinessClass, readinessLabel } from './readiness'
 import { ProjectPicker } from './components/ProjectPicker'
+import { ProjectOverview } from './components/ProjectOverview'
 import { ConfigEditor } from './components/ConfigEditor'
 import { PlanPanel } from './components/PlanPanel'
 import { RunDashboard, type PendingSuccessorStart } from './components/RunDashboard'
 import * as api from './api'
 
-type View = 'projects' | 'configuration' | 'plans' | 'runs'
+type View = 'projects' | 'overview' | 'settings' | 'plans' | 'runs'
+
+type ProjectView = 'overview' | 'settings' | 'plans' | 'runs'
 
 const NAV_ITEMS: Array<{ view: View; label: string; needsProject: boolean }> = [
   { view: 'projects', label: 'Projects', needsProject: false },
-  { view: 'configuration', label: 'Configuration', needsProject: true },
+  { view: 'overview', label: 'Overview', needsProject: true },
+  { view: 'settings', label: 'Settings', needsProject: true },
   { view: 'plans', label: 'Plans', needsProject: true },
   { view: 'runs', label: 'Runs', needsProject: true },
 ]
@@ -115,14 +119,14 @@ export function App() {
   function switchView(next: View) {
     if (next === view) return
     if (NAV_ITEMS.find((item) => item.view === next)?.needsProject && !selectedProject) return
-    requestGuarded(`leave the configuration editor for ${next}`, () => setView(next))
+    requestGuarded(`leave the editor for ${next}`, () => setView(next))
   }
 
-  function selectProject(project: ProjectInfo) {
-    if (project.id === selectedProjectId) return
-    requestGuarded(`open ${project.display_name} with unsaved configuration edits`, () => {
+  function openProject(project: ProjectInfo) {
+    requestGuarded(`open ${project.display_name} with unsaved edits`, () => {
       setSelectedProjectId(project.id)
       setRunDashboardPlanPath(null)
+      setView('overview')
     })
   }
 
@@ -138,7 +142,7 @@ export function App() {
     }
     setProjects((current) => [...current.filter((project) => project.id !== created.id), createdProject])
     setSelectedProjectId(created.id)
-    setView(created.readiness === 'ready' ? 'plans' : 'configuration')
+    setView(created.readiness === 'ready' ? 'plans' : 'settings')
     try {
       const refreshed = await api.listProjects()
       const canonical = refreshed.find((project) => project.id === created.id)
@@ -209,25 +213,55 @@ export function App() {
       <header className="app-header">
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>aflow</h1>
-          <div className="text-xs text-dim truncate">Registered projects, configuration, plans, and daemon-owned runs</div>
+          <div className="text-xs text-dim truncate">Set up your code project, plan the work, and follow every run</div>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={handleLogout}>Logout</button>
       </header>
 
       <nav className="workspace-nav" aria-label="Workspace views">
         {NAV_ITEMS.map((item) => (
-          <button
-            key={item.view}
-            className={`nav-tab ${view === item.view ? 'active' : ''}`}
-            aria-current={view === item.view ? 'page' : undefined}
-            disabled={item.needsProject && !selectedProject}
-            title={item.needsProject && !selectedProject ? 'Select a project first' : undefined}
-            onClick={() => switchView(item.view)}
-          >
-            {item.label}
-          </button>
+          <span key={item.view} className="nav-item-group">
+            {item.view === 'overview' && <span className="nav-separator" aria-hidden="true" />}
+            <button
+              className={`nav-tab ${view === item.view ? 'active' : ''}`}
+              aria-current={view === item.view ? 'page' : undefined}
+              disabled={item.needsProject && !selectedProject}
+              title={item.needsProject && !selectedProject ? 'Open a project first' : undefined}
+              onClick={() => switchView(item.view)}
+            >
+              {item.label}
+            </button>
+          </span>
         ))}
       </nav>
+
+      {selectedProject && (
+        <div className="project-context-bar" aria-label="Selected project">
+          <div className="content-button-row" style={{ minWidth: 0 }}>
+            <strong className="truncate">{selectedProject.display_name}</strong>
+            <span className={readinessClass(selectedProject.readiness)}>
+              {readinessLabel(selectedProject.readiness)}
+            </span>
+            <span className="text-xs text-dim mono truncate">{selectedProject.current_path}</span>
+          </div>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => requestGuarded('return to the project list', () => setView('projects'))}
+          >
+            Change project
+          </button>
+          {readinessGuidance[selectedProject.readiness] && (
+            <p className="text-xs readiness-note">
+              {readinessGuidance[selectedProject.readiness]}
+              {selectedProject.readiness === 'configuration_required' && view !== 'settings' && (
+                <button className="btn btn-secondary btn-sm" onClick={() => switchView('settings')}>
+                  Open settings
+                </button>
+              )}
+            </p>
+          )}
+        </div>
+      )}
 
       {pendingSuccessorStart && view !== 'runs' && (
         <div className="notice" role="status">
@@ -252,13 +286,19 @@ export function App() {
       )}
 
       <main className="workspace-main">
+        {view === 'projects' && !selectedProject && (
+          <p className="text-xs text-dim no-project-hint" role="note">
+            Overview, Settings, Plans, and Runs become available after you open a project below.
+          </p>
+        )}
+
         {view === 'projects' && (
           <ProjectPicker
             projects={projects}
             selectedProjectId={selectedProjectId}
             loading={projectsLoading}
             error={projectsError}
-            onSelectProject={selectProject}
+            onSelectProject={openProject}
             onRefresh={() => void loadProjects()}
             onCreate={handleCreateProject}
             onUnregister={handleUnregister}
@@ -266,38 +306,29 @@ export function App() {
         )}
 
         {view !== 'projects' && !selectedProject && (
-          <div className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60%' }}>
-            <div className="text-sm text-dim">Select a registered project in the Projects view first.</div>
+          <div className="card choose-project-state">
+            <h2 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Choose a project first</h2>
+            <p className="text-sm text-dim">
+              Overview, Settings, Plans, and Runs belong to a single project. Open one from the
+              project list to continue.
+            </p>
+            <div className="dashboard-actions">
+              <button className="btn btn-primary btn-sm" onClick={() => setView('projects')}>
+                Go to Projects
+              </button>
+            </div>
           </div>
         )}
 
         {view !== 'projects' && selectedProject && (
           <div className="workspace-content">
-            <div className="card selected-project-bar">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-xs)', minWidth: 0 }}>
-                <div className="content-button-row">
-                  <strong style={{ overflowWrap: 'anywhere' }}>{selectedProject.display_name}</strong>
-                  <span className={readinessClass(selectedProject.readiness)}>
-                    {readinessLabel(selectedProject.readiness)}
-                  </span>
-                </div>
-                <span className="text-xs text-dim mono" style={{ overflowWrap: 'anywhere' }}>
-                  {selectedProject.current_path}
-                </span>
-              </div>
-              {readinessGuidance[selectedProject.readiness] && (
-                <div className="readiness-guidance">
-                  <p className="text-sm">{readinessGuidance[selectedProject.readiness]}</p>
-                  {selectedProject.readiness === 'configuration_required' && view !== 'configuration' && (
-                    <button className="btn btn-secondary btn-sm" onClick={() => switchView('configuration')}>
-                      Open configuration
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {view === 'configuration' && (
+            {view === 'overview' && (
+              <ProjectOverview
+                project={selectedProject}
+                onOpenView={(next: ProjectView | 'projects') => switchView(next)}
+              />
+            )}
+            {view === 'settings' && (
               <ConfigEditor
                 project={selectedProject}
                 onDirtyChange={handleConfigDirty}
