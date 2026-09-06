@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import select
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -350,12 +351,14 @@ def test_tty_and_non_tty_streams_receive_identical_ordered_output() -> None:
     try:
         with os.fdopen(slave, "w", encoding="utf-8") as tty_stream:
             _drive(_renderer(tty_stream))
-        tty_output = b""
-        while tty_output.count(b"\n") < 3:
-            chunk = os.read(master, 65536)
-            if not chunk:
-                break
-            tty_output += chunk
+            tty_stream.flush()
+            tty_output = b""
+            while tty_output.count(b"\n") < 3:
+                readable, _, _ = select.select((master,), (), (), 1.0)
+                assert readable, "PTY did not expose the renderer output"
+                chunk = os.read(master, 65536)
+                assert chunk, "PTY reached EOF before all renderer records"
+                tty_output += chunk
     finally:
         os.close(master)
     tty_text = tty_output.decode("utf-8")

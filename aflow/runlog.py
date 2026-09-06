@@ -530,11 +530,13 @@ def evidence_artifact_path(paths: RunPaths, kind: str, sha256: str) -> Path:
 def evidence_reference(
     paths: RunPaths, kind: str, sha256: str, byte_size: int
 ) -> EvidenceReference:
-    """Build the typed reference whose path is relative to the repository root."""
+    """Build a canonical repository-relative reference for one artifact."""
     destination = evidence_artifact_path(paths, kind, sha256)
     try:
-        relative = destination.relative_to(paths.repo_root)
-    except ValueError as exc:
+        relative = destination.resolve(strict=False).relative_to(
+            paths.repo_root.resolve()
+        )
+    except (OSError, ValueError) as exc:
         raise ValueError(
             f"evidence artifact is outside the repository: {destination}"
         ) from exc
