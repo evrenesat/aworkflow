@@ -289,7 +289,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
           {selected.status !== 'done' && (
             <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy || dirty}>
-              Move to {selected.status === 'todo' ? 'in-progress' : 'done'}
+              Move to {selected.status === 'todo' ? 'Ready' : 'Done'}
             </button>
           )}
           {selected.status === 'in_progress' && (

@@ -180,7 +180,7 @@ describe('PlanPanel', () => {
     await openPlan(todoPlan, '# Original\n')
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Draft\n' } })
 
-    const promote = screen.getByRole('button', { name: 'Move to in-progress' })
+    const promote = screen.getByRole('button', { name: 'Move to Ready' })
     expect(promote).toHaveProperty('disabled', true)
     fireEvent.click(promote)
     expect(api.promoteProjectPlan).not.toHaveBeenCalled()
@@ -192,7 +192,7 @@ describe('PlanPanel', () => {
     vi.mocked(api.promoteProjectPlan).mockResolvedValue(promoted)
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await openPlan(todoPlan, '# Plan A\n')
-    fireEvent.click(screen.getByRole('button', { name: 'Move to in-progress' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Move to Ready' }))
 
     await waitFor(() => expect(api.promoteProjectPlan).toHaveBeenCalledWith(
       'alpha', 'todo', 'plan-a.md', { expected_revision: todoPlan.revision },

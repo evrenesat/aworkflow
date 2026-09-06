@@ -252,7 +252,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         <div>
           <h3 style={{ fontWeight: 600 }}>Configuration</h3>
           <div className="text-xs text-dim">
-            Both documents are saved and validated together under one combined revision.
+            Both configuration files are checked and saved together.
           </div>
         </div>
         <span className="text-xs text-dim mono" title={snapshot.revision}>

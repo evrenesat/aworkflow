@@ -846,3 +846,5 @@
 - Retained startup-answer, idempotency and stop-before-replacement behavior. The owner corrected a test callback option typo after stopping the repair controller; validation and approval are recorded in the original checkpoint ledger.
 
 - Narrow-browser inspection found the selected Runs tab clipped offscreen. Mobile navigation now shows Projects on its own row and all four project views together without horizontal scrolling.
+
+- Plan promotion buttons now use the same Ready/Done names as the surrounding guidance; settings explain the shared save in plain language.
