@@ -761,3 +761,5 @@
 - The compact launch form offers configured workflow/team choices and previews each materialized step's role, selected profile, team/global source and model/effort details. ZCode settings are identified as external.
 - Only Ready plans with a resolved workflow preview and valid turn limit can start. Invalid extra-instruction guidance stays visible when Advanced options is closed.
 - Retained startup-answer, idempotency and stop-before-replacement behavior. The owner corrected a test callback option typo after stopping the repair controller; validation and approval are recorded in the original checkpoint ledger.
+
+- Checkpoint 6 adds project/run links, progress-first run views and Technical details. Owner repair removes URL fragments from canonical links, constructs clipboard links from validated identities, and retains the selected run across oldest-first page refreshes.

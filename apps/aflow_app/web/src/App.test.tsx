@@ -95,6 +95,7 @@ function guidedFormResponse(validation = configPayload().validation) {
 
 describe('App workspace shell', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/')
     vi.clearAllMocks()
     vi.mocked(api.getAuthToken).mockReturnValue('test-token')
     vi.mocked(api.listProjects).mockResolvedValue([])
@@ -605,4 +606,191 @@ describe('App workspace shell', () => {
     fireEvent.click(within(suggestionList).getByRole('button', { name: /Kilo/ }))
     expect((screen.getByLabelText('Relative project path') as HTMLInputElement).value).toBe('tools/kilo')
   })
+
+  describe('project and run deep links', () => {
+    const controlPlanePlan = { path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }
+    const linkedRun = {
+      run_id: 'run-linked', status: 'running', schema_version: 1, ownership: 'control_plane' as const,
+      revision: 1, reason: null, unit_name: 'aflow-run-linked.service', launch_phase: 'running',
+      workflow_name: 'managed', team: 'base', current_step: 'plan', turns_completed: 1, max_turns: 5,
+      selected_start_step: null, skipped_steps: [] as string[], restarted_from_run_id: null as string | null,
+      evidence: { manifest_created_at: '2024-01-01T00:00:00Z', plan_path: 'plans/in-progress/demo.md' },
+    }
+    let pushHistorySpy: ReturnType<typeof vi.spyOn>
+    let replaceHistorySpy: ReturnType<typeof vi.spyOn>
+
+    beforeEach(() => {
+      // happy-dom's History is inert, so links are staged through the location
+      // and push/replace contracts are asserted on the History API itself.
+      window.location.search = ''
+      window.location.hash = ''
+      pushHistorySpy = vi.spyOn(window.history, 'pushState')
+      replaceHistorySpy = vi.spyOn(window.history, 'replaceState')
+    })
+
+    afterEach(() => {
+      pushHistorySpy.mockRestore()
+      replaceHistorySpy.mockRestore()
+    })
+
+    function mockReadyWorkspace() {
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
+        { project_id: 'alpha', root: '/srv/code/alpha', schema_version: 1 },
+      ])
+      vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })
+      vi.mocked(api.listControlPlanePlans).mockResolvedValue([controlPlanePlan])
+      vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
+      vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+      vi.mocked(api.listRunEvents).mockResolvedValue([])
+      vi.mocked(api.getRunContext).mockResolvedValue({ run_id: 'run-linked', level: 'lite', data: {}, schema_version: 1 })
+    }
+
+    it('reopens exactly the linked project run after a reload', async () => {
+      window.location.search = '?project=alpha&view=runs&run=run-linked'
+      mockReadyWorkspace()
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockResolvedValue(linkedRun)
+      render(<App />)
+
+      await screen.findByRole('heading', { name: 'Run run-linked' })
+      expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
+      // The linked run was validated through the project-scoped direct endpoint.
+      expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-linked')
+      // A fully valid link needs no URL rewrite at all.
+      expect(replaceHistorySpy).not.toHaveBeenCalled()
+      expect(pushHistorySpy).not.toHaveBeenCalled()
+    })
+
+    it('removes a fragment from an otherwise canonical run link without pushing history', async () => {
+      window.location.search = '?project=alpha&view=runs&run=run-linked'
+      window.location.hash = '#fragment-sentinel'
+      mockReadyWorkspace()
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockResolvedValue(linkedRun)
+      render(<App />)
+
+      await screen.findByRole('heading', { name: 'Run run-linked' })
+      await waitFor(() => expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-linked'))
+      expect(pushHistorySpy).not.toHaveBeenCalled()
+    })
+
+    it('reflects the passively selected newest run in the Runs URL', async () => {
+      window.location.search = '?project=alpha&view=runs'
+      mockReadyWorkspace()
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [linkedRun], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockResolvedValue(linkedRun)
+      render(<App />)
+
+      await screen.findByRole('heading', { name: 'Run run-linked' })
+      expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-linked')
+      expect(pushHistorySpy).not.toHaveBeenCalled()
+    })
+
+    it('clears a stale project link with guidance instead of a substitute', async () => {
+      window.location.search = '?project=ghost&view=runs'
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      render(<App />)
+
+      await screen.findByText(/is not in the registered project list/)
+      expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
+      expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/')
+      expect(api.listControlPlaneRuns).not.toHaveBeenCalled()
+    })
+
+    it('normalizes an unknown view to Overview and rewrites the URL', async () => {
+      window.location.search = '?project=alpha&view=widgets'
+      mockReadyWorkspace()
+      render(<App />)
+
+      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+      expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('aria-current')).toBe('page')
+      // The normalization effect may flush just after the first paint.
+      await waitFor(() => expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=overview'))
+    })
+
+    it('opens Overview for a view-less project link and normalizes the URL', async () => {
+      window.location.search = '?project=alpha'
+      mockReadyWorkspace()
+      render(<App />)
+
+      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+      await waitFor(() => expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=overview'))
+    })
+
+    it('keeps the Runs view and drops a missing run id without selecting a substitute', async () => {
+      window.location.search = '?project=alpha&view=runs&run=run-gone'
+      mockReadyWorkspace()
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [linkedRun], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun)
+        .mockRejectedValueOnce(new api.ApiError(404, 'run not found', 'run_not_found'))
+        .mockResolvedValue(linkedRun)
+      render(<App />)
+
+      await screen.findByText(/is not recorded for this project/)
+      expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
+      expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs')
+      // No substitute: the recorded run stays listed but never auto-selected.
+      expect(screen.getByRole('button', { name: /run-linked running/ })).toBeDefined()
+      expect(screen.queryByRole('heading', { name: /Run run-/ })).toBeNull()
+      expect(screen.getByRole('button', { name: 'New run' })).toBeDefined()
+
+      // An explicit pick clears the stale-link guidance.
+      fireEvent.click(screen.getByRole('button', { name: /run-linked running/ }))
+      await screen.findByRole('heading', { name: 'Run run-linked' })
+      expect(screen.queryByText(/is not recorded for this project/)).toBeNull()
+    })
+
+    it('pushes run selection into the URL and restores the prior run on browser back', async () => {
+      const secondRun = { ...linkedRun, run_id: 'run-second', status: 'completed', current_step: 'review' }
+      window.location.search = '?project=alpha&view=runs&run=run-linked'
+      mockReadyWorkspace()
+      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [linkedRun, secondRun], next_cursor: null, schema_version: 1 })
+      vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-second' ? secondRun : linkedRun)
+      render(<App />)
+
+      await screen.findByRole('heading', { name: 'Run run-linked' })
+      fireEvent.click(screen.getByRole('button', { name: /run-second completed/ }))
+      await screen.findByRole('heading', { name: 'Run run-second' })
+      // An explicit pick is a history push, never a replace.
+      expect(pushHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-second')
+
+      // Browser back restores the previous validated project/run pair.
+      window.location.search = '?project=alpha&view=runs&run=run-linked'
+      fireEvent(window, new Event('popstate'))
+      await screen.findByRole('heading', { name: 'Run run-linked' })
+      expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-linked')
+      expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
+    })
+
+    it('guards browser back with unsaved edits and restores the URL on cancel', async () => {
+      window.location.search = ''
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      render(<App />)
+      fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
+      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+      fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+      await screen.findByLabelText('aflow.toml contents')
+      // Opening Settings was a user navigation: a history push.
+      expect(pushHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=settings')
+      fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# edited\n' } })
+      await screen.findByText(/Unsaved edits/)
+
+      // Back is intercepted by the existing unsaved-edits guard.
+      window.location.search = '?project=alpha&view=overview'
+      fireEvent(window, new Event('popstate'))
+      expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
+      fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+      expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
+      // Cancelling restored the URL of the visible editor.
+      expect(pushHistorySpy).toHaveBeenLastCalledWith(null, '', '/?project=alpha&view=settings')
+
+      // Leaving anyway applies the requested navigation.
+      fireEvent(window, new Event('popstate'))
+      fireEvent.click(screen.getByRole('button', { name: 'Leave anyway' }))
+      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+      expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
+    })
+  })
+
 })
