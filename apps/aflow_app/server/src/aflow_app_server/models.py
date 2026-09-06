@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -222,6 +222,160 @@ class ProjectConfigSavePayload(CanonicalTransportModel):
 class ProjectConfigValidatePayload(CanonicalTransportModel):
     aflow_toml: str
     workflows_toml: str
+
+
+class GuidedActionBase(CanonicalTransportModel):
+    """Base for the closed, discriminated guided-config action set."""
+
+    type: str
+
+
+class BuildStarterAction(GuidedActionBase):
+    type: Literal["build_starter"]
+    workflow: str = Field(min_length=1, max_length=64)
+    main_branch: str = Field(min_length=1, max_length=128)
+    team: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class SetDefaultWorkflowAction(GuidedActionBase):
+    type: Literal["set_default_workflow"]
+    value: str = Field(min_length=1, max_length=64)
+
+
+class SetMaxTurnsAction(GuidedActionBase):
+    type: Literal["set_max_turns"]
+    value: int | None = Field(default=None, ge=1)
+
+
+class UpsertProfileAction(GuidedActionBase):
+    type: Literal["upsert_profile"]
+    harness: str = Field(min_length=1, max_length=64)
+    profile: str = Field(min_length=1, max_length=64)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    effort: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class SetGlobalRoleAction(GuidedActionBase):
+    type: Literal["set_global_role"]
+    role: str = Field(min_length=1, max_length=64)
+    selector: str = Field(min_length=1, max_length=192)
+
+
+class AddTeamAction(GuidedActionBase):
+    type: Literal["add_team"]
+    team: str = Field(min_length=1, max_length=64)
+
+
+class SetTeamRoleAction(GuidedActionBase):
+    type: Literal["set_team_role"]
+    team: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1, max_length=64)
+    selector: str = Field(min_length=1, max_length=192)
+
+
+class SetWorkflowDefaultTeamAction(GuidedActionBase):
+    type: Literal["set_workflow_default_team"]
+    workflow: str = Field(min_length=1, max_length=64)
+    team: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+GuidedConfigAction = Annotated[
+    BuildStarterAction
+    | SetDefaultWorkflowAction
+    | SetMaxTurnsAction
+    | UpsertProfileAction
+    | SetGlobalRoleAction
+    | AddTeamAction
+    | SetTeamRoleAction
+    | SetWorkflowDefaultTeamAction,
+    Field(discriminator="type"),
+]
+
+
+class ProjectConfigFormPayload(CanonicalTransportModel):
+    """Strict form request: candidate pair plus zero or one typed action.
+
+    No ``expected_revision`` is accepted; the existing ``PUT /config`` remains
+    the only save boundary.
+    """
+
+    aflow_toml: str
+    workflows_toml: str
+    action: GuidedConfigAction | None = None
+
+
+class GuidedProfileSummary(CanonicalTransportModel):
+    model: str | None = None
+    effort: str | None = None
+
+
+class GuidedWorkflowStepSummaries(CanonicalTransportModel):
+    declared_steps: tuple[str, ...]
+    first_step: str | None = None
+    executable_steps: tuple[str, ...] | None = None
+    first_executable_step: str | None = None
+
+
+class GuidedTeamSummary(CanonicalTransportModel):
+    roles: Mapping[str, str]
+
+
+class GuidedFormProjection(CanonicalTransportModel):
+    default_workflow: str | None = None
+    max_turns: int | None = None
+    harnesses: Mapping[str, Mapping[str, GuidedProfileSummary]]
+    roles: Mapping[str, str]
+    teams: Mapping[str, GuidedTeamSummary]
+    workflow_default_teams: Mapping[str, str | None]
+    workflows: Mapping[str, GuidedWorkflowStepSummaries]
+
+
+class GuidedConfiguredChoices(CanonicalTransportModel):
+    harnesses: tuple[str, ...]
+    profiles: Mapping[str, tuple[str, ...]]
+    selectors: tuple[str, ...]
+    roles: tuple[str, ...]
+    teams: tuple[str, ...]
+    workflows: tuple[str, ...]
+
+
+class GuidedHarnessSuggestion(CanonicalTransportModel):
+    name: str
+    supports_effort: bool
+    custom_model_supported: bool
+
+
+class GuidedProfileSuggestion(CanonicalTransportModel):
+    harness: str
+    profile: str
+    model: str | None = None
+    effort: str | None = None
+
+
+class GuidedSuggestions(CanonicalTransportModel):
+    label: str = "suggestion"
+    harnesses: tuple[GuidedHarnessSuggestion, ...]
+    profiles: tuple[GuidedProfileSuggestion, ...]
+    note: str
+
+
+class GuidedStarterDefaults(CanonicalTransportModel):
+    workflow: str
+    team: None = None
+    main_branch: str
+    main_branch_source: Literal["git_head", "fallback"]
+
+
+class ProjectConfigFormResponse(CanonicalTransportModel):
+    aflow_toml: str
+    workflows_toml: str
+    changed: bool
+    validation: ConfigValidationModel
+    form: GuidedFormProjection | None
+    syntax_issues: tuple[ConfigValidationIssueModel, ...]
+    choices: GuidedConfiguredChoices
+    suggestions: GuidedSuggestions
+    starter_defaults: GuidedStarterDefaults | None = None
 
 
 class ProjectDiscoveryCandidateModel(CanonicalTransportModel):

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.routing import Match, Mount, get_route_path
 from starlette.types import Scope
 
+from aflow.config import ConfigError, validate_starter_main_branch
 from aflow.control_plane import (
     ControlConflictError,
     ControlIdempotencyConflict,
@@ -40,8 +42,10 @@ from .control_plane_service import (
     ControlPlaneUnavailableError,
     ProjectNotAllowedError,
 )
+from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
 from .models import (
+    BuildStarterAction,
     CapabilityResponse,
     ConfigValidationIssueModel,
     ConfigValidationModel,
@@ -50,9 +54,12 @@ from .models import (
     EventResponse,
     EventTailResponse,
     GlobalCapabilitiesResponse,
+    GuidedStarterDefaults,
     OwnerStopPayload,
     PlanListResponse,
     PlanResponse,
+    ProjectConfigFormPayload,
+    ProjectConfigFormResponse,
     ProjectConfigResponse,
     ProjectConfigSavePayload,
     ProjectConfigValidatePayload,
@@ -533,6 +540,18 @@ async def plan_revision_conflict_handler(
         status.HTTP_409_CONFLICT,
         "revision_conflict",
         current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(GuidedConfigError)
+async def guided_config_rejected_handler(
+    _: Request, exc: GuidedConfigError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "guided_config_rejected",
+        reason=exc.code,
+        message=" ".join(str(exc).split())[:300],
     )
 
 
@@ -1143,6 +1162,83 @@ def validate_project_config(
     return _config_validation_response(
         service.validate_candidate(project_id, payload.aflow_toml, payload.workflows_toml)
     )
+
+
+_BRANCH_PROBE_TIMEOUT_SECONDS = 15.0
+
+
+def _probe_main_branch(root: Path) -> GuidedStarterDefaults:
+    """Read the registered root's current branch with a bounded Git probe."""
+    branch: str | None = None
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(root), "symbolic-ref", "--short", "HEAD"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_BRANCH_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    if completed is not None and completed.returncode == 0:
+        candidate = completed.stdout.strip()
+        if candidate and not candidate.startswith("-"):
+            try:
+                # Advertise a probed branch only when starter rendering would
+                # accept it; otherwise fall back to the labeled default.
+                branch = validate_starter_main_branch(candidate)
+            except ConfigError:
+                branch = None
+    if branch is None:
+        return GuidedStarterDefaults(
+            workflow="implement",
+            main_branch="main",
+            main_branch_source="fallback",
+        )
+    return GuidedStarterDefaults(
+        workflow="implement", main_branch=branch, main_branch_source="git_head"
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/config/form",
+    response_model=ProjectConfigFormResponse,
+    tags=["projects"],
+)
+def project_config_form(
+    project_id: str,
+    payload: ProjectConfigFormPayload,
+    _: str = Depends(verify_token),
+    registry: ProjectRegistry = Depends(get_project_registry),
+) -> ProjectConfigFormResponse:
+    """Transform a candidate pair through the pure guided form; never saves.
+
+    The endpoint accepts no ``expected_revision`` and performs no registered
+    project write or reload.  The only registry use is resolving the registered
+    root for a bounded Git branch probe when starter defaults are requested.
+    """
+    starter_defaults: GuidedStarterDefaults | None = None
+    wants_starter = (
+        payload.action is None or isinstance(payload.action, BuildStarterAction)
+    ) and payload.aflow_toml == "" and payload.workflows_toml == ""
+    if wants_starter:
+        if registry.get(project_id) is None:
+            raise ProjectNotAllowedError("project is not registered")
+        try:
+            _, root = registry.resolve(project_id)
+        except ProjectRegistryError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "project_root_unavailable"},
+            ) from exc
+        starter_defaults = _probe_main_branch(root)
+    result = guided_form_response(
+        payload.aflow_toml, payload.workflows_toml, payload.action
+    )
+    response = ProjectConfigFormResponse.model_validate(result)
+    if starter_defaults is not None:
+        response = response.model_copy(update={"starter_defaults": starter_defaults})
+    return response
 
 
 # Health check (no auth required)

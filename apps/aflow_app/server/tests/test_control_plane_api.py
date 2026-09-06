@@ -799,3 +799,327 @@ def test_rest_typed_successor_start_exposes_lineage_and_keeps_instruction_text_t
         },
     )
     assert rejected.status_code == 422
+
+
+def test_project_config_form_is_pure_authenticated_and_action_bounded(
+    control_client,
+) -> None:
+    from aflow.config import render_starter_documents
+
+    client, root, _, _ = control_client
+    config_dir = root / ".aflow" / "config"
+    before = (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    )
+
+    unauthenticated = TestClient(app).post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "", "workflows_toml": ""},
+    )
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json() == {"detail": {"code": "unauthorized"}}
+
+    read = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    aflow_text = read["aflow_toml"]
+    workflows_text = read["workflows_toml"]
+
+    noop = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": aflow_text, "workflows_toml": workflows_text},
+    )
+    assert noop.status_code == 200
+    body = noop.json()
+    assert body["changed"] is False
+    assert body["aflow_toml"] == aflow_text
+    assert body["form"]["default_workflow"] == "managed"
+    assert body["starter_defaults"] is None
+
+    updated = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "set_max_turns", "value": 9},
+        },
+    )
+    assert updated.status_code == 200
+    updated_body = updated.json()
+    assert updated_body["changed"] is True
+    assert "max_turns = 9" in updated_body["aflow_toml"]
+    assert updated_body["validation"]["state"] == "ready"
+
+    rejected = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "set_default_workflow", "value": "ghost"},
+        },
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "guided_config_rejected"
+    assert rejected.json()["detail"]["reason"] == "unknown_workflow"
+
+    unknown_action = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "delete_profile", "harness": "codex"},
+        },
+    )
+    assert unknown_action.status_code == 422
+
+    unknown_field = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "set_max_turns", "value": 5, "force": True},
+        },
+    )
+    assert unknown_field.status_code == 422
+
+    revision_field = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "expected_revision": read["revision"],
+        },
+    )
+    assert revision_field.status_code == 422
+
+    syntax = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "[aflow\n", "workflows_toml": workflows_text},
+    )
+    assert syntax.status_code == 200
+    assert syntax.json()["changed"] is False
+    assert syntax.json()["form"] is None
+    assert syntax.json()["syntax_issues"][0]["document"] == "aflow.toml"
+
+    assert (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    ) == before
+
+
+def test_project_config_form_build_starter_from_empty_pair(control_client) -> None:
+    from aflow.config import render_starter_documents
+
+    client, root, _, _ = control_client
+    probe = subprocess.run(
+        ("git", "-C", str(root), "symbolic-ref", "--short", "HEAD"),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    empty = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "", "workflows_toml": ""},
+    )
+    assert empty.status_code == 200
+    assert empty.json()["starter_defaults"]["main_branch"] == probe
+    assert empty.json()["starter_defaults"]["workflow"] == "implement"
+
+    built = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": "",
+            "workflows_toml": "",
+            "action": {
+                "type": "build_starter",
+                "workflow": "implement",
+                "main_branch": probe,
+            },
+        },
+    )
+    assert built.status_code == 200
+    expected_aflow, expected_workflows = render_starter_documents(
+        "implement", None, probe
+    )
+    assert built.json()["aflow_toml"] == expected_aflow
+    assert built.json()["workflows_toml"] == expected_workflows
+    assert built.json()["validation"]["state"] == "configuration_required"
+    assert built.json()["starter_defaults"]["main_branch_source"] == "git_head"
+
+    nonempty = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": "[aflow]\n",
+            "workflows_toml": "",
+            "action": {
+                "type": "build_starter",
+                "workflow": "implement",
+                "main_branch": "main",
+            },
+        },
+    )
+    assert nonempty.status_code == 422
+    assert (
+        nonempty.json()["detail"]["reason"] == "build_starter_requires_empty_pair"
+    )
+
+    # Nothing was written or reloaded: the committed pair is untouched.
+    reread = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    assert reread["aflow_toml"] != expected_aflow
+
+
+def test_project_config_form_rejects_zcode_model_with_explanation(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    read = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+
+    rejected = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": read["aflow_toml"],
+            "workflows_toml": read["workflows_toml"],
+            "action": {
+                "type": "upsert_profile",
+                "harness": "zcode",
+                "profile": "p",
+                "model": "gpt",
+            },
+        },
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "guided_config_rejected"
+    assert rejected.json()["detail"]["reason"] == "zcode_managed_by_zcode"
+    assert "ZCode" in rejected.json()["detail"]["message"]
+
+
+def test_project_config_form_dotted_profiles_and_bounded_rejections(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    config_dir = root / ".aflow" / "config"
+    before = (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    )
+    read = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    aflow_text = read["aflow_toml"]
+    workflows_text = read["workflows_toml"]
+
+    created = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {
+                "type": "upsert_profile",
+                "harness": "opencode",
+                "profile": "glm-5.3",
+                "model": "glm-5.3",
+            },
+        },
+    )
+    assert created.status_code == 200
+    created_body = created.json()
+    assert created_body["form"]["harnesses"]["opencode"]["glm-5.3"]["model"] == (
+        "glm-5.3"
+    )
+
+    assigned = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": created_body["aflow_toml"],
+            "workflows_toml": workflows_text,
+            "action": {
+                "type": "set_global_role",
+                "role": "worker",
+                "selector": "opencode.glm-5.3",
+            },
+        },
+    )
+    assert assigned.status_code == 200
+    assert 'worker = "opencode.glm-5.3"' in assigned.json()["aflow_toml"]
+    assert "opencode.glm-5.3" in assigned.json()["choices"]["selectors"]
+
+    bounded_cases = [
+        # Starter-invalid input must stay a bounded 422, never HTTP 500.
+        {
+            "type": "set_default_workflow",
+            "value": "bad name!",
+        },
+        # Reserved role and unknown global role are rejected before mutation.
+        {
+            "type": "set_global_role",
+            "role": "prompts",
+            "selector": "codex.test",
+        },
+        {
+            "type": "set_team_role",
+            "team": "ghost-team",
+            "role": "ghost-role",
+            "selector": "codex.test",
+        },
+        # Supplied ZCode model/effort, explicit null included, is rejected.
+        {"type": "upsert_profile", "harness": "zcode", "profile": "p", "model": None},
+    ]
+    expected_reasons = [
+        "invalid_action_value",
+        "reserved_role",
+        "unknown_role",
+        "zcode_managed_by_zcode",
+    ]
+    for action, reason in zip(bounded_cases, expected_reasons, strict=True):
+        rejected = client.post(
+            f"/api/projects/{PROJECT_ID}/config/form",
+            json={
+                "aflow_toml": aflow_text,
+                "workflows_toml": workflows_text,
+                "action": action,
+            },
+        )
+        assert rejected.status_code == 422, action
+        assert rejected.json()["detail"]["code"] == "guided_config_rejected"
+        assert rejected.json()["detail"]["reason"] == reason
+
+    # Rejections never wrote or reloaded the registered project.
+    assert (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    ) == before
+
+
+def test_project_config_form_branch_probe_falls_back_for_renderer_incompatible_branch(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    subprocess.run(
+        ("git", "-C", str(root), "checkout", "-q", "-b", "feature/foo+bar"),
+        check=True,
+    )
+
+    empty = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "", "workflows_toml": ""},
+    )
+    assert empty.status_code == 200
+    assert empty.json()["starter_defaults"] == {
+        "workflow": "implement",
+        "team": None,
+        "main_branch": "main",
+        "main_branch_source": "fallback",
+    }
+
+    built = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": "",
+            "workflows_toml": "",
+            "action": {
+                "type": "build_starter",
+                "workflow": "implement",
+                "main_branch": "main",
+            },
+        },
+    )
+    assert built.status_code == 200
+    assert built.json()["changed"] is True
