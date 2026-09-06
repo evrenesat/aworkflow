@@ -166,6 +166,13 @@ export function App() {
 
   const handleConfigDirty = useCallback((dirty: boolean) => setConfigDirty(dirty), [])
   const handlePlanDirty = useCallback((dirty: boolean) => setPlanDirty(dirty), [])
+  const handleConfigSaved = useCallback((saved: ProjectConfig) => {
+    const readiness = saved.validation.state
+    if (readiness === 'invalid') return
+    setProjects((current) => current.map((project) => (
+      project.id === saved.project_id ? { ...project, readiness } : project
+    )))
+  }, [])
   const handleConfigReady = useCallback((saved: ProjectConfig) => {
     if (saved.validation.state !== 'ready') return
     setProjects((current) => current.map((project) => (
@@ -294,6 +301,7 @@ export function App() {
               <ConfigEditor
                 project={selectedProject}
                 onDirtyChange={handleConfigDirty}
+                onSaved={handleConfigSaved}
                 onReady={handleConfigReady}
               />
             )}

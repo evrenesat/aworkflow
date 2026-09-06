@@ -722,3 +722,10 @@
 - Manager artifacts, worker turn artifacts, and lifecycle failure metadata now
   use their existing nonzero-result handling without storing a traceback or
   prompt-bearing launch diagnostic.
+
+### Browser verification: live status and manager display
+
+- Config saves immediately update the shell readiness badge.
+- Healthy event streams refresh canonical run and bounded context summaries, coalescing bursts and ignoring stale requests while preserving the last snapshot on failure.
+- Manager outcomes read the canonical run-extract schema; completed plans display completed checkpoints.
+- Verified real-provider browser start, live controls, owner stop and successor completion; added regressions for the observed display gaps.

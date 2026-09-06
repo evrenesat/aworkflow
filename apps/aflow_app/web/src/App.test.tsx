@@ -191,6 +191,9 @@ describe('App workspace shell', () => {
     await screen.findByLabelText('aflow.toml contents')
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# ready\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save both files' }))
+    await waitFor(() => expect(screen.getByText('Ready')).toBeDefined())
+    expect(screen.queryByText(/needs explicit configuration/)).toBeNull()
+    expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
     fireEvent.click(await screen.findByRole('button', { name: 'Go to plans' }))
 
     await screen.findByLabelText('New plan filename')

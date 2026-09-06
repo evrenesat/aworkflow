@@ -104,7 +104,7 @@ describe('RunDashboard', () => {
             checkpoints: [{ index: 1, name: 'Setup' }, { index: 2, name: 'Build' }],
             current_checkpoint: { index: 2, name: 'Build' },
           },
-          manager_decisions: [{ decision_number: 4, action: 'transition', reason: 'implementation finished' }],
+          run_extract: [{ kind: 'manager_decision', number: 4, routing: { action: 'transition' }, semantic_summary: 'implementation finished' }],
           finished_turn: { turn_number: 3, step_name: 'implement', status: 'completed', returncode: 0, semantic_result: { result: 'implemented the feature' } },
         },
       },
@@ -488,6 +488,64 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(screen.getByText(/Source inactivity could not be confirmed/)).toBeDefined())
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBeGreaterThanOrEqual(31)
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('refreshes canonical progress and terminal controls from streamed events without a manual refresh', async () => {
+    let onEventsHook: ((events: api.RunEvent[]) => void) | null = null
+    vi.mocked(api.subscribeToRunEvents).mockImplementation((subscription) => {
+      onEventsHook = subscription.onEvents
+      return () => {}
+    })
+    renderDashboard()
+    await screen.findByText('implement · 2 / 8')
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue({
+      ...ownedRun, status: 'completed', current_step: 'review', turns_completed: 3,
+    })
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: 'run-owned', level: 'lite', schema_version: 1,
+      data: { manager_context: { plan_state: { is_complete: true, checkpoints: [{ index: 1, name: 'Done' }], current_checkpoint: null }, run_extract: [
+        { kind: 'manager_decision', number: 1, routing: { action: 'continue' }, semantic_summary: 'checkpoint complete' },
+      ] } },
+    })
+    if (!onEventsHook) throw new Error('subscription hook was not registered')
+    onEventsHook!([{ sequence: 2, event_type: 'run_completed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
+    await screen.findByText('review · 3 / 8')
+    await screen.findByText('Decision #1: continue — checkpoint complete')
+    await screen.findByText('All 1 checkpoints complete')
+    expect(screen.getAllByText('completed').length).toBeGreaterThan(0)
+    expect(screen.queryByRole('heading', { name: 'Change workflow (guided restart)' })).toBeNull()
+  })
+
+  it('coalesces event bursts during a summary request and preserves the last snapshot on failure', async () => {
+    let onEventsHook: ((events: api.RunEvent[]) => void) | null = null
+    vi.mocked(api.subscribeToRunEvents).mockImplementation((subscription) => {
+      onEventsHook = subscription.onEvents
+      return () => {}
+    })
+    renderDashboard()
+    await screen.findByText('implement · 2 / 8')
+    let finishRefresh: ((run: Awaited<ReturnType<typeof api.getControlPlaneRun>>) => void) | undefined
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve }))
+    const emit = (sequence: number) => {
+      if (!onEventsHook) throw new Error('subscription hook was not registered')
+      onEventsHook([{ sequence, event_type: 'status_changed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
+    }
+    emit(2)
+    await waitFor(() => expect(finishRefresh).toBeDefined())
+    const callsInFlight = vi.mocked(api.getControlPlaneRun).mock.calls.length
+    emit(3)
+    emit(4)
+    expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight)
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, current_step: 'review', turns_completed: 4 })
+    finishRefresh!({ ...ownedRun, turns_completed: 3 })
+    await screen.findByText('review · 4 / 8')
+    expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight + 1)
+    expect(api.listRunEvents).toHaveBeenCalledTimes(1)
+    vi.mocked(api.getControlPlaneRun).mockRejectedValue(new Error('summary temporarily unavailable'))
+    emit(5)
+    await screen.findByText('summary temporarily unavailable')
+    expect(screen.getByText('review · 4 / 8')).toBeDefined()
+    expect(screen.getAllByText('running').length).toBeGreaterThan(0)
   })
 
   it('keeps a stream failure distinct from run state and refreshes once after reconnect', async () => {

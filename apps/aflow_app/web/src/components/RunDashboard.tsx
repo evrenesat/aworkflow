@@ -145,6 +145,7 @@ function planPathFromContext(context: RunContext | null): string {
 }
 
 interface CheckpointSummary {
+  complete: boolean
   name: string | null
   index: number | null
   count: number
@@ -163,7 +164,7 @@ function checkpointSummary(context: RunContext | null): CheckpointSummary | null
     : null
   const name = current && typeof current.name === 'string' ? current.name : null
   const index = current && typeof current.index === 'number' ? current.index : null
-  return { name, index, count: checkpoints.length }
+  return { name, index, count: checkpoints.length, complete: planState.is_complete === true }
 }
 
 interface ManagerOutcome {
@@ -181,7 +182,15 @@ function managerOutcome(context: RunContext | null): ManagerOutcome | null {
   const managerContext = contextRecord(context, 'manager_context')
   if (!managerContext) return null
   let decision: string | null = null
-  const decisions = managerContext.manager_decisions
+  const extract = Array.isArray(managerContext.run_extract) ? managerContext.run_extract : []
+  const decisions = Array.isArray(managerContext.manager_decisions)
+    ? managerContext.manager_decisions
+    : extract.filter((entry) => typeof entry === 'object' && entry !== null && entry.kind === 'manager_decision')
+      .map((entry) => ({
+        decision_number: entry.number,
+        action: entry.routing?.action,
+        reason: entry.semantic_summary,
+      }))
   if (Array.isArray(decisions) && decisions.length > 0) {
     const last = decisions[decisions.length - 1]
     if (typeof last === 'object' && last !== null) {
@@ -324,6 +333,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   }, [onPendingSuccessorStartChange])
   const [elapsedNow, setElapsedNow] = useState(() => Date.now())
   const selectedRunRef = useRef<string | null>(null)
+  const snapshotRequestRef = useRef(0)
   const controlsForRunRef = useRef<string | null>(null)
   const previousStreamStateRef = useRef<api.StreamState>('stopped')
   const { getKey: getPendingWriteKey, clearKey: clearPendingWriteKey, clearAll: clearPendingWriteKeys } = usePendingWriteKeys()
@@ -442,13 +452,34 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     setContextLevel('lite')
     setFullContextAcknowledged(false)
     previousStreamStateRef.current = 'stopped'
-    void loadSelectedRun(projectId, selectedRunId, active)
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null
+    let refreshingSnapshot = true
+    let refreshRequested = false
+    const scheduleSnapshotRefresh = () => {
+      if (!active) return
+      refreshRequested = true
+      if (refreshTimer || refreshingSnapshot) return
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null
+        refreshRequested = false
+        refreshingSnapshot = true
+        void loadSelectedRun(projectId, selectedRunId, () => active, true).finally(() => {
+          refreshingSnapshot = false
+          if (refreshRequested) scheduleSnapshotRefresh()
+        })
+      }, 100)
+    }
+    void loadSelectedRun(projectId, selectedRunId, () => active).finally(() => {
+      refreshingSnapshot = false
+      if (refreshRequested) scheduleSnapshotRefresh()
+    })
     const unsubscribe = api.subscribeToRunEvents({
       projectId,
       runId: selectedRunId,
       onEvents: (incoming) => {
         if (!active || selectedRunRef.current !== selectedRunId) return
         setEvents((current) => mergeEvents(current, incoming))
+        if (incoming.length > 0) scheduleSnapshotRefresh()
       },
       onError: (streamError) => {
         if (!active) return
@@ -464,13 +495,14 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
           if (previous === 'reconnecting') {
             // The stream reconnected after a gap: refresh canonical status so
             // the snapshot reflects anything missed while disconnected.
-            void refreshSelectedRun()
+            scheduleSnapshotRefresh()
           }
         }
       },
     })
     return () => {
       active = false
+      if (refreshTimer) clearTimeout(refreshTimer)
       unsubscribe()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribes only per project/run, not per render
@@ -504,19 +536,25 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     }
   }
 
-  async function loadSelectedRun(nextProjectId: string, runId: string, active = true) {
+  async function loadSelectedRun(
+    nextProjectId: string,
+    runId: string,
+    isActive = () => true,
+    preserveFullContext = false,
+  ) {
+    const requestNumber = ++snapshotRequestRef.current
     try {
       const [run, tail, liteContext] = await Promise.all([
         api.getControlPlaneRun(nextProjectId, runId),
-        api.listRunEvents(nextProjectId, runId, { limit: MAX_TIMELINE_EVENTS }),
+        preserveFullContext ? Promise.resolve([]) : api.listRunEvents(nextProjectId, runId, { limit: MAX_TIMELINE_EVENTS }),
         api.getRunContext(nextProjectId, runId, 'lite'),
       ])
-      if (!active || selectedRunRef.current !== runId) return
+      if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
       setRuns((current) => upsertRun(current, run))
       setEvents((current) => mergeEvents(current, tail))
-      setContext(liteContext)
+      setContext((current) => preserveFullContext && current?.level === 'full' ? current : liteContext)
     } catch (loadError) {
-      if (active) setError(errorMessage(loadError, 'Failed to load run details'))
+      if (isActive() && selectedRunRef.current === runId && requestNumber === snapshotRequestRef.current) setError(errorMessage(loadError, 'Failed to load run details'))
     }
   }
 
@@ -1060,7 +1098,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
                 ? capabilities.workflow_details[selectedRun.workflow_name].excluded_steps.join(', ')
                 : 'none'}</dd></div>
               <div><dt>Checkpoint</dt><dd>{checkpoints
-                ? `${checkpoints.name ?? 'unnamed'} (${checkpoints.index ?? '?'} of ${checkpoints.count})`
+                ? checkpoints.complete ? `All ${checkpoints.count} checkpoints complete` : `${checkpoints.name ?? 'unnamed'} (${checkpoints.index ?? '?'} of ${checkpoints.count})`
                 : 'Not reported'}</dd></div>
               <div><dt>Start / elapsed</dt><dd>{startTime === 'Not reported' ? 'Not reported' : timestamp(startTime)}{elapsed ? ` · running for ${elapsed}` : ''}</dd></div>
               <div><dt>Lineage</dt><dd className="mono">

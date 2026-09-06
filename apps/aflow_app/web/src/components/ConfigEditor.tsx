@@ -14,7 +14,9 @@ interface ConfigEditorProps {
   project: ProjectInfo
   /** Reports unsaved text so the shell can guard navigation. */
   onDirtyChange: (dirty: boolean) => void
-  /** Invoked after a save that leaves the project configuration ready. */
+  /** Reports the canonical result of a successful save without navigating. */
+  onSaved?: (saved: ProjectConfig) => void
+  /** Opens plans using the saved ready configuration. */
   onReady?: (saved: ProjectConfig) => void
 }
 
@@ -39,7 +41,7 @@ function shortRevision(revision: string): string {
  * documents are validated and committed together under one combined
  * revision; local text is never discarded without explicit confirmation.
  */
-export function ConfigEditor({ project, onDirtyChange, onReady }: ConfigEditorProps) {
+export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: ConfigEditorProps) {
   const [snapshot, setSnapshot] = useState<ProjectConfig | null>(null)
   const [aflowText, setAflowText] = useState('')
   const [workflowsText, setWorkflowsText] = useState('')
@@ -143,6 +145,7 @@ export function ConfigEditor({ project, onDirtyChange, onReady }: ConfigEditorPr
         expected_revision: snapshot.revision,
       })
       applyCommitted(saved, 'Saved')
+      onSaved?.(saved)
     } catch (err) {
       if (err instanceof ApiError && err.code === 'revision_conflict') {
         const current = err.detail.current_revision
