@@ -1432,25 +1432,25 @@ export function RunDashboard({ projectId, requestedRunId = null, onRunSelectionC
               {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
 
               <section className="dashboard-section">
-                <div className="section-heading"><h4>Latest bounded outcomes</h4><span className="text-xs text-dim">manager · checkpoint · live overrides</span></div>
+                <div className="section-heading"><h4>Latest progress</h4><span className="text-xs text-dim">decisions · checkpoints · run settings</span></div>
                 <div className="text-sm">
                   <div>Checkpoint: <span>{checkpoints
                     ? checkpoints.complete ? `All ${checkpoints.count} checkpoints complete` : `${checkpoints.name ?? 'unnamed'} (${checkpoints.index ?? '?'} of ${checkpoints.count})`
                     : 'Not reported'}</span></div>
                   <div>{outcome?.decision ?? 'No manager decision reported yet.'}</div>
-                  <div>{outcome?.finishedTurn ? `Last finalized turn: ${outcome.finishedTurn}` : 'No finalized turn reported yet.'}</div>
+                  <div>{outcome?.finishedTurn ? `Last finished turn: ${outcome.finishedTurn}` : 'No finished turn reported yet.'}</div>
                   {outcome?.resultText && <pre className="dashboard-payload">{outcome.resultText}</pre>}
                   <div className="text-xs text-dim">
-                    Live overrides: max turns {overrideText(controlOverride, 'max_turns')} · team {overrideText(controlOverride, 'team')}
+                    Run settings: max turns {overrideText(controlOverride, 'max_turns')} · team {overrideText(controlOverride, 'team')}
                     {Object.keys(overrideRoles(controlOverride)).length
                       ? ` · selectors ${Object.entries(overrideRoles(controlOverride)).map(([role, selector]) => `${role}=${selector}`).join(', ')}`
-                      : ' · no selector overrides'}
+                      : ' · default role profiles'}
                   </div>
                 </div>
               </section>
 
               <section className="dashboard-section">
-                <div className="section-heading"><h4>Safe controls</h4><span className="text-xs text-dim">Server capability and revision gated</span></div>
+                <div className="section-heading"><h4>Run settings</h4><span className="text-xs text-dim">Available changes for this run</span></div>
                 {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
                 <div className="notice">
                   Changes are saved now and applied between turns. They remain marked Pending until the run
@@ -1481,7 +1481,7 @@ export function RunDashboard({ projectId, requestedRunId = null, onRunSelectionC
                     </label>
                   )
                 })}
-                <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Apply safe controls'}</button></div>
+                <div className="dashboard-actions"><button className="btn btn-secondary" onClick={() => void handleControl()} disabled={!canMutate || busyAction === 'control'}>{busyAction === 'control' ? 'Applying…' : 'Save run settings'}</button></div>
               </section>
 
               <section className="dashboard-section dashboard-actions">
@@ -1535,9 +1535,9 @@ export function RunDashboard({ projectId, requestedRunId = null, onRunSelectionC
               )}
 
               <section className="dashboard-section">
-                <div className="section-heading"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} bounded events</span></div><button className="btn btn-secondary btn-sm" onClick={() => void refreshSelectedRun()}>Refresh status</button></div>
+                <div className="section-heading"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} recent events</span></div><button className="btn btn-secondary btn-sm" onClick={() => void refreshSelectedRun()}>Refresh status</button></div>
                 {streamNotice && <div className="notice">{streamNotice}</div>}
-                {events.length === 0 ? <p className="text-sm text-dim">No bounded events are available yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{event.event_type.replace(/_/g, ' ')}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
+                {events.length === 0 ? <p className="text-sm text-dim">No activity has been reported yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{event.event_type.replace(/_/g, ' ')}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
               </section>
 
               <section className="dashboard-section">

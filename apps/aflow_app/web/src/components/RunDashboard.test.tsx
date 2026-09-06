@@ -252,7 +252,7 @@ describe('RunDashboard', () => {
     expect(screen.getByText('legacy-step')).toBeDefined()
     await waitFor(() => expect(screen.getByText('Build (2 of 2)')).toBeDefined())
     await waitFor(() => expect(screen.getByText('Decision #4: transition — implementation finished')).toBeDefined())
-    expect(screen.getByText('Last finalized turn: turn 3 · implement · completed · exit 0')).toBeDefined()
+    expect(screen.getByText('Last finished turn: turn 3 · implement · completed · exit 0')).toBeDefined()
     expect(screen.getByText('implemented the feature')).toBeDefined()
     expect(screen.getByText(/aflow-run-run-owned\.service · running · not reconciled/)).toBeDefined()
     expect(screen.getByText(/plans\/in-progress\/demo-2\.md/)).toBeDefined()
@@ -413,13 +413,13 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(screen.getByText('Revision').parentElement?.textContent).toContain('2'))
     expect(screen.getByText('workflow requires restart; it is not offered as a live control.')).toBeDefined()
     fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '9' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Apply safe controls' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
     await waitFor(() => expect(screen.getByText(/Another operator changed this run/)).toBeDefined())
     expect(api.getControlPlaneRun).toHaveBeenCalledWith('control-project', 'run-owned')
     expect((screen.getByLabelText('Control max turns') as HTMLInputElement).value).toBe('9')
 
     fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '10' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Apply safe controls' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
     await waitFor(() => expect(screen.getByText(/server requires a restart/)).toBeDefined())
     expect((screen.getByLabelText('Control max turns') as HTMLInputElement).value).toBe('10')
   })
@@ -442,7 +442,7 @@ describe('RunDashboard', () => {
     fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
     fireEvent.change(screen.getByLabelText('Selector for worker'), { target: { value: 'harness/impl-b' } })
     await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('full'))
-    fireEvent.click(screen.getByRole('button', { name: 'Apply safe controls' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
       'run-owned',

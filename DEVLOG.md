@@ -853,3 +853,5 @@
 
 - Run lists now show the newest returned run first using canonical launch time (or the timestamp in older run IDs), while refresh preserves an explicit selection. The API itself remains stably paginated in ascending identity order.
 - Checkpoint 6 adds project/run links, progress-first run views and Technical details. Owner repair removes URL fragments from canonical links, constructs clipboard links from validated identities, and retains the selected run across oldest-first page refreshes.
+
+- Run progress and editable settings now use plain labels; internal bounded-event and revision terminology remains in technical details.
