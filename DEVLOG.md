@@ -750,3 +750,7 @@
 ### 2026-09-06 — Clarify remote interfaces and private entry point
 
 - Documented canonical REST/SSE, optional MCP, deferred remote ACP, and Codex as an optional engine harness. Root usage and architecture now point to the private deployment runbook and MagicDNS HTTPS discovery through Tailscale Serve status.
+
+### 2026-09-06 — Report applied live turn limits
+
+- HTTPS browser verification found that status retained the initial turn limit after a safe override. Control-plane projections now use the engine-recorded effective limit; pending override writes alone do not change the reported value.

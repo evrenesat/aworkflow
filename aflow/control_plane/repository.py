@@ -130,6 +130,9 @@ class RunRepository:
             raise RepositoryNotFoundError(f"run '{valid}' does not exist")
 
         metadata = self._read_run_metadata(run_dir) if run_dir.is_dir() else {}
+        max_turns = _optional_int(metadata.get("effective_max_turns")) or _optional_int(
+            metadata.get("max_turns")
+        )
         if manifest is None:
             # Legacy state has no immutable launch evidence.  Even a stale
             # ``running`` record must never be interpreted as a live process.
@@ -142,7 +145,7 @@ class RunRepository:
                 team=_optional_text(metadata.get("team")),
                 current_step=_optional_text(metadata.get("current_step_name")),
                 turns_completed=_optional_int(metadata.get("turns_completed")),
-                max_turns=_optional_int(metadata.get("max_turns")),
+                max_turns=max_turns,
                 evidence={"recorded_status": metadata.get("status")},
             )
 
@@ -181,7 +184,7 @@ class RunRepository:
             team=_optional_text(metadata.get("team")) or manifest.team,
             current_step=_optional_text(metadata.get("current_step_name")),
             turns_completed=_optional_int(metadata.get("turns_completed")),
-            max_turns=_optional_int(metadata.get("max_turns")) or manifest.max_turns,
+            max_turns=max_turns or manifest.max_turns,
             selected_start_step=manifest.start_step,
             skipped_steps=manifest.skipped_steps,
             restarted_from_run_id=manifest.restarted_from_run_id,
