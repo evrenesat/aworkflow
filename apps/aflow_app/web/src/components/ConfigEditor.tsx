@@ -7,8 +7,10 @@ import type {
   ProjectConfig,
   ProjectInfo,
 } from '../types'
+import { GuidedConfigForm } from './GuidedConfigForm'
 
 type ConfigTab = 'aflow' | 'workflows'
+type EditorMode = 'guided' | 'toml'
 
 interface ConfigEditorProps {
   project: ProjectInfo
@@ -46,7 +48,12 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
   const [aflowText, setAflowText] = useState('')
   const [workflowsText, setWorkflowsText] = useState('')
   const [activeTab, setActiveTab] = useState<ConfigTab>('aflow')
+  const [mode, setMode] = useState<EditorMode>('guided')
+  const [pendingFocusDocument, setPendingFocusDocument] = useState<'aflow.toml' | 'workflows.toml' | null>(null)
   const [validation, setValidation] = useState<ConfigValidation | null>(null)
+  /** The exact pair the held validation describes; anything else is stale. */
+  const [validationPair, setValidationPair] = useState<{ aflow: string; workflows: string } | null>(null)
+  const [guidedActionPending, setGuidedActionPending] = useState(false)
   const [busy, setBusy] = useState<'validate' | 'save' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -56,26 +63,47 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
   const [loading, setLoading] = useState(true)
   const aflowTabRef = useRef<HTMLButtonElement | null>(null)
   const workflowsTabRef = useRef<HTMLButtonElement | null>(null)
+  const aflowTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const workflowsTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  useEffect(() => {
+    if (mode !== 'toml' || pendingFocusDocument === null) return
+    ;(pendingFocusDocument === 'workflows.toml' ? workflowsTextareaRef : aflowTextareaRef)
+      .current?.focus()
+    setPendingFocusDocument(null)
+  }, [mode, pendingFocusDocument])
+
+  function openAdvancedTOML(document: 'aflow.toml' | 'workflows.toml' = 'aflow.toml') {
+    setPendingFocusDocument(document)
+    setMode('toml')
+  }
 
   const dirty = Boolean(
     snapshot
     && (aflowText !== snapshot.aflow_toml || workflowsText !== snapshot.workflows_toml),
   )
+  // A ready result may only offer the Plans shortcut while it describes the
+  // exact committed pair: dirty or superseded candidates never qualify.
+  const validationCurrent = validationPair !== null
+    && validationPair.aflow === aflowText
+    && validationPair.workflows === workflowsText
+
+  const hasUnsavedWork = dirty || guidedActionPending
 
   useEffect(() => {
-    onDirtyChange(dirty)
+    onDirtyChange(hasUnsavedWork)
     return () => onDirtyChange(false)
-  }, [dirty, onDirtyChange])
+  }, [hasUnsavedWork, onDirtyChange])
 
   useEffect(() => {
-    if (!dirty) return
+    if (!hasUnsavedWork) return
     const guard = (event: BeforeUnloadEvent) => {
       event.preventDefault()
       event.returnValue = ''
     }
     window.addEventListener('beforeunload', guard)
     return () => window.removeEventListener('beforeunload', guard)
-  }, [dirty])
+  }, [hasUnsavedWork])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -90,11 +118,13 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
       setAflowText(loaded.aflow_toml)
       setWorkflowsText(loaded.workflows_toml)
       setValidation(loaded.validation)
+      setValidationPair({ aflow: loaded.aflow_toml, workflows: loaded.workflows_toml })
     } catch (err) {
       setSnapshot(null)
       setAflowText('')
       setWorkflowsText('')
       setValidation(null)
+      setValidationPair(null)
       setError(err instanceof Error ? err.message : 'Failed to load the configuration pair')
     } finally {
       setLoading(false)
@@ -110,6 +140,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
     setAflowText(next.aflow_toml)
     setWorkflowsText(next.workflows_toml)
     setValidation(next.validation)
+    setValidationPair({ aflow: next.aflow_toml, workflows: next.workflows_toml })
     setConflict(null)
     setBlockers(null)
     setConfirmReload(false)
@@ -117,15 +148,14 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
   }
 
   async function handleValidate() {
+    const submitted = { aflow_toml: aflowText, workflows_toml: workflowsText }
     try {
       setBusy('validate')
       setError(null)
       setNotice(null)
-      const result = await api.validateProjectConfig(project.id, {
-        aflow_toml: aflowText,
-        workflows_toml: workflowsText,
-      })
+      const result = await api.validateProjectConfig(project.id, submitted)
       setValidation(result)
+      setValidationPair({ aflow: submitted.aflow_toml, workflows: submitted.workflows_toml })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Validation request failed')
     } finally {
@@ -146,6 +176,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
       })
       applyCommitted(saved, 'Saved')
       onSaved?.(saved)
+      return saved
     } catch (err) {
       if (err instanceof ApiError && err.code === 'revision_conflict') {
         const current = err.detail.current_revision
@@ -159,9 +190,16 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         setError(err instanceof Error ? err.message : 'Failed to save the configuration pair')
       }
       // Local text is deliberately preserved for every failure above.
+      return null
     } finally {
       setBusy(null)
     }
+  }
+
+  /** Guided primary path: commit the shared pair, then continue to Plans when ready. */
+  async function handleSaveAndContinue() {
+    const saved = await handleSave()
+    if (saved && saved.validation.state === 'ready') onReady?.(saved)
   }
 
   async function handleDiscardAndReload() {
@@ -260,6 +298,42 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         </div>
       )}
 
+      <div role="group" aria-label="Settings views" className="config-tabs">
+        <button
+          className={`btn btn-sm ${mode === 'guided' ? 'btn-primary' : 'btn-secondary'}`}
+          aria-pressed={mode === 'guided'}
+          onClick={() => setMode('guided')}
+        >
+          Guided settings
+        </button>
+        <button
+          className={`btn btn-sm ${mode === 'toml' ? 'btn-primary' : 'btn-secondary'}`}
+          aria-pressed={mode === 'toml'}
+          onClick={() => setMode('toml')}
+        >
+          Advanced TOML
+        </button>
+      </div>
+
+      <div hidden={mode !== 'guided'} className="guided-panel">
+        <GuidedConfigForm
+          project={project}
+          aflowText={aflowText}
+          workflowsText={workflowsText}
+          onDraftChange={(nextAflow, nextWorkflows) => {
+            setAflowText(nextAflow)
+            setWorkflowsText(nextWorkflows)
+          }}
+          onActionPendingChange={setGuidedActionPending}
+          onCandidateValidation={(nextValidation, pair) => {
+            setValidation(nextValidation)
+            setValidationPair(pair)
+          }}
+          onRequestAdvanced={openAdvancedTOML}
+        />
+      </div>
+
+      <div hidden={mode !== 'toml'} className="toml-panel">
       <div role="tablist" aria-label="Configuration documents" className="config-tabs" onKeyDown={handleTabKeys}>
         <button
           ref={aflowTabRef}
@@ -294,6 +368,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         hidden={activeTab !== 'aflow'}
       >
         <textarea
+          ref={aflowTextareaRef}
           className="input mono config-textarea"
           aria-label="aflow.toml contents"
           spellCheck={false}
@@ -308,12 +383,14 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         hidden={activeTab !== 'workflows'}
       >
         <textarea
+          ref={workflowsTextareaRef}
           className="input mono config-textarea"
           aria-label="workflows.toml contents"
           spellCheck={false}
           value={workflowsText}
           onChange={(event) => setWorkflowsText(event.target.value)}
         />
+      </div>
       </div>
 
       <div className="dashboard-actions">
@@ -327,22 +404,36 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         <button
           className="btn btn-primary"
           onClick={() => void handleSave()}
-          disabled={busy !== null || !dirty}
+          disabled={busy !== null || guidedActionPending || !dirty}
         >
           {busy === 'save' ? 'Saving…' : 'Save both files'}
         </button>
+        {mode === 'guided' && (
+          <button
+            className="btn btn-primary"
+            onClick={() => void handleSaveAndContinue()}
+            disabled={busy !== null || guidedActionPending || !dirty}
+          >
+            {busy === 'save' ? 'Saving…' : 'Save and continue to Plans'}
+          </button>
+        )}
       </div>
 
       {validation && (
         <div className="card validation-report" aria-label="Configuration validation report">
           <div className="section-heading">
             <strong className="text-sm">{stateText(validation.state)}</strong>
-            {validation.state === 'ready' && onReady && (
-              <button className="btn btn-primary btn-sm" onClick={() => onReady(snapshot)}>
+            {validation.state === 'ready' && onReady && !dirty && validationCurrent && (
+              <button className="btn btn-primary btn-sm" disabled={busy !== null || guidedActionPending} onClick={() => onReady(snapshot)}>
                 Go to plans
               </button>
             )}
           </div>
+          {!validationCurrent && (
+            <p className="text-xs text-dim" role="note">
+              This report is out of date for the edited draft — validate again to refresh it.
+            </p>
+          )}
           {validation.issues.length > 0 && (
             <ul className="validation-issues">
               {validation.issues.map((issue, index) => (

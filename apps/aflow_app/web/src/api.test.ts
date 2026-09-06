@@ -138,6 +138,44 @@ describe('workflow control API client', () => {
     }))
   })
 
+  it('transforms a candidate pair through the pure form endpoint without a revision', async () => {
+    api.setAuthToken('test-token')
+    const validation = {
+      state: 'ready', issues: [], placeholders: [],
+      workflows: ['starter'], teams: [], roles: ['worker'],
+    }
+    mockOkJson({
+      aflow_toml: '# configured\n', workflows_toml: '# workflows\n', changed: true,
+      validation,
+      form: {
+        default_workflow: 'starter', max_turns: null, harnesses: {}, roles: {},
+        teams: {}, workflow_default_teams: {}, workflows: {},
+      },
+      syntax_issues: [],
+      choices: { harnesses: [], profiles: {}, selectors: [], roles: ['worker'], teams: [], workflows: ['starter'] },
+      suggestions: { label: 'suggestion', harnesses: [], profiles: [], note: 'Bundled values are suggestions.' },
+      starter_defaults: null,
+    })
+    const response = await api.postProjectConfigForm('beta', {
+      aflow_toml: '# aflow\n',
+      workflows_toml: '# workflows\n',
+      action: { type: 'set_global_role', role: 'worker', selector: 'starter.default' },
+    })
+    expect(response.changed).toBe(true)
+    expect(response.form?.default_workflow).toBe('starter')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config/form', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({
+        aflow_toml: '# aflow\n',
+        workflows_toml: '# workflows\n',
+        action: { type: 'set_global_role', role: 'worker', selector: 'starter.default' },
+      }),
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+    }))
+    // The pure transform never sends or receives a revision.
+    expect((vi.mocked(global.fetch).mock.calls.at(-1)![1] as RequestInit).body).not.toContain('revision')
+  })
+
   it('carries config conflict and blocker detail through ApiError', async () => {
     vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: false, status: 409,

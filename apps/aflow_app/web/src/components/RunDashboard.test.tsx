@@ -67,7 +67,7 @@ function renderDashboard(options: { restartPollIntervalMs?: number } = {}) {
 
 describe('RunDashboard', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([project])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['control-project'] })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(capabilities)
