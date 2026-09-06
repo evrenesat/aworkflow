@@ -378,7 +378,7 @@ describe('RunDashboard', () => {
     expect((screen.getByLabelText('Selector for worker') as HTMLSelectElement).tagName).toBe('SELECT')
     expect(screen.getByRole('option', { name: 'harness/impl-a' })).toBeDefined()
     expect(screen.getByRole('option', { name: 'harness/impl-b' })).toBeDefined()
-    expect(screen.getByText(/next safe boundary between turns/)).toBeDefined()
+    expect(screen.getByText(/Changes are saved now and applied between turns/)).toBeDefined()
 
     fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
     fireEvent.change(screen.getByLabelText('Selector for worker'), { target: { value: 'harness/impl-b' } })

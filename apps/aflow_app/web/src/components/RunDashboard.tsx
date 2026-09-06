@@ -550,7 +550,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
         : `${initialPlanPath} is still a draft — move it to Ready (in progress) in Plans before running it.`)
     } else {
       setStartPlanPath('')
-      setFeedback('Select a daemon-approved plan from the run dashboard before starting a run.')
+      setFeedback('Choose a Ready plan before starting a run.')
     }
     onInitialPlanHandled()
   }, [initialPlanPath, onInitialPlanHandled, plans, plansLoaded])
@@ -1118,7 +1118,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
         : 'no project default'
       continue
     }
-    workflowBadges[workflow] = committedForm?.workflows[workflow] ? 'configured' : 'daemon-admitted'
+    workflowBadges[workflow] = committedForm?.workflows[workflow] ? 'configured' : 'available on this server'
   }
   const teamOptions = ['', ...new Set([
     ...(committedForm ? Object.keys(committedForm.teams) : []),
@@ -1127,7 +1127,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
   const teamBadges: Record<string, string> = { '': 'no team — follow the workflow default' }
   for (const team of teamOptions) {
     if (team === '') continue
-    teamBadges[team] = committedForm?.teams[team] ? 'configured' : 'daemon-admitted'
+    teamBadges[team] = committedForm?.teams[team] ? 'configured' : 'available on this server'
   }
   // Launch admission offers only saved Ready (in progress) plans: Draft and
   // Done records are never selectable, so their paths are never submitted.
@@ -1193,7 +1193,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
   const roleChoices = capabilities?.roles ?? []
 
   if (loading) {
-    return <div className="card dashboard-loading"><div className="spinner" />Loading daemon-owned runs…</div>
+    return <div className="card dashboard-loading"><div className="spinner" />Loading runs…</div>
   }
 
   return (
@@ -1275,7 +1275,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
                 New run
               </button>
             </h3>
-            <span className="text-xs text-dim">Start a daemon-owned run; the server owns validation and returns either a run or a startup question.</span>
+            <span className="text-xs text-dim">Choose a Ready plan and review the steps below. AFlow checks the setup before starting.</span>
           </div>
           {newRunOpen && (
             <div id="new-run-body" className="start-run-form">
@@ -1288,7 +1288,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
                   optionBadges={planBadges}
                   disabled={restartDraftFrozen}
                   emptyOption="Choose an allowed plan"
-                  placeholder="Search daemon-approved plans"
+                  placeholder="Search Ready plans"
                 />
                 <span className="text-xs text-dim">Only Ready (in progress) plans are offered — move a draft to Ready in Plans to run it.</span>
               </div>
@@ -1410,7 +1410,7 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
                         <span className="mono">{skippedByDraft.join(', ')}</span>. They are recorded as skipped, not executed.
                       </div>
                     )}
-                    <label className="dashboard-field"><span>Extra instructions — one bounded line per instruction (optional)</span>
+                    <label className="dashboard-field"><span>Extra instructions (optional — one instruction per line)</span>
                       <textarea
                         className="input textarea"
                         aria-label="Run extra instructions"
@@ -1517,10 +1517,8 @@ export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled,
               <div className="section-heading"><h4>Safe controls</h4><span className="text-xs text-dim">Server capability and revision gated</span></div>
               {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
               <div className="notice">
-                Changes are recorded now with a compare-and-swap revision and idempotency key. The engine applies
-                recorded values at the next safe boundary between turns; the UI only reports a control as applied
-                once the returned revision and a subsequent event confirm it. Selectors that the frozen
-                configuration does not admit require a restart and are never offered here.
+                Changes are saved now and applied between turns. They remain marked Pending until the run
+                confirms them. To use a profile outside this run's available choices, restart the run.
               </div>
               {capabilities && Object.entries(capabilities.control_safety).filter(([, safety]) => safety === 'restart_required').map(([control]) => (
                 <div className="text-xs text-dim" key={control}>{control.replace(/_/g, ' ')} requires restart; it is not offered as a live control.</div>
