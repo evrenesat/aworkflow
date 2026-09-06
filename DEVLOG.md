@@ -844,3 +844,5 @@
 - The compact launch form offers configured workflow/team choices and previews each materialized step's role, selected profile, team/global source and model/effort details. ZCode settings are identified as external.
 - Only Ready plans with a resolved workflow preview and valid turn limit can start. Invalid extra-instruction guidance stays visible when Advanced options is closed.
 - Retained startup-answer, idempotency and stop-before-replacement behavior. The owner corrected a test callback option typo after stopping the repair controller; validation and approval are recorded in the original checkpoint ledger.
+
+- Narrow-browser inspection found the selected Runs tab clipped offscreen. Mobile navigation now shows Projects on its own row and all four project views together without horizontal scrolling.

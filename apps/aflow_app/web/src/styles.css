@@ -818,7 +818,27 @@ a {
   }
 
   .workspace-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     padding: var(--spacing-sm);
+    overflow-x: visible;
+  }
+
+  .workspace-nav .nav-item-group:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .workspace-nav .nav-tab {
+    width: 100%;
+    padding-inline: var(--spacing-xs);
+  }
+
+  .workspace-nav .nav-item-group:first-child .nav-tab {
+    width: auto;
+  }
+
+  .workspace-nav .nav-separator {
+    display: none;
   }
 
   .config-textarea {
