@@ -102,7 +102,11 @@ describe('App workspace shell', () => {
     vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload())
     vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse())
     vi.mocked(api.listProjectPlans).mockResolvedValue([])
-    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([])
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
+      { project_id: 'alpha', root: '/srv/code/alpha', schema_version: 1 },
+    ])
+    vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: [] })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
       schema_version: 1, workflows: [], teams: [], roles: [], controls: [],
@@ -430,7 +434,7 @@ describe('App workspace shell', () => {
     await screen.findByLabelText('New plan filename')
   })
 
-  it('opens the run dashboard from an in-progress plan', async () => {
+  it('hands an in-progress plan to a New run that opens with the exact plan selected', async () => {
     const inProgressPlan = {
       project_id: 'alpha', name: 'demo.md', path: 'plans/in-progress/demo.md',
       status: 'in_progress' as const, revision: 'c'.repeat(64), size_bytes: 7, content: '# Demo\n',
@@ -438,13 +442,20 @@ describe('App workspace shell', () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     vi.mocked(api.listProjectPlans).mockResolvedValue([inProgressPlan])
     vi.mocked(api.readProjectPlan).mockResolvedValue(inProgressPlan)
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([
+      { path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 },
+    ])
+    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
-    const planButton = await screen.findByRole('button', { name: /demo\.md/ })
-    fireEvent.click(planButton)
-    fireEvent.click(await screen.findByText('Open run dashboard'))
+    fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
+
     await screen.findByText('Run dashboard')
+    expect(screen.getByRole('button', { name: 'New run' }).getAttribute('aria-expanded')).toBe('true')
+    await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
   })
 
   it('enters the same project workspace when Open is clicked twice with Projects between clicks', async () => {

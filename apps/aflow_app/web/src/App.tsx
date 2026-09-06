@@ -263,7 +263,7 @@ export function App() {
         </div>
       )}
 
-      {pendingSuccessorStart && view !== 'runs' && (
+      {pendingSuccessorStart && (view !== 'runs' || selectedProjectId !== pendingSuccessorStart.projectId) && (
         <div className="notice" role="status">
           A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
           <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
@@ -345,11 +345,13 @@ export function App() {
             )}
             {view === 'runs' && (
               <RunDashboard
-                initialProjectRoot={selectedProject.current_path}
+                key={selectedProject.id}
+                projectId={selectedProject.id}
                 initialPlanPath={runDashboardPlanPath}
                 onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
                 pendingSuccessorStart={pendingSuccessorStart}
                 onPendingSuccessorStartChange={setPendingSuccessorStart}
+                onOpenSettings={() => switchView('settings')}
               />
             )}
           </div>

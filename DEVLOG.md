@@ -754,3 +754,10 @@
 ### 2026-09-06 — Report applied live turn limits
 
 - HTTPS browser verification found that status retained the initial turn limit after a safe override. Control-plane projections now use the engine-recorded effective limit; pending override writes alone do not change the reported value.
+
+### 2026-09-06 — Preview exact dashboard runs (checkpoint 5)
+
+- Plans now explain Draft, Ready and Done, and a saved Ready plan opens the exact launch draft.
+- The compact launch form offers configured workflow/team choices and previews each materialized step's role, selected profile, team/global source and model/effort details. ZCode settings are identified as external.
+- Only Ready plans with a resolved workflow preview and valid turn limit can start. Invalid extra-instruction guidance stays visible when Advanced options is closed.
+- Retained startup-answer, idempotency and stop-before-replacement behavior. The owner corrected a test callback option typo after stopping the repair controller; validation and approval are recorded in the original checkpoint ledger.

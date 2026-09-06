@@ -9,6 +9,7 @@ vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
   return {
     ...actual,
+    getProjectConfig: vi.fn(), postProjectConfigForm: vi.fn(),
     listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
     listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
     startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(),
@@ -51,18 +52,87 @@ const ownedRun = {
   revision: 1, reason: null, unit_name: 'aflow-run-run-owned.service', launch_phase: 'running',
   workflow_name: 'managed', team: 'base', current_step: 'implement', turns_completed: 2, max_turns: 8,
   selected_start_step: null, skipped_steps: [] as string[], restarted_from_run_id: null as string | null,
-  evidence: { manifest_created_at: '2024-01-01T00:00:00Z', plan_path: 'plans/todo/demo.md', worktree_path: '/workspace/alpha', branch: 'feature/run' },
+  evidence: { manifest_created_at: '2024-01-01T00:00:00Z', plan_path: 'plans/in-progress/demo.md', worktree_path: '/workspace/alpha', branch: 'feature/run' },
 }
 
-function renderDashboard(options: { restartPollIntervalMs?: number } = {}) {
+const committedConfig = {
+  project_id: 'control-project',
+  revision: 'a'.repeat(64),
+  documents: ['aflow.toml', 'workflows.toml'],
+  aflow_toml: '# committed aflow\n',
+  workflows_toml: '# committed workflows\n',
+  validation: {
+    state: 'ready' as const, issues: [] as never[], placeholders: [] as string[],
+    workflows: ['managed', 'other'], teams: ['base', 'full'], roles: ['worker'],
+  },
+}
+
+/** A committed projection whose configured workflows carry exact step roles. */
+const emptyProjection = {
+  aflow_toml: committedConfig.aflow_toml,
+  workflows_toml: committedConfig.workflows_toml,
+  changed: false,
+  validation: committedConfig.validation,
+  form: {
+    default_workflow: null as string | null,
+    max_turns: null as number | null,
+    harnesses: {} as Record<string, Record<string, { model: string | null; effort: string | null }>>,
+    roles: {} as Record<string, string>,
+    teams: {} as Record<string, { roles: Record<string, string> }>,
+    workflow_default_teams: {} as Record<string, string | null>,
+    workflows: {
+      managed: {
+        declared_steps: ['plan', 'implement', 'review'],
+        first_step: 'plan',
+        executable_steps: ['plan', 'implement', 'review'],
+        first_executable_step: 'plan',
+        step_roles: { plan: 'reviewer', implement: 'worker', review: 'reviewer' },
+      },
+      other: {
+        declared_steps: ['research'],
+        first_step: 'research',
+        executable_steps: ['research'],
+        first_executable_step: 'research',
+        step_roles: { research: 'worker' },
+      },
+    } as Record<string, { declared_steps: string[]; first_step: string | null; executable_steps: string[] | null; first_executable_step: string | null; step_roles: Record<string, string> | null }>,
+  },
+  syntax_issues: [] as never[],
+  choices: { harnesses: [] as string[], profiles: {} as Record<string, string[]>, selectors: [] as string[], roles: [] as string[], teams: [] as string[], workflows: [] as string[] },
+  suggestions: { label: 'suggestion', harnesses: [], profiles: [], note: 'Bundled values are labeled suggestions.' },
+  starter_defaults: null,
+}
+
+function renderDashboard(options: {
+  restartPollIntervalMs?: number
+  initialPlanPath?: string | null
+  onInitialPlanHandled?: () => void
+} = {}) {
   return render(
     <RunDashboard
-      initialProjectRoot="/workspace/alpha"
-      initialPlanPath={null}
-      onInitialPlanHandled={vi.fn()}
+      projectId="control-project"
+      initialPlanPath={options.initialPlanPath ?? null}
+      onInitialPlanHandled={options.onInitialPlanHandled ?? vi.fn()}
       restartPollIntervalMs={options.restartPollIntervalMs}
+      onOpenSettings={vi.fn()}
     />,
   )
+}
+
+/** Commits an option in a searchable combobox control. */
+function choose(label: string, value: string) {
+  const input = screen.getByLabelText(label)
+  fireEvent.focus(input)
+  fireEvent.change(input, { target: { value } })
+  fireEvent.keyDown(input, { key: 'Enter' })
+}
+
+async function openNewRun() {
+  fireEvent.click(await screen.findByRole('button', { name: 'New run' }))
+}
+
+function openAdvanced() {
+  fireEvent.click(screen.getByRole('button', { name: 'Advanced options' }))
 }
 
 describe('RunDashboard', () => {
@@ -71,7 +141,9 @@ describe('RunDashboard', () => {
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([project])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['control-project'] })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(capabilities)
-    vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/todo/demo.md', status: 'todo', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }])
+    vi.mocked(api.getProjectConfig).mockResolvedValue(committedConfig)
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue(emptyProjection)
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }])
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownedRun)
     vi.mocked(api.listRunEvents).mockResolvedValue([{ sequence: 1, event_type: 'run_started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:00Z' }])
@@ -143,9 +215,10 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLSelectElement).value).toBe('plans/todo/demo.md'))
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
 
@@ -169,8 +242,9 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await screen.findByText('Worktree is dirty. Start anyway?')
 
@@ -189,15 +263,17 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    openAdvanced()
     expect((screen.getByLabelText('Run start step') as HTMLSelectElement).disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'managed' } })
+    choose('Run workflow', 'managed')
 
     expect(screen.getByRole('option', { name: '1 · plan' })).toBeDefined()
     expect(screen.getByRole('option', { name: '2 · implement' })).toBeDefined()
     expect(screen.getByRole('option', { name: '3 · review' })).toBeDefined()
-    expect(screen.getByRole('option', { name: 'Workflow default (base)' })).toBeDefined()
+    // The capability default team is inherited without an explicit selection.
+    expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('base — workflow default (base)')
     fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
     const skipNotice = screen.getByText(/skips the earlier executable steps:/)
     expect(skipNotice.textContent).toContain('plan')
@@ -205,7 +281,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
-      expect.objectContaining({ plan_path: 'plans/todo/demo.md', workflow_name: 'managed', start_step: 'implement' }),
+      expect.objectContaining({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', team: 'base', start_step: 'implement' }),
       expect.stringMatching(/^start-/),
     ))
     const request = vi.mocked(api.startControlPlaneRun).mock.calls[0][1]
@@ -220,8 +296,10 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    openAdvanced()
     fireEvent.change(screen.getByLabelText('Run extra instructions'), { target: { value: '  Focus on tests.  \n\nKeep runs short. ' } })
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
@@ -234,6 +312,8 @@ describe('RunDashboard', () => {
       target: { value: Array.from({ length: 9 }, (_, index) => `instruction ${index + 1}`).join('\n') },
     })
     await waitFor(() => expect(screen.getByText(/At most 8 instruction lines/)).toBeDefined())
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced options' }))
+    expect(screen.getByRole('alert').textContent).toContain('Open Advanced options to edit')
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
     expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1)
   })
@@ -243,8 +323,9 @@ describe('RunDashboard', () => {
     vi.mocked(api.startControlPlaneRun).mockRejectedValue(new Error('connection lost'))
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(screen.getByText('connection lost')).toBeDefined())
 
@@ -257,7 +338,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(3))
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][2]).not.toBe(unchangedRetryKey)
-    expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][1]).toEqual({ plan_path: 'plans/todo/demo.md', max_turns: 9 })
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][1]).toEqual({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', team: 'base', max_turns: 9 })
   })
 
   it('refreshes a CAS conflict, keeps local control edits, and reports restart-required changes', async () => {
@@ -322,9 +403,10 @@ describe('RunDashboard', () => {
     })
     renderDashboard({ restartPollIntervalMs: 1 })
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    await openNewRun()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
     expect(screen.getByText(/and start successor workflow/)).toBeDefined()
     expect(screen.getAllByText('run-owned').length).toBeGreaterThanOrEqual(2)
@@ -332,7 +414,7 @@ describe('RunDashboard', () => {
 
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
-      expect.objectContaining({ plan_path: 'plans/todo/demo.md', workflow_name: 'other', restarted_from_run_id: 'run-owned' }),
+      expect.objectContaining({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', restarted_from_run_id: 'run-owned' }),
       expect.anything(),
     ))
     expect(vi.mocked(api.ownerStopControlPlaneRun).mock.invocationCallOrder[0])
@@ -363,15 +445,20 @@ describe('RunDashboard', () => {
     vi.spyOn(api, 'listProjects').mockResolvedValue([{
       id: project.project_id, display_name: 'Alpha', current_path: project.root,
       is_git_root: true, registered_at: '2026-01-01T00:00:00Z', readiness: 'ready',
+    }, {
+      id: 'control-other', display_name: 'Beta', current_path: '/workspace/beta',
+      is_git_root: true, registered_at: '2026-01-01T00:00:00Z', readiness: 'ready',
     }])
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([project, { ...project, project_id: 'control-other', root: '/workspace/beta' }])
     render(<App />)
     fireEvent.click(await screen.findByText('Alpha'))
     fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
 
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    await openNewRun()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
@@ -385,6 +472,12 @@ describe('RunDashboard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
     await screen.findByText(/Its exact request remains preserved/)
+    fireEvent.click(await screen.findByText('Beta'))
+    fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
+    await screen.findByRole('button', { name: 'Retry exact successor request' })
+    expect(screen.getByRole('button', { name: 'Retry exact successor request' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
+    expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByRole('button', { name: 'Resolve pending successor' }))
     await screen.findByRole('button', { name: 'Retry exact successor request' })
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
@@ -407,9 +500,10 @@ describe('RunDashboard', () => {
       .mockRejectedValueOnce(new ApiError(422, 'invalid successor', 'validation_error'))
     renderDashboard({ restartPollIntervalMs: 1 })
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    await openNewRun()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
     await screen.findByRole('button', { name: 'Retry exact successor request' })
@@ -426,7 +520,7 @@ describe('RunDashboard', () => {
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownerStopped)
     const rendered = renderDashboard()
 
-    await screen.findByText('owner stopped')
+    await screen.findAllByText('owner stopped')
     expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
     rendered.unmount()
 
@@ -434,7 +528,7 @@ describe('RunDashboard', () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [completed], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(completed)
     renderDashboard()
-    await screen.findByText('completed')
+    await screen.findAllByText('completed')
     expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
@@ -444,16 +538,17 @@ describe('RunDashboard', () => {
     vi.mocked(api.ownerStopControlPlaneRun).mockRejectedValue(new Error('stop rejected by server'))
     renderDashboard({ restartPollIntervalMs: 1 })
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    await openNewRun()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
     await waitFor(() => expect(screen.getByText(/Restart stopped without a successor: stop rejected by server/)).toBeDefined())
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
     expect(screen.getByText(/source run state above is authoritative and your draft is preserved/)).toBeDefined()
-    expect((screen.getByLabelText('Run workflow') as HTMLSelectElement).value).toBe('other')
+    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('other')
     expect(screen.getAllByText('running').length).toBeGreaterThan(0)
   })
 
@@ -463,9 +558,10 @@ describe('RunDashboard', () => {
     vi.mocked(api.getControlPlaneRun).mockRejectedValue(new Error('network unreachable'))
     renderDashboard({ restartPollIntervalMs: 1 })
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    await openNewRun()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
@@ -480,9 +576,10 @@ describe('RunDashboard', () => {
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownedRun)
     renderDashboard({ restartPollIntervalMs: 1 })
 
-    await waitFor(() => expect(screen.getByRole('option', { name: 'plans/todo/demo.md' })).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Run plan'), { target: { value: 'plans/todo/demo.md' } })
-    fireEvent.change(screen.getByLabelText('Run workflow'), { target: { value: 'other' } })
+    await openNewRun()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Change workflow: stop and restart…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
@@ -584,7 +681,7 @@ describe('RunDashboard', () => {
     vi.mocked(api.resumeControlPlaneRun).mockResolvedValue({ run_id: 'run-continuation', created: false, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null })
     const rendered = renderDashboard()
 
-    await waitFor(() => expect(screen.getByText('Needs attention — explicit resume required')).toBeDefined())
+    await waitFor(() => expect(screen.getAllByText('Needs attention — explicit resume required').length).toBeGreaterThan(0))
     fireEvent.click(screen.getByRole('button', { name: /Owner stop/ }))
     expect(screen.getByText(/Confirm owner stop for run-needs-attention/)).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop' }))
@@ -630,11 +727,393 @@ describe('RunDashboard', () => {
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(legacyRun)
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByText('Legacy interrupted (read-only)')).toBeDefined())
+    await waitFor(() => expect(screen.getAllByText('Legacy interrupted (read-only)').length).toBeGreaterThan(0))
     expect(screen.getByText(/Legacy record classified as interrupted and read-only/)).toBeDefined()
     expect(screen.getByLabelText('Control max turns').getAttribute('disabled')).not.toBeNull()
     expect(screen.queryByRole('button', { name: /Owner stop/ })).toBeNull()
     expect(screen.queryByRole('button', { name: /Resume as new run/ })).toBeNull()
     expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
+  })
+
+  it('keeps New run collapsed behind existing runs and preserves the selected run', async () => {
+    renderDashboard()
+    await screen.findByRole('heading', { name: 'Run run-owned' })
+    const toggle = screen.getByRole('button', { name: 'New run' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByLabelText('Run plan')).toBeNull()
+
+    await openNewRun()
+    expect(screen.getByLabelText('Run plan')).toBeDefined()
+    expect(screen.getByRole('heading', { name: 'Run run-owned' })).toBeDefined()
+  })
+
+  it('opens New run automatically when no runs exist', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    renderDashboard()
+    await screen.findByLabelText('Run plan')
+    expect(screen.getByRole('button', { name: 'New run' }).getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('hands off the exact plan path from Run this plan and opens New run', async () => {
+    const onInitialPlanHandled = vi.fn()
+    renderDashboard({ initialPlanPath: 'plans/in-progress/demo.md', onInitialPlanHandled })
+    await screen.findByRole('heading', { name: 'Run run-owned' })
+    expect(screen.getByRole('button', { name: 'New run' }).getAttribute('aria-expanded')).toBe('true')
+    await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
+    expect(onInitialPlanHandled).toHaveBeenCalled()
+  })
+
+  it('offers only Ready plans for launch and rejects Draft and Done handoffs with promotion guidance', async () => {
+    const draft = { path: 'plans/todo/demo.md', status: 'todo', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }
+    const done = { path: 'plans/done/demo.md', status: 'done', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([
+      draft,
+      { path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 },
+      done,
+    ])
+    const admissionView = renderDashboard()
+
+    await openNewRun()
+    const planInput = screen.getByLabelText('Run plan')
+    fireEvent.focus(planInput)
+    // Only the Ready (in progress) plan is selectable; Draft and Done are
+    // never offered, so their paths can never be submitted.
+    expect(screen.getByRole('option', { name: /plans\/in-progress\/demo\.md/ })).toBeDefined()
+    expect(screen.queryByRole('option', { name: /plans\/todo\/demo\.md/ })).toBeNull()
+    expect(screen.queryByRole('option', { name: /plans\/done\/demo\.md/ })).toBeNull()
+    admissionView.unmount()
+
+    // A Draft handoff is cleared with the promotion guidance, not selected.
+    const onDraftHandled = vi.fn()
+    const draftRender = renderDashboard({ initialPlanPath: 'plans/todo/demo.md', onInitialPlanHandled: onDraftHandled })
+    await screen.findByText(/is still a draft — move it to Ready \(in progress\) in Plans before running it\./)
+    expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    expect(onDraftHandled).toHaveBeenCalled()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    draftRender.unmount()
+
+    // A Done handoff explains the archival lifecycle instead of a launch.
+    renderDashboard({ initialPlanPath: 'plans/done/demo.md' })
+    await screen.findByText(/is done and kept for the record, so it cannot start a run\./)
+    expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('')
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('requires a workflow choice when no project default is configured before start or restart', async () => {
+    renderDashboard()
+    await screen.findByRole('button', { name: 'New run' })
+    fireEvent.click(screen.getByRole('button', { name: 'New run' }))
+    choose('Run plan', 'plans/in-progress/demo.md')
+    expect(screen.getByText(/Choose an available workflow, or set a project default/)).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Change workflow: stop and restart…' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    choose('Run workflow', 'other')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Change workflow: stop and restart…' })).toBeDefined()
+  })
+
+  it('disables launch while an executable step lacks its exact role mapping', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        workflows: {
+          managed: {
+            declared_steps: ['plan', 'implement', 'review'],
+            first_step: 'plan',
+            executable_steps: ['plan', 'implement', 'review'],
+            first_executable_step: 'plan',
+            step_roles: null,
+          },
+        },
+      },
+    })
+    const first = renderDashboard()
+
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    expect(screen.getByText(/exact role preview is unavailable/).textContent).toContain('plan, implement, review')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+
+    // A partially mapped workflow is equally unlaunchable: the unmapped step
+    // is named instead of falling back to any configured role.
+    first.unmount()
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        workflows: {
+          managed: {
+            declared_steps: ['plan', 'implement', 'review'],
+            first_step: 'plan',
+            executable_steps: ['plan', 'implement', 'review'],
+            first_executable_step: 'plan',
+            step_roles: { plan: 'reviewer', implement: 'worker' },
+          },
+        },
+      },
+    })
+    renderDashboard()
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    expect(screen.getByText(/exact role preview is unavailable/).textContent).toContain('review')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('applies one max-turns validation to preview and request, so an invalid override never launches', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: { ...emptyProjection.form, default_workflow: 'managed', max_turns: 12 },
+    })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+
+    // Zero and fractional overrides get corrective help and disable Start.
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '0' } })
+    expect(screen.getByText(/Max turns must be a whole number of 1 or greater/)).toBeDefined()
+    expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('invalid override')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '1.5' } })
+    expect(screen.getByText(/Max turns must be a whole number of 1 or greater/)).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+
+    // A valid explicit override is both displayed and sent.
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '7' } })
+    await waitFor(() => expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('7 — your override'))
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      expect.objectContaining({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', max_turns: 7 }),
+      expect.anything(),
+    ))
+
+    // Empty keeps the configured default in both preview and request.
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '' } })
+    expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('12 — project default')
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][1]).toEqual({
+      plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', team: 'base', max_turns: 12,
+    })
+  })
+
+  it('resolves launch values with user override, then committed defaults, and labels the sources', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        default_workflow: 'managed',
+        max_turns: 12,
+        harnesses: {
+          codex: { fast: { model: 'glm-4.6', effort: 'high' } },
+          zcode: { main: { model: null, effort: null } },
+        },
+        roles: { reviewer: 'zcode.main' },
+        teams: { base: { roles: { worker: 'codex.fast' } } },
+        workflow_default_teams: { managed: 'base' },
+        workflows: {
+          managed: {
+            declared_steps: ['plan', 'implement', 'review'],
+            first_step: 'plan',
+            executable_steps: ['plan', 'implement', 'review'],
+            first_executable_step: 'plan',
+            step_roles: { plan: 'reviewer', implement: 'worker', review: 'reviewer' },
+          },
+          other: {
+            declared_steps: ['research'],
+            first_step: 'research',
+            executable_steps: ['research'],
+            first_executable_step: 'research',
+            step_roles: { research: 'worker' },
+          },
+        },
+      },
+    })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+
+    // Without overrides, the committed defaults resolve and are labeled as defaults.
+    const preview = screen.getByLabelText('Effective choices for this launch').textContent ?? ''
+    expect(preview).toContain('managed — project default')
+    expect(preview).toContain('12 — project default')
+    expect(preview).toContain('base — workflow default (base)')
+
+    // Each executable step resolves exactly its own declared role — the other
+    // configured roles are never repeated under a step.
+    const implementRow = screen.getByRole('row', { name: /^implement/ })
+    expect(implementRow.textContent).toContain('worker → codex.fast')
+    expect(implementRow.textContent).toContain('glm-4.6 · effort high')
+    expect(implementRow.textContent).toContain('— team base override')
+    expect(implementRow.textContent).not.toContain('zcode.main')
+    const planRow = screen.getByRole('row', { name: /^plan/ })
+    expect(planRow.textContent).toContain('reviewer → zcode.main')
+    expect(planRow.textContent).toContain('model and effort configured in ZCode — global')
+    expect(planRow.textContent).not.toContain('codex.fast')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      { plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', team: 'base', max_turns: 12 },
+      expect.stringMatching(/^start-/),
+    ))
+
+    // Overrides win over committed values and recompute the exact step roles.
+    choose('Run workflow', 'other')
+    choose('Run team', 'full')
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '7' } })
+    const overridden = screen.getByLabelText('Effective choices for this launch').textContent ?? ''
+    expect(overridden).toContain('other — your selection')
+    expect(overridden).toContain('7 — your override')
+    expect(overridden).toContain('full — your selection')
+    // Team full has no role overrides and worker has no global assignment, so
+    // the research step's exact role is missing with the settings action named.
+    expect(overridden).toContain('worker — missing')
+    expect(overridden).toContain('Settings → Roles')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(api.startControlPlaneRun).toHaveBeenLastCalledWith(
+      'control-project',
+      { plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', team: 'full', max_turns: 7 },
+      expect.stringMatching(/^start-/),
+    )
+  })
+
+  it('clears a start step the newly chosen workflow does not contain', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        workflows: {
+          managed: {
+            declared_steps: ['plan', 'implement', 'review'],
+            first_step: 'plan',
+            executable_steps: ['plan', 'implement', 'review'],
+            first_executable_step: 'plan',
+            step_roles: { plan: 'reviewer', implement: 'worker', review: 'reviewer' },
+          },
+          other: {
+            declared_steps: ['research'],
+            first_step: 'research',
+            executable_steps: ['research'],
+            first_executable_step: 'research',
+            step_roles: { research: 'worker' },
+          },
+        },
+      },
+    })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    openAdvanced()
+    choose('Run workflow', 'managed')
+    fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
+    expect(screen.getByText(/skips the earlier executable steps:/).textContent).toContain('plan')
+
+    choose('Run workflow', 'other')
+    expect((screen.getByLabelText('Run start step') as HTMLSelectElement).selectedIndex).toBe(0)
+    expect(screen.queryByText(/skips the earlier executable steps/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      expect.objectContaining({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'other' }),
+      expect.anything(),
+    ))
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[0][1].start_step).toBeUndefined()
+  })
+
+  it('disables launch with exact settings guidance while the committed configuration is not ready', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      validation: { ...committedConfig.validation, state: 'configuration_required' as const },
+    })
+    renderDashboard()
+
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByText(/still requires explicit model selectors/)).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Open settings' })).toBeDefined()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('explains a committed TOML syntax error instead of offering launch', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: null,
+      syntax_issues: [{ document: 'workflows.toml', line: 3, message: 'unexpected token' }],
+    })
+    renderDashboard()
+
+    await screen.findByLabelText('Run plan')
+    choose('Run plan', 'plans/in-progress/demo.md')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByText(/TOML syntax error/)).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Open settings' })).toBeDefined()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('keeps runs visible and blocks launch when the committed configuration cannot be read', async () => {
+    vi.mocked(api.getProjectConfig).mockRejectedValue(new Error('config unavailable'))
+    renderDashboard()
+    await screen.findByRole('heading', { name: 'Run run-owned' })
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByText(/could not be read \(config unavailable\)/)).toBeDefined()
+    expect(screen.getByRole('heading', { name: 'Run run-owned' })).toBeDefined()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('shows control-plane guidance without other projects when the registered project is unavailable', async () => {
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
+      { project_id: 'another-project', root: '/workspace/other', schema_version: 1 },
+    ])
+    renderDashboard()
+
+    await screen.findByRole('alert', { name: 'Project unavailable to the control plane' })
+    expect(screen.queryByLabelText('Run plan')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Run run-owned' })).toBeNull()
+    expect(api.listControlPlaneRuns).not.toHaveBeenCalled()
+    expect(api.listControlPlanePlans).not.toHaveBeenCalled()
+    expect(api.getControlPlaneCapabilities).not.toHaveBeenCalled()
   })
 })

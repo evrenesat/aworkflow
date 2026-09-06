@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
+  ConfigValidationIssue,
   ControlPlaneCapabilities,
   ControlPlanePlan,
-  ControlPlaneProject,
   ControlPlaneReadiness,
+  GuidedFormProjection,
+  GuidedProfileSummary,
   RunContext,
   RunEvent,
   RunStatus,
@@ -13,6 +15,7 @@ import type {
 } from '../types'
 import { ApiError } from '../api'
 import * as api from '../api'
+import { Combobox } from './Combobox'
 
 const MAX_TIMELINE_EVENTS = 100
 /** Bounded wait for exact source inactivity before a successor start. */
@@ -25,13 +28,87 @@ const MAX_EXTRA_INSTRUCTION_LENGTH = 512
 const MAX_EXTRA_INSTRUCTIONS_TOTAL = 4_096
 
 interface RunDashboardProps {
-  initialProjectRoot: string
+  /** The registered project whose runs are shown; its sole project authority. */
+  projectId: string
   initialPlanPath: string | null
   onInitialPlanHandled: () => void
   /** Test-only override; production callers retain the bounded 1s–30poll wait. */
   restartPollIntervalMs?: number
   pendingSuccessorStart?: PendingSuccessorStart | null
   onPendingSuccessorStartChange?: (pending: PendingSuccessorStart | null) => void
+  /** Opens Settings for the same project when launch prerequisites are missing. */
+  onOpenSettings?: () => void
+}
+
+/**
+ * The projection of the committed configuration pair, fetched through the pure
+ * form endpoint.  The run form resolves launch values only from this plus the
+ * canonical daemon capabilities — never from unsaved settings drafts.
+ */
+interface CommittedProjection {
+  validationState: 'ready' | 'configuration_required' | 'invalid'
+  form: GuidedFormProjection | null
+  syntaxIssues: ConfigValidationIssue[]
+}
+
+interface RoleResolution {
+  role: string
+  selector: string | null
+  source: 'team' | 'global' | 'missing'
+}
+
+/** Resolves one exact role through the team override, then the global selector. */
+function resolveStepRole(
+  role: string,
+  teamRoles: Record<string, string>,
+  globalRoles: Record<string, string>,
+): RoleResolution {
+  const teamSelector = teamRoles[role]
+  if (typeof teamSelector === 'string' && teamSelector.trim()) {
+    return { role, selector: teamSelector, source: 'team' as const }
+  }
+  const globalSelector = globalRoles[role]
+  if (typeof globalSelector === 'string' && globalSelector.trim()) {
+    return { role, selector: globalSelector, source: 'global' as const }
+  }
+  return { role, selector: null, source: 'missing' as const }
+}
+
+/**
+ * The single max-turns validation shared by the preview and the request:
+ * empty keeps the configured/default behavior, and a nonempty override must
+ * be a whole number of 1 or greater — anything else blocks the launch.
+ */
+function maxTurnsProblem(raw: string): string | null {
+  const text = raw.trim()
+  if (text === '') return null
+  const value = Number(text)
+  if (!/^\d+$/.test(text) || !Number.isSafeInteger(value) || value < 1) {
+    return 'Max turns must be a whole number of 1 or greater — correct or clear the override.'
+  }
+  return null
+}
+
+function selectorProfileSummary(
+  selector: string,
+  projection: GuidedFormProjection | null,
+): GuidedProfileSummary | null {
+  const dot = selector.indexOf('.')
+  if (dot <= 0 || !projection) return null
+  return projection.harnesses[selector.slice(0, dot)]?.[selector.slice(dot + 1)] ?? null
+}
+
+/** Model and effort text of a resolved selector; empty when unreported. */
+function selectorModelEffortText(
+  selector: string,
+  projection: GuidedFormProjection | null,
+): string {
+  const summary = selectorProfileSummary(selector, projection)
+  if (!summary) return ''
+  if (selector.startsWith('zcode.')) return 'model and effort configured in ZCode'
+  return [summary.model, summary.effort ? `effort ${summary.effort}` : null]
+    .filter((part): part is string => Boolean(part))
+    .join(' · ')
 }
 
 function requestKey(prefix: string): string {
@@ -286,18 +363,31 @@ export interface PendingSuccessorStart {
   idempotencyKey: string
 }
 
-function workflowSteps(capabilities: ControlPlaneCapabilities | null, workflow: string): string[] {
-  if (!capabilities || !workflow) return []
-  return capabilities.workflow_details?.[workflow]?.executable_steps ?? []
+/**
+ * Executable steps of the effective workflow, resolved from the committed
+ * projection first and the daemon-admitted capabilities second.
+ */
+function configuredWorkflowSteps(
+  projection: GuidedFormProjection | null,
+  capabilities: ControlPlaneCapabilities | null,
+  workflow: string,
+): string[] {
+  if (!workflow) return []
+  const projected = projection?.workflows[workflow]
+  if (projected?.executable_steps && projected.executable_steps.length > 0) return projected.executable_steps
+  const admitted = capabilities?.workflow_details?.[workflow]?.executable_steps
+  if (admitted && admitted.length > 0) return admitted
+  return []
 }
 
-export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange }: RunDashboardProps) {
-  const [projects, setProjects] = useState<ControlPlaneProject[]>([])
-  const [projectId, setProjectId] = useState<string | null>(null)
+export function RunDashboard({ projectId, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
+  const [projectAvailable, setProjectAvailable] = useState<boolean | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
   const [plans, setPlans] = useState<ControlPlanePlan[]>([])
   const [plansLoaded, setPlansLoaded] = useState(false)
+  const [committed, setCommitted] = useState<CommittedProjection | null>(null)
+  const [committedError, setCommittedError] = useState<string | null>(null)
   const [runs, setRuns] = useState<RunStatus[]>([])
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const [events, setEvents] = useState<RunEvent[]>([])
@@ -332,6 +422,11 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     onPendingSuccessorStartChange?.(pending)
   }, [onPendingSuccessorStartChange])
   const [elapsedNow, setElapsedNow] = useState(() => Date.now())
+  // New run is a compact disclosure: it opens for an exact plan handoff, when
+  // no runs exist, or when a frozen successor draft needs attention.
+  const [newRunOpen, setNewRunOpen] = useState(initialPlanPath !== null)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [refreshNonce, setRefreshNonce] = useState(0)
   const selectedRunRef = useRef<string | null>(null)
   const snapshotRequestRef = useRef(0)
   const controlsForRunRef = useRef<string | null>(null)
@@ -341,11 +436,6 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   const selectedRun = useMemo(
     () => runs.find((run) => run.run_id === selectedRunId) ?? null,
     [runs, selectedRunId],
-  )
-
-  const selectedProject = useMemo(
-    () => projects.find((project) => project.project_id === projectId) ?? null,
-    [projects, projectId],
   )
 
   const successorRunIds = useMemo(
@@ -411,34 +501,55 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     return () => clearInterval(ticker)
   }, [selectedRunIsActive])
 
+  // A frozen successor draft lives in the New run form; surface it on remount.
   useEffect(() => {
+    if (pendingSuccessorStart) setNewRunOpen(true)
+  }, [pendingSuccessorStart])
+
+  // The registered project id is the sole authority: no root matching, no
+  // internal switcher, and never a fallback to another control-plane project.
+  useEffect(() => {
+    let active = true
     void (async () => {
       try {
         setLoading(true)
         setError(null)
-        const available = await api.listControlPlaneProjects()
-        setProjects(available)
-        const matchingProject = available.find((project) => project.root === initialProjectRoot)
-        setProjectId((current) => current && available.some((project) => project.project_id === current)
-          ? current
-          : matchingProject?.project_id ?? available[0]?.project_id ?? null)
+        setProjectAvailable(null)
+        const [available, readinessState] = await Promise.all([
+          api.listControlPlaneProjects(),
+          api.getControlPlaneReadiness(),
+        ])
+        if (!active) return
+        setReadiness(readinessState)
+        const availableHere = available.some((project) => project.project_id === projectId)
+        setProjectAvailable(availableHere)
+        if (availableHere) await loadDashboard(projectId)
       } catch (loadError) {
-        setError(errorMessage(loadError, 'Failed to load control-plane projects'))
+        if (active) setError(errorMessage(loadError, 'Failed to load control-plane projects'))
       } finally {
-        setLoading(false)
+        if (active) setLoading(false)
       }
     })()
-  }, [initialProjectRoot])
-
-  useEffect(() => {
-    if (projectId) void loadDashboard(projectId)
-  }, [projectId])
+    return () => {
+      active = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reloads per project and explicit refresh only
+  }, [projectId, refreshNonce])
 
   useEffect(() => {
     if (!initialPlanPath || !plansLoaded) return
-    if (plans.some((plan) => plan.path === initialPlanPath)) {
+    const handedOff = plans.find((plan) => plan.path === initialPlanPath)
+    if (handedOff && handedOff.status === 'in_progress') {
       setStartPlanPath(initialPlanPath)
+    } else if (handedOff) {
+      setStartPlanPath('')
+      // Only a saved Ready plan may enter launch: a Draft or Done handoff is
+      // cleared with the existing promotion guidance instead of a no-op.
+      setFeedback(handedOff.status === 'done'
+        ? `${initialPlanPath} is done and kept for the record, so it cannot start a run. Create a new plan and move it through Draft → Ready.`
+        : `${initialPlanPath} is still a draft — move it to Ready (in progress) in Plans before running it.`)
     } else {
+      setStartPlanPath('')
       setFeedback('Select a daemon-approved plan from the run dashboard before starting a run.')
     }
     onInitialPlanHandled()
@@ -527,6 +638,25 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
       setSelectedRunId((current) => page.runs.some((run) => run.run_id === current)
         ? current
         : page.runs[0]?.run_id ?? null)
+      if (page.runs.length === 0) setNewRunOpen(true)
+      // The launch form projects the committed pair through the pure form
+      // endpoint; a projection failure only blocks launch, never the runs.
+      try {
+        const committedPair = await api.getProjectConfig(nextProjectId)
+        const projected = await api.postProjectConfigForm(nextProjectId, {
+          aflow_toml: committedPair.aflow_toml,
+          workflows_toml: committedPair.workflows_toml,
+        })
+        setCommitted({
+          validationState: projected.validation.state,
+          form: projected.form,
+          syntaxIssues: projected.syntax_issues,
+        })
+        setCommittedError(null)
+      } catch (projectionError) {
+        setCommitted(null)
+        setCommittedError(errorMessage(projectionError, 'Failed to read the committed configuration'))
+      }
     } catch (loadError) {
       // Preserve the last daemon snapshot: a connection failure is not a run transition.
       setError(`${errorMessage(loadError, 'Failed to refresh runs')}. Existing run data remains visible.`)
@@ -596,20 +726,48 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     }
   }
 
+  /** A workflow change keeps only start-step/team values the new workflow admits. */
+  function changeStartWorkflow(workflow: string) {
+    setStartWorkflow(workflow)
+    setStartStep((current) => current && configuredWorkflowSteps(committedForm, capabilities, workflow).includes(current)
+      ? current
+      : '')
+    setStartTeam((current) => (current && teamOptions.includes(current) ? current : ''))
+  }
+
+  /**
+   * Launch values resolve with explicit precedence: the user override wins,
+   * then the committed default (workflow, max turns, workflow default team),
+   * and only a value with no configured source is omitted from the request.
+   */
   function startRequestFromDraft(restartedFromRunId?: string): StartRunRequest {
+    // One validation result for preview and request alike: empty keeps the
+    // configured/default value, a valid override wins, and an invalid
+    // nonempty override never reaches a request because the launch is
+    // disabled while it is displayed.
+    const maxTurns = startMaxTurns.trim() === ''
+      ? configuredMaxTurns
+      : startMaxTurnsProblem === null
+        ? Number(startMaxTurns.trim())
+        : null
     return {
       plan_path: startPlanPath.trim(),
-      ...(startWorkflow.trim() ? { workflow_name: startWorkflow.trim() } : {}),
-      ...(startTeam.trim() ? { team: startTeam.trim() } : {}),
+      ...(effectiveWorkflow ? { workflow_name: effectiveWorkflow } : {}),
+      ...(effectiveTeam ? { team: effectiveTeam } : {}),
       ...(startStep.trim() ? { start_step: startStep.trim() } : {}),
-      ...(startMaxTurns.trim() ? { max_turns: Number(startMaxTurns.trim()) } : {}),
+      ...(typeof maxTurns === 'number' && Number.isInteger(maxTurns) && maxTurns > 0
+        ? { max_turns: maxTurns }
+        : {}),
       ...(extraInstructions.length ? { extra_instructions: extraInstructions } : {}),
       ...(restartedFromRunId ? { restarted_from_run_id: restartedFromRunId } : {}),
     }
   }
 
   async function handleStart() {
-    if (!projectId || !startPlanPath) return
+    const selectedPlan = plans.find((plan) => plan.path === startPlanPath.trim())
+    // Launch admission is lifecycle-checked again at submit time: only a
+    // saved Ready (in progress) plan path is ever submitted.
+    if (startDisabled || !projectId || !selectedPlan || selectedPlan.status !== 'in_progress') return
     const startRequest = startRequestFromDraft()
     const intent = { project_id: projectId, ...startRequest }
     try {
@@ -626,14 +784,13 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     }
   }
 
-  async function handleStartResponse(response: StartRunResponse, action: string, responseProjectId = projectId) {
-    if (responseProjectId) setProjectId(responseProjectId)
+  async function handleStartResponse(response: StartRunResponse, action: string) {
     if (response.startup_question) {
       setStartupQuestion(response.startup_question)
       setFeedback(`${action} is awaiting a startup answer. No workflow has been started.`)
       return
     }
-    if (!response.result || !responseProjectId) return
+    if (!response.result) return
     const result = response.result
     setStartupQuestion(null)
     const lineage = result.restarted_from_run_id
@@ -642,7 +799,8 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
     setFeedback(result.created
       ? `${action} created run ${result.run_id}.${lineage}`
       : `${action} replay returned existing run ${result.run_id}; no duplicate was created.`)
-    await loadDashboard(responseProjectId)
+    setNewRunOpen(false)
+    await loadDashboard(projectId)
     setSelectedRunId(result.run_id)
   }
 
@@ -784,7 +942,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   }
 
   async function retryPendingSuccessorStart() {
-    if (!pendingSuccessorStart) return
+    if (!pendingSuccessorStart || pendingSuccessorStart.projectId !== projectId) return
     const { projectId: successorProjectId, request, idempotencyKey } = pendingSuccessorStart
     try {
       setRestartPhase('starting')
@@ -795,7 +953,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
       setPendingSuccessorStart(null)
       setRestartPhase(null)
       setRestartNotice(null)
-      await handleStartResponse(response, 'Successor retry', successorProjectId)
+      await handleStartResponse(response, 'Successor retry')
     } catch (restartError) {
       if (successorStartWasRejected(restartError)) {
         clearPendingWriteKey('start', { project_id: successorProjectId, ...request })
@@ -810,7 +968,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   }
 
   async function handleConfirmedRestart() {
-    if (!projectId || !selectedRun || !selectedRunIsActive || !startWorkflow.trim() || pendingSuccessorStart) return
+    if (!restartDraftReady || !projectId || !selectedRun || !selectedRunIsActive || pendingSuccessorStart) return
     const sourceRunId = selectedRun.run_id
     const startRequest = startRequestFromDraft(sourceRunId)
     const stopIntent = {
@@ -900,20 +1058,119 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
   const canMutate = selectedRun?.ownership === 'control_plane'
   const canResume = canMutate && selectedRun?.status === 'needs_attention'
   const canRestart = canMutate && selectedRunIsActive
+  const startMaxTurnsProblem = maxTurnsProblem(startMaxTurns)
   const restartDraftWorkflow = startWorkflow.trim()
-  const restartDraftReady = Boolean(restartDraftWorkflow && restartDraftWorkflow !== selectedRun?.workflow_name && startPlanPath.trim())
-  const restartDraftHint = !canRestart
-    ? null
-    : restartDraftReady
-      ? null
-      : 'Select a successor workflow and plan in the start form to enable a guided restart of this run.'
   const restartInProgress = restartPhase === 'stopping' || restartPhase === 'waiting' || restartPhase === 'starting'
   const successorOutcomeUnknown = pendingSuccessorStart !== null && restartPhase !== 'starting'
   const restartDraftFrozen = pendingSuccessorStart !== null
   const restartPendingConfirmation = restartPhase === 'confirming'
-  const runSteps = workflowSteps(capabilities, startWorkflow.trim())
+
+  // Effective launch values, resolved only from the committed projection plus
+  // canonical capabilities.  An unresolved value is never labeled a default.
+  const committedForm = committed?.form ?? null
+  const effectiveWorkflow = startWorkflow.trim() || (committedForm?.default_workflow ?? '').trim()
+  const effectiveWorkflowSource = startWorkflow.trim()
+    ? 'your selection'
+    : committedForm?.default_workflow
+      ? 'project default'
+      : 'not resolved'
+  const configuredMaxTurns = committedForm?.max_turns ?? null
+  const effectiveMaxTurns = startMaxTurns.trim() !== '' ? Number(startMaxTurns.trim()) : configuredMaxTurns
+  const effectiveMaxTurnsSource = startMaxTurns.trim() !== ''
+    ? 'your override'
+    : configuredMaxTurns !== null
+      ? 'project default'
+      : 'no limit configured'
+  const workflowDefaultTeam = effectiveWorkflow
+    ? committedForm?.workflow_default_teams?.[effectiveWorkflow]
+      ?? capabilities?.workflow_details?.[effectiveWorkflow]?.default_team
+      ?? null
+    : null
+  const effectiveTeam = startTeam.trim() || workflowDefaultTeam || ''
+  const effectiveTeamSource = startTeam.trim()
+    ? 'your selection'
+    : workflowDefaultTeam
+      ? `workflow default (${workflowDefaultTeam})`
+      : 'no team — global role assignments apply'
+  const effectiveTeamRoles = effectiveTeam ? committedForm?.teams?.[effectiveTeam]?.roles ?? {} : {}
+  const effectiveSteps = configuredWorkflowSteps(committedForm, capabilities, effectiveWorkflow)
+  // Exact per-step roles come only from the committed projection's
+  // materialized mapping; a role is never inferred from the step name, the
+  // full configured role list, or raw TOML.
+  const stepRoleMap = effectiveWorkflow
+    ? committedForm?.workflows?.[effectiveWorkflow]?.step_roles ?? null
+    : null
+  const unmappedSteps = stepRoleMap === null
+    ? effectiveSteps
+    : effectiveSteps.filter((step) => !(step in stepRoleMap))
+
+  // Configured-only choices for the searchable controls; the '' sentinel is
+  // the explicit "no override" value that follows the configured defaults.
+  const workflowOptions = ['', ...new Set([
+    ...(committedForm ? Object.keys(committedForm.workflows) : []),
+    ...(capabilities?.workflows ?? []),
+  ])].sort()
+  const workflowBadges: Record<string, string> = {}
+  for (const workflow of workflowOptions) {
+    if (workflow === '') {
+      workflowBadges[''] = committedForm?.default_workflow
+        ? `project default (${committedForm.default_workflow})`
+        : 'no project default'
+      continue
+    }
+    workflowBadges[workflow] = committedForm?.workflows[workflow] ? 'configured' : 'daemon-admitted'
+  }
+  const teamOptions = ['', ...new Set([
+    ...(committedForm ? Object.keys(committedForm.teams) : []),
+    ...(capabilities?.teams ?? []),
+  ])].sort()
+  const teamBadges: Record<string, string> = { '': 'no team — follow the workflow default' }
+  for (const team of teamOptions) {
+    if (team === '') continue
+    teamBadges[team] = committedForm?.teams[team] ? 'configured' : 'daemon-admitted'
+  }
+  // Launch admission offers only saved Ready (in progress) plans: Draft and
+  // Done records are never selectable, so their paths are never submitted.
+  const runnablePlans = plans.filter((plan) => plan.status === 'in_progress')
+  const planOptions = runnablePlans.map((plan) => plan.path)
+  const planBadges: Record<string, string> = Object.fromEntries(runnablePlans.map((plan) => [
+    plan.path,
+    'ready',
+  ]))
+
+  const launchBlocker = (() => {
+    if (!startPlanPath.trim()) return 'Choose a Ready plan to enable Start run.'
+    if (!runnablePlans.some((plan) => plan.path === startPlanPath.trim())) {
+      return 'Choose a Ready plan from the available options. Draft and Done plans cannot run.'
+    }
+    if (committedError) return `The committed configuration could not be read (${committedError}). Refresh to retry, or fix it in Settings.`
+    if (committed === null) return 'The committed configuration has not finished loading yet.'
+    if (committed.form === null) return 'The committed configuration has a TOML syntax error — fix it in Settings and save the pair before starting a run.'
+    if (committed.validationState === 'configuration_required') return 'The committed configuration still requires explicit model selectors — finish configuration in Settings and save it before starting a run.'
+    if (committed.validationState === 'invalid') return 'The committed configuration is invalid — fix the diagnostics in Settings and save the pair before starting a run.'
+    if (!effectiveWorkflow || !workflowOptions.includes(effectiveWorkflow)) return 'Choose an available workflow, or set a project default in Settings.'
+    if (effectiveTeam && !teamOptions.includes(effectiveTeam)) return 'Choose an available team, or clear the override to use the workflow default.'
+    if (effectiveSteps.length === 0) return 'The workflow has no available executable steps to preview. Check it in Settings.'
+    if (unmappedSteps.length > 0) return `The exact role preview is unavailable for ${effectiveWorkflow} step${unmappedSteps.length > 1 ? 's' : ''} ${unmappedSteps.join(', ')} — the committed configuration does not map those executable steps to roles. Refresh, or check the workflow in Settings, before starting a run.`
+    return null
+  })()
+  const startDisabled = !projectAvailable
+    || !startPlanPath
+    || busyAction === 'start'
+    || restartInProgress
+    || restartDraftFrozen
+    || Boolean(extraInstructionProblem)
+    || startMaxTurnsProblem !== null
+    || launchBlocker !== null
+  const restartDraftReady = Boolean(restartDraftWorkflow && restartDraftWorkflow !== selectedRun?.workflow_name)
+    && launchBlocker === null && startMaxTurnsProblem === null && !extraInstructionProblem
+  const restartDraftHint = canRestart && !restartDraftReady
+    ? 'Select a different workflow and complete the Ready plan choices in New run to enable a guided restart.'
+    : null
+  const runSteps = effectiveSteps
   const startStepIndex = runSteps.indexOf(startStep.trim())
   const skippedByDraft = startStepIndex > 0 ? runSteps.slice(0, startStepIndex) : []
+
   const readinessLabel = readiness === null
     ? 'Readiness unavailable'
     : readiness.ready ? 'Daemon ready' : 'Daemon not ready'
@@ -946,7 +1203,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
           <h2>Run dashboard</h2>
           <p className="text-sm text-dim">Persistent server records remain visible if the daemon connection is interrupted.</p>
         </div>
-        <button className="btn btn-secondary btn-sm" onClick={() => projectId && void loadDashboard(projectId)} disabled={refreshing || !projectId}>
+        <button className="btn btn-secondary btn-sm" onClick={() => setRefreshNonce((nonce) => nonce + 1)} disabled={refreshing || loading}>
           {refreshing ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
@@ -956,26 +1213,35 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
       {successorOutcomeUnknown && pendingSuccessorStart && (
         <div className="notice" role="alert">
           The successor request for {pendingSuccessorStart.sourceRunId} in {pendingSuccessorStart.projectId} is frozen while its outcome is unknown. Do not start a changed replacement.
-          <div className="dashboard-actions"><button className="btn btn-primary" disabled={restartInProgress} onClick={() => void retryPendingSuccessorStart()}>Retry exact successor request</button></div>
+          <div className="dashboard-actions"><button className="btn btn-primary" disabled={restartInProgress || pendingSuccessorStart.projectId !== projectId} onClick={() => void retryPendingSuccessorStart()}>Retry exact successor request</button></div>
         </div>
       )}
 
-      <label className="dashboard-field">
-        <span>Control-plane project</span>
-        <select className="input" aria-label="Control-plane project" value={projectId ?? ''} onChange={(event) => setProjectId(event.target.value || null)}>
-          {projects.length === 0 && <option value="">No control-plane projects available</option>}
-          {projects.map((project) => <option key={project.project_id} value={project.project_id}>{project.project_id} — {project.root}</option>)}
-        </select>
-      </label>
-
-      {selectedProject && capabilities && (
+      {projectAvailable && capabilities && (
         <div className="dashboard-capabilities card">
-          <div><strong>{selectedProject.project_id}</strong><span className="text-dim mono">{selectedProject.root}</span><span className={`status-pill ${readiness?.ready ? '' : 'status-awaiting'}`}>{readinessLabel}</span></div>
+          <div><strong>{projectId}</strong><span className={`status-pill ${readiness?.ready ? '' : 'status-awaiting'}`}>{readinessLabel}</span></div>
           <div className="text-xs text-dim">Workflows: {capabilities.workflows.join(', ') || 'not reported'} · Teams: {capabilities.teams.join(', ') || 'not reported'}</div>
         </div>
       )}
 
-      {startupQuestion && (
+      {projectAvailable === false && (
+        <div className="card" role="alert" aria-label="Project unavailable to the control plane">
+          <h3>This project is not available to the workflow control plane</h3>
+          <p className="text-sm text-dim">
+            <span className="mono">{projectId}</span> is registered in the dashboard, but the control plane does not
+            list it, so its plans and runs cannot be shown here and no run can be started. The daemon may need to
+            reload its project registry after the project was registered or its configuration saved.
+          </p>
+          <p className="text-sm text-dim">Daemon readiness: {readinessLabel}.</p>
+          <div className="dashboard-actions">
+            <button className="btn btn-secondary btn-sm" disabled={refreshing} onClick={() => setRefreshNonce((nonce) => nonce + 1)}>
+              Retry control-plane check
+            </button>
+          </div>
+        </div>
+      )}
+
+      {projectAvailable && startupQuestion && (
         <section className="card startup-question" aria-label="Startup question">
           <div className="status-pill status-awaiting">Awaiting startup answer · {startupQuestion.kind.replace(/_/g, ' ')}</div>
           <h3>{startupQuestion.message}</h3>
@@ -995,76 +1261,196 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
         </section>
       )}
 
-      <section className="card start-run-form">
-        <div>
-          <h3>Start a daemon-owned run</h3>
-          <p className="text-sm text-dim">The server owns validation and returns either a run or a startup question.</p>
-        </div>
-        <label className="dashboard-field"><span>Plan</span>
-          <select className="input" aria-label="Run plan" value={startPlanPath} disabled={restartDraftFrozen} onChange={(event) => setStartPlanPath(event.target.value)}>
-            <option value="">Select an allowed plan</option>
-            {plans.map((plan) => <option key={plan.path} value={plan.path}>{plan.path}</option>)}
-          </select>
-        </label>
-        <div className="dashboard-form-grid">
-          <label className="dashboard-field"><span>Workflow</span>
-            <select className="input" aria-label="Run workflow" value={startWorkflow} disabled={restartDraftFrozen} onChange={(event) => { setStartWorkflow(event.target.value); setStartStep('') }}>
-              <option value="">Server default</option>
-              {capabilities?.workflows.map((workflow) => <option key={workflow} value={workflow}>{workflow}</option>)}
-            </select>
-          </label>
-          <label className="dashboard-field"><span>Team</span>
-            <select className="input" aria-label="Run team" value={startTeam} disabled={restartDraftFrozen} onChange={(event) => setStartTeam(event.target.value)}>
-              <option value={startWorkflow && capabilities?.workflow_details?.[startWorkflow]?.default_team
-                ? capabilities.workflow_details[startWorkflow].default_team ?? ''
-                : ''}>
-                {startWorkflow && capabilities?.workflow_details?.[startWorkflow]?.default_team
-                  ? `Workflow default (${capabilities.workflow_details[startWorkflow].default_team})`
-                  : 'Server default'}
-              </option>
-              {capabilities?.teams.map((team) => <option key={team} value={team}>{team}</option>)}
-            </select>
-          </label>
-          <label className="dashboard-field"><span>Start step</span>
-            <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!startWorkflow || restartDraftFrozen}>
-              <option value="">{startWorkflow ? 'Workflow first step (default)' : 'Select a workflow first'}</option>
-              {runSteps.map((step, index) => (
-                <option key={step} value={step}>{index + 1} · {step}</option>
-              ))}
-            </select>
-          </label>
-          <label className="dashboard-field"><span>Max turns</span>
-            <input className="input" aria-label="Run max turns" type="number" min="1" value={startMaxTurns} disabled={restartDraftFrozen} onChange={(event) => setStartMaxTurns(event.target.value)} />
-          </label>
-        </div>
-        {skippedByDraft.length > 0 && (
-          <div className="notice">
-            Starting at <strong>{startStep}</strong> skips the earlier executable steps:{' '}
-            <span className="mono">{skippedByDraft.join(', ')}</span>. They are recorded as skipped, not executed.
+      {projectAvailable && (
+        <section className="card start-run-form">
+          <div className="section-heading">
+            <h3>
+              <button
+                type="button"
+                className="disclosure-toggle"
+                aria-expanded={newRunOpen}
+                aria-controls="new-run-body"
+                onClick={() => setNewRunOpen((open) => !open)}
+              >
+                New run
+              </button>
+            </h3>
+            <span className="text-xs text-dim">Start a daemon-owned run; the server owns validation and returns either a run or a startup question.</span>
           </div>
-        )}
-        <label className="dashboard-field"><span>Extra instructions — one bounded line per instruction (optional)</span>
-          <textarea
-            className="input textarea"
-            aria-label="Run extra instructions"
-            disabled={restartDraftFrozen}
-            value={startExtraInstructions}
-            onChange={(event) => setStartExtraInstructions(event.target.value)}
-            rows={3}
-          />
-        </label>
-        {extraInstructionProblem && <div className="error-message">{extraInstructionProblem}</div>}
-        <button
-          className="btn btn-primary"
-          onClick={() => void handleStart()}
-          disabled={!projectId || !startPlanPath || busyAction === 'start' || restartInProgress || restartDraftFrozen || Boolean(extraInstructionProblem)}
-        >
-          {busyAction === 'start' ? 'Starting…' : 'Start run'}
-        </button>
-      </section>
+          {newRunOpen && (
+            <div id="new-run-body" className="start-run-form">
+              <div className="dashboard-field">
+                <Combobox
+                  label="Run plan"
+                  value={startPlanPath}
+                  onChange={setStartPlanPath}
+                  options={planOptions}
+                  optionBadges={planBadges}
+                  disabled={restartDraftFrozen}
+                  emptyOption="Choose an allowed plan"
+                  placeholder="Search daemon-approved plans"
+                />
+                <span className="text-xs text-dim">Only Ready (in progress) plans are offered — move a draft to Ready in Plans to run it.</span>
+              </div>
+              <div className="dashboard-form-grid">
+                <div className="dashboard-field">
+                  <Combobox
+                    label="Run workflow"
+                    value={startWorkflow}
+                    onChange={changeStartWorkflow}
+                    options={workflowOptions}
+                    optionBadges={workflowBadges}
+                    disabled={restartDraftFrozen}
+                    emptyOption="Leave empty to use the project default workflow"
+                    placeholder="Search workflows"
+                  />
+                </div>
+                <div className="dashboard-field">
+                  <Combobox
+                    label="Run team"
+                    value={startTeam}
+                    onChange={setStartTeam}
+                    options={teamOptions}
+                    optionBadges={teamBadges}
+                    disabled={restartDraftFrozen}
+                    emptyOption="Leave empty to use the workflow default team"
+                    placeholder="Search teams"
+                  />
+                </div>
+                <label className="dashboard-field"><span>Max turns</span>
+                  <input className="input" aria-label="Run max turns" type="number" min="1" value={startMaxTurns} disabled={restartDraftFrozen} onChange={(event) => setStartMaxTurns(event.target.value)} />
+                  {startMaxTurnsProblem
+                    ? <span className="error-message" role="alert">{startMaxTurnsProblem}</span>
+                    : <span className="text-xs text-dim">{configuredMaxTurns !== null ? `Project default: ${configuredMaxTurns}.` : 'No project default max turns is configured.'}</span>}
+                </label>
+              </div>
+              <section className="dashboard-section" aria-label="Effective choices for this launch">
+                <div className="section-heading">
+                  <h4>Effective choices for this launch</h4>
+                  <span className="text-xs text-dim">from your selections and the committed configuration</span>
+                </div>
+                <dl className="run-preview-list">
+                  <div><dt>Plan</dt><dd className="mono">{startPlanPath.trim() || <span className="text-dim">Not chosen</span>}</dd></div>
+                  <div><dt>Workflow</dt><dd>{effectiveWorkflow
+                    ? <><span className="mono">{effectiveWorkflow}</span> — {effectiveWorkflowSource}</>
+                    : <span className="text-dim">Not resolved — choose a workflow or set a project default in Settings</span>}</dd></div>
+                  <div><dt>Max turns</dt><dd>{startMaxTurnsProblem !== null
+                    ? <><span className="mono">{startMaxTurns.trim()}</span> — invalid override: correct the Max turns field</>
+                    : effectiveMaxTurns !== null
+                      ? <><span className="mono">{effectiveMaxTurns}</span> — {effectiveMaxTurnsSource}</>
+                      : <span className="text-dim">{effectiveMaxTurnsSource}</span>}</dd></div>
+                  <div><dt>Team</dt><dd>{effectiveTeam
+                    ? <><span className="mono">{effectiveTeam}</span> — {effectiveTeamSource}</>
+                    : <span className="text-dim">{effectiveTeamSource}</span>}</dd></div>
+                </dl>
+                {effectiveWorkflow && (effectiveSteps.length ? (
+                  <table className="guided-table">
+                    <caption className="text-xs text-dim">
+                      Executable steps with their exact role ({effectiveTeam ? `team ${effectiveTeam} override → global` : 'global selector'})
+                    </caption>
+                    <thead><tr><th scope="col">Step</th><th scope="col">Role → selector</th></tr></thead>
+                    <tbody>
+                      {effectiveSteps.map((step) => {
+                        const role = stepRoleMap?.[step]
+                        const resolution = role
+                          ? resolveStepRole(role, effectiveTeamRoles, committedForm?.roles ?? {})
+                          : null
+                        return (
+                          <tr key={step}>
+                            <td className="mono">{step}</td>
+                            <td>
+                              {!resolution
+                                ? <span className="text-dim text-sm">Exact role preview unavailable for this step.</span>
+                                : resolution.selector
+                                  ? <div className="text-sm">
+                                      <span className="mono">{resolution.role} → {resolution.selector}</span>
+                                      {selectorModelEffortText(resolution.selector, committedForm) && <> · {selectorModelEffortText(resolution.selector, committedForm)}</>}
+                                      {resolution.source === 'team' && <> — team {effectiveTeam} override</>}
+                                      {resolution.source === 'global' && <> — global</>}
+                                    </div>
+                                  : <div className="text-sm"><span className="mono">{resolution.role}</span> — <span className="text-dim">missing — assign it in Settings → Roles or a team override</span></div>}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                ) : (
+                  <p className="text-sm text-dim">
+                    Executable steps for <span className="mono">{effectiveWorkflow}</span> are not available from the
+                    committed configuration — check the workflow declaration in Settings.
+                  </p>
+                ))}
+              </section>
+              <section className="dashboard-section">
+                <h4>
+                  <button
+                    type="button"
+                    className="disclosure-toggle"
+                    aria-expanded={advancedOpen}
+                    aria-controls="new-run-advanced"
+                    onClick={() => setAdvancedOpen((open) => !open)}
+                  >
+                    Advanced options
+                  </button>
+                </h4>
+                {advancedOpen && (
+                  <div id="new-run-advanced" className="start-run-form">
+                    <label className="dashboard-field"><span>Start step</span>
+                      <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!effectiveWorkflow || restartDraftFrozen}>
+                        <option value="">{effectiveWorkflow ? 'Workflow first step (default)' : 'Select a workflow first'}</option>
+                        {runSteps.map((step, index) => (
+                          <option key={step} value={step}>{index + 1} · {step}</option>
+                        ))}
+                      </select>
+                    </label>
+                    {skippedByDraft.length > 0 && (
+                      <div className="notice">
+                        Starting at <strong>{startStep}</strong> skips the earlier executable steps:{' '}
+                        <span className="mono">{skippedByDraft.join(', ')}</span>. They are recorded as skipped, not executed.
+                      </div>
+                    )}
+                    <label className="dashboard-field"><span>Extra instructions — one bounded line per instruction (optional)</span>
+                      <textarea
+                        className="input textarea"
+                        aria-label="Run extra instructions"
+                        disabled={restartDraftFrozen}
+                        value={startExtraInstructions}
+                        onChange={(event) => setStartExtraInstructions(event.target.value)}
+                        rows={3}
+                      />
+                    </label>
+                  </div>
+                )}
+              </section>
+              {extraInstructionProblem && <div className="error-message" role="alert">{extraInstructionProblem} Open Advanced options to edit the instructions.</div>}
+              {launchBlocker && (
+                <div className="notice" role="note">
+                  {launchBlocker}
+                  {onOpenSettings && (
+                    <div className="dashboard-actions">
+                      <button className="btn btn-secondary btn-sm" onClick={onOpenSettings}>Open settings</button>
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="dashboard-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void handleStart()}
+                  disabled={startDisabled}
+                >
+                  {busyAction === 'start' ? 'Starting…' : 'Start run'}
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
 
-      <div className="dashboard-columns">
-        <section className="card run-list" aria-label="Project runs">
+      {projectAvailable && (
+        <div className="dashboard-columns">
+          <section className="card run-list" aria-label="Project runs">
           <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{runs.length} recorded</span></div>
           {runs.length === 0 ? <p className="text-sm text-dim">No runs are recorded for this project.</p> : runs.map((run) => (
             <button className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => setSelectedRunId(run.run_id)}>
@@ -1180,7 +1566,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
                   A workflow change is never applied in place. Confirming performs an owner stop of{' '}
                   <span className="mono">{selectedRun.run_id}</span>, waits until the canonical status proves that
                   exact unit is inactive and terminal, and only then starts a fresh run from the typed draft in the
-                  start form above with <span className="mono">restarted_from_run_id</span> lineage. If the stop, the
+                  New run form with <span className="mono">restarted_from_run_id</span> lineage. If the stop, the
                   wait, or the successor start fails, automation halts: the draft is preserved and the source state
                   above stays authoritative. Explicit resume stays a separate same-workflow action.
                 </div>
@@ -1190,7 +1576,7 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
                     <div className="dashboard-actions"><button className="btn btn-danger" onClick={() => setRestartPhase('confirming')}>Change workflow: stop and restart…</button></div>
                   )}
                 {restartPendingConfirmation && !restartDraftReady && (
-                  <div className="text-xs text-dim">Select a successor workflow and plan in the start form before confirming.</div>
+                  <div className="text-xs text-dim">Select a successor workflow and plan in the New run form before confirming.</div>
                 )}
                 {restartPendingConfirmation && restartDraftReady && (
                   <div className="confirmation">
@@ -1229,7 +1615,8 @@ export function RunDashboard({ initialProjectRoot, initialPlanPath, onInitialPla
             </section>
           </>}
         </section>
-      </div>
+        </div>
+      )}
     </div>
   )
 }

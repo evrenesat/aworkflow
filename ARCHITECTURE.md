@@ -896,6 +896,15 @@ dashboard launch.
 reads, commits, capability loads, and launch reservation share one per-project
 lock so a launch cannot freeze a torn or superseded pair.
 
+The guided configuration projection exposes each workflow's materialized
+executable step names and `step_roles` from the production loader. The run
+preview resolves each step's role through the selected team's override and
+then the global selector, using the saved configuration pair. Draft and Done
+plans cannot launch from the UI; unresolved workflow/step previews and invalid
+turn-limit overrides require correction before starting or stopping for a
+replacement run. These checks preserve the existing canonical launch and
+restart protocols.
+
 The REST control-plane routes and `/mcp` mount delegate to the same durable
 `ControlPlaneService`. The HTTP layer does not own workflow processes. Bearer
 credentials are accepted only in headers, while project roots and executable

@@ -499,7 +499,70 @@ extends = "deliver"
         assert alias.declared_steps == tuple(produced.declared_steps)
         assert alias.executable_steps == tuple(produced.steps)
         assert alias.first_executable_step == produced.first_step
+        assert alias.step_roles == {
+            name: step.role for name, step in produced.steps.items()
+        }
         assert form.workflow_default_teams["alias"] == produced.team
+
+
+class TestStepRoleProjection:
+    def test_step_roles_use_each_steps_declared_role(self) -> None:
+        aflow_text = AFLOW_TEXT.replace(
+            '[roles]\nworker = "codex.fast"',
+            '[roles]\nworker = "codex.fast"\nplanner = "codex.deep"',
+        )
+        workflows_text = WORKFLOWS_TEXT.replace(
+            '[workflow.deliver.steps.verify]\nrole = "worker"',
+            '[workflow.deliver.steps.verify]\nrole = "planner"',
+        )
+        response = _call(aflow_text=aflow_text, workflows_text=workflows_text)
+        form = response.form
+        assert form is not None
+        deliver = form.workflows["deliver"]
+        assert deliver.step_roles == {"implement": "worker", "verify": "planner"}
+
+    def test_alias_and_excluded_step_roles_match_the_production_loader(self) -> None:
+        workflows_text = TestAliasProjection.TEAM_WORKFLOWS + (
+            "\n[workflow.narrow]\nextends = \"deliver\"\nexclude = [\"verify\"]\n"
+        )
+        response = _call(workflows_text=workflows_text)
+        form = response.form
+        assert form is not None
+        # The alias inherits every executable step with its declared role.
+        assert form.workflows["alias"].step_roles == {
+            "implement": "worker",
+            "verify": "worker",
+        }
+        # The excluded step is absent from both executable steps and roles.
+        narrow = form.workflows["narrow"]
+        assert narrow.executable_steps == ("implement",)
+        assert narrow.step_roles == {"implement": "worker"}
+        assert "verify" not in narrow.step_roles
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temp_dir = Path(temporary)
+            (temp_dir / "aflow.toml").write_text(response.aflow_toml, encoding="utf-8")
+            (temp_dir / "workflows.toml").write_text(
+                response.workflows_toml, encoding="utf-8"
+            )
+            config = load_workflow_config(temp_dir / "aflow.toml")
+        produced = config.workflows["narrow"]
+        assert narrow.step_roles == {
+            name: step.role for name, step in produced.steps.items()
+        }
+
+    def test_step_roles_stay_null_when_materialization_is_unavailable(self) -> None:
+        # A semantically invalid pair is still projectable from the raw
+        # tables, but the production loader never ran, so there is no exact
+        # per-step role evidence and the field stays None.
+        broken = AFLOW_TEXT.replace('worker = "codex.fast"', 'worker = "codex.missing"')
+        response = _call(aflow_text=broken)
+        assert response.validation.state == "invalid"
+        assert response.form is not None
+        deliver = response.form.workflows["deliver"]
+        assert deliver.step_roles is None
+        assert deliver.executable_steps is None
+        assert deliver.declared_steps == ("implement", "verify")
 
 
 class TestRoleTargetValidation:
