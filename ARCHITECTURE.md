@@ -876,6 +876,18 @@ the private MagicDNS HTTPS entry point; operators discover its advertised
 address with `tailscale serve status --json`. The
 [deployment runbook](deploy/aflowd/README.md) owns activation and rollback steps.
 
+Continuous deployment is a bounded local poll, not a service. The optional
+`aflowd-deploy.timer` runs `continuous-deploy.py`, which deploys an exact
+public `main` commit only when it descends from the installed release and
+GitHub Actions recorded a completed successful `ci.yml` push-to-main run for
+that exact SHA. Active workflow ownership defers the deployment through the
+candidate's own preflight, the existing installer performs rollout and
+rollback, and every poll records an atomic `status.json` plus preserved
+preflight snapshots and installer logs. Failed candidates are never retried
+automatically. Installing the timer is bootstrap only; accepting continuous
+deployment on p100 remains an owner observation, and public `main` publishing
+stays a separate authorization.
+
 The versioned project registry is the sole project authority beneath one
 managed root. `project_service.py` creates, registers, renames, and safely
 unregisters exact Git roots. The server does not discover projects from local
