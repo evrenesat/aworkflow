@@ -138,15 +138,22 @@ class TestTraversal:
 
         assert set(_candidates(payload)) == {"real"}
 
-    def test_path_unsafe_slug_reports_blocker(self, tmp_path: Path) -> None:
+    def test_unsafe_basename_is_addable_with_actual_display_name(
+        self, tmp_path: Path
+    ) -> None:
         registry, managed = _registry(tmp_path)
         _committed_repo(managed, "My_Project")
 
         payload = discover_projects(registry)
 
         entry = _candidates(payload)["My_Project"]
-        assert entry["addable"] is False
-        assert entry["add_blocker"] == "path must end in a path-safe project slug"
+        assert entry == {
+            "relative_path": "My_Project",
+            "display_name": "My_Project",
+            "registered_project_id": None,
+            "addable": True,
+            "add_blocker": None,
+        }
 
 
 class TestRegistryInteraction:
@@ -227,12 +234,13 @@ class TestRegistryInteraction:
         found = _candidates(payload)
         assert set(found) == {"Team/shared", "team/shared"}
         assert found["Team/shared"]["registered_project_id"] == "shared"
+        # The case-distinct unregistered root gets a deterministic distinct ID.
         unregistered = found["team/shared"]
         assert unregistered["registered_project_id"] is None
-        assert unregistered["addable"] is False
-        assert unregistered["add_blocker"] == "project id is already registered"
+        assert unregistered["addable"] is True
+        assert unregistered["add_blocker"] is None
 
-    def test_duplicate_basename_registered_elsewhere_reports_blocker(
+    def test_duplicate_basename_registered_elsewhere_is_addable(
         self, tmp_path: Path
     ) -> None:
         registry, managed = _registry(tmp_path)
@@ -246,6 +254,24 @@ class TestRegistryInteraction:
         assert found["one/shared"]["registered_project_id"] == "shared"
         entry = found["two/shared"]
         assert entry["registered_project_id"] is None
+        assert entry["addable"] is True
+        assert entry["add_blocker"] is None
+
+    def test_add_pre_check_rejects_when_no_safe_id_is_allocatable(
+        self, tmp_path: Path
+    ) -> None:
+        from aflow_app_server.project_ids import deterministic_project_id
+
+        registry, managed = _registry(tmp_path)
+        _committed_repo(managed, "agent_flow")
+        # Occupy the exact deterministic ID the candidate would receive.
+        _committed_repo(managed, "other")
+        colliding = deterministic_project_id("agent_flow")
+        registry.register(colliding, "Colliding", "other")
+
+        payload = discover_projects(registry)
+
+        entry = _candidates(payload)["agent_flow"]
         assert entry["addable"] is False
         assert entry["add_blocker"] == "project id is already registered"
 

@@ -12,10 +12,10 @@ from collections import deque
 from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
-import re
 import subprocess
 from typing import Any
 
+from .project_ids import allocate_project_id, default_display_name
 from .project_registry import ProjectRegistry
 
 
@@ -24,7 +24,6 @@ MAX_VISITED_ENTRIES = 500
 MAX_CANDIDATES = 100
 GIT_PROBE_TIMEOUT_SECONDS = 15.0
 MAX_DEPTH = 2
-_PROJECT_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 # Exact skip names are case-sensitive on p100; hidden and _archive* names are
 # skipped by prefix.
 _EXACT_SKIP_NAMES = frozenset({"worktrees", "node_modules", ".venv", "evidence"})
@@ -194,22 +193,18 @@ def discover_projects(registry: ProjectRegistry) -> dict[str, Any]:
             or declared in path.parents
             for declared in declared_roots
         )
-        slug = PurePosixPath(relative).parts[-1]
-        if overlap:
-            blocker = "overlaps a registered project root"
-        elif _PROJECT_ID_RE.fullmatch(slug) is None:
-            blocker = "path must end in a path-safe project slug"
-        elif slug in registered_ids:
-            # ProjectService derives the project ID from this basename; a
-            # registered ID elsewhere would make Add fail deterministically.
-            blocker = "project id is already registered"
+        if overlap:            blocker = "overlaps a registered project root"
         elif not _has_commit_head(path):
             blocker = "repository HEAD does not point to a commit"
+        elif allocate_project_id(relative, registered_ids) is None:
+            # The same ID rule ProjectService uses at registration time: only
+            # an unallocatable ID blocks Add, never the basename itself.
+            blocker = "project id is already registered"
         else:
             blocker = None
         candidates.append(DiscoveredCandidate(
             relative_path=relative,
-            display_name=slug.replace("-", " ").title(),
+            display_name=default_display_name(relative),
             registered_project_id=None,
             addable=blocker is None,
             add_blocker=blocker,

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
-import re
 import shutil
 import subprocess
 from typing import Literal
@@ -19,11 +18,11 @@ from aflow.config import (
 )
 
 from .control_plane_service import ControlPlaneService
+from .project_ids import allocate_project_id, default_display_name
 from .project_registry import ProjectRegistry, ProjectRegistryError
 
 
 _GIT_TIMEOUT_SECONDS = 15.0
-_PROJECT_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _INITIAL_COMMIT_MESSAGE = "Initialize project"
 
 READINESS_READY = "ready"
@@ -225,10 +224,15 @@ class ProjectService:
         branch = _validated_branch(request.main_branch)
         self._validated_starter_names(request)
         self._reject_conflicts(relative)
-        project_id = relative.parts[-1]
-        if _PROJECT_ID_RE.fullmatch(project_id) is None:
-            raise ProjectServiceError("path must end in a path-safe project slug")
-        display_name = self._validated_display_name(request.display_name, project_id)
+        # Registry IDs are internal labels: an unsafe or collided basename gets
+        # a deterministic safe ID instead of forcing a directory rename.
+        occupied_ids = {record.id for record in self._registry.list_records()}
+        project_id = allocate_project_id(str(relative), occupied_ids)
+        if project_id is None:
+            raise ProjectServiceError("project id is already registered")
+        display_name = self._validated_display_name(
+            request.display_name, default_display_name(str(relative))
+        )
         target = self._registry.managed_root.joinpath(*relative.parts)
         if request.mode == "create":
             return self._create(
@@ -260,10 +264,10 @@ class ProjectService:
                 raise ProjectServiceError(str(exc)) from exc
 
     @staticmethod
-    def _validated_display_name(raw: str | None, project_id: str) -> str:
+    def _validated_display_name(raw: str | None, fallback: str) -> str:
         """Apply the registry display-name rules before any mutation."""
         if raw is None:
-            return project_id.replace("-", " ").title()
+            return fallback
         if (
             not isinstance(raw, str)
             or not raw.strip()

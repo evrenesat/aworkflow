@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 
@@ -482,6 +483,204 @@ class TestRejectionsAndRollback:
         with pytest.raises(ProjectServiceError, match="already registered"):
             _create(service, "alpha")
         assert _git(managed / "alpha", "status", "--porcelain") == ""
+
+
+class TestUnsafeFolderNames:
+    """Existing folders register without renaming; IDs stay path-safe."""
+
+    def test_real_world_basenames_register_with_stable_generated_ids(
+        self, tmp_path: Path
+    ) -> None:
+        from aflow_app_server.project_ids import deterministic_project_id
+
+        service, registry, managed = _service(tmp_path)
+        for name in ("agent_flow", "codHex", "My Project", "prøjekt"):
+            _committed_repo(managed, name)
+            head = _git(managed / name, "rev-parse", "HEAD")
+
+            result = _create(service, name, mode="register")
+
+            assert result["id"] == deterministic_project_id(name)
+            assert registry.get(result["id"]) is not None
+            record, root = registry.resolve(result["id"])
+            assert root == managed / name
+            assert record.relative_root == name
+            # Registration is read-only for an existing repository.
+            assert _git(managed / name, "rev-parse", "HEAD") == head
+            assert _git(managed / name, "status", "--porcelain") == ""
+            assert not (managed / name / ".aflow").exists()
+
+    def test_generated_ids_are_path_safe_and_repeatable(self, tmp_path: Path) -> None:
+        from aflow_app_server.project_ids import (
+            PROJECT_ID_RE,
+            deterministic_project_id,
+        )
+
+        for name in ("agent_flow", "codHex", "My Project", "prøjekt", "folder with spaces"):
+            project_id = deterministic_project_id(name)
+            assert PROJECT_ID_RE.fullmatch(project_id) is not None
+            assert deterministic_project_id(name) == project_id
+        # The base truncates to 48 characters; a fully non-ASCII basename
+        # falls back to "project"; the digest distinguishes both cases.
+        long_id = deterministic_project_id("a" * 60)
+        assert long_id.startswith("a" * 48 + "-")
+        assert deterministic_project_id("øø").startswith("project-")
+        assert long_id != deterministic_project_id("a" * 60 + "b")
+
+    def test_consecutive_unsafe_runs_collapse_to_single_hyphens(
+        self, tmp_path: Path
+    ) -> None:
+        from aflow_app_server.project_ids import (
+            PROJECT_ID_RE,
+            deterministic_project_id,
+        )
+
+        service, registry, managed = _service(tmp_path)
+        for name in ("a__b", "folder  with spaces", "mix - _ .!run"):
+            project_id = deterministic_project_id(name)
+            assert PROJECT_ID_RE.fullmatch(project_id) is not None
+            assert "--" not in project_id
+
+            _committed_repo(managed, name)
+            result = _create(service, name, mode="register")
+
+            assert result["id"] == project_id
+            assert registry.get(project_id) is not None
+
+    def test_truncation_boundary_landing_on_unsafe_run_keeps_id_safe(
+        self, tmp_path: Path
+    ) -> None:
+        from aflow_app_server.project_ids import (
+            PROJECT_ID_RE,
+            deterministic_project_id,
+        )
+
+        service, registry, managed = _service(tmp_path)
+        for name, base in (
+            ("a" * 47 + " b", "a" * 47),
+            ("a" * 46 + " _b", "a" * 46),
+        ):
+            project_id = deterministic_project_id(name)
+            assert project_id.startswith(base + "-")
+            assert PROJECT_ID_RE.fullmatch(project_id) is not None
+
+            _committed_repo(managed, name)
+            result = _create(service, name, mode="register")
+
+            assert result["id"] == project_id
+            assert registry.get(project_id) is not None
+
+    def test_default_display_name_uses_actual_basename_for_unsafe_names(
+        self, tmp_path: Path
+    ) -> None:
+        service, _, managed = _service(tmp_path)
+        _committed_repo(managed, "codHex")
+
+        result = _create(service, "codHex", mode="register")
+
+        assert result["display_name"] == "codHex"
+
+    def test_safe_slug_default_display_behavior_is_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        service, _, _ = _service(tmp_path)
+        result = _create(service, "beta-service")
+        assert result["display_name"] == "Beta Service"
+
+    def test_two_roots_with_same_basename_get_distinct_stable_ids(
+        self, tmp_path: Path
+    ) -> None:
+        service, registry, managed = _service(tmp_path)
+        _committed_repo(managed, "one/agent_flow")
+        _committed_repo(managed, "two/agent_flow")
+
+        first = _create(service, "one/agent_flow", mode="register")
+        second = _create(service, "two/agent_flow", mode="register")
+
+        assert first["id"] != second["id"]
+        assert registry.resolve(first["id"])[1] == managed / "one" / "agent_flow"
+        assert registry.resolve(second["id"])[1] == managed / "two" / "agent_flow"
+
+    @pytest.mark.skipif(
+        os.path.normcase("A") != "A",
+        reason="case-distinct roots require case-sensitive path identity",
+    )
+    def test_case_distinct_basenames_stay_distinct(self, tmp_path: Path) -> None:
+        service, registry, managed = _service(tmp_path)
+        _committed_repo(managed, "case")
+        _committed_repo(managed, "Case")
+
+        lower = _create(service, "case", mode="register")
+        upper = _create(service, "Case", mode="register")
+
+        # The safe-slug basename keeps its exact ID; the unsafe case gets a
+        # deterministic one. Lookup remains case-sensitive on both.
+        assert lower["id"] == "case"
+        assert upper["id"] != "case"
+        assert registry.resolve(lower["id"])[1] == managed / "case"
+        assert registry.resolve(upper["id"])[1] == managed / "Case"
+
+    def test_existing_registry_ids_are_unchanged_by_new_registrations(
+        self, tmp_path: Path
+    ) -> None:
+        service, registry, managed = _service(tmp_path)
+        _create(service, "alpha")
+        _committed_repo(managed, "agent_flow")
+        before = {record.id: record for record in registry.list_records()}
+
+        _create(service, "agent_flow", mode="register")
+
+        after = {record.id: record for record in registry.list_records()}
+        for record_id, record in before.items():
+            assert after[record_id] == record
+
+    def test_unallocatable_id_is_rejected_without_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        from aflow_app_server.project_ids import deterministic_project_id
+
+        service, registry, managed = _service(tmp_path)
+        project = _committed_repo(managed, "agent_flow")
+        head = _git(project, "rev-parse", "HEAD")
+        _committed_repo(managed, "other")
+        registry.register(deterministic_project_id("agent_flow"), "Other", "other")
+
+        with pytest.raises(ProjectServiceError, match="project id is already registered"):
+            _create(service, "agent_flow", mode="register")
+
+        assert registry.get("agent_flow") is None
+        assert _git(project, "rev-parse", "HEAD") == head
+        assert _git(project, "status", "--porcelain") == ""
+        assert len(registry.list_records()) == 1
+
+    def test_create_mode_allocates_safe_id_for_unsafe_basename(
+        self, tmp_path: Path
+    ) -> None:
+        from aflow_app_server.project_ids import deterministic_project_id
+
+        service, registry, managed = _service(tmp_path)
+
+        result = _create(service, "My Project")
+
+        assert result["id"] == deterministic_project_id("My Project")
+        assert result["display_name"] == "My Project"
+        assert (managed / "My Project" / ".git").exists()
+        assert registry.get(result["id"]) is not None
+
+    def test_traversal_symlink_and_overlap_rejection_is_retained(
+        self, tmp_path: Path
+    ) -> None:
+        service, _, managed = _service(tmp_path)
+        real = _committed_repo(managed, "real_root")
+        (managed / "alias").symlink_to(real, target_is_directory=True)
+
+        with pytest.raises(ProjectServiceError, match="symlink"):
+            _create(service, "alias", mode="register")
+        _create(service, "real_root", mode="register")
+        with pytest.raises(ProjectServiceError, match="already registered"):
+            _create(service, "real_root", mode="register")
+        with pytest.raises(ProjectServiceError, match="relative"):
+            _create(service, "../outside", mode="register")
 
 
 class TestUnregister:
