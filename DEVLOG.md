@@ -1,5 +1,44 @@
 # DEVLOG
 
+## 2026-09-06 — Bounded continuous-deployment poller for validated main
+
+- Added `deploy/aflowd/continuous-deploy.py`, a standard-library one-shot
+  poller that deploys origin main of the fixed public repository only when the
+  exact fetched commit descends from the current release and GitHub Actions
+  shows a completed successful `ci.yml` push/main run for that exact SHA.
+  Missing, pending, failed, or identity-mismatched CI, divergence, unknown
+  releases, and network errors defer with a truthful sanitized status and
+  leave the running service untouched; candidate code never executes before
+  every gate passes.
+- The poller keeps its own dedicated clone under
+  `/var/lib/aflowd/deploy/source`, refuses unexpected or dirty sources without
+  ever resetting or cleaning, holds an exclusive nonblocking invocation lock,
+  and reuses the candidate's own `preflight.sh` and `install.sh` with the
+  production defaults (release root `/opt/aflowd`, loopback backend, registry
+  and managed root unchanged). Attempted deployments preserve the preflight
+  snapshot and installer log under `/var/lib/aflowd/deploy/attempts/`; blocked
+  preflight temporary directories are discarded. A failed rollout records
+  `last_failed_commit` in the atomic `status.json` and is never retried
+  automatically until a new candidate appears or an operator passes
+  `--retry-failed`.
+- Review repairs to the same slice: a successful install records the
+  installed candidate as `current_commit` immediately; a nonzero preflight
+  defers only with a valid schema-1 snapshot recording
+  `safe_to_rollout: false`, while missing, malformed, or safe-but-failed
+  output fails the poll; an installer that outlives its bounded timeout has
+  its whole process group terminated before the poll reports failure, even
+  for a direct `--retry-failed` run; and a failed final status write makes
+  the poll exit nonzero instead of reporting nominal success over a stale
+  `status.json`.
+- Added `aflowd-deploy.service`/`aflowd-deploy.timer` (oneshot;
+  `OnBootSec=2min`, `OnUnitInactiveSec=5min`) plus
+  `install-continuous-deploy.sh`, which is dry-run by default and with
+  `--apply` installs exactly those two units and enables the timer — no broad
+  service restarts. `status.sh` now reports the timer state and the saved
+  deployment status, gracefully handling their absence. Tests cover candidate
+  gates, deferrals, suppression, exclusive invocation, and installer dry-run
+  behavior with temporary repositories and mocked CI responses only.
+
 ## 2026-09-06 — Rolling browser session login for the remote web client
 
 - The web client now logs in once by posting the deployment bearer to
@@ -788,3 +827,5 @@
 - Local verification baseline: server `uv run pytest -q` 163 passed (3 known
   deprecation warnings); web tests 87 passed with known React `act(...)` stderr
   notices; `npm run build` and `git diff --check` clean.
+
+- Deployment owner repair: all timed-out poller subprocesses now terminate their process group, including children left after parent exit; focused regressions cover TERM-ignoring descendants and both error/deferral results.

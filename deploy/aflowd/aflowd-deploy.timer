@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule AFlow validated-main deployment polls
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=aflowd-deploy.service
+
+[Install]
+WantedBy=timers.target

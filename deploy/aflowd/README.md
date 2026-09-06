@@ -136,6 +136,73 @@ Then complete authenticated browser/client acceptance for project, config,
 plan, start, SSE status, safe control, stop, and successor restart. Keep tokens,
 prompts, and config bodies out of shared evidence.
 
+## 5. Continuous deployment of validated main
+
+An optional bounded poller installs validated main automatically when no
+workflow is active. It is enabled only by the explicit owner step below;
+nothing deploys until then.
+
+**Trusted boundary.** `continuous-deploy.py` deploys exactly one kind of
+candidate: the exact fetched `main` tip of
+`https://github.com/evrenesat/aworkflow.git` that descends from the current
+release and has a completed, successful `ci.yml` run for a push to `main` with
+that exact head SHA (checked against the public GitHub Actions API, no
+credentials). Missing, pending, failed, or identity-mismatched CI, divergence,
+unknown current releases, and network errors defer with a sanitized reason and
+never touch the running service. Candidate code does not execute until every
+gate has passed.
+
+**Run preservation.** While any workflow unit, controller, or nonterminal run
+is active, the candidate's own `preflight.sh` refuses the rollout and the
+poller defers; the release, controller, and runs stay untouched, and a later
+safe poll proceeds automatically.
+
+**Existing machinery stays authoritative.** The poller owns no deployment or
+rollback engine. After the gates pass it detaches its dedicated clean clone at
+the candidate and invokes that candidate's `preflight.sh` and `install.sh`
+with the production defaults (release root `/opt/aflowd`, unit
+`/etc/systemd/system/aflowd.service`, loopback `http://127.0.0.1:8765`,
+environment `/etc/aflowd/aflowd.env`, managed root `/root/code`, registry
+`/var/lib/aflowd/projects.json`, project config
+`/root/code/aflow-control-plane-proof-20260811/.aflow/config`), so readiness
+checks and installer rollback behave exactly as in a manual rollout. The
+poller's clone lives under `/var/lib/aflowd/deploy/source`; an unexpected or
+dirty source defers and is never reset or cleaned. Each attempted deployment
+keeps its preflight snapshot and installer log under
+`/var/lib/aflowd/deploy/attempts/`; refused or failed preflight temporaries
+are discarded. A nonzero preflight defers only when it wrote a valid
+schema-1 snapshot recording `safe_to_rollout: false`; missing, malformed, or
+safe-but-failed preflight output fails the poll instead. An installer that
+outlives its bounded timeout has its whole process group terminated before
+the poll reports failure, including a direct `--retry-failed` run. Every poll
+writes an atomic
+`/var/lib/aflowd/deploy/status.json` (phase, reason, commits, attempt paths)
+and prints the same phase/reason to the journal; `status.sh` surfaces both.
+A successful install records the deployed candidate as `current_commit`
+immediately, and a failed final status write makes the poll exit nonzero so
+systemd or the direct caller sees the operational failure.
+
+**Failed candidates never retry on their own.** A failed rollout records
+`last_failed_commit` in `status.json`; the same candidate is skipped until a
+new candidate appears or an operator explicitly reattempts it.
+
+**Bootstrap versus acceptance.** Installing the timer is only the bootstrap.
+Actual continuous deployment acceptance on p100 means the owner observes a
+timer-triggered deferral during an active run and then a validated-main
+transition after workflows finish. Publishing `main` publicly remains a
+separate, explicit owner authorization; this poller deploys only what is
+already on the public main branch with green CI.
+
+Install, inspect, disable, and reattempt:
+
+```sh
+sudo deploy/aflowd/install-continuous-deploy.sh                 # dry-run plan
+sudo deploy/aflowd/install-continuous-deploy.sh --apply         # install units + enable timer
+sudo deploy/aflowd/status.sh                                    # shows timer + deployment status
+sudo systemctl disable --now aflowd-deploy.timer                # stop polling
+sudo /opt/aflowd/current/src/deploy/aflowd/continuous-deploy.py --retry-failed
+```
+
 ## Rollback
 
 Restore Serve first. The script compares the current all-service config with the
