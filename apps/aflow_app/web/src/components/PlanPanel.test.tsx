@@ -49,13 +49,54 @@ describe('PlanPanel', () => {
 
   it('groups contained plans by lifecycle status and reads the selected plan', async () => {
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
-    await screen.findByText('Todo')
-    expect(screen.getByText('In progress')).toBeDefined()
+    await screen.findByText('Draft (todo)')
+    expect(screen.getByText('Ready (in progress)')).toBeDefined()
     expect(screen.getByText('Done')).toBeDefined()
     await openPlan(todoPlan, '# Plan A\n')
     expect(api.readProjectPlan).toHaveBeenCalledWith('alpha', 'todo', 'plan-a.md')
     expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Plan A\n')
     expect(screen.getByText(todoPlan.path)).toBeDefined()
+  })
+
+  it('explains the lifecycle and offers Run this plan only for a saved Ready plan', async () => {
+    const onOpenRunDashboard = vi.fn()
+    const donePlan: PlanDocument = {
+      project_id: 'alpha', name: 'plan-c.md', path: 'plans/done/plan-c.md',
+      status: 'done', revision: 'c'.repeat(64), size_bytes: 14,
+    }
+    vi.mocked(api.listProjectPlans).mockResolvedValue([todoPlan, inProgressPlan, donePlan])
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={onOpenRunDashboard} />)
+
+    await screen.findByText('Draft (todo)')
+    expect(screen.getByText(/A draft is not runnable yet/)).toBeDefined()
+    expect(screen.getByText(/Runnable plans/)).toBeDefined()
+    expect(screen.getByText(/kept for the record/)).toBeDefined()
+
+    // A saved Ready plan offers the exact relative path handoff.
+    await openPlan(inProgressPlan, '# Ready plan\n')
+    const run = screen.getByRole('button', { name: 'Run this plan' })
+    expect(run.getAttribute('disabled')).toBeNull()
+    fireEvent.click(run)
+    expect(onOpenRunDashboard).toHaveBeenCalledWith('plans/in-progress/plan-b.md')
+
+    // A dirty Ready draft must be saved before it can run.
+    fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Unsaved\n' } })
+    expect(screen.getByRole('button', { name: 'Run this plan' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByText(/Save this draft before running the plan/)).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: '← All plans' }))
+    expect(screen.getByRole('alertdialog', { name: 'Unsaved plan edits' })).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Discard edits' }))
+
+    // Drafts explain how to become runnable instead of offering a no-op.
+    await openPlan(todoPlan, '# Draft plan\n')
+    expect(screen.queryByRole('button', { name: 'Run this plan' })).toBeNull()
+    expect(screen.getByText(/not runnable yet\. Save it and move it to Ready/)).toBeDefined()
+
+    // Done plans explain that they are archival.
+    fireEvent.click(screen.getByRole('button', { name: '← All plans' }))
+    await openPlan(donePlan, '# Done plan\n')
+    expect(screen.queryByRole('button', { name: 'Run this plan' })).toBeNull()
+    expect(screen.getByText(/kept for the record and cannot run/)).toBeDefined()
   })
 
   it('creates a plan in the todo lifecycle and opens it', async () => {

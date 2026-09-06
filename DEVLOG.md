@@ -838,3 +838,9 @@
 - Browser preview found that pure empty-draft validation could override missing-file readiness. The settings report now preserves saved readiness for unchanged documents and explains the starter/save step before offering Plans.
 
 - Browser acceptance repairs: label ZCode models as externally configured, distinguish unspecified values from missing profiles, and preserve the selected project name on narrow screens.
+### 2026-09-06 — Preview exact dashboard runs (checkpoint 5)
+
+- Plans now explain Draft, Ready and Done, and a saved Ready plan opens the exact launch draft.
+- The compact launch form offers configured workflow/team choices and previews each materialized step's role, selected profile, team/global source and model/effort details. ZCode settings are identified as external.
+- Only Ready plans with a resolved workflow preview and valid turn limit can start. Invalid extra-instruction guidance stays visible when Advanced options is closed.
+- Retained startup-answer, idempotency and stop-before-replacement behavior. The owner corrected a test callback option typo after stopping the repair controller; validation and approval are recorded in the original checkpoint ledger.

@@ -314,6 +314,9 @@ class GuidedWorkflowStepSummaries(CanonicalTransportModel):
     first_step: str | None = None
     executable_steps: tuple[str, ...] | None = None
     first_executable_step: str | None = None
+    # Exact declared role per materialized executable step; None when the
+    # production loader could not materialize the workflow.
+    step_roles: Mapping[str, str] | None = None
 
 
 class GuidedTeamSummary(CanonicalTransportModel):

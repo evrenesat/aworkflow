@@ -18,6 +18,25 @@ function shortRevision(revision: string): string {
   return revision.slice(0, 12)
 }
 
+/** Lifecycle sections always render in canonical order with runnable guidance. */
+const LIFECYCLE_SECTIONS: Array<{ status: PlanDocument['status']; title: string; hint: string }> = [
+  {
+    status: 'todo',
+    title: 'Draft (todo)',
+    hint: 'Editable working notes. A draft is not runnable yet — save it, then move it to Ready.',
+  },
+  {
+    status: 'in_progress',
+    title: 'Ready (in progress)',
+    hint: 'Runnable plans. Open one and use “Run this plan” to start a run from it.',
+  },
+  {
+    status: 'done',
+    title: 'Done',
+    hint: 'Finished plans, kept for the record. A done plan is no longer runnable.',
+  },
+]
+
 /**
  * Plan list/reader/editor against the revisioned plan routes.  Local text is
  * preserved on every network or conflict failure; the server copy is only
@@ -202,11 +221,25 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   }
 
   if (selected) {
+    // Only a saved Ready plan can run: a dirty draft or another lifecycle
+    // state explains its next step instead of exposing a button that no-ops.
+    const runnable = selected.status === 'in_progress' && !dirty
+    const lifecycleExplanation = selected.status === 'todo'
+      ? 'This draft is not runnable yet. Save it and move it to Ready (in progress) to enable “Run this plan”.'
+      : selected.status === 'done'
+        ? 'Done plans are kept for the record and cannot run. Create a new plan and move it through Draft → Ready to run this work again.'
+        : dirty
+          ? 'Save this draft before running the plan.'
+          : null
+
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--spacing-md)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
           <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← All plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
+          <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>
+            {selected.status === 'todo' ? 'Draft — not runnable yet' : selected.status === 'in_progress' ? 'Ready — runnable' : 'Done — not runnable'}
+          </span>
           <span className="text-xs text-dim mono" title={selected.revision}>
             Revision {shortRevision(selected.revision)}
           </span>
@@ -252,7 +285,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           onChange={(event) => setContent(event.target.value)}
           style={{ flex: 1, minHeight: '360px', resize: 'vertical' }}
         />
-        <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap', alignItems: 'center' }}>
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
           {selected.status !== 'done' && (
             <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy || dirty}>
@@ -260,12 +293,19 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
             </button>
           )}
           {selected.status === 'in_progress' && (
-            <button className="btn btn-primary" onClick={() => onOpenRunDashboard(selected.path)}>
-              Open run dashboard
+            <button
+              className="btn btn-primary"
+              onClick={() => onOpenRunDashboard(selected.path)}
+              disabled={!runnable}
+            >
+              Run this plan
             </button>
           )}
         </div>
-        {dirty && <div className="text-sm text-dim">Save this draft before moving it through the lifecycle.</div>}
+        {lifecycleExplanation && <div className="text-sm text-dim">{lifecycleExplanation}</div>}
+        {dirty && selected.status !== 'in_progress' && (
+          <div className="text-sm text-dim">Save this draft before moving it through the lifecycle.</div>
+        )}
       </div>
     )
   }
@@ -285,13 +325,12 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           Create plan
         </button>
       </div>
-      {(['todo', 'in_progress', 'done'] as const).map((status) => {
+      {LIFECYCLE_SECTIONS.map(({ status, title, hint }) => {
         const matching = plans.filter((plan) => plan.status === status)
         return (
           <section key={status}>
-            <h3 style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 'var(--spacing-sm)' }}>
-              {status === 'in_progress' ? 'In progress' : status[0].toUpperCase() + status.slice(1)}
-            </h3>
+            <h3 style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 'var(--spacing-xs)' }}>{title}</h3>
+            <p className="text-xs text-dim" style={{ marginTop: 0 }}>{hint}</p>
             {matching.length === 0 ? (
               <div className="card text-dim text-sm">No plans</div>
             ) : matching.map((plan) => (

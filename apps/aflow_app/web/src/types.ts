@@ -101,6 +101,8 @@ export interface GuidedWorkflowStepSummaries {
   first_step: string | null
   executable_steps: string[] | null
   first_executable_step: string | null
+  /** Exact declared role per materialized executable step; null when unavailable. */
+  step_roles?: Record<string, string> | null
 }
 
 export interface GuidedFormProjection {

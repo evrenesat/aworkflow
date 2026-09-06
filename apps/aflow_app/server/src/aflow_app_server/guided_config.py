@@ -442,6 +442,7 @@ def _projection(
                 "first_step": first_step,
                 "executable_steps": None,
                 "first_executable_step": None,
+                "step_roles": None,
             }
     report = validate_candidate_pair(*texts)
     if report.state != "invalid":
@@ -462,6 +463,7 @@ def _projection(
                         "first_step": None,
                         "executable_steps": None,
                         "first_executable_step": None,
+                        "step_roles": None,
                     },
                 )
                 # The materialized config resolves aliases ('extends') and
@@ -471,6 +473,10 @@ def _projection(
                 summary["first_step"] = next(iter(wf_config.declared_steps), None)
                 summary["executable_steps"] = tuple(wf_config.steps)
                 summary["first_executable_step"] = wf_config.first_step
+                summary["step_roles"] = {
+                    step_name: step_config.role
+                    for step_name, step_config in wf_config.steps.items()
+                }
                 workflow_default_teams[wf_name] = wf_config.team
     return {
         "default_workflow": default_workflow,
