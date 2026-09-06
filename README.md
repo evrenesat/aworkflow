@@ -232,13 +232,20 @@ calls the same reusable CI workflow before uploading a package.
 The optional remote workflow-control app lives in `apps/aflow_app/` and is
 not included in the published wheel. Its Python 3.12+ server manages registered
 projects, revisioned configuration and Markdown plans, and durable runs through
-REST and MCP. The web client is the interactive dashboard: typed run starts
+the canonical REST API and SSE stream, with MCP as an optional adapter.
+The web client is the interactive dashboard: typed run starts
 (plan, workflow, team, start step, max turns, bounded extra instructions),
 SSE progress with reconnect-safe snapshots, capability-gated compare-and-swap
 controls for max turns/team/selectors, explicit resume, and guided
 stop-then-start workflow changes with `restarted_from_run_id` lineage. Provider
 choice stays in normal engine harness profiles; Codex is one optional harness
-adapter.
+adapter. A remote ACP interface is deferred.
+
+Private deployments keep the backend on `127.0.0.1:8765` and publish it to the
+tailnet through Tailscale Serve. After enabling Serve, use
+`tailscale serve status --json` to discover the advertised MagicDNS HTTPS
+address. Follow the [private deployment runbook](deploy/aflowd/README.md) for
+installation, activation, verification, and rollback.
 
 ## Documentation
 

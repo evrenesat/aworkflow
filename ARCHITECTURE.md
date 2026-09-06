@@ -867,6 +867,15 @@ excluded from the published wheel. Its FastAPI server and React client expose
 four product areas: registered projects, the canonical configuration pair,
 filesystem plans, and durable workflow runs.
 
+REST plus SSE is the canonical remote interface; MCP is an optional adapter
+to the same control-plane service. A remote ACP interface is deferred. Codex is
+an optional engine harness, and the web app has no provider-specific client.
+
+The production backend binds only to `127.0.0.1:8765`. Tailscale Serve supplies
+the private MagicDNS HTTPS entry point; operators discover its advertised
+address with `tailscale serve status --json`. The
+[deployment runbook](deploy/aflowd/README.md) owns activation and rollback steps.
+
 The versioned project registry is the sole project authority beneath one
 managed root. `project_service.py` creates, registers, renames, and safely
 unregisters exact Git roots. The server does not discover projects from local

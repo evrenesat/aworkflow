@@ -746,3 +746,7 @@
 - Verified real-provider browser start, live controls, owner stop and successor completion; added regressions for the observed display gaps.
 
 - Final browser screenshot check: native dropdowns now inherit text styling and use the dark color scheme, keeping selected values readable.
+
+### 2026-09-06 — Clarify remote interfaces and private entry point
+
+- Documented canonical REST/SSE, optional MCP, deferred remote ACP, and Codex as an optional engine harness. Root usage and architecture now point to the private deployment runbook and MagicDNS HTTPS discovery through Tailscale Serve status.
