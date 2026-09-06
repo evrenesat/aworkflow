@@ -774,3 +774,17 @@
 ### 2026-09-06 — Report applied live turn limits
 
 - HTTPS browser verification found that status retained the initial turn limit after a safe override. Control-plane projections now use the engine-recorded effective limit; pending override writes alone do not change the reported value.
+
+### 2026-09-06 — Dashboard changes participate in CI
+
+- CI gained a required Ubuntu dashboard job (Python 3.12, Node 22 with npm cache
+  keyed to the web lockfile) so main's success also covers the shipped app server
+  and web UI.
+- The job runs the server's frozen dev sync and full pytest suite, then npm ci,
+  the full vitest suite, and the production web build in their project
+  directories; it runs for PRs, main pushes, and reusable workflow calls.
+- Existing engine test matrix and package build job are unchanged; no publishing
+  trigger or credentials were added.
+- Local verification baseline: server `uv run pytest -q` 163 passed (3 known
+  deprecation warnings); web tests 87 passed with known React `act(...)` stderr
+  notices; `npm run build` and `git diff --check` clean.
