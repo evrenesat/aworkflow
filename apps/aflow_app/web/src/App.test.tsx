@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
+import type { ProjectConfig, ProjectConfigFormResponse, PlanDocument, RunStatus } from './types'
 import * as api from './api'
 import { consumeActivityMarker, resetActivityMarker } from './activity'
 
@@ -916,6 +917,153 @@ describe('App workspace shell', () => {
       expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
       expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
     })
+  })
+
+  it('completes discovery, guided save recovery, Ready-plan launch and exact-link reload', async () => {
+    // These typed API fixtures test UI contracts, not filesystem or daemon execution.
+    window.location.search = ''
+    window.location.hash = ''
+    const push = vi.spyOn(window.history, 'pushState')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    const baseToml = '[aflow]\ndefault_workflow = "starter"\nmax_turns = 6\n[harness.zcode.profiles.default]\n[prompts]\nwork = "Follow the plan"\n'
+    const readyToml = baseToml + '[roles]\nworker = "zcode.default"\n'
+    const workflows = '[workflow]\nmain_branch = "main"\n[workflow.starter.steps.implement]\nrole = "worker"\nprompts = ["work"]\ngo = [{ to = "END", when = "DONE" }]\n'
+    const validation = (ready: boolean) => ({
+      state: ready ? 'ready' as const : 'invalid' as const,
+      issues: ready ? [] : [{ document: null, line: null, message: "workflow.starter.steps.implement.role references unknown role 'worker'" }],
+      placeholders: [], workflows: ready ? ['starter'] : [], teams: [], roles: ready ? ['worker'] : [],
+    })
+    const projectConfig = (ready: boolean): ProjectConfig => ({
+      ...configPayload(), aflow_toml: ready ? readyToml : baseToml, workflows_toml: workflows,
+      validation: validation(ready), revision: (ready ? 'b' : 'a').repeat(64),
+    })
+    const projection = (ready: boolean, changed = false): ProjectConfigFormResponse => ({
+      ...guidedFormResponse(), aflow_toml: ready ? readyToml : baseToml, workflows_toml: workflows,
+      validation: validation(ready), changed,
+      form: {
+        default_workflow: 'starter', max_turns: 6,
+        harnesses: { zcode: { default: { model: null, effort: null } } },
+        roles: ready ? { worker: 'zcode.default' } : {}, teams: {},
+        workflow_default_teams: { starter: null },
+        workflows: { starter: { declared_steps: ['implement'], first_step: 'implement',
+          executable_steps: ready ? ['implement'] : null, first_executable_step: ready ? 'implement' : null,
+          step_roles: ready ? { implement: 'worker' } : null } },
+      },
+      choices: { harnesses: ['zcode'], profiles: { zcode: ['default'] }, selectors: ['zcode.default'],
+        roles: ready ? ['worker'] : [], teams: [], workflows: ['starter'] },
+      suggestions: { label: 'suggestion', harnesses: [{ name: 'zcode', supports_effort: false, custom_model_supported: false }],
+        profiles: [], note: 'ZCode models are configured in ZCode.' },
+    })
+    const plan: PlanDocument = {
+      project_id: 'beta', name: 'journey.md', path: 'plans/in-progress/journey.md',
+      status: 'in_progress', revision: 'c'.repeat(64), size_bytes: 10, content: '# Journey\n',
+    }
+    const run: RunStatus = {
+      run_id: 'run-journey', status: 'running', schema_version: 1, ownership: 'control_plane',
+      revision: 0, reason: null, unit_name: null, launch_phase: 'running', workflow_name: 'starter',
+      team: null, current_step: 'implement', turns_completed: 0, max_turns: 6,
+      selected_start_step: 'implement', skipped_steps: [], restarted_from_run_id: null,
+      evidence: { manifest_created_at: '2026-09-07T00:00:00Z', plan_path: plan.path },
+    }
+    let added = false
+    let saved = false
+    vi.mocked(api.listProjects).mockImplementation(async () => added ? [{
+      ...configProject, readiness: saved ? 'ready' : 'configuration_required',
+    }] : [])
+    vi.mocked(api.getProjectDiscovery).mockImplementation(async () => ({
+      ...discoveryBase, candidates: [{ relative_path: 'beta', display_name: 'Beta Project',
+        registered_project_id: added ? 'beta' : null, addable: !added, add_blocker: added ? 'already registered' : null }],
+    }))
+    vi.mocked(api.createProject).mockImplementation(async () => {
+      added = true
+      return { id: 'beta', display_name: 'Beta Project', relative_root: 'beta', root: '/srv/code/beta',
+        created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required' }
+    })
+    vi.mocked(api.getProjectConfig).mockImplementation(async () => projectConfig(saved))
+    vi.mocked(api.postProjectConfigForm).mockImplementation(async (_project, request) => {
+      if (request.action) {
+        expect(request.action).toEqual({ type: 'set_global_role', role: 'worker', selector: 'zcode.default' })
+        return projection(true, true)
+      }
+      return projection(request.aflow_toml === readyToml)
+    })
+    vi.mocked(api.saveProjectConfig).mockRejectedValueOnce(new Error('temporary save failure'))
+      .mockImplementation(async (_project, request) => {
+        expect(request).toEqual({ aflow_toml: readyToml, workflows_toml: workflows, expected_revision: 'a'.repeat(64) })
+        saved = true
+        return projectConfig(true)
+      })
+    vi.mocked(api.listProjectPlans).mockResolvedValue([plan])
+    vi.mocked(api.readProjectPlan).mockResolvedValue(plan)
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([{ project_id: 'beta', root: '/srv/code/beta', schema_version: 1 }])
+    vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['beta'] })
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([
+      { path: plan.path, status: 'in_progress', modified_at: '2026-09-07T00:00:00Z', schema_version: 1 },
+    ])
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
+      schema_version: 1, workflows: ['starter'], teams: [], roles: ['worker'], controls: [],
+      workflow_details: { starter: { declared_steps: ['implement'], executable_steps: ['implement'],
+        excluded_steps: [], first_step: 'implement', default_team: null } },
+      admitted_role_selectors: { worker: ['zcode.default'] }, context_levels: ['lite'],
+      team_upgrade_chains: {}, control_safety: {}, service_features: [],
+    })
+    vi.mocked(api.listRunEvents).mockResolvedValue([])
+    vi.mocked(api.getRunContext).mockResolvedValue({ run_id: run.run_id, level: 'lite', data: {}, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(run)
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: run.run_id, created: true, status: 'running', schema_version: 1 }, startup_question: null,
+    })
+    const app = render(<App />)
+    try {
+      fireEvent.change(await screen.findByLabelText('Search projects and available candidates'), { target: { value: 'Beta' } })
+      fireEvent.click(await screen.findByRole('button', { name: 'Add', exact: true }))
+      await screen.findByRole('heading', { name: 'Roles', exact: true })
+      fireEvent.click(screen.getByRole('button', { name: 'Projects', exact: true }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Open', exact: true }))
+      await screen.findByRole('heading', { name: /How Beta Project fits together/ })
+      fireEvent.click(screen.getByRole('button', { name: 'Settings', exact: true }))
+      const role = await screen.findByRole('combobox', { name: 'Role', exact: true })
+      fireEvent.change(role, { target: { value: 'worker' } })
+      fireEvent.keyDown(role, { key: 'Enter' })
+      const selector = screen.getByRole('combobox', { name: 'Profile (configured choices only)', exact: true })
+      fireEvent.change(selector, { target: { value: 'zcode' } })
+      fireEvent.keyDown(selector, { key: 'ArrowDown' })
+      fireEvent.keyDown(selector, { key: 'Enter' })
+      fireEvent.click(screen.getByRole('button', { name: 'Apply role to draft' }))
+      const save = await screen.findByRole('button', { name: 'Save and continue to Plans' })
+      await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
+      fireEvent.click(save)
+      await screen.findByText('temporary save failure')
+      expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe(readyToml)
+      fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
+      fireEvent.click(await screen.findByRole('button', { name: /journey\.md/ }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
+      const preview = await screen.findByLabelText('Effective choices for this launch')
+      await waitFor(() => expect(preview.textContent).toContain('zcode.default'))
+      expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe(plan.path)
+      const start = screen.getByRole('button', { name: 'Start run', exact: true })
+      await waitFor(() => expect(start.getAttribute('disabled')).toBeNull())
+      fireEvent.click(start)
+      await screen.findByRole('heading', { name: 'Run run-journey' })
+      expect(api.startControlPlaneRun).toHaveBeenCalledWith('beta',
+        expect.objectContaining({ plan_path: plan.path }), expect.any(String))
+      const runLink = [...push.mock.calls, ...replace.mock.calls].map((call) => String(call[2])).find((url) => url.includes('run=run-journey'))
+      expect(runLink).toBe('/?project=beta&view=runs&run=run-journey')
+      app.unmount()
+      // happy-dom's History is inert. Re-mount the exact emitted URL; real
+      // browser history is verified separately against the served application.
+      window.location.search = String(runLink).split('?')[1]
+      const reloaded = render(<App />)
+      await screen.findByRole('heading', { name: 'Run run-journey' })
+      expect(api.getControlPlaneRun).toHaveBeenCalledWith('beta', 'run-journey')
+      expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
+      reloaded.unmount()
+    } finally {
+      app.unmount()
+      push.mockRestore()
+      replace.mockRestore()
+      window.location.search = ''
+    }
   })
 
 })

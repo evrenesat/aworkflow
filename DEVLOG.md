@@ -855,3 +855,5 @@
 - Checkpoint 6 adds project/run links, progress-first run views and Technical details. Owner repair removes URL fragments from canonical links, constructs clipboard links from validated identities, and retains the selected run across oldest-first page refreshes.
 
 - Run progress and editable settings now use plain labels; internal bounded-event and revision terminology remains in technical details.
+
+- Completed the dashboard App journey contract test: discovery, Add/Open, guided role assignment, failed-save recovery, Ready plan preview/launch and exact-link remount. Updated the remote-app guide and architecture for discovery, shared drafts, suggestions, run links and the separate deployed owner acceptance recipe.

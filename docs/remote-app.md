@@ -27,17 +27,19 @@ The server binds to `127.0.0.1:8765` by default and serves the built web client 
 
 ## Web workspace
 
-The web client is a same-origin workspace for exactly one selected registered project at a time. Navigation is Projects, Configuration, Plans, and Runs.
+The web client is a same-origin workspace for exactly one selected registered project at a time. Projects selects the workspace. Open enters that project’s Overview; Settings, Plans and Runs then belong to the selected project. The project name and path stay visible above these tabs.
 
 Login sends the deployment bearer once in the `Authorization` header to `POST /api/session`; the server answers with a signed HttpOnly, Secure, SameSite=Strict cookie. Reloads and new same-origin tabs restore the session from that cookie (`GET /api/session`) without re-entering the token. The session rolls forward for 30 days from real visible dashboard activity (the client marks such requests with `X-AFlow-Activity: 1`, at most once per minute); background polling and the event stream never renew it. Expiry, an invalid cookie, or a server token rotation ends the session and the client shows sign-in again while preserving the current project and view. Logout (`DELETE /api/session`) expires the cookie immediately — use it on a shared browser. The bearer token is never stored in localStorage, sessionStorage, URLs, or readable cookies; it lives only in the login request. Header-only REST and MCP clients are unaffected.
 
-Projects view: lists only registry-backed projects with a readiness state (`ready`, `configuration_required`, or `blocked`). A create/register form accepts a normalized relative path beneath the managed root, an optional display name, main branch, optional initial workflow and team, and — for register mode — an explicit initialize-Git confirmation for empty non-Git directories and an optional starter-config initialization that never overwrites existing documents. Existing folder names never need renaming; unsafe basenames receive a deterministic path-safe registry ID while keeping their actual name as the default display name. Unregister removes only the registry record after an inline confirmation that states files, Git history, and plans are preserved. Project-list failures surface a retry instead of local filesystem choices.
+Projects view: shows added projects and available Git projects beneath the server's managed root. Type a name or relative path to filter both lists. Discovery examines two directory levels with bounded results; it does not search your Mac or automatically register anything. Add registers an existing exact Git root without modifying files or history. Blocked candidates explain what needs fixing; truncated or failed scans offer guidance and retry. The explicit create/register form remains available, including discovered path suggestions. Existing directory names need not change: internal registry IDs are independent of display names. Unregister removes only the registry record after confirmation and preserves files, Git history and plans.
 
-Configuration view: two plain-text tabs for `aflow.toml` and `workflows.toml` under one displayed combined SHA-256 revision. Validate checks the candidate pair without saving; Save commits both documents atomically with `expected_revision`. Stale-revision conflicts keep the local text in the editor and reload the server copy only after an explicit discard confirmation. When runs block saving, the blocking run IDs and statuses are listed. Unsaved edits show an indicator, confirm navigation away, and guard page reload. A save that leaves the configuration valid links on to the Plans view.
+Settings view: guided widgets are the default. A project with no configuration offers Build starter draft. Set up profiles, assign roles, choose workflow/team defaults and review validation; changes stay in a draft until Save both files or Save and continue to Plans succeeds. Available choices come from the current configuration; bundled model/profile suggestions are labeled suggestions. Searchable controls support Arrow keys, Enter and Escape. Custom values are accepted only where the field says so. ZCode model and effort remain configured in ZCode, with an external-configuration label rather than an invented model list.
 
-Plans view: lists the `todo`, `in-progress`, and `done` lifecycle sections, creates plans, and edits them as plain Markdown with expected-revision saves and one-step promotion. Local text is preserved on network and revision-conflict failures; the server copy is reloaded only after confirmation. An in-progress plan can be opened in the run dashboard.
+Advanced TOML exposes the same two documents, not a second configuration source. Use it for uncommon workflow graphs and prompts. Validate checks without saving. Both save actions commit the pair with the current revision. Errors and stale-revision conflicts preserve the draft; reload requires explicit discard. Unsaved navigation is guarded, and a successful ready save can continue to Plans.
 
-Runs view: the primary interactive dashboard for starting, understanding, and safely adjusting workflow runs. Everything below reads the canonical control-plane REST/SSE contracts; no state is invented client-side.
+Plans view: Draft, Ready and Done correspond to plans/todo, plans/in-progress and plans/done. Create and edit Markdown, Save, then Move to Ready when it is ready to run. Run this plan opens Runs with that exact Ready plan selected. Draft and Done plans cannot launch. Failed saves preserve text, and promotion never silently overwrites a destination.
+
+Runs view: selected-run progress and recent runs come first; New run is a secondary disclosure. The newest returned run is selected only when no run is already selected or requested. Plan, workflow, team and start-step widgets show available choices. The launch preview uses the saved configuration and resolves each step's role and profile, including team overrides. Missing choices and invalid turn limits explain why Start run is unavailable. Run settings distinguish pending changes from applied values; low-level unit, revision, ownership and raw context/event information is under Technical details.
 
 Project run list and selected-run overview:
 
@@ -67,7 +69,19 @@ Guided workflow change (restart):
 - If the stop is rejected, the revision changes, inactivity cannot be proven, the network fails, or the successor start fails, automation halts: no retry loops, no overlapping units, the draft stays in the form, and the authoritative source state is shown for an explicitly renewed attempt.
 - Explicit resume remains the separate same-workflow action for `needs_attention` runs and never accepts replacement launch choices. Legacy runs are read-only and offer no controls. Owner stop, restart, and Full context keep their existing confirmation and disclosure guards.
 
-End-to-end user journey: register or create a project in the Projects view, validate and save the two configuration documents in the Configuration view until readiness is `ready`, create or select a plan in the Plans view, then open the Runs view: start the run with typed choices, answer any startup question, watch progress over SSE, adjust team or selectors with compare-and-swap controls while it runs, and either let it finish, stop it explicitly, resume a `needs_attention` run in place, or change its workflow through the guided stop-then-start restart with visible lineage.
+Run links contain only registered project ID, view and optional run ID. Reload and browser back/forward restore the requested workspace. An older linked run is fetched directly even when absent from the first page. Invalid project/run links show guidance instead of selecting another run; unknown views normalize to Overview. Copy link uses only validated identifiers. Tokens, configuration text and prompts never belong in links.
+
+## Owner acceptance after deployment
+
+1. Use the actual private HTTPS address after deployment; confirm the installed release. Sign in once, refresh twice and open a new tab: the session should restore without another token.
+2. In Projects, open an already-added project and confirm Overview visibly opens. Navigate Settings → Plans → Runs, then back/forward, checking the selected project remains clear.
+3. Prepare a disposable Git project with a committed README beneath the managed root. Find it by typing, click Add, and confirm its original files and commit are preserved.
+4. Build a starter draft. Choose the installed harness/profile and assign the worker role using keyboard suggestions. ZCode requires its existing host-side model configuration. Review help and validation, save, and confirm the project becomes Ready.
+5. Create a safe one-checkpoint Markdown plan that writes a disposable text file. Save and Move to Ready, use Run this plan, inspect the exact step/profile preview and start it. Follow the returned run, reload its link and verify both successful completion and the expected file contents.
+6. Check wide and narrow layouts, available choices, disabled-action explanations, progress and Technical details. Copy the run link and reopen it. Logout, then reload the other tab and confirm it requires sign-in.
+7. Unregister the disposable project after saving evidence; unregister must preserve its files. Keep the previous release available for rollback using the deployment runbook if acceptance fails.
+
+The App journey test mocks API responses and checks UI contracts, including recovery from a failed save. Server tests verify real validation, containment and persistence. Neither substitutes for the owner’s deployed browser and worker-output checks above.
 
 ## Configuration
 
@@ -101,6 +115,7 @@ environment_file = "/etc/aflowd/worker.env"
 
 ## Project and configuration API
 
+- `GET /api/project-discovery` (read-only bounded candidates)
 - `GET /api/projects`
 - `POST /api/projects`
 - `GET /api/projects/{project_id}`
@@ -109,6 +124,7 @@ environment_file = "/etc/aflowd/worker.env"
 - `GET /api/projects/{project_id}/config`
 - `PUT /api/projects/{project_id}/config`
 - `POST /api/projects/{project_id}/config/validate`
+- `POST /api/projects/{project_id}/config/form` (pure projection or one draft operation; does not save)
 
 Project creation and registration accept only normalized paths relative to the managed root. Existing folders are added without renaming: the registry ID is an internal path-safe label, so basenames with underscores, uppercase letters, spaces, or non-ASCII characters get a deterministic safe ID (safe-slug basenames keep their exact name), and the discovered display name uses the actual folder name. Registration never modifies directory contents; unregister removes the registry record after active-unit checks and never deletes repository files.
 

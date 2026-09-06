@@ -890,8 +890,9 @@ stays a separate authorization.
 
 The versioned project registry is the sole project authority beneath one
 managed root. `project_service.py` creates, registers, renames, and safely
-unregisters exact Git roots. The server does not discover projects from local
-filesystem scans or agent-client state.
+unregisters exact Git roots. Read-only project_discovery.py lists bounded Git
+candidates two levels beneath the managed root; discovery does not grant access
+or write registration. The explicit Add operation remains the enrollment boundary.
 
 `plan_service.py` resolves each project through that registry and addresses
 only direct regular UTF-8 Markdown files under `plans/todo`,
@@ -908,6 +909,11 @@ dashboard launch.
 reads, commits, capability loads, and launch reservation share one per-project
 lock so a launch cannot freeze a torn or superseded pair.
 
+The pure guided_config.py form endpoint projects or transforms the supplied
+configuration pair without saving it. Widgets and Advanced TOML share the same
+draft; project_config_service.py remains the sole save boundary. Suggestions
+are distinct from configured choices, and ZCode model/effort stay external.
+
 The guided configuration projection exposes each workflow's materialized
 executable step names and `step_roles` from the production loader. The run
 preview resolves each step's role through the selected team's override and
@@ -916,6 +922,13 @@ plans cannot launch from the UI; unresolved workflow/step previews and invalid
 turn-limit overrides require correction before starting or stopping for a
 replacement run. These checks preserve the existing canonical launch and
 restart protocols.
+
+The React workspace keeps validated project/view/run identifiers in the URL.
+Project selection and run lookup remain registry-scoped; direct lookup restores
+older linked runs without substituting another selection. User navigation pushes
+history, while normalization and passive updates replace it. Dirty navigation is
+guarded; credentials and editor contents never enter links. Progress precedes
+the New run form, with technical metadata disclosed separately.
 
 The REST control-plane routes and `/mcp` mount delegate to the same durable
 `ControlPlaneService`. The HTTP layer does not own workflow processes. Bearer
