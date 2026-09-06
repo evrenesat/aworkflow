@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ProjectConfig, ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
 import { readinessClass, readinessLabel } from './readiness'
+import { markUserActivity } from './activity'
 import { ProjectPicker } from './components/ProjectPicker'
 import { ProjectOverview } from './components/ProjectOverview'
 import { ConfigEditor } from './components/ConfigEditor'
@@ -11,6 +12,9 @@ import * as api from './api'
 type View = 'projects' | 'overview' | 'settings' | 'plans' | 'runs'
 
 type ProjectView = 'overview' | 'settings' | 'plans' | 'runs'
+
+/** Why the login gate is (or is not) shown. */
+type AuthGate = 'checking' | 'signedOut' | 'restoreFailed' | 'expired' | 'signedIn'
 
 const NAV_ITEMS: Array<{ view: View; label: string; needsProject: boolean }> = [
   { view: 'projects', label: 'Projects', needsProject: false },
@@ -30,10 +34,15 @@ const readinessGuidance: Record<string, string> = {
 }
 
 export function App() {
-  const [authToken, setAuthTokenState] = useState('')
-  const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [authGate, setAuthGate] = useState<AuthGate>('checking')
+  const [restoreAttempt, setRestoreAttempt] = useState(0)
+  const [loginDraft, setLoginDraft] = useState('')
+  const [loginPending, setLoginPending] = useState(false)
+  const [loginError, setLoginError] = useState<string | null>(null)
+  const [logoutPending, setLogoutPending] = useState(false)
+  const [logoutError, setLogoutError] = useState<string | null>(null)
   const [projects, setProjects] = useState<ProjectInfo[]>([])
-  const [projectsLoading, setProjectsLoading] = useState(false)
+  const [projectsLoading, setProjectsLoading] = useState(true)
   const [projectsError, setProjectsError] = useState<string | null>(null)
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
   const [view, setView] = useState<View>('projects')
@@ -42,14 +51,55 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
   const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
+  // Bumped on logout so late responses cannot restore signed-in UI.
+  const authEpoch = useRef(0)
 
+  // On load, ask the server whether the browser session cookie is still
+  // valid. Only a definitive 401 shows Login; a network/server failure
+  // offers Retry instead of a false signed-out message.
   useEffect(() => {
-    const token = api.getAuthToken()
-    if (token) {
-      setAuthTokenState(token)
-      setIsAuthenticated(true)
-    }
+    let cancelled = false
+    if (document.visibilityState === 'visible') markUserActivity()
+    api.checkSession()
+      .then(() => { if (!cancelled) setAuthGate('signedIn') })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        if (err instanceof api.ApiError && err.status === 401) setAuthGate('signedOut')
+        else setAuthGate('restoreFailed')
+      })
+    return () => { cancelled = true }
+  }, [restoreAttempt])
+
+  // A 401 on any ordinary API or stream request means the session expired
+  // (or the token was rotated); the workspace state is preserved so signing
+  // in again returns to the same project and view.
+  useEffect(() => {
+    api.setSessionExpiredHandler(() => {
+      setAuthGate((gate) => (gate === 'signedIn' ? 'expired' : gate))
+    })
+    return () => api.setSessionExpiredHandler(null)
   }, [])
+
+  // Track visible page entry and real visible pointer/keyboard/focus
+  // activity; the marker lives only in memory and is consumed by the next
+  // authenticated REST request (see activity.ts).
+  useEffect(() => {
+    if (authGate !== 'signedIn') return
+    const markVisibleActivity = () => {
+      if (document.visibilityState === 'visible') markUserActivity()
+    }
+    markVisibleActivity()
+    window.addEventListener('pointerdown', markVisibleActivity)
+    window.addEventListener('keydown', markVisibleActivity)
+    window.addEventListener('focus', markVisibleActivity)
+    document.addEventListener('visibilitychange', markVisibleActivity)
+    return () => {
+      window.removeEventListener('pointerdown', markVisibleActivity)
+      window.removeEventListener('keydown', markVisibleActivity)
+      window.removeEventListener('focus', markVisibleActivity)
+      document.removeEventListener('visibilitychange', markVisibleActivity)
+    }
+  }, [authGate])
 
 
   useEffect(() => {
@@ -63,31 +113,48 @@ export function App() {
   }, [pendingSuccessorStart])
 
   const loadProjects = useCallback(async () => {
+    const epoch = authEpoch.current
     try {
       setProjectsLoading(true)
       setProjectsError(null)
-      setProjects(await api.listProjects())
+      const loaded = await api.listProjects()
+      if (authEpoch.current !== epoch) return
+      setProjects(loaded)
     } catch (err) {
+      if (authEpoch.current !== epoch) return
       setProjectsError(err instanceof Error ? err.message : 'Failed to load registered projects')
     } finally {
-      setProjectsLoading(false)
+      if (authEpoch.current === epoch) setProjectsLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    if (isAuthenticated) void loadProjects()
-  }, [isAuthenticated, loadProjects])
+    if (authGate === 'signedIn') void loadProjects()
+  }, [authGate, loadProjects])
 
-  function handleLogin() {
-    if (!authToken.trim()) return
-    api.setAuthToken(authToken)
-    setIsAuthenticated(true)
+  async function handleLogin() {
+    const token = loginDraft.trim()
+    if (!token || loginPending) return
+    setLoginPending(true)
+    setLoginError(null)
+    try {
+      await api.loginSession(token)
+      api.clearAuthToken()
+      // The token is never kept; the HttpOnly session cookie carries auth.
+      setLoginDraft('')
+      setAuthGate('signedIn')
+    } catch (err) {
+      if (err instanceof api.ApiError && err.status === 401) {
+        setLoginError('Login failed: the server did not accept that token. Check it and try again.')
+      } else {
+        setLoginError('Login could not reach the server. Your entered token is preserved; retry once the connection recovers.')
+      }
+    } finally {
+      setLoginPending(false)
+    }
   }
 
-  function handleLogout() {
-    api.clearAuthToken()
-    setIsAuthenticated(false)
-    setAuthTokenState('')
+  function resetWorkspace() {
     setProjects([])
     setProjectsError(null)
     setSelectedProjectId(null)
@@ -97,6 +164,31 @@ export function App() {
     setPendingAction(null)
     setRunDashboardPlanPath(null)
     setPendingSuccessorStart(null)
+  }
+
+  async function handleLogout() {
+    if (logoutPending) return
+    setLogoutPending(true)
+    setLogoutError(null)
+    const epoch = authEpoch.current
+    try {
+      await api.logoutSession()
+      ++authEpoch.current
+      api.clearAuthToken()
+      resetWorkspace()
+      setLoginDraft('')
+      setLoginError(null)
+      setAuthGate('signedOut')
+    } catch (err) {
+      if (authEpoch.current !== epoch) return
+      setLogoutError(
+        `Logout could not be confirmed by the server. ${
+          err instanceof Error ? err.message : 'Check the connection and try again.'
+        }`,
+      )
+    } finally {
+      setLogoutPending(false)
+    }
   }
 
   /**
@@ -131,7 +223,9 @@ export function App() {
   }
 
   async function handleCreateProject(request: ProjectCreateRequest): Promise<ProjectCreateResult> {
+    const epoch = authEpoch.current
     const created = await api.createProject(request)
+    if (authEpoch.current !== epoch) throw new Error('Signed out before the project list could refresh')
     const createdProject: ProjectInfo = {
       id: created.id,
       display_name: created.display_name,
@@ -141,13 +235,16 @@ export function App() {
       readiness: created.readiness,
     }
     setProjects((current) => [...current.filter((project) => project.id !== created.id), createdProject])
+    if (authEpoch.current !== epoch) return created
     setSelectedProjectId(created.id)
     setView(created.readiness === 'ready' ? 'plans' : 'settings')
     try {
       const refreshed = await api.listProjects()
+      if (authEpoch.current !== epoch) return created
       const canonical = refreshed.find((project) => project.id === created.id)
       setProjects([...refreshed.filter((project) => project.id !== created.id), canonical ?? createdProject])
     } catch (err) {
+      if (authEpoch.current !== epoch) return created
       setProjectsError(
         `Project ${created.display_name} was created, but the project list could not refresh. ${
           err instanceof Error ? err.message : 'Retry the refresh to update the list.'
@@ -192,17 +289,53 @@ export function App() {
     })
   }
 
-  if (!isAuthenticated) {
+  if (authGate !== 'signedIn') {
     return (
       <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--spacing-lg)' }}>
-        <div className="card" style={{ maxWidth: '400px', width: '100%' }}>
+        <div className="card" style={{ maxWidth: '420px', width: '100%' }}>
           <h1 style={{ fontSize: '1.5rem', fontWeight: 600, marginBottom: 'var(--spacing-lg)' }}>aflow Remote</h1>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
-            <input className="input" type="password" placeholder="Auth token" value={authToken}
-              onChange={(event) => setAuthTokenState(event.target.value)}
-              onKeyDown={(event) => event.key === 'Enter' && handleLogin()} />
-            <button className="btn btn-primary" onClick={handleLogin} disabled={!authToken.trim()}>Login</button>
-          </div>
+          {authGate === 'checking' && (
+            <p className="text-sm text-dim" role="status">Checking your saved session…</p>
+          )}
+          {authGate === 'restoreFailed' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
+              <p className="text-sm" role="alert">
+                The server could not be reached to check your session. This is a connection problem, not a signed-out state.
+              </p>
+              <button
+                className="btn btn-primary"
+                onClick={() => { setAuthGate('checking'); setRestoreAttempt((attempt) => attempt + 1) }}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {(authGate === 'signedOut' || authGate === 'expired') && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
+              {authGate === 'expired' && (
+                <p className="text-sm" role="alert">
+                  Your session ended (30 days without dashboard activity, or the server token was rotated).
+                  Sign in again to return to your current project and view.
+                </p>
+              )}
+              {loginError && <p className="text-sm" role="alert">{loginError}</p>}
+              <input className="input" type="password" placeholder="Auth token" value={loginDraft}
+                onChange={(event) => setLoginDraft(event.target.value)}
+                onKeyDown={(event) => event.key === 'Enter' && void handleLogin()} />
+              <button className="btn btn-primary" onClick={() => void handleLogin()}
+                disabled={!loginDraft.trim() || loginPending}>
+                {loginPending ? 'Signing in…' : 'Login'}
+              </button>
+              <div className="text-xs text-dim" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-xs)' }}>
+                <span>Stay signed in for 30 days of inactivity; your dashboard activity renews that window.</span>
+                <span>On a shared browser, use Logout when you finish.</span>
+                <span>
+                  The token is the deployment bearer from the server's configured token file or <code>AFLOW_APP_TOKEN</code>;
+                  ask your operator if you no longer have it. It is sent only at login and never stored in the browser.
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     )
@@ -215,8 +348,17 @@ export function App() {
           <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>aflow</h1>
           <div className="text-xs text-dim truncate">Set up your code project, plan the work, and follow every run</div>
         </div>
-        <button className="btn btn-secondary btn-sm" onClick={handleLogout}>Logout</button>
+        <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()} disabled={logoutPending}>
+          {logoutPending ? 'Signing out…' : 'Logout'}
+        </button>
       </header>
+
+      {logoutError && (
+        <div className="notice" role="alert" style={{ display: 'flex', gap: 'var(--spacing-md)', alignItems: 'center' }}>
+          <span className="text-sm">{logoutError}</span>
+          <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()}>Retry logout</button>
+        </div>
+      )}
 
       <nav className="workspace-nav" aria-label="Workspace views">
         {NAV_ITEMS.map((item) => (

@@ -902,8 +902,20 @@ credentials are accepted only in headers, while project roots and executable
 inputs remain server-owned. The remote application has no agent-provider client;
 provider selection occurs only through configured engine harness profiles.
 
+The web client authenticates through a rolling browser session instead of a
+long-lived in-memory bearer. Login verifies the deployment token in the
+`Authorization` header once and sets a signed HttpOnly, Secure, SameSite=Strict
+cookie (`browser_session.py`); the token itself is never persisted in the
+browser. The session expires after 30 days and is renewed only by requests the
+client marks `X-AFlow-Activity: 1` for real visible dashboard activity, so
+background polling and the SSE stream never extend an unattended session. A 401
+on an ordinary request surfaces as session expiry in the client while
+preserving the current project and view; logout expires the cookie. The `/mcp`
+mount and header-only REST clients keep the existing bearer-only behavior.
+
 ```text
-browser -> authenticated project/config/plan routes -> exact project registry
+browser -> login (bearer header once) -> signed HttpOnly session cookie
+       -> cookie-authenticated project/config/plan/run routes
        \-> authenticated run REST or MCP -----------> control-plane service
                                                        |
                                                        v

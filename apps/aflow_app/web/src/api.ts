@@ -25,6 +25,8 @@ import type {
   StartRunResult,
 } from './types'
 
+import { consumeActivityMarker, resetActivityMarker } from './activity'
+
 const API_BASE = '/api'
 
 export class ApiError extends Error {
@@ -64,17 +66,42 @@ function getHeaders(includeJson = true): HeadersInit {
   return headers
 }
 
+type SessionExpiredHandler = () => void
+
+let sessionExpiredHandler: SessionExpiredHandler | null = null
+let sessionRequests = new AbortController()
+
+export function setSessionExpiredHandler(handler: SessionExpiredHandler | null): void {
+  sessionExpiredHandler = handler
+}
+
+function isSessionUrl(url: string): boolean {
+  return url === '/api/session' || url.startsWith('/api/session/')
+}
+
 async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const includeJson = !(options.body instanceof FormData)
+  const headers: Record<string, string> = {
+    ...getHeaders(includeJson) as Record<string, string>,
+    ...options.headers as Record<string, string>,
+  }
+  // Visible page restoration counts as use; login and logout do not renew.
+  if ((!isSessionUrl(url) || !options.method || options.method === 'GET') && consumeActivityMarker()) {
+    headers['X-AFlow-Activity'] = '1'
+  }
+  const signal = options.signal ?? sessionRequests.signal
   const response = await fetch(url, {
+    credentials: 'same-origin',
+    signal,
     ...options,
-    headers: {
-      ...getHeaders(includeJson),
-      ...options.headers,
-    },
+    headers,
   })
 
+  if (signal.aborted) throw new DOMException('Session ended', 'AbortError')
   if (!response.ok) {
+    if (response.status === 401 && !isSessionUrl(url)) {
+      sessionExpiredHandler?.()
+    }
     const text = await response.text()
     let message = text
     let code: string | null = null
@@ -98,7 +125,9 @@ async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> 
     return undefined as T
   }
 
-  return response.json()
+  const result = await response.json()
+  if (signal.aborted) throw new DOMException('Session ended', 'AbortError')
+  return result
 }
 
 function buildQuery(params: Record<string, string | number | boolean | string[] | undefined>): string {
@@ -115,6 +144,28 @@ function buildQuery(params: Record<string, string | number | boolean | string[] 
   }
   const query = search.toString()
   return query ? `?${query}` : ''
+}
+
+export async function checkSession(): Promise<{ authenticated: boolean }> {
+  return fetchJson<{ authenticated: boolean }>('/api/session')
+}
+
+/**
+ * Exchange the deployment bearer for a signed HttpOnly session cookie. The
+ * token travels only in this request header and is never stored.
+ */
+export async function loginSession(token: string): Promise<{ authenticated: boolean }> {
+  return fetchJson<{ authenticated: boolean }>('/api/session', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export async function logoutSession(): Promise<void> {
+  await fetchJson<void>('/api/session', { method: 'DELETE' })
+  sessionRequests.abort()
+  sessionRequests = new AbortController()
+  resetActivityMarker()
 }
 
 export async function listProjects(): Promise<ProjectInfo[]> {
@@ -439,9 +490,15 @@ export function subscribeToRunEvents(subscription: RunEventSubscription): () => 
             after_sequence: cursor,
             limit: 100,
           })}`,
-          { headers: getHeaders(false), signal: controller.signal },
+          { headers: getHeaders(false), credentials: 'same-origin', signal: controller.signal },
         )
         if (!response.ok) {
+          if (response.status === 401) {
+            // The browser session expired; stop reconnecting instead of
+            // retrying the stream against a signed-out session.
+            sessionExpiredHandler?.()
+            return
+          }
           const message = await response.text()
           throw new ApiError(response.status, message || 'Run event stream failed')
         }

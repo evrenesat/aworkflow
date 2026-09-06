@@ -1,12 +1,157 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from './api'
+import { consumeActivityMarker, markUserActivity, resetActivityMarker } from './activity'
 
 function mockOkJson<T>(value: T, status = 200) {
   vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status, json: async () => value } as Response)
 }
 
 describe('workflow control API client', () => {
-  beforeEach(() => { global.fetch = vi.fn(); api.clearAuthToken() })
+  beforeEach(() => {
+    global.fetch = vi.fn()
+    api.clearAuthToken()
+    api.setSessionExpiredHandler(null)
+    resetActivityMarker()
+    window.localStorage.clear()
+    window.sessionStorage.clear()
+  })
+
+  it('exchanges the bearer for a cookie session without persisting the token', async () => {
+    mockOkJson({ authenticated: true })
+    await api.loginSession('secret-token')
+    const [url, options] = vi.mocked(global.fetch).mock.calls.at(-1)!
+    expect(url).toBe('/api/session')
+    expect(options).toEqual(expect.objectContaining({
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: expect.objectContaining({ Authorization: 'Bearer secret-token' }),
+    }))
+    expect(window.localStorage.length).toBe(0)
+    expect(window.sessionStorage.length).toBe(0)
+
+    // Normal requests afterwards ride the same-origin cookie without any
+    // Authorization header or stored credential.
+    mockOkJson([])
+    await api.listProjects()
+    const [, listOptions] = vi.mocked(global.fetch).mock.calls.at(-1)!
+    expect(listOptions.credentials).toBe('same-origin')
+    expect((listOptions.headers as Record<string, string>).Authorization).toBeUndefined()
+
+    mockOkJson({ authenticated: true })
+    await api.checkSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![0]).toBe('/api/session')
+
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await api.logoutSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)).toEqual(['/api/session', expect.objectContaining({ method: 'DELETE', credentials: 'same-origin' })])
+  })
+
+  it('marks the next authenticated request with user activity at most once per minute', async () => {
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).not.toHaveProperty('X-AFlow-Activity')
+
+    markUserActivity()
+    markUserActivity()
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).toEqual(expect.objectContaining({ 'X-AFlow-Activity': '1' }))
+
+    // The marker was consumed; the immediate next request is unmarked.
+    markUserActivity(Date.now() + 1_000)
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).not.toHaveProperty('X-AFlow-Activity')
+  })
+
+  it('renews a visible page restore but leaves background restores unmarked', async () => {
+    markUserActivity()
+    mockOkJson({ authenticated: true })
+    await api.checkSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).toHaveProperty('X-AFlow-Activity', '1')
+    mockOkJson({ authenticated: true })
+    await api.checkSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).not.toHaveProperty('X-AFlow-Activity')
+  })
+
+  it('aborts pending requests after confirmed logout and rejects late results', async () => {
+    let finish!: (response: Response) => void
+    vi.mocked(global.fetch).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const pending = api.listProjects()
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    const signal = vi.mocked(global.fetch).mock.calls[0][1].signal!
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await api.logoutSession()
+    expect(signal.aborted).toBe(true)
+    finish({ ok: true, status: 200, json: async () => [{ id: 'late' }] } as Response)
+    await rejected
+    mockOkJson({ authenticated: true })
+    await expect(api.checkSession()).resolves.toEqual({ authenticated: true })
+  })
+
+  it('does not abort the workspace or announce expiry when logout fails', async () => {
+    const onExpired = vi.fn()
+    api.setSessionExpiredHandler(onExpired)
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 503, text: async () => 'unavailable' } as Response)
+    await expect(api.logoutSession()).rejects.toMatchObject({ status: 503 })
+    expect(vi.mocked(global.fetch).mock.calls[0][1].signal!.aborted).toBe(false)
+    expect(onExpired).not.toHaveBeenCalled()
+  })
+
+  it('keeps background stream requests unmarked by user activity', async () => {
+    markUserActivity()
+    const encoder = new TextEncoder()
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      body: new ReadableStream<Uint8Array>({
+        pull: (controller) => {
+          controller.enqueue(encoder.encode('data: {"events":[]}\n\n'))
+          controller.close()
+        },
+      }),
+    } as unknown as Response)
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1', runId: 'run-1', reconnectDelaysMs: [1],
+      onEvents: () => {},
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    unsubscribe()
+    const headers = vi.mocked(global.fetch).mock.calls.at(-1)![1].headers as Record<string, string>
+    expect(headers['X-AFlow-Activity']).toBeUndefined()
+    // The marker stays pending for the next ordinary REST request.
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).toEqual(expect.objectContaining({ 'X-AFlow-Activity': '1' }))
+  })
+
+  it('reports a 401 on ordinary requests as session expiry, but not on session endpoints', async () => {
+    const onExpired = vi.fn()
+    api.setSessionExpiredHandler(onExpired)
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'unauthorized' } as Response)
+    await expect(api.listProjects()).rejects.toMatchObject({ status: 401 })
+    expect(onExpired).toHaveBeenCalledTimes(1)
+
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'unauthorized' } as Response)
+    await expect(api.checkSession()).rejects.toMatchObject({ status: 401 })
+    expect(onExpired).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops the run event stream on 401 and reports session expiry once', async () => {
+    const onExpired = vi.fn()
+    api.setSessionExpiredHandler(onExpired)
+    vi.mocked(global.fetch).mockResolvedValue({ ok: false, status: 401, text: async () => 'unauthorized' } as Response)
+    const states: api.StreamState[] = []
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1', runId: 'run-1', reconnectDelaysMs: [1],
+      onEvents: () => {},
+      onStateChange: (state) => states.push(state),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    unsubscribe()
+    expect(onExpired).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(1)
+    expect(states).not.toContain('connected')
+  })
 
   it('keeps bearer material in memory and sends it only as a header', async () => {
     api.setAuthToken('test-token')

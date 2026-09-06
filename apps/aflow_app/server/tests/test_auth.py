@@ -340,3 +340,27 @@ def test_mcp_transport_rejects_cookie_only_sessions(session_client) -> None:
     )
     assert response.status_code == 401
     assert response.json() == {"detail": {"code": "unauthorized"}}
+
+
+def test_visible_restore_rolls_expiry_but_background_restore_does_not(session_client) -> None:
+    client, _, _, clock = session_client
+    _login(client)
+    original = client.cookies.get("aflow_session")
+    clock["now"] += 29 * 24 * 60 * 60
+    background = client.get("/api/session")
+    assert background.status_code == 200
+    assert "set-cookie" not in background.headers
+    assert client.cookies.get("aflow_session") == original
+    restored = client.get("/api/session", headers={"X-AFlow-Activity": "1"})
+    assert restored.status_code == 200
+    assert _decode_session_value(client.cookies.get("aflow_session"))["exp"] == int(
+        clock["now"] + browser_session.SESSION_MAX_AGE_SECONDS
+    )
+    clock["now"] += 2 * 24 * 60 * 60
+    assert client.get("/api/session").status_code == 200
+    logout = client.delete(
+        "/api/session", headers={"Origin": "https://testserver", "X-AFlow-Activity": "1"}
+    )
+    assert logout.status_code == 204
+    assert "Max-Age=0" in logout.headers["set-cookie"]
+    assert client.get("/api/session").status_code == 401

@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
 import * as api from './api'
+import { consumeActivityMarker, resetActivityMarker } from './activity'
 
 vi.mock('./api', () => ({
   ApiError: class ApiError extends Error {
@@ -15,6 +16,7 @@ vi.mock('./api', () => ({
     }
   },
   getAuthToken: vi.fn(), setAuthToken: vi.fn(), clearAuthToken: vi.fn(),
+  checkSession: vi.fn(), loginSession: vi.fn(), logoutSession: vi.fn(), setSessionExpiredHandler: vi.fn(),
   listProjects: vi.fn(), getProjectDiscovery: vi.fn(), getProject: vi.fn(), createProject: vi.fn(), unregisterProject: vi.fn(),
   getProjectConfig: vi.fn(), saveProjectConfig: vi.fn(), validateProjectConfig: vi.fn(),
   listProjectPlans: vi.fn(), createProjectPlan: vi.fn(), readProjectPlan: vi.fn(),
@@ -68,7 +70,10 @@ const configPayload = (state: 'ready' | 'configuration_required' | 'invalid' = '
 describe('App workspace shell', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.getAuthToken).mockReturnValue('test-token')
+    resetActivityMarker()
+    vi.mocked(api.checkSession).mockResolvedValue({ authenticated: true })
+    vi.mocked(api.loginSession).mockResolvedValue({ authenticated: true })
+    vi.mocked(api.logoutSession).mockResolvedValue(undefined)
     vi.mocked(api.listProjects).mockResolvedValue([])
     vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
     vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload())
@@ -84,10 +89,130 @@ describe('App workspace shell', () => {
     vi.mocked(api.subscribeToRunEvents).mockReturnValue(() => {})
   })
 
-  it('shows login when unauthenticated', () => {
-    vi.mocked(api.getAuthToken).mockReturnValue(null)
+  it('restores a valid server session on load without a token prompt', async () => {
     render(<App />)
-    expect(screen.getByPlaceholderText('Auth token')).toBeDefined()
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
+    expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Login' })).toBeNull()
+  })
+
+  it('marks visible session restoration before requesting it and restores after remount', async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    vi.mocked(api.checkSession).mockImplementation(async () => {
+      expect(consumeActivityMarker()).toBe(true)
+      return { authenticated: true }
+    })
+    const first = render(<App />)
+    await screen.findByRole('button', { name: 'Logout' })
+    first.unmount()
+    resetActivityMarker()
+    render(<App />)
+    await screen.findByRole('button', { name: 'Logout' })
+    expect(api.checkSession).toHaveBeenCalledTimes(2)
+    expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
+  })
+
+  it('shows login only after a definitive 401 from the session check', async () => {
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    render(<App />)
+    expect(await screen.findByPlaceholderText('Auth token')).toBeDefined()
+    // The signed-out state is never announced for a connection failure.
+    expect(screen.queryByText(/could not be reached/)).toBeNull()
+  })
+
+  it('offers Retry instead of a signed-out message when the session check cannot reach the server', async () => {
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new TypeError('fetch failed'))
+    render(<App />)
+    expect(await screen.findByText(/server could not be reached/)).toBeDefined()
+    expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
+    expect(screen.queryByText(/could not be reached/)).toBeNull()
+  })
+
+  it('logs in through the server, clears the token entry, and never stores the bearer', async () => {
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    render(<App />)
+    const input = await screen.findByPlaceholderText('Auth token')
+    expect(screen.getByText(/30 days of inactivity/)).toBeDefined()
+    fireEvent.change(input, { target: { value: '  secret-token  ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }))
+    await waitFor(() => expect(api.loginSession).toHaveBeenCalledWith('secret-token'))
+    await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
+    expect((screen.queryByPlaceholderText('Auth token') as HTMLInputElement | null)?.value ?? '').toBe('')
+    expect(api.setAuthToken).not.toHaveBeenCalled()
+    expect(window.localStorage.length).toBe(0)
+    expect(window.sessionStorage.length).toBe(0)
+  })
+
+  it('keeps the entered draft and explains a rejected login', async () => {
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    vi.mocked(api.loginSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    render(<App />)
+    const input = await screen.findByPlaceholderText('Auth token')
+    fireEvent.change(input, { target: { value: 'wrong-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }))
+    expect(await screen.findByText(/did not accept that token/)).toBeDefined()
+    expect((screen.getByPlaceholderText('Auth token') as HTMLInputElement).value).toBe('wrong-token')
+  })
+
+  it('keeps the entered draft through a transient login network failure', async () => {
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    vi.mocked(api.loginSession).mockRejectedValueOnce(new TypeError('fetch failed'))
+    render(<App />)
+    fireEvent.change(await screen.findByPlaceholderText('Auth token'), { target: { value: 'token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }))
+    expect(await screen.findByText(/could not reach the server/)).toBeDefined()
+    expect((screen.getByPlaceholderText('Auth token') as HTMLInputElement).value).toBe('token')
+  })
+
+  it('signs out only after the server confirms logout and returns to the login gate', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+    await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(1))
+    await screen.findByPlaceholderText('Auth token')
+  })
+
+  it('keeps the workspace and offers retryable feedback when logout cannot be confirmed', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    vi.mocked(api.logoutSession).mockRejectedValueOnce(new TypeError('fetch failed'))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+    expect(await screen.findByText(/Logout could not be confirmed/)).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Retry logout' })).toBeDefined()
+    expect(screen.getByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry logout' }))
+    await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(2))
+    await screen.findByPlaceholderText('Auth token')
+  })
+
+  it('treats a 401 during ordinary use as session expiry and preserves the workspace for re-login', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    const expiredHandler = vi.fn()
+    vi.mocked(api.setSessionExpiredHandler).mockImplementation((handler) => expiredHandler.mockImplementation(handler ?? (() => {})))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    // Simulate a later authenticated request failing with 401.
+    expiredHandler()
+    expect(await screen.findByText(/Your session ended/)).toBeDefined()
+    expect(screen.queryByRole('heading', { name: /How Alpha Project fits together/ })).toBeNull()
+    // Re-login returns to the preserved project view.
+    vi.mocked(api.loginSession).mockResolvedValue({ authenticated: true })
+    fireEvent.change(await screen.findByPlaceholderText('Auth token'), { target: { value: 'token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }))
+    expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+  })
+
+  it('does not treat a server error as session expiry', async () => {
+    vi.mocked(api.listProjects).mockRejectedValueOnce(new api.ApiError(503, 'control plane unavailable'))
+    render(<App />)
+    expect(await screen.findByText(/control plane unavailable/)).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDefined()
+    expect(screen.queryByText(/Your session ended/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Logout' })).toBeDefined()
   })
 
   it('guides an empty registry into the create form and shows the server context', async () => {

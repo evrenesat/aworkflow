@@ -9,6 +9,7 @@ vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
   return {
     ...actual,
+    checkSession: vi.fn(),
     listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
     listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
     startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(),
@@ -67,7 +68,8 @@ function renderDashboard(options: { restartPollIntervalMs?: number } = {}) {
 
 describe('RunDashboard', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
+    vi.mocked(api.checkSession).mockResolvedValue({ authenticated: true })
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([project])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['control-project'] })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(capabilities)

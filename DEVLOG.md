@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-09-06 — Rolling browser session login for the remote web client
+
+- The web client now logs in once by posting the deployment bearer to
+  `POST /api/session`; the server sets the signed HttpOnly session cookie and
+  the token is cleared from memory and never stored in the browser.
+- On load the client checks `GET /api/session`: a valid cookie restores the
+  workspace without a prompt, a definitive 401 shows Login, and a network
+  failure offers Retry instead of a false signed-out state.
+- Visible page restoration renews the session before loading projects; real
+  pointer/keyboard/focus activity marks the next authenticated
+  REST request `X-AFlow-Activity: 1` (at most once per minute, in memory only),
+  which the server uses to roll the 30-day session forward; polling and SSE
+  never renew it.
+- A 401 during ordinary use or the event stream switches to a session-expired
+  sign-in that preserves the current project and view after re-login; logout
+  waits for `DELETE /api/session` confirmation before clearing the workspace
+  and aborts pending requests so late results cannot refill a signed-out
+  workspace. Failed logout offers retryable feedback. Header-only REST and MCP clients
+  are unchanged.
+
 ## 2026-09-06 — Remove remote agent planning and retain plan management
 
 - Removed the remote provider client, interactive planning surface, and its

@@ -11,7 +11,7 @@ Agent providers are selected by normal AFlow harness profiles when a workflow ru
 - Plan routes edit only direct regular `.md` files under `plans/todo`, `plans/in-progress`, and `plans/done`.
 - Configuration routes address only `.aflow/config/aflow.toml` and `.aflow/config/workflows.toml` as one revisioned pair.
 - Run REST and MCP routes delegate to the same durable control-plane service.
-- All API and MCP operations require an `Authorization: Bearer ...` header. Credentials in URLs or MCP payloads are rejected.
+- REST accepts an `Authorization: Bearer ...` header or, for the web client, a signed HttpOnly session cookie. Credentials in URLs or MCP payloads are rejected; `/mcp` stays header-only.
 - `/health` reports process liveness. Authenticated `/ready` reports control-plane readiness.
 
 ## Run locally
@@ -27,7 +27,9 @@ The server binds to `127.0.0.1:8765` by default and serves the built web client 
 
 ## Web workspace
 
-The web client is a bearer-authenticated, same-origin workspace for exactly one selected registered project at a time. Navigation is Projects, Configuration, Plans, and Runs. The bearer token is kept in memory only and sent as a header; no token, project path, or editor content is persisted in the browser.
+The web client is a same-origin workspace for exactly one selected registered project at a time. Navigation is Projects, Configuration, Plans, and Runs.
+
+Login sends the deployment bearer once in the `Authorization` header to `POST /api/session`; the server answers with a signed HttpOnly, Secure, SameSite=Strict cookie. Reloads and new same-origin tabs restore the session from that cookie (`GET /api/session`) without re-entering the token. The session rolls forward for 30 days from real visible dashboard activity (the client marks such requests with `X-AFlow-Activity: 1`, at most once per minute); background polling and the event stream never renew it. Expiry, an invalid cookie, or a server token rotation ends the session and the client shows sign-in again while preserving the current project and view. Logout (`DELETE /api/session`) expires the cookie immediately — use it on a shared browser. The bearer token is never stored in localStorage, sessionStorage, URLs, or readable cookies; it lives only in the login request. Header-only REST and MCP clients are unaffected.
 
 Projects view: lists only registry-backed projects with a readiness state (`ready`, `configuration_required`, or `blocked`). A create/register form accepts a normalized relative path beneath the managed root, an optional display name, main branch, optional initial workflow and team, and — for register mode — an explicit initialize-Git confirmation for empty non-Git directories and an optional starter-config initialization that never overwrites existing documents. Existing folder names never need renaming; unsafe basenames receive a deterministic path-safe registry ID while keeping their actual name as the default display name. Unregister removes only the registry record after an inline confirmation that states files, Git history, and plans are preserved. Project-list failures surface a retry instead of local filesystem choices.
 

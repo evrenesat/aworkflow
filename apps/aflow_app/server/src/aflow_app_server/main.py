@@ -546,7 +546,7 @@ async def renew_browser_session(request: Request, call_next):
     path = request.url.path
     if (
         request.headers.get("x-aflow-activity") == "1"
-        and not path.startswith("/api/session")
+        and not (path == "/api/session" and request.method in {"POST", "DELETE"})
         and not (path == "/mcp" or path.startswith("/mcp/"))
         and response.status_code < status.HTTP_400_BAD_REQUEST
     ):
