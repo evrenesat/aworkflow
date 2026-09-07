@@ -181,13 +181,19 @@ class TestRegister:
             text=True,
         ).stdout
 
+        # The fixture itself creates untracked config. Compare before/after
+        # without relying on the operator's global ignore file.
+        status_args = ("-c", "core.excludesFile=/dev/null", "status", "--porcelain")
+        before_status = _git(project, *status_args)
+        assert before_status == "?? .aflow/"
+
         result = _create(service, "gamma", mode="register")
 
         assert result["id"] == "gamma"
         assert (project / ".aflow" / "config" / "aflow.toml").read_text() == "# kept\n"
         assert (project / ".aflow" / "config" / "workflows.toml").exists() is False
         assert _git(project, "rev-parse", "HEAD") == before.strip()
-        assert _git(project, "status", "--porcelain") == ""
+        assert _git(project, *status_args) == before_status
         assert registry.get("gamma") is not None
 
     def test_register_initialize_config_refuses_existing_documents(
