@@ -834,3 +834,5 @@
   notices; `npm run build` and `git diff --check` clean.
 
 - Deployment owner repair: all timed-out poller subprocesses now terminate their process group, including children left after parent exit; focused regressions cover TERM-ignoring descendants and both error/deferral results.
+
+- Fixed the continuous deployer’s real preflight handoff: reserve a unique snapshot path, then release the empty directory so preflight creates it. The deployment fixture now rejects existing paths like the production script; the success regression fails before the fix.

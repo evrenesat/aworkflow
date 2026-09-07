@@ -38,7 +38,9 @@ for argument in "$@"; do
   if [ "$previous" = "--output-dir" ]; then output_dir="$argument"; fi
   previous="$argument"
 done
-mkdir -p "$output_dir"
+# Match the real preflight contract: it creates a new snapshot directory.
+[ ! -e "$output_dir" ] || exit 1
+mkdir "$output_dir" || exit 1
 if [ -n "$DEPLOY_CD_PREFLIGHT_SLEEP" ]; then sleep "$DEPLOY_CD_PREFLIGHT_SLEEP"; fi
 if [ -n "$DEPLOY_CD_PREFLIGHT_SNAPSHOT" ]; then
   printf '%s\\n' "$DEPLOY_CD_PREFLIGHT_SNAPSHOT" >"$output_dir/preflight.json"

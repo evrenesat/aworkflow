@@ -388,6 +388,8 @@ def _deploy(source: Path, candidate: str, state_dir: Path, status: dict[str, obj
     temporary_root = state_dir / "tmp"
     temporary_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     preflight_dir = Path(tempfile.mkdtemp(prefix="preflight-", dir=temporary_root))
+    # Reserve a unique name, then let preflight create its own new directory.
+    preflight_dir.rmdir()
     try:
         preflight = _run(_preflight_arguments(source, preflight_dir, args), PREFLIGHT_TIMEOUT_SECONDS)
     except PollerError:
