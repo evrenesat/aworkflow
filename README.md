@@ -63,6 +63,13 @@ aflow run path/to/plan.md -- keep changes limited to the requested scope
 If no workflow is named, AFlow uses `aflow.default_workflow` from the
 configuration.
 
+Status and progress are printed as plain, append-only `key=value` records on
+stderr. Interactive terminals, redirected logs, and `TERM=dumb` environments
+receive the same ordered, copyable lines with no cursor movement, ANSI styling,
+or keyboard capture, and one final summary record per run. `aflow show` prints
+plain ASCII workflow graphs, roles, and teams. The CLI is a portable launcher
+and log stream; the remote web application is the interactive dashboard.
+
 ## Run the lightweight local daemon
 
 `aflow daemon` exposes the same 13 control-plane MCP tools without the remote
@@ -143,6 +150,42 @@ lifecycle identity when no plan is supplied. Older run metadata remains
 readable for analysis but is not migrated or resumable. Detailed compatibility,
 recovery, supervision, and next-turn override rules are documented separately.
 
+Use `--continue-from-current` for an accepted, partially completed plan:
+
+```bash
+aflow run --continue-from-current path/to/plan.md
+```
+
+The current symbolic branch must match the plan's Git Tracking Plan Branch, and
+its full HEAD must match Pre-Handoff Base HEAD. The plan must contain both a
+completed and an unchecked checkpoint. AFlow starts a normal nested lifecycle
+from that branch, records the continuation branch and HEAD in `run.json`, and
+merges the generated feature branch back to the same branch. The option is
+explicit and cannot be combined with `--resume` or `--resume-reset-scope`.
+
+For a repository and registered managed worktree copied under new absolute
+paths, relocation is explicit and fail-closed:
+
+```bash
+aflow run --resume RUN_ID --resume-rehome-worktree /path/to/registered-worktree
+aflow run --resume RUN_ID --team TEAM_NAME
+```
+
+The first command requires the current primary checkout on the recorded main
+branch, the recorded feature branch and pre-handoff commit to exist, and the
+replacement path to be the exact registered feature worktree. AFlow remaps
+only repository-owned resume paths, carries validated scope-v2 evidence into
+the continuation, preserves the source run byte-for-byte, and records
+`resume_relocation` in the new `run.json`. It never discovers or creates a
+replacement worktree.
+
+A different baseline team is accepted only for an explicitly named resume and
+a configured team. Pending manager notes, team-step overrides, finalized turns,
+boundary or repartition transactions, hotplug transactions, and unapplied
+owner routing changes name the blocking field and stop before allocation. The
+continuation records `resumed_from_team` and `resume_team_override`; automatic
+and same-team resumes retain strict team equality.
+
 ### Live worker role hotplug
 
 An override may change a worker selector at the next safe worker boundary:
@@ -186,10 +229,23 @@ all core tests. Pull requests and pushes to `main` run Python 3.11 on Ubuntu
 and macOS, and the package build waits for both platform test jobs. Publication
 calls the same reusable CI workflow before uploading a package.
 
-The optional remote management app lives in `apps/aflow_app/` and is not
-included in the published wheel. Its server requires Python 3.12+ and exposes a
-provider-neutral planning-session API; Codex integration is implemented through
-`codex-app-server-sdk` behind that boundary.
+The optional remote workflow-control app lives in `apps/aflow_app/` and is
+not included in the published wheel. Its Python 3.12+ server manages registered
+projects, revisioned configuration and Markdown plans, and durable runs through
+the canonical REST API and SSE stream, with MCP as an optional adapter.
+The web client is the interactive dashboard: typed run starts
+(plan, workflow, team, start step, max turns, bounded extra instructions),
+SSE progress with reconnect-safe snapshots, capability-gated compare-and-swap
+controls for max turns/team/selectors, explicit resume, and guided
+stop-then-start workflow changes with `restarted_from_run_id` lineage. Provider
+choice stays in normal engine harness profiles; Codex is one optional harness
+adapter. A remote ACP interface is deferred.
+
+Private deployments keep the backend on `127.0.0.1:8765` and publish it to the
+tailnet through Tailscale Serve. After enabling Serve, use
+`tailscale serve status --json` to discover the advertised MagicDNS HTTPS
+address. Follow the [private deployment runbook](deploy/aflowd/README.md) for
+installation, activation, verification, and rollback.
 
 ## Documentation
 

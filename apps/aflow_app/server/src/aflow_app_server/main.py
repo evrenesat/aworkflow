@@ -10,12 +10,13 @@ import json
 import logging
 import os
 import re
-import tempfile
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.routing import Match, Mount, get_route_path
 from starlette.types import Scope
 
+from aflow.config import ConfigError, validate_starter_main_branch
 from aflow.control_plane import (
     ControlConflictError,
     ControlIdempotencyConflict,
@@ -34,25 +36,41 @@ from aflow.control_plane import (
 from aflow.control_plane.persistence import PersistenceError
 from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict
 
-import aflow_app_server.planning_routes as planning_routes_module
-from .aflow_service import AflowService
+from .browser_session import (
+    SESSION_COOKIE_NAME,
+    SESSION_MAX_AGE_SECONDS,
+    encode_session,
+    verify_session,
+)
 from .config import ServerConfig
 from .control_plane_service import (
+    ControlPlaneServiceConfig,
     ControlPlaneService,
     ControlPlaneUnavailableError,
     ProjectNotAllowedError,
 )
+from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
 from .models import (
+    BuildStarterAction,
     CapabilityResponse,
+    ConfigValidationIssueModel,
+    ConfigValidationModel,
     ContextResponse,
     ControlResponse,
     EventResponse,
     EventTailResponse,
     GlobalCapabilitiesResponse,
+    GuidedStarterDefaults,
     OwnerStopPayload,
     PlanListResponse,
     PlanResponse,
+    ProjectConfigFormPayload,
+    ProjectConfigFormResponse,
+    ProjectConfigResponse,
+    ProjectConfigSavePayload,
+    ProjectConfigValidatePayload,
+    ProjectDiscoveryResponse,
     ProjectListResponse,
     ProjectResponse,
     RunControlPayload,
@@ -65,22 +83,37 @@ from .models import (
     StartupAnswerPayload,
     StartupQuestionResponse,
 )
-from .planning import AttachmentStore, PlanningService, ProviderRegistry
-from .planning.providers import CodexProvider
-from .planning.registry import UnavailablePlanningProvider
-from .project_catalog import ProjectCatalog
-from .plan_store import PlanStore
-from .transcription import TranscriptionClient, TranscriptionError, create_transcription_client
+from .plan_service import (
+    PlanProjectNotFound,
+    PlanRevisionConflict,
+    PlanService,
+    PlanServiceError,
+)
+import aflow_app_server.plan_routes as plan_routes_module
+from .project_config_service import (
+    ConfigValidationReport,
+    ProjectConfigError,
+    ProjectConfigService,
+    ProjectConfigRevisionConflict,
+    ProjectConfigRunBlocked,
+    ProjectConfigSnapshot,
+)
+from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
+from .project_registry import ProjectRegistry, ProjectRegistryError
+from .project_service import (
+    ProjectRequest,
+    ProjectService,
+    ProjectServiceError,
+    project_readiness,
+)
 
 
 # Global state
 _config: ServerConfig | None = None
-_project_catalog: ProjectCatalog | None = None
-_service: AflowService | None = None
+_project_registry: ProjectRegistry | None = None
+_plan_service: PlanService | None = None
 _control_plane_service: ControlPlaneService | None = None
-_transcription_client: TranscriptionClient | None = None
-_planning_registry: ProviderRegistry | None = None
-_planning_service: PlanningService | None = None
+_project_config_service: ProjectConfigService | None = None
 _seen_plugin_probe_fingerprints: set[str] = set()
 
 _EVENT_STREAM_POLL_INTERVAL_SECONDS = 0.1
@@ -217,18 +250,18 @@ def get_config() -> ServerConfig:
     return _config
 
 
-def get_project_catalog() -> ProjectCatalog:
-    """Get the project catalog."""
-    if _project_catalog is None:
+def get_project_registry() -> ProjectRegistry:
+    """Return the canonical project registry."""
+    if _project_registry is None:
         raise RuntimeError("Server not initialized")
-    return _project_catalog
+    return _project_registry
 
 
-def get_service() -> AflowService:
-    """Get the aflow service."""
-    if _service is None:
+def get_plan_service() -> PlanService:
+    """Return revisioned filesystem plan management."""
+    if _plan_service is None:
         raise RuntimeError("Server not initialized")
-    return _service
+    return _plan_service
 
 
 def get_control_plane_service() -> ControlPlaneService:
@@ -241,28 +274,27 @@ def get_control_plane_service() -> ControlPlaneService:
     return _control_plane_service
 
 
-def get_transcription_client() -> TranscriptionClient:
-    """Get the transcription client."""
-    if _transcription_client is None:
+def get_project_config_service() -> ProjectConfigService:
+    """Return the registry-backed config text service."""
+    if _project_config_service is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Transcription service not configured",
+            detail={"code": "control_plane_unavailable"},
         )
-    return _transcription_client
-
-
-def get_planning_service() -> PlanningService:
-    """Get the application-lifespan provider-neutral planning service."""
-    if _planning_service is None:
-        raise RuntimeError("Server not initialized")
-    return _planning_service
+    return _project_config_service
 
 
 security = HTTPBearer(auto_error=False)
 
 
 def _verify_bearer_token(provided_token: str | None, config: ServerConfig) -> str:
-    """Verify a header bearer credential for every authenticated transport."""
+    """Verify a header bearer credential and return the matched token value.
+
+    Returning the exact value that passed the constant-time comparison lets
+    callers that mint derived credentials (the browser session) use the same
+    token epoch that authenticated the request, instead of rereading the
+    possibly rotated deployment token.
+    """
     try:
         expected = config.current_auth_token()
     except ValueError:
@@ -273,7 +305,7 @@ def _verify_bearer_token(provided_token: str | None, config: ServerConfig) -> st
             detail={"code": "unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return "authenticated"
+    return expected
 
 
 def _bearer_token_from_header(authorization: str | None) -> str | None:
@@ -286,29 +318,90 @@ def _bearer_token_from_header(authorization: str | None) -> str | None:
 
 
 async def verify_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     config: ServerConfig = Depends(get_config),
 ) -> str:
-    """Verify one header-only bearer token using constant-time comparison."""
-    provided_token = (
-        credentials.credentials
-        if credentials and credentials.scheme.lower() == "bearer"
-        else None
+    """Authenticate a request by explicit header bearer or browser session.
+
+    A supplied Authorization header must be a valid bearer credential; an
+    invalid or malformed header is rejected rather than falling back to the
+    cookie. A session cookie is accepted only without an Authorization header,
+    and cookie-authenticated unsafe methods additionally require an exact
+    same-origin Origin header. MCP transports keep header-only authentication.
+    """
+    authorization = request.headers.get("authorization")
+    if authorization is not None:
+        return _verify_bearer_token(_bearer_token_from_header(authorization), config)
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    if not cookie:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "unauthorized"},
+        )
+    try:
+        auth_token = config.current_auth_token()
+    except ValueError:
+        auth_token = ""
+    try:
+        if not auth_token:
+            raise ValueError("authentication token unavailable")
+        verify_session(cookie, auth_token)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "unauthorized"},
+        )
+    if request.method in _UNSAFE_METHODS and not _same_origin(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "origin_required"},
+        )
+    return "authenticated"
+
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _same_origin(request: Request) -> bool:
+    """Require an Origin header exactly matching the request's own origin."""
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        return False
+    parsed = urlsplit(origin)
+    if not parsed.scheme or not parsed.hostname:
+        return False
+    url = request.url
+    default_ports = {"http": 80, "https": 443}
+    origin_port = parsed.port or default_ports.get(parsed.scheme)
+    request_port = url.port or default_ports.get(url.scheme)
+    return (
+        parsed.scheme == url.scheme
+        and parsed.hostname == url.hostname
+        and origin_port == request_port
     )
-    return _verify_bearer_token(provided_token, config)
 
 
-def get_plan_store_factory(project_catalog: ProjectCatalog = Depends(get_project_catalog)):
-    """Factory for creating plan stores."""
-    def _get_plan_store(project_id: str) -> PlanStore:
-        project = project_catalog.get_project(project_id)
-        if project is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Project not found",
-            )
-        return PlanStore(project.current_path)
-    return _get_plan_store
+def _set_session_cookie(response: Response, value: str, max_age: int) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        value,
+        max_age=max_age,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
+
+
+def get_project_service() -> ProjectService:
+    """Return the registry-backed create/register/unregister service."""
+    if _project_registry is None or _control_plane_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "control_plane_unavailable"},
+        )
+    return ProjectService(_project_registry, _control_plane_service)
 
 
 def _get_web_dist_dir() -> Path:
@@ -366,83 +459,41 @@ class _MCPMount(Mount):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize server state on startup."""
-    global _config, _project_catalog, _service, _control_plane_service, _transcription_client
-    global _planning_registry, _planning_service
+    """Initialize canonical project, plan, config, and run services."""
+    global _config, _project_registry, _plan_service, _control_plane_service, _project_config_service
 
     _config = ServerConfig.from_env()
     errors = _config.validate()
     if errors:
         raise RuntimeError(f"Configuration errors: {', '.join(errors)}")
-
-    _project_catalog = ProjectCatalog(
-        _config.projects_home,
-        _config.project_overrides_path,
-        legacy_registry_path=_config.repo_registry_path,
+    project_registry = ProjectRegistry(
+        _config.managed_projects_root,
+        _config.project_registry_path,
     )
-    _service = AflowService()
-    _control_plane_service = ControlPlaneService(_config.control_plane_projects)
+    _project_registry = project_registry
+    _plan_service = PlanService(project_registry)
+    _control_plane_service = ControlPlaneService(ControlPlaneServiceConfig(
+        registry=project_registry,
+        aflow_executable=_config.aflow_executable,
+        environment_file=_config.environment_file,
+        release_identity=_config.release_identity,
+        environment=_config.control_plane_environment,
+    ))
     _control_plane_service.start()
-    _transcription_client = create_transcription_client(
-        _config.transcription_url,
-        _config.transcription_token,
+    _project_config_service = ProjectConfigService(
+        project_registry,
+        _control_plane_service,
+        audit_path=_config.config_audit_path,
     )
-    attachment_store = AttachmentStore(
-        _config.attachment_root,
-        max_file_size_bytes=_config.attachment_max_file_size_bytes,
-        max_count_per_turn=_config.attachment_max_count_per_turn,
-        max_total_size_bytes_per_turn=(
-            _config.attachment_max_total_size_bytes_per_turn
-        ),
-    )
-    providers = []
-    for provider in _config.planning_providers:
-        if not provider.enabled:
-            continue
-        if provider.kind == "codex":
-            providers.append(
-                CodexProvider(
-                    provider.id,
-                    provider.display_name,
-                    server_url=provider.server_url,
-                    server_token=provider.server_token,
-                    operation_timeout_seconds=_config.planning_operation_timeout_seconds,
-                    execution_policy=_config.planning_execution_policy,
-                    attachment_store=attachment_store,
-                )
-            )
-        else:
-            providers.append(
-                UnavailablePlanningProvider(provider.id, provider.display_name)
-            )
-    _planning_registry = ProviderRegistry(
-        providers,
-        operation_timeout_seconds=_config.planning_operation_timeout_seconds,
-    )
-    await _planning_registry.start()
-    _planning_service = PlanningService(
-        _planning_registry,
-        default_provider_id=_config.default_planning_provider_id,
-        attachment_store=attachment_store,
-    )
-    app.state.planning_service = _planning_service
-    app.state.attachment_store = attachment_store
-
     try:
         async with mcp_http_app.lifespan(app):
             yield
     finally:
-        await _planning_registry.close()
-        # Cleanup
-        app.state.planning_service = None
-        app.state.attachment_store = None
-        _planning_service = None
-        _planning_registry = None
         _config = None
-        _project_catalog = None
-        _service = None
+        _project_registry = None
+        _plan_service = None
         _control_plane_service = None
-        _transcription_client = None
+        _project_config_service = None
 
 
 app = FastAPI(
@@ -489,10 +540,43 @@ async def block_local_plugin_probe(request: Request, call_next):
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     return await call_next(request)
 
-app.dependency_overrides[planning_routes_module._get_project_catalog] = get_project_catalog
-app.dependency_overrides[planning_routes_module._get_planning_service] = get_planning_service
+@app.middleware("http")
+async def renew_browser_session(request: Request, call_next):
+    """Roll a valid session cookie forward on marked user activity.
 
-app.include_router(planning_routes_module.router, dependencies=[Depends(verify_token)])
+    Only a cookie-authenticated response that explicitly carries
+    X-AFlow-Activity: 1 is renewed, so background polling and SSE traffic
+    never extend an unattended session. Failed authentication, logout, and
+    MCP transports are never renewed.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if (
+        request.headers.get("x-aflow-activity") == "1"
+        and not (path == "/api/session" and request.method in {"POST", "DELETE"})
+        and not (path == "/mcp" or path.startswith("/mcp/"))
+        and response.status_code < status.HTTP_400_BAD_REQUEST
+    ):
+        cookie = request.cookies.get(SESSION_COOKIE_NAME)
+        config = _config
+        if cookie and config is not None:
+            try:
+                auth_token = config.current_auth_token()
+            except ValueError:
+                auth_token = ""
+            if auth_token:
+                try:
+                    verify_session(cookie, auth_token)
+                except ValueError:
+                    return response
+                _set_session_cookie(
+                    response, encode_session(auth_token), SESSION_MAX_AGE_SECONDS
+                )
+    return response
+
+
+app.dependency_overrides[plan_routes_module._get_plan_service] = get_plan_service
+app.include_router(plan_routes_module.router, dependencies=[Depends(verify_token)])
 app.router.routes.append(_MCPMount("/mcp", app=mcp_http_app, name="mcp"))
 
 
@@ -542,6 +626,61 @@ async def restart_required_handler(_: Request, exc: RestartRequiredControlError)
     )
 
 
+@app.exception_handler(ProjectConfigRevisionConflict)
+async def config_revision_conflict_handler(
+    _: Request, exc: ProjectConfigRevisionConflict
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT,
+        "revision_conflict",
+        current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(PlanProjectNotFound)
+async def plan_project_not_found_handler(
+    _: Request, __: PlanProjectNotFound
+) -> JSONResponse:
+    return _error_response(status.HTTP_404_NOT_FOUND, "project_not_found")
+
+
+@app.exception_handler(PlanRevisionConflict)
+async def plan_revision_conflict_handler(
+    _: Request, exc: PlanRevisionConflict
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT,
+        "revision_conflict",
+        current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(GuidedConfigError)
+async def guided_config_rejected_handler(
+    _: Request, exc: GuidedConfigError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "guided_config_rejected",
+        reason=exc.code,
+        message=" ".join(str(exc).split())[:300],
+    )
+
+
+@app.exception_handler(ProjectConfigRunBlocked)
+async def config_save_blocked_handler(
+    _: Request, exc: ProjectConfigRunBlocked
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT,
+        "config_save_blocked",
+        blocking_runs=[
+            {"run_id": run_id, "status": run_status}
+            for run_id, run_status in exc.blocking_runs
+        ],
+    )
+
+
 @app.exception_handler(DaemonAuthorizationError)
 @app.exception_handler(ServiceAuthorizationError)
 async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse:
@@ -552,6 +691,10 @@ async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse
 @app.exception_handler(PersistenceError)
 @app.exception_handler(DaemonError)
 @app.exception_handler(ValueError)
+@app.exception_handler(ProjectRegistryError)
+@app.exception_handler(ProjectServiceError)
+@app.exception_handler(ProjectConfigError)
+@app.exception_handler(PlanServiceError)
 async def rejected_operation_handler(_: Request, __: Exception) -> JSONResponse:
     return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "operation_rejected")
 
@@ -584,6 +727,11 @@ def ready(
     return ReadinessResponse(
         ready=service.ready,
         projects=tuple(project.project_id for project in service.projects()),
+        project_errors={
+            project_id: error
+            for project_id, error in service.readiness().items()
+            if error is not None
+        },
     )
 
 
@@ -598,10 +746,8 @@ def global_capabilities(
 ) -> GlobalCapabilitiesResponse:
     return GlobalCapabilitiesResponse(
         projects={
-            project.project_id: CapabilityResponse.from_canonical(
-                service.capabilities(project.project_id)
-            )
-            for project in service.projects()
+            project_id: CapabilityResponse.from_canonical(capabilities)
+            for project_id, capabilities in service.ready_capabilities().items()
         }
     )
 
@@ -802,6 +948,8 @@ def start_run(
         team=payload.team,
         start_step=payload.start_step,
         max_turns=payload.max_turns,
+        extra_instructions=payload.extra_instructions,
+        restarted_from_run_id=payload.restarted_from_run_id,
         idempotency_key=idempotency_key,
     )
     adapted = _start_response(result)
@@ -918,105 +1066,348 @@ class UpdateProjectRequest(BaseModel):
     alias: str | None = None
 
 
-# Project endpoints
+class ProjectCreateRequest(BaseModel):
+    """Typed create/register contract with no executable, absolute path, or argv fields."""
+    mode: str
+    path: str
+    display_name: str | None = None
+    main_branch: str = "main"
+    initial_workflow: str | None = None
+    initial_team: str | None = None
+    initialize_git: bool = False
+    initialize_config: bool = False
+
+
+def _project_payload(registry: ProjectRegistry, project_id: str) -> dict[str, Any] | None:
+    record = registry.get(project_id)
+    if record is None:
+        return None
+    try:
+        _, root = registry.resolve(project_id)
+        is_git_root = True
+    except ProjectRegistryError:
+        root = registry.declared_root(project_id)
+        is_git_root = False
+    return {
+        "id": record.id,
+        "display_name": record.display_name,
+        "current_path": str(root),
+        "is_git_root": is_git_root,
+        "registered_at": record.created_at.isoformat(),
+        "readiness": project_readiness(root, is_git_root=is_git_root),
+    }
+
+
 @app.get("/api/projects")
-async def list_projects(
+def list_projects(
     _: str = Depends(verify_token),
-    project_catalog: ProjectCatalog = Depends(get_project_catalog),
+    registry: ProjectRegistry = Depends(get_project_registry),
 ) -> list[dict[str, Any]]:
-    """List all discovered projects."""
-    sessions = ()
-    if _planning_service is not None:
-        sessions, _ = await _planning_service.list_sessions()
-    projects = project_catalog.list_projects(sessions=sessions)
-    return [project.to_dict() for project in projects]
+    """List only explicitly registered projects."""
+    return [payload for record in registry.list_records() if (payload := _project_payload(registry, record.id))]
+
+
+@app.get(
+    "/api/project-discovery",
+    response_model=ProjectDiscoveryResponse,
+    tags=["projects"],
+)
+def get_project_discovery(
+    _: str = Depends(verify_token),
+    registry: ProjectRegistry = Depends(get_project_registry),
+) -> ProjectDiscoveryResponse:
+    """List bounded existing Git roots; read-only and never an allowlist."""
+    try:
+        payload = discover_projects(registry)
+    except ProjectDiscoveryUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "discovery_unavailable"},
+        )
+    return ProjectDiscoveryResponse.model_validate(payload)
+
+
+@app.post("/api/projects", status_code=status.HTTP_201_CREATED)
+def create_project(
+    request: ProjectCreateRequest,
+    _: str = Depends(verify_token),
+    project_service: ProjectService = Depends(get_project_service),
+) -> dict[str, Any]:
+    if request.mode not in {"create", "register"}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail={"code": "unsupported_project_mode"})
+    return project_service.create_or_register(ProjectRequest(
+        mode=request.mode,  # type: ignore[arg-type]
+        relative_path=request.path,
+        display_name=request.display_name,
+        main_branch=request.main_branch,
+        initial_workflow=request.initial_workflow,
+        initial_team=request.initial_team,
+        initialize_git=request.initialize_git,
+        initialize_config=request.initialize_config,
+    ))
+
+
+@app.delete("/api/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unregister_project(
+    project_id: str,
+    _: str = Depends(verify_token),
+    project_service: ProjectService = Depends(get_project_service),
+) -> Response:
+    if not project_service.unregister(project_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/api/projects/{project_id}")
-async def get_project(
+def get_project(
     project_id: str,
     _: str = Depends(verify_token),
-    project_catalog: ProjectCatalog = Depends(get_project_catalog),
+    registry: ProjectRegistry = Depends(get_project_registry),
 ) -> dict[str, Any]:
-    """Get a specific project."""
-    sessions = ()
-    if _planning_service is not None:
-        sessions, _ = await _planning_service.list_sessions()
-    project = project_catalog.get_project(project_id, sessions=sessions)
+    project = _project_payload(registry, project_id)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-    return project.to_dict()
+    return project
 
 
 @app.patch("/api/projects/{project_id}")
-async def update_project(
+def update_project(
     project_id: str,
     request: UpdateProjectRequest,
     _: str = Depends(verify_token),
-    project_catalog: ProjectCatalog = Depends(get_project_catalog),
+    registry: ProjectRegistry = Depends(get_project_registry),
 ) -> dict[str, Any]:
-    """Update a project's override metadata."""
-    project = project_catalog.update_project(
-        project_id,
-        display_name=request.display_name,
-        current_path=request.current_path,
-        alias=request.alias,
-    )
+    if request.alias is not None:
+        raise ProjectRegistryError("project roots and aliases are not mutable")
+    if request.current_path is not None:
+        submitted = Path(request.current_path).expanduser()
+        declared = registry.declared_root(project_id)
+        _, resolved = registry.resolve(project_id)
+        if not submitted.is_absolute() or submitted not in {declared, resolved}:
+            raise ProjectRegistryError("project roots and aliases are not mutable")
+    if request.display_name is not None and registry.rename(project_id, request.display_name) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    project = _project_payload(registry, project_id)
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-    return project.to_dict()
+    return project
 
 
-# Plan endpoints
-@app.get("/api/projects/{project_id}/plans")
-async def list_plans(
+# Project configuration endpoints.  Exactly two documents are addressable;
+# no route, payload, or response field can name a third file.
+def _config_validation_response(report: ConfigValidationReport) -> ConfigValidationModel:
+    return ConfigValidationModel(
+        state=report.state,  # type: ignore[arg-type]
+        issues=tuple(
+            ConfigValidationIssueModel(
+                document=issue.document, line=issue.line, message=issue.message
+            )
+            for issue in report.issues
+        ),
+        placeholders=report.placeholders,
+        workflows=report.workflows,
+        teams=report.teams,
+        roles=report.roles,
+    )
+
+
+def _config_response(snapshot: ProjectConfigSnapshot) -> ProjectConfigResponse:
+    return ProjectConfigResponse(
+        project_id=snapshot.project_id,
+        revision=snapshot.revision,
+        documents=snapshot.documents,
+        aflow_toml=snapshot.aflow_toml,
+        workflows_toml=snapshot.workflows_toml,
+        validation=_config_validation_response(snapshot.validation),
+    )
+
+
+@app.get(
+    "/api/projects/{project_id}/config",
+    response_model=ProjectConfigResponse,
+    tags=["projects"],
+)
+def get_project_config(
     project_id: str,
     _: str = Depends(verify_token),
-    project_catalog: ProjectCatalog = Depends(get_project_catalog),
-    service: AflowService = Depends(get_service),
-) -> list[dict[str, Any]]:
-    """List all plan files for a project."""
-    project = project_catalog.get_project(project_id)
-    if project is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-
-    plans = service.list_plans(project.current_path)
-    return [plan.to_dict() for plan in plans]
+    service: ProjectConfigService = Depends(get_project_config_service),
+) -> ProjectConfigResponse:
+    """Return both exact configuration texts with their combined revision."""
+    return _config_response(service.read(project_id))
 
 
-# Transcription endpoints
-class TranscriptionResponse(BaseModel):
-    text: str
-
-
-@app.post("/api/transcribe")
-async def transcribe_audio(
-    file: UploadFile = File(...),
+@app.put(
+    "/api/projects/{project_id}/config",
+    response_model=ProjectConfigResponse,
+    tags=["projects"],
+)
+def save_project_config(
+    project_id: str,
+    payload: ProjectConfigSavePayload,
     _: str = Depends(verify_token),
-    client: TranscriptionClient = Depends(get_transcription_client),
-) -> TranscriptionResponse:
-    """Transcribe an uploaded audio file."""
-    if not file:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided")
+    service: ProjectConfigService = Depends(get_project_config_service),
+) -> ProjectConfigResponse:
+    """Validate and atomically commit both documents as one revisioned pair."""
+    return _config_response(
+        service.save(
+            project_id,
+            payload.aflow_toml,
+            payload.workflows_toml,
+            payload.expected_revision,
+            caller_scope="rest",
+        )
+    )
 
-    temp_file = None
+
+@app.post(
+    "/api/projects/{project_id}/config/validate",
+    response_model=ConfigValidationModel,
+    tags=["projects"],
+)
+def validate_project_config(
+    project_id: str,
+    payload: ProjectConfigValidatePayload,
+    _: str = Depends(verify_token),
+    service: ProjectConfigService = Depends(get_project_config_service),
+) -> ConfigValidationModel:
+    """Validate a candidate pair through the production loader without saving."""
+    return _config_validation_response(
+        service.validate_candidate(project_id, payload.aflow_toml, payload.workflows_toml)
+    )
+
+
+# Browser session endpoints. Login exchanges the deployment bearer for a
+# signed HttpOnly cookie; logout always clears it. No-store on all of them.
+@app.post("/api/session")
+def login_session(
+    request: Request,
+    response: Response,
+    verified_token: str = Depends(verify_token),
+) -> dict[str, bool]:
+    """Verify a bearer login credential and start a rolling browser session.
+
+    The cookie is signed with the exact token value that authenticated the
+    submitted bearer, so a rotation concurrent with login can only issue a
+    session for the submitted epoch, which the rotation itself invalidates.
+    """
+    if request.headers.get("authorization") is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "unauthorized"},
+        )
+    if not _same_origin(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "origin_required"},
+        )
+    response.headers["Cache-Control"] = "no-store"
+    _set_session_cookie(response, encode_session(verified_token), SESSION_MAX_AGE_SECONDS)
+    return {"authenticated": True}
+
+
+@app.get("/api/session")
+def session_status(
+    response: Response,
+    _: str = Depends(verify_token),
+) -> dict[str, bool]:
+    """Report an authenticated header bearer or browser session."""
+    response.headers["Cache-Control"] = "no-store"
+    return {"authenticated": True}
+
+
+@app.delete("/api/session", status_code=status.HTTP_204_NO_CONTENT)
+def logout_session(request: Request, response: Response) -> None:
+    """Expire the browser session cookie; idempotent for absent sessions."""
+    if not _same_origin(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "origin_required"},
+        )
+    response.headers["Cache-Control"] = "no-store"
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+
+
+_BRANCH_PROBE_TIMEOUT_SECONDS = 15.0
+
+
+def _probe_main_branch(root: Path) -> GuidedStarterDefaults:
+    """Read the registered root's current branch with a bounded Git probe."""
+    branch: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_path = Path(temp_file.name)
-
-        text = await client.transcribe(temp_path)
-        return TranscriptionResponse(text=text)
-
-    except TranscriptionError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-    finally:
-        if temp_file:
+        completed = subprocess.run(
+            ("git", "-C", str(root), "symbolic-ref", "--short", "HEAD"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_BRANCH_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    if completed is not None and completed.returncode == 0:
+        candidate = completed.stdout.strip()
+        if candidate and not candidate.startswith("-"):
             try:
-                Path(temp_file.name).unlink(missing_ok=True)
-            except Exception:
-                pass
+                # Advertise a probed branch only when starter rendering would
+                # accept it; otherwise fall back to the labeled default.
+                branch = validate_starter_main_branch(candidate)
+            except ConfigError:
+                branch = None
+    if branch is None:
+        return GuidedStarterDefaults(
+            workflow="implement",
+            main_branch="main",
+            main_branch_source="fallback",
+        )
+    return GuidedStarterDefaults(
+        workflow="implement", main_branch=branch, main_branch_source="git_head"
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/config/form",
+    response_model=ProjectConfigFormResponse,
+    tags=["projects"],
+)
+def project_config_form(
+    project_id: str,
+    payload: ProjectConfigFormPayload,
+    _: str = Depends(verify_token),
+    registry: ProjectRegistry = Depends(get_project_registry),
+) -> ProjectConfigFormResponse:
+    """Transform a candidate pair through the pure guided form; never saves.
+
+    The endpoint accepts no ``expected_revision`` and performs no registered
+    project write or reload.  The only registry use is resolving the registered
+    root for a bounded Git branch probe when starter defaults are requested.
+    """
+    starter_defaults: GuidedStarterDefaults | None = None
+    wants_starter = (
+        payload.action is None or isinstance(payload.action, BuildStarterAction)
+    ) and payload.aflow_toml == "" and payload.workflows_toml == ""
+    if wants_starter:
+        if registry.get(project_id) is None:
+            raise ProjectNotAllowedError("project is not registered")
+        try:
+            _, root = registry.resolve(project_id)
+        except ProjectRegistryError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "project_root_unavailable"},
+            ) from exc
+        starter_defaults = _probe_main_branch(root)
+    result = guided_form_response(
+        payload.aflow_toml, payload.workflows_toml, payload.action
+    )
+    response = ProjectConfigFormResponse.model_validate(result)
+    if starter_defaults is not None:
+        response = response.model_copy(update={"starter_defaults": starter_defaults})
+    return response
 
 
 # Health check (no auth required)

@@ -474,8 +474,9 @@ Levels:
 - **Lite** — receives semantic results, plan snapshots, structured state,
   controller/routing counters, compact history, and bounded diagnostics.
   Never plan prose, prompts, or raw trace bodies.
-- **Full** — Lite context plus the complete active-plan Markdown. Chosen
-  directly after: consecutive unchanged executions of the same step
+- **Full** — The same live schema-v3 reference-only context as Lite, with
+  richer bounded scope and rejection evidence when available. Chosen directly
+  after: consecutive unchanged executions of the same step
   (≥ `full_after_stalled_turns`), the second reviewer rejection within one
   open original-checkpoint scope, explicit stop markers, invalid plans,
   ambiguous failures, illegal transitions, same-step cap, max-turns, merge

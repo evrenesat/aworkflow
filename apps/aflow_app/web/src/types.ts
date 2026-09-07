@@ -1,145 +1,213 @@
+export type ProjectReadiness = 'ready' | 'configuration_required' | 'blocked'
+
 export interface ProjectInfo {
   id: string
   display_name: string
   current_path: string
-  historical_aliases: string[]
-  detection_source: string
-  linked_session_count: number
   is_git_root: boolean
   registered_at: string
-  name?: string
-  path?: string
-  aliases?: string[]
+  readiness: ProjectReadiness
 }
 
-export interface PlanInfo {
+export interface ProjectCreateRequest {
+  mode: 'create' | 'register'
+  path: string
+  display_name?: string | null
+  main_branch?: string
+  initial_workflow?: string | null
+  initial_team?: string | null
+  initialize_git?: boolean
+  initialize_config?: boolean
+}
+
+export interface ProjectCreateResult {
+  id: string
+  display_name: string
+  relative_root: string
+  root: string
+  created_at: string
+  readiness: ProjectReadiness
+}
+
+export interface ProjectDiscoveryCandidate {
+  relative_path: string
+  display_name: string
+  registered_project_id: string | null
+  addable: boolean
+  add_blocker: string | null
+}
+
+export interface ProjectDiscovery {
+  schema_version: number
+  managed_root: string
+  candidates: ProjectDiscoveryCandidate[]
+  visited_entries: number
+  skipped_unreadable: number
+  truncated: boolean
+  limits: {
+    max_visited_entries: number
+    max_candidates: number
+  }
+}
+
+export interface ConfigValidationIssue {
+  document: string | null
+  line: number | null
+  message: string
+}
+
+export interface ConfigValidation {
+  state: 'ready' | 'configuration_required' | 'invalid'
+  issues: ConfigValidationIssue[]
+  placeholders: string[]
+  workflows: string[]
+  teams: string[]
+  roles: string[]
+}
+
+export interface ProjectConfig {
+  project_id: string
+  revision: string
+  documents: string[]
+  aflow_toml: string
+  workflows_toml: string
+  validation: ConfigValidation
+}
+
+export interface ProjectConfigSaveRequest {
+  aflow_toml: string
+  workflows_toml: string
+  expected_revision: string
+}
+
+export interface ProjectConfigValidateRequest {
+  aflow_toml: string
+  workflows_toml: string
+}
+
+export interface ConfigBlockedRun {
+  run_id: string
+  status: string
+}
+
+/** Guided-config contract mirroring the server's pure form endpoint. */
+export interface GuidedProfileSummary {
+  model: string | null
+  effort: string | null
+}
+
+export interface GuidedWorkflowStepSummaries {
+  declared_steps: string[]
+  first_step: string | null
+  executable_steps: string[] | null
+  first_executable_step: string | null
+  /** Exact declared role per materialized executable step; null when unavailable. */
+  step_roles?: Record<string, string> | null
+}
+
+export interface GuidedFormProjection {
+  default_workflow: string | null
+  max_turns: number | null
+  harnesses: Record<string, Record<string, GuidedProfileSummary>>
+  roles: Record<string, string>
+  teams: Record<string, { roles: Record<string, string> }>
+  workflow_default_teams: Record<string, string | null>
+  workflows: Record<string, GuidedWorkflowStepSummaries>
+}
+
+export interface GuidedConfiguredChoices {
+  harnesses: string[]
+  profiles: Record<string, string[]>
+  selectors: string[]
+  roles: string[]
+  teams: string[]
+  workflows: string[]
+}
+
+export interface GuidedHarnessSuggestion {
+  name: string
+  supports_effort: boolean
+  custom_model_supported: boolean
+}
+
+export interface GuidedProfileSuggestion {
+  harness: string
+  profile: string
+  model: string | null
+  effort: string | null
+}
+
+export interface GuidedSuggestions {
+  label: string
+  harnesses: GuidedHarnessSuggestion[]
+  profiles: GuidedProfileSuggestion[]
+  note: string
+}
+
+export interface GuidedStarterDefaults {
+  workflow: string
+  team: null
+  main_branch: string
+  main_branch_source: 'git_head' | 'fallback'
+}
+
+export type GuidedConfigAction =
+  | { type: 'build_starter'; workflow: string; main_branch: string; team?: string | null }
+  | { type: 'set_default_workflow'; value: string }
+  | { type: 'set_max_turns'; value: number | null }
+  | { type: 'upsert_profile'; harness: string; profile: string; model?: string | null; effort?: string | null }
+  | { type: 'set_global_role'; role: string; selector: string }
+  | { type: 'add_team'; team: string }
+  | { type: 'set_team_role'; team: string; role: string; selector: string }
+  | { type: 'set_workflow_default_team'; workflow: string; team: string | null }
+
+export interface ProjectConfigFormRequest {
+  aflow_toml: string
+  workflows_toml: string
+  action?: GuidedConfigAction | null
+}
+
+export interface ProjectConfigFormResponse {
+  aflow_toml: string
+  workflows_toml: string
+  changed: boolean
+  validation: ConfigValidation
+  form: GuidedFormProjection | null
+  syntax_issues: ConfigValidationIssue[]
+  choices: GuidedConfiguredChoices
+  suggestions: GuidedSuggestions
+  starter_defaults: GuidedStarterDefaults | null
+}
+
+export type PlanStatus = 'todo' | 'in_progress' | 'done'
+
+export interface PlanDocument {
+  project_id: string
   name: string
   path: string
-  status: 'draft' | 'in_progress'
-  checkpoint_count: number
-  unchecked_count: number
-  is_complete: boolean
-}
-
-export type ProviderState = 'starting' | 'ready' | 'degraded' | 'unavailable' | 'disabled'
-export type SessionStatus = 'idle' | 'running' | 'waiting_for_approval' | 'failed' | 'archived' | 'unknown'
-export type TurnStatus = 'pending' | 'running' | 'waiting_for_approval' | 'completed' | 'failed' | 'interrupted'
-export type AttachmentKind = 'file' | 'image'
-
-export interface PlanningError {
-  code: string
-  message: string
-  provider_id: string | null
-  retryable: boolean
-}
-
-export interface ProviderCapabilities {
-  models: string[]
-  reasoning_levels: string[]
-  reasoning_summaries: string[]
-  attachments: boolean
-  attachment_kinds: AttachmentKind[]
-  output_schema: boolean
-  fork: boolean
-  archive: boolean
-  approvals: boolean
-  interruption: boolean
-  compaction: boolean
-  rollback: boolean
-}
-
-export interface ProviderReadiness {
-  provider_id: string
-  display_name: string
-  state: ProviderState
-  capabilities: ProviderCapabilities
-  error: PlanningError | null
-}
-
-export interface SessionKey {
-  provider_id: string
-  provider_session_id: string
-}
-
-export interface TurnItem {
-  type?: string
-  [key: string]: unknown
-}
-
-export interface PlanningTurn {
-  turn_id: string
-  status: TurnStatus
-  items: TurnItem[]
-  error: PlanningError | null
-  created_at: string | null
-  completed_at: string | null
-  attachment_ids: string[]
-}
-
-export interface PlanningSession {
-  key: SessionKey
-  project_id: string | null
-  cwd: string
-  title: string | null
-  preview: string
-  status: SessionStatus
-  model: string | null
-  reasoning_level: string | null
-  archived: boolean
-  created_at: string | null
-  updated_at: string | null
-  turns: PlanningTurn[]
-}
-
-export interface PlanningSessionPage {
-  sessions: PlanningSession[]
-  providers: ProviderReadiness[]
-  next_cursor: string | null
-}
-
-export interface ProviderModels {
-  provider_id: string
-  models: string[]
-}
-
-export interface ReasoningOptions {
-  provider_id: string
-  reasoning_levels: string[]
-  reasoning_summaries: string[]
-}
-
-export interface Attachment {
-  attachment_id: string
-  filename: string
-  kind: AttachmentKind
-  media_type: string | null
+  status: PlanStatus
+  revision: string
   size_bytes: number
-  created_at: string | null
-}
-
-export interface PendingApproval {
-  approval_id: string
-  key: SessionKey
-  turn_id: string
-  kind: 'command' | 'file_change'
-  reason: string | null
-}
-
-export interface StartTurnRequest {
-  text: string
-  attachment_ids?: string[]
-  model?: string
-  reasoning_level?: string
-  reasoning_summary?: string
+  content?: string
 }
 
 /** Versioned REST views returned by the daemon-backed control plane. */
+export interface WorkflowCapability {
+  declared_steps: string[]
+  executable_steps: string[]
+  excluded_steps: string[]
+  first_step: string | null
+  default_team: string | null
+}
+
 export interface ControlPlaneCapabilities {
   schema_version: number
   workflows: string[]
   teams: string[]
   roles: string[]
   controls: string[]
+  workflow_details: Record<string, WorkflowCapability>
+  admitted_role_selectors: Record<string, string[]>
   context_levels: Array<'lite' | 'full'>
   team_upgrade_chains: Record<string, string[]>
   control_safety: Record<string, 'safe' | 'restart_required'>
@@ -171,6 +239,9 @@ export interface RunStatus {
   current_step: string | null
   turns_completed: number | null
   max_turns: number | null
+  selected_start_step: string | null
+  skipped_steps: string[]
+  restarted_from_run_id: string | null
   evidence: Record<string, unknown>
 }
 
@@ -223,6 +294,17 @@ export interface StartRunResult {
   schema_version: number
   manifest_path: string | null
   reason: string | null
+  restarted_from_run_id: string | null
+}
+
+export interface StartRunRequest {
+  plan_path: string
+  workflow_name?: string
+  team?: string
+  start_step?: string
+  max_turns?: number
+  extra_instructions?: string[]
+  restarted_from_run_id?: string
 }
 
 export interface StartRunResponse {

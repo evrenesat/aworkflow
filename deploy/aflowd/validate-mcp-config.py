@@ -30,16 +30,17 @@ def validate(path: Path) -> None:
         raise ValueError("MCP URL is required")
     parsed = urlsplit(url)
     if (
-        parsed.scheme != "http"
-        or parsed.hostname != "100.103.69.9"
-        or parsed.port != 8765
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or not parsed.hostname.endswith(".ts.net")
+        or parsed.port is not None
         or parsed.path != "/mcp"
         or parsed.query
         or parsed.fragment
         or parsed.username
         or parsed.password
     ):
-        raise ValueError("MCP URL must be the credential-free Tailscale /mcp endpoint")
+        raise ValueError("MCP URL must be a credential-free MagicDNS HTTPS /mcp endpoint")
     if server.get("required") is not False:
         raise ValueError("MCP server must remain optional")
     if not isinstance(server.get("bearer_token_env_var"), str) or not server["bearer_token_env_var"]:

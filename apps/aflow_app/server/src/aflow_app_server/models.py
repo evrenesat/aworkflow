@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
-from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,141 +17,6 @@ from aflow.control_plane import (
 )
 
 
-class PlanStatus(str, Enum):
-    """Status of a plan file."""
-
-    DRAFT = "draft"
-    IN_PROGRESS = "in_progress"
-
-
-@dataclass
-class RepoInfo:
-    """Information about a registered repository."""
-
-    id: str
-    name: str
-    path: Path
-    is_git_root: bool
-    registered_at: datetime
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "path": str(self.path),
-            "is_git_root": self.is_git_root,
-            "registered_at": self.registered_at.isoformat(),
-        }
-
-
-@dataclass(frozen=True)
-class ProjectInfo:
-    """Information about a discovered project."""
-
-    id: str
-    display_name: str
-    current_path: Path
-    historical_aliases: tuple[Path, ...]
-    detection_source: str
-    linked_session_count: int
-    is_git_root: bool
-    registered_at: datetime
-
-    @property
-    def name(self) -> str:
-        """Backward-compatible alias for the display name."""
-        return self.display_name
-
-    @property
-    def path(self) -> Path:
-        """Backward-compatible alias for the current path."""
-        return self.current_path
-
-    def to_dict(self) -> dict[str, Any]:
-        aliases = [str(alias) for alias in self.historical_aliases]
-        payload = {
-            "id": self.id,
-            "display_name": self.display_name,
-            "current_path": str(self.current_path),
-            "historical_aliases": aliases,
-            "detection_source": self.detection_source,
-            "linked_session_count": self.linked_session_count,
-            "is_git_root": self.is_git_root,
-            "registered_at": self.registered_at.isoformat(),
-        }
-        payload.update(
-            {
-                "name": self.display_name,
-                "path": str(self.current_path),
-                "aliases": aliases,
-            }
-        )
-        return payload
-
-
-@dataclass
-class PlanInfo:
-    """Information about a plan file."""
-
-    name: str
-    path: Path
-    status: PlanStatus
-    checkpoint_count: int
-    unchecked_count: int
-    is_complete: bool
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "path": str(self.path),
-            "status": self.status.value,
-            "checkpoint_count": self.checkpoint_count,
-            "unchecked_count": self.unchecked_count,
-            "is_complete": self.is_complete,
-        }
-
-
-@dataclass
-class ExecutionRequest:
-    """Request to start a workflow execution."""
-
-    project_id: str
-    plan_path: str
-    workflow_name: str | None = None
-    team: str | None = None
-    start_step: str | None = None
-    max_turns: int | None = None
-    extra_instructions: str | None = None
-
-
-@dataclass
-class ExecutionStatus:
-    """Status of a workflow execution."""
-
-    run_id: str
-    project_id: str
-    plan_path: str
-    workflow_name: str | None
-    status: str
-    turns_completed: int
-    current_step: str | None
-    started_at: datetime
-    error: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "project_id": self.project_id,
-            "plan_path": self.plan_path,
-            "workflow_name": self.workflow_name,
-            "status": self.status,
-            "turns_completed": self.turns_completed,
-            "current_step": self.current_step,
-            "started_at": self.started_at.isoformat(),
-            "error": self.error,
-        }
-
-
 class CanonicalTransportModel(BaseModel):
     """Strict Pydantic view of a versioned control-plane value."""
 
@@ -166,12 +27,23 @@ class CanonicalTransportModel(BaseModel):
         return cls.model_validate(value.to_dict())
 
 
+class WorkflowCapabilityResponse(CanonicalTransportModel):
+    declared_steps: tuple[str, ...]
+    executable_steps: tuple[str, ...]
+    excluded_steps: tuple[str, ...]
+    first_step: str | None = None
+    default_team: str | None = None
+
+
 class CapabilityResponse(CanonicalTransportModel):
     schema_version: int
     workflows: tuple[str, ...]
     teams: tuple[str, ...]
     roles: tuple[str, ...]
     controls: tuple[str, ...]
+    workflow_details: Mapping[str, WorkflowCapabilityResponse]
+    admitted_role_selectors: Mapping[str, tuple[str, ...]]
+    status_values: tuple[str, ...]
     context_levels: tuple[Literal["lite", "full"], ...]
     team_upgrade_chains: Mapping[str, tuple[str, ...]]
     control_safety: Mapping[str, Literal["safe", "restart_required"]]
@@ -192,6 +64,9 @@ class RunStatusResponse(CanonicalTransportModel):
     current_step: str | None = None
     turns_completed: int | None = None
     max_turns: int | None = None
+    selected_start_step: str | None = None
+    skipped_steps: tuple[str, ...] = ()
+    restarted_from_run_id: str | None = None
     evidence: Mapping[str, Any]
 
 
@@ -202,6 +77,7 @@ class StartRunResponse(CanonicalTransportModel):
     schema_version: int
     manifest_path: str | None = None
     reason: str | None = None
+    restarted_from_run_id: str | None = None
 
 
 class StartupQuestionResponse(CanonicalTransportModel):
@@ -275,6 +151,7 @@ class GlobalCapabilitiesResponse(CanonicalTransportModel):
 class ReadinessResponse(CanonicalTransportModel):
     ready: bool
     projects: tuple[str, ...]
+    project_errors: Mapping[str, str] = Field(default_factory=dict)
 
 
 class PlanResponse(CanonicalTransportModel):
@@ -300,6 +177,8 @@ class StartRunPayload(CanonicalTransportModel):
     team: str | None = Field(default=None, max_length=128)
     start_step: str | None = Field(default=None, max_length=128)
     max_turns: int | None = Field(default=None, ge=1)
+    extra_instructions: tuple[str, ...] = Field(default=(), max_length=8)
+    restarted_from_run_id: str | None = Field(default=None, max_length=64)
 
 
 class StartupAnswerPayload(CanonicalTransportModel):
@@ -308,6 +187,216 @@ class StartupAnswerPayload(CanonicalTransportModel):
 
 class OwnerStopPayload(CanonicalTransportModel):
     expected_revision: int = Field(ge=0)
+
+
+class ConfigValidationIssueModel(CanonicalTransportModel):
+    document: str | None = None
+    line: int | None = None
+    message: str
+
+
+class ConfigValidationModel(CanonicalTransportModel):
+    state: Literal["ready", "configuration_required", "invalid"]
+    issues: tuple[ConfigValidationIssueModel, ...]
+    placeholders: tuple[str, ...]
+    workflows: tuple[str, ...]
+    teams: tuple[str, ...]
+    roles: tuple[str, ...]
+
+
+class ProjectConfigResponse(CanonicalTransportModel):
+    project_id: str
+    revision: str
+    documents: tuple[str, ...]
+    aflow_toml: str
+    workflows_toml: str
+    validation: ConfigValidationModel
+
+
+class ProjectConfigSavePayload(CanonicalTransportModel):
+    aflow_toml: str
+    workflows_toml: str
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ProjectConfigValidatePayload(CanonicalTransportModel):
+    aflow_toml: str
+    workflows_toml: str
+
+
+class GuidedActionBase(CanonicalTransportModel):
+    """Base for the closed, discriminated guided-config action set."""
+
+    type: str
+
+
+class BuildStarterAction(GuidedActionBase):
+    type: Literal["build_starter"]
+    workflow: str = Field(min_length=1, max_length=64)
+    main_branch: str = Field(min_length=1, max_length=128)
+    team: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class SetDefaultWorkflowAction(GuidedActionBase):
+    type: Literal["set_default_workflow"]
+    value: str = Field(min_length=1, max_length=64)
+
+
+class SetMaxTurnsAction(GuidedActionBase):
+    type: Literal["set_max_turns"]
+    value: int | None = Field(default=None, ge=1)
+
+
+class UpsertProfileAction(GuidedActionBase):
+    type: Literal["upsert_profile"]
+    harness: str = Field(min_length=1, max_length=64)
+    profile: str = Field(min_length=1, max_length=64)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    effort: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class SetGlobalRoleAction(GuidedActionBase):
+    type: Literal["set_global_role"]
+    role: str = Field(min_length=1, max_length=64)
+    selector: str = Field(min_length=1, max_length=192)
+
+
+class AddTeamAction(GuidedActionBase):
+    type: Literal["add_team"]
+    team: str = Field(min_length=1, max_length=64)
+
+
+class SetTeamRoleAction(GuidedActionBase):
+    type: Literal["set_team_role"]
+    team: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1, max_length=64)
+    selector: str = Field(min_length=1, max_length=192)
+
+
+class SetWorkflowDefaultTeamAction(GuidedActionBase):
+    type: Literal["set_workflow_default_team"]
+    workflow: str = Field(min_length=1, max_length=64)
+    team: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+GuidedConfigAction = Annotated[
+    BuildStarterAction
+    | SetDefaultWorkflowAction
+    | SetMaxTurnsAction
+    | UpsertProfileAction
+    | SetGlobalRoleAction
+    | AddTeamAction
+    | SetTeamRoleAction
+    | SetWorkflowDefaultTeamAction,
+    Field(discriminator="type"),
+]
+
+
+class ProjectConfigFormPayload(CanonicalTransportModel):
+    """Strict form request: candidate pair plus zero or one typed action.
+
+    No ``expected_revision`` is accepted; the existing ``PUT /config`` remains
+    the only save boundary.
+    """
+
+    aflow_toml: str
+    workflows_toml: str
+    action: GuidedConfigAction | None = None
+
+
+class GuidedProfileSummary(CanonicalTransportModel):
+    model: str | None = None
+    effort: str | None = None
+
+
+class GuidedWorkflowStepSummaries(CanonicalTransportModel):
+    declared_steps: tuple[str, ...]
+    first_step: str | None = None
+    executable_steps: tuple[str, ...] | None = None
+    first_executable_step: str | None = None
+    # Exact declared role per materialized executable step; None when the
+    # production loader could not materialize the workflow.
+    step_roles: Mapping[str, str] | None = None
+
+
+class GuidedTeamSummary(CanonicalTransportModel):
+    roles: Mapping[str, str]
+
+
+class GuidedFormProjection(CanonicalTransportModel):
+    default_workflow: str | None = None
+    max_turns: int | None = None
+    harnesses: Mapping[str, Mapping[str, GuidedProfileSummary]]
+    roles: Mapping[str, str]
+    teams: Mapping[str, GuidedTeamSummary]
+    workflow_default_teams: Mapping[str, str | None]
+    workflows: Mapping[str, GuidedWorkflowStepSummaries]
+
+
+class GuidedConfiguredChoices(CanonicalTransportModel):
+    harnesses: tuple[str, ...]
+    profiles: Mapping[str, tuple[str, ...]]
+    selectors: tuple[str, ...]
+    roles: tuple[str, ...]
+    teams: tuple[str, ...]
+    workflows: tuple[str, ...]
+
+
+class GuidedHarnessSuggestion(CanonicalTransportModel):
+    name: str
+    supports_effort: bool
+    custom_model_supported: bool
+
+
+class GuidedProfileSuggestion(CanonicalTransportModel):
+    harness: str
+    profile: str
+    model: str | None = None
+    effort: str | None = None
+
+
+class GuidedSuggestions(CanonicalTransportModel):
+    label: str = "suggestion"
+    harnesses: tuple[GuidedHarnessSuggestion, ...]
+    profiles: tuple[GuidedProfileSuggestion, ...]
+    note: str
+
+
+class GuidedStarterDefaults(CanonicalTransportModel):
+    workflow: str
+    team: None = None
+    main_branch: str
+    main_branch_source: Literal["git_head", "fallback"]
+
+
+class ProjectConfigFormResponse(CanonicalTransportModel):
+    aflow_toml: str
+    workflows_toml: str
+    changed: bool
+    validation: ConfigValidationModel
+    form: GuidedFormProjection | None
+    syntax_issues: tuple[ConfigValidationIssueModel, ...]
+    choices: GuidedConfiguredChoices
+    suggestions: GuidedSuggestions
+    starter_defaults: GuidedStarterDefaults | None = None
+
+
+class ProjectDiscoveryCandidateModel(CanonicalTransportModel):
+    relative_path: str
+    display_name: str
+    registered_project_id: str | None = None
+    addable: bool
+    add_blocker: str | None = None
+
+
+class ProjectDiscoveryResponse(CanonicalTransportModel):
+    schema_version: int
+    managed_root: str
+    candidates: tuple[ProjectDiscoveryCandidateModel, ...]
+    visited_entries: int
+    skipped_unreadable: int
+    truncated: bool
+    limits: Mapping[str, int]
 
 
 def canonical_contract_payloads() -> dict[str, dict[str, Any]]:

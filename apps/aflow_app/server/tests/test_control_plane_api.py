@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 from pathlib import Path
+import subprocess
 from threading import Thread
 import time
 from types import SimpleNamespace
@@ -17,9 +18,9 @@ from fastapi.testclient import TestClient
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
 from aflow.control_plane import CapabilitySet, ContextBundle, RunControlRequest, RunStatus, StartRunResult
 from aflow.control_plane.persistence import append_run_event
-from aflow.control_plane.units import InMemoryUnitManager
+from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import AflowDaemon
-from aflow_app_server.config import ControlPlaneProjectConfig, ServerConfig
+from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.main import app
 from aflow_app_server.models import (
@@ -30,7 +31,12 @@ from aflow_app_server.models import (
     StartRunResponse,
     canonical_contract_payloads,
 )
-from aflow_app_server.project_catalog import ProjectCatalog
+from aflow_app_server.project_registry import (
+    ProjectRegistry,
+    ProjectRegistryError,
+)
+from aflow_app_server.project_config_service import ProjectConfigService
+from aflow_app_server.plan_service import PlanService
 
 
 TOKEN = "control-plane-test-token"
@@ -103,13 +109,14 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     root = tmp_path / "project"
     root.mkdir()
-    (root / ".git").mkdir()
+    subprocess.run(("git", "init", "-q", str(root)), check=True)
     plan = root / "plans" / "todo" / "test-plan.md"
     plan.parent.mkdir(parents=True)
     plan.write_text("# Test\n\n### [ ] Checkpoint 1: Test\n- [ ] step\n")
     second_plan = root / "plans" / "todo" / "second-plan.md"
     second_plan.write_text("# Second\n\n### [ ] Checkpoint 1: Test\n- [ ] step\n")
-    config_path = root / "aflow.toml"
+    config_path = root / ".aflow" / "config" / "aflow.toml"
+    config_path.parent.mkdir(parents=True)
     _write_workflow_config(config_path)
     environment_file = root / "aflowd.env"
     environment_file.write_text("AFLOWD_MODE=test\n")
@@ -119,16 +126,13 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     executable.chmod(0o755)
     units = InMemoryUnitManager()
 
-    project = ControlPlaneProjectConfig(
-        id=PROJECT_ID,
-        root=root,
-        config_path=config_path,
+    registry = ProjectRegistry(tmp_path, tmp_path / "registry.json")
+    registry.register(PROJECT_ID, "Test project", "project")
+    control_service = ControlPlaneService(
+        registry,
         aflow_executable=executable,
         environment_file=environment_file,
         release_identity="test-release",
-    )
-    control_service = ControlPlaneService(
-        (project,),
         daemon_factory=lambda config: AflowDaemon(config, units=units),
     )
     control_service.start()
@@ -136,35 +140,31 @@ def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         bind_host="127.0.0.1",
         bind_port=8765,
         auth_token=TOKEN,
-        repo_registry_path=tmp_path / "repos.json",
-        codex_app_server_url=None,
-        codex_app_server_token=None,
-        transcription_url=None,
-        transcription_token=None,
-        projects_home=tmp_path / "code",
-        project_overrides_path=tmp_path / "projects.json",
-        attachment_root=tmp_path / "attachments",
-        control_plane_projects=(project,),
+        managed_projects_root=tmp_path,
+        project_registry_path=registry.path,
+        aflow_executable=executable,
+        environment_file=environment_file,
+        release_identity="test-release",
     )
     main._config = config
-    main._project_catalog = ProjectCatalog(
-        config.projects_home,
-        config.project_overrides_path,
-        legacy_registry_path=config.repo_registry_path,
-    )
+    main._project_registry = registry
+    main._plan_service = PlanService(registry)
     main._control_plane_service = control_service
-    main._service = None
-    main._planning_service = None
+    main._project_config_service = ProjectConfigService(
+        registry,
+        control_service,
+        audit_path=tmp_path / "config_audit.jsonl",
+    )
     client = TestClient(app)
     client.headers["Authorization"] = f"Bearer {TOKEN}"
     try:
         yield client, root, units, monkeypatch
     finally:
         main._config = None
-        main._project_catalog = None
+        main._project_registry = None
+        main._plan_service = None
         main._control_plane_service = None
-        main._service = None
-        main._planning_service = None
+        main._project_config_service = None
 
 
 def _prepared(request) -> PreparedRun:
@@ -175,8 +175,8 @@ def _prepared(request) -> PreparedRun:
         config_path=request.config_path,
         max_turns=request.max_turns or 15,
         team=request.team,
-        extra_instructions=(),
-        start_step=request.start_step or "implement",
+        extra_instructions=request.extra_instructions,
+        start_step=("implement" if request.start_step in {None, "1"} else request.start_step),
     )
 
 
@@ -211,6 +211,129 @@ def _answer_pending(
     )
     assert response.status_code == 200
     return response.json()
+
+
+def test_unregister_refuses_to_invalidate_daemon_with_active_unit(control_client) -> None:
+    from aflow_app_server import main
+
+    client, _, _, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    _answer_pending(client, pending, monkeypatch)
+    service = main._control_plane_service
+    assert service is not None
+
+    with pytest.raises(ProjectRegistryError, match="active workflow unit"):
+        service.unregister(PROJECT_ID)
+
+    assert service.projects()[0].project_id == PROJECT_ID
+
+
+def _fresh_control_service(root: Path, units: InMemoryUnitManager) -> ControlPlaneService:
+    from aflow_app_server import main
+
+    config = main._config
+    assert config is not None
+    registry = ProjectRegistry(config.managed_projects_root, config.project_registry_path)
+    service = ControlPlaneService(
+        registry,
+        aflow_executable=config.aflow_executable,
+        environment_file=config.environment_file,
+        release_identity=config.release_identity,
+        daemon_factory=lambda daemon_config: AflowDaemon(daemon_config, units=units),
+    )
+    service.start()
+    assert service._projects == {}
+    assert registry.resolve(PROJECT_ID)[1] == root.resolve()
+    return service
+
+
+def test_unregister_uncached_project_still_observes_active_exact_unit(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    result = started["result"]
+    assert isinstance(result, dict)
+    run_id = str(result["run_id"])
+    assert units.get(f"aflow-run-{run_id}.service").is_active  # type: ignore[union-attr]
+    fresh = _fresh_control_service(root, units)
+
+    with pytest.raises(ProjectRegistryError, match="active workflow unit"):
+        fresh.unregister(PROJECT_ID)
+
+    assert fresh.projects()[0].project_id == PROJECT_ID
+
+
+def test_unregister_uncached_inactive_project_removes_only_requested_state(control_client) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    result = started["result"]
+    assert isinstance(result, dict)
+    run_id = str(result["run_id"])
+    unit_name = f"aflow-run-{run_id}.service"
+    units.units[unit_name] = UnitState(
+        name=unit_name,
+        active_state="inactive",
+        sub_state="dead",
+        result="success",
+    )
+    config = main._config
+    assert config is not None
+    second = root.parent / "second-project"
+    subprocess.run(("git", "init", "-q", str(second)), check=True)
+    second_config = second / ".aflow" / "config" / "aflow.toml"
+    second_config.parent.mkdir(parents=True)
+    _write_workflow_config(second_config)
+    registry = ProjectRegistry(config.managed_projects_root, config.project_registry_path)
+    registry.register("second-project", "Second project", "second-project")
+    fresh = _fresh_control_service(root, units)
+    assert fresh.capabilities("second-project").workflows == ("managed",)
+
+    assert fresh.unregister(PROJECT_ID) is True
+    assert [project.project_id for project in fresh.projects()] == ["second-project"]
+    assert set(fresh._projects) == {"second-project"}
+
+
+def test_registry_project_editor_shape_renames_but_never_moves_root(control_client) -> None:
+    from aflow_app_server import main
+
+    client, root, _, _ = control_client
+    config = main._config
+    assert config is not None
+    registry_path = config.project_registry_path
+    before = json.loads(registry_path.read_text())
+
+    renamed = client.patch(
+        f"/api/projects/{PROJECT_ID}",
+        json={"display_name": "Renamed project", "current_path": str(root.resolve())},
+    )
+
+    assert renamed.status_code == 200
+    assert renamed.json()["display_name"] == "Renamed project"
+    assert renamed.json()["current_path"] == str(root.resolve())
+    after_rename = json.loads(registry_path.read_text())
+    assert after_rename["projects"][0]["relative_root"] == "project"
+    assert after_rename["projects"][0]["updated_at"] != before["projects"][0]["updated_at"]
+
+    stable_bytes = registry_path.read_bytes()
+    rejected = client.patch(
+        f"/api/projects/{PROJECT_ID}",
+        json={"display_name": "Must not persist", "current_path": str(root.parent / "other")},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": {"code": "operation_rejected"}}
+    assert registry_path.read_bytes() == stable_bytes
+
+    alias_rejected = client.patch(
+        f"/api/projects/{PROJECT_ID}",
+        json={"alias": str(root)},
+    )
+    assert alias_rejected.status_code == 422
+    assert alias_rejected.json() == {"detail": {"code": "operation_rejected"}}
+    assert registry_path.read_bytes() == stable_bytes
 
 
 def test_transport_models_match_canonical_control_plane_models() -> None:
@@ -266,7 +389,11 @@ def test_deprecated_execution_routes_are_not_registered() -> None:
 def test_control_plane_reads_pending_start_and_idempotency(control_client) -> None:
     client, _, units, monkeypatch = control_client
     assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/ready").json() == {"ready": True, "projects": [PROJECT_ID]}
+    assert client.get("/ready").json() == {
+        "ready": True,
+        "projects": [PROJECT_ID],
+        "project_errors": {},
+    }
     assert client.get("/api/control-plane/projects").json()["projects"][0]["project_id"] == PROJECT_ID
     assert client.get("/api/control-plane/capabilities").status_code == 200
     assert client.get(f"/api/control-plane/projects/{PROJECT_ID}/plans").status_code == 200
@@ -454,3 +581,545 @@ def test_control_plane_rejects_unknown_projects_and_plan_traversal(control_clien
     )
     assert rejected.status_code == 422
     assert rejected.json() == {"detail": {"code": "operation_rejected"}}
+
+
+def test_project_config_read_validate_save_and_stale_revision(control_client, tmp_path: Path) -> None:
+    from aflow.config import bootstrap_project_config
+
+    client, root, _, _ = control_client
+    config_dir = root / ".aflow" / "config"
+    aflow_text = (config_dir / "aflow.toml").read_text(encoding="utf-8")
+    workflows_text = (config_dir / "workflows.toml").read_text(encoding="utf-8")
+
+    unauthorized = client.get(
+        f"/api/projects/{PROJECT_ID}/config",
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert unauthorized.status_code == 401
+    assert unauthorized.json() == {"detail": {"code": "unauthorized"}}
+
+    read = client.get(f"/api/projects/{PROJECT_ID}/config")
+    assert read.status_code == 200
+    body = read.json()
+    assert body["project_id"] == PROJECT_ID
+    assert body["documents"] == ["aflow.toml", "workflows.toml"]
+    assert body["aflow_toml"] == aflow_text
+    assert body["workflows_toml"] == workflows_text
+    assert body["validation"]["state"] == "ready"
+    assert body["validation"]["workflows"] == ["managed"]
+    revision = body["revision"]
+
+    starter = tmp_path / "starter-scratch"
+    starter.mkdir()
+    bootstrap_project_config(starter / "aflow.toml")
+    placeholder = client.post(
+        f"/api/projects/{PROJECT_ID}/config/validate",
+        json={
+            "aflow_toml": (starter / "aflow.toml").read_text(encoding="utf-8"),
+            "workflows_toml": (starter / "workflows.toml").read_text(encoding="utf-8"),
+        },
+    )
+    assert placeholder.status_code == 200
+    assert placeholder.json()["state"] == "configuration_required"
+    assert "harness.starter.profiles.default.model" in placeholder.json()["placeholders"]
+
+    updated_aflow = aflow_text.replace('model = "test"', 'model = "test-2"')
+    saved = client.put(
+        f"/api/projects/{PROJECT_ID}/config",
+        json={
+            "aflow_toml": updated_aflow,
+            "workflows_toml": workflows_text,
+            "expected_revision": revision,
+        },
+    )
+    assert saved.status_code == 200
+    saved_body = saved.json()
+    assert saved_body["revision"] != revision
+    assert saved_body["validation"]["state"] == "ready"
+    assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == updated_aflow
+
+    stale = client.put(
+        f"/api/projects/{PROJECT_ID}/config",
+        json={
+            "aflow_toml": updated_aflow.replace('model = "test-2"', 'model = "test-3"'),
+            "workflows_toml": workflows_text,
+            "expected_revision": revision,
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "revision_conflict"
+    assert stale.json()["detail"]["current_revision"] == saved_body["revision"]
+    assert (config_dir / "aflow.toml").read_text(encoding="utf-8") == updated_aflow
+
+    malformed = client.put(
+        f"/api/projects/{PROJECT_ID}/config",
+        json={
+            "aflow_toml": updated_aflow,
+            "workflows_toml": workflows_text,
+            "expected_revision": "not-a-revision",
+        },
+    )
+    assert malformed.status_code == 422
+
+    broken_workflows = workflows_text.replace('role = "worker"', 'role = "ghost"')
+    invalid = client.put(
+        f"/api/projects/{PROJECT_ID}/config",
+        json={
+            "aflow_toml": updated_aflow,
+            "workflows_toml": broken_workflows,
+            "expected_revision": saved_body["revision"],
+        },
+    )
+    assert invalid.status_code == 422
+    assert invalid.json() == {"detail": {"code": "operation_rejected"}}
+    assert (config_dir / "workflows.toml").read_text(encoding="utf-8") == workflows_text
+
+    reread = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    assert reread["revision"] == saved_body["revision"]
+    assert reread["aflow_toml"] == updated_aflow
+
+
+def test_project_config_save_blocked_while_run_active_then_allowed_after_stop(
+    control_client,
+) -> None:
+    client, _, _, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    result = started["result"]
+    assert isinstance(result, dict)
+    run_id = result["run_id"]
+
+    before = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    updated_aflow = before["aflow_toml"].replace('model = "test"', 'model = "blocked"')
+    blocked = client.put(
+        f"/api/projects/{PROJECT_ID}/config",
+        json={
+            "aflow_toml": updated_aflow,
+            "workflows_toml": before["workflows_toml"],
+            "expected_revision": before["revision"],
+        },
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "config_save_blocked"
+    blocking_runs = blocked.json()["detail"]["blocking_runs"]
+    assert [entry["run_id"] for entry in blocking_runs] == [run_id]
+    assert blocking_runs[0]["status"] in {"running", "unit_started"}
+    assert (client.get(f"/api/projects/{PROJECT_ID}/config").json()["revision"]) == before["revision"]
+
+    stopped = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/owner-stop",
+        headers={"Idempotency-Key": "stop-config"},
+        json={"expected_revision": 0},
+    )
+    assert stopped.status_code == 200
+
+    saved = client.put(
+        f"/api/projects/{PROJECT_ID}/config",
+        json={
+            "aflow_toml": updated_aflow,
+            "workflows_toml": before["workflows_toml"],
+            "expected_revision": before["revision"],
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["revision"] != before["revision"]
+    assert saved.json()["validation"]["state"] == "ready"
+
+
+def test_rest_typed_successor_start_exposes_lineage_and_keeps_instruction_text_transient(
+    control_client,
+) -> None:
+    client, root, units, monkeypatch = control_client
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    source_response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "rest-source"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "start_step": "1",
+            "max_turns": 2,
+        },
+    )
+    assert source_response.status_code == 201
+    source_id = source_response.json()["result"]["run_id"]
+    stopped = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/owner-stop",
+        headers={"Idempotency-Key": "rest-source-stop"},
+        json={"expected_revision": 0},
+    )
+    assert stopped.status_code == 200
+
+    sentinel = "private-rest-guidance-91ac"
+    successor_response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "rest-successor"},
+        json={
+            "plan_path": "plans/todo/second-plan.md",
+            "workflow_name": "managed",
+            "start_step": "1",
+            "max_turns": 3,
+            "extra_instructions": [sentinel],
+            "restarted_from_run_id": source_id,
+        },
+    )
+
+    assert successor_response.status_code == 201
+    successor = successor_response.json()["result"]
+    assert successor["run_id"] != source_id
+    assert successor["restarted_from_run_id"] == source_id
+    status = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{successor['run_id']}"
+    )
+    assert status.status_code == 200
+    assert status.json()["selected_start_step"] == "implement"
+    assert status.json()["restarted_from_run_id"] == source_id
+    assert units.start_calls[-1][1][-1] == f"--extra-instruction={sentinel}"
+    durable = [
+        root / ".aflow" / "launches" / f"{successor['run_id']}.json",
+        root / ".aflow" / "start-requests" / f"{successor['run_id']}.json",
+        root / ".aflow" / "runs" / successor["run_id"] / "events.jsonl",
+    ]
+    assert all(sentinel not in path.read_text() for path in durable)
+    source_events = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/events"
+    )
+    assert source_events.status_code == 200
+    assert any(
+        event["event_type"] == "restart_successor_requested"
+        and event["data"]["successor_run_id"] == successor["run_id"]
+        for event in source_events.json()["events"]
+    )
+
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "unknown_launch_option": True,
+        },
+    )
+    assert rejected.status_code == 422
+
+
+def test_project_config_form_is_pure_authenticated_and_action_bounded(
+    control_client,
+) -> None:
+    from aflow.config import render_starter_documents
+
+    client, root, _, _ = control_client
+    config_dir = root / ".aflow" / "config"
+    before = (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    )
+
+    unauthenticated = TestClient(app).post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "", "workflows_toml": ""},
+    )
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json() == {"detail": {"code": "unauthorized"}}
+
+    read = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    aflow_text = read["aflow_toml"]
+    workflows_text = read["workflows_toml"]
+
+    noop = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": aflow_text, "workflows_toml": workflows_text},
+    )
+    assert noop.status_code == 200
+    body = noop.json()
+    assert body["changed"] is False
+    assert body["aflow_toml"] == aflow_text
+    assert body["form"]["default_workflow"] == "managed"
+    assert body["starter_defaults"] is None
+
+    updated = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "set_max_turns", "value": 9},
+        },
+    )
+    assert updated.status_code == 200
+    updated_body = updated.json()
+    assert updated_body["changed"] is True
+    assert "max_turns = 9" in updated_body["aflow_toml"]
+    assert updated_body["validation"]["state"] == "ready"
+
+    rejected = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "set_default_workflow", "value": "ghost"},
+        },
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "guided_config_rejected"
+    assert rejected.json()["detail"]["reason"] == "unknown_workflow"
+
+    unknown_action = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "delete_profile", "harness": "codex"},
+        },
+    )
+    assert unknown_action.status_code == 422
+
+    unknown_field = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {"type": "set_max_turns", "value": 5, "force": True},
+        },
+    )
+    assert unknown_field.status_code == 422
+
+    revision_field = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "expected_revision": read["revision"],
+        },
+    )
+    assert revision_field.status_code == 422
+
+    syntax = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "[aflow\n", "workflows_toml": workflows_text},
+    )
+    assert syntax.status_code == 200
+    assert syntax.json()["changed"] is False
+    assert syntax.json()["form"] is None
+    assert syntax.json()["syntax_issues"][0]["document"] == "aflow.toml"
+
+    assert (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    ) == before
+
+
+def test_project_config_form_build_starter_from_empty_pair(control_client) -> None:
+    from aflow.config import render_starter_documents
+
+    client, root, _, _ = control_client
+    probe = subprocess.run(
+        ("git", "-C", str(root), "symbolic-ref", "--short", "HEAD"),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    empty = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "", "workflows_toml": ""},
+    )
+    assert empty.status_code == 200
+    assert empty.json()["starter_defaults"]["main_branch"] == probe
+    assert empty.json()["starter_defaults"]["workflow"] == "implement"
+
+    built = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": "",
+            "workflows_toml": "",
+            "action": {
+                "type": "build_starter",
+                "workflow": "implement",
+                "main_branch": probe,
+            },
+        },
+    )
+    assert built.status_code == 200
+    expected_aflow, expected_workflows = render_starter_documents(
+        "implement", None, probe
+    )
+    assert built.json()["aflow_toml"] == expected_aflow
+    assert built.json()["workflows_toml"] == expected_workflows
+    assert built.json()["validation"]["state"] == "configuration_required"
+    assert built.json()["starter_defaults"]["main_branch_source"] == "git_head"
+
+    nonempty = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": "[aflow]\n",
+            "workflows_toml": "",
+            "action": {
+                "type": "build_starter",
+                "workflow": "implement",
+                "main_branch": "main",
+            },
+        },
+    )
+    assert nonempty.status_code == 422
+    assert (
+        nonempty.json()["detail"]["reason"] == "build_starter_requires_empty_pair"
+    )
+
+    # Nothing was written or reloaded: the committed pair is untouched.
+    reread = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    assert reread["aflow_toml"] != expected_aflow
+
+
+def test_project_config_form_rejects_zcode_model_with_explanation(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    read = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+
+    rejected = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": read["aflow_toml"],
+            "workflows_toml": read["workflows_toml"],
+            "action": {
+                "type": "upsert_profile",
+                "harness": "zcode",
+                "profile": "p",
+                "model": "gpt",
+            },
+        },
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "guided_config_rejected"
+    assert rejected.json()["detail"]["reason"] == "zcode_managed_by_zcode"
+    assert "ZCode" in rejected.json()["detail"]["message"]
+
+
+def test_project_config_form_dotted_profiles_and_bounded_rejections(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    config_dir = root / ".aflow" / "config"
+    before = (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    )
+    read = client.get(f"/api/projects/{PROJECT_ID}/config").json()
+    aflow_text = read["aflow_toml"]
+    workflows_text = read["workflows_toml"]
+
+    created = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": aflow_text,
+            "workflows_toml": workflows_text,
+            "action": {
+                "type": "upsert_profile",
+                "harness": "opencode",
+                "profile": "glm-5.3",
+                "model": "glm-5.3",
+            },
+        },
+    )
+    assert created.status_code == 200
+    created_body = created.json()
+    assert created_body["form"]["harnesses"]["opencode"]["glm-5.3"]["model"] == (
+        "glm-5.3"
+    )
+
+    assigned = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": created_body["aflow_toml"],
+            "workflows_toml": workflows_text,
+            "action": {
+                "type": "set_global_role",
+                "role": "worker",
+                "selector": "opencode.glm-5.3",
+            },
+        },
+    )
+    assert assigned.status_code == 200
+    assert 'worker = "opencode.glm-5.3"' in assigned.json()["aflow_toml"]
+    assert "opencode.glm-5.3" in assigned.json()["choices"]["selectors"]
+
+    bounded_cases = [
+        # Starter-invalid input must stay a bounded 422, never HTTP 500.
+        {
+            "type": "set_default_workflow",
+            "value": "bad name!",
+        },
+        # Reserved role and unknown global role are rejected before mutation.
+        {
+            "type": "set_global_role",
+            "role": "prompts",
+            "selector": "codex.test",
+        },
+        {
+            "type": "set_team_role",
+            "team": "ghost-team",
+            "role": "ghost-role",
+            "selector": "codex.test",
+        },
+        # Supplied ZCode model/effort, explicit null included, is rejected.
+        {"type": "upsert_profile", "harness": "zcode", "profile": "p", "model": None},
+    ]
+    expected_reasons = [
+        "invalid_action_value",
+        "reserved_role",
+        "unknown_role",
+        "zcode_managed_by_zcode",
+    ]
+    for action, reason in zip(bounded_cases, expected_reasons, strict=True):
+        rejected = client.post(
+            f"/api/projects/{PROJECT_ID}/config/form",
+            json={
+                "aflow_toml": aflow_text,
+                "workflows_toml": workflows_text,
+                "action": action,
+            },
+        )
+        assert rejected.status_code == 422, action
+        assert rejected.json()["detail"]["code"] == "guided_config_rejected"
+        assert rejected.json()["detail"]["reason"] == reason
+
+    # Rejections never wrote or reloaded the registered project.
+    assert (
+        (config_dir / "aflow.toml").read_bytes(),
+        (config_dir / "workflows.toml").read_bytes(),
+    ) == before
+
+
+def test_project_config_form_branch_probe_falls_back_for_renderer_incompatible_branch(
+    control_client,
+) -> None:
+    client, root, _, _ = control_client
+    subprocess.run(
+        ("git", "-C", str(root), "checkout", "-q", "-b", "feature/foo+bar"),
+        check=True,
+    )
+
+    empty = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={"aflow_toml": "", "workflows_toml": ""},
+    )
+    assert empty.status_code == 200
+    assert empty.json()["starter_defaults"] == {
+        "workflow": "implement",
+        "team": None,
+        "main_branch": "main",
+        "main_branch_source": "fallback",
+    }
+
+    built = client.post(
+        f"/api/projects/{PROJECT_ID}/config/form",
+        json={
+            "aflow_toml": "",
+            "workflows_toml": "",
+            "action": {
+                "type": "build_starter",
+                "workflow": "implement",
+                "main_branch": "main",
+            },
+        },
+    )
+    assert built.status_code == 200
+    assert built.json()["changed"] is True

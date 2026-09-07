@@ -1,0 +1,12 @@
+[Unit]
+Description=AFlow validated-main deployment poll
+Documentation=file:/opt/aflowd/current/src/deploy/aflowd/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /opt/aflowd/current/src/deploy/aflowd/continuous-deploy.py
+TimeoutStartSec=75min

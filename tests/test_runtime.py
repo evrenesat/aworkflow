@@ -21,6 +21,7 @@ from aflow.run_state import (
     PendingManagerNotes,
     PendingRepartitionV1,
     PendingTeamOverride,
+    ResumeContext,
     load_override_request,
     manager_resume_fields,
     resolve_resume_override,
@@ -2410,6 +2411,97 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert second_backup == backup_dir / 'plan_v03.md'
             assert sorted(child.name for child in backup_dir.iterdir()) == ['plan.md', 'plan_v02.md', 'plan_v03.md']
 
+    def test_followup_plan_backup_skips_original_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Plan\n', encoding='utf-8')
+
+            result = _backup_active_followup_plan(repo_root, original, original)
+
+            assert result is None
+            assert not (repo_root / 'plans' / 'backups').exists()
+
+    def test_followup_plan_backup_skips_missing_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+
+            result = _backup_active_followup_plan(repo_root, original, followup)
+
+            assert result is None
+            assert not (repo_root / 'plans' / 'backups').exists()
+
+    def test_followup_plan_backup_copies_nonoriginal_active_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Original plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+            followup_text = '# Generated follow-up\n'
+            followup.write_text(followup_text, encoding='utf-8')
+
+            backup_path = _backup_active_followup_plan(repo_root, original, followup)
+
+            expected = repo_root / 'plans' / 'backups' / 'plan-cp01-v01.md'
+            assert backup_path == expected
+            assert expected.read_text(encoding='utf-8') == followup_text
+            assert followup.is_file()
+            assert [child.name for child in expected.parent.iterdir()] == ['plan-cp01-v01.md']
+
+    def test_followup_plan_backup_dedupes_identical_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Original plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+            followup.write_text('# Generated follow-up\n', encoding='utf-8')
+            backup_dir = repo_root / 'plans' / 'backups'
+
+            first = _backup_active_followup_plan(repo_root, original, followup)
+            second = _backup_active_followup_plan(repo_root, original, followup)
+
+            assert first == backup_dir / 'plan-cp01-v01.md'
+            assert second == first
+            assert [child.name for child in backup_dir.iterdir()] == ['plan-cp01-v01.md']
+
+    def test_followup_plan_backup_versions_changed_content_and_preserves_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            original = root / 'plan.md'
+            original.write_text('# Original plan\n', encoding='utf-8')
+            followup = root / 'plan-cp01-v01.md'
+            followup.write_text('first follow-up version\n', encoding='utf-8')
+            backup_dir = repo_root / 'plans' / 'backups'
+            backup_dir.mkdir(parents=True)
+            (backup_dir / 'operator-notes.txt').write_text('unrelated\n', encoding='utf-8')
+
+            first_backup = _backup_active_followup_plan(repo_root, original, followup)
+            assert first_backup == backup_dir / 'plan-cp01-v01.md'
+
+            followup.write_text('second follow-up version\n', encoding='utf-8')
+            second_backup = _backup_active_followup_plan(repo_root, original, followup)
+            assert second_backup == backup_dir / 'plan-cp01-v01_v02.md'
+
+            assert (backup_dir / 'plan-cp01-v01.md').read_text(encoding='utf-8') == 'first follow-up version\n'
+            assert (backup_dir / 'plan-cp01-v01_v02.md').read_text(encoding='utf-8') == 'second follow-up version\n'
+            assert (backup_dir / 'operator-notes.txt').read_text(encoding='utf-8') == 'unrelated\n'
+            assert sorted(child.name for child in backup_dir.iterdir()) == [
+                'operator-notes.txt', 'plan-cp01-v01.md', 'plan-cp01-v01_v02.md',
+            ]
+
     def test_condition_parsing_simple_symbols(self) -> None:
         assert evaluate_condition('DONE', done=True, new_plan_exists=False, max_turns_reached=False)
         assert not evaluate_condition('DONE', done=False, new_plan_exists=False, max_turns_reached=False)
@@ -2700,6 +2792,109 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 str(plan_path),
                 str((repo_root / 'plan-fix-cp01-v01.md').resolve()),
             ]
+
+    def test_followup_plan_backup_exists_before_harness_and_dedupes_across_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            config_dir = repo_root
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+            followup_path = repo_root / 'plan-fix-cp01-v01.md'
+            followup_text = '# Generated follow-up\n'
+            backup_dir = repo_root / 'plans' / 'backups'
+            turn_counter = [0]
+
+            def capturing_runner(argv, **kwargs):
+                turn_counter[0] += 1
+                if turn_counter[0] == 1:
+                    followup_path.write_text(followup_text, encoding='utf-8')
+                elif turn_counter[0] == 2:
+                    followup_backup = backup_dir / 'plan-fix-cp01-v01.md'
+                    assert followup_backup.is_file()
+                    assert followup_backup.read_text(encoding='utf-8') == followup_text
+                else:
+                    assert sorted(child.name for child in backup_dir.iterdir()) == [
+                        'plan-fix-cp01-v01.md', 'plan.md',
+                    ]
+                    _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
+                return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
+
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})},
+                workflows={'loop': WorkflowConfig(
+                    steps={
+                        'review': WorkflowStepConfig(
+                            role='architect',
+                            prompts=('review_prompt',),
+                            go=(GoTransition(to='followup', when='NEW_PLAN_EXISTS'), GoTransition(to='END')),
+                        ),
+                        'followup': WorkflowStepConfig(
+                            role='architect',
+                            prompts=('followup_prompt',),
+                            go=(GoTransition(to='followup', when='!DONE', preserve_active_plan=True), GoTransition(to='END')),
+                        ),
+                    },
+                    first_step='review',
+                )},
+                prompts={
+                    'review_prompt': 'Review. Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.',
+                    'followup_prompt': 'Follow up. Active: {ACTIVE_PLAN_PATH}.',
+                },
+            )
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                wf_config,
+                'loop',
+                config_dir=config_dir,
+                adapter=CodexAdapter(),
+                runner=capturing_runner,
+            )
+
+            assert result.turns_completed == 3
+            assert sorted(child.name for child in backup_dir.iterdir()) == [
+                'plan-fix-cp01-v01.md', 'plan.md',
+            ]
+            assert followup_path.is_file()
+
+    def test_original_active_plan_turns_do_not_add_followup_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            config_dir = repo_root
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+            backup_dir = repo_root / 'plans' / 'backups'
+
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            wf_config = WorkflowUserConfig(
+                roles={'architect': 'codex.default'},
+                harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})},
+                workflows={'simple': WorkflowConfig(
+                    steps={'implement_plan': WorkflowStepConfig(
+                        role='architect',
+                        prompts=('p',),
+                        go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')),
+                    )},
+                    first_step='implement_plan',
+                )},
+                prompts={'p': 'Work.'},
+            )
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                wf_config,
+                'simple',
+                config_dir=config_dir,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.turns_completed == 1
+            assert [child.name for child in backup_dir.iterdir()] == ['plan.md']
 
     def test_workflow_multistep_review_and_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5345,6 +5540,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert len(run_dirs_numeric) == 1
             run_json_numeric = json.loads((run_dirs_numeric[0] / 'run.json').read_text(encoding='utf-8'))
             selected_step_numeric = run_json_numeric['selected_start_step']
+            numeric_events = [
+                json.loads(line)['event_type']
+                for line in (run_dirs_numeric[0] / 'events.jsonl').read_text(encoding='utf-8').splitlines()
+            ]
+            assert 'launch_requested' in numeric_events
+            assert 'steps_skipped' in numeric_events
 
             # Clean up runs directory
             import shutil
@@ -6255,6 +6456,261 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 )
             assert 'main' in str(ctx.value)
             assert 'other' in str(ctx.value)
+
+    def _run_current_branch_continuation_fixture(
+        self,
+        *,
+        move_primary_before_merge: bool = False,
+        fail_invocation: bool = False,
+    ) -> tuple[object, Path, str]:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        root = Path(tmpdir.name)
+        _make_lifecycle_git_repo(root, branch="main")
+        subprocess.run(
+            ["git", "config", "core.excludesFile", "/dev/null"],
+            cwd=str(root),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", "accepted"],
+            cwd=str(root),
+            check=True,
+            capture_output=True,
+        )
+        plan_path = root / "plans" / "in-progress" / "continuation.md"
+        plan_path.parent.mkdir(parents=True)
+        accepted_before_plan = _run_git_in_test(
+            ["rev-parse", "HEAD"], cwd=root
+        )[1]
+        tick = chr(96)
+        plan_path.write_text(
+            textwrap.dedent(
+                f"""\
+                # Plan
+
+                ## Git Tracking
+
+                - Plan Branch: {tick}accepted{tick}
+                - Pre-Handoff Base HEAD: {tick}{accepted_before_plan}{tick}
+
+                ### [x] Checkpoint 1: Done
+                - [x] step one
+
+                ### [ ] Checkpoint 2: Next
+                - [ ] step two
+                """
+            ),
+            encoding="utf-8",
+        )
+        _git_commit_file(root, plan_path)
+        accepted_head = _run_git_in_test(["rev-parse", "HEAD"], cwd=root)[1]
+        plan_path.write_text(
+            plan_path.read_text(encoding="utf-8").replace(
+                accepted_before_plan, accepted_head
+            ),
+            encoding="utf-8",
+        )
+        if move_primary_before_merge:
+            subprocess.run(
+                ["git", "branch", "other"],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+            )
+        main_head = _run_git_in_test(["rev-parse", "main"], cwd=root)[1]
+        workflow_config = _make_worktree_wf_config(
+            main_branch="main",
+            worktree_root=str(root.parent / f"worktrees-{root.name}"),
+        )
+        relative_plan = plan_path.relative_to(root)
+
+        def runner(argv, **kwargs):
+            if fail_invocation:
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "planned continuation failure"
+                )
+            execution_root = Path(kwargs["cwd"])
+            execution_plan = execution_root / relative_plan
+            execution_plan.write_text(
+                execution_plan.read_text(encoding="utf-8")
+                .replace("### [ ] Checkpoint 2: Next", "### [x] Checkpoint 2: Next")
+                .replace("- [ ] step two", "- [x] step two"),
+                encoding="utf-8",
+            )
+            _git_commit_file(execution_root, execution_plan)
+            if move_primary_before_merge:
+                subprocess.run(
+                    ["git", "checkout", "--", str(relative_plan)],
+                    cwd=str(root),
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "checkout", "other"],
+                    cwd=str(root),
+                    check=True,
+                    capture_output=True,
+                )
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        result = run_workflow(
+            ControllerConfig(
+                repo_root=root,
+                plan_path=plan_path,
+                max_turns=1,
+                continuation_from_branch="accepted",
+                continuation_from_head=accepted_head,
+                continuation_mode="current_branch",
+            ),
+            workflow_config,
+            "wt_wf",
+            config_dir=root,
+            adapter=CodexAdapter(),
+            runner=runner,
+        )
+        return result, root, main_head
+
+    def test_current_branch_continuation_merges_to_accepted_branch(self) -> None:
+        result, root, main_head = self._run_current_branch_continuation_fixture()
+        payload = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload["main_branch"] == "accepted"
+        assert payload["continuation_from_branch"] == "accepted"
+        assert payload["continuation_mode"] == "current_branch"
+        assert payload["frozen_config"]["continuation_from_head"] == (
+            payload["continuation_from_head"]
+        )
+        assert _run_git_in_test(["rev-parse", "main"], cwd=root)[1] == main_head
+        assert _run_git_in_test(["symbolic-ref", "--short", "HEAD"], cwd=root)[1] == "accepted"
+
+    def test_current_branch_continuation_rejects_primary_branch_movement(self) -> None:
+        with pytest.raises(WorkflowError, match="primary checkout"):
+            self._run_current_branch_continuation_fixture(
+                move_primary_before_merge=True,
+            )
+
+    def _continuation_resume_context_from_run(
+        self,
+        repo_root: Path,
+        run_dir: Path,
+        workflow_steps: Mapping[str, object],
+    ) -> tuple[ResumeContext, Path]:
+        """Rebuild one resume context through the real current-schema loaders."""
+        from aflow.cli import (
+            _decode_frozen_run_identity,
+            _reconstruct_resume_context,
+            _resume_plan_path,
+        )
+
+        prev_run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        resolved_run_id = Path(run_dir.name)
+        frozen_run_identity = _decode_frozen_run_identity(prev_run, resolved_run_id)
+        plan_path = _resume_plan_path(prev_run, repo_root)
+        assert plan_path is not None
+        resume_context = _reconstruct_resume_context(
+            resolved_run_id=resolved_run_id,
+            run_dir=run_dir,
+            prev_run=prev_run,
+            plan_path=plan_path,
+            frozen_run_identity=frozen_run_identity,
+            reset_scope=False,
+            require_resume=True,
+            workflow_steps=workflow_steps,
+        )
+        assert resume_context is not None
+        return resume_context, plan_path
+
+    def test_current_branch_continuation_identity_survives_two_resumes(self) -> None:
+        with pytest.raises(WorkflowError) as first_error:
+            self._run_current_branch_continuation_fixture(fail_invocation=True)
+        run_a_dir = first_error.value.run_dir
+        assert run_a_dir is not None
+        payload_a = json.loads((run_a_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload_a["continuation_from_branch"] == "accepted"
+        assert payload_a["continuation_mode"] == "current_branch"
+        accepted_head = payload_a["continuation_from_head"]
+        root = Path(payload_a["repo_root"])
+        workflow_config = _make_worktree_wf_config(
+            main_branch="main",
+            worktree_root=str(root.parent / f"worktrees-{root.name}"),
+        )
+        steps = workflow_config.workflows["wt_wf"].steps
+
+        def failing_runner(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 1, "", "planned continuation failure"
+            )
+
+        def completing_runner(argv, **kwargs):
+            execution_root = Path(kwargs["cwd"])
+            execution_plan = execution_root / "plans" / "in-progress" / "continuation.md"
+            execution_plan.write_text(
+                execution_plan.read_text(encoding="utf-8")
+                .replace("### [ ] Checkpoint 2: Next", "### [x] Checkpoint 2: Next")
+                .replace("- [ ] step two", "- [x] step two"),
+                encoding="utf-8",
+            )
+            _git_commit_file(execution_root, execution_plan)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        resume_a, plan_path_a = self._continuation_resume_context_from_run(
+            root, run_a_dir, steps
+        )
+        assert resume_a.continuation_from_branch == "accepted"
+        assert resume_a.continuation_from_head == accepted_head
+        assert resume_a.continuation_mode == "current_branch"
+
+        with pytest.raises(WorkflowError) as second_error:
+            run_workflow(
+                ControllerConfig(
+                    repo_root=root,
+                    plan_path=plan_path_a,
+                    max_turns=1,
+                ),
+                workflow_config,
+                "wt_wf",
+                config_dir=root,
+                adapter=CodexAdapter(),
+                runner=failing_runner,
+                resume=resume_a,
+            )
+        run_b_dir = second_error.value.run_dir
+        assert run_b_dir is not None
+        payload_b = json.loads((run_b_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload_b["resumed_from_run_id"] == run_a_dir.name
+        assert payload_b["continuation_from_branch"] == "accepted"
+        assert payload_b["continuation_from_head"] == accepted_head
+        assert payload_b["continuation_mode"] == "current_branch"
+        assert payload_b["frozen_config"]["continuation_from_head"] == accepted_head
+
+        resume_b, plan_path_b = self._continuation_resume_context_from_run(
+            root, run_b_dir, steps
+        )
+        assert resume_b.continuation_from_branch == "accepted"
+        assert resume_b.continuation_from_head == accepted_head
+        assert resume_b.continuation_mode == "current_branch"
+
+        result_c = run_workflow(
+            ControllerConfig(
+                repo_root=root,
+                plan_path=plan_path_b,
+                max_turns=1,
+            ),
+            workflow_config,
+            "wt_wf",
+            config_dir=root,
+            adapter=CodexAdapter(),
+            runner=completing_runner,
+            resume=resume_b,
+        )
+        payload_c = json.loads((result_c.run_dir / "run.json").read_text(encoding="utf-8"))
+        assert payload_c["resumed_from_run_id"] == run_b_dir.name
+        assert payload_c["continuation_from_branch"] == "accepted"
+        assert payload_c["continuation_from_head"] == accepted_head
+        assert payload_c["continuation_mode"] == "current_branch"
+        assert payload_c["frozen_config"]["continuation_from_head"] == accepted_head
+        assert payload_c["status"] == "completed"
 
     def test_preflight_fails_when_main_branch_does_not_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -11791,7 +12247,9 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert lite_result['status'] == 'invalid'
             assert "action 'stop' is not eligible" in lite_result['error']
             assert lite_result['finalized_turn_number'] == 1
-            assert lite_context['controller_state']['eligible_actions'] == ['continue']
+            assert lite_context['controller_state']['eligible_actions'] == [
+                'continue', 'escalate_to_full',
+            ]
             assert full_result['level'] == 'full'
             assert full_result['trigger'] == 'lite_invalid'
             assert full_result['status'] == 'accepted'
@@ -12983,8 +13441,12 @@ class LifecycleBootstrapTests(unittest.TestCase):
             full_context = json.loads((
                 run_dir / "manager" / "decision-002" / "context.json"
             ).read_text(encoding="utf-8"))
+            lite_context = json.loads((
+                run_dir / "manager" / "decision-001" / "context.json"
+            ).read_text(encoding="utf-8"))
             assert lite_result["status"] == "accepted"
             assert lite_result["action"] == "escalate_to_full"
+            assert "escalate_to_full" in lite_context["controller_state"]["eligible_actions"]
             assert full_result["level"] == "full"
             assert full_result["trigger"] == "lite_escalation"
             assert full_result["status"] == "accepted"
@@ -12997,6 +13459,79 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert run_json["status"] == "failed"
             assert run_json["failure_reason"] == report
             assert failed_events[0].failure_reason == report  # type: ignore[attr-defined]
+
+    def test_manager_context_failure_writes_one_invalid_decision_without_provider(
+        self,
+    ) -> None:
+        from aflow.manager import ManagerInlineContextLimitError
+        from aflow.manager_context import build_manager_context as actual_build_context
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            build_calls = 0
+            provider_models: list[str] = []
+            failure = (
+                "manager inline context exceeds the 32768-byte hard limit: "
+                "total_bytes=32769; schema_version=3 level=5"
+            )
+
+            def fail_after_selection(*args, **kwargs):
+                nonlocal build_calls
+                build_calls += 1
+                if build_calls == 1:
+                    return actual_build_context(*args, **kwargs)
+                raise ManagerInlineContextLimitError(failure)
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                provider_models.append(model)
+                assert model == "worker", "manager provider launched after prelaunch failure"
+                _write_plan(plan_path, _COMPLETE_PLAN + "\nEVIDENCE-BODY\n")
+                return subprocess.CompletedProcess(argv, 0, "work complete", "")
+
+            with patch(
+                "aflow.workflow.build_manager_context",
+                side_effect=fail_after_selection,
+            ):
+                with pytest.raises(WorkflowError) as raised:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                        ),
+                        _clean_end_manager_workflow_config(),
+                        "managed",
+                        config_dir=repo_root,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+            assert provider_models == ["worker"]
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            result_paths = sorted(
+                (run_dir / "manager").glob("decision-*/result.json")
+            )
+            assert len(result_paths) == 1
+            result = json.loads(result_paths[0].read_text(encoding="utf-8"))
+            assert result["status"] == "invalid"
+            assert result["error"] == failure
+            stored_context = json.loads(
+                result_paths[0].with_name("context.json").read_text(encoding="utf-8")
+            )
+            serialized = json.dumps(stored_context, sort_keys=True)
+            assert "32769" not in serialized
+            decision_dir = result_paths[0].parent
+            decision_artifacts = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in decision_dir.iterdir()
+                if path.is_file()
+            )
+            assert "EVIDENCE-BODY" not in decision_artifacts
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            assert run_json["status"] == "failed"
+            assert failure in run_json["failure_reason"]
 
     def test_manager_non_end_lite_stop_emits_report_then_stops_banner_before_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

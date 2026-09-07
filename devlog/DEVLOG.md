@@ -1,3 +1,32 @@
+# 2026-09-05 — Accepted-branch continuation
+
+- Added explicit `--continue-from-current` startup validation for symbolic
+  branch identity, exact Git Tracking Plan Branch and Pre-Handoff Base HEAD,
+  and partially completed plans.
+- Reused the normal nested lifecycle with the validated branch as the effective
+  main branch, persisting continuation identity in `run.json` and frozen state.
+- Preserved strict schema-v2 resume validation and kept continuation out of
+  historical run lookup.
+
+# 2026-09-05 — Follow-up plan backups before harness turns
+
+- Added `_backup_active_followup_plan` in `workflow.py` and called it in the
+  turn loop right after harness preflight on both the normal and the
+  inconsistent-checkpoint retry paths, so a reviewer-created non-original
+  active plan is copied into `plans/backups/` before the harness runs and
+  before any approval cleanup can delete the in-progress copy.
+- Reused the startup original-plan backup core (`_backup_plan_copy`) so
+  follow-up backups share the same content-aware, collision-safe naming:
+  identical content deduplicates to the existing copy and changed content
+  gains a `_vNN` version without touching unrelated backup files.
+- Original active plans never take the per-turn path (their startup backup is
+  unchanged), the active plan is copied rather than moved, and prompt path
+  substitution is untouched. A missing active plan skips the backup; backup
+  I/O failures fail the turn pre-harness instead of losing the evidence.
+- Covered the behavior with helper unit tests and two run-level tests: the
+  backup exists at harness entry and dedupes across follow-up turns, and an
+  original-plan-only run adds no follow-up backups.
+
 # 2026-08-31 — Supported harness profile refresh
 
 - Restricted the packaged AFlow configuration to the seven actively supported

@@ -137,6 +137,64 @@ class ManagerCallOutcome:
     context: dict[str, object]
     error: str | None
     correction_consumed: bool = False
+    prelaunch_failure: bool = False
+
+
+def _manager_prelaunch_failure_context(
+    *,
+    run_id: str,
+    decision_number: int,
+    level: str,
+    trigger: str,
+    boundary: FinalizedTurnBoundary,
+    metadata: Mapping[str, object],
+    workspace_state: Mapping[str, object],
+) -> dict[str, object]:
+    """Return a safe minimal context when provider input could not be built."""
+    schema_version = (
+        MANAGER_CONTEXT_SCHEMA_VERSION_V3
+        if boundary.context_schema_version >= 4
+        else boundary.context_schema_version
+    )
+    return {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "decision_number": decision_number,
+        "level": level,
+        "trigger": trigger,
+        "finished_turn": {
+            "turn_number": boundary.finalized_turn_number,
+            "status": "manager-prelaunch-failure",
+            "error": "manager context was unavailable before provider launch",
+            "raw_artifacts": [],
+        },
+        "run_extract": [],
+        "plan_state": {
+            "original_plan_path": metadata.get("original_plan_path"),
+            "active_plan_path": metadata.get("active_plan_path"),
+            "current_checkpoint": None,
+        },
+        "controller_state": {
+            "terminal": boundary.terminal,
+            "proposed_action": boundary.proposed_action,
+            "proposed_next_step": boundary.proposed_transition,
+            "baseline_team": boundary.baseline_team,
+            "eligible_actions": list(boundary.eligible_actions),
+            "workspace_state": dict(workspace_state),
+            "lite_evidence": "manager context was unavailable before provider launch",
+        },
+        "evidence": {
+            "available": False,
+            "reason": "manager context was unavailable before provider launch",
+        },
+        "plan_content_disclosure": {
+            "active_plan": "unavailable",
+            "original_plan": "unavailable",
+            "checkpoint": "unavailable",
+        },
+        "manager_prelaunch_failure": True,
+    }
+
 
 def _manager_repo_fingerprint(
     execution_repo_root: Path,
@@ -251,31 +309,66 @@ class _ManagerCallExecutor:
                 "merge_state": "managed" if self.execution_context is not None and "merge" in self.execution_context.teardown else "none",
             },
         }
-        context = build_manager_context(
-            context_run_dir or self.run_paths.run_dir,
-            level=level,  # type: ignore[arg-type]
-            trigger=boundary.trigger,
-            decision_number=decision_number,
-            run_metadata=metadata,
-            boundary=boundary_payload,
-            active_plan_content=captured_active_plan,
-            capture_evidence=True,
-        )
-        if boundary.context_schema_version >= 3:
-            controller_state = context.get("controller_state")
-            if isinstance(controller_state, dict):
-                controller_state["checkpoint_repartitions"] = list(
-                    boundary.repartition_history
-                )
-        boundary_payload["captured_plan_state"] = context["plan_state"]
         eligible = set(boundary.__dict__.get("eligible_actions", ()))
         if level == "lite":
             eligible.add("escalate_to_full")
-
-        system_prompt, user_prompt = build_manager_prompts(
-            context,
-            skill_name=self.workflow_config.manager.skill,
-        )
+        context: dict[str, object]
+        system_prompt = ""
+        user_prompt = ""
+        prelaunch_failure = False
+        stdout = ""
+        stderr = ""
+        result_payload: dict[str, object] = {
+            "decision_number": decision_number,
+            "finalized_turn_number": boundary.finalized_turn_number,
+            "level": level,
+            "trigger": boundary.trigger,
+            "status": "invalid",
+        }
+        parsed: ManagerDecisionV1 | None = None
+        original_candidate: ManagerDecisionV1 | None = None
+        note_violation: ManagerNoteAuthorityError | None = None
+        error: str | None = None
+        try:
+            context = build_manager_context(
+                context_run_dir or self.run_paths.run_dir,
+                level=level,  # type: ignore[arg-type]
+                trigger=boundary.trigger,
+                decision_number=decision_number,
+                run_metadata=metadata,
+                boundary=boundary_payload,
+                active_plan_content=captured_active_plan,
+                capture_evidence=True,
+            )
+            if boundary.context_schema_version >= 3:
+                controller_state = context.get("controller_state")
+                if isinstance(controller_state, dict):
+                    controller_state["checkpoint_repartitions"] = list(
+                        boundary.repartition_history
+                    )
+            boundary_payload["captured_plan_state"] = context["plan_state"]
+            system_prompt, user_prompt = build_manager_prompts(
+                context,
+                skill_name=self.workflow_config.manager.skill,
+            )
+        except (OSError, UnicodeError, ValueError, WorkflowError) as exc:
+            prelaunch_failure = True
+            error = str(exc)
+            context = _manager_prelaunch_failure_context(
+                run_id=self.state.run_id,
+                decision_number=decision_number,
+                level=level,
+                trigger=boundary.trigger,
+                boundary=boundary,
+                metadata=metadata,
+                workspace_state=boundary_payload["workspace_state"],
+            )
+            result_payload.update({
+                "status": "invalid",
+                "failure_stage": "prelaunch",
+                "error": error,
+            })
+        boundary_payload.setdefault("captured_plan_state", context.get("plan_state", {}))
         artifact_dir = self.run_paths.manager_dir / f"decision-{decision_number:03d}"
         artifact_paths = {
             name: str((artifact_dir / filename).relative_to(self.run_paths.run_dir))
@@ -285,21 +378,16 @@ class _ManagerCallExecutor:
                 "stderr": "stderr.txt", "result": "result.json",
             }.items()
         }
-        target_team = boundary.implementation_upgrade.get("target_team") if boundary.implementation_upgrade else boundary.actual_team
-        stdout = ""
-        stderr = ""
-        result_payload: dict[str, object] = {
-            "decision_number": decision_number, "finalized_turn_number": boundary.finalized_turn_number,
-            "level": level, "trigger": boundary.trigger, "status": "invalid",
-        }
-        parsed: ManagerDecisionV1 | None = None
-        original_candidate: ManagerDecisionV1 | None = None
-        note_violation: ManagerNoteAuthorityError | None = None
-        error: str | None = None
+        target_team = (
+            boundary.implementation_upgrade.get("target_team")
+            if boundary.implementation_upgrade else boundary.actual_team
+        )
         role_resolution = None
         manager_profile = None
         manager_adapter = None
         try:
+            if prelaunch_failure:
+                raise ManagerDecisionError(error or "manager context was unavailable before provider launch")
             role_resolution = resolve_manager_role(
                 self.workflow_config, level=level, baseline_team=baseline_team_name  # type: ignore[arg-type]
             )
@@ -400,6 +488,15 @@ class _ManagerCallExecutor:
             note_violation = None
             error = "manager mutated repository or plan state"
             result_payload.update({"status": "mutation-detected", "error": error})
+        persisted_boundary_payload = dict(boundary_payload)
+        persisted_active_plan_content = captured_active_plan
+        if prelaunch_failure:
+            # Context construction failed before a provider could inspect the
+            # input. Keep the failure artifact useful without copying plan
+            # bodies into the manager decision record.
+            persisted_boundary_payload.pop("active_plan_content", None)
+            persisted_boundary_payload.pop("original_plan_content", None)
+            persisted_active_plan_content = None
         artifacts = write_manager_artifacts(
             self.run_paths, decision_number=decision_number, context=context,
             system_prompt=system_prompt, user_prompt=user_prompt, stdout=stdout, stderr=stderr,
@@ -408,8 +505,8 @@ class _ManagerCallExecutor:
                 "decision_number": decision_number,
                 "trigger": boundary.trigger,
                 "run_metadata": metadata,
-                "boundary": boundary_payload,
-                "active_plan_content": captured_active_plan,
+                "boundary": persisted_boundary_payload,
+                "active_plan_content": persisted_active_plan_content,
             },
         )
         correction_consumed = False
@@ -596,6 +693,7 @@ class _ManagerCallExecutor:
             context=context,
             error=error,
             correction_consumed=correction_consumed,
+            prelaunch_failure=prelaunch_failure,
         )
 
 
@@ -1608,6 +1706,7 @@ class _ManagerGateCoordinator:
         lite_eligible = set(base_eligible)
         if clean_end_boundary:
             lite_eligible.discard("stop")
+        lite_eligible.add("escalate_to_full")
         boundary = FinalizedTurnBoundary(
             finalized_turn_number=(
                 self.state.active_turn
@@ -1698,6 +1797,7 @@ class _ManagerGateCoordinator:
             decision is None
             and level == "lite"
             and not outcome.correction_consumed
+            and not outcome.prelaunch_failure
             and error != "manager mutated repository or plan state"
         ):
             level = "full"
@@ -1913,6 +2013,9 @@ def _freeze_run_identity(
     workflow_config: WorkflowUserConfig,
     *,
     config_dir: Path,
+    continuation_from_branch: str | None = None,
+    continuation_from_head: str | None = None,
+    continuation_mode: str | None = None,
 ) -> FrozenRunIdentity:
     """Fingerprint the resolved in-memory inputs used to execute one workflow."""
     selected = {
@@ -1936,6 +2039,9 @@ def _freeze_run_identity(
         workflow_name=workflow_name,
         config_path=str(config_dir.resolve()),
         config_fingerprint=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        continuation_from_branch=continuation_from_branch,
+        continuation_from_head=continuation_from_head,
+        continuation_mode=continuation_mode,
     )
 
 
@@ -1957,6 +2063,7 @@ def _daemon_manifest_matches_execution(existing: object, expected: object) -> bo
         "idempotency_key",
         "caller_scope",
         "frozen_config_fingerprint",
+        "restarted_from_run_id",
     )
     if any(getattr(existing, field, None) != getattr(expected, field, None) for field in fields):
         return False
@@ -1964,7 +2071,13 @@ def _daemon_manifest_matches_execution(existing: object, expected: object) -> bo
         return False
     existing_start_step = getattr(existing, "start_step", None)
     expected_start_step = getattr(expected, "start_step", None)
-    return existing_start_step is None or existing_start_step == expected_start_step
+    if existing_start_step is None:
+        return True
+    return (
+        existing_start_step == expected_start_step
+        and getattr(existing, "skipped_steps", ())
+        == getattr(expected, "skipped_steps", ())
+    )
 
 
 def _frozen_identity_mismatch(
@@ -1974,7 +2087,14 @@ def _frozen_identity_mismatch(
     """Describe the persisted identity fields that differ from current config."""
     differences = [
         f"{field} saved '{getattr(saved, field)}' but current '{getattr(current, field)}'"
-        for field in ("workflow_name", "config_path", "config_fingerprint")
+        for field in (
+            "workflow_name",
+            "config_path",
+            "config_fingerprint",
+            "continuation_from_branch",
+            "continuation_from_head",
+            "continuation_mode",
+        )
         if getattr(saved, field) != getattr(current, field)
     ]
     if not differences:
@@ -2292,6 +2412,94 @@ def load_scope_envelope_for_resume(
     return artifact_bytes
 
 
+def load_scope_evidence_for_resume(
+    source_run_dir: Path,
+    scope: ActiveImplementationScope,
+    envelope_bytes: bytes,
+) -> dict[str, bytes]:
+    """Bind schema-v2 evidence bytes before a resume may prune its source."""
+    try:
+        from .repartition import ScopeEnvelopeV2, parse_envelope_bytes
+        from .runlog import (
+            RunPaths,
+            evidence_artifact_path,
+            resolve_envelope_texts,
+            resolve_evidence_artifact,
+        )
+
+        envelope = parse_envelope_bytes(envelope_bytes)
+        if not isinstance(envelope, ScopeEnvelopeV2):
+            return {}
+        source_root = source_run_dir.resolve(strict=True)
+        repo_root = source_root.parent.parent.parent
+        paths = RunPaths(
+            repo_root=repo_root,
+            runs_root=source_root.parent,
+            run_dir=source_root,
+            turns_dir=source_root / "turns",
+            manager_dir=source_root / "manager",
+            run_json=source_root / "run.json",
+        )
+        # Resolve both references through the source runlog validator. This
+        # checks containment, digest, byte size, UTF-8, and checkpoint span.
+        resolve_envelope_texts(paths, envelope)
+        artifacts: dict[str, bytes] = {}
+        for reference in (envelope.plan_ref, envelope.checkpoint_ref):
+            data = resolve_evidence_artifact(
+                paths,
+                {
+                    "kind": reference.kind,
+                    "path": reference.path,
+                    "sha256": reference.sha256,
+                    "byte_size": reference.byte_size,
+                },
+            )
+            destination = evidence_artifact_path(
+                paths, reference.kind, reference.sha256
+            )
+            relative = destination.resolve().relative_to(source_root).as_posix()
+            existing = artifacts.get(relative)
+            if existing is not None and existing != data:
+                raise ValueError(
+                    f"source evidence path {relative} resolves to conflicting bytes"
+                )
+            artifacts[relative] = data
+        return artifacts
+    except WorkflowError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise WorkflowError(
+            f"cannot bind scope envelope evidence for resume: {exc}"
+        ) from exc
+
+
+def _rebase_scope_envelope_evidence(
+    paths: RunPaths,
+    envelope: object,
+) -> object:
+    """Rebase only in-memory v2 evidence paths to the current run."""
+    from .repartition import ScopeEnvelopeV2
+    from .runlog import evidence_reference
+
+    if not isinstance(envelope, ScopeEnvelopeV2):
+        return envelope
+
+    def rebase(reference: object) -> object:
+        expected = evidence_reference(
+            paths,
+            reference.kind,
+            reference.sha256,
+            reference.byte_size,
+        )
+        return replace(reference, path=expected.path)
+
+    return replace(
+        envelope,
+        plan_ref=rebase(envelope.plan_ref),
+        checkpoint_ref=rebase(envelope.checkpoint_ref),
+    )
+
+
 def _resolved_envelope_plan_text(
     paths: RunPaths,
     envelope: object,
@@ -2306,6 +2514,7 @@ def _resolved_envelope_plan_text(
     try:
         from .runlog import resolve_envelope_texts
 
+        envelope = _rebase_scope_envelope_evidence(paths, envelope)
         plan_text, _ = resolve_envelope_texts(paths, envelope)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise WorkflowError(
@@ -3056,17 +3265,23 @@ def _same_file_contents(
     return candidate_identity[1] == source_hash
 
 
-def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
-    if not original_plan_path.is_file():
-        raise WorkflowError(f"original plan file does not exist: {original_plan_path}")
+def _backup_plan_copy(
+    repo_root: Path,
+    source_path: Path,
+    *,
+    base_name: str,
+    suffix: str,
+    subject: str,
+) -> Path:
+    if not source_path.is_file():
+        raise WorkflowError(f"{subject} file does not exist: {source_path}")
 
     backup_dir = repo_root / "plans" / "backups"
-    base_name, suffix = _plan_backup_base_name(original_plan_path)
     base_backup_path = backup_dir / f"{base_name}{suffix}"
     version_pattern = re.compile(
         rf"^{re.escape(base_name)}_v(\d+){re.escape(suffix)}$"
     )
-    source_identity = _file_identity(original_plan_path)
+    source_identity = _file_identity(source_path)
     highest_version = 1
 
     try:
@@ -3074,7 +3289,7 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
 
         if base_backup_path.is_file():
             if _same_file_contents(
-                original_plan_path,
+                source_path,
                 base_backup_path,
                 source_identity=source_identity,
             ):
@@ -3088,7 +3303,7 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
                 continue
             highest_version = max(highest_version, int(match.group(1)))
             if _same_file_contents(
-                original_plan_path,
+                source_path,
                 child,
                 source_identity=source_identity,
             ):
@@ -3103,12 +3318,56 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
                 version += 1
                 target_path = backup_dir / f"{base_name}_v{version:02d}{suffix}"
 
-        shutil.copyfile(original_plan_path, target_path)
+        shutil.copyfile(source_path, target_path)
         return target_path
     except OSError as exc:
         raise WorkflowError(
-            f"failed to back up original plan {original_plan_path} into {backup_dir}: {exc}"
+            f"failed to back up {subject} {source_path} into {backup_dir}: {exc}"
         ) from exc
+
+
+def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
+    if not original_plan_path.is_file():
+        raise WorkflowError(f"original plan file does not exist: {original_plan_path}")
+
+    base_name, suffix = _plan_backup_base_name(original_plan_path)
+    return _backup_plan_copy(
+        repo_root,
+        original_plan_path,
+        base_name=base_name,
+        suffix=suffix,
+        subject="original plan",
+    )
+
+
+def _backup_active_followup_plan(
+    repo_root: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    *,
+    source_path: Path | None = None,
+) -> Path | None:
+    """Back up a non-original active plan before its harness turn runs.
+
+    Reviewer-created follow-up plans can still be deleted from
+    plans/in-progress/ by the approval lifecycle, so the plans/backups/ copy
+    is the durable debugging evidence. Original plans already keep a startup
+    backup and never take this per-turn path. A missing active plan is
+    skipped; backup I/O failures propagate so the turn fails closed.
+    """
+    if active_plan_path == original_plan_path:
+        return None
+    backup_source = source_path if source_path is not None else active_plan_path
+    if not backup_source.is_file():
+        return None
+    base_name, suffix = _plan_backup_base_name(active_plan_path)
+    return _backup_plan_copy(
+        repo_root,
+        backup_source,
+        base_name=base_name,
+        suffix=suffix,
+        subject="active follow-up plan",
+    )
 
 
 def _done_plan_path(repo_root: Path, plan_path: Path) -> Path | None:
@@ -3412,8 +3671,8 @@ def _run_process(
             list(invocation.argv),
             cwd=str(repo_root),
             env={**os.environ, **invocation.env},
-            # Pipe explicit prompt text; otherwise close child stdin so the
-            # dashboard retains exclusive ownership of terminal input.
+            # Pipe explicit prompt text; otherwise close child stdin so a
+            # harness child can never read interactive terminal input.
             stdin=(
                 subprocess.PIPE
                 if invocation.stdin_text is not None
@@ -3848,6 +4107,7 @@ def _lifecycle_preflight(
     repo_state: RepoState,
     *,
     skip_phase_b: bool = False,
+    main_branch_override: str | None = None,
 ) -> _LifecyclePlan | None:
     setup = wf.setup or ()
     teardown = wf.teardown or ()
@@ -3862,7 +4122,7 @@ def _lifecycle_preflight(
         )
 
     # --- Phase A: git-independent validation ---
-    main_branch = wf.main_branch
+    main_branch = main_branch_override or wf.main_branch
     if not main_branch:
         raise WorkflowError(
             "workflow uses lifecycle setup but main_branch is not configured"
@@ -4356,6 +4616,49 @@ def _ensure_merge_handoff_clean(
 def _lifecycle_is_bootstrap_eligible(wf: WorkflowConfig, repo_state: RepoState) -> bool:
     """True when the lifecycle workflow needs a bootstrap before git-dependent preflight."""
     return bool(wf.setup) and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN)
+
+
+def _validate_current_branch_execution(
+    repo_root: Path,
+    wf: WorkflowConfig,
+    *,
+    continuation_from_branch: str | None,
+    continuation_from_head: str | None,
+    continuation_mode: str | None,
+) -> None:
+    """Revalidate a newly prepared current-branch continuation before allocation."""
+    if continuation_mode != "current_branch":
+        return
+    if not continuation_from_branch or not continuation_from_head:
+        raise WorkflowError(
+            "current-branch continuation requires a recorded branch and HEAD"
+        )
+    if (
+        tuple(wf.setup or ()) != ("worktree", "branch")
+        or tuple(wf.teardown or ()) != ("merge", "rm_worktree")
+    ):
+        raise WorkflowError(
+            "current-branch continuation requires lifecycle setup "
+            "[worktree, branch] and teardown [merge, rm_worktree]"
+        )
+
+    rc, current_branch, branch_error = _run_git(
+        ["symbolic-ref", "--short", "HEAD"], cwd=repo_root
+    )
+    if rc != 0 or current_branch.strip() != continuation_from_branch:
+        raise WorkflowError(
+            "current-branch continuation branch changed after preparation: "
+            f"expected '{continuation_from_branch}', got "
+            f"'{current_branch.strip() or branch_error or 'detached HEAD'}'"
+        )
+
+    rc, current_head, head_error = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
+    if rc != 0 or current_head.strip() != continuation_from_head:
+        raise WorkflowError(
+            "current-branch continuation HEAD changed after preparation: "
+            f"expected '{continuation_from_head}', got "
+            f"'{current_head.strip() or head_error or 'unresolvable HEAD'}'"
+        )
 
 
 _SKIP_SECTION_HEADING_RE = re.compile(
@@ -5241,10 +5544,21 @@ def run_workflow(
     if wf.first_step is None:
         raise WorkflowError(f"workflow '{workflow_name}' has no steps")
 
+    continuation_from_branch = config.continuation_from_branch
+    continuation_from_head = config.continuation_from_head
+    continuation_mode = config.continuation_mode
+    if resume is not None:
+        continuation_from_branch = resume.continuation_from_branch
+        continuation_from_head = resume.continuation_from_head
+        continuation_mode = resume.continuation_mode
+
     current_frozen_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
         config_dir=config_dir,
+        continuation_from_branch=continuation_from_branch,
+        continuation_from_head=continuation_from_head,
+        continuation_mode=continuation_mode,
     )
     if resume is not None and resume.frozen_run_identity is not None:
         identity_mismatch = _frozen_identity_mismatch(
@@ -5256,6 +5570,17 @@ def run_workflow(
                 "resume frozen configuration mismatch: "
                 f"{identity_mismatch}"
             )
+        if resume.resume_team_override is not None:
+            config = replace(config, team=resume.resume_team_override)
+
+    if resume is None:
+        _validate_current_branch_execution(
+            config.repo_root,
+            wf,
+            continuation_from_branch=continuation_from_branch,
+            continuation_from_head=continuation_from_head,
+            continuation_mode=continuation_mode,
+        )
 
     original_plan_path = config.plan_path
     repo_state = probe_repo_state(config.repo_root)
@@ -5269,6 +5594,11 @@ def run_workflow(
             workflow_config.aflow,
             repo_state,
             skip_phase_b=needs_bootstrap,
+            main_branch_override=(
+                config.continuation_from_branch
+                if config.continuation_mode == "current_branch"
+                else None
+            ),
         )
 
     try:
@@ -5323,6 +5653,8 @@ def run_workflow(
             idempotency_key=config.idempotency_key,
             caller_scope=config.caller_scope,
             frozen_config_fingerprint=current_frozen_identity.config_fingerprint,
+            restarted_from_run_id=config.restarted_from_run_id,
+            skipped_steps=config.skipped_steps,
         )
         existing_manifest = (
             RunRepository(config.repo_root).get_launch_manifest(reserved_run_id)
@@ -5399,7 +5731,10 @@ def run_workflow(
             config,
             keep_runs=(config.keep_runs + 1) if preserve_resume_override_source else config.keep_runs,
             reserved_run_id=reserved_run_id,
-        )
+        ),
+        **({"preserved_run_ids": frozenset({resume.resumed_from_run_id})}
+           if resume is not None and (resume.resume_relocation is not None or resume.resume_team_override is not None)
+           else {}),
     )
     journal = EventJournal(run_paths.run_dir)
     if launch_result.created:
@@ -5409,7 +5744,24 @@ def run_workflow(
             {"run_id": reserved_run_id, "manifest_path": launch_result.manifest_path},
         )
         write_launch_phase(config.repo_root, reserved_run_id, "launch_requested")
-        append_run_event(run_paths.run_dir, "launch_requested", {"resumed": resume is not None})
+    if config.skipped_steps:
+        append_run_event(
+            run_paths.run_dir,
+            "steps_skipped",
+            {"steps": list(config.skipped_steps), "selected_start_step": config.start_step},
+        )
+    if config.restarted_from_run_id is not None:
+        append_run_event(
+            run_paths.run_dir,
+            "restart_successor",
+            {"restarted_from_run_id": config.restarted_from_run_id},
+        )
+    if launch_result.created:
+        append_run_event(
+            run_paths.run_dir,
+            "launch_requested",
+            {"resumed": resume is not None},
+        )
     write_launch_phase(config.repo_root, reserved_run_id, "launch_started")
     append_run_event(run_paths.run_dir, "launch_started", {"resumed": resume is not None})
     if resume is not None:
@@ -5438,10 +5790,27 @@ def run_workflow(
     state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
     run_metadata = RunMetadataWriter(
         paths=run_paths,
-        config=config,
+        # Resume derives the authoritative continuation identity above; the
+        # caller-supplied config omits it, and run.json top-level metadata
+        # must stay consistent with the frozen identity serialized alongside.
+        config=replace(
+            config,
+            continuation_from_branch=continuation_from_branch,
+            continuation_from_head=continuation_from_head,
+            continuation_mode=continuation_mode,
+        ),
         state=state,
         workflow_name=workflow_name,
         resumed_from_run_id=resumed_from_run_id,
+        resume_provenance=(
+            {
+                **({"resume_relocation": dict(resume.resume_relocation)}
+                   if resume.resume_relocation is not None else {}),
+                **({"resumed_from_team": resume.resumed_from_team,
+                    "resume_team_override": resume.resume_team_override}
+                   if resume.resume_team_override is not None else {}),
+            } if resume is not None else None
+        ),
     )
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
@@ -5893,8 +6262,40 @@ def run_workflow(
             else:
                 _atomic_replace_bytes(destination, artifact_bytes)
 
-        # Carry the fully validated source artifact into the new run before
-        # any harness or manager call.  Do not consult the old source path.
+        # Carry the fully validated v2 evidence into the new run before any
+        # harness or manager call. Do not consult the old source path.
+        for relative_path, artifact_bytes in resume.scope_evidence_artifact_bytes.items():
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise WorkflowError(
+                    "cannot resume: scope evidence path must be relative to the new run: "
+                    f"{relative_path}"
+                )
+            raw_destination = run_paths.run_dir / relative
+            destination = raw_destination.resolve()
+            try:
+                destination.relative_to(run_paths.run_dir.resolve())
+            except ValueError as exc:
+                raise WorkflowError(
+                    "cannot resume: scope evidence path escapes the new run directory: "
+                    f"{relative_path}"
+                ) from exc
+            if raw_destination.is_symlink():
+                raise WorkflowError(
+                    "cannot resume: scope evidence destination must not be a symlink: "
+                    f"{relative_path}"
+                )
+            if destination.exists():
+                if destination.read_bytes() != artifact_bytes:
+                    raise WorkflowError(
+                        "cannot resume: scope evidence artifact already exists with "
+                        f"different bytes: {relative_path}"
+                    )
+            else:
+                _atomic_replace_bytes(destination, artifact_bytes)
+
+        # Carry the fully validated source envelope into the new run before
+        # any harness or manager call. Do not consult the old source path.
         if resumed_envelope_bytes is not None and state.active_implementation_scope is not None:
             scope = state.active_implementation_scope
             reference = _scope_envelope_reference(scope)
@@ -9066,6 +9467,14 @@ def run_workflow(
                     step_name=current_step_name,
                     turn_number=turn_number,
                 )
+                # Must complete before the harness runs: in-progress approval
+                # cleanup may delete the follow-up plan this turn is about to use.
+                _backup_active_followup_plan(
+                    config.repo_root,
+                    original_plan_path,
+                    active_plan_path,
+                    source_path=_exec_plan_path(active_plan_path, exec_ctx),
+                )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":
                     _fail_hotplug_target(exc.summary)
@@ -9375,6 +9784,14 @@ def run_workflow(
                     workflow_turn=turn_number,
                     step_name=current_step_name,
                     turn_number=turn_number,
+                )
+                # Must complete before the harness runs: in-progress approval
+                # cleanup may delete the follow-up plan this turn is about to use.
+                _backup_active_followup_plan(
+                    config.repo_root,
+                    original_plan_path,
+                    active_plan_path,
+                    source_path=_exec_plan_path(active_plan_path, exec_ctx),
                 )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":

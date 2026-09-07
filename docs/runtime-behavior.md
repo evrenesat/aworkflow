@@ -356,9 +356,10 @@ writes are atomic and refuse to overwrite; paths must stay inside the run
 directory.
 
 Hotplug events (`hotplug_requested`, `hotplug_stage_changed`,
-`hotplug_applied`, `hotplug_failed`) are emitted to observers. The live banner
-shows `hotplug <stage>: <source_selector> -> <target_selector> (<capability>)
-| active <selector>` while a transaction is live, and `aflow analyze` reports
+`hotplug_applied`, `hotplug_failed`) are emitted to observers. Status records
+include `status=... hotplug <stage>: <source_selector> -> <target_selector>
+(<capability>) | active <selector>` while a transaction is live, and
+`aflow analyze` reports
 the current/pending transactions, normalized history, capability paths, and
 active session count.
 ## Daemon control plane and direct CLI
@@ -395,6 +396,21 @@ after reconciliation reports `needs_attention`. Do not restart an exact
 workflow unit to recover it: the daemon records the ambiguity and an explicit
 resume creates a new linked continuation. An owner stop is terminal.
 
+REST and MCP fresh starts share one typed StartupRequest. Capability discovery
+lists each workflow's declared, executable, and excluded steps, canonical first
+step, default team, configured roles/teams, admitted selectors, and public
+status vocabulary. A numeric start-step input resolves against executable
+steps and only its canonical name is durable. Earlier executable steps appear
+as skipped in status and run events.
+
+A workflow change uses a fresh successor start with restarted_from_run_id.
+The daemon accepts that lineage only after the same-project, same-caller source
+has explicit owner-stop evidence and its exact unit is inactive. The successor
+gets a new run ID and normal frozen-config validation. Resume remains strict
+continuation of the saved invocation. Bounded extra instructions affect the
+request digest and worker prompt but their text is omitted from control-plane
+manifests, start records, events, and status.
+
 `aflow-guard-development-run` remains opt-in supervision for the exact run a
 user explicitly asks it to guard, particularly normal direct-CLI and legacy
 workflows. It is not a second daemon controller, a release-health monitor, or
@@ -429,15 +445,17 @@ it does not increase `turns_completed`, consume `max_turns`, create a checkpoint
 commit, or trigger same-step caps.
 
 The manager receives a reproducible, versioned context built from durable
-artifacts. Lite receives semantic results, plan snapshots and structured state,
-controller/routing counters, compact history, and bounded diagnostics. It does
-not receive active-plan content, prompts, or raw trace bodies. Full adds the
-complete active-plan Markdown. Full is chosen directly after consecutive
-unchanged executions of the same workflow step, the second reviewer rejection
-within one open original-checkpoint scope, explicit stop markers, invalid plans,
-and ambiguous failures. Alternating implementation and review steps do not
-select Full merely because their plan snapshots are unchanged. Lite can
-escalate once to Full at the same boundary.
+artifacts. Live schema-v3 Lite and Full contexts carry bounded semantic
+results, plan snapshots and structured state, controller/routing counters,
+compact history, bounded diagnostics, and controller-declared evidence
+references. Neither level receives active-plan or checkpoint content inline,
+prompts, or raw trace bodies; Full may receive richer bounded scope and
+rejection evidence. Full is chosen directly after consecutive unchanged
+executions of the same workflow step, the second reviewer rejection within one
+open original-checkpoint scope, explicit stop markers, invalid plans, and
+ambiguous failures. Alternating implementation and review steps do not select
+Full merely because their plan snapshots are unchanged. Lite can escalate once
+to Full at the same boundary.
 
 The strict manager protocol permits only controller actions: accept the
 proposal, retry, select an eligible implementation upgrade, select an eligible
@@ -572,8 +590,8 @@ implementation.
 Every successful finalized turn is written with `status: "completed"`, a single
 authoritative finish timestamp, and its duration even while the overall
 `run.json` status remains `running`. Manager stop reports are persisted, emitted
-to observers, and raised only after the live banner is stopped; the CLI then
-prints the complete report exactly once.
+to observers, and raised only after the final status record is written; the
+CLI then prints the complete report exactly once.
 
 New manager boundaries carry an explicit context schema version and the
 structured plan state captured at invocation time. Historical analysis therefore
@@ -604,81 +622,52 @@ For branch-only and no-lifecycle workflows, the worktree must be clean before st
 
 The interactive prompt accepts `y` or `yes`; any other input exits with code `1`.
 
-## Live Status
+## Status Output
 
-While a step is running, `aflow` shows a borderless, single-column Rich status
-document on stderr. The live document is ordered as the plan title, current
-checkpoint review history when present, chronological turn history, workflow
-graph, and summary/status. Rich's automatic refresh is disabled; AFlow owns
-one render loop that waits three seconds before its first periodic repaint and
-then repaints at most once every three seconds. Ordinary state and
-banner-context updates coalesce into that next repaint, while Git statistics
-retain their independent 10-second polling cadence. Input and resize wakes are
-drained as scheduler work, so they cannot bypass a due Git poll; coincident
-work is rendered once. Lifecycle paints are explicit so the final manager
-report remains visible exactly once after the banner stops.
+While a workflow runs, `aflow` writes plain, append-only status records to
+stderr. Every meaningful state transition, turn finalization, and the final
+summary emits one deterministic `key=value` record line prefixed with
+`aflow time=` and `event=start|update|final`. Identical consecutive snapshots
+are deduplicated, so no poll-tick or repeated snapshot produces duplicate
+records. Output never depends on terminal size, terminal type, or keyboard
+input: interactive TTYs, redirected logs, `TERM=dumb`, narrow `COLUMNS`, and
+`NO_COLOR` environments all receive the same ordered, copyable lines, with no
+ANSI styling and no cursor or alternate-screen sequences. Interactive startup
+questions remain interactive when stdin and stdout are TTYs.
 
-When Rich, the dashboard console, and POSIX stdin are all usable TTYs, the
-live document runs in an in-process alternate-screen viewport. `k`/Up and
-`j`/Down move one line; `b`/PageUp and `f`/Space/PageDown move one page;
-`g`/Home jumps to the top; and `G`/End jumps to the bottom and resumes
-follow-tail mode. Manual positions remain stable while new content arrives.
-The footer shows the current range and whether follow-tail or manual mode is
-active. Terminal-size changes are detected by the input reader and cause one
-renderer-owned redraw; unknown keys, `q`, Escape, and malformed sequences are
-ignored. Unsupported or failed terminal setup falls back to the normal
-borderless live display without raw input or alternate-screen control.
+Fields include, when available:
 
-The dashboard input reader is the sole owner of the TTY after startup
-questions complete. It uses POSIX cbreak mode with canonical input and echo
-disabled while preserving `ISIG`, and restores the saved attributes
-idempotently on pause, stop, failure, interruption cleanup, or interpreter
-exit. Renderer-owned cleanup also stops Rich, exits the alternate screen,
-shows the cursor, and closes the session after a background failure or
-interpreter exit; the saved last document is used for one best-effort
-scrollback snapshot. The renderer joins input and refresh threads before
-stopping `Live`. Interactive pause/stop exits the alternate screen and prints
-one complete borderless dashboard snapshot to normal scrollback before any
-manager or terminal report; non-interactive fallback does not print a
-duplicate snapshot.
+- timestamp, event kind, run id, and resumed-from run id
+- status with end reason, including live hotplug stage, selector transition,
+  capability path, and active selector
+- workflow name and current step
+- checkpoint index/count and name
+- turn count and effective max turns
+- team, step role, resolved selector, harness, and model
+- selected start step and the skipped executable step names it implies
+- chosen transition with its condition and the finalized turn outcome
+- frozen-config fingerprint and safe override diagnostics
+- manager decision, pending notes/upgrades, and manager report path
+- review-rejection ordinal and its review artifact path
+- repartition stage, latest split summary, and candidate artifact path
+- original/active/generated plan paths
+- git summary since workflow start with a bounded changed-file list
+- artifact links: turn stdout, issues summary, and manager report paths
 
-Harness execution does not compete with dashboard input. Most configured
-adapters deliver their effective prompt through argv or a prompt flag, and the
-real subprocess path closes those children's stdin with
-`stdin=subprocess.DEVNULL`. An adapter that supplies explicit `stdin_text`,
-currently Codex, receives it through `stdin=subprocess.PIPE`. Child
-stdout/stderr remain captured and drained; injected runner callables receive
-the same explicit input.
+Display values are bounded; durable artifact references are never truncated.
+Control bytes are flattened so pasted provider output stays copy-safe, while
+non-ASCII content remains readable. Controller-owned values are rendered
+literally; there is no markup engine to interpret.
 
-Fields include:
+The git summary is based on a baseline captured at workflow start, so
+pre-existing dirty state is excluded. If git is unavailable, git fields are
+omitted and the workflow still runs. A failed or closed stderr disables further
+status output instead of failing the run.
 
-- elapsed time
-- run id and resumed-from run id when present
-- run-state schema, frozen-config fingerprint, and safe override status
-- workflow and current step
-- harness, model, and effort
-- hotplug stage, selector transition, and capability path when a hotplug
-  transaction is live
-- checkpoint progress and turn count
-- original and active plan paths
-- workflow graph
-- turn history with stdout/stderr artifact links when non-empty
-- git summary since workflow start
-- issues link when issues exist
-- current run status
-
-For an active scope with rejected reviews, the document displays the complete
-chronological rejection history before turn history. A re-implementation row
-names its exact rejection ordinal and shows the repair summary when available,
-otherwise the reviewer summary. Workflow steps include explicit
-`[active]`, `[inactive]`, `[excluded]`, or `[skipped]` labels so exported text
-does not depend on color. Full reviewer stdout remains linked from the record;
-controller-owned text is rendered literally rather than as Rich markup.
-
-The separate `aflow show` workflow-inspection output remains panel-based; this
-flattening applies only to the live dashboard.
-
-The git summary is based on a baseline captured at workflow start, so pre-existing dirty state is excluded. If git is unavailable, git rows are omitted and the workflow still runs.
+`aflow show` renders plain ASCII workflow inspection output: shared or
+workflow-applicable roles and teams, then each declared step labeled
+`[executable]` or `[excluded]` with `go ->` transitions, `[terminal]` END
+markers, and `when <condition>` annotations.
 
 ## Run Logs
 

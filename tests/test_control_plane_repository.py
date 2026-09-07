@@ -137,3 +137,28 @@ def test_repository_rejects_escape_and_invalid_manifest_schema(tmp_path: Path) -
     (launches / "bad-run.json").write_text('{"schema_version":99}\n')
     with pytest.raises(RepositorySchemaError):
         RunRepository(safe_root).get_launch_manifest("bad-run")
+
+@pytest.mark.parametrize("owned", [True, False])
+def test_status_reports_applied_turn_limit_not_pending_override(
+    tmp_path: Path, owned: bool,
+) -> None:
+    run_id = "limit-run"
+    if owned:
+        create_launch_manifest(tmp_path, _manifest(run_id))
+    run_dir = tmp_path / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    metadata_path = run_dir / "run.json"
+    metadata = {"status": "running", "max_turns": 6}
+    metadata_path.write_text(json.dumps(metadata))
+    (run_dir / "overrides.toml").write_text("revision = 1\nmax_turns = 8\n")
+    repository = RunRepository(tmp_path)
+
+    # Recording an override is not evidence that the engine applied it.
+    assert repository.get_run_status(run_id).max_turns == 6
+
+    metadata["effective_max_turns"] = 8
+    metadata_path.write_text(json.dumps(metadata))
+    before = metadata_path.read_bytes()
+    assert repository.get_run_status(run_id).max_turns == 8
+    assert repository.list_runs().runs[0].max_turns == 8
+    assert metadata_path.read_bytes() == before

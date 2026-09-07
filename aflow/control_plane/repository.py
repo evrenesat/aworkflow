@@ -107,6 +107,17 @@ class RunRepository:
             raise RepositoryError("launch manifest may not be a symlink")
         return self._parse_manifest(path)
 
+    def get_frozen_config_path(self, run_id: str) -> str | None:
+        """Return the recorded frozen config path without exposing run metadata."""
+        valid, is_legacy_identity = self._readable_run_id(run_id)
+        if is_legacy_identity:
+            return None
+        metadata = self._read_run_metadata(self.run_directory(valid))
+        frozen_config = metadata.get("frozen_config")
+        if not isinstance(frozen_config, Mapping):
+            return None
+        return _optional_text(frozen_config.get("config_path"))
+
     def get_run_status(self, run_id: str) -> RunStatus:
         valid, is_legacy_identity = self._readable_run_id(run_id)
         run_dir = (
@@ -119,6 +130,9 @@ class RunRepository:
             raise RepositoryNotFoundError(f"run '{valid}' does not exist")
 
         metadata = self._read_run_metadata(run_dir) if run_dir.is_dir() else {}
+        max_turns = _optional_int(metadata.get("effective_max_turns")) or _optional_int(
+            metadata.get("max_turns")
+        )
         if manifest is None:
             # Legacy state has no immutable launch evidence.  Even a stale
             # ``running`` record must never be interpreted as a live process.
@@ -131,7 +145,7 @@ class RunRepository:
                 team=_optional_text(metadata.get("team")),
                 current_step=_optional_text(metadata.get("current_step_name")),
                 turns_completed=_optional_int(metadata.get("turns_completed")),
-                max_turns=_optional_int(metadata.get("max_turns")),
+                max_turns=max_turns,
                 evidence={"recorded_status": metadata.get("status")},
             )
 
@@ -170,7 +184,10 @@ class RunRepository:
             team=_optional_text(metadata.get("team")) or manifest.team,
             current_step=_optional_text(metadata.get("current_step_name")),
             turns_completed=_optional_int(metadata.get("turns_completed")),
-            max_turns=_optional_int(metadata.get("max_turns")) or manifest.max_turns,
+            max_turns=max_turns or manifest.max_turns,
+            selected_start_step=manifest.start_step,
+            skipped_steps=manifest.skipped_steps,
+            restarted_from_run_id=manifest.restarted_from_run_id,
             evidence={
                 "has_run_metadata": bool(metadata),
                 "manifest_created_at": manifest.created_at,
@@ -308,6 +325,12 @@ class RunRepository:
                 request_digest=_optional_text(payload.get("request_digest")),
                 frozen_config_fingerprint=_optional_text(payload.get("frozen_config_fingerprint")),
                 intended_unit=_optional_text(payload.get("intended_unit")),
+                restarted_from_run_id=(
+                    validate_run_id(str(payload["restarted_from_run_id"]))
+                    if payload.get("restarted_from_run_id") is not None
+                    else None
+                ),
+                skipped_steps=_manifest_step_names(payload.get("skipped_steps", ())),
                 created_at=str(payload["created_at"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -370,6 +393,17 @@ class RunRepository:
         except (OSError, RuntimeError, ValueError) as exc:
             raise RepositoryError("repository artifact escapes project root") from exc
         return resolved
+
+
+def _manifest_step_names(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) > 128
+        or any(not isinstance(item, str) or not item or len(item) > 4_096 for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise RepositorySchemaError("launch manifest skipped steps are invalid")
+    return tuple(value)
 
 
 def _optional_text(value: object) -> str | None:

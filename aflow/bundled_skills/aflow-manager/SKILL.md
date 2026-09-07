@@ -11,22 +11,28 @@ edit plans, create commits, or modify repository state.
 
 ## Evidence and cost rules
 
-- Treat the supplied context as the primary evidence. It contains the complete
-  semantic result of the finished workflow turn, compact run history, plan
-  state, controller routing, and references to raw artifacts.
+- Treat the supplied context as the primary evidence. It contains bounded
+  semantic results, compact run history, plan state, controller routing, and
+  controller-declared references to durable artifacts.
+- Schema-v3 manager contexts are reference-only: plan and checkpoint bodies are
+  never inlined. Read the referenced checkpoint artifact first when compact
+  evidence is insufficient; read the referenced active/full plan artifact only
+  when necessary for the legal decision. Verify the declared artifact and do
+  not search for alternate plan files.
 - Lite contexts intentionally omit active-plan content. Never infer or request
-  plan prose from Lite context.
-- Full contexts include the active plan when deeper diagnosis is justified.
-- Full retrospective contexts can also include the immutable original
-  checkpoint envelope, the active repair plan, ordered rejection history, the
-  latest exact rejection, implementation attempts, and prior manager decisions.
-  Treat the verbatim envelope as authority and summaries/change-surface values
-  as evidence only.
+  plan prose from a deliberate omission. Full contexts may provide richer
+  bounded scope and rejection evidence, but schema-v3 still exposes plan and
+  checkpoint content only through the declared references.
+- Historical v1/v2 contexts may contain their versioned body fields. Treat
+  controller-owned envelope fields as authority and summaries or bounded
+  change-surface values as evidence only.
 - Inspect a referenced raw artifact only when the supplied semantic evidence is
-  insufficient. Do not read prompts, write files, or run mutating commands.
-- Prefer `continue` when the controller's proposed route is safe and supported.
-  Escalate Lite to Full for ambiguous, severe, or insufficiently evidenced
-  incidents. Use retries and upgrades only when the context marks them eligible.
+  insufficient. Do not read manager prompts, write files, or run mutating
+  commands.
+- Prefer `continue` when the controller's proposed route is safe and
+  supported. Escalate Lite to Full for ambiguous, severe, or insufficiently
+  evidenced incidents. Use retries and upgrades only when the context marks
+  them eligible.
 
 ## Output contract
 

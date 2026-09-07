@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
+import json
 import subprocess
 from threading import Event
 
@@ -10,7 +12,16 @@ import pytest
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind, StartupRequest
 from aflow.config import GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
-from aflow.control_plane import InMemoryUnitManager, create_launch_manifest, read_events
+from aflow.control_plane import (
+    ControlConflictError,
+    RepositoryNotFoundError,
+    InMemoryUnitManager,
+    LaunchManifest,
+    append_run_event,
+    create_launch_manifest,
+    read_events,
+    write_launch_phase,
+)
 from aflow.daemon import (
     AflowDaemon,
     DaemonConfig,
@@ -35,6 +46,52 @@ def _workflow_config() -> WorkflowUserConfig:
         roles={"worker": "codex.worker"},
         workflows={"managed": workflow},
         prompts={"p": "Work."},
+    )
+
+
+
+
+def _two_step_workflow_config() -> WorkflowUserConfig:
+    implement = WorkflowStepConfig(
+        role="worker",
+        prompts=("p",),
+        go=(GoTransition(to="review", when="DONE"),),
+    )
+    review = WorkflowStepConfig(
+        role="worker",
+        prompts=("p",),
+        go=(GoTransition(to="END", when="DONE"),),
+    )
+    excluded = WorkflowStepConfig(role="worker", prompts=("p",))
+    return WorkflowUserConfig(
+        roles={"worker": "codex.worker"},
+        workflows={
+            "managed": WorkflowConfig(
+                declared_steps={
+                    "draft": excluded,
+                    "implement": implement,
+                    "review": review,
+                },
+                steps={"implement": implement, "review": review},
+                first_step="implement",
+                excluded_steps=("draft",),
+            )
+        },
+        prompts={"p": "Work."},
+    )
+
+
+def _prepared_for_request(request: StartupRequest) -> PreparedRun:
+    selected = "review" if request.start_step in {"2", "review"} else "implement"
+    return PreparedRun(
+        workflow_name="managed",
+        repo_root=request.repo_root,
+        plan_path=request.plan_path,
+        config_path=request.config_path,
+        max_turns=request.max_turns or 2,
+        team=request.team,
+        extra_instructions=request.extra_instructions,
+        start_step=selected,
     )
 
 
@@ -628,3 +685,469 @@ def test_daemon_owner_stop_persists_terminal_phase_and_requires_event_authorizat
     assert stopped.status == "owner_stopped"
     assert units.stop_calls == [f"aflow-run-{started.run_id}.service"]
     assert daemon.service.poll_events(started.run_id, authorizer=lambda action, status: True)
+
+
+def test_daemon_typed_start_persists_canonical_step_and_redacted_instruction_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    workflow_config = _two_step_workflow_config()
+    daemon.service._workflow_config = workflow_config
+    sentinel = "private-runtime-guidance-4f91"
+    request = replace(
+        request,
+        workflow_config=workflow_config,
+        start_step="2",
+        extra_instructions=(sentinel,),
+    )
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+
+    started = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="typed-start",
+    )
+
+    manifest = daemon.application.repository.get_launch_manifest(started.run_id)
+    assert manifest is not None
+    assert manifest.start_step == "review"
+    assert manifest.skipped_steps == ("implement",)
+    status = daemon.service.run_status(started.run_id)
+    assert status.selected_start_step == "review"
+    assert status.skipped_steps == ("implement",)
+    argv = units.start_calls[-1][1]
+    assert argv[-1] == f"--extra-instruction={sentinel}"
+    launch = request.repo_root / ".aflow" / "launches" / f"{started.run_id}.json"
+    record = request.repo_root / ".aflow" / "start-requests" / f"{started.run_id}.json"
+    events = request.repo_root / ".aflow" / "runs" / started.run_id / "events.jsonl"
+    assert sentinel not in launch.read_text()
+    assert sentinel not in record.read_text()
+    assert sentinel not in events.read_text()
+
+
+def test_daemon_exact_retry_restores_transient_instructions_after_prepared_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    sentinel = "private-retry-guidance-7c31"
+    request = replace(request, extra_instructions=(sentinel,))
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+
+    def crash_after_prepare(record, _prepared, *, created):
+        assert created is True
+        assert record["state"] == "prepared"
+        raise RuntimeError("synthetic pre-unit crash")
+
+    monkeypatch.setattr(
+        daemon.service,
+        "_launch_prepared_locked",
+        crash_after_prepare,
+    )
+    with pytest.raises(RuntimeError, match="synthetic pre-unit crash"):
+        daemon.service.start(
+            request,
+            caller_scope="project:one",
+            idempotency_key="prepared-retry",
+        )
+
+    records = list(
+        (request.repo_root / ".aflow" / "start-requests").glob("*.json")
+    )
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert record["state"] == "prepared"
+    run_id = record["run_id"]
+    assert sentinel not in records[0].read_text()
+    launch_path = (
+        request.repo_root / ".aflow" / "launches" / f"{run_id}.json"
+    )
+    assert sentinel not in launch_path.read_text()
+
+    fresh = AflowDaemon(daemon.service._config, units=units)
+    fresh.start()
+    with pytest.raises(DaemonIdempotencyConflict):
+        fresh.service.start(
+            replace(request, extra_instructions=("different guidance",)),
+            caller_scope="project:one",
+            idempotency_key="prepared-retry",
+        )
+
+    retried = fresh.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="prepared-retry",
+    )
+
+    assert retried.run_id == run_id
+    assert retried.created is False
+    assert retried.status == "running"
+    assert units.start_calls[-1][1][-1] == f"--extra-instruction={sentinel}"
+    events_path = (
+        request.repo_root / ".aflow" / "runs" / run_id / "events.jsonl"
+    )
+    assert sentinel not in records[0].read_text()
+    assert sentinel not in launch_path.read_text()
+    assert sentinel not in events_path.read_text()
+
+
+def test_daemon_rejects_excluded_step_before_reserving_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    workflow_config = _two_step_workflow_config()
+    daemon.service._workflow_config = workflow_config
+    request = replace(
+        request,
+        workflow_config=workflow_config,
+        start_step="draft",
+    )
+
+    with pytest.raises(DaemonError, match="excluded"):
+        daemon.service.start(
+            request,
+            caller_scope="project:one",
+            idempotency_key="excluded-start",
+        )
+
+    assert units.start_calls == []
+    launches = request.repo_root / ".aflow" / "launches"
+    assert not launches.exists() or list(launches.glob("*.json")) == []
+
+
+def test_daemon_restart_successor_requires_owner_stopped_inactive_source_and_keeps_lineage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+    source = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="source-start",
+    )
+    successor_request = replace(
+        request,
+        restarted_from_run_id=source.run_id,
+        max_turns=4,
+    )
+
+    with pytest.raises(DaemonError, match="explicit owner stop"):
+        daemon.service.start(
+            successor_request,
+            caller_scope="project:one",
+            idempotency_key="active-successor",
+        )
+
+    daemon.service.owner_stop(
+        source.run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="source-stop",
+    )
+    original_start = units.start
+
+    def fail_start(*_args, **_kwargs):
+        raise RuntimeError("synthetic unit failure")
+
+    monkeypatch.setattr(units, "start", fail_start)
+    with pytest.raises(DaemonError, match="workflow unit failed to start"):
+        daemon.service.start(
+            successor_request,
+            caller_scope="project:one",
+            idempotency_key="failed-successor",
+        )
+    assert daemon.service.run_status(source.run_id).status == "owner_stopped"
+    monkeypatch.setattr(units, "start", original_start)
+
+    successor = daemon.service.start(
+        successor_request,
+        caller_scope="project:one",
+        idempotency_key="stopped-successor",
+    )
+
+    replay = daemon.service.start(
+        successor_request,
+        caller_scope="project:one",
+        idempotency_key="stopped-successor",
+    )
+    assert replay.run_id == successor.run_id
+    assert replay.restarted_from_run_id == source.run_id
+    assert successor.run_id != source.run_id
+    assert successor.restarted_from_run_id == source.run_id
+    manifest = daemon.application.repository.get_launch_manifest(successor.run_id)
+    assert manifest is not None
+    assert manifest.restarted_from_run_id == source.run_id
+    status = daemon.service.run_status(successor.run_id)
+    assert status.restarted_from_run_id == source.run_id
+    source_events = daemon.service.poll_events(
+        source.run_id,
+        authorizer=lambda _action, _status: True,
+    )
+    assert any(
+        event.event_type == "restart_successor_requested"
+        and event.data["successor_run_id"] == successor.run_id
+        for event in source_events
+    )
+
+
+def test_startup_answer_selected_later_step_is_reported_as_skipped_without_manifest_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from aflow.control_plane import LaunchManifest
+    from aflow.workflow import _daemon_manifest_matches_execution
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    workflow_config = _two_step_workflow_config()
+    daemon.service._workflow_config = workflow_config
+    request = replace(request, workflow_config=workflow_config)
+    monkeypatch.setattr(
+        "aflow.daemon.prepare_startup",
+        lambda _request: StartupQuestion(
+            kind=StartupQuestionKind.PICK_STEP,
+            message="Choose",
+            choices=["implement", "review"],
+        ),
+    )
+    monkeypatch.setattr(
+        "aflow.daemon.prepare_startup_with_answer",
+        lambda _question, value, _answer: replace(
+            _prepared_for_request(value),
+            start_step="review",
+        ),
+    )
+
+    pending = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="question-step",
+    )
+    started = daemon.service.answer_startup(
+        pending.question_id,
+        "review",
+        caller_scope="project:one",
+        idempotency_key="question-step-answer",
+    )
+
+    status = daemon.service.run_status(started.run_id)
+    assert status.selected_start_step == "review"
+    assert status.skipped_steps == ("implement",)
+    manifest = daemon.application.repository.get_launch_manifest(started.run_id)
+    assert manifest is not None
+    assert manifest.start_step is None
+    expected = LaunchManifest(
+        **{
+            **manifest.__dict__,
+            "start_step": "review",
+            "skipped_steps": ("implement",),
+        }
+    )
+    assert _daemon_manifest_matches_execution(manifest, expected)
+
+
+def test_daemon_restart_successor_rejects_self_and_cyclic_lineage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    with pytest.raises(DaemonError, match="cannot restart itself"):
+        daemon.service._validate_restart_source(
+            "same-run",
+            successor_run_id="same-run",
+            caller_scope="project:one",
+        )
+
+    for run_id, predecessor in (("cycle-a", "cycle-b"), ("cycle-b", "cycle-a")):
+        create_launch_manifest(
+            request.repo_root,
+            LaunchManifest(
+                run_id=run_id,
+                project_root=str(request.repo_root.resolve()),
+                plan_path=str(request.plan_path.resolve()),
+                workflow_name="managed",
+                max_turns=2,
+                caller_scope="project:one",
+                restarted_from_run_id=predecessor,
+            ),
+        )
+    write_launch_phase(request.repo_root, "cycle-a", "owner_stopped")
+    append_run_event(
+        request.repo_root / ".aflow" / "runs" / "cycle-a",
+        "owner_stopped",
+        {"source": "daemon"},
+    )
+
+    with pytest.raises(DaemonError, match="cyclic"):
+        daemon.service._validate_restart_source(
+            "cycle-a",
+            successor_run_id="fresh-run",
+            caller_scope="project:one",
+        )
+
+
+def test_daemon_owner_stop_manifest_only_requires_exact_owner_and_revision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    run_id = "manifest-only-stop"
+    manifest = daemon.service._initial_manifest_for(
+        run_id=run_id,
+        request=request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+    create_launch_manifest(request.repo_root, manifest)
+    manifest_path = request.repo_root / ".aflow" / "launches" / f"{run_id}.json"
+    run_dir = request.repo_root / ".aflow" / "runs" / run_id
+    plan_bytes = request.plan_path.read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+
+    with pytest.raises(ControlConflictError) as conflict:
+        daemon.service.owner_stop(
+            run_id,
+            expected_revision=1,
+            caller_scope="project:one",
+            idempotency_key="stale-stop",
+        )
+    assert conflict.value.current_revision == 0
+    assert not run_dir.exists()
+
+    with pytest.raises(PermissionError):
+        daemon.service.owner_stop(
+            run_id,
+            expected_revision=0,
+            caller_scope="project:other",
+            idempotency_key="unauthorized-stop",
+        )
+    assert not run_dir.exists()
+
+    unrelated_run_dir = request.repo_root / ".aflow" / "runs" / "other-run"
+    unrelated_run_dir.mkdir()
+    marker = unrelated_run_dir / "keep.txt"
+    marker.write_text("keep me\n")
+    run_dir.symlink_to(unrelated_run_dir, target_is_directory=True)
+    with pytest.raises(DaemonError, match="run artifact path is unsafe"):
+        daemon.service.owner_stop(
+            run_id,
+            expected_revision=0,
+            caller_scope="project:one",
+            idempotency_key="symlink-stop",
+        )
+    assert marker.read_text() == "keep me\n"
+    assert not (unrelated_run_dir / "overrides.toml").exists()
+    run_dir.unlink()
+    marker.unlink()
+    unrelated_run_dir.rmdir()
+
+    missing_run_dir = request.repo_root / ".aflow" / "runs" / "missing-manifest"
+    with pytest.raises(RepositoryNotFoundError):
+        daemon.service.owner_stop(
+            "missing-manifest",
+            expected_revision=0,
+            caller_scope="project:one",
+            idempotency_key="missing-stop",
+        )
+    assert not missing_run_dir.exists()
+
+    stopped = daemon.service.owner_stop(
+        run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="stop-1",
+    )
+    replayed_stop = daemon.service.owner_stop(
+        run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="stop-1",
+    )
+    replayed_start = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+
+    assert stopped.status == "owner_stopped"
+    assert stopped.revision == 1
+    assert replayed_stop.status == "owner_stopped"
+    assert replayed_stop.revision == 1
+    assert replayed_start.status == "owner_stopped"
+    assert run_dir.is_dir()
+    assert (run_dir / "overrides.toml").is_file()
+    assert not (run_dir / "run.json").exists()
+    assert not (
+        request.repo_root / ".aflow" / "start-requests" / f"{run_id}.json"
+    ).exists()
+    assert units.start_calls == []
+    assert units.stop_calls == []
+    assert request.plan_path.read_bytes() == plan_bytes
+    assert manifest_path.read_bytes() == manifest_bytes
+
+
+def test_daemon_owner_stop_pending_question_remains_terminal_for_reads_and_answers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    question = StartupQuestion(
+        kind=StartupQuestionKind.PICK_STEP,
+        message="Choose a step",
+        choices=["implement"],
+    )
+    monkeypatch.setattr("aflow.daemon.prepare_startup", lambda value: question)
+    pending = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+    assert pending.run_id is not None
+    assert pending.question_id is not None
+    run_dir = request.repo_root / ".aflow" / "runs" / pending.run_id
+    record_path = (
+        request.repo_root / ".aflow" / "start-requests" / f"{pending.run_id}.json"
+    )
+    manifest_path = (
+        request.repo_root / ".aflow" / "launches" / f"{pending.run_id}.json"
+    )
+    record_bytes = record_path.read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+    plan_bytes = request.plan_path.read_bytes()
+    assert not run_dir.exists()
+
+    stopped = daemon.service.owner_stop(
+        pending.run_id,
+        expected_revision=0,
+        caller_scope="project:one",
+        idempotency_key="stop-1",
+    )
+    monkeypatch.setattr(
+        "aflow.daemon.prepare_startup_with_answer",
+        lambda *args: pytest.fail("a stopped startup question must not be answered"),
+    )
+    status = daemon.service.run_status(pending.run_id)
+    replayed_start = daemon.service.start(
+        request,
+        caller_scope="project:one",
+        idempotency_key="start-1",
+    )
+    replayed_answer = daemon.service.answer_startup(
+        pending.question_id,
+        "implement",
+        caller_scope="project:one",
+        idempotency_key="answer-1",
+    )
+
+    assert stopped.status == "owner_stopped"
+    assert status.status == "owner_stopped"
+    assert replayed_start.status == "owner_stopped"
+    assert replayed_answer.status == "owner_stopped"
+    assert record_path.read_bytes() == record_bytes
+    assert manifest_path.read_bytes() == manifest_bytes
+    assert request.plan_path.read_bytes() == plan_bytes
+    assert not (run_dir / "run.json").exists()
+    assert units.start_calls == []
+    assert units.stop_calls == []

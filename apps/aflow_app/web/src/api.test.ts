@@ -1,235 +1,441 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from './api'
+import { markUserActivity, resetActivityMarker } from './activity'
 
 function mockOkJson<T>(value: T, status = 200) {
   vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status, json: async () => value } as Response)
 }
 
-const key = { provider_id: 'codex', provider_session_id: 'session-1' }
-
-describe('provider-neutral API client', () => {
+describe('workflow control API client', () => {
   beforeEach(() => {
     global.fetch = vi.fn()
     api.clearAuthToken()
+    api.setSessionExpiredHandler(null)
+    resetActivityMarker()
+    window.localStorage.clear()
+    window.sessionStorage.clear()
   })
 
-  it('keeps bearer material in memory and sends it only as an authorization header', async () => {
+  it('exchanges the bearer for a cookie session without persisting the token', async () => {
+    mockOkJson({ authenticated: true })
+    await api.loginSession('secret-token')
+    const [url, options] = vi.mocked(global.fetch).mock.calls.at(-1)!
+    expect(url).toBe('/api/session')
+    expect(options).toEqual(expect.objectContaining({
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: expect.objectContaining({ Authorization: 'Bearer secret-token' }),
+    }))
+    expect(window.localStorage.length).toBe(0)
+    expect(window.sessionStorage.length).toBe(0)
+
+    // Normal requests afterwards ride the same-origin cookie without any
+    // Authorization header or stored credential.
+    mockOkJson([])
+    await api.listProjects()
+    const [, listOptions] = vi.mocked(global.fetch).mock.calls.at(-1)!
+    expect(listOptions.credentials).toBe('same-origin')
+    expect((listOptions.headers as Record<string, string>).Authorization).toBeUndefined()
+
+    mockOkJson({ authenticated: true })
+    await api.checkSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![0]).toBe('/api/session')
+
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await api.logoutSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)).toEqual(['/api/session', expect.objectContaining({ method: 'DELETE', credentials: 'same-origin' })])
+  })
+
+  it('marks the next authenticated request with user activity at most once per minute', async () => {
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).not.toHaveProperty('X-AFlow-Activity')
+
+    markUserActivity()
+    markUserActivity()
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).toEqual(expect.objectContaining({ 'X-AFlow-Activity': '1' }))
+
+    // The marker was consumed; the immediate next request is unmarked.
+    markUserActivity(Date.now() + 1_000)
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).not.toHaveProperty('X-AFlow-Activity')
+  })
+
+  it('renews a visible page restore but leaves background restores unmarked', async () => {
+    markUserActivity()
+    mockOkJson({ authenticated: true })
+    await api.checkSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).toHaveProperty('X-AFlow-Activity', '1')
+    mockOkJson({ authenticated: true })
+    await api.checkSession()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).not.toHaveProperty('X-AFlow-Activity')
+  })
+
+  it('aborts pending requests after confirmed logout and rejects late results', async () => {
+    let finish!: (response: Response) => void
+    vi.mocked(global.fetch).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    const pending = api.listProjects()
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    const signal = vi.mocked(global.fetch).mock.calls[0][1].signal!
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await api.logoutSession()
+    expect(signal.aborted).toBe(true)
+    finish({ ok: true, status: 200, json: async () => [{ id: 'late' }] } as Response)
+    await rejected
+    mockOkJson({ authenticated: true })
+    await expect(api.checkSession()).resolves.toEqual({ authenticated: true })
+  })
+
+  it('does not abort the workspace or announce expiry when logout fails', async () => {
+    const onExpired = vi.fn()
+    api.setSessionExpiredHandler(onExpired)
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 503, text: async () => 'unavailable' } as Response)
+    await expect(api.logoutSession()).rejects.toMatchObject({ status: 503 })
+    expect(vi.mocked(global.fetch).mock.calls[0][1].signal!.aborted).toBe(false)
+    expect(onExpired).not.toHaveBeenCalled()
+  })
+
+  it('keeps background stream requests unmarked by user activity', async () => {
+    markUserActivity()
+    const encoder = new TextEncoder()
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      body: new ReadableStream<Uint8Array>({
+        pull: (controller) => {
+          controller.enqueue(encoder.encode('data: {"events":[]}\n\n'))
+          controller.close()
+        },
+      }),
+    } as unknown as Response)
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1', runId: 'run-1', reconnectDelaysMs: [1],
+      onEvents: () => {},
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    unsubscribe()
+    const headers = vi.mocked(global.fetch).mock.calls.at(-1)![1].headers as Record<string, string>
+    expect(headers['X-AFlow-Activity']).toBeUndefined()
+    // The marker stays pending for the next ordinary REST request.
+    mockOkJson([])
+    await api.listProjects()
+    expect(vi.mocked(global.fetch).mock.calls.at(-1)![1].headers).toEqual(expect.objectContaining({ 'X-AFlow-Activity': '1' }))
+  })
+
+  it('reports a 401 on ordinary requests as session expiry, but not on session endpoints', async () => {
+    const onExpired = vi.fn()
+    api.setSessionExpiredHandler(onExpired)
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'unauthorized' } as Response)
+    await expect(api.listProjects()).rejects.toMatchObject({ status: 401 })
+    expect(onExpired).toHaveBeenCalledTimes(1)
+
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 401, text: async () => 'unauthorized' } as Response)
+    await expect(api.checkSession()).rejects.toMatchObject({ status: 401 })
+    expect(onExpired).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops the run event stream on 401 and reports session expiry once', async () => {
+    const onExpired = vi.fn()
+    api.setSessionExpiredHandler(onExpired)
+    vi.mocked(global.fetch).mockResolvedValue({ ok: false, status: 401, text: async () => 'unauthorized' } as Response)
+    const states: api.StreamState[] = []
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1', runId: 'run-1', reconnectDelaysMs: [1],
+      onEvents: () => {},
+      onStateChange: (state) => states.push(state),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    unsubscribe()
+    expect(onExpired).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(1)
+    expect(states).not.toContain('connected')
+  })
+
+  it('keeps bearer material in memory and sends it only as a header', async () => {
     api.setAuthToken('test-token')
-    mockOkJson([{ id: 'project-1', display_name: 'Alpha', linked_session_count: 2 }])
-    expect((await api.listProjects())[0].linked_session_count).toBe(2)
+    mockOkJson([{ id: 'project-1', display_name: 'Alpha' }])
+    expect((await api.listProjects())[0].display_name).toBe('Alpha')
     expect(global.fetch).toHaveBeenCalledWith('/api/projects', expect.objectContaining({
       headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
     }))
     expect(window.localStorage.length).toBe(0)
-    api.clearAuthToken()
-    expect(api.getAuthToken()).toBeNull()
-    expect(window.localStorage.length).toBe(0)
   })
 
-  it('keeps idempotency and bearer material out of storage and mutation URLs', async () => {
+  it('reads bounded project discovery with authentication only as a header', async () => {
     api.setAuthToken('test-token')
-    window.localStorage.clear()
-    window.sessionStorage.clear()
-    const initialUrl = window.location.href
-    mockOkJson({ result: { run_id: 'run-1', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null }, startup_question: null }, 201)
-
-    await api.startControlPlaneRun('control-project', { plan_path: 'plans/todo/demo.md' }, 'start-retry-key')
-
-    const [url, options] = vi.mocked(global.fetch).mock.calls.at(-1)!
-    expect(url).not.toContain('test-token')
-    expect(url).not.toContain('start-retry-key')
-    expect(options.headers).toEqual(expect.objectContaining({
-      Authorization: 'Bearer test-token',
-      'Idempotency-Key': 'start-retry-key',
-    }))
-    expect(window.localStorage.length).toBe(0)
-    expect(window.sessionStorage.length).toBe(0)
-    expect(window.location.href).toBe(initialUrl)
-  })
-
-  it('uses canonical provider-qualified session routes without cwd payloads', async () => {
-    mockOkJson({ sessions: [], providers: [], next_cursor: null })
-    await api.listProjectSessions('project-1', { archived: false })
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/sessions?archived=false', expect.any(Object)
-    )
-
-    mockOkJson({ key, turns: [] })
-    await api.getProjectSession('project-1', key)
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/providers/codex/sessions/session-1?include_turns=true', expect.any(Object)
-    )
-
-    mockOkJson({ key, turns: [] }, 201)
-    await api.startProjectSession('project-1', { provider_id: 'codex', model: 'gpt-5' })
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/sessions',
-      expect.objectContaining({ method: 'POST', body: JSON.stringify({ provider_id: 'codex', model: 'gpt-5' }) })
-    )
-
-    mockOkJson({ key, turns: [] })
-    await api.resumeProjectSession('project-1', key)
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/providers/codex/sessions/session-1/resume',
-      expect.objectContaining({ method: 'POST' })
-    )
-  })
-
-  it('sends provider-neutral turn controls and actions', async () => {
-    mockOkJson({ turn_id: 'turn-1', status: 'running', items: [] }, 201)
-    await api.startProjectTurn('project-1', key, {
-      text: 'hello', attachment_ids: ['attachment-1'], model: 'gpt-5',
-      reasoning_level: 'high', reasoning_summary: 'concise',
+    mockOkJson({
+      schema_version: 1,
+      managed_root: '/srv/code',
+      candidates: [
+        {
+          relative_path: 'tools/kilo',
+          display_name: 'Kilo',
+          registered_project_id: null,
+          addable: true,
+          add_blocker: null,
+        },
+      ],
+      visited_entries: 4,
+      skipped_unreadable: 1,
+      truncated: false,
+      limits: { max_visited_entries: 500, max_candidates: 100 },
     })
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/providers/codex/sessions/session-1/turns',
-      expect.objectContaining({
-        method: 'POST',
-        body: JSON.stringify({
-          text: 'hello', attachment_ids: ['attachment-1'], model: 'gpt-5',
-          reasoning_level: 'high', reasoning_summary: 'concise',
-        }),
-      })
-    )
-
-    mockOkJson({ status: 'interrupted' })
-    await api.interruptProjectTurn('project-1', key, 'turn-1')
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/providers/codex/sessions/session-1/turns/turn-1/interrupt',
-      expect.objectContaining({ method: 'POST' })
-    )
-
-    mockOkJson({ status: 'recorded' })
-    await api.respondToApproval('project-1', key, 'approval-1', 'accept')
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/projects/project-1/planning/providers/codex/sessions/session-1/approvals/approval-1',
-      expect.objectContaining({ method: 'POST', body: JSON.stringify({ decision: 'accept' }) })
-    )
-  })
-
-  it('uploads multipart attachments without a JSON content type', async () => {
-    api.setAuthToken('test-token')
-    mockOkJson({ attachment_id: 'a-1', filename: 'diagram.png', kind: 'image', size_bytes: 3 }, 201)
-    await api.uploadAttachment('project-1', key, new File(['abc'], 'diagram.png', { type: 'image/png' }), 'image')
-
-    const [, options] = vi.mocked(global.fetch).mock.calls.at(-1)!
-    expect(options.body).toBeInstanceOf(FormData)
-    expect(options.headers.Authorization).toBe('Bearer test-token')
-    expect(options.headers['Content-Type']).toBeUndefined()
-  })
-
-  it('surfaces bounded provider error messages', async () => {
-    vi.mocked(global.fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 503,
-      text: async () => JSON.stringify({ detail: { code: 'provider_unavailable', message: 'Planning provider is unavailable.' } }),
-    } as Response)
-    await expect(api.listProjectSessions('project-1')).rejects.toThrow('Planning provider is unavailable.')
-  })
-
-  it('surfaces an authenticated control-plane failure and clears the in-memory bearer on logout', async () => {
-    api.setAuthToken('test-token')
-    vi.mocked(global.fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 401,
-      text: async () => JSON.stringify({ detail: { code: 'unauthorized' } }),
-    } as Response)
-    await expect(api.getControlPlaneReadiness()).rejects.toMatchObject({ status: 401, code: 'unauthorized' })
-
-    api.clearAuthToken()
-    mockOkJson({ ready: true, projects: [] })
-    await api.getControlPlaneReadiness()
-    expect(global.fetch).toHaveBeenLastCalledWith('/ready', expect.objectContaining({
-      headers: expect.not.objectContaining({ Authorization: expect.anything() }),
+    const discovery = await api.getProjectDiscovery()
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/project-discovery', expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
     }))
-    expect(window.localStorage.length).toBe(0)
+    expect(discovery.candidates[0].relative_path).toBe('tools/kilo')
+    expect(discovery.candidates[0].addable).toBe(true)
   })
 
-  it('keeps planning draft routes while using the control-plane run contract', async () => {
-    mockOkJson({ name: 'plan-a', path: '/tmp/plan-a.md', status: 'draft' }, 201)
-    await api.savePlanDraft('project-1', { name: 'plan-a', content: '# Plan' })
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/drafts', expect.objectContaining({ method: 'POST' }))
+  it('uses revisioned project plan routes', async () => {
+    mockOkJson({ project_id: 'project-1', name: 'demo.md', path: 'plans/todo/demo.md', status: 'todo', revision: 'a'.repeat(64), size_bytes: 6 }, 201)
+    await api.createProjectPlan('project-1', { name: 'demo.md', content: '# Plan' })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans', expect.objectContaining({ method: 'POST' }))
 
-    mockOkJson({ projects: [{ project_id: 'control-project', root: '/workspace/alpha', schema_version: 1 }] })
-    expect((await api.listControlPlaneProjects())[0].project_id).toBe('control-project')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects', expect.any(Object))
+    mockOkJson({ project_id: 'project-1', name: 'demo.md', path: 'plans/todo/demo.md', status: 'todo', revision: 'b'.repeat(64), size_bytes: 9 })
+    await api.updateProjectPlan('project-1', 'todo', 'demo.md', { content: '# Updated', expected_revision: 'a'.repeat(64) })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/todo/demo.md', expect.objectContaining({ method: 'PUT' }))
 
-    mockOkJson({ ready: true, projects: ['control-project'] })
-    await expect(api.getControlPlaneReadiness()).resolves.toEqual({ ready: true, projects: ['control-project'] })
-    expect(global.fetch).toHaveBeenLastCalledWith('/ready', expect.any(Object))
-
-    mockOkJson({ schema_version: 1, workflows: ['managed'], teams: ['review'], roles: ['worker'], controls: ['max_turns'], context_levels: ['lite'], team_upgrade_chains: {}, control_safety: { max_turns: 'safe' }, service_features: [] })
-    await api.getControlPlaneCapabilities('control project')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/control%20project/capabilities', expect.any(Object))
-
-    mockOkJson({ runs: [], next_cursor: null, schema_version: 1 })
-    await api.listControlPlaneRuns('control-project', { limit: 100 })
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/control-project/runs?limit=100', expect.any(Object))
-
-    mockOkJson({ result: { run_id: 'run-1', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null }, startup_question: null }, 201)
-    await api.startControlPlaneRun('control-project', { plan_path: 'plans/todo/demo.md' }, 'start-key')
-    expect(global.fetch).toHaveBeenLastCalledWith(
-      '/api/control-plane/projects/control-project/runs',
-      expect.objectContaining({ method: 'POST', headers: expect.objectContaining({ 'Idempotency-Key': 'start-key' }) }),
-    )
-
-    mockOkJson({ result: { run_id: 'run-1', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null }, startup_question: null })
-    await api.answerStartupQuestion('control-project', 'question-1', 'implement', 'answer-key')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/control-project/startup-answers/question-1', expect.objectContaining({ method: 'POST' }))
-
-    mockOkJson({ revision: 1, changed: true, owner_stop: false, run: { run_id: 'run-1' } })
-    await api.controlControlPlaneRun('control-project', 'run-1', { expected_revision: 0, max_turns: 3 }, 'control-key')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/control-project/runs/run-1/control', expect.objectContaining({ method: 'PATCH' }))
-
-    mockOkJson({ run_id: 'run-1', status: 'owner_stopped' })
-    await api.ownerStopControlPlaneRun('control-project', 'run-1', 1, 'stop-key')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/control-project/runs/run-1/owner-stop', expect.objectContaining({ method: 'POST' }))
-
-    mockOkJson({ run_id: 'run-2', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null }, 201)
-    await api.resumeControlPlaneRun('control-project', 'run-1', 'resume-key')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/control-project/runs/run-1/resume', expect.objectContaining({ method: 'POST' }))
+    mockOkJson({ project_id: 'project-1', name: 'demo.md', path: 'plans/in-progress/demo.md', status: 'in_progress', revision: 'b'.repeat(64), size_bytes: 9 })
+    await api.promoteProjectPlan('project-1', 'todo', 'demo.md', { expected_revision: 'b'.repeat(64) })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/todo/demo.md/promote', expect.objectContaining({ method: 'POST' }))
   })
 
-  it('reconnects authenticated run streams from the latest sequence without duplicate events or token URLs', async () => {
+  it('keeps idempotency keys out of mutation URLs and storage', async () => {
     api.setAuthToken('test-token')
-    const encoder = new TextEncoder()
-    const streamResponse = (events: Array<{ sequence: number; event_type: string; data: Record<string, unknown>; schema_version: number; timestamp: string }>) => ({
-      ok: true,
-      status: 200,
-      body: new ReadableStream({
-        start(controller) {
-          controller.enqueue(encoder.encode(`event: events\ndata: ${JSON.stringify({ events })}\n\n`))
-          controller.close()
+    window.localStorage.clear(); window.sessionStorage.clear()
+    mockOkJson({ result: { run_id: 'run-1', created: true, status: 'running', schema_version: 1 }, startup_question: null }, 201)
+    await api.startControlPlaneRun('control-project', { plan_path: 'plans/todo/demo.md' }, 'start-key')
+    const [url, options] = vi.mocked(global.fetch).mock.calls.at(-1)!
+    expect(url).not.toContain('test-token'); expect(url).not.toContain('start-key')
+    expect(options.headers).toEqual(expect.objectContaining({ Authorization: 'Bearer test-token', 'Idempotency-Key': 'start-key' }))
+    expect(window.localStorage.length).toBe(0); expect(window.sessionStorage.length).toBe(0)
+  })
+
+  it('surfaces structured API failures', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false, status: 409,
+      text: async () => JSON.stringify({ detail: { code: 'revision_conflict', current_revision: 'b'.repeat(64) } }),
+    } as Response)
+    await expect(api.updateProjectPlan('project-1', 'todo', 'demo.md', { content: 'x', expected_revision: 'a'.repeat(64) }))
+      .rejects.toMatchObject({ status: 409, code: 'revision_conflict' })
+  })
+
+  it('creates and unregisters projects through the registry-scoped contract', async () => {
+    api.setAuthToken('test-token')
+    mockOkJson({
+      id: 'beta', display_name: 'Beta', relative_root: 'beta', root: '/srv/code/beta',
+      created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required',
+    }, 201)
+    const created = await api.createProject({
+      mode: 'register', path: 'beta', display_name: 'Beta', main_branch: 'main',
+      initial_workflow: 'starter', initial_team: null, initialize_git: true, initialize_config: false,
+    })
+    expect(created.id).toBe('beta')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({
+        mode: 'register', path: 'beta', display_name: 'Beta', main_branch: 'main',
+        initial_workflow: 'starter', initial_team: null, initialize_git: true, initialize_config: false,
+      }),
+    }))
+
+    mockOkJson(undefined, 204)
+    await api.unregisterProject('beta')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('reads, validates, and revision-saves the canonical configuration pair', async () => {
+    api.setAuthToken('test-token')
+    const validation = {
+      state: 'configuration_required', issues: [], placeholders: ['harness.starter.profiles.default.model'],
+      workflows: ['starter'], teams: [], roles: [],
+    }
+    mockOkJson({
+      project_id: 'beta', revision: 'a'.repeat(64), documents: ['aflow.toml', 'workflows.toml'],
+      aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', validation,
+    })
+    const config = await api.getProjectConfig('beta')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config', expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+    }))
+    expect(config.revision).toBe('a'.repeat(64))
+
+    mockOkJson(validation)
+    await api.validateProjectConfig('beta', { aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config/validate', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' }),
+    }))
+
+    mockOkJson({ ...config, revision: 'b'.repeat(64) })
+    await api.saveProjectConfig('beta', {
+      aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', expected_revision: 'a'.repeat(64),
+    })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({
+        aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', expected_revision: 'a'.repeat(64),
+      }),
+    }))
+  })
+
+  it('transforms a candidate pair through the pure form endpoint without a revision', async () => {
+    api.setAuthToken('test-token')
+    const validation = {
+      state: 'ready', issues: [], placeholders: [],
+      workflows: ['starter'], teams: [], roles: ['worker'],
+    }
+    mockOkJson({
+      aflow_toml: '# configured\n', workflows_toml: '# workflows\n', changed: true,
+      validation,
+      form: {
+        default_workflow: 'starter', max_turns: null, harnesses: {}, roles: {},
+        teams: {}, workflow_default_teams: {}, workflows: {},
+      },
+      syntax_issues: [],
+      choices: { harnesses: [], profiles: {}, selectors: [], roles: ['worker'], teams: [], workflows: ['starter'] },
+      suggestions: { label: 'suggestion', harnesses: [], profiles: [], note: 'Bundled values are suggestions.' },
+      starter_defaults: null,
+    })
+    const response = await api.postProjectConfigForm('beta', {
+      aflow_toml: '# aflow\n',
+      workflows_toml: '# workflows\n',
+      action: { type: 'set_global_role', role: 'worker', selector: 'starter.default' },
+    })
+    expect(response.changed).toBe(true)
+    expect(response.form?.default_workflow).toBe('starter')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config/form', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({
+        aflow_toml: '# aflow\n',
+        workflows_toml: '# workflows\n',
+        action: { type: 'set_global_role', role: 'worker', selector: 'starter.default' },
+      }),
+      headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+    }))
+    // The pure transform never sends or receives a revision.
+    expect((vi.mocked(global.fetch).mock.calls.at(-1)![1] as RequestInit).body).not.toContain('revision')
+  })
+
+  it('carries config conflict and blocker detail through ApiError', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false, status: 409,
+      text: async () => JSON.stringify({
+        detail: {
+          code: 'config_save_blocked',
+          blocking_runs: [{ run_id: 'run-9', status: 'running' }],
         },
       }),
     } as Response)
-    vi.mocked(global.fetch)
-      .mockResolvedValueOnce(streamResponse([{ sequence: 1, event_type: 'started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:00Z' }]))
-      .mockResolvedValueOnce(streamResponse([
-        { sequence: 1, event_type: 'started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:00Z' },
-        { sequence: 2, event_type: 'progress', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:01Z' },
-      ]))
-    const received: number[] = []
-    let unsubscribe = () => {}
-    unsubscribe = api.subscribeToRunEvents({
-      projectId: 'control-project',
-      runId: 'run-1',
-      afterSequence: 0,
-      reconnectDelaysMs: [0],
-      onEvents: (events) => {
-        received.push(...events.map((event) => event.sequence))
-        if (received.includes(2)) unsubscribe()
-      },
+    await expect(api.saveProjectConfig('beta', {
+      aflow_toml: 'x', workflows_toml: 'y', expected_revision: 'a'.repeat(64),
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'config_save_blocked',
+      detail: { blocking_runs: [{ run_id: 'run-9', status: 'running' }] },
     })
-    for (let attempt = 0; attempt < 20 && !received.includes(2); attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+  })
 
-    expect(received).toEqual([1, 2])
-    const streamCalls = vi.mocked(global.fetch).mock.calls
-    expect(streamCalls[0][0]).toBe('/api/control-plane/projects/control-project/runs/run-1/events/stream?after_sequence=0&limit=100')
-    expect(streamCalls[1][0]).toBe('/api/control-plane/projects/control-project/runs/run-1/events/stream?after_sequence=1&limit=100')
-    expect(streamCalls.every(([url]) => !String(url).includes('test-token'))).toBe(true)
-    expect(streamCalls[0][1]?.headers).toEqual(expect.objectContaining({ Authorization: 'Bearer test-token' }))
+  it('resumes the run event stream from the last sequence and deduplicates replayed events', async () => {
+    api.setAuthToken('test-token')
+    const encoder = new TextEncoder()
+    const streamFor = (frames: string[]) => {
+      let sent = 0
+      return new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent < frames.length) {
+            controller.enqueue(encoder.encode(frames[sent]))
+            sent += 1
+          } else {
+            controller.error(new Error('stream dropped'))
+          }
+        },
+      })
+    }
+    const events = (sequences: number[]) => JSON.stringify({
+      events: sequences.map((sequence) => ({
+        sequence, event_type: `tick_${sequence}`, data: {}, schema_version: 1, timestamp: '2026-01-01T00:00:00Z',
+      })),
+    })
+    vi.mocked(global.fetch)
+      .mockResolvedValueOnce({ ok: true, status: 200, body: streamFor([`data: ${events([1, 2])}\n\n`]) } as unknown as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, body: streamFor([`data: ${events([2, 3])}\n\n`]) } as unknown as Response)
+
+    const batches: number[][] = []
+    const states: api.StreamState[] = []
+    const errors: string[] = []
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1',
+      runId: 'run-1',
+      reconnectDelaysMs: [1],
+      onEvents: (incoming) => batches.push(incoming.map((event) => event.sequence)),
+      onStateChange: (state) => states.push(state),
+      onError: (error) => errors.push(error.message),
+    })
+
+    await waitFor(() => expect(batches.flat()).toEqual([1, 2, 3]))
+    unsubscribe()
+
+    const firstUrl = vi.mocked(global.fetch).mock.calls[0][0] as string
+    const secondUrl = vi.mocked(global.fetch).mock.calls[1][0] as string
+    expect(firstUrl).not.toContain('after_sequence')
+    expect(secondUrl).toContain('after_sequence=2')
+    expect(secondUrl).not.toContain('test-token')
+    // Sequence 2 was replayed by the server after reconnect but delivered once.
+    expect(batches).toEqual([[1, 2], [3]])
+    expect(states).toContain('connected')
+    expect(states).toContain('reconnecting')
+    expect(errors.length).toBeGreaterThan(0)
+  })
+
+  it('reports stream failures as connection state without inventing run state', async () => {
+    api.setAuthToken('test-token')
+    vi.mocked(global.fetch).mockResolvedValue({
+      ok: false, status: 503, text: async () => 'control plane unavailable',
+    } as Response)
+    const states: api.StreamState[] = []
+    const errors: string[] = []
+    const unsubscribe = api.subscribeToRunEvents({
+      projectId: 'project-1',
+      runId: 'run-1',
+      reconnectDelaysMs: [1],
+      onEvents: () => {},
+      onStateChange: (state) => states.push(state),
+      onError: (error) => errors.push(error.message),
+    })
+    await waitFor(() => expect(errors.length).toBeGreaterThanOrEqual(2))
+    unsubscribe()
+    expect(errors[0]).toContain('control plane unavailable')
+    expect(states[states.length - 1]).toBe('stopped')
+    expect(states).not.toContain('connected')
   })
 })
+
+function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    let lastError: unknown = null
+    const tick = () => {
+      let satisfied = false
+      try {
+        satisfied = predicate()
+      } catch (error) {
+        lastError = error
+      }
+      if (satisfied) {
+        resolve()
+        return
+      }
+      if (Date.now() - started > timeoutMs) {
+        reject(lastError ?? new Error('waitFor timed out'))
+        return
+      }
+      setTimeout(tick, 5)
+    }
+    tick()
+  })
+}

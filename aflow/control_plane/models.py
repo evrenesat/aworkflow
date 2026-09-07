@@ -72,12 +72,29 @@ def bounded_redacted(value: Any, *, depth: int = 0) -> Any:
 
 
 @dataclass(frozen=True)
+class WorkflowCapability:
+    """Ordered workflow choices safe to expose before a launch."""
+
+    declared_steps: tuple[str, ...] = ()
+    executable_steps: tuple[str, ...] = ()
+    excluded_steps: tuple[str, ...] = ()
+    first_step: str | None = None
+    default_team: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
 class CapabilitySet:
     schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
     workflows: tuple[str, ...] = ()
     teams: tuple[str, ...] = ()
     roles: tuple[str, ...] = ()
     controls: tuple[str, ...] = ()
+    workflow_details: Mapping[str, WorkflowCapability] = field(default_factory=dict)
+    admitted_role_selectors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    status_values: tuple[str, ...] = ()
     context_levels: tuple[Literal["lite", "full"], ...] = ("lite", "full")
     team_upgrade_chains: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     control_safety: Mapping[str, Literal["safe", "restart_required"]] = field(
@@ -104,6 +121,9 @@ class RunStatus:
     current_step: str | None = None
     turns_completed: int | None = None
     max_turns: int | None = None
+    selected_start_step: str | None = None
+    skipped_steps: tuple[str, ...] = ()
+    restarted_from_run_id: str | None = None
     evidence: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -118,6 +138,7 @@ class StartRunResult:
     schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
     manifest_path: str | None = None
     reason: str | None = None
+    restarted_from_run_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))
@@ -237,6 +258,8 @@ class LaunchManifest:
     request_digest: str | None = None
     frozen_config_fingerprint: str | None = None
     intended_unit: str | None = None
+    restarted_from_run_id: str | None = None
+    skipped_steps: tuple[str, ...] = ()
     created_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -262,6 +285,8 @@ class LaunchManifest:
             "request_digest": self.request_digest,
             "frozen_config_fingerprint": self.frozen_config_fingerprint,
             "intended_unit": self.intended_unit,
+            "restarted_from_run_id": self.restarted_from_run_id,
+            "skipped_steps": list(self.skipped_steps),
             "created_at": self.created_at,
         }
 

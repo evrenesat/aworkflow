@@ -59,9 +59,14 @@ class WorkflowRunner:
             team=prepared.team,
             extra_instructions=prepared.extra_instructions,
             start_step=prepared.start_step,
+            continuation_from_branch=prepared.continuation_from_branch,
+            continuation_from_head=prepared.continuation_from_head,
+            continuation_mode=prepared.continuation_mode,
             reserved_run_id=prepared.reserved_run_id,
             idempotency_key=prepared.idempotency_key,
             caller_scope=prepared.caller_scope,
+            restarted_from_run_id=prepared.restarted_from_run_id,
+            skipped_steps=prepared.skipped_steps,
         )
 
         parsed_plan: ParsedPlan | None = None

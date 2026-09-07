@@ -1,17 +1,16 @@
 import type {
-  Attachment,
-  AttachmentKind,
-  PendingApproval,
-  PlanInfo,
-  PlanningSession,
-  PlanningSessionPage,
+  ConfigValidation,
+  PlanDocument,
+  PlanStatus,
+  ProjectConfig,
+  ProjectConfigFormRequest,
+  ProjectConfigFormResponse,
+  ProjectConfigSaveRequest,
+  ProjectConfigValidateRequest,
+  ProjectCreateRequest,
+  ProjectCreateResult,
+  ProjectDiscovery,
   ProjectInfo,
-  ProviderModels,
-  ProviderReadiness,
-  ReasoningOptions,
-  SessionKey,
-  StartTurnRequest,
-  PlanningTurn,
   ControlPlaneCapabilities,
   ControlPlanePlan,
   ControlPlaneProject,
@@ -23,9 +22,12 @@ import type {
   RunEventTail,
   RunPage,
   RunStatus,
+  StartRunRequest,
   StartRunResponse,
   StartRunResult,
 } from './types'
+
+import { consumeActivityMarker, resetActivityMarker } from './activity'
 
 const API_BASE = '/api'
 
@@ -66,17 +68,42 @@ function getHeaders(includeJson = true): HeadersInit {
   return headers
 }
 
+type SessionExpiredHandler = () => void
+
+let sessionExpiredHandler: SessionExpiredHandler | null = null
+let sessionRequests = new AbortController()
+
+export function setSessionExpiredHandler(handler: SessionExpiredHandler | null): void {
+  sessionExpiredHandler = handler
+}
+
+function isSessionUrl(url: string): boolean {
+  return url === '/api/session' || url.startsWith('/api/session/')
+}
+
 async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const includeJson = !(options.body instanceof FormData)
+  const headers: Record<string, string> = {
+    ...getHeaders(includeJson) as Record<string, string>,
+    ...options.headers as Record<string, string>,
+  }
+  // Visible page restoration counts as use; login and logout do not renew.
+  if ((!isSessionUrl(url) || !options.method || options.method === 'GET') && consumeActivityMarker()) {
+    headers['X-AFlow-Activity'] = '1'
+  }
+  const signal = options.signal ?? sessionRequests.signal
   const response = await fetch(url, {
+    credentials: 'same-origin',
+    signal,
     ...options,
-    headers: {
-      ...getHeaders(includeJson),
-      ...options.headers,
-    },
+    headers,
   })
 
+  if (signal.aborted) throw new DOMException('Session ended', 'AbortError')
   if (!response.ok) {
+    if (response.status === 401 && !isSessionUrl(url)) {
+      sessionExpiredHandler?.()
+    }
     const text = await response.text()
     let message = text
     let code: string | null = null
@@ -100,7 +127,9 @@ async function fetchJson<T>(url: string, options: RequestInit = {}): Promise<T> 
     return undefined as T
   }
 
-  return response.json()
+  const result = await response.json()
+  if (signal.aborted) throw new DOMException('Session ended', 'AbortError')
+  return result
 }
 
 function buildQuery(params: Record<string, string | number | boolean | string[] | undefined>): string {
@@ -119,8 +148,34 @@ function buildQuery(params: Record<string, string | number | boolean | string[] 
   return query ? `?${query}` : ''
 }
 
+export async function checkSession(): Promise<{ authenticated: boolean }> {
+  return fetchJson<{ authenticated: boolean }>('/api/session')
+}
+
+/**
+ * Exchange the deployment bearer for a signed HttpOnly session cookie. The
+ * token travels only in this request header and is never stored.
+ */
+export async function loginSession(token: string): Promise<{ authenticated: boolean }> {
+  return fetchJson<{ authenticated: boolean }>('/api/session', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export async function logoutSession(): Promise<void> {
+  await fetchJson<void>('/api/session', { method: 'DELETE' })
+  sessionRequests.abort()
+  sessionRequests = new AbortController()
+  resetActivityMarker()
+}
+
 export async function listProjects(): Promise<ProjectInfo[]> {
   return fetchJson<ProjectInfo[]>(`${API_BASE}/projects`)
+}
+
+export async function getProjectDiscovery(): Promise<ProjectDiscovery> {
+  return fetchJson<ProjectDiscovery>(`${API_BASE}/project-discovery`)
 }
 
 export async function getProject(projectId: string): Promise<ProjectInfo> {
@@ -137,168 +192,101 @@ export async function updateProject(
   })
 }
 
-export async function listProjectPlans(projectId: string): Promise<PlanInfo[]> {
-  return fetchJson<PlanInfo[]>(`${API_BASE}/projects/${projectId}/plans`)
+export async function createProject(request: ProjectCreateRequest): Promise<ProjectCreateResult> {
+  return fetchJson<ProjectCreateResult>(`${API_BASE}/projects`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })
 }
 
-function sessionPath(projectId: string, key: SessionKey): string {
-  return `${API_BASE}/projects/${projectId}/planning/providers/${encodeURIComponent(key.provider_id)}/sessions/${encodeURIComponent(key.provider_session_id)}`
+export async function unregisterProject(projectId: string): Promise<void> {
+  await fetchJson<void>(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, {
+    method: 'DELETE',
+  })
 }
 
-export async function listPlanningProviders(): Promise<ProviderReadiness[]> {
-  const response = await fetchJson<{ providers: ProviderReadiness[] }>(`${API_BASE}/planning/providers`)
-  return response.providers
+export async function getProjectConfig(projectId: string): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/config`)
 }
 
-export async function listProviderModels(providerId: string): Promise<ProviderModels> {
-  return fetchJson<ProviderModels>(`${API_BASE}/planning/providers/${encodeURIComponent(providerId)}/models`)
-}
-
-export async function listReasoningOptions(providerId: string): Promise<ReasoningOptions> {
-  return fetchJson<ReasoningOptions>(`${API_BASE}/planning/providers/${encodeURIComponent(providerId)}/reasoning-options`)
-}
-
-export async function listProjectSessions(
+export async function saveProjectConfig(
   projectId: string,
-  request: { archived?: boolean } = {}
-): Promise<PlanningSessionPage> {
-  return fetchJson<PlanningSessionPage>(
-    `${API_BASE}/projects/${projectId}/planning/sessions${buildQuery(request)}`
+  request: ProjectConfigSaveRequest,
+): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/config`, {
+    method: 'PUT',
+    body: JSON.stringify(request),
+  })
+}
+
+export async function validateProjectConfig(
+  projectId: string,
+  request: ProjectConfigValidateRequest,
+): Promise<ConfigValidation> {
+  return fetchJson<ConfigValidation>(
+    `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/validate`,
+    { method: 'POST', body: JSON.stringify(request) },
   )
 }
 
-export async function getProjectSession(
+/**
+ * Transform one candidate pair (plus at most one typed action) through the
+ * pure guided form.  The endpoint never saves: no revision is sent.
+ */
+export async function postProjectConfigForm(
   projectId: string,
-  key: SessionKey,
-  includeTurns = true
-): Promise<PlanningSession> {
-  return fetchJson<PlanningSession>(`${sessionPath(projectId, key)}${buildQuery({ include_turns: includeTurns })}`)
+  request: ProjectConfigFormRequest,
+  options: { signal?: AbortSignal } = {},
+): Promise<ProjectConfigFormResponse> {
+  return fetchJson<ProjectConfigFormResponse>(
+    `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/form`,
+    { method: 'POST', body: JSON.stringify(request), signal: options.signal },
+  )
 }
 
-export async function startProjectSession(
+export async function listProjectPlans(projectId: string, status?: PlanStatus): Promise<PlanDocument[]> {
+  return fetchJson<PlanDocument[]>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/plans${buildQuery({ status })}`)
+}
+
+export async function createProjectPlan(
   projectId: string,
-  request: { provider_id?: string; model?: string; reasoning_level?: string } = {}
-): Promise<PlanningSession> {
-  return fetchJson<PlanningSession>(`${API_BASE}/projects/${projectId}/planning/sessions`, {
+  request: { name: string; content: string },
+): Promise<PlanDocument> {
+  return fetchJson<PlanDocument>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/plans`, {
     method: 'POST',
     body: JSON.stringify(request),
   })
 }
 
-export async function resumeProjectSession(projectId: string, key: SessionKey): Promise<PlanningSession> {
-  return fetchJson<PlanningSession>(`${sessionPath(projectId, key)}/resume`, {
-    method: 'POST',
-  })
+function planPath(projectId: string, status: PlanStatus, name: string): string {
+  return `${API_BASE}/projects/${encodeURIComponent(projectId)}/plans/${status}/${encodeURIComponent(name)}`
 }
 
-export async function forkProjectSession(projectId: string, key: SessionKey): Promise<PlanningSession> {
-  return fetchJson<PlanningSession>(`${sessionPath(projectId, key)}/fork`, {
-    method: 'POST',
-  })
+export async function readProjectPlan(projectId: string, status: PlanStatus, name: string): Promise<PlanDocument> {
+  return fetchJson<PlanDocument>(planPath(projectId, status, name))
 }
 
-export async function setProjectSessionName(projectId: string, key: SessionKey, name: string): Promise<void> {
-  return fetchJson<void>(sessionPath(projectId, key), {
-    method: 'PATCH',
-    body: JSON.stringify({ name }),
-  })
-}
-
-export async function setProjectSessionArchived(
+export async function updateProjectPlan(
   projectId: string,
-  key: SessionKey,
-  archived: boolean
-): Promise<{ archived: boolean }> {
-  return fetchJson<{ archived: boolean }>(`${sessionPath(projectId, key)}/${archived ? 'archive' : 'unarchive'}`, {
-    method: 'POST',
-  })
-}
-
-export async function startProjectTurn(projectId: string, key: SessionKey, request: StartTurnRequest): Promise<PlanningTurn> {
-  return fetchJson<PlanningTurn>(`${sessionPath(projectId, key)}/turns`, {
-    method: 'POST',
+  status: PlanStatus,
+  name: string,
+  request: { content: string; expected_revision: string },
+): Promise<PlanDocument> {
+  return fetchJson<PlanDocument>(planPath(projectId, status, name), {
+    method: 'PUT',
     body: JSON.stringify(request),
   })
 }
 
-export async function interruptProjectTurn(projectId: string, key: SessionKey, turnId: string): Promise<void> {
-  return fetchJson<void>(`${sessionPath(projectId, key)}/turns/${encodeURIComponent(turnId)}/interrupt`, { method: 'POST' })
-}
-
-export async function listPendingApprovals(projectId: string, key: SessionKey): Promise<PendingApproval[]> {
-  const response = await fetchJson<{ approvals: PendingApproval[] }>(`${sessionPath(projectId, key)}/approvals`)
-  return response.approvals
-}
-
-export async function respondToApproval(
+export async function promoteProjectPlan(
   projectId: string,
-  key: SessionKey,
-  approvalId: string,
-  decision: 'accept' | 'decline' | 'cancel'
-): Promise<void> {
-  return fetchJson<void>(`${sessionPath(projectId, key)}/approvals/${encodeURIComponent(approvalId)}`, {
-    method: 'POST',
-    body: JSON.stringify({ decision }),
-  })
-}
-
-export async function listAttachments(projectId: string, key: SessionKey): Promise<Attachment[]> {
-  const response = await fetchJson<{ attachments: Attachment[] }>(`${sessionPath(projectId, key)}/attachments`)
-  return response.attachments
-}
-
-export async function uploadAttachment(
-  projectId: string,
-  key: SessionKey,
-  file: File,
-  kind: AttachmentKind
-): Promise<Attachment> {
-  const body = new FormData()
-  body.append('file', file)
-  body.append('kind', kind)
-  return fetchJson<Attachment>(`${sessionPath(projectId, key)}/attachments`, {
-    method: 'POST',
-    body,
-  })
-}
-
-export async function deleteAttachment(projectId: string, key: SessionKey, attachmentId: string): Promise<void> {
-  return fetchJson<void>(`${sessionPath(projectId, key)}/attachments/${encodeURIComponent(attachmentId)}`, {
-    method: 'DELETE',
-  })
-}
-
-export async function listPlanDrafts(projectId: string): Promise<string[]> {
-  return fetchJson<string[]>(`${API_BASE}/projects/${projectId}/plans/drafts`)
-}
-
-export async function savePlanDraft(
-  projectId: string,
-  request: { name: string; content: string }
-): Promise<{ name: string; path: string; status: 'draft' }> {
-  return fetchJson<{ name: string; path: string; status: 'draft' }>(`${API_BASE}/projects/${projectId}/plans/drafts`, {
+  status: Exclude<PlanStatus, 'done'>,
+  name: string,
+  request: { expected_revision: string; target_name?: string | null },
+): Promise<PlanDocument> {
+  return fetchJson<PlanDocument>(`${planPath(projectId, status, name)}/promote`, {
     method: 'POST',
     body: JSON.stringify(request),
-  })
-}
-
-export async function loadPlanDraft(projectId: string, name: string): Promise<{ name: string; content: string }> {
-  return fetchJson<{ name: string; content: string }>(`${API_BASE}/projects/${projectId}/plans/drafts/${name}`)
-}
-
-export async function promotePlanDraft(
-  projectId: string,
-  request: { draft_name: string; target_name?: string | null }
-): Promise<{ name: string; path: string; status: 'in_progress' }> {
-  return fetchJson<{ name: string; path: string; status: 'in_progress' }>(`${API_BASE}/projects/${projectId}/plans/promote`, {
-    method: 'POST',
-    body: JSON.stringify(request),
-  })
-}
-
-export async function deletePlanDraft(projectId: string, name: string): Promise<void> {
-  return fetchJson<void>(`${API_BASE}/projects/${projectId}/plans/drafts/${name}`, {
-    method: 'DELETE',
   })
 }
 
@@ -368,13 +356,7 @@ export async function getRunContext(
 
 export async function startControlPlaneRun(
   projectId: string,
-  request: {
-    plan_path: string
-    workflow_name?: string
-    team?: string
-    start_step?: string
-    max_turns?: number
-  },
+  request: StartRunRequest,
   idempotencyKey: string,
 ): Promise<StartRunResponse> {
   return fetchJson<StartRunResponse>(`${controlProjectPath(projectId)}/runs`, {
@@ -525,9 +507,15 @@ export function subscribeToRunEvents(subscription: RunEventSubscription): () => 
             after_sequence: cursor,
             limit: 100,
           })}`,
-          { headers: getHeaders(false), signal: controller.signal },
+          { headers: getHeaders(false), credentials: 'same-origin', signal: controller.signal },
         )
         if (!response.ok) {
+          if (response.status === 401) {
+            // The browser session expired; stop reconnecting instead of
+            // retrying the stream against a signed-out session.
+            sessionExpiredHandler?.()
+            return
+          }
           const message = await response.text()
           throw new ApiError(response.status, message || 'Run event stream failed')
         }
@@ -569,36 +557,5 @@ export async function checkHealth(): Promise<{ status: string }> {
   if (!response.ok) {
     throw new Error('Health check failed')
   }
-  return response.json()
-}
-
-export async function transcribeAudio(audioFile: File): Promise<{ text: string }> {
-  const formData = new FormData()
-  formData.append('file', audioFile)
-
-  const token = getAuthToken()
-  const headers: HeadersInit = {}
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`
-  }
-
-  const response = await fetch(`${API_BASE}/transcribe`, {
-    method: 'POST',
-    headers,
-    body: formData,
-  })
-
-  if (!response.ok) {
-    const text = await response.text()
-    let message = text
-    try {
-      const json = JSON.parse(text)
-      message = json.detail || json.message || text
-    } catch {
-      // Use text as-is
-    }
-    throw new ApiError(response.status, message)
-  }
-
   return response.json()
 }

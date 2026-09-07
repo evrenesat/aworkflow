@@ -1004,7 +1004,8 @@ def build_manager_context(
     """Build deterministic manager context from durable run artifacts.
 
     The exact same function is intentionally suitable for runtime and later
-    analysis.  Full is the sole path that reads the active plan text.
+    analysis. Historical v1/v2 shapes retain their stored body fields; live
+    selector-4 boundaries emit reference-only schema-v3 contexts.
 
     ``capture_evidence`` is true only for live runtime boundaries: it writes
     content-addressed plan/checkpoint evidence (idempotently, reusing any

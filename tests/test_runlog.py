@@ -664,6 +664,45 @@ def test_evidence_resolve_roundtrip_and_fail_closed_validation(tmp_path: Path) -
         resolve_evidence_artifact(paths, missing)
 
 
+def test_evidence_store_accepts_repo_alias_without_weakening_symlink_containment(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-repo"
+    real_root.mkdir()
+    alias_root = tmp_path / "repo-alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    plan_path = real_root / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    canonical_paths = create_run_paths(
+        ControllerConfig(repo_root=real_root.resolve(), plan_path=plan_path)
+    )
+    alias_run_dir = alias_root / canonical_paths.run_dir.relative_to(real_root.resolve())
+    paths = RunPaths(
+        repo_root=real_root.resolve(),
+        runs_root=canonical_paths.runs_root,
+        run_dir=alias_run_dir,
+        turns_dir=alias_run_dir / "turns",
+        manager_dir=alias_run_dir / "manager",
+        run_json=alias_run_dir / "run.json",
+    )
+
+    body = b"ALIAS-SENTINEL\n"
+    ref = store_evidence_artifact(paths, kind="plan", data=body)
+    assert ref.path == (
+        f".aflow/runs/{canonical_paths.run_dir.name}/evidence/plans/"
+        f"{hashlib.sha256(body).hexdigest()}.md"
+    )
+    assert resolve_evidence_artifact(paths, ref) == body
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    checkpoint_dir = evidence_artifact_dir(paths, "checkpoint")
+    checkpoint_dir.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        store_evidence_artifact(paths, kind="checkpoint", data=b"ESCAPE-SENTINEL\n")
+    assert list(outside.iterdir()) == []
+
+
 def test_evidence_store_rejects_absolute_and_traversal_kinds(tmp_path: Path) -> None:
     paths = _evidence_paths(tmp_path)
     with pytest.raises(ValueError, match="unknown evidence kind"):

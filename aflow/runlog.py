@@ -415,7 +415,9 @@ def write_last_run_id(repo_root: Path, run_id: str) -> None:
     shell_file.write_text(run_id, encoding="utf-8")
 
 
-def create_run_paths(config: ControllerConfig) -> RunPaths:
+def create_run_paths(
+    config: ControllerConfig, *, preserved_run_ids: frozenset[str] = frozenset(),
+) -> RunPaths:
     runs_root = config.repo_root / ".aflow" / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
     # A control-plane caller may reserve a canonical identity before launch;
@@ -444,7 +446,7 @@ def create_run_paths(config: ControllerConfig) -> RunPaths:
         manager_dir=manager_dir,
         run_json=run_json,
     )
-    prune_old_runs(runs_root, config.keep_runs)
+    prune_old_runs(runs_root, config.keep_runs, preserved_run_ids=preserved_run_ids)
     write_last_run_id(config.repo_root, run_dir.name)
     return paths
 
@@ -454,8 +456,10 @@ def _run_dir_sort_key(path: Path) -> tuple[int, str]:
     return (stat_result.st_mtime_ns, path.name)
 
 
-def prune_old_runs(runs_root: Path, keep_runs: int) -> None:
-    run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
+def prune_old_runs(
+    runs_root: Path, keep_runs: int, *, preserved_run_ids: frozenset[str] = frozenset(),
+) -> None:
+    run_dirs = [path for path in runs_root.iterdir() if path.is_dir() and path.name not in preserved_run_ids]
     run_dirs.sort(key=_run_dir_sort_key)
     while len(run_dirs) > keep_runs:
         doomed = run_dirs.pop(0)
@@ -526,11 +530,13 @@ def evidence_artifact_path(paths: RunPaths, kind: str, sha256: str) -> Path:
 def evidence_reference(
     paths: RunPaths, kind: str, sha256: str, byte_size: int
 ) -> EvidenceReference:
-    """Build the typed reference whose path is relative to the repository root."""
+    """Build a canonical repository-relative reference for one artifact."""
     destination = evidence_artifact_path(paths, kind, sha256)
     try:
-        relative = destination.relative_to(paths.repo_root)
-    except ValueError as exc:
+        relative = destination.resolve(strict=False).relative_to(
+            paths.repo_root.resolve()
+        )
+    except (OSError, ValueError) as exc:
         raise ValueError(
             f"evidence artifact is outside the repository: {destination}"
         ) from exc
@@ -1043,6 +1049,7 @@ class RunMetadataWriter:
     state: ControllerState | None
     workflow_name: str
     resumed_from_run_id: str | None = None
+    resume_provenance: Mapping[str, object] | None = None
 
     def write(
         self,
@@ -1138,6 +1145,18 @@ class RunMetadataWriter:
             "turns_completed": turns_completed if turns_completed is not None else (self.state.turns_completed if self.state else 0),
             "last_snapshot": _snapshot_payload(last_snapshot if last_snapshot is not None else (self.state.last_snapshot if self.state else None)),
         }
+        for key in (
+            "continuation_from_branch",
+            "continuation_from_head",
+            "continuation_mode",
+        ):
+            value = getattr(self.config, key)
+            if value is not None:
+                payload[key] = value
+            elif key in previous:
+                payload[key] = previous[key]
+        if self.resume_provenance is not None:
+            payload.update(self.resume_provenance)
         if execution_context is not None:
             payload["execution_repo_root"] = str(execution_context.execution_repo_root)
             payload["feature_branch"] = execution_context.feature_branch
@@ -1229,6 +1248,18 @@ class RunMetadataWriter:
             for field in ("workflow_name", "config_path", "config_fingerprint")
         ):
             raise ValueError("frozen_config must contain current non-empty identity fields")
+        for field in (
+            "continuation_from_branch",
+            "continuation_from_head",
+            "continuation_mode",
+        ):
+            value = frozen_config.get(field)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"frozen_config.{field} must be a non-empty string or null"
+                )
         payload["frozen_config"] = dict(frozen_config)
 
         durable_state = self.state

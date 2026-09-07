@@ -1,0 +1,25 @@
+# Provider-neutral starter configuration for a newly created or registered
+# project. The project stays `configuration_required` until the placeholder
+# harness profile below is replaced with an explicit provider/model selector.
+
+[aflow]
+# Initial workflow recorded during project creation or registration.
+default_workflow = "__STARTER_WORKFLOW__"
+
+# Global role selectors. Each value must resolve to a
+# [harness.<name>.profiles.<profile>] table.
+[roles]
+worker = "starter.default"
+
+# Placeholder harness profile. `FILL_IN_MODEL` marks this project as
+# configuration_required until an explicit selector is configured.
+[harness.starter.profiles.default]
+model = "FILL_IN_MODEL"
+
+[prompts]
+implementation = """
+This is the active plan for the current implementation step:
+ACTIVE_PLAN: "{ACTIVE_PLAN_PATH}".
+
+Implement the next checkpoint of the active plan following its steps.
+"""

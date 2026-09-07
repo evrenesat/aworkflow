@@ -59,6 +59,12 @@ When two bare positional arguments are given, `aflow` resolves them by checking 
 
 Extra CLI instructions after `--` are appended to the rendered step prompt.
 
+REST and MCP starts use the same typed choices: plan path, workflow, team,
+start step, max turns, bounded extra instructions, and an optional stopped-run
+predecessor. Numeric start steps remain 1-based and are stored as canonical
+step names. Selecting a later executable step reports the earlier executable
+steps as skipped.
+
 ## Startup Prompts
 
 If you omit `--start-step` and the plan is partly complete, `aflow` prompts you to pick a step when the workflow has more than one step.
@@ -93,6 +99,12 @@ the plan, workflow, team, start step, max-turns, or extra instructions only
 when the value is compatible with the saved invocation; conflicting values
 fail without creating a new run. Fresh `aflow run` invocations still require a
 plan.
+
+A remote successor restart is separate from resume. It creates a fresh run
+with normal startup validation and records restarted_from_run_id; the source
+must be daemon-owned, explicitly owner-stopped, and have no active exact unit.
+Use resume to continue the saved invocation without changing its launch
+identity.
 
 Only schema-version `2` run metadata is resumable. Older, missing, boolean,
 string, and future schema values are readable for inspection but are rejected
@@ -143,6 +155,39 @@ implementation scope, scoped stall/rejection counters, pending
 notes/upgrades/boundary decisions, and stale manager-report pointer. The
 explicit run id prevents an accidental reset of an implicitly selected run.
 
+### Rehome and baseline-team continuation
+
+A copied run can be resumed under a new absolute repository root only with an
+explicit source id and a supplied replacement worktree:
+
+```bash
+aflow run --resume RUN_ID --resume-rehome-worktree /path/to/registered-worktree
+```
+
+The current primary checkout must be on the saved main branch. The replacement
+must already be registered by that checkout, use the saved feature branch, and
+be free of merge, rebase, cherry-pick, and revert operations. AFlow does not
+create branches or worktrees and does not infer relocation for `AUTO`. Only
+paths inside the recorded repository or worktree roots are remapped. The source
+run, plans, manager artifacts, and envelope bytes remain unchanged; schema-v2
+plan/checkpoint evidence is validated before pruning and copied into the
+continuation.
+
+The same named resume may explicitly change the future baseline team:
+
+```bash
+aflow run --resume RUN_ID --team TEAM_NAME
+```
+
+`TEAM_NAME` must be configured. The change is rejected before allocation when
+`pending_manager_notes`, `pending_step_team_override`, `pending_finalized_turn`,
+`pending_boundary_decision`, `pending_repartition`, hotplug state, or unapplied
+owner routing state is present. The continuation records
+`resumed_from_team` and `resume_team_override`; historical selectors and source
+metadata are retained. Applied run-local selectors and active native sessions
+are not carried into the continuation, so the target team's worker, reviewer,
+and manager selectors govern future turns.
+
 ## Analyze
 
 `aflow analyze` inspects run logs under `.aflow/runs/`.
@@ -171,8 +216,10 @@ Corpus mode flags:
 `--manager-context lite|full` rebuilds the same read-only versioned context
 that manager supervision used for a finalized workflow turn. `--turn N` selects
 that turn and otherwise defaults to the latest finalized turn. These options
-require single-run mode and never invoke a manager or alter run artifacts. Lite
-excludes plan prose; Full includes the complete active-plan body. For a stopped
+require single-run mode and never invoke a manager or alter run artifacts. Live
+schema-v3 Lite and Full contexts keep plan and checkpoint content in declared
+run-local evidence references; Full may provide richer bounded scope and
+rejection evidence. For a stopped
 run, read `.aflow/runs/<RUN_ID>/manager-report.md` first; it is designed to
 explain the incident without requiring raw logs.
 
@@ -203,16 +250,41 @@ quota, provider health, model availability, or arbitrary dependency health.
 The guardian remains the fallback for older runs and unanticipated failures
 outside the safe preflight contract.
 
+## Status Output
+
+`aflow run` writes plain, append-only status records to stderr while a workflow
+executes. Each meaningful state transition, turn finalization, and the final
+summary produces one deterministic `key=value` record line:
+
+```text
+aflow time=2026-09-05T12:00:00Z event=update run=20260905T120000Z-abc123 status="running turn 3" workflow=managed step=implement checkpoint=2/5 checkpoint_name="Checkpoint 2: Implement" turn=3/10 team=base role=worker:codex.default transition=review outcome=completed git="M 1, A 0, D 0 | +12/-3 | 2 commits" artifact=.aflow/runs/<run-id>/turns/0003/stdout.txt
+```
+
+Identical consecutive snapshots are deduplicated. Output is the same ordered,
+copyable stream for interactive terminals and redirected logs, with no ANSI
+styling, cursor movement, or keyboard capture; only startup questions remain
+interactive. Display values are bounded, but durable artifact references are
+never truncated, and control bytes are flattened so pasted logs stay safe.
+Engine exit codes and final success/failure messages on stdout are unchanged.
+
 ## Show
 
-`aflow show` prints workflow diagrams and the role/team relationships they use.
+`aflow show` prints workflow graphs and the role/team relationships they use as
+plain ASCII text.
 
 ```bash
 aflow show
 aflow show review_implement_cp_review
 ```
 
-With no workflow argument, it prints a shared roles/teams section followed by every workflow in config order. With a workflow name, it prints only that workflow plus the roles and teams that apply to it. Steps listed in `exclude = [...]` stay visible in gray because `aflow show` uses the declared graph, not only the executable step map.
+With no workflow argument, it prints a shared roles/teams section followed by
+every workflow in config order. With a workflow name, it prints only that
+workflow plus the roles and teams that apply to it (the workflow's default team
+is marked `(default)`). Each declared step is labeled `[executable]` or
+`[excluded]` with words rather than color, so steps listed in
+`exclude = [...]` stay visible in the declared graph. Transitions print as
+`go -> <target>`, with `[terminal]` marking END and `when <condition>` shown
+after conditional transitions.
 
 ## Plan Format
 

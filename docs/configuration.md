@@ -15,7 +15,7 @@ On first run, `aflow` creates both files under `~/.config/aflow/` from packaged 
 | `keep_runs` | int | `20` | Number of run log directories to retain under `.aflow/runs/`. |
 | `max_turns` | int | `15` | Hard cap on turns for a run. `--max-turns` / `-mt` overrides it for one invocation. |
 | `retry_inconsistent_checkpoint_state` | int | `0` | Automatic retry count when a harness exits cleanly but leaves a checkpoint heading checked while tasks remain unchecked. The packaged bootstrap file ships `1`, so a freshly bootstrapped config effectively defaults to 1. |
-| `banner_files_limit` | int | `10` | Maximum changed files shown in the live banner before `+N more`. |
+| `banner_files_limit` | int | `10` | Maximum changed files shown in status records before `+N more`. |
 | `max_same_step_turns` | int | `5` | Maximum consecutive turns the same step can be selected in multi-step workflows. `0` disables it. |
 | `team_lead` | string | - | Role name used for merge handoff and fallback harness recovery. Required for workflows with `merge` teardown. |
 | `branch_prefix` | string | - | Feature branch prefix template. Combined with a sanitized plan stem and timestamp suffix. |
@@ -208,15 +208,17 @@ are evidence rather than gates. The Full manager is read-only; the controller
 owns rendering, validation, application, and routing. `AFLOW_STOP` remains
 terminal for semantic, safety, ownership, destructive, and other hard blockers.
 
-Lite is the normal cost-aware supervisor. It receives the finished turn's
-complete semantic result, compact run history, structured plan state, routing
-state, and bounded diagnostic excerpts, but never plan prose or prompt bodies.
-Full receives the same context plus the complete current active-plan Markdown.
+Lite is the normal cost-aware supervisor. Live schema-v3 contexts provide
+bounded semantic results, compact run history, structured plan state, routing
+state, bounded diagnostic excerpts, and controller-declared evidence
+references; neither level receives plan prose or prompt bodies inline. Full
+may provide richer bounded scope and rejection evidence, while plan and
+checkpoint content remains available only through the declared references.
 The controller chooses Full directly after the configured same-step stall
 threshold, after repeated reviewer-to-implementer non-convergence within one
 open checkpoint scope, and for explicit stops, invalid plans, or ambiguous
-failures. Lite
-can also request one immediate Full decision at the same boundary.
+failures. Lite can also request one immediate Full decision at the same
+boundary.
 
 ### Team upgrade routes
 
@@ -268,7 +270,7 @@ and does not change quality-upgrade routing.
 - Aliases also cannot set `retry_inconsistent_checkpoint_state` (it is always
   inherited from the base) and cannot extend another alias — only concrete
   base workflows. Alias cycles are rejected at config load.
-- `exclude = ["step_name"]` removes steps from execution while keeping them visible in `aflow show` and the live banner. Alias exclusions are applied after inheritance.
+- `exclude = ["step_name"]` removes steps from execution while keeping them visible in `aflow show` and status records. Alias exclusions are applied after inheritance.
 - Concrete workflows start at their first declared step unless `--start-step` overrides that.
 - `prompts` must be a non-empty array of prompt keys.
 - `go` transitions are checked in declaration order. First match wins.
@@ -354,6 +356,47 @@ The recovery handoff expects strict JSON with:
 - `reason`
 - `suggested_keywords`
 - `suggested_action`
+
+## Project Starter Configuration
+
+When the remote app creates a project or explicitly initializes configuration for
+a registered one, it writes a provider-neutral starter pair under
+`<project>/.aflow/config/`:
+
+- `aflow.toml` records the chosen initial workflow as `aflow.default_workflow`
+  and, when given, the named initial team under `[teams."<team>".roles]`.
+- `workflows.toml` defines one generic single-step workflow, wired to that team
+  when one was named, and records the request's validated `main_branch` in the
+  `[workflow]` lifecycle defaults (`main` when not specified).
+
+The starter deliberately selects no harness provider. It declares a placeholder
+harness profile with `model = "FILL_IN_MODEL"`, which the engine loader accepts
+only while every profile of that harness remains a placeholder. The project is
+reported as `configuration_required` until explicit role selectors and harness
+profiles replace the placeholder; `aflow` and the remote app classify readiness
+through the normal loader and placeholder detection, not a second validator.
+Existing configuration documents are never overwritten.
+
+## Remote project configuration
+
+The remote workflow control app edits the complete project configuration as one
+revisioned pair under the project .aflow/config directory:
+
+- GET /api/projects/{project_id}/config returns the exact UTF-8 text of
+  aflow.toml and workflows.toml, their combined SHA-256 revision, and bounded
+  readiness details.
+- POST /api/projects/{project_id}/config/validate validates a candidate pair
+  without writing it. Diagnostics include only document names, line numbers,
+  and bounded semantic messages; prompts, tokens, and filesystem paths are
+  excluded.
+- PUT /api/projects/{project_id}/config requires both complete documents and
+  the revision returned by the read. A stale revision, invalid pair,
+  placeholder selector, or owned nonterminal/resume-compatible run rejects the
+  write before either file changes.
+- A successful write stages and fsyncs both documents, replaces them with
+  rollback handling, appends redacted revision metadata to server state, and
+  reloads capabilities for future runs. Existing workflow units and run
+  records retain their current configuration and controls.
 
 
 ## ZCode profiles

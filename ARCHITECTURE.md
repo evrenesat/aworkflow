@@ -28,7 +28,7 @@ flowchart TD
     Transition["workflow.py — evaluate_condition() + proposed transition"]
     Manager["workflow.py — optional manager gate"]
     RunLog["runlog.py — write run metadata & turn artifacts"]
-    Banner["status.py — Rich live banner on stderr"]
+    Banner["status.py — plain append-only status records on stderr"]
 
     User --> CLI
     CLI --> Config
@@ -87,19 +87,24 @@ prerequisites that cannot be verified safely by product preflight.
 After a workflow turn has durable final artifacts, the controller computes its
 proposed recovery or transition and optionally invokes the interstep manager
 before applying it. This includes a proposed terminal transition: merge and
-teardown begin only after the manager accepts that terminal action. Lite gets
-compact semantic evidence and structured state, while Full additionally gets
-the complete active plan. Manager calls and their exact artifacts live outside
-the workflow turn sequence, so they never affect turn counts or checkpoints.
+teardown begin only after the manager accepts that terminal action.
+Lite and Full get compact semantic evidence and structured state; live schema-v3
+contexts keep plan and checkpoint bodies in run-local evidence references, with
+Full receiving the controller-selected scope and rejection detail. Historical
+v1/v2 analysis retains its stored versioned body fields. Manager calls and
+their exact artifacts live outside the workflow turn sequence, so they never
+affect turn counts or checkpoints.
 Turn-text diagnostics preserve the stream and structured outcome boundary:
 semantic stdout is scanned for text signals, successful zero-return stderr may
 be a harness transcript and remains untrusted context, and stderr becomes a
 failure diagnostic only for a nonzero return code or a failure-like turn
 status. Explicit `AFLOW_STOP` parsing remains independent on both streams.
 Durable plan, branch, worktree, boundary, and turn-outcome fields override
-contradictory transcript text. Lite keeps active and original plan bodies null
-and marks both as intentionally omitted; this redaction is not evidence that a
-plan is missing, while Full can include available plan content.
+contradictory transcript text. Live schema-v3 contexts keep plan and
+checkpoint bodies out of both Lite and Full prompts; both levels use the
+controller-declared evidence references, with Full receiving richer bounded
+scope and rejection detail. Historical v1/v2 contexts retain their stored
+versioned body fields.
 
 ### Run-local evidence store and reference-only manager contexts
 
@@ -279,6 +284,15 @@ stdout remains the durable detailed evidence.
 
 ## Module Breakdown
 
+Explicit current-branch continuation validates the symbolic current branch,
+the plan's exact Git Tracking Plan Branch and Pre-Handoff Base HEAD, and a
+partially completed checkpoint snapshot before lifecycle allocation. It uses
+the same nested worktree and teardown path as a fresh run, with the validated
+branch as the effective lifecycle main branch. Continuation identity is
+persisted in top-level run metadata and the frozen run identity; historical
+resume lookup is skipped, and strict existing resume validation remains
+unchanged.
+
 ### `cli.py`
 Entry point. Exposes three subcommands:
 - **`aflow run [plan_or_workflow ...] [-- extra instructions]`** -- runs a workflow.
@@ -295,7 +309,7 @@ Entry point. Exposes three subcommands:
   - With a workflow name, it prints only that workflow plus the roles and teams that apply to it.
 - **`aflow analyze [RUN_ID] [--all] [--manager-context lite|full] [--turn N]`** -- analyzes run logs from `.aflow/runs/`.
   - Single-run mode resolves the target run in `analyzer.py`, and the CLI delegates to `aflow.api.analyze.analyze_runs()` so library callers get the same behavior.
-  - Manager-context mode is read-only and uses the same shared context builder as runtime; Lite excludes plan content and Full includes the active plan.
+  - Manager-context mode is read-only and uses the same shared context builder as runtime; live schema-v3 Lite and Full contexts reference declared evidence artifacts, while historical v1/v2 analysis follows its stored schema.
 
 `main()` resolves `aflow run` startup in this order:
 
@@ -338,7 +352,7 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - **`[prompts]`** section: named prompt templates.
 - Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) inherited by all workflows that don't override them. Not a runnable workflow.
 - **`[workflow.<name>]`** tables in `workflows.toml`: concrete workflows define `steps`, alias workflows use `extends` and optional `team`. Both may override lifecycle defaults with `setup`, `teardown`, `main_branch`, and `merge_prompt`.
-- Concrete and alias workflows may also set `exclude = ["step_name"]` to remove declared steps from the executable graph while keeping them visible to `aflow show` and the live banner. Alias exclusions are applied after inheritance.
+- Concrete and alias workflows may also set `exclude = ["step_name"]` to remove declared steps from the executable graph while keeping them visible to `aflow show` and status records. Alias exclusions are applied after inheritance.
 - **`[workflow.<name>.steps.<step>]`** tables: `role` (global role key), `prompts` (list of prompt keys), `go` (transition array with `to` and optional `when` condition).
 
 Lifecycle validation enforces that `(setup, teardown)` is one of three accepted tuples: `([], [])`, `(["branch"], ["merge"])`, or `(["worktree", "branch"], ["merge", "rm_worktree"])`. Any other combination is rejected at load time with the exact workflow path.
@@ -374,21 +388,22 @@ classifier while retaining its backup-plan and active-plan allowances.
    c. Resolve the step's role through the selected team and global role map to get the concrete harness selector.
    d. Render prompt templates with path placeholders.
    e. Build a `HarnessInvocation` via the adapter, using `execution_repo_root` as the subprocess cwd.
-   f. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
-   g. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
-   h. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
-   i. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
-   j. Evaluate `go` transitions using condition symbols (`DONE`, `NEW_PLAN_EXISTS`, `MAX_TURNS_REACHED`).
-   k. Finalize turn artifacts with the active plan that rendered the current
+   f. Before the harness runs, copy a non-original active plan into `plans/backups/` (content-aware, collision-safe naming shared with the startup original-plan backup; identical content deduplicates and changed content gains a `_vNN` version while existing backups and unrelated files are preserved). Original active plans skip this per-turn path because they already have the startup backup, and a missing active plan is skipped, while backup I/O failures fail the turn before the harness starts.
+   g. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
+   h. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
+   i. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
+   j. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
+   k. Evaluate `go` transitions using condition symbols (`DONE`, `NEW_PLAN_EXISTS`, `MAX_TURNS_REACHED`).
+   l. Finalize turn artifacts with the active plan that rendered the current
       prompt, then select the next active plan: a newly created plan wins;
       otherwise `preserve_active_plan = true` retains the current plan; all
       other transitions reset to the original plan. Worktree checks use the
       execution path while persisted controller state uses the primary-checkout
       logical path.
-   l. Update run metadata with the active plan selected for the next turn.
-   m. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The Full manager is read-only: the manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout and current-run fingerprints detect mutation. Its own invocation does not count as a workflow turn.
-   n. Persist accepted one-hop notes, exact selector, target active-plan identity, stable implementation-scope identity, and an eligible implementation-team override before the next step begins. Resume restores the scope and an unconsumed target before launching it, normalizes attempt histories to mutable live lists, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
-   o. Treat `END` as successful only when the post-turn original-plan snapshot
+   m. Update run metadata with the active plan selected for the next turn.
+   n. With manager supervision enabled, persist immutable boundary input beside the finalized artifacts, then build a versioned context and invoke Lite or Full before applying the proposed action, including `END`. The Full manager is read-only: the manager has a closed decision set and cannot alter source, plans, git, config, or run control files; execution-checkout and current-run fingerprints detect mutation. Its own invocation does not count as a workflow turn.
+   o. Persist accepted one-hop notes, exact selector, target active-plan identity, stable implementation-scope identity, and an eligible implementation-team override before the next step begins. Resume restores the scope and an unconsumed target before launching it, normalizes attempt histories to mutable live lists, and marks the boundary consumed only after its `starting` artifact is durable. Same-step caps select one direct Full terminal boundary rather than a normal Lite transition followed by Full.
+   p. Treat `END` as successful only when the post-turn original-plan snapshot
       is complete. An incomplete max-turn or ordinary `END` records the chosen
       transition but fails without a successful `end_reason`.
 
@@ -434,6 +449,25 @@ classifier while retaining its backup-plan and active-plan allowances.
    history while omitting the saved active overlay and clearing the live
    scope/attempt index; the linked source run retains the immutable attempt
    audit.
+
+   An explicit `--resume RUN_ID --resume-rehome-worktree PATH` is the only
+   relocation path. It verifies the current primary main branch, recorded
+   feature branch and base commit, and the exact registered replacement
+   worktree before allocating a continuation. It remaps only contained schema
+   paths; external paths, selectors, hashes, scope IDs, and source artifacts
+   remain unchanged. Scope-v2 evidence is bound from the source run and copied
+   under the continuation so digest-addressed envelope references still resolve.
+   The continuation records `resume_relocation` and protects the selected source
+   run from `keep_runs` pruning.
+
+   A named resume may pass `--team TEAM_NAME` to change the baseline for future
+   turns when the team is configured and no pending manager note, step-team
+   override, finalized turn, boundary, repartition, hotplug, or unapplied
+   owner-routing state exists. The exact blocking field is reported before
+   allocation. The continuation records `resumed_from_team` and
+   `resume_team_override`, while historical selectors and manager history stay
+   authoritative. Automatic and ordinary same-team resumes retain strict team
+   equality.
 
 ### `repartition.py`
 
@@ -577,51 +611,36 @@ Git snapshot helpers used by the banner and CLI. Provides three public data clas
 All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
 
 ### `status.py`
-Rich-based live banner rendered to stderr during a run. The live dashboard is
-a borderless, deterministic single-column document ordered as the plan title,
-current-scope review history, chronological turns, workflow graph, and summary
-status. It shows elapsed time, run id, resumed-from run id when present,
-workflow/step name, harness, model, checkpoint progress, turn count, issues,
-plan paths, git summary (if available), schema/frozen-config identity, safe
-override diagnostics, and status.
-When the active implementation scope has rejected reviews, it also shows every
-current-scope rejection before the chronological turn cards and labels the next
-worker as a re-implementation with its compact rejection reason.
-Workflow steps carry explicit plain-text active, inactive, excluded, or skipped
-labels; color is only additional reinforcement. Controller-owned values use
-literal `Text` renderables so Rich markup-like content remains unchanged. The
-module also owns the shared workflow-graph classification helpers used by both
-the live banner and `aflow show`; only the live branch is flattened, while
-`build_workflow_show()` retains its panel-based presentation.
+Plain append-only status output rendered to stderr during a run. Meaningful
+state transitions, turn finalizations, and the final summary each emit one
+deterministic `key=value` record line prefixed with `aflow time=` and
+`event=start|update|final`. Identical consecutive snapshots are deduplicated,
+display values are bounded (durable artifact references are never truncated),
+control bytes are flattened, and dynamic Unicode content remains readable.
+Output is identical for interactive and redirected streams: no terminal-size or
+input dependence, no ANSI styling, and no cursor or alternate-screen sequences.
+Records carry run identity and lineage, status and end reason (including live
+hotplug stage, selector transition, and capability), workflow, step, checkpoint
+index/count/name, turn/max, team, role selector, harness/model, chosen
+transition and outcome, skipped start-step names, safe override diagnostics,
+manager and review-rejection pointers, repartition summaries, git summary since
+start with a bounded changed-file list, and artifact links (stdout, issues,
+manager report, review evidence).
 
-`BannerRenderer` owns a background daemon thread that waits for the first
-`refresh_interval_seconds` deadline and then performs one explicit
-`Live.update(..., refresh=False)` plus `Live.refresh()` per periodic repaint
-(default 3 s). Rich automatic refresh is disabled, and ordinary
-`update(...)`/`set_context(...)` calls only replace the newest state/context
-for the next tick. Git collection remains independently due every
-`git_poll_interval_seconds` (default 10 s), while lifecycle paints are kept
-explicit and bounded so manager reports can follow the stopped banner. Input
-wakes are drained within the same scheduler cycle, before due Git collection,
-so continuous navigation cannot starve Git and coincident work causes one
-repaint.
-On a supported POSIX TTY, `BannerRenderer` also creates one
-`TerminalInputSession` and one `ScrollableViewport`. The session owns cbreak
-input and a bounded `select()` reader, but only enqueues decoded navigation or
-resize work; the render thread applies all queued work and is the only
-background caller of `Live.update()`/`Live.refresh()`. Interactive `Live`
-instances use `screen=True`, `auto_refresh=False`, and cropped viewport output;
-all other consoles retain the borderless, non-interactive fallback. `k`/Up,
-`j`/Down, `b`/PageUp, `f`/Space/PageDown, `g`/Home, and `G`/End provide
-line/page/top/bottom navigation, with bottom restoring follow-tail. Pause and
-stop join the input and render threads, stop `Live`, restore terminal
-attributes, and then print one full borderless snapshot to normal scrollback
-only when alternate-screen mode was active. Background renderer failures and
-interpreter exit use the same idempotent renderer-owned cleanup, including
-Rich cursor/alternate-screen restoration and the session's termios restore.
-During a live run, real harness children receive closed stdin because every
-configured adapter already places its effective prompt in argv or a CLI flag;
-the dashboard/controller therefore has exclusive ownership of terminal input.
+`BannerRenderer` is the single renderer. It keeps the historical name because
+the workflow call sites and the `banner_files_limit` configuration option are
+unchanged. It owns no background threads, terminal input, alternate screen, or
+atexit cleanup: `start`/`update`/`stop`/`set_context` only maintain renderer
+state and write records, and a failed stderr disables further output instead of
+failing the run. Git statistics are captured from a start-of-run baseline at
+record time, so pre-existing dirty state is excluded.
+
+The module also owns the shared workflow-graph source helpers used by both the
+records and `aflow show`. `build_workflow_show()` renders plain ASCII: roles
+and applicable teams, then each declared step labeled `[executable]` or
+`[excluded]`, with `go ->` transitions marked `[terminal]` for END and
+`when <condition>` annotations. Skipped start-step names appear in status
+records as words.
 
 ### `skill_installer.py`
 Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, muse, and pi all use `~/.agents/skills`).
@@ -698,8 +717,23 @@ Startup models (`models.py`):
 **CLI-as-adapter boundary:**
 - `cli.py` consumes the public `aflow.api` surface for startup preparation and workflow execution.
 - Terminal rendering in `cli.py` and `status.py` is implemented as an `ExecutionObserver` over structured library events.
-- CLI-specific behavior (TTY-only prompts, Rich banner rendering, exit codes) lives entirely in `cli.py`, while startup decisions, execution state, and plan mutations are owned by the library.
+- CLI-specific behavior (TTY-only prompts, status record rendering, exit codes) lives entirely in `cli.py`, while startup decisions, execution state, and plan mutations are owned by the library.
 - Non-CLI callers can import from `aflow` or `aflow.api` directly and use the same startup and runner APIs without invoking `aflow.cli.main()` or requiring terminal access.
+
+**Typed control-plane launches:**
+
+- REST and MCP adapt into one StartupRequest; transport models reject unknown
+  fields and the daemon resolves numeric start steps before run reservation.
+- Immutable launch manifests carry canonical step, skipped-step, frozen-config,
+  and optional restarted_from_run_id metadata. Extra-instruction text stays
+  transient while its digest binds idempotency.
+- A restart successor is a normal fresh launch with a new run ID. Its source
+  must have same-project control-plane ownership, an explicit owner-stop
+  terminal event, and an inactive exact unit. Resume remains the separate,
+  strict saved-invocation continuation path.
+- The server's per-project lock covers config lookup, predecessor validation,
+  and successor reservation/unit start. It is released after the unit is
+  active and is never held across workflow execution.
 
 ## Workflow Configuration
 
@@ -742,7 +776,6 @@ aflow/
   recovery.py          # harness failure classification and recovery
   scope_pressure.py    # structural scope-pressure signal parsing
   stop_marker.py       # explicit AFLOW_STOP parsing
-  terminal_viewport.py # terminal viewport and navigation helpers
   control_plane/       # shared daemon application, persistence, and units
     application.py     # canonical lifecycle application boundary
     capabilities.py    # versioned capability descriptions
@@ -761,7 +794,7 @@ aflow/
   run_state.py         # runtime data classes
   repartition.py       # immutable envelopes, strict split protocol, validation
   runlog.py            # run/turn artifact persistence
-  status.py            # Rich live banner with AFlow-owned refresh thread
+  status.py            # plain append-only status records on stderr
   git_status.py        # git snapshot helpers (probe, baseline, summary)
   skill_installer.py   # bundled skill installer
   aflow.toml           # global config, harness profiles, roles, teams, prompts
@@ -819,7 +852,7 @@ default `dev` dependency group rather than the installed runtime package.
 
 - **Plan as source of truth.** The Markdown plan file on disk is authoritative. The engine re-reads it before and after every turn because the agent subprocess may modify it (checking off steps/checkpoints).
 - **Harness-agnostic.** The engine doesn't know how any specific agent CLI works. Adapters translate a uniform interface into CLI-specific argv/env. Adding a new harness means one ~30-line adapter file.
-- **Library-first architecture.** All startup preparation and workflow execution logic lives in the `aflow.api` public surface. The CLI is a thin terminal adapter that renders library-provided questions and events for interactive use. Non-CLI callers can import and use the same library APIs without terminal access or Rich dependencies.
+- **Library-first architecture.** All startup preparation and workflow execution logic lives in the `aflow.api` public surface. The CLI is a thin terminal adapter that renders library-provided questions and events for interactive use. Non-CLI callers can import and use the same library APIs without terminal access or rendering dependencies.
 - **Interactive startup decisions are structured.** Startup decisions that require human input are represented as `StartupQuestion` objects with a `kind` enum, prompt text, and metadata. The CLI renders these as TTY prompts; library callers can present them in any UI or handle them programmatically via `prepare_startup_with_answer()`.
 - **Condition-based transitions.** Step transitions use a small expression language over three boolean symbols rather than hardcoded control flow. This keeps workflow definitions declarative.
 - **Structured run logging.** Every turn's prompts, outputs, and snapshots are persisted to `.aflow/runs/` for debugging and auditability. Old runs are pruned automatically.
@@ -829,123 +862,99 @@ default `dev` dependency group rather than the installed runtime package.
 
 ## Remote App (Separate Subproject)
 
-The `apps/aflow_app/` directory contains a mobile-first remote management
-application that imports `aflow` as a library. It is not included in the
-published `aworkflow` wheel.
+The optional `apps/aflow_app/` application imports AFlow as a library and is
+excluded from the published wheel. Its FastAPI server and React client expose
+four product areas: registered projects, the canonical configuration pair,
+filesystem plans, and durable workflow runs.
 
-### Server (`apps/aflow_app/server/`)
+REST plus SSE is the canonical remote interface; MCP is an optional adapter
+to the same control-plane service. A remote ACP interface is deferred. Codex is
+an optional engine harness, and the web app has no provider-specific client.
 
-The Python 3.12+ FastAPI server owns project identity, plan drafts, workflow
-execution, and the application-facing planning-session API. Its main boundaries
-are:
+The production backend binds only to `127.0.0.1:8765`. Tailscale Serve supplies
+the private MagicDNS HTTPS entry point; operators discover its advertised
+address with `tailscale serve status --json`. The
+[deployment runbook](deploy/aflowd/README.md) owns activation and rollback steps.
 
-- `main.py` owns application-lifespan state: configuration, the project
-  catalog, one long-lived planning provider registry, the planning service, and
-  the shared attachment store.
-- `project_catalog.py` discovers local projects and associates provider
-  sessions by current working directory and stored historical aliases. Project
-  paths remain server-authoritative.
-- `planning/models.py`, `provider.py`, `registry.py`, and `service.py`
-  define the provider-neutral session, capability, error, lifecycle, and
-  operation contracts. Session identity is always the pair
-  `(provider_id, provider_session_id)`.
-- `planning_routes.py` exposes provider discovery and project-scoped session
-  routes under
-  `/api/projects/{project_id}/planning/providers/{provider_id}/sessions`.
-  The same router retains the existing project plan-draft URLs, which are not
-  provider operations.
-- `planning/providers/codex.py` is the concrete Codex adapter. It uses the
-  public `codex-app-server-sdk` API for session lifecycle, turns, model
-  discovery, archive state, approvals, and interruption. Codex protocol models
-  and errors are normalized before they reach the app boundary.
-- `planning/attachment_store.py` stores uploaded bytes beneath shared
-  aflow-managed configuration storage, outside project repositories. It
-  validates provider-qualified namespaces, limits, containment, and in-flight
-  leases. The Codex adapter supplies staged file/image metadata to turns through
-  deterministic prompt augmentation because the SDK helpers do not provide
-  equivalent native rich-attachment input.
+Continuous deployment is a bounded local poll, not a service. The optional
+`aflowd-deploy.timer` runs `continuous-deploy.py`, which deploys an exact
+public `main` commit only when it descends from the installed release and
+GitHub Actions recorded a completed successful `ci.yml` push-to-main run for
+that exact SHA. Active workflow ownership defers the deployment through the
+candidate's own preflight, the existing installer performs rollout and
+rollback, and every poll records an atomic `status.json` plus preserved
+preflight snapshots and installer logs. Failed candidates are never retried
+automatically. Installing the timer is bootstrap only; accepting continuous
+deployment on p100 remains an owner observation, and public `main` publishing
+stays a separate authorization.
 
-Provider capabilities drive available models, reasoning values, attachment
-kinds, and optional operations. A provider failure is reported through bounded,
-provider-neutral readiness/error models and does not suppress healthy providers.
-The default execution policy is configured server-side as full access; it is
-not selected by browser requests.
+The versioned project registry is the sole project authority beneath one
+managed root. `project_service.py` creates, registers, renames, and safely
+unregisters exact Git roots. Read-only project_discovery.py lists bounded Git
+candidates two levels beneath the managed root; discovery does not grant access
+or write registration. The explicit Add operation remains the enrollment boundary.
 
-The server also provides repository/project discovery, plan persistence,
-workflow execution through `aflow.api`, SSE execution events, token
-authentication, and optional audio transcription. Configuration is loaded from
-environment variables and `~/.config/aflow/config.toml`.
+`plan_service.py` resolves each project through that registry and addresses
+only direct regular UTF-8 Markdown files under `plans/todo`,
+`plans/in-progress`, and `plans/done`. It returns SHA-256 revisions, requires an
+expected revision for edits and moves, writes through fsynced temporary files,
+and permits only `todo -> in_progress -> done` promotion. Rejected validation,
+stale edits, and occupied destinations leave the original bytes in place.
+`plan_routes.py` provides the authenticated project-scoped REST adapter. The web
+client uses this same contract for plan creation, editing, promotion, and run
+dashboard launch.
 
-### Web Client (`apps/aflow_app/web/`)
+`project_config_service.py` owns exactly `.aflow/config/aflow.toml` and
+`.aflow/config/workflows.toml` as one validated revisioned pair. Configuration
+reads, commits, capability loads, and launch reservation share one per-project
+lock so a launch cannot freeze a torn or superseded pair.
 
-The React client uses only provider-neutral project and planning-session
-vocabulary. It supports provider selection, capability-derived model and
-reasoning controls, separate active/archived session lists, resume/fork/archive
-operations, approvals, interruption, attachment upload/delete, plan drafts, and
-workflow execution. React keys and API requests carry `provider_id` and
-`provider_session_id` separately.
+The pure guided_config.py form endpoint projects or transforms the supplied
+configuration pair without saving it. Widgets and Advanced TOML share the same
+draft; project_config_service.py remains the sole save boundary. Suggestions
+are distinct from configured choices, and ZCode model/effort stay external.
 
-### Daemon-backed control plane
+The guided configuration projection exposes each workflow's materialized
+executable step names and `step_roles` from the production loader. The run
+preview resolves each step's role through the selected team's override and
+then the global selector, using the saved configuration pair. Draft and Done
+plans cannot launch from the UI; unresolved workflow/step previews and invalid
+turn-limit overrides require correction before starting or stopping for a
+replacement run. These checks preserve the existing canonical launch and
+restart protocols.
 
-There are two transport/lifetime adapters over the same durable control-plane
-application. The lightweight `aflow daemon` CLI owns one project and uses
-`SubprocessUnitManager`: each `daemon-worker` is launched without a shell in a
-new process group, and daemon shutdown terminates and reaps every owned group.
-Stdio MCP runs attached by default; optional streamable HTTP binds to
-`127.0.0.1`. Its atomic mode-0600 pidfile includes process-birth identity, so a
-stale or reused PID cannot authorize a signal. It has no REST or web surface.
+The React workspace keeps validated project/view/run identifiers in the URL.
+Project selection and run lookup remain registry-scoped; direct lookup restores
+older linked runs without substituting another selection. User navigation pushes
+history, while normalization and passive updates replace it. Dirty navigation is
+guarded; credentials and editor contents never enter links. Progress precedes
+the New run form, with technical metadata disclosed separately.
 
-The 13 MCP tools and three resource templates are registered in
-`aflow.mcp_control_plane`. The remote app's `mcp_adapter` is a compatibility
-wrapper that adds app-specific safe error mappings. Its FastAPI `/mcp` mount
-retains the server-owned header bearer check; registry sharing does not move
-authorization into a client or URL.
+The REST control-plane routes and `/mcp` mount delegate to the same durable
+`ControlPlaneService`. The HTTP layer does not own workflow processes. Bearer
+credentials are accepted only in headers, while project roots and executable
+inputs remain server-owned. The remote application has no agent-provider client;
+provider selection occurs only through configured engine harness profiles.
 
-The systemd-backed remote control plane separates durable workflow ownership
-from its browser REST, UI, and MCP transports. Browser lifecycle REST uses only
-project-scoped `/api/control-plane/projects/{project_id}/...` routes. REST and
-MCP delegate to the same durable control-plane application and services;
-neither transport infers a project by scanning daemons. `aflowd.service` runs
-the release-pinned remote-app server on its configured private bind address. Its
-`ControlPlaneService` owns the static project allowlist and calls the AFlow
-daemon for every lifecycle operation; the transport layer neither launches
-subprocesses nor reads or writes `.aflow` artifacts directly.
+The web client authenticates through a rolling browser session instead of a
+long-lived in-memory bearer. Login verifies the deployment token in the
+`Authorization` header once and sets a signed HttpOnly, Secure, SameSite=Strict
+cookie (`browser_session.py`); the token itself is never persisted in the
+browser. The session expires after 30 days and is renewed only by requests the
+client marks `X-AFlow-Activity: 1` for real visible dashboard activity, so
+background polling and the SSE stream never extend an unattended session. A 401
+on an ordinary request surfaces as session expiry in the client while
+preserving the current project and view; logout expires the cookie. The `/mcp`
+mount and header-only REST clients keep the existing bearer-only behavior.
 
 ```text
-Browser UI / REST client / MCP client
-                |  bearer header; write approval for MCP
-                v
-aflowd.service (one immutable /opt/aflowd/releases/<commit>)
-                |  static allowlisted project only
-                v
-AFlow daemon -> launch manifest / ordered events / revisioned overrides
-                |                         |
-                v                         v
-independent systemd-run workflow    existing .aflow/runs/<run-id>
+browser -> login (bearer header once) -> signed HttpOnly session cookie
+       -> cookie-authenticated project/config/plan/run routes
+       \-> authenticated run REST or MCP -----------> control-plane service
+                                                       |
+                                                       v
+                                              durable project daemon
 ```
-
-`aflowd` has `Restart=always`; workflow units have `Restart=no` and retain an
-absolute executable from the release selected at launch. A daemon restart,
-client disconnect, or SSH disconnect therefore cannot restart or stop a
-workflow. Reconciliation is observational: a missing, failed, or ambiguously
-collected exact unit becomes `needs_attention`, never completion evidence or an
-automatic restart. A user must explicitly resume an eligible non-legacy run,
-which creates a linked continuation with a distinct run id. Owner stop is a
-separate, durably recorded terminal operation.
-
-Starts, startup answers, controls, owner stops, and resumes are scoped by
-idempotency evidence. Mutable controls also require an `expected_revision`
-compare-and-swap value. A startup question leaves the launch manifest in
-`awaiting_startup_answer` and creates no workflow unit until an accepted,
-idempotent answer. Older runs without control-plane manifests remain readable
-as legacy/interrupted data but cannot be mutated or resumed through this API.
-
-The repository's environment-specific Linux deployment example stages a Git
-commit under `/opt/aflowd/releases/<commit>`, validates release entrypoint
-hashes and a mode-0600 token environment file, switches the `current` symlink
-atomically, then performs authenticated readiness. A failed readiness check
-restores the previous service and release target. It is an operator reference,
-not a portable installer or part of the public package setup path.
 
 ### Live worker hotplug boundary
 

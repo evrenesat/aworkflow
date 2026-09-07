@@ -1,6 +1,12 @@
 from tests._support import *  # noqa: F401,F403
 from aflow.workflow import resolve_role_prompt
 from aflow.run_state import load_override_request
+from aflow.config import (
+    bootstrap_project_config,
+    find_placeholders,
+    project_configuration_state,
+    render_starter_documents,
+)
 
 
 def test_daemon_config_defaults_and_valid_overrides(tmp_path: Path) -> None:
@@ -1383,3 +1389,159 @@ class SameStepCapConfigTests(unittest.TestCase):
             with pytest.raises(ConfigError) as ctx:
                 load_workflow_config(config_path)
             assert 'max_same_step_turns' in str(ctx.value)
+
+
+class TestBootstrapProjectConfig:
+    """Provider-neutral starter bootstrap for newly created projects."""
+
+    def test_bootstrap_writes_valid_placeholder_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            written_aflow, written_workflows = bootstrap_project_config(config_path)
+            assert written_aflow == config_path
+            assert written_workflows == Path(tmpdir) / "workflows.toml"
+            config = load_workflow_config(config_path)
+            assert config.aflow.default_workflow == "implement"
+            assert "starter" in config.harnesses
+            assert find_placeholders(config) == [
+                "harness.starter.profiles.default.model"
+            ]
+            assert project_configuration_state(config_path) == "configuration_required"
+
+    def test_bootstrap_records_initial_workflow_and_team(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(
+                config_path, initial_workflow="build", initial_team="crew"
+            )
+            config = load_workflow_config(config_path)
+            assert config.aflow.default_workflow == "build"
+            assert "crew" in config.teams
+            assert config.workflows["build"].team == "crew"
+            aflow_text = config_path.read_text(encoding="utf-8")
+            assert "codex" not in aflow_text.lower()
+
+    def test_bootstrap_threads_main_branch_into_starter_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path, main_branch="trunk")
+            config = load_workflow_config(config_path)
+            assert config.workflows["implement"].main_branch == "trunk"
+            workflows_text = (
+                Path(tmpdir) / "workflows.toml"
+            ).read_text(encoding="utf-8")
+            assert 'main_branch = "trunk"' in workflows_text
+            assert "__STARTER_MAIN_BRANCH__" not in workflows_text
+
+    def test_bootstrap_defaults_main_branch_to_main(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            config = load_workflow_config(config_path)
+            assert config.workflows["implement"].main_branch == "main"
+
+    def test_bootstrap_rejects_unsafe_main_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            with pytest.raises(ConfigError, match="valid Git branch name"):
+                bootstrap_project_config(config_path, main_branch="-evil")
+            assert not config_path.exists()
+
+    def test_bootstrap_refuses_overwrite_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            before = config_path.read_bytes()
+            with pytest.raises(ConfigError, match="refusing overwrite"):
+                bootstrap_project_config(config_path, initial_workflow="other")
+            assert config_path.read_bytes() == before
+
+    def test_bootstrap_rejects_unsafe_initial_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            with pytest.raises(ConfigError, match="workflow-safe name"):
+                bootstrap_project_config(config_path, initial_workflow='../escape')
+
+    def test_placeholder_harness_only_allows_placeholder_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            text = config_path.read_text(encoding="utf-8")
+            config_path.write_text(
+                text.replace('model = "FILL_IN_MODEL"', 'model = "gpt"'),
+                encoding="utf-8",
+            )
+            with pytest.raises(ConfigError, match="unsupported harness 'starter'"):
+                load_workflow_config(config_path)
+
+    def test_unknown_placeholder_harness_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            text = config_path.read_text(encoding="utf-8").replace("starter", "typo")
+            config_path.write_text(text, encoding="utf-8")
+            with pytest.raises(ConfigError, match="unsupported harness 'typo'"):
+                load_workflow_config(config_path)
+
+    def test_project_configuration_state_ready_without_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            text = config_path.read_text(encoding="utf-8")
+            config_path.write_text(
+                text.replace('model = "FILL_IN_MODEL"', 'model = "test"')
+                .replace("[harness.starter", "[harness.codex")
+                .replace('worker = "starter.default"', 'worker = "codex.default"'),
+                encoding="utf-8",
+            )
+            assert project_configuration_state(config_path) == "ready"
+
+
+class TestRenderStarterDocuments:
+    """Pure starter rendering shares bootstrap's exact bytes and behavior."""
+
+    def test_render_matches_bootstrap_bytes_for_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(config_path)
+            rendered_aflow, rendered_workflows = render_starter_documents()
+            assert rendered_aflow == (config_path).read_text(encoding="utf-8")
+            assert rendered_workflows == (
+                Path(tmpdir) / "workflows.toml"
+            ).read_text(encoding="utf-8")
+
+    def test_render_matches_bootstrap_bytes_for_explicit_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "aflow.toml"
+            bootstrap_project_config(
+                config_path,
+                initial_workflow="build",
+                initial_team="crew",
+                main_branch="trunk",
+            )
+            rendered_aflow, rendered_workflows = render_starter_documents(
+                "build", "crew", "trunk"
+            )
+            assert rendered_aflow == config_path.read_text(encoding="utf-8")
+            assert rendered_workflows == (
+                Path(tmpdir) / "workflows.toml"
+            ).read_text(encoding="utf-8")
+
+    def test_render_is_pure_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            before = set(os.listdir(tmpdir))
+            rendered_aflow, rendered_workflows = render_starter_documents(
+                "solo", None, "release"
+            )
+            assert set(os.listdir(tmpdir)) == before
+        assert rendered_aflow.startswith("# Provider-neutral starter")
+        assert "solo" in rendered_aflow
+        assert 'main_branch = "release"' in rendered_workflows
+
+    def test_render_validates_inputs_like_bootstrap(self) -> None:
+        with pytest.raises(ConfigError, match="valid Git branch name"):
+            render_starter_documents(main_branch="-evil")
+        with pytest.raises(ConfigError, match="workflow-safe name"):
+            render_starter_documents(initial_workflow="../escape")
+        with pytest.raises(ConfigError, match="workflow-safe name"):
+            render_starter_documents(initial_team="bad name")

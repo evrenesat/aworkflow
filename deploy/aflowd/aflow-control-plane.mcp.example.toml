@@ -3,7 +3,7 @@
 # environment. Literal bearer tokens, query parameters, fragments, and userinfo
 # in this URL are rejected by validate-mcp-config.py.
 [mcp_servers.aflow_control_plane]
-url = "http://100.103.69.9:8765/mcp"
+url = "https://audioventura-home-ingest.tail0fad23.ts.net/mcp"
 required = false
 bearer_token_env_var = "AFLOW_CONTROL_PLANE_TOKEN"
 default_tools_approval_mode = "writes"

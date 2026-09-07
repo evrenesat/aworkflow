@@ -1,5 +1,229 @@
 # DEVLOG
 
+## 2026-09-06 — Bounded continuous-deployment poller for validated main
+
+- Added `deploy/aflowd/continuous-deploy.py`, a standard-library one-shot
+  poller that deploys origin main of the fixed public repository only when the
+  exact fetched commit descends from the current release and GitHub Actions
+  shows a completed successful `ci.yml` push/main run for that exact SHA.
+  Missing, pending, failed, or identity-mismatched CI, divergence, unknown
+  releases, and network errors defer with a truthful sanitized status and
+  leave the running service untouched; candidate code never executes before
+  every gate passes.
+- The poller keeps its own dedicated clone under
+  `/var/lib/aflowd/deploy/source`, refuses unexpected or dirty sources without
+  ever resetting or cleaning, holds an exclusive nonblocking invocation lock,
+  and reuses the candidate's own `preflight.sh` and `install.sh` with the
+  production defaults (release root `/opt/aflowd`, loopback backend, registry
+  and managed root unchanged). Attempted deployments preserve the preflight
+  snapshot and installer log under `/var/lib/aflowd/deploy/attempts/`; blocked
+  preflight temporary directories are discarded. A failed rollout records
+  `last_failed_commit` in the atomic `status.json` and is never retried
+  automatically until a new candidate appears or an operator passes
+  `--retry-failed`.
+- Review repairs to the same slice: a successful install records the
+  installed candidate as `current_commit` immediately; a nonzero preflight
+  defers only with a valid schema-1 snapshot recording
+  `safe_to_rollout: false`, while missing, malformed, or safe-but-failed
+  output fails the poll; an installer that outlives its bounded timeout has
+  its whole process group terminated before the poll reports failure, even
+  for a direct `--retry-failed` run; and a failed final status write makes
+  the poll exit nonzero instead of reporting nominal success over a stale
+  `status.json`.
+- Added `aflowd-deploy.service`/`aflowd-deploy.timer` (oneshot;
+  `OnBootSec=2min`, `OnUnitInactiveSec=5min`) plus
+  `install-continuous-deploy.sh`, which is dry-run by default and with
+  `--apply` installs exactly those two units and enables the timer — no broad
+  service restarts. `status.sh` now reports the timer state and the saved
+  deployment status, gracefully handling their absence. Tests cover candidate
+  gates, deferrals, suppression, exclusive invocation, and installer dry-run
+  behavior with temporary repositories and mocked CI responses only.
+
+## 2026-09-06 — Rolling browser session login for the remote web client
+
+- The web client now logs in once by posting the deployment bearer to
+  `POST /api/session`; the server sets the signed HttpOnly session cookie and
+  the token is cleared from memory and never stored in the browser.
+- On load the client checks `GET /api/session`: a valid cookie restores the
+  workspace without a prompt, a definitive 401 shows Login, and a network
+  failure offers Retry instead of a false signed-out state.
+- Visible page restoration renews the session before loading projects; real
+  pointer/keyboard/focus activity marks the next authenticated
+  REST request `X-AFlow-Activity: 1` (at most once per minute, in memory only),
+  which the server uses to roll the 30-day session forward; polling and SSE
+  never renew it.
+- A 401 during ordinary use or the event stream switches to a session-expired
+  sign-in that preserves the current project and view after re-login; logout
+  waits for `DELETE /api/session` confirmation before clearing the workspace
+  and aborts pending requests so late results cannot refill a signed-out
+  workspace. Failed logout offers retryable feedback. Header-only REST and MCP clients
+  are unchanged.
+
+## 2026-09-06 — Remove remote agent planning and retain plan management
+
+- Removed the remote provider client, interactive planning surface, and its
+  transport dependencies; provider choice remains an engine harness concern.
+- Added registry-scoped Markdown plan CRUD with SHA-256 expected revisions,
+  bounded regular-file checks, atomic updates, and one-way lifecycle moves.
+- Rebuilt the web plan editor around that contract and kept durable run REST,
+  SSE, and MCP behavior unchanged.
+
+## 2026-09-06 -- Preserve uncomposable project save guards
+
+- Uncomposable project run snapshots now include the durable frozen config path,
+  keeping failed migrated runs and nonterminal blockers on the same save path.
+
+## 2026-09-06 -- Preserve historical config-path resume safety
+
+- Project config saves now ignore a failed or interrupted control-plane run only
+  when its durable frozen configuration path is known and differs from the
+  canonical project config path. Matching or missing paths remain blocked.
+
+## 2026-09-06 — Run progress, live controls, and guided workflow restart UI
+
+- Rebuilt the web run dashboard on the typed checkpoint-5 contracts: the
+  overview now renders `selected_start_step`/`skipped_steps`,
+  `restarted_from_run_id` lineage, checkpoint name/index/count and bounded
+  manager/harness outcomes from the lite context, and live overrides read from
+  the `control_changed` journal event.
+- The start form gained capability-admitted per-workflow start-step choices
+  with explicit skip explanations, bounded extra-instruction lines, and
+  boolean answers for `confirm_recovery`/`confirm_worktree_dirty` questions;
+  idempotency-key reuse and draft preservation are unchanged.
+- Live controls offer only capability-admitted team/selector values, keep
+  local edits on stale revisions, and describe next-safe-boundary semantics.
+- A workflow change is a guided confirmation, owner stop with CAS, a bounded
+  wait for exact `owner_stopped` status and launch phase, then a successor
+  start with `restarted_from_run_id`; normal guided restart is available only
+  for active owned runs. A lost successor response freezes the exact request and
+  idempotency key for successor-only recovery without another owner stop.
+- SSE handling keeps the last snapshot through disconnects, resumes from the
+  last sequence, deduplicates replay, refreshes canonical status once on
+  reconnect, and never maps a network failure to a run transition.
+
+
+## 2026-09-06 - Retain uncertain successor recovery across navigation
+
+- Keep the exact pending successor request in the workspace shell until the server resolves it. Inspecting another run or switching views preserves the original project, request and idempotency key, with a visible route back to recovery.
+
+## 2026-09-06 - Stop daemon-owned runs before unit startup
+
+- The daemon owner-stop path now creates the standard run artifact directory
+  only after an exact control-plane manifest, caller scope, and initial
+  revision are verified. It then uses the existing revisioned control,
+  event-journal, unit-stop, and terminal launch-phase path without fabricating
+  run metadata.
+- An owner-stopped launch phase remains authoritative over a persisted startup
+  question during status reads, idempotent start replay, and later answers, so
+  a stopped pre-start run cannot create a workflow unit.
+
+## 2026-09-05 - Align manager contract and prelaunch failures
+
+- Updated the bundled manager contract and inline precedence rules for live
+  schema-v3 reference-only contexts: read the declared checkpoint evidence
+  first, inspect the active/full plan reference only when needed, and never
+  search alternate plan files.
+- Lite manager contexts now persist the already-supported escalate_to_full
+  action alongside the prompt's effective eligibility; Full routing remains
+  controller-owned and unchanged.
+- Context, evidence-capture, and prompt-budget failures now produce one
+  bounded invalid manager decision artifact before the controller records the
+  truthful run failure. No provider-start event is emitted and failed
+  artifacts do not copy plan bodies.
+
+## 2026-09-05 -- Complete explicit resume rehome and team continuation
+
+- Added the fail-closed `--resume RUN_ID --resume-rehome-worktree PATH` path.
+  It validates the current primary branch, recorded feature branch and base
+  commit, exact registered replacement worktree, and Git operation state before
+  allocation. Only contained resume paths are remapped; the source run remains
+  byte-identical and the continuation records `resume_relocation`.
+- Bound schema-v2 plan/checkpoint evidence before `keep_runs` pruning and
+  copied it into the continuation with in-memory reference rebasing, preserving
+  envelope bytes, hashes, scope IDs, and source artifacts.
+- Added the named configured `--team` continuation override with exact blockers
+  for pending routing state and `resumed_from_team`/`resume_team_override`
+  provenance. Automatic and ordinary resumes retain strict team matching.
+
+## 2026-09-06 — Add typed workflow starts and successor lineage
+
+- Added canonical launch options across REST, MCP, daemon, and worker boundaries,
+  including validated workflow steps, bounded ephemeral instructions, and
+  durable request digests without prompt content.
+- Expanded capabilities and status with declared, executable, excluded, and
+  skipped steps plus configured teams, roles, admitted selectors, and the
+  public status vocabulary.
+- Added owner-stopped successor starts with immutable predecessor lineage while
+  preserving strict resume checks, idempotency, unit exclusivity, and frozen
+  configuration controls.
+
+## 2026-09-05 — Project, config, and plan web workspace
+
+- Rebuilt the web shell around one canonical registered project with
+  Projects / Configuration / Plans / Runs navigation, registry-backed
+  readiness pills (`ready`, `configuration_required`, `blocked`), and guided
+  setup: a new or newly registered project lands in the configuration view,
+  and a ready configuration links on to plan selection.
+- Added typed create/register and non-destructive unregister flows: relative
+  managed-root path, display name, main branch, optional initial
+  workflow/team, explicit initialize-Git confirmation for register mode, and
+  confirmations that state files, history, and plans are preserved.
+- Added a two-tab plain-text editor for `aflow.toml` / `workflows.toml` with
+  the shared combined revision, validate-only and atomic save calls,
+  stale-revision recovery that keeps local text until an explicit
+  discard-and-reload, active-run blocker lists, and unsaved-edit guards
+  (navigation confirmation and beforeunload).
+- Plan create/read/edit/promote now recover from revision conflicts the same
+  way, and every failure path preserves the local draft.
+- Plan drafts now use the same shell navigation guard as configuration edits;
+  list return requires an explicit discard, and lifecycle moves stay disabled
+  until the draft is saved. Project creation and ready-config navigation keep
+  their successful server result when a follow-up registry refresh fails.
+- Removed the dead `transcribeAudio` client method that targeted the deleted
+  transcription route; no session/provider/audio UI remains.
+
+## 2026-09-05 - Add revisioned remote project configuration
+
+- Added the authenticated two-document project configuration contract for
+  aflow.toml and workflows.toml, with combined revisions, private-pair
+  validation, bounded diagnostics, placeholder readiness, and redacted audit
+  metadata.
+- Saves use per-project compare-and-swap locking and rollback-safe staged
+  replacement. Control-plane-owned active or resume-compatible runs block
+  edits; terminal and legacy history remain read-only and do not block idle
+  configuration.
+- Successful saves reload future-run capabilities while preserving existing
+  workflow units and durable run state. Focused server/API and frozen-config
+  tests cover validation, concurrency, lockout, rollback, and capability
+  reload.
+
+## 2026-09-06 - Preserve failed-turn logs in plain output
+
+- Emit the complete stderr artifact path in final plain status records, including
+  failures with no stdout artifact. Added a failed-turn regression with a long path.
+
+## 2026-09-05 — Plain append-only CLI status output
+
+- Replaced the Rich live dashboard, alternate-screen viewport, and cbreak
+  terminal input with one plain renderer: append-only `key=value` status
+  records on stderr, emitted on meaningful transitions, turn finalizations,
+  and one final summary, deduplicating identical consecutive snapshots.
+- `aflow show` now prints plain ASCII workflow graphs, roles, and teams with
+  explicit `[executable]`/`[excluded]` step words, `[terminal]` END markers,
+  and `when` transition conditions instead of panels and color.
+- Removed `aflow/terminal_viewport.py`, every Rich import and render object,
+  cursor restoration, background refresh/input threads, and all dual-mode
+  fallbacks. Dropped the direct `rich` dependency from `pyproject.toml`;
+  `rich` remains in the lock only as a transitive dependency of the MCP
+  transport and is never imported by AFlow.
+- Records bound display values without truncating durable artifact references,
+  flatten control bytes, preserve Unicode content, and produce identical
+  ordered output for TTY, redirected, `TERM=dumb`, and narrow terminals.
+  Engine exit codes, stdout machine results, observer events, and workflow
+  state transitions are unchanged. The `BannerRenderer` name is retained
+  because workflow call sites and the `banner_files_limit` config option are
+  unchanged; the implementation is the single plain renderer.
+
 ## 2026-09-06 — Native ZCode harness adapter
 
 - Registered ZCode for noninteractive workflow turns with explicit workspace,
@@ -66,6 +290,19 @@
 - Ignore the single late correlated response for a request already settled by
   that notification; all unknown response IDs remain terminal mismatches.
 - Added focused coverage for new-session and resumed-session negotiation.
+
+## 2026-09-01 — Canonical dynamic project registry
+
+- Replaced runtime static control-plane project tables and broad catalog
+  discovery with one atomic, versioned exact-root registry under a canonical
+  managed-projects directory.
+- Centralized release executable, identity, environment file, and child
+  environment at server composition; project records can no longer override
+  process inputs.
+- Made project daemons lazy and isolated per-project readiness failures so a
+  registry update is usable without restarting the remote server.
+- Restored exact-root validation clears transient registration failures, so a
+  temporarily unavailable cached project recovers without a server restart.
 
 ## 2026-09-01 — Audit public documentation scope and accuracy
 
@@ -559,3 +796,64 @@
 - Manager artifacts, worker turn artifacts, and lifecycle failure metadata now
   use their existing nonzero-result handling without storing a traceback or
   prompt-bearing launch diagnostic.
+
+### Browser verification: live status and manager display
+
+- Config saves immediately update the shell readiness badge.
+- Healthy event streams refresh canonical run and bounded context summaries, coalescing bursts and ignoring stale requests while preserving the last snapshot on failure.
+- Manager outcomes read the canonical run-extract schema; completed plans display completed checkpoints.
+- Verified real-provider browser start, live controls, owner stop and successor completion; added regressions for the observed display gaps.
+
+- Final browser screenshot check: native dropdowns now inherit text styling and use the dark color scheme, keeping selected values readable.
+
+### 2026-09-06 — Clarify remote interfaces and private entry point
+
+- Documented canonical REST/SSE, optional MCP, deferred remote ACP, and Codex as an optional engine harness. Root usage and architecture now point to the private deployment runbook and MagicDNS HTTPS discovery through Tailscale Serve status.
+
+### 2026-09-06 — Report applied live turn limits
+
+- HTTPS browser verification found that status retained the initial turn limit after a safe override. Control-plane projections now use the engine-recorded effective limit; pending override writes alone do not change the reported value.
+
+## 2026-09-06: Combine guided settings with rolling login
+
+- Integrated approved guided configuration backend e59721c with deployed browser login 6076caf. Retained both session routes and guided-form routes when resolving their shared insertion point.
+- Verified the combined server suite (204 passed), engine configuration tests (135 passed, 7 subtests), and Ruff. UI and deployment automation integration remain pending.
+
+### 2026-09-06 — Dashboard changes participate in CI
+
+- CI gained a required Ubuntu dashboard job (Python 3.12, Node 22 with npm cache
+  keyed to the web lockfile) so main's success also covers the shipped app server
+  and web UI.
+- The job runs the server's frozen dev sync and full pytest suite, then npm ci,
+  the full vitest suite, and the production web build in their project
+  directories; it runs for PRs, main pushes, and reusable workflow calls.
+- Existing engine test matrix and package build job are unchanged; no publishing
+  trigger or credentials were added.
+- Local verification baseline: server `uv run pytest -q` 163 passed (3 known
+  deprecation warnings); web tests 87 passed with known React `act(...)` stderr
+  notices; `npm run build` and `git diff --check` clean.
+
+- Deployment owner repair: all timed-out poller subprocesses now terminate their process group, including children left after parent exit; focused regressions cover TERM-ignoring descendants and both error/deferral results.
+
+- Browser preview found that pure empty-draft validation could override missing-file readiness. The settings report now preserves saved readiness for unchanged documents and explains the starter/save step before offering Plans.
+
+- Browser acceptance repairs: label ZCode models as externally configured, distinguish unspecified values from missing profiles, and preserve the selected project name on narrow screens.
+### 2026-09-06 — Preview exact dashboard runs (checkpoint 5)
+
+- Plans now explain Draft, Ready and Done, and a saved Ready plan opens the exact launch draft.
+- The compact launch form offers configured workflow/team choices and previews each materialized step's role, selected profile, team/global source and model/effort details. ZCode settings are identified as external.
+- Only Ready plans with a resolved workflow preview and valid turn limit can start. Invalid extra-instruction guidance stays visible when Advanced options is closed.
+- Retained startup-answer, idempotency and stop-before-replacement behavior. The owner corrected a test callback option typo after stopping the repair controller; validation and approval are recorded in the original checkpoint ledger.
+
+- Narrow-browser inspection found the selected Runs tab clipped offscreen. Mobile navigation now shows Projects on its own row and all four project views together without horizontal scrolling.
+
+- Plan promotion buttons now use the same Ready/Done names as the surrounding guidance; settings explain the shared save in plain language.
+
+- Run setup and live-control help now explain Ready plans, available choices, and Pending changes in plain language.
+
+- Run lists now show the newest returned run first using canonical launch time (or the timestamp in older run IDs), while refresh preserves an explicit selection. The API itself remains stably paginated in ascending identity order.
+- Checkpoint 6 adds project/run links, progress-first run views and Technical details. Owner repair removes URL fragments from canonical links, constructs clipboard links from validated identities, and retains the selected run across oldest-first page refreshes.
+
+- Run progress and editable settings now use plain labels; internal bounded-event and revision terminology remains in technical details.
+
+- Completed the dashboard App journey contract test: discovery, Add/Open, guided role assignment, failed-save recovery, Ready plan preview/launch and exact-link remount. Updated the remote-app guide and architecture for discovery, shared drafts, suggestions, run links and the separate deployed owner acceptance recipe.
