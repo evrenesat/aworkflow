@@ -859,3 +859,4 @@
 - Completed the dashboard App journey contract test: discovery, Add/Open, guided role assignment, failed-save recovery, Ready plan preview/launch and exact-link remount. Updated the remote-app guide and architecture for discovery, shared drafts, suggestions, run links and the separate deployed owner acceptance recipe.
 
 - CI registration preservation checks now compare the pre-existing Git status with global excludes disabled; a user’s ignored .aflow directory no longer hides the fixture’s untracked configuration.
+- Fixed the continuous deployer’s real preflight handoff: reserve a unique snapshot path, then release the empty directory so preflight creates it. The deployment fixture now rejects existing paths like the production script; the success regression fails before the fix.
