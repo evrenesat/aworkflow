@@ -860,3 +860,5 @@
 
 - CI registration preservation checks now compare the pre-existing Git status with global excludes disabled; a user’s ignored .aflow directory no longer hides the fixture’s untracked configuration.
 - Fixed the continuous deployer’s real preflight handoff: reserve a unique snapshot path, then release the empty directory so preflight creates it. The deployment fixture now rejects existing paths like the production script; the success regression fails before the fix.
+
+- CI process-cleanup assertions now recognize both a missing proc file and a process disappearing during the read as termination, with deterministic coverage of both Linux outcomes.

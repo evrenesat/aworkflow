@@ -215,9 +215,18 @@ def _process_terminated(pid: int) -> bool:
     """True once the process is gone or only an unreaped zombie remains."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
     return stat.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_process_terminated_accepts_disappeared_proc_entry(monkeypatch, error) -> None:
+    def vanished(_path, **_kwargs):
+        raise error()
+
+    monkeypatch.setattr(Path, "read_text", vanished)
+    assert _process_terminated(12345)
 
 
 def _assert_process_terminated(pid: int, description: str) -> None:
