@@ -580,6 +580,10 @@ Data classes for runtime state:
 - `ControllerState` -- mutable per-run state (snapshot, turn count, issues, timing, status, pending retry context, consecutive same-step streak tracking, frozen configuration identity, effective turn limit, and safe override result).
   - Also carries the current run id and, for resumed runs, the source run id so the banner and startup output can surface both immediately.
 - `FrozenRunIdentity` -- selected workflow name, resolved configuration path, and a canonical SHA-256 fingerprint computed once from the resolved in-memory execution configuration.
+- Resume with a validated copied snapshot preserves the predecessor's recorded
+  identity path (original config for CLI runs or snapshot config for workers).
+  It compares the loaded snapshot's fingerprint independently; copying the
+  snapshot never substitutes live configuration or relaxes drift validation.
 - `OverrideRequest` / `OverrideResult` -- the strict user request and durable controller decision for one `overrides.toml` content digest. Raw notes stay out of broad status output.
 - `ResumeOverrideResolution` -- the selected predecessor's persisted result plus actual-file classification for the successor's first boundary. It uses the normal override loader and never scans other runs.
 - `RetryContext` -- frozen dataclass holding everything needed to rerun the same step on the next turn without re-parsing the broken plan (step name, role, resolved selector, pre-failure snapshot, saved plan paths, base prompt, parse error string, attempt counter, retry limit).

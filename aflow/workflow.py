@@ -2008,13 +2008,17 @@ _REVIEW_SKILL_NAMES = frozenset({
 _PLAN_BRANCH_LINE_RE = re.compile(r"^(\s*-\s+Plan Branch:\s+`)([^`]*)(`.*)$", re.MULTILINE)
 
 
-def _resume_identity_config_dir(config: "ControllerConfig", config_dir: Path) -> Path:
-    """Report the original configuration path for a resumed run's identity.
+def _resume_identity_config_dir(
+    config: "ControllerConfig", config_dir: Path,
+    saved_identity: FrozenRunIdentity | None = None,
+) -> Path:
+    """Keep a validated snapshot's identity stable across resumed copies.
 
     When the controller loaded its configuration from the run's frozen
     snapshot (worker/resume path), the fingerprint is identical but the
-    recorded identity path must remain the run's original configuration
-    location, so the persisted comparison stays stable across restarts.
+    CLI runs may record the original location, while detached workers record
+    their snapshot location. Preserve either predecessor convention; the
+    caller still compares the loaded configuration's fingerprint.
     """
     from .run_config_snapshot import SnapshotError, load_run_config_snapshot
 
@@ -2026,7 +2030,7 @@ def _resume_identity_config_dir(config: "ControllerConfig", config_dir: Path) ->
         return config_dir
     if snapshot is None:
         return config_dir
-    return Path(snapshot.origin_config_path)
+    return Path(saved_identity.config_path if saved_identity is not None else snapshot.origin_config_path)
 
 
 def _freeze_run_identity(
@@ -5593,7 +5597,7 @@ def run_workflow(
     current_frozen_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
-        config_dir=_resume_identity_config_dir(config, config_dir)
+        config_dir=_resume_identity_config_dir(config, config_dir, resume.frozen_run_identity)
         if resume is not None
         else config_dir,
         continuation_from_branch=continuation_from_branch,

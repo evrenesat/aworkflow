@@ -234,6 +234,62 @@ def test_copy_run_config_snapshot_preserves_origin(tmp_path, global_pair):
         )
 
 
+@pytest.mark.parametrize("saved_path_kind", ["snapshot", "original"])
+@pytest.mark.parametrize("fingerprint_drift", [False, True])
+def test_resumed_worker_validates_copied_snapshot_identity(
+    tmp_path, global_pair, monkeypatch, saved_path_kind, fingerprint_drift,
+):
+    from aflow.run_state import ControllerConfig, ResumeContext
+    from aflow.workflow import WorkflowError, run_workflow
+
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    config = load_workflow_config(config_path)
+    original_identity = _freeze_run_identity("simple", config, config_dir=config_path)
+    source = create_run_config_snapshot(
+        repo_root=repo, run_id="20260908t000000z-00000010",
+        config_path=config_path, workflow_name="simple",
+        fingerprint=original_identity.config_fingerprint,
+    )
+    saved_identity = _freeze_run_identity(
+        "simple", load_workflow_config(source.config_path),
+        config_dir=source.config_path if saved_path_kind == "snapshot" else config_path,
+    )
+    successor = copy_run_config_snapshot(
+        repo, source=source, run_id="20260908t000000z-00000011",
+        workflow_name="simple", fingerprint=source.fingerprint,
+    )
+    loaded = load_workflow_config(successor.config_path)
+    # Live configuration must not be needed to validate frozen worker inputs.
+    config_path.write_text("invalid live configuration")
+    if fingerprint_drift:
+        saved_identity = replace(saved_identity, config_fingerprint="changed")
+    resume = ResumeContext(
+        resumed_from_run_id=source.run_id, feature_branch="feature/snapshot",
+        worktree_path=repo, main_branch="main", setup=(), teardown=(),
+        frozen_run_identity=saved_identity,
+    )
+
+    class IdentityAccepted(Exception):
+        pass
+
+    def stop_before_repository_execution(*args, **kwargs):
+        raise IdentityAccepted
+
+    monkeypatch.setattr("aflow.workflow.probe_repo_state", stop_before_repository_execution)
+    expected = WorkflowError if fingerprint_drift else IdentityAccepted
+    with pytest.raises(expected) as caught:
+        run_workflow(
+            ControllerConfig(
+                repo_root=repo, plan_path=repo / "plan.md",
+                reserved_run_id=successor.run_id,
+            ),
+            loaded, "simple", config_dir=successor.config_path, resume=resume,
+        )
+    if fingerprint_drift:
+        assert "config_fingerprint" in str(caught.value)
+
+
 def test_configuration_pair_lock_serializes_saves_and_snapshots(tmp_path, global_pair):
     home, config_path = global_pair
     acquired: list[str] = []

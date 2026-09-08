@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-08 — Preserve frozen identity during worker Resume
+
+- Fixed controller Resume rejecting a copied snapshot because it compared the
+  predecessor's snapshot path against the original global configuration path.
+  Validated snapshots preserve the predecessor's recorded identity path, while
+  configuration fingerprints and continuation identity remain checked.
+- Added controller-entry regressions for both CLI/original and worker/snapshot
+  identity paths, with invalid live configuration and rejected fingerprint drift.
+  The running Doublangu workflow and its historical receipts remain untouched.
+- Verification: snapshot, runtime, control-plane Resume and daemon suites passed
+  (309 tests, 43 subtests). Reinstating the old path selection in an isolated
+  test plugin reproduced the worker/snapshot regression; `git diff --check` passed.
+
 ## 2026-09-08 — Global Settings, prompt editing, recovery, and All runs
 
 - Added global domain tabs with one Save all action and changed-only revisioned
