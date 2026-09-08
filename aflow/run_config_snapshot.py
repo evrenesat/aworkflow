@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -64,14 +65,29 @@ def configuration_pair_lock(pair_dir: Path) -> Iterator[Path]:
 
     The lock file lives next to the pair it guards, so global UI saves and
     run-reservation snapshots block each other but unrelated repositories or
-    legacy project-local pairs remain independent.
+    legacy project-local pairs remain independent. On a read-only file system
+    (for example a hardened deployment whose unit cannot write the global
+    configuration directory) the lock degrades to best-effort: an existing
+    lock file is still honored, and with none available reads proceed
+    unlocked because writes are impossible there anyway.
     """
     pair_dir = Path(pair_dir)
-    pair_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = pair_dir / PAIR_LOCK_NAME
+    try:
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = pair_dir / PAIR_LOCK_NAME
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if exc.errno not in (errno.EROFS, errno.EPERM, errno.EACCES):
+            raise
+        existing = pair_dir / PAIR_LOCK_NAME
+        if existing.is_file() and not existing.is_symlink():
+            fd = os.open(existing, os.O_WRONLY | os.O_NOFOLLOW)
+            lock_path = existing
+        else:
+            yield None
+            return
     import fcntl
 
-    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:

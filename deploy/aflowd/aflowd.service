@@ -33,7 +33,7 @@ ProtectControlGroups=yes
 LockPersonality=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=@MANAGED_PROJECTS_ROOT@ /var/lib/aflowd
+ReadWritePaths=@MANAGED_PROJECTS_ROOT@ /var/lib/aflowd /root/.config/aflow
 UMask=0077
 
 [Install]
