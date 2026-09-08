@@ -591,8 +591,12 @@ def build_manager_prompts(
         *(
             (
                 "Plan and checkpoint content is referenced, not inlined: evidence "
-                "artifact paths in MANAGER_CONTEXT_JSON are relative to the "
-                "repository working directory.",
+                "artifact paths in MANAGER_CONTEXT_JSON use the absolute bases "
+                "in controller_state.artifact_roots, not your working directory.",
+                "Resolve paths beginning .aflow/ against artifact_roots.repository; "
+                "resolve run-relative paths such as turns/, manager/, and evidence/ "
+                "against artifact_roots.run. Use declared absolute paths as given. "
+                "The execution worktree may differ from both artifact roots.",
                 "Read the referenced checkpoint artifact first when you need "
                 "checkpoint evidence for the legal decision.",
                 "Read the referenced active/full plan artifact only if the compact "

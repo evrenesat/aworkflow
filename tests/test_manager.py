@@ -1153,9 +1153,11 @@ def test_v3_prompt_system_instructions_reference_artifacts_only() -> None:
         "Plan and checkpoint content is referenced, not inlined" in system
     )
     assert (
-        "artifact paths in MANAGER_CONTEXT_JSON are relative to the "
-        "repository working directory" in system
+        "artifact paths in MANAGER_CONTEXT_JSON use the absolute bases" in system
     )
+    assert "controller_state.artifact_roots, not your working directory" in system
+    assert "against artifact_roots.run" in system
+    assert "against artifact_roots.repository" in system
     assert "Read the referenced checkpoint artifact first" in system
     assert (
         "Read the referenced active/full plan artifact only if the compact "

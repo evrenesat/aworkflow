@@ -35,6 +35,17 @@
   Additional project-registry coverage passed with the server suite. Existing
   user workflows and records were not changed; no deployment or tool reinstall.
 
+## 2026-09-08 — Resolve manager evidence outside the execution worktree
+
+- Schema-v3 manager context now declares absolute primary-repository and run
+  artifact roots. Prompt instructions resolve repository-relative evidence and
+  run-relative reviewer output against those roots, not the execution worktree.
+- Verified the stopped Doublangu run's checkpoint hash and reviewer approval
+  through the corrected roots without changing historical artifacts. Both Lite
+  and Full regressions read exact evidence from a separate working directory.
+- Verification: 96 manager/context tests plus 37 manager runtime tests and
+  7 subtests passed. No review result is fabricated or inlined as a workaround.
+
 ## 2026-09-08 — Preserve frozen identity during worker Resume
 
 - Fixed controller Resume rejecting a copied snapshot because it compared the

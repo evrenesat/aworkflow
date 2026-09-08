@@ -1564,6 +1564,13 @@ def build_manager_context(
         for key, value in context.controller_state.items()
         if key not in {"latest_full_rejection", "repartition_evidence"}
     }
+    # Evidence is owned by the primary repository, not the manager's worktree.
+    # Keep both bases explicit because turn references are run-relative while
+    # content-addressed evidence references are repository-relative.
+    v3_controller_state["artifact_roots"] = {
+        "repository": str(_v3_run_paths(run_dir).repo_root.resolve()),
+        "run": str(run_dir.resolve()),
+    }
     if validated_envelope is not None:
         summary: dict[str, Any] = {
             "available": True,

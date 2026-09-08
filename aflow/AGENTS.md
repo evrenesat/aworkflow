@@ -20,3 +20,7 @@
   around the snapshot, and never let a partial snapshot launch a worker.
 
 - The detached wrapper owns bounded redacted stdout/stderr tails and final exit receipts. Drain both pipes concurrently, retain stream identity, and keep early exception records nonce-bound. Never redirect actual worker diagnostics to DEVNULL or put raw output into public events.
+
+- Manager evidence belongs to the primary repository's run directory, which may
+  differ from its execution worktree. Schema-v3 context declares both artifact
+  roots; preserve repository-relative versus run-relative reference semantics.

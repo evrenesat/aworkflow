@@ -1423,7 +1423,8 @@ def test_v3_without_capture_discloses_unavailable_and_writes_nothing(tmp_path: P
     assert context["plan_content_disclosure"]["active_plan"] == "unavailable"
 
 
-def test_v3_reviewer_finished_turn_references_stdout_artifact(tmp_path: Path) -> None:
+@pytest.mark.parametrize("level", ["lite", "full"])
+def test_v3_reviewer_finished_turn_references_stdout_artifact(tmp_path: Path, monkeypatch, level) -> None:
     run_dir, plan = _run(tmp_path)
     plan_text = plan.read_text(encoding="utf-8")
     reviewer_stdout = "REVIEWER-EXACT-BODY-SENTINEL-9f9f\n" * 30
@@ -1431,8 +1432,11 @@ def test_v3_reviewer_finished_turn_references_stdout_artifact(tmp_path: Path) ->
     boundary = dict(_enveloped_boundary(run_dir, plan))
     boundary["context_schema_version"] = 4
 
+    worktree = tmp_path / "separate-worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
     context = build_manager_context(
-        run_dir, level="full", boundary=boundary,
+        run_dir, level=level, boundary=boundary,
         active_plan_content=plan_text, capture_evidence=True,
     )
 
@@ -1443,6 +1447,16 @@ def test_v3_reviewer_finished_turn_references_stdout_artifact(tmp_path: Path) ->
     assert reviewer["artifact_path"] == "turns/turn-001/stdout.txt"
     assert reviewer["available"] is True
     assert reviewer["byte_size"] == len(reviewer_stdout.encode("utf-8"))
+    roots = context["controller_state"]["artifact_roots"]
+    assert Path(roots["run"]).is_absolute()
+    assert Path(roots["repository"]).is_absolute()
+    assert not Path(reviewer["artifact_path"]).exists()
+    assert (Path(roots["run"]) / reviewer["artifact_path"]).read_text() == reviewer_stdout
+    checkpoint_ref = context["evidence"]["checkpoint"]["reference"]
+    checkpoint_path = Path(roots["repository"]) / checkpoint_ref["path"]
+    assert not Path(checkpoint_ref["path"]).exists()
+    import hashlib
+    assert hashlib.sha256(checkpoint_path.read_bytes()).hexdigest() == checkpoint_ref["sha256"]
     result = context["finished_turn"]["semantic_result"]["result"]
     assert "referenced by artifact" in result
 
