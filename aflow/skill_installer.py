@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib import resources
 try:
     from importlib.resources.abc import Traversable
 except ImportError:
@@ -11,39 +10,39 @@ import shutil
 import sys
 from typing import Callable
 
-
-@dataclass(frozen=True)
-class BundledSkillMetadata:
-    name: str
-    default: bool
-
-
-BUNDLED_SKILL_METADATA = (
-    BundledSkillMetadata(name="aflow-plan", default=True),
-    BundledSkillMetadata(name="aflow-execute-plan", default=True),
-    BundledSkillMetadata(name="aflow-execute-checkpoint", default=True),
-    BundledSkillMetadata(name="aflow-review-squash", default=True),
-    BundledSkillMetadata(name="aflow-review-checkpoint", default=True),
-    BundledSkillMetadata(name="aflow-review-final", default=True),
-    BundledSkillMetadata(name="aflow-merge", default=True),
-    BundledSkillMetadata(name="aflow-init-repo", default=True),
-    BundledSkillMetadata(name="aflow-harness-recovery-lead", default=True),
-    BundledSkillMetadata(name="aflow-manager", default=True),
-    BundledSkillMetadata(name="aflow-repartition-checkpoint", default=True),
-    BundledSkillMetadata(name="aflow-guard-development-run", default=True),
-    BundledSkillMetadata(name="material-code-review", default=True),
-    BundledSkillMetadata(name="aflow-assistant", default=False),
+from .skill_catalog import (
+    BundledSkill,
+    BundledSkillMetadata,
+    BUNDLED_SKILL_METADATA,
+    BUNDLED_SKILL_NAMES,
+    DEFAULT_BUNDLED_SKILL_NAMES,
+    OPTIONAL_BUNDLED_SKILL_NAMES,
+    SkillCatalogError,
+    bundled_skills_root,
+    validate_bundled_skill_name,
 )
+from .skill_catalog import discover_bundled_skills as _discover_bundled_skills
 
-DEFAULT_BUNDLED_SKILL_NAMES = tuple(
-    meta.name for meta in BUNDLED_SKILL_METADATA if meta.default
-)
-
-OPTIONAL_BUNDLED_SKILL_NAMES = tuple(
-    meta.name for meta in BUNDLED_SKILL_METADATA if not meta.default
-)
-
-BUNDLED_SKILL_NAMES = tuple(sorted(meta.name for meta in BUNDLED_SKILL_METADATA))
+__all__ = [
+    "BundledSkill",
+    "BundledSkillMetadata",
+    "BUNDLED_SKILL_METADATA",
+    "BUNDLED_SKILL_NAMES",
+    "DEFAULT_BUNDLED_SKILL_NAMES",
+    "OPTIONAL_BUNDLED_SKILL_NAMES",
+    "HarnessInstallSpec",
+    "InstallerError",
+    "InstallPlan",
+    "InstallTarget",
+    "PreviewRow",
+    "SUPPORTED_HARNESS_INSTALL_SPECS",
+    "build_install_plan",
+    "bundled_skills_root",
+    "detect_auto_targets",
+    "discover_bundled_skills",
+    "install_skills",
+    "render_preview",
+]
 
 
 @dataclass(frozen=True)
@@ -69,10 +68,15 @@ class InstallerError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class BundledSkill:
-    name: str
-    source: Traversable
+def discover_bundled_skills(
+    only_skills: tuple[str, ...] | None = None,
+    include_optional: bool = False,
+) -> tuple[BundledSkill, ...]:
+    """Discover bundled skills, keeping the installer's bounded error type."""
+    try:
+        return _discover_bundled_skills(only_skills=only_skills, include_optional=include_optional)
+    except SkillCatalogError as exc:
+        raise InstallerError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -95,37 +99,6 @@ class InstallPlan:
     skills: tuple[BundledSkill, ...]
     targets: tuple[InstallTarget, ...]
     preview_rows: tuple[PreviewRow, ...]
-
-
-def bundled_skills_root() -> Traversable:
-    return resources.files("aflow").joinpath("bundled_skills")
-
-
-def discover_bundled_skills(
-    only_skills: tuple[str, ...] | None = None,
-    include_optional: bool = False,
-) -> tuple[BundledSkill, ...]:
-    root = bundled_skills_root()
-    skills: list[BundledSkill] = []
-    missing: list[str] = []
-
-    skill_names_to_discover: tuple[str, ...]
-    if only_skills is not None:
-        skill_names_to_discover = only_skills
-    else:
-        skill_names_to_discover = BUNDLED_SKILL_NAMES if include_optional else DEFAULT_BUNDLED_SKILL_NAMES
-
-    for skill_name in skill_names_to_discover:
-        skill_dir = root.joinpath(skill_name)
-        skill_md = skill_dir.joinpath("SKILL.md")
-        if not skill_dir.is_dir() or not skill_md.is_file():
-            missing.append(skill_name)
-            continue
-        skills.append(BundledSkill(name=skill_name, source=skill_dir))
-    if missing:
-        missing_text = ", ".join(missing)
-        raise InstallerError(f"Missing bundled skill resources: {missing_text}")
-    return tuple(skills)
 
 
 def detect_auto_targets() -> tuple[InstallTarget, ...]:
@@ -268,13 +241,11 @@ def _validate_selection(
     if only_skills is not None and len(only_skills) == 0:
         raise InstallerError("--only requires at least one skill name.")
     if only_skills is not None:
-        valid_names = {meta.name for meta in BUNDLED_SKILL_METADATA}
         for skill_name in only_skills:
-            if skill_name not in valid_names:
-                raise InstallerError(
-                    f"Unknown bundled skill: {skill_name}. "
-                    f"Valid skills are: {', '.join(sorted(valid_names))}"
-                )
+            try:
+                validate_bundled_skill_name(skill_name)
+            except SkillCatalogError as exc:
+                raise InstallerError(str(exc)) from exc
 
 
 def install_skills(

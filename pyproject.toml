@@ -15,6 +15,7 @@ dependencies = [
     "sse-starlette>=2.2.0",
     "pydantic>=2.0.0",
     "tomlkit>=0.13.0",
+    "pyyaml>=6.0.0",
 ]
 
 [project.urls]

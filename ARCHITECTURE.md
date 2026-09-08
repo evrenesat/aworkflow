@@ -687,8 +687,14 @@ and applicable teams, then each declared step labeled `[executable]` or
 `when <condition>` annotations. Skipped start-step names appear in status
 records as words.
 
+### `skill_catalog.py`
+Owns the bundled skill registry and package-resource lookup: `BUNDLED_SKILL_METADATA` with `DEFAULT_BUNDLED_SKILL_NAMES`, `OPTIONAL_BUNDLED_SKILL_NAMES`, and the sorted `BUNDLED_SKILL_NAMES` inventory, plus exact-name validation and `discover_bundled_skills()` over `importlib.resources`. The module depends only on package resources so the installer and the skill store share one registry without importing each other. `skill_installer` re-exports the registry names its CLI contract has always exposed.
+
 ### `skill_installer.py`
-Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, muse, and pi all use `~/.agents/skills`).
+Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, muse, and pi all use `~/.agents/skills`). The registry itself lives in `skill_catalog.py` and is re-exported here.
+
+### `skill_store.py`
+Owns the canonical per-account skill document store at `Path.home() / '.config' / 'aflow' / 'skills'`. Reads are pure: the effective `SKILL.md` is the saved canonical file when present, otherwise that name's bundled package resource, and a malformed canonical document is a bounded error rather than a silent package fallback. Reads never create, initialize, refresh, or reinstall anything. Documents are validated completely (UTF-8, no NUL bytes, at most 1 MiB, YAML frontmatter whose `name` matches and whose `description` is a nonempty string, nonempty Markdown body) with a safe YAML parser that rejects anchors/aliases before expansion; extra safe frontmatter fields are permitted and the Markdown body is never executed or templated. `save(name, content, expected_revision)` is a compare-and-swap on the SHA-256 revision of the effective `SKILL.md` UTF-8 bytes, compared and written under one POSIX advisory lock shared by later refresh flows. Identical bytes are a no-op; first initialization stages and validates the complete bundled directory, materializes it into canonical storage (preserving file permission/executable intent), records version-1 baseline metadata (per-file SHA-256 plus relative filenames of the package bytes) under `.metadata/<name>.json`, and only then atomically replaces `SKILL.md` through a same-directory temporary file with fsync and rename. Baseline metadata and the lock live outside installed skill directories; user saves never advance the baseline or touch supporting files. Canonical skill directories/files, baseline metadata, and resource paths must be real, contained, no-follow entries — symlink escapes and unmanaged pre-existing trees yield bounded errors with saved bytes unchanged.
 
 ### `bundled_skills/`
 Thirteen default skill definitions plus one optional shipped skill installed into harness skill directories:
@@ -844,7 +850,9 @@ aflow/
   runlog.py            # run/turn artifact persistence
   status.py            # plain append-only status records on stderr
   git_status.py        # git snapshot helpers (probe, baseline, summary)
+  skill_catalog.py     # bundled skill registry and package-resource lookup
   skill_installer.py   # bundled skill installer
+  skill_store.py       # canonical per-account skill document store (revisions, lock)
   aflow.toml           # global config, harness profiles, roles, teams, prompts
   workflows.toml       # workflow definitions and aliases
   harnesses/

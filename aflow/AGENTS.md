@@ -24,3 +24,17 @@
 - Manager evidence belongs to the primary repository's run directory, which may
   differ from its execution worktree. Schema-v3 context declares both artifact
   roots; preserve repository-relative versus run-relative reference semantics.
+
+- The canonical skill store (`~/.config/aflow/skills/`, resolved through the
+  executing account's `Path.home()`) is owned by `aflow/skill_store.py`; the
+  bundled registry lives in `aflow/skill_catalog.py`. Reads are pure and must
+  never create, initialize, refresh, or reinstall anything. The effective
+  `SKILL.md` is saved canonical bytes when valid, otherwise the package
+  resource; a malformed canonical document is an error, never a silent
+  fallback. Saves are SHA-256-revision compare-and-swap under the single
+  store lock in `.metadata/`, which sits outside every installed skill
+  directory alongside version-1 baseline metadata. Saves materialize the
+  complete bundled tree on first initialization only; afterwards they replace
+  `SKILL.md` atomically and never touch supporting files or the recorded
+  package baseline. Never edit package resources or a repository checkout on
+  behalf of a store request, and never traverse a symlinked store entry.
