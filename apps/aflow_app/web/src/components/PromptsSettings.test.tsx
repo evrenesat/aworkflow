@@ -23,11 +23,13 @@ describe('PromptsSettings', () => {
     expect(screen.queryByRole('button', { name: 'More actions for prompt implementation_plans' })).toBeNull()
     fireEvent.click(screen.getByText('Used by 1 configured reference'))
     expect(screen.getByText('workflow.demo.steps.implement.prompts')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
     expect(screen.getByText('No configured references')).toBeTruthy()
   })
 
   it('labels the secondary action as a prompt, never as plan deletion', () => {
     render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
     const trigger = screen.getByRole('button', { name: 'More actions for prompt review_plans' })
     fireEvent.click(trigger)
     expect(screen.getByRole('menuitem', { name: 'Delete prompt…' })).toBeTruthy()
@@ -36,6 +38,7 @@ describe('PromptsSettings', () => {
 
   it('opens and closes the More menu with the keyboard', () => {
     render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
     const trigger = screen.getByRole('button', { name: 'More actions for prompt review_plans' })
     trigger.focus()
     expect(trigger.getAttribute('aria-expanded')).toBe('false')
@@ -49,6 +52,7 @@ describe('PromptsSettings', () => {
   it('requires confirmation and delegates deletion and undo to its draft owner', () => {
     const onDelete = vi.fn(), onUndo = vi.fn()
     const view = render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={onDelete} onUndo={onUndo} />)
+    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
     fireEvent.click(screen.getByRole('button', { name: 'More actions for prompt review_plans' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete prompt…' }))
     expect(onDelete).not.toHaveBeenCalled()

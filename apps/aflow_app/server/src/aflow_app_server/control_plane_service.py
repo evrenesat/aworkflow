@@ -8,7 +8,7 @@ checkpoint 1-3 control-plane and daemon services.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 import os
 from pathlib import Path
@@ -30,6 +30,7 @@ from aflow.control_plane import (
     StartRunResult,
     StartupQuestionRecord,
 )
+from aflow.control_plane.run_history import RunHistory
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
 
 from .project_registry import (
@@ -241,18 +242,28 @@ class ControlPlaneService:
             limit=limit, cursor=cursor
         )
 
-    def list_runs(self, project_id: str, *, limit: int, cursor: str | None) -> RunPage:
+    def list_runs(self, project_id: str, *, limit: int, cursor: str | None, history: str = "visible") -> RunPage:
         item = self._project(project_id)
-        page = item.daemon.application.repository.list_runs(limit=limit, cursor=cursor)
+        page = item.daemon.application.repository.list_history(limit=limit, cursor=cursor, history=history)
         return RunPage(
-            runs=tuple(item.daemon.service.run_status(run.run_id) for run in page.runs),
+            runs=tuple(replace(item.daemon.service.run_status(run.run_id), history_state=run.history_state, history_revision=run.history_revision) for run in page.runs),
             next_cursor=page.next_cursor,
         )
 
     def run_status(self, project_id: str, run_id: str) -> RunStatus:
-        return self._project(project_id).daemon.service.run_status(run_id)
+        item = self._project(project_id)
+        return RunHistory(item.daemon.application.repository).project(item.daemon.service.run_status(run_id), external=True)
+
+    def change_history(self, project_id, run_id, *, state, expected_revision, idempotency_key, acknowledge_active=False):
+        item = self._project(project_id)
+        run = item.daemon.service.run_status(run_id)
+        return RunHistory(item.daemon.application.repository).mutate(
+            run_id, state=state, expected_revision=expected_revision, idempotency_key=idempotency_key,
+            active=run.activity == "active", acknowledge_active=acknowledge_active,
+        )
 
     def restart_options(self, project_id: str, run_id: str):
+        self.run_status(project_id, run_id)
         return self._project(project_id).daemon.service.restart_options(
             run_id, caller_scope=self._caller_scope(project_id, "rest")
         )
@@ -265,6 +276,7 @@ class ControlPlaneService:
         after_sequence: int | None,
         limit: int,
     ) -> tuple[RunEvent, ...]:
+        self.run_status(project_id, run_id)
         item = self._project(project_id)
         return item.daemon.service.poll_events(
             run_id,
@@ -281,6 +293,7 @@ class ControlPlaneService:
         level: str,
         full_scope: bool,
     ) -> ContextBundle:
+        self.run_status(project_id, run_id)
         return self._project(project_id).daemon.application.context.get(
             run_id,
             level=level,  # type: ignore[arg-type]
@@ -418,7 +431,7 @@ class ControlPlaneService:
                     item = _ProjectDaemon(
                         record, root, daemon_config.config_path, daemon
                     )
-                    daemon.start()
+                    daemon.start(persist_reconciliation=False)
                 except Exception as exc:
                     self._unavailable[project_id] = "project_daemon_start_failed"
                     raise ControlPlaneUnavailableError(

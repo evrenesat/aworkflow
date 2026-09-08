@@ -14,7 +14,7 @@ vi.mock('../api', async () => {
     listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
     listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
     startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(),
-    ownerStopControlPlaneRun: vi.fn(), resumeControlPlaneRun: vi.fn(), subscribeToRunEvents: vi.fn(),
+    changeRunHistory: vi.fn(), ownerStopControlPlaneRun: vi.fn(), resumeControlPlaneRun: vi.fn(), subscribeToRunEvents: vi.fn(),
   }
 })
 
@@ -267,6 +267,78 @@ describe('RunDashboard', () => {
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
+  it('refreshes loaded pages and removes records that leave the history filter', async () => {
+    let records = Array.from({ length: 130 }, (_, index) => ({ ...ownedRun, run_id: `history-${index}`, plan_path: `plans/history-${index}.md` }))
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_project, request) => ({
+      runs: request?.cursor ? records.slice(100) : records.slice(0, 100),
+      next_cursor: request?.cursor ? null : 'page-two', schema_version: 1,
+    }))
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_project, id) => records.find(run => run.run_id === id)!)
+    const view = renderDashboard()
+    const count = () => view.container.querySelectorAll('.run-list-item').length
+    await waitFor(() => expect(count()).toBe(100))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Load more runs' }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Load more runs' }))
+    await waitFor(() => expect(count()).toBe(130))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(5))
+    expect(count()).toBe(130)
+    records = records.filter(run => run.run_id !== 'history-125')
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(count()).toBe(129))
+    expect(view.container.querySelector('.run-list')?.textContent).not.toContain('history-125.md')
+  })
+
+  it('uses renewed acknowledgement after a definitive rejection', async () => {
+    vi.mocked(api.changeRunHistory).mockRejectedValueOnce(new ApiError(422, 'Acknowledge active workflow')).mockResolvedValueOnce({ state: 'deleted', revision: 1 })
+    renderDashboard()
+    fireEvent.click(await screen.findByRole('button', { name: 'More run actions' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete record…' }))
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, activity: 'active' })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }))
+    fireEvent.click(await screen.findByRole('checkbox', { name: /will not stop the active workflow/ }))
+    await screen.findByText(/Acknowledge active workflow/)
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }))
+    await screen.findByRole('heading', { name: 'Deleted record' })
+    const calls = vi.mocked(api.changeRunHistory).mock.calls
+    expect(calls[0][5]).toBe(false)
+    expect(calls[1][5]).toBe(true)
+    expect(calls[1][4]).not.toBe(calls[0][4])
+  })
+
+  it('requires active acknowledgement and keeps the history retry key after response loss', async () => {
+    const active = { ...ownedRun, activity: 'active' as const, history_revision: 0 }
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(active)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [active], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.changeRunHistory).mockRejectedValueOnce(new Error('response lost')).mockResolvedValue({ state: 'deleted', revision: 1 })
+    renderDashboard()
+    fireEvent.click(await screen.findByRole('button', { name: 'More run actions' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete record…' }))
+    const confirm = screen.getByRole('button', { name: 'Confirm delete' }) as HTMLButtonElement
+    expect(confirm.disabled).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox', { name: /will not stop the active workflow/ }))
+    fireEvent.click(confirm)
+    await screen.findByText(/response lost/)
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }))
+    await screen.findByRole('heading', { name: 'Deleted record' })
+    const calls = vi.mocked(api.changeRunHistory).mock.calls
+    expect(calls[1]).toEqual(calls[0])
+    expect(calls[0].slice(0, 4)).toEqual(['control-project', 'run-owned', 'delete', 0])
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('retains opened archived details and restores without workflow controls', async () => {
+    vi.mocked(api.changeRunHistory).mockResolvedValueOnce({ state: 'archived', revision: 1 }).mockResolvedValueOnce({ state: 'visible', revision: 2 })
+    renderDashboard()
+    fireEvent.click(await screen.findByRole('button', { name: 'More run actions' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Archive', exact: true }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Restore', exact: true }))
+    await waitFor(() => expect(api.changeRunHistory).toHaveBeenCalledTimes(2))
+    expect(api.changeRunHistory).toHaveBeenLastCalledWith('control-project', 'run-owned', 'restore', 1, expect.any(String), false)
+  })
+
   it('renders the run overview with lineage, skipped steps, checkpoints, outcomes, and reconciliation evidence', async () => {
     const successorRun = { ...ownedRun, run_id: 'run-successor', restarted_from_run_id: 'run-owned', status: 'running' }
     const linkedSourceRun = { ...ownedRun, selected_start_step: 'implement', skipped_steps: ['plan'], restarted_from_run_id: 'run-source' }
@@ -307,7 +379,7 @@ describe('RunDashboard', () => {
     expect(screen.getByText('implemented the feature')).toBeDefined()
     expect(screen.getByText(/aflow-run-run-owned\.service · running · not reconciled/)).toBeDefined()
     expect(screen.getByText(/plans\/in-progress\/demo-2\.md/)).toBeDefined()
-    expect(screen.getByText(/Max turns: 8/)).toBeDefined()
+    expect(screen.getAllByText('Max turns')[0]).toBeDefined()
     expect(screen.getByText(/running for /)).toBeDefined()
     // The progress header names the plan file from canonical run evidence;
     // the demo-2 context fallback above stays under Diagnostics.
@@ -728,7 +800,7 @@ describe('RunDashboard', () => {
       return () => {}
     })
     renderDashboard()
-    await screen.findByText('implement · 2 / 8')
+    await screen.findByText('implement · 2')
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalled())
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({
       ...ownedRun, status: 'completed', current_step: 'review', turns_completed: 3,
@@ -741,7 +813,7 @@ describe('RunDashboard', () => {
     })
     if (!onEventsHook) throw new Error('subscription hook was not registered')
     onEventsHook!([{ sequence: 2, event_type: 'run_completed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
-    await screen.findByText('review · 3 / 8')
+    await screen.findByText('review · 3')
     await screen.findByText('Decision #1: continue — checkpoint complete')
     await screen.findByText('All 1 checkpoints complete')
     expect(screen.getAllByText('Completed').length).toBeGreaterThan(0)
@@ -755,7 +827,7 @@ describe('RunDashboard', () => {
       return () => {}
     })
     renderDashboard()
-    await screen.findByText('implement · 2 / 8')
+    await screen.findByText('implement · 2')
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalled())
     let finishRefresh: ((run: Awaited<ReturnType<typeof api.getControlPlaneRun>>) => void) | undefined
     vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve }))
@@ -771,13 +843,13 @@ describe('RunDashboard', () => {
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight)
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, current_step: 'review', turns_completed: 4 })
     finishRefresh!({ ...ownedRun, turns_completed: 3 })
-    await screen.findByText('review · 4 / 8')
+    await screen.findByText('review · 4')
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight + 1)
     expect(vi.mocked(api.listRunEvents).mock.calls.length).toBeGreaterThanOrEqual(1)
     vi.mocked(api.getControlPlaneRun).mockRejectedValue(new Error('summary temporarily unavailable'))
     emit(5)
     await screen.findByText('summary temporarily unavailable')
-    expect(screen.getByText('review · 4 / 8')).toBeDefined()
+    expect(screen.getByText('review · 4')).toBeDefined()
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
@@ -857,13 +929,13 @@ describe('RunDashboard', () => {
   })
 
   it('classifies stale legacy runs as interrupted read-only records', async () => {
-    const legacyRun = { ...ownedRun, run_id: 'legacy-run', ownership: 'legacy' as const, status: 'interrupted', unit_name: null, reason: 'legacy run has no control-plane launch manifest' }
+    const legacyRun = { ...ownedRun, run_id: 'legacy-run', ownership: 'legacy' as const, status: 'needs_attention', unit_name: null, reason: 'legacy run has no control-plane launch manifest' }
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [legacyRun], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(legacyRun)
     renderDashboard()
 
     await waitFor(() => expect(screen.getAllByText('Needs attention').length).toBeGreaterThan(0))
-    expect(screen.getByText(/Legacy record classified as interrupted and read-only/)).toBeDefined()
+    expect(screen.getByText(/Legacy execution record/)).toBeDefined()
     expect(screen.queryByLabelText('Control max turns')).toBeNull()
     expect(screen.queryByRole('button', { name: /Owner stop/ })).toBeNull()
     expect(screen.queryByRole('button', { name: /Resume as new run/ })).toBeNull()
@@ -1384,7 +1456,7 @@ describe('RunDashboard', () => {
     expect(newRun.compareDocumentPosition(runList!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(newRun.compareDocumentPosition(progressHeader!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     // The progress header carries the run's current step and turns.
-    expect(screen.getByText('implement · 2 / 8')).toBeDefined()
+    expect(screen.getByText('implement · 2')).toBeDefined()
     expect(screen.queryByText(/stream connected|stream stopped/)).toBeNull()
   })
 

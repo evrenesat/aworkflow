@@ -9,12 +9,18 @@ as equivalent workflow commands. It also installs the optional `aflowd`
 durable control-plane service entry point.
 
 The remote app opens on All runs: every ongoing run across registered projects
-plus the latest 10 other runs (the count is a browser preference). Projects
+a separate Needs attention group for unconfirmed outcomes, and the latest 10
+terminal runs (the count is a browser preference). Projects
 have separate Runs, Plans, and New run pages. Global Settings offers Agents &
 Roles, Teams, Workflows, Prompts, and General tabs with one changed-only save.
 Appearance follows the system by default; Light and Dark overrides
 persist in the browser. Startup failures retain their safe explanation after
-reload, and runtime starts only from execution evidence.
+reload, and runtime starts only from execution evidence. Starting requires a
+currently verified preparation owner or workflow unit. Archive hides history
+until restored; Delete record permanently hides it while retaining workflow
+files and recovery evidence. Neither action stops a workflow.
+Runs, Teams, Workflows, and Prompts use separate navigation/editor scroll panes.
+Advanced TOML is a settings-wide mode; guided drafts share one save coordinator.
 Failed runs offer Resume when saved execution supports it, or Restart with
 editable launch options. Restart creates a new attempt using current settings
 and retains plan progress; Resume keeps the source configuration snapshot.

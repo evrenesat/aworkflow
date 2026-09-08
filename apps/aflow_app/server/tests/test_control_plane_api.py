@@ -1182,3 +1182,80 @@ def test_real_dirty_startup_failure_survives_api_reload(control_client):
     assert status["evidence"]["no_agent_started"] is True
     assert status["started_at"] is None
     assert status["plan_path"].endswith("plans/todo/test-plan.md")
+
+
+def test_history_api_filters_deleted_links_replays_and_auth(control_client):
+    client, root, _, _ = control_client
+    directory = root / '.aflow' / 'runs' / 'legacy-history'
+    directory.mkdir(parents=True)
+    source = directory / 'run.json'
+    source.write_text('{"status":"running"}')
+    endpoint = f'/api/control-plane/projects/{PROJECT_ID}/runs/legacy-history'
+    body = {'expected_revision': 0}
+    headers = {'Idempotency-Key': 'archive-history'}
+    response = client.post(endpoint + '/archive', json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    assert client.post(endpoint + '/archive', json=body, headers=headers).json() == response.json()
+    assert client.get(endpoint).json()['history_state'] == 'archived'
+    assert client.get(endpoint.rsplit('/', 1)[0]).json()['runs'] == []
+    assert len(client.get(endpoint.rsplit('/', 1)[0] + '?history=archived').json()['runs']) == 1
+    assert client.post(endpoint + '/restore', json=body, headers={'Idempotency-Key': 'stale'}).status_code == 409
+    deleted = client.request('DELETE', endpoint, json={'expected_revision': 1}, headers={'Idempotency-Key': 'delete-history'})
+    assert deleted.status_code == 200
+    assert client.request('DELETE', endpoint, json={'expected_revision': 1}, headers={'Idempotency-Key': 'delete-history'}).json() == deleted.json()
+    assert client.get(endpoint).status_code == 410
+    assert client.get(endpoint + '/context').status_code == 410
+    assert client.get(endpoint.rsplit('/', 1)[0] + '?history=all').json()['runs'] == []
+    assert client.post(endpoint + '/restore', json={'expected_revision': 2}, headers={'Idempotency-Key': 'restore-deleted'}).status_code == 410
+    assert client.post(endpoint.replace(PROJECT_ID, 'unregistered') + '/archive', json=body, headers=headers).status_code == 404
+    assert source.read_text() == '{"status":"running"}'
+    client.headers.pop('Authorization')
+    assert client.post(endpoint + '/archive', json=body, headers=headers).status_code == 401
+
+
+def test_history_active_acknowledgement_keeps_unit_running(control_client):
+    from aflow.control_plane import LaunchManifest, create_launch_manifest
+    client, root, units, _ = control_client
+    create_launch_manifest(root, LaunchManifest(run_id='active-history', project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
+    unit = 'aflow-run-active-history.service'
+    units.start(unit, ('test',), cwd=root)
+    endpoint = f'/api/control-plane/projects/{PROJECT_ID}/runs/active-history/archive'
+    headers = {'Idempotency-Key': 'active-archive'}
+    assert client.post(endpoint, json={'expected_revision': 0}, headers=headers).status_code == 422
+    response = client.post(endpoint, json={'expected_revision': 0, 'acknowledge_active': True}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert units.get(unit).is_active
+
+
+def test_first_and_cached_history_reads_leave_all_artifact_bytes_unchanged(control_client):
+    from aflow.control_plane import LaunchManifest, create_launch_manifest
+    client, root, _, _ = control_client
+    create_launch_manifest(root, LaunchManifest(run_id='read-only', project_root=str(root), plan_path='plans/todo/test-plan.md', workflow_name='managed', max_turns=5))
+    directory = root / '.aflow' / 'runs' / 'read-only'
+    directory.mkdir()
+    (directory / 'run.json').write_text('{"status":"running"}')
+    before = {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    for _ in range(2):
+        detail = client.get(f'/api/control-plane/projects/{PROJECT_ID}/runs/read-only')
+        listing = client.get(f'/api/control-plane/projects/{PROJECT_ID}/runs')
+        assert detail.status_code == listing.status_code == 200
+        assert detail.json()['status'] == 'needs_attention'
+        assert listing.json()['runs'][0]['activity'] == 'unknown'
+        assert before == {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
+
+
+def test_deleted_history_retains_original_launch_idempotency(control_client):
+    from aflow_app_server import main
+    client, root, units, monkeypatch = control_client
+    started = _answer_pending(client, _start_pending(client, monkeypatch), monkeypatch)
+    run_id = started['result']['run_id']
+    before = {p: p.read_bytes() for p in (root / '.aflow').rglob('*') if p.is_file()}
+    endpoint = f'/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}'
+    deleted = client.request('DELETE', endpoint, json={'expected_revision': 0, 'acknowledge_active': True}, headers={'Idempotency-Key': 'delete-launched'})
+    assert deleted.status_code == 200, deleted.text
+    replay = client.post(f'/api/control-plane/projects/{PROJECT_ID}/runs', headers={'Idempotency-Key': 'start-1'}, json={'plan_path': 'plans/todo/test-plan.md', 'workflow_name': 'managed'})
+    assert replay.status_code == 200, replay.text
+    assert replay.json()['result']['run_id'] == run_id
+    assert len(units.start_calls) == 1
+    assert any(run.run_id == run_id for run in main._control_plane_service._project(PROJECT_ID).daemon.application.repository.list_runs().runs)
+    assert all(p.read_bytes() == data for p, data in before.items())

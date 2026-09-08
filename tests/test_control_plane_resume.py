@@ -198,6 +198,6 @@ def test_legacy_run_status_remains_read_only_and_historical(tmp_path: Path) -> N
     status = RunRepository(repo_root).get_run_status("20260101T000000Z-abcdef12")
 
     assert status.ownership == "legacy"
-    assert status.status == "interrupted"
+    assert status.status == "needs_attention"
     assert status.reason == "legacy run has no control-plane launch manifest"
     assert run_json.read_bytes() == before

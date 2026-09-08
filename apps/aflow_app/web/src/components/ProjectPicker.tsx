@@ -119,7 +119,7 @@ export function ProjectPicker({
   const filteredProjects = projects.filter((project) =>
     matchesQuery(query, project.display_name, project.current_path),
   )
-  const allCandidates = discovery?.candidates ?? []
+  const allCandidates = (discovery?.candidates ?? []).filter(candidate => candidate.registered_project_id === null)
   const filteredCandidates = allCandidates.filter((candidate) =>
     matchesQuery(query, candidate.display_name, candidate.relative_path),
   )
@@ -260,14 +260,14 @@ export function ProjectPicker({
               </div>
             </div>
           )}
-          {!discoveryLoading && !discoveryError && discovery && discovery.candidates.length === 0 && (
+          {!discoveryLoading && !discoveryError && discovery && allCandidates.length === 0 && (
             <div className="card text-dim text-sm">
               No discoverable Git projects beneath the managed root yet. Discovery covers direct
               and nested directories up to two levels; deeper or skipped locations can still be
               added by relative path with Add project.
             </div>
           )}
-          {!discoveryLoading && !discoveryError && discovery && discovery.candidates.length > 0 && filteredCandidates.length === 0 && (
+          {!discoveryLoading && !discoveryError && discovery && allCandidates.length > 0 && filteredCandidates.length === 0 && (
             <div className="card text-dim text-sm">
               No available projects match “{search.trim()}”.
               <div className="dashboard-actions" style={{ marginTop: 'var(--spacing-sm)' }}>

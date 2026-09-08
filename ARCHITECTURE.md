@@ -10,6 +10,32 @@ banner-stop, and `WorkflowError` ordering in one boundary. Startup, preflight,
 manager/event-emitting, and merge failures remain explicit because their
 additional responsibilities differ.
 
+## Run activity and history projection
+
+`control_plane/run_activity.py` projects current activity, reason codes, and
+status from controller, receipt, preparation-owner, and live-unit evidence.
+Preparation records carry a versioned PID/process-start/host-boot identity
+under the existing start-request lock. GET validates it without repairing old
+records. The daemon supplements repository evidence with current unit reads;
+controller terminal state and explicit owner stop retain authority. API daemon
+composition reconciles read-only, including its first request; normal daemon
+startup and periodic reconciliation still persist observations.
+
+`control_plane/run_history.py` owns atomic, versioned metadata under
+`.aflow/run-history/`, addressed by the SHA-256 of the exact validated run ID.
+It stores visibility, revision, timestamp, and bounded mutation replay receipts.
+Deleted is absorbing. `RunRepository.list_history` filters before pagination;
+internal `list_runs` remains inclusive for recovery and launch lineage. HTTP
+history mutations require authentication, revision and idempotency checks;
+external deleted reads return 410. No history action signals a process or removes
+workflow artifacts.
+
+The web `SidebarEditorLayout` bounds navigation and detail panes within Runs and
+Settings only. Selection resets detail scrolling; polling preserves scroll and
+focus. `GlobalSettings` owns drafts and selected editor IDs across guided/raw
+mode changes, while run dashboards retain pending history keys and deletion
+tombstones across navigation and late responses.
+
 ## High-Level Data Flow
 
 `aflow noop-plan` copies a packaged template from `aflow/templates/` and creates

@@ -4,6 +4,29 @@ A mobile-friendly workflow control interface for registered AFlow projects. It s
 
 The server sources also ship inside the published `aworkflow` wheel, where `aflow ui` serves them with bundled web assets and the shared global configuration. This subproject remains the development/test entry point. Full behavior and API details are in [Remote workflow control app](../../docs/remote-app.md).
 
+## Run history and settings
+
+All runs and project Runs offer Visible, Archived, and All history filters.
+Archive preserves direct links and supports Restore. Delete record requires
+confirmation and returns a Deleted record page on subsequent access; workflow
+files, logs, snapshots, plans, and recovery/idempotency records remain intact.
+Hiding an active run requires acknowledging that execution will continue.
+
+Starting requires current activity evidence. Missing or untrusted activity is
+Needs attention, separately listed outside Recent; confirmed execution failures
+are Failed and preparation failures are Could not start.
+
+Run history uses `POST .../runs/{run_id}/archive`, `POST .../restore`, and
+`DELETE .../runs/{run_id}` beneath the existing project route. Send
+`Idempotency-Key` and a JSON `expected_revision` (the run's `history_revision`),
+plus `acknowledge_active: true` when hiding active work. Lists accept
+`history=visible|archived|all`; deleted external reads return HTTP 410.
+
+Runs and the Teams, Workflows, and Prompts editors have independent scrolling
+menus. Settings keeps one shared draft and save action. Advanced TOML replaces
+all guided tabs until switching back; Connection settings TOML stays in General.
+Clear effort text to unset it, then Save all changes.
+
 ## Development
 
 ```bash

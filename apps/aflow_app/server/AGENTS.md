@@ -20,3 +20,7 @@
   endpoints still recheck all admission conditions.
 
 - Worker failure status comes from the canonical receipt-aware repository projection on each read, including cached services. Keep worker-exit fields mirrored in transport models and diagnostic context authenticated and bounded.
+
+- API daemon composition uses read-only reconciliation, including cold reads.
+  History endpoints delegate to the additive history service; internal run
+  enumeration and lifecycle artifacts must remain available after UI deletion.

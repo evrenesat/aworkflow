@@ -81,12 +81,12 @@ def test_reconciliation_classifies_crash_windows_and_never_mutates_legacy_runs(t
     before = legacy_file.read_bytes()
     service = ReconciliationService(RunRepository(tmp_path), InMemoryUnitManager())
 
-    assert service.reconcile_run("manifest-only").status == "manifest_only"
+    assert service.reconcile_run("manifest-only").status == "needs_attention"
     assert service.reconcile_run("launch-requested").status == "needs_attention"
     legacy_result = service.reconcile_run("legacy-run")
 
     assert legacy_result.ownership == "legacy"
-    assert legacy_result.status == "interrupted"
+    assert legacy_result.status == "needs_attention"
     assert legacy_file.read_bytes() == before
     assert not (legacy / "events.jsonl").exists()
 

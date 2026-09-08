@@ -1,7 +1,8 @@
 # Control-plane persistence
 
 - This package owns additive durable control-plane artifacts only: launch manifests,
-  launch phases, ordered run events, and revisioned `overrides.toml` writes.
+  launch phases, ordered run events, revisioned `overrides.toml` writes, and
+  presentation-only metadata under `.aflow/run-history`.
 - `.aflow/runs`, `run.json`, and the workflow controller remain authoritative for
   workflow state. Do not add a second run database or bypass existing override
   parsing/validation.
@@ -14,3 +15,9 @@
   execution timing comes from controller metadata and terminal launch evidence.
 
 - Portable worker diagnostics are a read-only projection of contained, schema/nonce/unit-validated receipts. Keep worker exit time separate from workflow execution time; no exit code alone proves completion. Recovery requires confirmed owned inactivity. GETs must never repair historical receipts or run controllers.
+
+- `run_activity` owns shared status/activity precedence; preserve raw observations
+  in evidence. Historical preparation strings never establish current activity.
+- Keep `list_runs` inclusive. UI visibility filtering belongs to `list_history`
+  before pagination. History deletion is absorbing but retains all workflow and
+  launch-idempotency evidence; replay only acknowledged deletes after deletion.

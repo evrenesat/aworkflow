@@ -1,5 +1,40 @@
 # DEVLOG
 
+## 2026-09-08 — Preserve history browsing and acknowledgement retries
+
+- Refresh every loaded run-history page, reconcile removals, and retain the
+  refreshed range cursor; discard superseded list responses.
+- Clear history mutation intents after definitive rejection so a newly
+  confirmed active-workflow acknowledgement is sent. Uncertain failures retain
+  the original key and payload for exact replay.
+- Verified 222 web tests, production build, and Chromium with 130 history rows
+  retained across refresh at desktop/mobile sizes in both themes; diff check passed.
+
+## 2026-09-08 — Fix Agents & Roles profile overflow
+
+- Narrowed the settings overflow selector to top-level panels and prevented
+  profile cards from shrinking inside the shared Agents & Roles scroller.
+- Chromium reproduced 236px content clipped into 48px cards before the fix.
+  Expanded coverage now checks full card height and access to the last profile
+  at desktop/mobile sizes in both themes.
+- Verified 220 web tests, both Chromium layout tests, web build and diff check.
+
+## 2026-09-08 — Run history controls and sidebar navigation
+
+- Added revisioned Archive/Restore/Delete record metadata without removing
+  workflow evidence or changing launch/recovery idempotency. Active work requires
+  explicit acknowledgement; deleted external reads return 410.
+- Projected current activity and status reasons from controller/worker evidence
+  and versioned preparation-owner identity. Cold and cached API reads stay
+  read-only; uncertain outcomes have their own overview group.
+- Added separate Runs/settings navigation and editor scrolling, settings-wide
+  Advanced TOML, parent-owned editor selections, and discovery deduplication.
+  Team/max turns are visible directly; clearing effort preserves the unset action.
+- Verified: 78 core tests, 108 server/API tests, 220 web tests, two Chromium
+  regressions (desktop/mobile, light/dark), production web build, and diff check.
+  Additional project-registry coverage passed with the server suite. Existing
+  user workflows and records were not changed; no deployment or tool reinstall.
+
 ## 2026-09-08 — Preserve frozen identity during worker Resume
 
 - Fixed controller Resume rejecting a copied snapshot because it compared the

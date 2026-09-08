@@ -490,7 +490,7 @@ export function App() {
         </div>
       )}
 
-      <main className="workspace-main">
+      <main className={`workspace-main ${view === 'runs' || view === 'settings' ? 'workspace-panes' : ''}`}>
         {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={(project, run) => applyQuery({ project, view: 'runs', run }, 'push')} />}
         {view === 'settings' && (
             <GlobalSettings
@@ -577,7 +577,7 @@ export function App() {
           </p>
         )}
         {visitedProjects.filter(id => projects.some(p => p.id === id)).map(id => (
-          <div key={id} hidden={query.project !== id || (view !== 'runs' && view !== 'new-run')}>
+          <div className="dashboard-host" key={id} hidden={query.project !== id || (view !== 'runs' && view !== 'new-run')}>
             <RunDashboard
               projectId={id}
               visible={query.project === id && (view === 'runs' || view === 'new-run')}

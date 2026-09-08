@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { GuidedFormProjection } from '../types'
+import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MenuItem, MoreMenu } from './MoreMenu'
 
 type ChangeFn = (update: (value: GuidedFormProjection) => void) => void
@@ -50,7 +51,9 @@ function NamedPromptCard({ name, text, displayName, usages, rename, change, onDe
 
 export interface DeletedPrompt { name: string; text: string; pendingName?: string }
 
-export function PromptsSettings({ draft, change, rename, names, deleted, onDelete, onUndo }: {
+export function PromptsSettings({ draft, change, rename, names, deleted, onDelete, onUndo, selected: suppliedSelected, onSelect }: {
+  selected?: string
+  onSelect?: (id: string) => void
   draft: GuidedFormProjection
   change: ChangeFn
   rename: (name: string, target: string) => void
@@ -59,8 +62,17 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
   onDelete: (name: string, text: string) => void
   onUndo: (name: string, restoreAs: string) => void
 }) {
-  const [role, setRole] = useState('')
-  const [team, setTeam] = useState('')
+  const [localSelected, setLocalSelected] = useState('')
+  const [navigationVersion, setNavigationVersion] = useState(0)
+  const entries = [
+    ...Object.keys(draft.prompts ?? {}).sort().map(name => ({ id: `named:${name}`, label: names[name] ?? name })),
+    ...Object.keys(draft.roles).sort().map(role => ({ id: JSON.stringify(['role', '', role]), label: `Global / ${role}` })),
+    ...Object.keys(draft.teams).sort().flatMap(team => [...new Set([...Object.keys(draft.roles), ...Object.keys(draft.teams[team].roles), ...Object.keys(draft.teams[team].prompts ?? {})])].sort().map(role => ({ id: JSON.stringify(['role', team, role]), label: `${team} / ${role}` }))),
+  ]
+  const requested = suppliedSelected ?? localSelected
+  const selected = entries.some(entry => entry.id === requested) ? requested : entries[0]?.id ?? ''
+  function select(id: string) { setLocalSelected(id); onSelect?.(id); setNavigationVersion(value => value + 1) }
+  const [, team = '', role = ''] = selected.startsWith('[') ? JSON.parse(selected) as string[] : []
   const [targetRole, setTargetRole] = useState('')
   const [targetTeam, setTargetTeam] = useState('')
   const [moveError, setMoveError] = useState<string | null>(null)
@@ -72,20 +84,21 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
     if (text === null) delete prompts[role]
     else prompts[role] = text
   })
-  return <section>
-    <h3>Named prompts</h3>
+  return <section className="settings-guided-content">
     <button className="btn btn-secondary" onClick={() => change(value => {
       const prompts = value.prompts ??= {}
       let key = 'new_prompt'
       for (let index = 2; key in prompts; index++) key = `new_prompt_${index}`
-      prompts[key] = ''
+      prompts[key] = ''; select(`named:${key}`)
     })}>New prompt</button>
     {deleted.map(item => <div className="notice" role="status" key={item.name}>
       Prompt <strong className="mono">{item.name}</strong> was removed from the unsaved draft; the deletion happens when you Save all.
       <label>Restore under key <input className="input" aria-label={`Restore key ${item.name}`} value={restoreKeys[item.name] ?? item.name} onChange={event => setRestoreKeys(keys => ({ ...keys, [item.name]: event.target.value }))} /></label>
       <button type="button" className="btn btn-secondary btn-sm" aria-label={`Undo deletion of ${item.name}`} onClick={() => onUndo(item.name, restoreKeys[item.name] ?? item.name)}>Undo</button>
     </div>)}
-    {Object.entries(draft.prompts ?? {}).map(([name, text]) => <NamedPromptCard
+    <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} navigation={<div><h3>Prompts</h3>{entries.map(entry => <button className={`btn sidebar-entry ${selected === entry.id ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === entry.id} key={entry.id} onClick={() => select(entry.id)}>{entry.label}</button>)}</div>}>
+    <h3>{entries.find(entry => entry.id === selected)?.label ?? 'No prompts'}</h3>
+    {Object.entries(draft.prompts ?? {}).filter(([name]) => selected === `named:${name}`).map(([name, text]) => <NamedPromptCard
       key={name}
       name={name}
       text={text}
@@ -95,10 +108,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
       change={change}
       onDelete={() => onDelete(name, text)}
     />)}
-    <h3>Role prompt text</h3>
     <div className="settings-fields">
-      <label>Role <select className="input" aria-label="Prompt role" value={role} onChange={e => setRole(e.target.value)}><option value="">Choose role</option>{Object.keys(draft.roles).map(key => <option key={key}>{key}</option>)}</select></label>
-      <label>Scope <select className="input" aria-label="Prompt team" value={team} onChange={e => setTeam(e.target.value)}><option value="">Global roles</option>{Object.keys(draft.teams).map(key => <option key={key}>{key}</option>)}</select></label>
       {role && <>
         <span>{role in map ? 'Explicit override' : team ? 'Inherited global text' : 'Default role prompt'}</span>
         <textarea className="input" rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} />
@@ -115,10 +125,11 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
               const target = targetTeam ? (value.teams[targetTeam].prompts ??= {}) : (value.role_prompts ??= {})
               target[targetRole] = source[role]; delete source[role]
             })
-            setMoveError(null); setRole(targetRole); setTeam(targetTeam)
+            setMoveError(null); select(JSON.stringify(['role', targetTeam, targetRole]))
           }}>Move override to target</button>
         </details>}
       </>}
     </div>
+    </SidebarEditorLayout>
   </section>
 }

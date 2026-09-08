@@ -1095,3 +1095,24 @@ input::placeholder, textarea::placeholder {
   .compact-row { flex-wrap: wrap; }
   .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
 }
+
+/* Only Runs and Settings take ownership of the available viewport. */
+.workspace-panes { overflow: hidden; }
+.workspace-panes > .dashboard-host:not([hidden]), .workspace-panes .run-dashboard,
+.workspace-panes > .global-settings { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+.sidebar-editor-layout { display: grid; grid-template-columns: minmax(12rem, 28%) minmax(0, 1fr); gap: var(--spacing-md); flex: 1; min-height: 0; min-width: 0; }
+.sidebar-editor-navigation, .sidebar-editor-detail { overflow: auto; min-height: 0; min-width: 0; overscroll-behavior: contain; }
+.sidebar-editor-navigation button { white-space: normal; overflow-wrap: anywhere; }
+.sidebar-editor-navigation .section-heading { position: sticky; top: 0; background: var(--color-bg); z-index: 1; }
+.sidebar-entry { display: block; width: 100%; text-align: left; margin-bottom: .35rem; }
+.sidebar-editor-detail > .card { min-width: 0; }
+.workspace-panes .settings-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.workspace-panes .global-settings > .settings-body > .settings-fields { overflow: auto; }
+.settings-guided-content { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.settings-guided-content > .settings-body { overflow: auto; }
+.settings-guided-content > .settings-body > :not(.sidebar-editor-layout):not(.settings-guided-content) { flex-shrink: 0; }
+.settings-guided-content:has(.sidebar-editor-layout) > .settings-body { overflow: hidden; }
+@media (max-width: 767px) {
+  .sidebar-editor-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(5rem, 35dvh) minmax(0, 1fr); }
+  .sidebar-editor-navigation { max-height: 35dvh; }
+}

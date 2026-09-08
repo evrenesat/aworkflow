@@ -47,6 +47,8 @@ def project_worker_status(status: RunStatus, root: Path) -> RunStatus:
     if evidence["active"] is None:
         return status if authoritative else replace(status, status="needs_attention", reason="Worker activity could not be confirmed")
     if evidence["active"]:
+        if authoritative:
+            return status
         if code is not None:
             return replace(status, status="needs_attention", reason="Active worker contradicts retained exit evidence")
         return status

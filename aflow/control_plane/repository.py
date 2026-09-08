@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
@@ -20,6 +21,7 @@ from .models import (
     bounded_redacted,
 )
 from .persistence import PersistenceError, RunIdentityError, read_events, validate_run_id
+from .run_activity import project_activity, preparation_active, valid_startup_question
 
 
 MAX_PAGE_SIZE = 1_000
@@ -137,9 +139,9 @@ class RunRepository:
         if manifest is None:
             # Legacy state has no immutable launch evidence.  Even a stale
             # ``running`` record must never be interpreted as a live process.
-            return RunStatus(
+            return project_activity(RunStatus(
                 run_id=valid,
-                status="interrupted",
+                status=metadata.get("status") if metadata.get("status") in {"completed", "failed", "interrupted"} else "needs_attention",
                 ownership="legacy",
                 reason="legacy run has no control-plane launch manifest",
                 workflow_name=_optional_text(metadata.get("workflow_name")),
@@ -150,7 +152,7 @@ class RunRepository:
                 plan_path=_optional_text(metadata.get("active_plan_path")) or _optional_text(metadata.get("plan_path")),
                 started_at=_optional_text(metadata.get("run_started_at")),
                 evidence={"recorded_status": metadata.get("status")},
-            )
+            ))
 
         phase_data = self._launch_state(valid)
         phase = _optional_text(phase_data.get("phase"))
@@ -222,16 +224,19 @@ class RunRepository:
             restarted_from_run_id=manifest.restarted_from_run_id,
             evidence={
                 "has_run_metadata": bool(metadata),
+                "recorded_status": metadata_status,
+                "startup_question_valid": valid_startup_question(startup),
                 "controller_terminal": metadata_status in {"completed", "failed", "interrupted"},
                 "manifest_created_at": manifest.created_at,
                 "reconciled": bool(reconciled),
                 "startup_state": startup.get("state"),
+                "preparation_active": preparation_active(startup.get("preparation_owner")),
                 "startup_failure": failure,
                 "no_agent_started": status != "running" and not metadata and phase in {None, "manifest_only"},
                 "overrides": self._override_summary(run_dir, metadata),
             },
         )
-        return project_worker_status(result, self.repo_root) if Path(manifest.project_root).resolve() == self.repo_root else result
+        return project_activity(project_worker_status(result, self.repo_root) if Path(manifest.project_root).resolve() == self.repo_root else result)
 
     def _startup_record(self, run_id: str) -> Mapping[str, Any]:
         path = self._contained_path(".aflow", "start-requests", f"{run_id}.json")
@@ -258,6 +263,23 @@ class RunRepository:
         selected = run_ids[:limit]
         next_cursor = selected[-1] if len(run_ids) > len(selected) and selected else None
         return RunPage(runs=tuple(self.get_run_status(run_id) for run_id in selected), next_cursor=next_cursor)
+
+    def list_history(self, *, limit=100, cursor=None, history="visible") -> RunPage:
+        from .run_history import RunHistory
+        _bounded_limit(limit)
+        if history not in {"visible", "archived", "all"}:
+            raise RepositoryError("invalid history filter")
+        if cursor is not None:
+            self._readable_run_id(cursor)
+        records = RunHistory(self)
+        ids = [run_id for run_id in self._run_ids() if cursor is None or run_id > cursor]
+        snapshots = {run_id: records.read(run_id) for run_id in ids}
+        ids = [run_id for run_id in ids if snapshots[run_id]["state"] in ({"visible", "archived"} if history == "all" else {history})]
+        selected = ids[:limit]
+        return RunPage(
+            runs=tuple(replace(self.get_run_status(run_id), history_state=snapshots[run_id]["state"], history_revision=snapshots[run_id]["revision"]) for run_id in selected),
+            next_cursor=selected[-1] if len(ids) > limit else None,
+        )
 
     def tail_events(
         self,

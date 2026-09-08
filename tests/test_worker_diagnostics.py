@@ -158,3 +158,11 @@ def test_diagnostic_write_failure_keeps_exit_and_returns_failure(tmp_path, monke
     else:
         assert (receipts / "error.json").exists()
         assert RunRepository(tmp_path).get_run_status(run.name).status == "failed"
+
+
+def test_controller_completion_wins_even_with_conflicting_live_receipt(tmp_path, monkeypatch):
+    from aflow.control_plane.models import RunStatus
+    from aflow.control_plane.worker_diagnostics import project_worker_status
+    monkeypatch.setattr('aflow.control_plane.worker_diagnostics.worker_evidence', lambda *_: {'active': True, 'exit_code': 1})
+    run = RunStatus(run_id='completed', status='completed', evidence={'controller_terminal': True})
+    assert project_worker_status(run, tmp_path).status == 'completed'

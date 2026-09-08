@@ -4,13 +4,14 @@ export const terminalStatuses = new Set(['completed', 'done', 'failed', 'owner_s
 
 export function statusLabel(run: RunStatus): string {
   if (run.status === 'failed' && run.worker_exit && !run.evidence.has_run_metadata) return 'Could not start'
-  if (run.ownership === 'legacy') return 'Needs attention'
+  if (run.status_reason_code === 'startup_failed') return 'Could not start'
+  if (run.ownership === 'legacy' && !terminalStatuses.has(run.status)) return 'Needs attention'
   if (run.status === 'needs_attention') {
     const failure = run.evidence.startup_failure as { stage?: string } | null
     return failure?.stage === 'preparation' && run.evidence.no_agent_started ? 'Could not start' : 'Needs attention'
   }
   if (run.status === 'awaiting_startup_answer') return 'Input needed'
-  if (['manifest_only', 'launch_requested', 'unit_started', 'launch_started'].includes(run.status)) return 'Starting'
+  if (['manifest_only', 'launch_requested', 'unit_started', 'launch_started'].includes(run.status)) return run.activity === 'active' || run.evidence.unit_active === true ? 'Starting' : 'Needs attention'
   if (run.status === 'owner_stopped') return 'Stopped'
   if (run.status === 'done') return 'Completed'
   const label = run.status.replace(/_/g, ' ')

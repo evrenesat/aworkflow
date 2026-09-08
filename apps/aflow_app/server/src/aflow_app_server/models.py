@@ -51,6 +51,10 @@ class CapabilityResponse(CanonicalTransportModel):
 
 
 class RunStatusResponse(CanonicalTransportModel):
+    activity: Literal["active", "inactive", "unknown"] = "unknown"
+    status_reason_code: str = "activity_unknown"
+    history_state: Literal["visible", "archived", "deleted"] = "visible"
+    history_revision: int = 0
     worker_exit: Mapping[str, Any] | None = None
     run_id: str
     status: str

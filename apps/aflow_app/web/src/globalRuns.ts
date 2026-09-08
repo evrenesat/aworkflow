@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import * as api from './api'
+import { statusLabel } from './runPresentation'
 import type { RunStatus } from './types'
 
 export const RECENT_LIMIT_KEY = 'aflow.recentRunsLimit'
@@ -29,11 +30,8 @@ export function useRecentRunsLimit(): [number, (value: number) => void] {
 
 export interface GlobalRun { projectId: string; run: RunStatus }
 export function isOngoing(run: RunStatus): boolean {
-  if (run.ownership !== 'control_plane') return false
-  if (run.evidence.unit_active === true) return true
-  if (run.evidence.startup_failure) return false
-  if (run.status === 'manifest_only' && run.evidence.startup_state === 'preparing') return true
-  return ['running', 'paused', 'waiting_for_input', 'waiting_for_valid_override', 'awaiting_startup_answer', 'launch_requested', 'unit_started', 'launch_started'].includes(run.status)
+  if (['Completed', 'Failed', 'Could not start', 'Stopped', 'Interrupted', 'Needs attention'].includes(statusLabel(run))) return false
+  return run.activity === 'active' || run.evidence.unit_active === true || ['paused', 'waiting_for_input', 'waiting_for_valid_override', 'awaiting_startup_answer'].includes(run.status)
 }
 function orderingTime(run: RunStatus): number {
   for (const value of [run.ended_at, run.evidence.manifest_created_at, run.started_at]) {
@@ -41,13 +39,13 @@ function orderingTime(run: RunStatus): number {
   }
   return 0
 }
-export function selectGlobalRuns(rows: GlobalRun[], limit: number): { ongoing: GlobalRun[]; recent: GlobalRun[] } {
-  const unique = [...new Map(rows.map(row => [JSON.stringify([row.projectId, row.run.run_id]), row])).values()]
+export function selectGlobalRuns(rows: GlobalRun[], limit: number, history: 'visible' | 'archived' | 'all' = 'visible'): { ongoing: GlobalRun[]; attention: GlobalRun[]; recent: GlobalRun[] } {
+  const unique = [...new Map(rows.filter(row => row.run.history_state !== 'deleted' && (history === 'all' || (row.run.history_state ?? 'visible') === history)).map(row => [JSON.stringify([row.projectId, row.run.run_id]), row])).values()]
   unique.sort((a, b) => orderingTime(b.run) - orderingTime(a.run)
     || a.projectId.localeCompare(b.projectId) || a.run.run_id.localeCompare(b.run.run_id))
-  return { ongoing: unique.filter(row => isOngoing(row.run)), recent: unique.filter(row => !isOngoing(row.run)).slice(0, limit) }
+  return { ongoing: unique.filter(row => isOngoing(row.run)), attention: unique.filter(row => !isOngoing(row.run) && statusLabel(row.run) === 'Needs attention'), recent: unique.filter(row => !isOngoing(row.run) && statusLabel(row.run) !== 'Needs attention').slice(0, limit) }
 }
-export async function fetchGlobalRuns(projectIds: string[], signal: AbortSignal) {
+export async function fetchGlobalRuns(projectIds: string[], signal: AbortSignal, history: 'visible' | 'archived' | 'all' = 'visible') {
   const byProject: Record<string, RunStatus[]> = {}
   const errors: string[] = []
   let next = 0
@@ -59,7 +57,7 @@ export async function fetchGlobalRuns(projectIds: string[], signal: AbortSignal)
         let cursor: string | undefined
         const seen = new Set<string>()
         do {
-          const page = await api.listControlPlaneRuns(id, { limit: 100, ...(cursor ? { cursor } : {}) }, { signal })
+          const page = await api.listControlPlaneRuns(id, { limit: 100, history, ...(cursor ? { cursor } : {}) }, { signal })
           if (signal.aborted) return
           runs.push(...page.runs)
           cursor = page.next_cursor ?? undefined

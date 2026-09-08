@@ -27,32 +27,35 @@ class ReconciliationService:
     def reconcile_periodic(self) -> tuple[ReconciliationResult, ...]:
         return self.reconcile_all()
 
-    def reconcile_all(self) -> tuple[ReconciliationResult, ...]:
+    def reconcile_all(self, *, persist: bool = True) -> tuple[ReconciliationResult, ...]:
         with self._lock:
             results: list[ReconciliationResult] = []
             cursor: str | None = None
             while True:
                 page = self._repository.list_runs(limit=1_000, cursor=cursor)
-                results.extend(self.reconcile_run(status.run_id) for status in page.runs)
+                results.extend(self.reconcile_run(status.run_id, persist=persist) for status in page.runs)
                 if page.next_cursor is None:
                     return tuple(results)
                 cursor = page.next_cursor
 
-    def reconcile_run(self, run_id: str) -> ReconciliationResult:
+    def reconcile_run(self, run_id: str, *, persist: bool = True) -> ReconciliationResult:
         with self._lock:
             status = self._repository.get_run_status(run_id)
             if status.ownership == "legacy":
                 return ReconciliationResult(
                     run_id=run_id,
-                    status="interrupted",
+                    status=status.status,
                     reason="legacy run has no control-plane ownership evidence",
                     ownership="legacy",
                 )
             result = self._classify_owned(status)
-            self._append_deduplicated_observation(status, result)
+            if persist:
+                self._append_deduplicated_observation(status, result)
             return result
 
     def _classify_owned(self, status: RunStatus) -> ReconciliationResult:
+        if status.status == "owner_stopped" or status.evidence.get("controller_terminal"):
+            return ReconciliationResult(status.run_id, status.status, "durable controller terminal state retained", unit_name=status.unit_name)
         if status.evidence.get("worker") is not None and status.evidence.get("unit_active") is False:
             return ReconciliationResult(status.run_id, status.status, status.reason or "Worker evidence observed", unit_name=status.unit_name, observed_unit_state="inactive")
         expected_name = f"aflow-run-{status.run_id}.service"

@@ -125,6 +125,10 @@ class CapabilitySet:
 class RunStatus:
     run_id: str
     status: str
+    activity: Literal["active", "inactive", "unknown"] = "unknown"
+    status_reason_code: str = "activity_unknown"
+    history_state: Literal["visible", "archived", "deleted"] = "visible"
+    history_revision: int = 0
     schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
     ownership: Literal["control_plane", "legacy"] = "control_plane"
     revision: int = 0

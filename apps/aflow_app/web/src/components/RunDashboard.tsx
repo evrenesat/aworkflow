@@ -15,6 +15,8 @@ import type {
 } from '../types'
 import { ApiError } from '../api'
 import * as api from '../api'
+import { SidebarEditorLayout } from './SidebarEditorLayout'
+import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage } from './NewRunPage'
 import { statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
@@ -206,7 +208,7 @@ function mergeEvents(current: RunEvent[], next: RunEvent[]): RunEvent[] {
 function upsertRun(current: RunStatus[], next: RunStatus): RunStatus[] {
   const existing = current.findIndex((run) => run.run_id === next.run_id)
   if (existing < 0) return [...current, next]
-  return current.map((run) => run.run_id === next.run_id ? next : run)
+  return current.map((run) => run.run_id === next.run_id ? { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) } : run)
 }
 
 function timestamp(value: unknown): string {
@@ -406,6 +408,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [plans, setPlans] = useState<ControlPlanePlan[]>([])
   const [committed, setCommitted] = useState<CommittedProjection | null>(null)
   const [committedError, setCommittedError] = useState<string | null>(null)
+  const [historyFilter, setHistoryFilter] = useState<'visible' | 'archived' | 'all'>('visible')
+  const historyFilterRef = useRef(historyFilter)
+  historyFilterRef.current = historyFilter
+  const loadedHistory = useRef({ scope: '', pages: 1 })
+  const historyRequest = useRef(0)
+  const [nextRunCursor, setNextRunCursor] = useState<string | null>(null)
+  const [navigationVersion, setNavigationVersion] = useState(0)
+  const [deletedIds, setDeletedIds] = useState<Set<string>>(new Set())
+  const deletedRef = useRef(new Set<string>())
+  const historyIntents = useRef(new Map<string, { action: 'archive' | 'restore' | 'delete'; revision: number; key: string; acknowledged: boolean }>())
+  const [historyConfirm, setHistoryConfirm] = useState<'archive' | 'delete' | null>(null)
+  const [acknowledgeActive, setAcknowledgeActive] = useState(false)
   const [runs, setRuns] = useState<RunStatus[]>([])
   const [selectedRunId, setSelectedRunId] = useState<string | null>(requestedRunId)
   const [missingRunId, setMissingRunId] = useState<string | null>(null)
@@ -668,7 +682,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }, [visible, projectId, initialPlanPath, refreshNonce])
 
   useEffect(() => {
-    if (!visible || !projectId || !selectedRunId) return
+    if (!visible || !projectId || !selectedRunId || deletedIds.has(selectedRunId)) return
     let active = true
     setEvents([])
     setContext(null)
@@ -736,9 +750,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       unsubscribe()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribes only per project/run, not per render
-  }, [visible, projectId, selectedRunId])
+  }, [visible, projectId, selectedRunId, deletedIds])
 
   async function loadDashboard(nextProjectId: string, isActive = () => true) {
+    const requestedHistory = historyFilter
+    const scope = JSON.stringify([nextProjectId, requestedHistory])
+    if (loadedHistory.current.scope !== scope) loadedHistory.current = { scope, pages: 1 }
+    const pageCount = loadedHistory.current.pages
+    const request = ++historyRequest.current
+    const callerActive = isActive
+    isActive = () => callerActive() && requestedHistory === historyFilterRef.current && request === historyRequest.current
+    async function reloadHistory() {
+      const runs: RunStatus[] = []
+      let cursor: string | undefined
+      const seen = new Set<string>()
+      for (let index = 0; index < pageCount; index++) {
+        const page = await api.listControlPlaneRuns(nextProjectId, { limit: 100, history: requestedHistory, ...(cursor ? { cursor } : {}) })
+        runs.push(...page.runs)
+        cursor = page.next_cursor ?? undefined
+        if (!cursor || !isActive()) break
+        if (seen.has(cursor)) throw new Error('Repeated history cursor')
+        seen.add(cursor)
+      }
+      return { runs, next_cursor: cursor ?? null }
+    }
     try {
       setRefreshing(true)
       setError(null)
@@ -746,21 +781,27 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         api.getControlPlaneReadiness(),
         api.getControlPlaneCapabilities(nextProjectId),
         api.listControlPlanePlans(nextProjectId),
-        api.listControlPlaneRuns(nextProjectId, { limit: 100 }),
+        reloadHistory(),
       ])
       if (!isActive()) return
       setReadiness(nextReadiness)
       setCapabilities(nextCapabilities)
       setPlans(nextPlans)
-      const orderedRuns = newestRunsFirst(page.runs)
+      setNextRunCursor(page.next_cursor)
+      const orderedRuns = newestRunsFirst(page.runs.filter(run => !deletedRef.current.has(run.run_id)))
       setRuns((current) => {
-        // The first page never silently displaces a run that was fetched
+        // Refreshed pages never silently displace a run that was fetched
         // directly (a requested link target or the current selection): it is
         // retained until the page itself carries it again.
         const pageIds = new Set(page.runs.map((run) => run.run_id))
         const pinned = current.filter((run) => !pageIds.has(run.run_id)
           && (run.run_id === requestedRunRef.current || run.run_id === selectedRunRef.current))
-        return [...orderedRuns.map(run => run.run_id === selectedRunRef.current ? current.find(item => item.run_id === run.run_id) ?? run : run), ...pinned]
+        return [...orderedRuns.map(run => {
+          const previous = current.find(item => item.run_id === run.run_id)
+          const next = run.run_id === selectedRunRef.current && previous ? previous : run
+          const history = previous && (previous.history_revision ?? 0) > (run.history_revision ?? 0) ? previous : run
+          return { ...next, history_state: history.history_state, history_revision: history.history_revision }
+        }), ...pinned]
       })
       // Default to the newest returned run only when there is no requested
       // or current selection: a linked run is validated separately through
@@ -818,11 +859,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         }),
       ])
       if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
+      if (deletedRef.current.has(runId)) return
       setRuns((current) => upsertRun(current, run))
       setStatusUpdatedAt(new Date().toISOString())
       setEvents((current) => mergeEvents(current, tail))
     } catch (loadError) {
       if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
+      if (loadError instanceof ApiError && loadError.status === 410) {
+        markDeleted(runId)
+        return
+      }
       if (loadError instanceof ApiError && loadError.status === 404) {
         // A linked run that does not exist selects no substitute: the Runs
         // view keeps its list and New run offer, and the URL drops the id.
@@ -867,7 +913,45 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   async function refreshSelectedRun() { await refreshPage() }
 
   /** An explicit run pick: cleared stale-link guidance and a history push report. */
+  async function loadMoreRuns() {
+    if (!nextRunCursor || refreshing) return
+    loadedHistory.current.pages += 1
+    await loadDashboard(projectId)
+  }
+  function markDeleted(runId: string) {
+    deletedRef.current.add(runId)
+    setDeletedIds(new Set(deletedRef.current))
+    setRuns(current => current.filter(run => run.run_id !== runId))
+    snapshotRequestRef.current += 1
+    window.dispatchEvent(new Event('aflow-history-changed'))
+  }
+  async function mutateHistory(action: 'archive' | 'restore' | 'delete') {
+    if (!selectedRun) return
+    const runId = selectedRun.run_id
+    const identity = JSON.stringify([projectId, runId, action])
+    const pending = historyIntents.current.get(identity) ?? { action, revision: selectedRun.history_revision ?? 0, key: requestKey('history'), acknowledged: acknowledgeActive }
+    historyIntents.current.set(identity, pending)
+    setBusyAction('history'); setError(null)
+    try {
+      const result = await api.changeRunHistory(projectId, runId, action, pending.revision, pending.key, pending.acknowledged)
+      historyIntents.current.delete(identity)
+      if (result.state === 'deleted') markDeleted(runId)
+      else setRuns(current => current.map(run => run.run_id === runId ? { ...run, history_state: result.state, history_revision: result.revision } : run))
+      setHistoryConfirm(null); setAcknowledgeActive(false)
+      window.dispatchEvent(new Event('aflow-history-changed'))
+    } catch (reason) {
+      if (reason instanceof ApiError && [400, 403, 404, 409, 410, 422].includes(reason.status)) {
+        historyIntents.current.delete(identity)
+        await loadSelectedRun(projectId, runId)
+      }
+      setError(`${errorMessage(reason, 'History update failed')}. Your action is still pending; retry after reviewing the current record.`)
+    } finally { setBusyAction(null) }
+  }
+  useEffect(() => { if (projectAvailable) void loadDashboard(projectId) }, [historyFilter]) // eslint-disable-line react-hooks/exhaustive-deps
+  const listedRuns = runs.filter(run => !deletedIds.has(run.run_id) && (run.history_state ?? 'visible') !== 'deleted' && (historyFilter === 'all' || (run.history_state ?? 'visible') === historyFilter))
   function selectRun(runId: string) {
+    setNavigationVersion(value => value + 1)
+    setHistoryConfirm(null)
     setMissingRunId(null)
     setSelectedRunId(runId)
     onRunSelectionChangeRef.current?.({ runId, userInitiated: true })
@@ -1718,10 +1802,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       )}
 
       {projectAvailable && !newRunPage && (
-        <div className="dashboard-columns">
+        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} navigation={
           <section className="card run-list" aria-label="Project runs">
-            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{runs.length} recorded</span></div>
-            {runs.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : runs.map((run) => (
+            <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
+            <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>
+            {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => (
               <button className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
                 <span>{run.plan_path?.split('/').pop() ?? run.run_id}</span>
                 <span className="status-pill">{statusLabel(run)}</span>
@@ -1732,10 +1817,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </span>
               </button>
             ))}
-          </section>
+            {nextRunCursor && <button className="btn btn-secondary" disabled={refreshing} onClick={() => void loadMoreRuns()}>Load more runs</button>}
+          </section>}>
 
           <section className="card run-detail" aria-label="Run details">
-            {!selectedRun ? <p className="text-sm text-dim">Select a recorded run to inspect its server status and events.</p> : <>
+            {selectedRunId && deletedIds.has(selectedRunId) ? <div><h3>Deleted record</h3><p>Workflow files and recovery data are retained.</p></div> : !selectedRun ? <p className="text-sm text-dim">Select a recorded run to inspect its server status and events.</p> : <>
               <div className="run-progress-header">
                 <div className="section-heading">
                   <div>
@@ -1743,16 +1829,29 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     <button className="text-xs text-dim mono" title="Copy run ID" onClick={() => void navigator.clipboard?.writeText(selectedRun.run_id)}>{selectedRun.run_id}</button>
                   </div>
                   <span className="status-pill">{statusLabel(selectedRun)}</span>
+                  {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
+                  {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" onClick={() => void mutateHistory('restore')}>Restore</button>}
+                  <MoreMenu label="More run actions">
+                    {selectedRun.history_state !== 'archived' && <MenuItem onClick={() => { if (selectedRun.activity === 'active') { setHistoryConfirm('archive'); setAcknowledgeActive(false) } else void mutateHistory('archive') }}>Archive</MenuItem>}
+                    <MenuItem danger onClick={() => { setHistoryConfirm('delete'); setAcknowledgeActive(false) }}>Delete record…</MenuItem>
+                  </MoreMenu>
                 </div>
+                {historyConfirm && <div role="alertdialog" aria-label={`${historyConfirm} record ${selectedRun.run_id}`}>
+                  <p>{selectedRun.run_id}: {historyConfirm === 'delete' ? 'Delete this run from history permanently? Workflow files and recovery data will be kept.' : 'Archive this run from the default history lists?'}</p>
+                  {selectedRun.activity === 'active' && <label><input type="checkbox" checked={acknowledgeActive} onChange={event => setAcknowledgeActive(event.target.checked)} />I understand this will not stop the active workflow.</label>}
+                  <button className="btn btn-danger" disabled={busyAction === 'history' || (selectedRun.activity === 'active' && !acknowledgeActive)} onClick={() => void mutateHistory(historyConfirm)}>Confirm {historyConfirm}</button>
+                  <button className="btn btn-secondary" onClick={() => setHistoryConfirm(null)}>Cancel</button>
+                </div>}
                 <dl className="run-progress-strip">
-                  {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{selectedRun.current_step} · {selectedRun.turns_completed ?? 0}{selectedRun.max_turns ? ` / ${selectedRun.max_turns}` : ''}</dd></div>}
-                  {selectedRun.workflow_name && <div><dt>Workflow / team</dt><dd>{selectedRun.workflow_name}{selectedRun.team ? ` · ${selectedRun.team}` : ''}</dd></div>}
+                  {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{selectedRun.current_step} · {selectedRun.turns_completed ?? 0}</dd></div>}
+                  {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{selectedRun.workflow_name}</dd></div>}
+                  <div><dt>Team</dt><dd>{selectedRun.team ?? 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
                   {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
                     : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
                   {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
                 </dl>
               </div>
-              {selectedRun.ownership === 'legacy' && <div className="notice">Legacy record classified as interrupted and read-only. It is never treated as a live workflow.</div>}
+              {selectedRun.ownership === 'legacy' && <div className="notice">Legacy execution record. Workflow controls are unavailable; history controls remain available.</div>}
               {selectedRun.evidence.no_agent_started === true && selectedRun.status !== 'running' && <p>No agent started.</p>}
               {streamState === 'reconnecting' && <div className="notice">Updates are stale. Use Refresh to retry.</div>}
               {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
@@ -1766,8 +1865,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {outcome?.resultText && <pre className="dashboard-payload">{outcome.resultText}</pre>}
               </section>}
 
-              {(selectedRun.max_turns || selectedRun.team) && <details className="dashboard-section"><summary>Effective settings</summary>
-                <p>Max turns: {selectedRun.max_turns ?? 'Default'}{selectedRun.team ? ` · Team: ${selectedRun.team}` : ''}</p>
+              {savedOverrides && <details className="dashboard-section" open><summary>Run changes</summary>
                 {savedOverrides && <div>
                   <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}</p>
                   {savedOverrides.max_turns && <p>Max turns: {savedOverrides.max_turns}</p>}
@@ -1893,7 +1991,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               </section>
             </>}
           </section>
-        </div>
+        </SidebarEditorLayout>
       )}
 
       {projectAvailable && newRunPage && <NewRunPage

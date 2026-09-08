@@ -202,7 +202,7 @@ class AflowDaemon:
             raise DaemonNotReadyError("daemon lifecycle has not started")
         return self._application
 
-    def start(self) -> tuple[ReconciliationResult, ...]:
+    def start(self, *, persist_reconciliation: bool = True) -> tuple[ReconciliationResult, ...]:
         """Load configuration and reconcile; this method never starts a workflow."""
         workflow_config = load_workflow_config(self._config.config_path)
         application = compose_control_plane(
@@ -211,7 +211,7 @@ class AflowDaemon:
             units=self._units,
         )
         application.capabilities.get()
-        reconciled = application.reconciliation.reconcile_startup()
+        reconciled = application.reconciliation.reconcile_all(persist=persist_reconciliation)
         self._application = application
         self._service = DaemonService(application, self._config, workflow_config)
         self._ready = True
@@ -673,36 +673,40 @@ class DaemonService:
 
     def run_status(self, run_id: str) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
+        from .control_plane.run_activity import project_activity
         status = self._application.repository.get_run_status(run_id)
         if status.status == "owner_stopped":
-            return status
+            return project_activity(status)
         if status.ownership != "control_plane":
-            return status
+            return project_activity(status)
         status = replace(status, evidence={**status.evidence, "can_resume": self._can_resume(status)})
         try:
             observed = self._application.units.get(_unit_name(run_id))
             if observed is not None and observed.name == _unit_name(run_id) and status.evidence.get("worker") is None:
-                status = replace(status, evidence={**status.evidence, "unit_active": observed.is_active})
+                status = replace(status, evidence={**status.evidence, "unit_active": observed.is_active, "unit_observation": "observed"})
+            elif status.evidence.get("worker") is None:
+                status = replace(status, evidence={**status.evidence, "unit_observation": "missing" if observed is None else "identity_mismatch"})
         except Exception:
-            pass  # Unavailable observation is unknown, never inferred active.
+            status = replace(status, evidence={**status.evidence, "unit_observation": "unavailable"})
         try:
             record = self._read_record(run_id)
         except DaemonError:
-            return status
-        if record.get("state") == "awaiting_startup_answer" and status.status not in {
+            return project_activity(status)
+        if record.get("state") == "awaiting_startup_answer" and status.evidence.get("startup_question_valid") and status.status not in {
             "running", "completed", "failed", "interrupted",
         }:
-            return replace(
+            return project_activity(replace(
                 status,
                 status="awaiting_startup_answer",
                 reason="startup answer required before workflow unit creation",
                 evidence={
                     **status.evidence,
+                    "startup_question_valid": True,
                     "startup_question": _question_record(
                         run_id, _question_from_record(record), _question_generation(record)
                     ).to_dict(),
                 },
-            )
+            ))
         prepared = record.get("prepared")
         if isinstance(prepared, Mapping):
             selected = _optional_string(prepared.get("start_step"))
@@ -712,12 +716,12 @@ class DaemonService:
                 and isinstance(skipped, list)
                 and all(isinstance(item, str) for item in skipped)
             ):
-                return replace(
+                return project_activity(replace(
                     status,
                     selected_start_step=selected,
                     skipped_steps=tuple(skipped),
-                )
-        return status
+                ))
+        return project_activity(status)
 
     def _can_resume(self, status: RunStatus) -> bool:
         """Read-only admission preview; resume rechecks before any reservation."""
@@ -907,6 +911,9 @@ class DaemonService:
         """Advance one already-reserved request without changing its identity."""
         if record.get("state") != "preparing":
             return self._pending_response_locked(record)
+        from .control_plane.run_activity import preparation_owner
+        record = {**record, "preparation_owner": preparation_owner()}
+        self._write_record(record)
         request = self._request_from_record(record)
         try:
             prepared_or_question = prepare_startup(request)

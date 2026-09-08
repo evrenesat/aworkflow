@@ -338,7 +338,7 @@ export async function listControlPlanePlans(projectId: string): Promise<ControlP
 
 export async function listControlPlaneRuns(
   projectId: string,
-  request: { cursor?: string; limit?: number } = {},
+  request: { cursor?: string; limit?: number; history?: 'visible' | 'archived' | 'all' } = {},
   options: { signal?: AbortSignal } = {},
 ): Promise<RunPage> {
   return fetchJson<RunPage>(`${controlProjectPath(projectId)}/runs${buildQuery(request)}`, options)
@@ -593,4 +593,11 @@ export async function checkHealth(): Promise<{ status: string }> {
     throw new Error('Health check failed')
   }
   return response.json()
+}
+
+export async function changeRunHistory(project: string, run: string, action: 'archive' | 'restore' | 'delete', revision: number, key: string, acknowledgeActive: boolean) {
+  return fetchJson<{ state: 'visible' | 'archived' | 'deleted'; revision: number }>(`${controlProjectPath(project)}/runs/${encodeURIComponent(run)}${action === 'delete' ? '' : `/${action}`}`, {
+    method: action === 'delete' ? 'DELETE' : 'POST', headers: withIdempotency(undefined, key),
+    body: JSON.stringify({ expected_revision: revision, acknowledge_active: acknowledgeActive }),
+  })
 }

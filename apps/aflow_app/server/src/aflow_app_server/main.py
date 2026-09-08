@@ -13,7 +13,7 @@ import re
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -34,6 +34,7 @@ from aflow.control_plane import (
     ServiceAuthorizationError,
 )
 from aflow.control_plane.persistence import PersistenceError
+from aflow.control_plane.run_history import DeletedRunError
 from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict, DaemonStartupError
 
 from .browser_session import (
@@ -673,6 +674,11 @@ async def control_plane_unavailable_handler(
     return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "control_plane_unavailable")
 
 
+@app.exception_handler(DeletedRunError)
+async def deleted_run_handler(_: Request, __: DeletedRunError) -> JSONResponse:
+    return _error_response(410, "run_deleted", message="Deleted record. Workflow files and recovery data are retained.")
+
+
 @app.exception_handler(RepositoryNotFoundError)
 async def run_not_found_handler(_: Request, __: RepositoryNotFoundError) -> JSONResponse:
     return _error_response(status.HTTP_404_NOT_FOUND, "run_not_found")
@@ -890,17 +896,44 @@ def control_plane_plans(
 )
 def control_plane_runs(
     project_id: str,
+    history: Literal["visible", "archived", "all"] = Query(default="visible"),
     limit: int = Query(default=100, ge=1, le=1_000),
     cursor: str | None = Query(default=None, max_length=64),
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> RunListResponse:
-    page = service.list_runs(project_id, limit=limit, cursor=cursor)
+    page = service.list_runs(project_id, limit=limit, cursor=cursor, history=history)
     return RunListResponse(
         runs=tuple(RunStatusResponse.from_canonical(run) for run in page.runs),
         next_cursor=page.next_cursor,
         schema_version=page.schema_version,
     )
+
+
+class RunHistoryRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    acknowledge_active: bool = False
+
+
+@app.post("/api/control-plane/projects/{project_id}/runs/{run_id}/archive", tags=["control-plane"])
+def archive_run_record(project_id: str, run_id: str, body: RunHistoryRequest,
+                      idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=256),
+                      _: str = Depends(verify_token), service: ControlPlaneService = Depends(get_control_plane_service)):
+    return service.change_history(project_id, run_id, state="archived", idempotency_key=idempotency_key, **body.model_dump())
+
+
+@app.post("/api/control-plane/projects/{project_id}/runs/{run_id}/restore", tags=["control-plane"])
+def restore_run_record(project_id: str, run_id: str, body: RunHistoryRequest,
+                      idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=256),
+                      _: str = Depends(verify_token), service: ControlPlaneService = Depends(get_control_plane_service)):
+    return service.change_history(project_id, run_id, state="visible", idempotency_key=idempotency_key, **body.model_dump())
+
+
+@app.delete("/api/control-plane/projects/{project_id}/runs/{run_id}", tags=["control-plane"])
+def delete_run_record(project_id: str, run_id: str, body: RunHistoryRequest,
+                      idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=256),
+                      _: str = Depends(verify_token), service: ControlPlaneService = Depends(get_control_plane_service)):
+    return service.change_history(project_id, run_id, state="deleted", idempotency_key=idempotency_key, **body.model_dump())
 
 
 @app.get(
@@ -968,9 +1001,12 @@ async def event_stream(
             if await request.is_disconnected():
                 return
 
-            pending_events = service.events(
-                project_id, run_id, after_sequence=cursor, limit=limit
-            )
+            try:
+                pending_events = service.events(
+                    project_id, run_id, after_sequence=cursor, limit=limit
+                )
+            except DeletedRunError:
+                return
 
     return EventSourceResponse(event_generator())
 

@@ -364,3 +364,14 @@ def test_visible_restore_rolls_expiry_but_background_restore_does_not(session_cl
     assert logout.status_code == 204
     assert "Max-Age=0" in logout.headers["set-cookie"]
     assert client.get("/api/session").status_code == 401
+
+
+def test_history_cookie_mutations_require_same_origin(session_client):
+    client, _, _, _ = session_client
+    _login(client)
+    base = '/api/control-plane/projects/example/runs/example'
+    for method, suffix in [('POST', '/archive'), ('POST', '/restore'), ('DELETE', '')]:
+        response = client.request(method, base + suffix, json={'expected_revision': 0}, headers={'Idempotency-Key': 'history'})
+        assert response.status_code == 403
+        allowed = client.request(method, base + suffix, json={'expected_revision': 0}, headers={'Idempotency-Key': 'history', 'Origin': 'https://testserver'})
+        assert allowed.status_code == 404

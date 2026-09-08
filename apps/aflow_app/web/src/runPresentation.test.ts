@@ -22,7 +22,8 @@ describe('honest run timing', () => {
     expect(executionDuration({ ...finished, ended_at: null }, Date.now())).toBeNull()
   })
   it('distinguishes failure, questions, launch and runtime', () => {
-    expect(statusLabel(run)).toBe('Starting')
+    expect(statusLabel(run)).toBe('Needs attention')
+    expect(statusLabel({ ...run, activity: 'active' })).toBe('Starting')
     expect(statusLabel({ ...run, status: 'awaiting_startup_answer' })).toBe('Input needed')
     expect(statusLabel({ ...run, status: 'needs_attention', evidence: { no_agent_started: true, startup_failure: { stage: 'preparation' } } })).toBe('Could not start')
     expect(statusLabel({ ...run, status: 'needs_attention', evidence: { startup_failure: { stage: 'unit_launch' } } })).toBe('Needs attention')

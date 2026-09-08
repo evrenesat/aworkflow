@@ -254,6 +254,10 @@ export interface ControlPlaneReadiness {
 }
 
 export interface RunStatus {
+  activity?: 'active' | 'inactive' | 'unknown'
+  status_reason_code?: string
+  history_state?: 'visible' | 'archived' | 'deleted'
+  history_revision?: number
   worker_exit?: { stage: string; reason: string | null; exit_code: number | null; exited_at: string | null; diagnostic_unavailable: boolean } | null
   plan_path?: string | null
   started_at?: string | null

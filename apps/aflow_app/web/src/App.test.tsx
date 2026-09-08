@@ -566,9 +566,8 @@ describe('App workspace shell', () => {
         ],
       })
     render(<App />)
-    const candidateItem = (await screen.findByText('alpha')).closest('[role="listitem"]') as HTMLElement
-    expect(within(candidateItem).getByText('Added')).toBeDefined()
-    expect(within(candidateItem).queryByRole('button', { name: 'Add', exact: true })).toBeNull()
+    await screen.findByRole('list', { name: 'Available on this server' })
+    expect(within(screen.getByRole('list', { name: 'Available on this server' })).queryByText('alpha')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'More actions for project Alpha Project' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Unregister…' }))
@@ -688,9 +687,7 @@ describe('App workspace shell', () => {
     expect(kiloItem.querySelector('.content-button')).toBeNull()
     const limboItem = screen.getByText('limbo').closest('[role="listitem"]') as HTMLElement
     expect(within(limboItem).queryAllByRole('button')).toHaveLength(0)
-    // A registered candidate's row remains an interactive open control.
-    const alphaItem = screen.getByText('alpha').closest('[role="listitem"]') as HTMLElement
-    expect(within(alphaItem).getByRole('button', { name: /Alpha Project/ })).toBeDefined()
+    expect(within(screen.getByRole('list', { name: 'Available on this server' })).queryByText('alpha')).toBeNull()
 
     fireEvent.change(screen.getByLabelText('Search projects and available candidates'), { target: { value: 'kilo' } })
     expect(screen.queryByText('limbo')).toBeNull()
@@ -733,7 +730,7 @@ describe('App workspace shell', () => {
     expect((screen.getByLabelText('Search projects and available candidates') as HTMLInputElement).value).toBe('kilo')
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(api.getProjectDiscovery).toHaveBeenCalledTimes(2))
-    expect(screen.getByText('Added')).toBeDefined()
+    expect(within(screen.getByRole('list', { name: 'Available on this server' })).queryByText('tools/kilo')).toBeNull()
   })
 
   it('recovers discovery failures and explains an empty server', async () => {
@@ -914,6 +911,7 @@ describe('App workspace shell', () => {
     await screen.findByRole('heading', { name: /AFlow · Alpha Project/ })
 
     // Guided save: an invalid draft keeps the draft; the corrected retry saves.
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
     await screen.findByLabelText('aflow.toml contents')
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# still placeholder\n' } })

@@ -71,8 +71,8 @@ def test_repository_lists_stable_plan_and_run_metadata(tmp_path: Path) -> None:
     assert page.next_cursor == "legacy-run"
     statuses = repository.list_runs(limit=10).runs
     assert [(status.run_id, status.ownership, status.status) for status in statuses] == [
-        ("legacy-run", "legacy", "interrupted"),
-        ("owned-run", "control_plane", "running"),
+        ("legacy-run", "legacy", "needs_attention"),
+        ("owned-run", "control_plane", "needs_attention"),
     ]
     assert legacy_metadata.read_text() == '{"status":"running","workflow_name":"old"}\n'
 
@@ -105,10 +105,10 @@ def test_repository_reads_historical_direct_cli_runs_without_enabling_control_pa
     assert (status.run_id, status.ownership, status.status) == (
         legacy_id,
         "legacy",
-        "interrupted",
+        "needs_attention",
     )
     assert [(item.run_id, item.ownership, item.status) for item in page.runs] == [
-        (legacy_id, "legacy", "interrupted")
+        (legacy_id, "legacy", "needs_attention")
     ]
     assert metadata.read_bytes() == before
     # The exact legacy id stays readable for preserved-run inspection, while
@@ -193,7 +193,7 @@ def test_old_startup_failure_is_read_only_and_active_terminal_authority_wins(tmp
     run_dir = tmp_path / ".aflow" / "runs" / "old-failure"
     run_dir.mkdir()
     append_run_event(run_dir, "reconciled", {"status": "running", "reason": "exact workflow unit is active"})
-    assert repo.get_run_status("old-failure").status == "running"
+    assert repo.get_run_status("old-failure").status == "needs_attention"
     assert repo.get_run_status("old-failure").evidence["no_agent_started"] is False
     (run_dir / "run.json").write_text(json.dumps({"status": "completed", "run_started_at": "2026-09-08T10:00:00Z"}))
     write_launch_phase(tmp_path, "old-failure", "completed")
