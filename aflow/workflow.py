@@ -5493,6 +5493,22 @@ def _emit_hotplug_event(
 
 def _discover_session_driver(adapter: HarnessAdapter, *, repo_root: Path | None = None) -> SessionDriver | None:
     """Enable native sessions only for a proven, supported production adapter."""
+    if getattr(adapter, "name", None) == "dsh":
+        executable = shutil.which("dsh")
+        if executable is None or repo_root is None:
+            return None
+        from .harnesses.dsh import DshAcpDriver, DshAcpProcess
+        process = None
+        try:
+            process = DshAcpProcess.start(repo_root=repo_root, executable=executable)
+            driver = DshAcpDriver.from_initialize(process.initialize())
+            driver.executable = executable
+            return driver
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return None
+        finally:
+            if process is not None:
+                process.close()
     if getattr(adapter, "name", None) == "reasonix":
         executable = shutil.which("reasonix") or "/usr/local/bin/reasonix"
         if not Path(executable).is_file():
@@ -9416,12 +9432,15 @@ def run_workflow(
                         transaction, source_driver, turn_session_driver, selector=selector,
                         system_prompt=system_prompt, user_prompt=user_prompt,
                         target_preflight=lambda: _preflight_or_fail(
-                            step_adapter.build_invocation(
-                                repo_root=execution_repo_root,
-                                model=resolved.model,
-                                system_prompt=system_prompt,
-                                user_prompt=user_prompt,
-                                effort=resolved.effort,
+                            turn_session_driver.build_invocation(
+                                SessionRequest(
+                                    repo_root=execution_repo_root,
+                                    selector=selector,
+                                    model=resolved.model,
+                                    system_prompt=system_prompt,
+                                    user_prompt=user_prompt,
+                                    effort=resolved.effort,
+                                )
                             ),
                             step_adapter,
                             invocation_kind="workflow_turn",
@@ -9736,12 +9755,15 @@ def run_workflow(
                         transaction, source_driver, turn_session_driver, selector=selector,
                         system_prompt=system_prompt, user_prompt=user_prompt,
                         target_preflight=lambda: _preflight_or_fail(
-                            step_adapter.build_invocation(
-                                repo_root=execution_repo_root,
-                                model=resolved.model,
-                                system_prompt=system_prompt,
-                                user_prompt=user_prompt,
-                                effort=resolved.effort,
+                            turn_session_driver.build_invocation(
+                                SessionRequest(
+                                    repo_root=execution_repo_root,
+                                    selector=selector,
+                                    model=resolved.model,
+                                    system_prompt=system_prompt,
+                                    user_prompt=user_prompt,
+                                    effort=resolved.effort,
+                                )
                             ),
                             step_adapter,
                             invocation_kind="workflow_turn",

@@ -20,7 +20,7 @@ durable control-plane service entry point.
 
 AFlow invokes existing CLIs rather than provider APIs. The selected harness must
 already be installed and authenticated. Adapters are included for Claude,
-Codex, Copilot, Gemini, Kiro, Muse, OpenCode, Pi, Reasonix, and ZCode.
+Codex, Copilot, DSH (ACP), Gemini, Kiro, Muse, OpenCode, Pi, Reasonix, and ZCode.
 ZCode uses its own project model/reasoning configuration; see the
 [ZCode profile setup](docs/configuration.md#zcode-profiles).
 

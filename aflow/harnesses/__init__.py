@@ -4,6 +4,7 @@ from .base import HarnessAdapter, HarnessInvocation as HarnessInvocation
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
 from .copilot import CopilotAdapter
+from .dsh import DshAdapter
 from .gemini import GeminiAdapter
 from .kiro import KiroAdapter
 from .muse import MuseAdapter
@@ -17,6 +18,7 @@ ADAPTERS: dict[str, HarnessAdapter] = {
     "claude": ClaudeAdapter(),
     "codex": CodexAdapter(),
     "copilot": CopilotAdapter(),
+    "dsh": DshAdapter(),
     "gemini": GeminiAdapter(),
     "kiro": KiroAdapter(),
     "muse": MuseAdapter(),

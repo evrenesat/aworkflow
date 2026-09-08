@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-08 — DSH ACP model selection
+
+- Added DSH ACP session discovery and execution with provider-qualified models,
+  dependent effort selection, exact-session output, and capability-gated resume.
+- Added timed pipe reads, unattended permission responses, session cleanup,
+  and contract tests for selection failures, resume, and transport bursts.
+- Cross-harness target preflight now checks the selected session invocation,
+  allowing ACP-only model selection without a headless fallback.
+- p100 model/team configuration remains host-local; DSH ACP requires its own
+  provider bundle and an inherited ZAI_API_KEY for Z.AI Coding Plan requests.
+
 ## 2026-09-06 — Bounded continuous-deployment poller for validated main
 
 - Added `deploy/aflowd/continuous-deploy.py`, a standard-library one-shot

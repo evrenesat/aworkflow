@@ -419,6 +419,31 @@ The remote app edits the shared workflow pair as one revisioned pair:
   binding and root changes need `aflow ui --stop` plus a restart. Responses
   and errors never contain the credential.
 
+## DSH ACP profiles
+
+DSH `0.1.2-rc.1` supplies the `acp` profile used by AFlow. Install the
+provider bundle into that profile as well as any independently used headless
+profile. For Z.AI, inherit `ZAI_API_KEY` in the AFlow process environment;
+do not store the credential in AFlow configuration. Ensure the ACP profile's
+model catalog advertises the selected model and reasoning effort.
+
+```toml
+[harness.dsh.profiles.glm-flash-max]
+model = "zai/glm-5.3-flash"
+effort = "max"
+
+[harness.dsh.profiles.glm-max]
+model = "zai/glm-5.3"
+effort = "max"
+```
+
+These selectors can serve ordinary worker and reviewer steps. AFlow verifies
+the model and effort through ACP before sending the prompt. Session resume
+and model changes are capability-gated. Manager and lifecycle roles should
+use another harness: per-call DSH model overrides require the session driver,
+and the plain headless adapter rejects them instead of using global defaults.
+No mid-turn steering or idempotent turn start is advertised.
+
 ## ZCode profiles
 
 Install and authenticate the native ZCode CLI first. Configure the desired

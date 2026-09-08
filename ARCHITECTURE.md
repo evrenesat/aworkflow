@@ -12,6 +12,14 @@ additional responsibilities differ.
 
 ## High-Level Data Flow
 
+DSH ordinary workflow turns use an owned ACP stdio session. Discovery only
+negotiates capabilities; execution opens or resumes a session, selects the
+provider-qualified model followed by its dependent reasoning effort, verifies
+the applied values, and gathers assistant chunks from that prompt's updates.
+The transport handles permission requests and drains both pipes independently.
+DSH profiles with model/effort overrides require ACP and fail closed on the
+plain-invocation path; DSH is not advertised for manager workspace reads.
+
 ```mermaid
 flowchart TD
     User["User runs: aflow run [workflow] plan.md"]
