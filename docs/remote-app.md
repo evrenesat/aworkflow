@@ -9,9 +9,9 @@ Agent providers are selected by normal AFlow harness profiles when a workflow ru
 - Every project is an exact Git root explicitly recorded in the versioned project registry.
 - Project paths are selected server-side from that registry. Requests cannot submit arbitrary roots.
 - Plan routes edit only direct regular `.md` files under `plans/todo`, `plans/in-progress`, and `plans/done`.
-- Configuration routes address only `.aflow/config/aflow.toml` and `.aflow/config/workflows.toml` as one revisioned pair.
+- Configuration routes address the one shared global pair `~/.config/aflow/aflow.toml` and `workflows.toml` as one revisioned pair; project-local configuration is never written or read.
 - Run REST and MCP routes delegate to the same durable control-plane service.
-- REST accepts an `Authorization: Bearer ...` header or, for the web client, a signed HttpOnly session cookie. Credentials in URLs or MCP payloads are rejected; `/mcp` stays header-only.
+- REST accepts an `Authorization: Bearer ...` header or, for the web client, a signed HttpOnly session cookie whose Secure attribute follows the effective request scheme, so direct HTTP from other devices works. Credentials in URLs or MCP payloads are rejected; `/mcp` stays header-only.
 - `/health` reports process liveness. Authenticated `/ready` reports control-plane readiness.
 
 ## Run locally
@@ -23,7 +23,7 @@ uv sync --project apps/aflow_app/server
 AFLOW_APP_TOKEN=secret uv run --project apps/aflow_app/server aflow-app-server
 ```
 
-The server binds to `127.0.0.1:8765` by default and serves the built web client from the same origin.
+The server binds to `127.0.0.1:8765` by default and serves the built web client from the same origin. `aflow ui` is the end-user launcher for this server; it resolves the global configuration automatically and needs no environment ceremony. The legacy `aflow-app-server` entry point keeps the environment-variable deployment path below.
 
 ## Web workspace
 
@@ -96,7 +96,7 @@ The server reads `~/.config/aflow/config.toml` and these environment overrides:
 - `AFLOW_RELEASE_IDENTITY`
 - `AFLOW_ENVIRONMENT_FILE`
 
-A token file is reread per request so rotation does not require a restart. The managed root, registry, executable, release identity, and environment file are server-owned launch inputs. Per-project workflow settings live in the canonical project configuration pair.
+A token file is reread per request so rotation does not require a restart, and when `aflow ui` serves the app the whole global `config.toml` is re-read on change, so a password rotation applies immediately. The managed root, registry, executable, release identity, and environment file are server-owned launch inputs; `aflow ui` resolves the executable and release identity from its own installation and prepares a private worker environment file automatically. All projects share the canonical global workflow pair (`~/.config/aflow/aflow.toml` plus `workflows.toml`).
 
 ```toml
 [server]
@@ -121,14 +121,15 @@ environment_file = "/etc/aflowd/worker.env"
 - `GET /api/projects/{project_id}`
 - `PATCH /api/projects/{project_id}`
 - `DELETE /api/projects/{project_id}`
-- `GET /api/projects/{project_id}/config`
-- `PUT /api/projects/{project_id}/config`
-- `POST /api/projects/{project_id}/config/validate`
-- `POST /api/projects/{project_id}/config/form` (pure projection or one draft operation; does not save)
+- `GET /api/config` (the shared global pair)
+- `PUT /api/config`
+- `POST /api/config/validate`
+- `POST /api/config/form` (pure projection or one draft operation; does not save)
+- `GET /api/settings` and `PUT /api/settings` (transport settings; write-only password; restart-required reporting)
 
-Project creation and registration accept only normalized paths relative to the managed root. Existing folders are added without renaming: the registry ID is an internal path-safe label, so basenames with underscores, uppercase letters, spaces, or non-ASCII characters get a deterministic safe ID (safe-slug basenames keep their exact name), and the discovered display name uses the actual folder name. Registration never modifies directory contents; unregister removes the registry record after active-unit checks and never deletes repository files.
+Project creation and registration accept only normalized paths relative to the managed root. Existing folders are added without renaming: the registry ID is an internal path-safe label, so basenames with underscores, uppercase letters, spaces, or non-ASCII characters get a deterministic safe ID (safe-slug basenames keep their exact name), and the discovered display name uses the actual folder name. Registration never modifies directory contents — no project-local configuration is written, because every project immediately uses the shared global configuration — and unregister removes the registry record after active-unit checks and never deletes repository files.
 
-Configuration reads return both exact texts, a combined SHA-256 revision, and bounded validation results. Saves require `expected_revision`, validate both candidates through the production loader, and atomically commit or restore the pair. New launches and configuration commits use the same per-project lock.
+Configuration reads return both exact texts, a combined SHA-256 revision, and bounded validation results. Saves require `expected_revision`, validate both candidates through the production loader, and atomically commit or restore the pair. Saves are never blocked by runs: every run freezes an immutable configuration snapshot at reservation (shared lock with saves), so edits apply to new runs in all projects only. Settings changes to bind host/port or the projects root report restart-required; password changes invalidate sessions immediately.
 
 ## Plan API
 

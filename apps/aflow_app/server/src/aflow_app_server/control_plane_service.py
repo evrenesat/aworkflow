@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 import os
 from pathlib import Path
 import re
@@ -67,6 +68,8 @@ class ControlPlaneServiceConfig:
     environment_file: Path
     release_identity: str
     environment: Mapping[str, str]
+    unit_manager_factory: Callable[[], Any] | None = None
+    workflow_config_path: Path | None = None
 
 
 class ControlPlaneService:
@@ -81,12 +84,20 @@ class ControlPlaneService:
         release_identity: str | None = None,
         environment: Mapping[str, str] | None = None,
         daemon_factory: DaemonFactory = AflowDaemon,
+        unit_manager_factory: Callable[[], Any] | None = None,
+        workflow_config_path: Path | None = None,
     ) -> None:
         if isinstance(registry, ControlPlaneServiceConfig):
             aflow_executable = registry.aflow_executable
             environment_file = registry.environment_file
             release_identity = registry.release_identity
             environment = registry.environment
+            unit_manager_factory = (
+                unit_manager_factory or registry.unit_manager_factory
+            )
+            workflow_config_path = (
+                workflow_config_path or registry.workflow_config_path
+            )
             registry = registry.registry
         if isinstance(registry, tuple):
             if registry:
@@ -104,9 +115,26 @@ class ControlPlaneService:
         self._environment_file = environment_file
         self._release_identity = release_identity
         self._environment = dict(environment or {})
+        # All projects share the one global workflow pair (decision 1 of the
+        # global-configuration product); per-project pairs are ignored.
+        if workflow_config_path is not None:
+            self._workflow_config_path = Path(workflow_config_path)
+        else:
+            from .config import global_config_dir
+
+            self._workflow_config_path = global_config_dir() / "aflow.toml"
         if self._registry is not None:
             self._validate_shared_release_inputs()
-        self._daemon_factory = daemon_factory
+        if unit_manager_factory is not None:
+            base_factory = daemon_factory
+            persistent_units = unit_manager_factory
+
+            def _factory_with_units(daemon_config: DaemonConfig) -> AflowDaemon:
+                return base_factory(daemon_config, units=persistent_units())
+
+            self._daemon_factory: DaemonFactory = _factory_with_units
+        else:
+            self._daemon_factory = daemon_factory
         self._projects: dict[str, _ProjectDaemon] = {}
         self._unavailable: dict[str, str] = {}
         self._lock = RLock()
@@ -596,7 +624,7 @@ class ControlPlaneService:
     ) -> tuple[ProjectRegistryRecord, Path, DaemonConfig]:
         if self._registry is not None:
             record, root = self._registry.resolve(project_id)
-            config_path = root / ".aflow" / "config" / "aflow.toml"
+            config_path = self._workflow_config_path
             return (
                 record,
                 root,

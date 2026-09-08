@@ -70,6 +70,32 @@ or keyboard capture, and one final summary record per run. `aflow show` prints
 plain ASCII workflow graphs, roles, and teams. The CLI is a portable launcher
 and log stream; the remote web application is the interactive dashboard.
 
+## Serve the web UI from any directory
+
+```bash
+aflow ui
+```
+
+One command installs nothing extra and serves the AFlow web UI. The first
+launch asks for a UI password and the projects root (default `~/code`),
+writes them to `~/.config/aflow/config.toml` (mode 0600), and serves the UI
+with the same global workflows and teams the CLI uses. The UI binds
+`0.0.0.0:8765` after setup, so other devices on your network or Tailscale can
+open it directly over HTTP.
+
+```bash
+aflow ui --daemon   # start in the background and return once ready
+aflow ui --status   # report the running server
+aflow ui --stop     # stop the UI; running workflows are not signalled
+aflow ui --host 127.0.0.1 --port 8765   # per-process overrides
+```
+
+Workflows started from the UI keep running when the UI stops or restarts and
+reattach when it returns. Each run freezes a copy of the workflow
+configuration at launch, so later configuration edits affect only new runs.
+Normal installations ship the UI inside the `aworkflow` wheel and never need
+Node; editable development installs build the web assets automatically.
+
 ## Run the lightweight local daemon
 
 `aflow daemon` exposes the same 13 control-plane MCP tools without the remote

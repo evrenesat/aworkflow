@@ -11,10 +11,8 @@ from typing import Literal
 
 from aflow.config import (
     ConfigError,
-    bootstrap_project_config,
     project_configuration_state,
     validate_starter_main_branch,
-    validate_starter_name,
 )
 
 from .control_plane_service import ControlPlaneService
@@ -31,12 +29,15 @@ READINESS_BLOCKED = "blocked"
 
 
 def project_readiness(info_current_path: Path, *, is_git_root: bool = True) -> str:
-    """Classify one project's configuration readiness through the engine loader."""
+    """Classify one project's readiness through the global engine classifier.
+
+    All projects share the global workflow pair, so the per-project path is
+    only consulted for the Git-root check; configuration readiness comes from
+    the global configuration itself.
+    """
     if not is_git_root:
         return READINESS_BLOCKED
-    return project_configuration_state(
-        info_current_path / ".aflow" / "config" / "aflow.toml"
-    )
+    return project_configuration_state()
 
 
 class ProjectServiceError(RuntimeError):
@@ -45,16 +46,18 @@ class ProjectServiceError(RuntimeError):
 
 @dataclass(frozen=True)
 class ProjectRequest:
-    """One validated create/register request with typed fields only."""
+    """One validated create/register request with typed fields only.
+
+    Project-level starter configuration fields were removed: registration
+    never writes project-local workflow configuration because every project
+    uses the shared global configuration.
+    """
 
     mode: Literal["create", "register"]
     relative_path: str
     display_name: str | None
     main_branch: str
-    initial_workflow: str | None
-    initial_team: str | None
     initialize_git: bool
-    initialize_config: bool
 
 
 def _validated_relative_root(registry: ProjectRegistry, raw_path: str) -> PurePosixPath:
@@ -203,12 +206,17 @@ class ProjectService:
         self._control_plane = control_plane
 
     def readiness(self, project_id: str) -> str:
-        """Classify one registered project's configuration readiness."""
+        """Classify configuration readiness from the one global workflow pair.
+
+        Every project uses the global configuration, so a registered project
+        is ready exactly when the global pair is ready; local project
+        configuration files are never consulted.
+        """
         try:
-            _, root = self._registry.resolve(project_id)
+            self._registry.resolve(project_id)
         except ProjectRegistryError:
             return READINESS_BLOCKED
-        return project_configuration_state(root / ".aflow" / "config" / "aflow.toml")
+        return project_configuration_state()
 
     def unregister(self, project_id: str) -> bool:
         """Remove only the registry record, after proving units inactive."""
@@ -219,10 +227,13 @@ class ProjectService:
         return self._control_plane.unregister(project_id)
 
     def create_or_register(self, request: ProjectRequest) -> dict[str, object]:
-        """Create or register one project and return its bounded description."""
+        """Create or register one project and return its bounded description.
+
+        Registration never writes project-local workflow configuration: new
+        projects immediately use the shared global configuration.
+        """
         relative = _validated_relative_root(self._registry, request.relative_path)
         branch = _validated_branch(request.main_branch)
-        self._validated_starter_names(request)
         self._reject_conflicts(relative)
         # Registry IDs are internal labels: an unsafe or collided basename gets
         # a deterministic safe ID instead of forcing a directory rename.
@@ -251,17 +262,6 @@ class ProjectService:
             branch=branch,
             request=request,
         )
-
-    @staticmethod
-    def _validated_starter_names(request: ProjectRequest) -> None:
-        """Reject unsafe workflow/team names before any filesystem mutation."""
-        for value in (request.initial_workflow, request.initial_team):
-            if value is None:
-                continue
-            try:
-                validate_starter_name(value)
-            except ConfigError as exc:
-                raise ProjectServiceError(str(exc)) from exc
 
     @staticmethod
     def _validated_display_name(raw: str | None, fallback: str) -> str:
@@ -312,7 +312,6 @@ class ProjectService:
         renamed = False
         try:
             _bootstrap_repository(temporary, branch)
-            self._write_starter_config(temporary, request, branch)
             if target.exists() or target.is_symlink():
                 raise ProjectServiceError("project target path already exists")
             os.replace(temporary, target)
@@ -363,35 +362,11 @@ class ProjectService:
                 raise ProjectServiceError(
                     "project root must be a Git repository or initialize_git must be set"
                 )
-            if request.initialize_config:
-                aflow_dir = target / ".aflow"
-                config_dir = aflow_dir / "config"
-                if not aflow_dir.exists():
-                    created_dirs.append(aflow_dir)
-                if not config_dir.exists():
-                    created_dirs.append(config_dir)
-                created_entries.extend(
-                    self._write_starter_config(target, request, branch)
-                )
             record = self._registry.register(project_id, display_name, str(relative))
         except Exception:
             _discard_created(created_entries, created_dirs)
             raise
         return self._describe(record)
-
-    @staticmethod
-    def _write_starter_config(
-        root: Path, request: ProjectRequest, branch: str
-    ) -> tuple[Path, Path]:
-        try:
-            return bootstrap_project_config(
-                root / ".aflow" / "config" / "aflow.toml",
-                initial_workflow=request.initial_workflow,
-                initial_team=request.initial_team,
-                main_branch=branch,
-            )
-        except ConfigError as exc:
-            raise ProjectServiceError(str(exc)) from exc
 
     def _describe(self, record: object) -> dict[str, object]:
         return {

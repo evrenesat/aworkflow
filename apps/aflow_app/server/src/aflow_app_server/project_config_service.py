@@ -260,6 +260,95 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _read_protected_document(
+    config_dir: Path, name: str
+) -> tuple[bytes, str] | None:
+    """Read one protected document; ``None`` when it does not exist yet."""
+    path = document_path(config_dir, name)
+    if path.is_symlink():
+        raise ProjectConfigError(f"{name} must not be a symlink")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ProjectConfigError(f"{name} is unavailable") from exc
+    if not stat_module.S_ISREG(info.st_mode):
+        raise ProjectConfigError(f"{name} must be a regular file")
+    if info.st_nlink != 1:
+        raise ProjectConfigError(f"{name} must not be a hard-linked file")
+    if info.st_size > MAX_CONFIG_DOCUMENT_BYTES:
+        raise ProjectConfigError(f"{name} exceeds the maximum supported size")
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ProjectConfigError(f"{name} is unreadable") from exc
+    if len(payload) > MAX_CONFIG_DOCUMENT_BYTES:
+        raise ProjectConfigError(f"{name} exceeds the maximum supported size")
+    try:
+        return payload, payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProjectConfigError(f"{name} is not valid UTF-8 text") from exc
+
+
+def _restore_document(target: Path, previous_bytes: bytes | None) -> None:
+    try:
+        if previous_bytes is None:
+            # The document did not exist before the failed transaction.
+            target.unlink(missing_ok=True)
+            return
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".restore-tmp", dir=target.parent
+        )
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(previous_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ProjectConfigError(
+            "the previous configuration could not be restored"
+        ) from exc
+
+
+def _append_audit_line(
+    audit_path: Path,
+    *,
+    project_id: str,
+    outcome: str,
+    old_revision: str | None,
+    new_revision: str | None,
+    caller_scope: str,
+) -> None:
+    """Append one bounded, redacted audit record to server state."""
+    record = {
+        "schema_version": _AUDIT_SCHEMA_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "project_id": project_id,
+        "outcome": outcome,
+        "old_revision": old_revision,
+        "new_revision": new_revision,
+        "caller_scope": caller_scope,
+    }
+    line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(audit_path, flags, 0o600)
+        try:
+            os.write(descriptor, line)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        # Audit metadata is advisory; a save must never fail because of it.
+        pass
+
+
 class ProjectConfigService:
     """Read, validate, and atomically save the two project config documents."""
 
@@ -423,31 +512,7 @@ class ProjectConfigService:
     @staticmethod
     def _read_document(config_dir: Path, name: str) -> tuple[bytes, str] | None:
         """Read one protected document; ``None`` when it does not exist yet."""
-        path = document_path(config_dir, name)
-        if path.is_symlink():
-            raise ProjectConfigError(f"{name} must not be a symlink")
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise ProjectConfigError(f"{name} is unavailable") from exc
-        if not stat_module.S_ISREG(info.st_mode):
-            raise ProjectConfigError(f"{name} must be a regular file")
-        if info.st_nlink != 1:
-            raise ProjectConfigError(f"{name} must not be a hard-linked file")
-        if info.st_size > MAX_CONFIG_DOCUMENT_BYTES:
-            raise ProjectConfigError(f"{name} exceeds the maximum supported size")
-        try:
-            payload = path.read_bytes()
-        except OSError as exc:
-            raise ProjectConfigError(f"{name} is unreadable") from exc
-        if len(payload) > MAX_CONFIG_DOCUMENT_BYTES:
-            raise ProjectConfigError(f"{name} exceeds the maximum supported size")
-        try:
-            return payload, payload.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProjectConfigError(f"{name} is not valid UTF-8 text") from exc
+        return _read_protected_document(config_dir, name)
 
     def _current_documents(
         self, config_dir: Path
@@ -575,7 +640,7 @@ class ProjectConfigService:
             try:
                 os.replace(second_temp, second_target)
             except OSError as exc:
-                self._restore_document(first_target, previous[0])
+                _restore_document(first_target, previous[0])
                 _fsync_directory(config_dir)
                 raise ProjectConfigError(
                     "workflows.toml replacement failed; the previous aflow.toml was restored"
@@ -590,28 +655,10 @@ class ProjectConfigService:
                 except OSError:
                     pass
 
-    def _restore_document(self, target: Path, previous_bytes: bytes | None) -> None:
-        try:
-            if previous_bytes is None:
-                # The document did not exist before the failed transaction.
-                target.unlink(missing_ok=True)
-                return
-            descriptor, temp_name = tempfile.mkstemp(
-                prefix=f".{target.name}.", suffix=".restore-tmp", dir=target.parent
-            )
-            temp = Path(temp_name)
-            try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(previous_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp, target)
-            finally:
-                temp.unlink(missing_ok=True)
-        except OSError as exc:
-            raise ProjectConfigError(
-                "the previous configuration could not be restored"
-            ) from exc
+    def _restore_document_for_target(
+        self, target: Path, previous_bytes: bytes | None
+    ) -> None:
+        _restore_document(target, previous_bytes)
 
     @staticmethod
     def _failure_outcome(exc: Exception) -> str:
@@ -635,27 +682,11 @@ class ProjectConfigService:
         caller_scope: str,
     ) -> None:
         """Append one bounded, redacted audit record to server state."""
-        record = {
-            "schema_version": _AUDIT_SCHEMA_VERSION,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "project_id": project_id,
-            "outcome": outcome,
-            "old_revision": old_revision,
-            "new_revision": new_revision,
-            "caller_scope": caller_scope,
-        }
-        line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-        try:
-            self._audit_path.parent.mkdir(parents=True, exist_ok=True)
-            flags = (
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-            )
-            descriptor = os.open(self._audit_path, flags, 0o600)
-            try:
-                os.write(descriptor, line)
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        except OSError:
-            # Audit metadata is advisory; a save must never fail because of it.
-            pass
+        _append_audit_line(
+            self._audit_path,
+            project_id=project_id,
+            outcome=outcome,
+            old_revision=old_revision,
+            new_revision=new_revision,
+            caller_scope=caller_scope,
+        )

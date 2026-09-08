@@ -258,24 +258,24 @@ describe('workflow control API client', () => {
       project_id: 'beta', revision: 'a'.repeat(64), documents: ['aflow.toml', 'workflows.toml'],
       aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', validation,
     })
-    const config = await api.getProjectConfig('beta')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config', expect.objectContaining({
+    const config = await api.getGlobalConfig()
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/config', expect.objectContaining({
       headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
     }))
     expect(config.revision).toBe('a'.repeat(64))
 
     mockOkJson(validation)
-    await api.validateProjectConfig('beta', { aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' })
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config/validate', expect.objectContaining({
+    await api.validateGlobalConfig({ aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/config/validate', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ aflow_toml: '# aflow\n', workflows_toml: '# workflows\n' }),
     }))
 
     mockOkJson({ ...config, revision: 'b'.repeat(64) })
-    await api.saveProjectConfig('beta', {
+    await api.saveGlobalConfig({
       aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', expected_revision: 'a'.repeat(64),
     })
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config', expect.objectContaining({
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/config', expect.objectContaining({
       method: 'PUT',
       body: JSON.stringify({
         aflow_toml: '# aflow\n', workflows_toml: '# workflows\n', expected_revision: 'a'.repeat(64),
@@ -301,14 +301,14 @@ describe('workflow control API client', () => {
       suggestions: { label: 'suggestion', harnesses: [], profiles: [], note: 'Bundled values are suggestions.' },
       starter_defaults: null,
     })
-    const response = await api.postProjectConfigForm('beta', {
+    const response = await api.postGlobalConfigForm({
       aflow_toml: '# aflow\n',
       workflows_toml: '# workflows\n',
       action: { type: 'set_global_role', role: 'worker', selector: 'starter.default' },
     })
     expect(response.changed).toBe(true)
     expect(response.form?.default_workflow).toBe('starter')
-    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/beta/config/form', expect.objectContaining({
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/config/form', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({
         aflow_toml: '# aflow\n',
@@ -331,7 +331,7 @@ describe('workflow control API client', () => {
         },
       }),
     } as Response)
-    await expect(api.saveProjectConfig('beta', {
+    await expect(api.saveGlobalConfig('beta', {
       aflow_toml: 'x', workflows_toml: 'y', expected_revision: 'a'.repeat(64),
     })).rejects.toMatchObject({
       status: 409,

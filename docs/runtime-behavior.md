@@ -362,6 +362,44 @@ include `status=... hotplug <stage>: <source_selector> -> <target_selector>
 `aflow analyze` reports
 the current/pending transactions, normalized history, capability paths, and
 active session count.
+## Frozen run configuration snapshots
+
+Every durably reserved run captures the complete effective workflow pair under
+`.aflow/runs/<run_id>/config/` before startup questions or worker launch. The
+snapshot records its origin paths and the canonical fingerprint in a versioned
+`snapshot.json`; schema-defined relative paths (such as `[aflow] worktree_root`)
+are resolved against the original configuration location before serialization,
+while prompt strings and repository-relative plan paths are never rewritten.
+Startup answers, worker launch, retries, resume, and run inspection all read
+the snapshot, so later global configuration edits affect only new runs.
+Snapshot creation shares one configuration lock with global saves, so a launch
+sees either the old pair or the new pair, never a mixture; a failed or
+fingerprint-mismatched snapshot fails the launch before any worker starts.
+Legacy runs without a snapshot keep their recorded identity checks, and a
+missing or damaged snapshot makes resume unavailable with an explanation
+instead of silently substituting current configuration.
+
+## UI process lifecycle and persistent units
+
+`aflow ui` serves the web app in the foreground by default; `--daemon`
+detaches with a per-user ownership record, lock, bounded log, and readiness
+file under `~/.config/aflow/ui/`. `--stop` verifies the recorded
+process-birth identity before signalling and never touches workflow units.
+Workflow units launched by the UI run through a portable persistent unit
+adapter (Linux and macOS): each unit is a detached private `aflow ui-worker`
+wrapper that owns its workflow subprocess group and writes bounded
+identity/exit receipts under the run's durable `units/` directory
+(`start.json`, `child.json`, `exit.json`, `error.json`, plus `stopped.json`
+after an explicit stop). Observation and signalling always require matching
+process-birth identity, never PID existence alone, so stale or reused records
+become observable ownership errors instead of duplicate launches or unrelated
+signals. A returning UI reconciles the exact receipts: it can display,
+monitor, and explicitly stop a pre-existing worker, and a workflow that
+finished while the UI was absent reports its real terminal result.
+`shutdown` in this adapter is a documented no-op — UI shutdown never signals
+workflow groups. The systemd unit manager remains the production-deployment
+adapter and the local-daemon subprocess adapter is unchanged.
+
 ## Daemon control plane and direct CLI
 
 The lightweight local daemon starts with `aflow daemon start --foreground`.

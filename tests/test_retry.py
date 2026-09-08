@@ -90,6 +90,7 @@ class RetryInconsistentCheckpointStartupTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CapturingAdapter(),
                 runner=runner,
                 parsed_plan=recovery.parsed_plan,
@@ -121,7 +122,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert 'inconsistent checkpoint state' in str(ctx.value).lower()
 
     def test_role_prompt_is_retained_when_retry_fixes_plan(self) -> None:
@@ -158,7 +159,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CapturingAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CapturingAdapter(), runner=runner)
             assert result.turns_completed == 2
             assert result.final_snapshot.is_complete
             assert captured_system_prompts == ['Retry role guidance.', 'Retry role guidance.']
@@ -189,7 +190,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
 
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             turn1_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
@@ -215,7 +216,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert len(captured_prompts) == 2
             assert 'inconsistent checkpoint state' in captured_prompts[1].lower()
 
@@ -232,7 +233,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
             with pytest.raises(WorkflowError):
-                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
 
     def test_workflow_override_enables_retry_when_global_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -251,7 +252,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert result.final_snapshot.is_complete
 
     def test_retry_exhaustion_fails_on_latest_error(self) -> None:
@@ -267,7 +268,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=10)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert 'inconsistent checkpoint state' in str(ctx.value).lower()
 
     def test_max_turn_on_failed_turn_does_not_schedule_retry(self) -> None:
@@ -283,7 +284,7 @@ class RetryInconsistentCheckpointWorkflowTests(unittest.TestCase):
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
             with pytest.raises(WorkflowError):
-                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
 
 
 class RetryInconsistentCheckpointArtifactTests(unittest.TestCase):
@@ -305,7 +306,7 @@ class RetryInconsistentCheckpointArtifactTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             turn1 = json.loads((result.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn1['status'] == 'retry-scheduled'
             assert turn1['retry_attempt'] == 1
@@ -328,7 +329,7 @@ class RetryInconsistentCheckpointArtifactTests(unittest.TestCase):
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
             assert run_json.get('pending_retry_step_name') is None
 
@@ -349,7 +350,7 @@ class RetryInconsistentCheckpointArtifactTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             turn2 = json.loads((result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
             assert turn2['was_retry'] is True
             assert turn2['retry_attempt'] == 1
@@ -371,7 +372,7 @@ class RetryInconsistentCheckpointArtifactTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             turn1 = json.loads((result.run_dir / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             turn2 = json.loads((result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
             run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -401,6 +402,7 @@ class SameStepCapWorkflowTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=20),
                     wf_config, 'loop', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             assert 'same-step cap' in str(ctx.value).lower()
             assert 'implement' in str(ctx.value)
@@ -424,6 +426,7 @@ class SameStepCapWorkflowTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=20),
                     wf_config, 'loop', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             assert 'same-step cap' in str(ctx.value).lower()
             assert '3' in str(ctx.value)
@@ -475,6 +478,7 @@ class SameStepCapWorkflowTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=20),
                 wf_config, 'alternating', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             assert result.final_snapshot.is_complete
 
@@ -495,6 +499,7 @@ class SameStepCapWorkflowTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=20),
                 wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             assert result.final_snapshot.is_complete
             assert call_count[0] >= 6
@@ -516,5 +521,6 @@ class SameStepCapWorkflowTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=20),
                 wf_config, 'loop', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             assert result.final_snapshot.is_complete

@@ -8,7 +8,7 @@ import { GuidedConfigForm } from './GuidedConfigForm'
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
-  return { ...actual, postProjectConfigForm: vi.fn() }
+  return { ...actual, postGlobalConfigForm: vi.fn() }
 })
 
 const project = {
@@ -82,7 +82,6 @@ function formResponse(overrides: Record<string, unknown> = {}): ProjectConfigFor
 
 function setup(texts: { aflow?: string; workflows?: string } = {}) {
   const props = {
-    project,
     aflowText: texts.aflow ?? '# aflow config\n',
     workflowsText: texts.workflows ?? '# workflows\n',
     onDraftChange: vi.fn(),
@@ -111,11 +110,11 @@ function commitComboboxValue(combobox: HTMLElement, value: string) {
 describe('GuidedConfigForm', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse())
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse())
   })
 
   it('distinguishes externally configured and unspecified models from missing profiles', async () => {
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
       form: {
         ...configuredForm,
         harnesses: {
@@ -134,7 +133,7 @@ describe('GuidedConfigForm', () => {
   })
 
   it('builds a starter draft from the empty pair using detected Git defaults', async () => {
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
       aflow_toml: '',
       workflows_toml: '',
       form: { default_workflow: null, max_turns: null, harnesses: {}, roles: {}, teams: {}, workflow_default_teams: {}, workflows: {} },
@@ -146,7 +145,7 @@ describe('GuidedConfigForm', () => {
     expect((screen.getByLabelText('Workflow') as HTMLInputElement).value).toBe('implement')
     expect((screen.getByLabelText('Main branch') as HTMLInputElement).value).toBe('trunk')
 
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
       aflow_toml: '# starter aflow\n',
       workflows_toml: '# starter workflows\n',
       changed: true,
@@ -155,7 +154,7 @@ describe('GuidedConfigForm', () => {
       starter_defaults: null,
     }))
     fireEvent.click(build)
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', {
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( {
       aflow_toml: '',
       workflows_toml: '',
       action: { type: 'build_starter', workflow: 'implement', main_branch: 'trunk', team: null },
@@ -195,12 +194,12 @@ describe('GuidedConfigForm', () => {
     expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLInputElement).value).toBe('deploy-custom')
     expect((screen.getByLabelText('Effort') as HTMLSelectElement).value).toBe('high')
 
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
       changed: true,
       aflow_toml: '# tuned keeps model deploy-custom and effort high\n',
     }))
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta', {
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith( {
       aflow_toml: '# aflow config\n',
       workflows_toml: '# workflows\n',
       // Neither value was edited, so neither may travel as an explicit null:
@@ -219,7 +218,7 @@ describe('GuidedConfigForm', () => {
     expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLInputElement).value).toBe('')
     fireEvent.change(screen.getByLabelText('Effort'), { target: { value: '' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith( expect.objectContaining({
       action: { type: 'upsert_profile', harness: 'claude', profile: 'tuned', model: null, effort: null },
     }), expect.anything()))
   })
@@ -240,7 +239,7 @@ describe('GuidedConfigForm', () => {
     expect(screen.getByText(/not verified as available/)).toBeDefined()
 
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith( expect.objectContaining({
       action: { type: 'upsert_profile', harness: 'claude', profile: 'deep', effort: 'high' },
     }), expect.anything()))
   })
@@ -281,7 +280,7 @@ describe('GuidedConfigForm', () => {
     expect(modelBox.value).toBe('gpt-5-mini')
 
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', {
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( {
       aflow_toml: '# aflow config\n',
       workflows_toml: '# workflows\n',
       // codex does not support an effort setting, so no effort field is sent.
@@ -305,7 +304,7 @@ describe('GuidedConfigForm', () => {
     expect(screen.getByText(/configured in ZCode/)).toBeDefined()
     commitComboboxValue(screen.getByRole('combobox', { name: 'Profile name' }), 'default')
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', {
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( {
       aflow_toml: '# aflow config\n',
       workflows_toml: '# workflows\n',
       action: { type: 'upsert_profile', harness: 'zcode', profile: 'default' },
@@ -328,7 +327,7 @@ describe('GuidedConfigForm', () => {
     fireEvent.change(roleBox, { target: { value: 'worker' } })
     fireEvent.blur(roleBox)
     fireEvent.click(screen.getByRole('button', { name: 'Apply role to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( expect.objectContaining({
       action: { type: 'set_global_role', role: 'worker', selector: 'codex.fast' },
     }), expect.anything()))
 
@@ -342,13 +341,13 @@ describe('GuidedConfigForm', () => {
     fireEvent.change(selectorBox, { target: { value: '' } })
     fireEvent.blur(selectorBox)
     expect(selectorBox.value).toBe('codex.fast')
-    const callsBefore = vi.mocked(api.postProjectConfigForm).mock.calls.length
+    const callsBefore = vi.mocked(api.postGlobalConfigForm).mock.calls.length
     fireEvent.focus(roleBox)
     fireEvent.change(roleBox, { target: { value: 'reviewer' } })
     fireEvent.blur(roleBox)
     fireEvent.click(screen.getByRole('button', { name: 'Apply role to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledTimes(callsBefore + 1))
-    expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(callsBefore + 1))
+    expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith( expect.objectContaining({
       action: { type: 'set_global_role', role: 'reviewer', selector: 'codex.fast' },
     }), expect.anything())
   })
@@ -360,10 +359,10 @@ describe('GuidedConfigForm', () => {
     fireEvent.focus(roleBox)
     fireEvent.change(roleBox, { target: { value: 'worker' } })
     fireEvent.blur(roleBox)
-    const callsBefore = vi.mocked(api.postProjectConfigForm).mock.calls.length
+    const callsBefore = vi.mocked(api.postGlobalConfigForm).mock.calls.length
     fireEvent.click(screen.getByRole('button', { name: 'Apply role to draft' }))
     await screen.findByText(/Choose one of the configured profiles/)
-    expect(api.postProjectConfigForm).toHaveBeenCalledTimes(callsBefore)
+    expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(callsBefore)
     // The typed role survives the rejected action.
     expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('worker')
   })
@@ -373,7 +372,7 @@ describe('GuidedConfigForm', () => {
     await screen.findByText('Teams')
     fireEvent.change(screen.getByLabelText('New team name'), { target: { value: 'release' } })
     fireEvent.click(screen.getByRole('button', { name: 'Add team' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( expect.objectContaining({
       action: { type: 'add_team', team: 'release' },
     }), expect.anything()))
 
@@ -382,7 +381,7 @@ describe('GuidedConfigForm', () => {
     const selectorBox = screen.getAllByRole('combobox', { name: 'Profile (configured choices only)' })[1] as HTMLInputElement
     pickOption(selectorBox, /codex\.default/)
     fireEvent.click(screen.getByRole('button', { name: 'Apply team override to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith( expect.objectContaining({
       action: { type: 'set_team_role', team: 'core', role: 'worker', selector: 'codex.default' },
     }), expect.anything()))
   })
@@ -392,13 +391,13 @@ describe('GuidedConfigForm', () => {
     const select = await screen.findByLabelText('Default team for implement')
     expect((select as HTMLSelectElement).value).toBe('core')
     fireEvent.change(select, { target: { value: '' } })
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( expect.objectContaining({
       action: { type: 'set_workflow_default_team', workflow: 'implement', team: null },
     }), expect.anything()))
   })
 
   it('keeps both texts and points to Advanced TOML on a syntax error', async () => {
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
       aflow_toml: '= broken\n',
       form: null,
       syntax_issues: [{ document: 'workflows.toml', line: 4, message: 'invalid key' }],
@@ -425,7 +424,7 @@ describe('GuidedConfigForm', () => {
     const { props, onCandidateValidation, view } = setup()
     await screen.findByText('Defaults')
     let release!: (value: ProjectConfigFormResponse) => void
-    vi.mocked(api.postProjectConfigForm).mockImplementationOnce(
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(
       () => new Promise<ProjectConfigFormResponse>((resolve) => { release = resolve }),
     )
     view.rerender(<GuidedConfigForm {...props} aflowText={'# edited\n'} />)
@@ -451,47 +450,31 @@ describe('GuidedConfigForm', () => {
     fireEvent.blur(roleBox)
     expect(roleBox.value).toBe('worker')
 
-    vi.mocked(api.postProjectConfigForm).mockRejectedValueOnce(new Error('reprojection failed'))
+    vi.mocked(api.postGlobalConfigForm).mockRejectedValueOnce(new Error('reprojection failed'))
     view.rerender(<GuidedConfigForm {...props} aflowText={'# next\n'} />)
     expect(await screen.findByText(/Guided settings could not be updated/)).toBeDefined()
     // The stale configured choices are neither rendered nor enabled.
     expect(screen.queryByText('Defaults')).toBeNull()
     expect(screen.queryByText('Apply role to draft')).toBeNull()
 
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({ aflow_toml: '# next\n' }))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({ aflow_toml: '# next\n' }))
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(await screen.findByText('Defaults')).toBeDefined()
     // The draft texts and the typed entry survive the failure and retry.
     expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('worker')
   })
 
-  it('hides configured choices when a projection fails after switching projects', async () => {
-    const { props, view } = setup()
-    await screen.findByText('Defaults')
-    vi.mocked(api.postProjectConfigForm).mockRejectedValueOnce(new Error('reprojection failed'))
-    view.rerender(
-      <GuidedConfigForm {...props} project={{ ...project, id: 'kilo', display_name: 'Kilo' }} />,
-    )
-    expect(await screen.findByText(/Guided settings could not be updated/)).toBeDefined()
-    expect(screen.queryByText('Apply profile to draft')).toBeNull()
-
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse())
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    expect(await screen.findByText('Defaults')).toBeDefined()
-    // Choices from the previous project are not actionable here.
-    expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('')
-  })
 
   it('ignores a response whose source draft is no longer current', async () => {
     let releaseStale!: (value: ProjectConfigFormResponse) => void
     // The first (initial) projection is held: it was submitted for the
     // original pair, before the Advanced TOML edit superseded it.
-    vi.mocked(api.postProjectConfigForm).mockImplementationOnce(
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(
       () => new Promise<ProjectConfigFormResponse>((resolve) => { releaseStale = resolve }),
     )
     const { props, onDraftChange, view } = setup()
     // The newer projection of the edited pair resolves first.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(
       formResponse({ aflow_toml: '# edited in advanced\n' }),
     )
     view.rerender(<GuidedConfigForm {...props} aflowText={'# edited in advanced\n'} />)
@@ -510,27 +493,9 @@ describe('GuidedConfigForm', () => {
     expect(screen.queryByText('Updating guided settings…')).toBeNull()
   })
 
-  it('clears dependent choices when the project changes', async () => {
-    const { props, view } = setup()
-    await screen.findByText('Roles')
-    const roleBox = screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement
-    fireEvent.focus(roleBox)
-    fireEvent.change(roleBox, { target: { value: 'worker' } })
-    fireEvent.blur(roleBox)
-    expect(roleBox.value).toBe('worker')
-
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse({
-      form: { ...configuredForm, roles: {}, teams: {}, harnesses: {}, workflow_default_teams: {} },
-      choices: emptyChoices,
-    }))
-    view.rerender(<GuidedConfigForm {...props} project={{ ...project, id: 'kilo', display_name: 'Kilo' }} />)
-    await waitFor(() => {
-      expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('')
-    })
-  })
 
   it('preserves the draft and offers retry when the form endpoint fails', async () => {
-    vi.mocked(api.postProjectConfigForm).mockRejectedValue(new Error('form endpoint down'))
+    vi.mocked(api.postGlobalConfigForm).mockRejectedValue(new Error('form endpoint down'))
     const { onDraftChange } = setup()
     expect(await screen.findByText(/Guided settings are temporarily unavailable/)).toBeDefined()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeDefined()
@@ -542,20 +507,20 @@ describe('GuidedConfigForm', () => {
     await screen.findByText('Defaults')
     fireEvent.change(screen.getByLabelText('Max turns'), { target: { value: '3' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply max turns' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( expect.objectContaining({
       action: { type: 'set_max_turns', value: 3 },
     }), expect.anything()))
 
     // A number input cannot hold "zero"; 0 is rejected as below the minimum.
     fireEvent.change(screen.getByLabelText('Max turns'), { target: { value: '0' } })
-    const callsBefore = vi.mocked(api.postProjectConfigForm).mock.calls.length
+    const callsBefore = vi.mocked(api.postGlobalConfigForm).mock.calls.length
     fireEvent.click(screen.getByRole('button', { name: 'Apply max turns' }))
     await screen.findByText(/whole number of 1 or more/)
-    expect(api.postProjectConfigForm).toHaveBeenCalledTimes(callsBefore)
+    expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(callsBefore)
 
     fireEvent.change(screen.getByLabelText('Max turns'), { target: { value: '' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply max turns' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta', expect.objectContaining({
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith( expect.objectContaining({
       action: { type: 'set_max_turns', value: null },
     }), expect.anything()))
   })
@@ -563,7 +528,7 @@ describe('GuidedConfigForm', () => {
 
 function EditableForm() {
   const [pair, setPair] = useState({ aflow: '# aflow config\n', workflows: '# workflows\n' })
-  return <GuidedConfigForm project={project} aflowText={pair.aflow} workflowsText={pair.workflows}
+  return <GuidedConfigForm aflowText={pair.aflow} workflowsText={pair.workflows}
     onDraftChange={(aflow, workflows) => setPair({ aflow, workflows })}
     onCandidateValidation={() => {}} onRequestAdvanced={() => {}} />
 }
@@ -578,7 +543,7 @@ function profileResponse(model: string, effort: string | null) {
 describe('guided edit regressions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formResponse())
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse())
   })
 
   async function selectTunedProfile() {
@@ -588,19 +553,19 @@ describe('guided edit regressions', () => {
   }
 
   it('applies model and effort changes back to their original values after an accepted update', async () => {
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(formResponse({ suggestions: { ...suggestions, profiles: [...suggestions.profiles, { harness: 'claude', profile: 'balanced', model: null, effort: 'medium' }] } }))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(formResponse({ suggestions: { ...suggestions, profiles: [...suggestions.profiles, { harness: 'claude', profile: 'balanced', model: null, effort: 'medium' }] } }))
     render(<EditableForm />)
     await selectTunedProfile()
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(profileResponse('model-B', 'medium'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(profileResponse('model-B', 'medium'))
     commitComboboxValue(screen.getByRole('combobox', { name: 'Model' }), 'model-B')
     fireEvent.change(screen.getByLabelText('Effort'), { target: { value: 'medium' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
     await waitFor(() => expect((screen.getByLabelText('Effort') as HTMLSelectElement).value).toBe('medium'))
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(profileResponse('deploy-custom', 'high'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(profileResponse('deploy-custom', 'high'))
     commitComboboxValue(screen.getByRole('combobox', { name: 'Model' }), 'deploy-custom')
     fireEvent.change(screen.getByLabelText('Effort'), { target: { value: 'high' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta',
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith(
       expect.objectContaining({ action: { type: 'upsert_profile', harness: 'claude', profile: 'tuned', model: 'deploy-custom', effort: 'high' } }),
       expect.anything()))
     await waitFor(() => expect((screen.getByLabelText('Effort') as HTMLSelectElement).value).toBe('high'))
@@ -610,7 +575,7 @@ describe('guided edit regressions', () => {
     render(<EditableForm />)
     await selectTunedProfile()
     let release!: (value: ProjectConfigFormResponse) => void
-    vi.mocked(api.postProjectConfigForm).mockImplementationOnce(() => new Promise((resolve) => { release = resolve }))
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(() => new Promise((resolve) => { release = resolve }))
     const model = screen.getByRole('combobox', { name: 'Model' })
     commitComboboxValue(model, 'model-B')
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
@@ -618,9 +583,9 @@ describe('guided edit regressions', () => {
     release(profileResponse('model-B', 'high'))
     await waitFor(() => expect((screen.getByRole('button', { name: 'Apply profile to draft' }) as HTMLButtonElement).disabled).toBe(false))
     expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLInputElement).value).toBe('model-C')
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(profileResponse('model-C', 'high'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(profileResponse('model-C', 'high'))
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta',
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith(
       expect.objectContaining({ action: { type: 'upsert_profile', harness: 'claude', profile: 'tuned', model: 'model-C' } }),
       expect.anything()))
     await waitFor(() => expect((screen.getByRole('button', { name: 'Apply profile to draft' }) as HTMLButtonElement).disabled).toBe(false))
@@ -642,20 +607,20 @@ describe('guided edit regressions', () => {
 
   it('shows custom configured effort, preserves it unchanged, and supports deliberate clearing', async () => {
     const custom = formResponse({ form: { ...configuredForm, harnesses: { ...configuredForm.harnesses, claude: { tuned: { model: 'deploy-custom', effort: 'ultra' } } } } })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(custom)
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(custom)
     render(<EditableForm />)
     await selectTunedProfile()
     const effort = screen.getByLabelText('Effort') as HTMLSelectElement
     expect(effort.value).toBe('ultra')
     expect(within(effort).getByRole('option', { name: 'ultra — configured' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta',
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith(
       expect.objectContaining({ action: { type: 'upsert_profile', harness: 'claude', profile: 'tuned' } }), expect.anything()))
     await waitFor(() => expect((screen.getByRole('button', { name: 'Apply profile to draft' }) as HTMLButtonElement).disabled).toBe(false))
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(profileResponse('deploy-custom', null))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(profileResponse('deploy-custom', null))
     fireEvent.change(effort, { target: { value: '' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply profile to draft' }))
-    await waitFor(() => expect(api.postProjectConfigForm).toHaveBeenLastCalledWith('beta',
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith(
       expect.objectContaining({ action: { type: 'upsert_profile', harness: 'claude', profile: 'tuned', effort: null } }), expect.anything()))
     await screen.findByRole('row', { name: 'claude.tuned deploy-custom —' })
   })
@@ -678,26 +643,22 @@ describe('guided edit regressions', () => {
     expect(input.hasAttribute('aria-activedescendant')).toBe(false)
     expect(screen.queryByRole('listbox')).toBeNull()
   })
-  it.each(['failure', 'unmount', 'project change'])('clears action pending state on %s', async (ending) => {
+  it.each(['failure', 'unmount'])('clears action pending state on %s', async (ending) => {
     const { props, view } = setup()
     await screen.findByText('Defaults')
     let reject!: (reason: Error) => void
-    vi.mocked(api.postProjectConfigForm).mockImplementationOnce(() => new Promise((_resolve, rejectPromise) => { reject = rejectPromise }))
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(() => new Promise((_resolve, rejectPromise) => { reject = rejectPromise }))
     fireEvent.change(screen.getByLabelText('Max turns'), { target: { value: '8' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply max turns' }))
     expect(props.onActionPendingChange).toHaveBeenLastCalledWith(true)
-    const call = vi.mocked(api.postProjectConfigForm).mock.calls.at(-1)!
-    const signal = call[2]!.signal!
+    const call = vi.mocked(api.postGlobalConfigForm).mock.calls.at(-1)!
+    const signal = call[1]!.signal!
     if (ending === 'failure') {
       reject(new Error('action unavailable'))
       await screen.findByText('action unavailable')
     } else if (ending === 'unmount') {
       view.unmount()
       expect(signal.aborted).toBe(true)
-    } else {
-      view.rerender(<GuidedConfigForm {...props} project={{ ...project, id: 'gamma' }} />)
-      expect(signal.aborted).toBe(true)
-      await screen.findByText('Defaults')
     }
     await waitFor(() => expect(props.onActionPendingChange).toHaveBeenLastCalledWith(false))
   })

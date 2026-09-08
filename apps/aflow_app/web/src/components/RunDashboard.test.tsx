@@ -10,7 +10,7 @@ vi.mock('../api', async () => {
   return {
     ...actual,
     checkSession: vi.fn(),
-    getProjectConfig: vi.fn(), postProjectConfigForm: vi.fn(),
+    getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(),
     listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
     listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
     startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(),
@@ -169,8 +169,8 @@ describe('RunDashboard', () => {
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([project])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['control-project'] })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(capabilities)
-    vi.mocked(api.getProjectConfig).mockResolvedValue(committedConfig)
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(emptyProjection)
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(committedConfig)
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(emptyProjection)
     vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }])
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownedRun)
@@ -887,7 +887,7 @@ describe('RunDashboard', () => {
 
   it('disables launch while an executable step lacks its exact role mapping', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       form: {
         ...emptyProjection.form,
@@ -915,7 +915,7 @@ describe('RunDashboard', () => {
     // A partially mapped workflow is equally unlaunchable: the unmapped step
     // is named instead of falling back to any configured role.
     first.unmount()
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       form: {
         ...emptyProjection.form,
@@ -941,7 +941,7 @@ describe('RunDashboard', () => {
 
   it('applies one max-turns validation to preview and request, so an invalid override never launches', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       form: { ...emptyProjection.form, default_workflow: 'managed', max_turns: 12 },
     })
@@ -990,7 +990,7 @@ describe('RunDashboard', () => {
 
   it('resolves launch values with user override, then committed defaults, and labels the sources', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       form: {
         default_workflow: 'managed',
@@ -1078,7 +1078,7 @@ describe('RunDashboard', () => {
 
   it('clears a start step the newly chosen workflow does not contain', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       form: {
         ...emptyProjection.form,
@@ -1128,7 +1128,7 @@ describe('RunDashboard', () => {
 
   it('disables launch with exact settings guidance while the committed configuration is not ready', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       validation: { ...committedConfig.validation, state: 'configuration_required' as const },
     })
@@ -1144,7 +1144,7 @@ describe('RunDashboard', () => {
 
   it('explains a committed TOML syntax error instead of offering launch', async () => {
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
       ...emptyProjection,
       form: null,
       syntax_issues: [{ document: 'workflows.toml', line: 3, message: 'unexpected token' }],
@@ -1160,7 +1160,7 @@ describe('RunDashboard', () => {
   })
 
   it('keeps runs visible and blocks launch when the committed configuration cannot be read', async () => {
-    vi.mocked(api.getProjectConfig).mockRejectedValue(new Error('config unavailable'))
+    vi.mocked(api.getGlobalConfig).mockRejectedValue(new Error('config unavailable'))
     renderDashboard()
     await screen.findByRole('heading', { name: 'Run run-owned' })
     await openNewRun()

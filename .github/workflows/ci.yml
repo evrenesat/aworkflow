@@ -23,6 +23,11 @@ jobs:
           - macos-latest
         python-version:
           - "3.11"
+          - "3.12"
+        exclude:
+          # Tiered matrix: the deploy/runtime-specific p100 address step only
+          # applies to Linux, so no exclusions are needed today.
+          - {}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -52,9 +57,18 @@ jobs:
         run: uv run python -m compileall -q aflow apps/aflow_app/server/src
 
   dashboard:
-    name: Dashboard (server, web)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Dashboard (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        python-version:
+          - "3.11"
+          - "3.12"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -62,7 +76,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -94,17 +108,125 @@ jobs:
         working-directory: apps/aflow_app/web
         run: npm run build
 
-  build:
-    name: Build package
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  packaging:
+    name: Packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
 
-      - name: Build package
-        run: uv build
+      - name: Set up Node (build-time only; the released wheel never needs it)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/aflow_app/web/package-lock.json
+
+      - name: Build wheel from the checkout
+        run: uv build --wheel
+
+      - name: Verify wheel bundles the UI assets and server package
+        run: python scripts/smoke_ui.py --verify-wheel dist/aworkflow-*.whl
+
+      - name: Build wheel from the sdist
+        run: |
+          uv build --sdist --out-dir dist-sdist
+          uv build --wheel dist-sdist/aworkflow-*.tar.gz --out-dir dist-from-sdist
+          python scripts/smoke_ui.py --verify-wheel dist-from-sdist/aworkflow-*.whl
+
+      - name: Installed-wheel smoke without Node (wheel from checkout)
+        run: python scripts/smoke_ui.py --wheel dist/aworkflow-*.whl --login-only
+
+      - name: Installed-wheel smoke without Node (wheel from sdist)
+        run: python scripts/smoke_ui.py --wheel dist-from-sdist/aworkflow-*.whl --login-only
+
+  browser-smoke:
+    name: Browser smoke (Linux, full flow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/aflow_app/web/package-lock.json
+
+      - name: Build the distributable wheel
+        run: uv build --wheel
+
+      - name: Install Playwright Chromium
+        run: |
+          uv sync --frozen --group dev
+          uv run --group dev playwright install chromium
+
+      - name: Browser smoke over non-loopback HTTP (installed wheel)
+        run: |
+          python scripts/smoke_ui.py \
+            --wheel dist/aworkflow-*.whl \
+            --browser \
+            --playwright-python "$(uv run --group dev python -c 'import sys; print(sys.executable)')"
+
+  browser-smoke-macos:
+    name: Browser smoke (macOS, login/cookie check)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/aflow_app/web/package-lock.json
+
+      - name: Build the distributable wheel
+        run: uv build --wheel
+
+      - name: Install Playwright Chromium
+        run: |
+          uv sync --frozen --group dev
+          uv run --group dev playwright install chromium
+
+      - name: Minimal browser login/cookie check over non-loopback HTTP
+        run: |
+          python scripts/smoke_ui.py \
+            --wheel dist/aworkflow-*.whl \
+            --browser --login-only \
+            --playwright-python "$(uv run --group dev python -c 'import sys; print(sys.executable)')"

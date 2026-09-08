@@ -22,6 +22,8 @@ import type {
   RunEventTail,
   RunPage,
   RunStatus,
+  SettingsResponse,
+  SettingsSaveRequest,
   StartRunRequest,
   StartRunResponse,
   StartRunResult,
@@ -205,43 +207,49 @@ export async function unregisterProject(projectId: string): Promise<void> {
   })
 }
 
-export async function getProjectConfig(projectId: string): Promise<ProjectConfig> {
-  return fetchJson<ProjectConfig>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/config`)
+/** The one shared global workflow pair: changes affect new runs in all projects. */
+export async function getGlobalConfig(): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/config`)
 }
 
-export async function saveProjectConfig(
-  projectId: string,
-  request: ProjectConfigSaveRequest,
-): Promise<ProjectConfig> {
-  return fetchJson<ProjectConfig>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/config`, {
+export async function saveGlobalConfig(request: ProjectConfigSaveRequest): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/config`, {
     method: 'PUT',
     body: JSON.stringify(request),
   })
 }
 
-export async function validateProjectConfig(
-  projectId: string,
-  request: ProjectConfigValidateRequest,
-): Promise<ConfigValidation> {
-  return fetchJson<ConfigValidation>(
-    `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/validate`,
-    { method: 'POST', body: JSON.stringify(request) },
-  )
+export async function validateGlobalConfig(request: ProjectConfigValidateRequest): Promise<ConfigValidation> {
+  return fetchJson<ConfigValidation>(`${API_BASE}/config/validate`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })
 }
 
 /**
  * Transform one candidate pair (plus at most one typed action) through the
  * pure guided form.  The endpoint never saves: no revision is sent.
  */
-export async function postProjectConfigForm(
-  projectId: string,
+export async function postGlobalConfigForm(
   request: ProjectConfigFormRequest,
   options: { signal?: AbortSignal } = {},
 ): Promise<ProjectConfigFormResponse> {
   return fetchJson<ProjectConfigFormResponse>(
-    `${API_BASE}/projects/${encodeURIComponent(projectId)}/config/form`,
+    `${API_BASE}/config/form`,
     { method: 'POST', body: JSON.stringify(request), signal: options.signal },
   )
+}
+
+/** Transport settings; the credential is write-only and never echoed back. */
+export async function getSettings(): Promise<SettingsResponse> {
+  return fetchJson<SettingsResponse>(`${API_BASE}/settings`)
+}
+
+export async function saveSettings(request: SettingsSaveRequest): Promise<SettingsResponse> {
+  return fetchJson<SettingsResponse>(`${API_BASE}/settings`, {
+    method: 'PUT',
+    body: JSON.stringify(request),
+  })
 }
 
 export async function listProjectPlans(projectId: string, status?: PlanStatus): Promise<PlanDocument[]> {

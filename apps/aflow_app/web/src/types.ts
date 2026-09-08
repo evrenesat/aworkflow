@@ -14,10 +14,7 @@ export interface ProjectCreateRequest {
   path: string
   display_name?: string | null
   main_branch?: string
-  initial_workflow?: string | null
-  initial_team?: string | null
   initialize_git?: boolean
-  initialize_config?: boolean
 }
 
 export interface ProjectCreateResult {
@@ -83,6 +80,30 @@ export interface ProjectConfigSaveRequest {
 export interface ProjectConfigValidateRequest {
   aflow_toml: string
   workflows_toml: string
+}
+
+/** Global transport settings (config.toml); the credential is write-only. */
+export interface SettingsResponse {
+  bind_host: string
+  bind_port: number
+  managed_projects_root: string
+  password_set: boolean
+  revision: string
+  advanced_toml: string
+  restart: {
+    bind_host: boolean
+    bind_port: boolean
+    managed_projects_root: boolean
+  }
+}
+
+export interface SettingsSaveRequest {
+  expected_revision: string
+  advanced_toml?: string | null
+  managed_projects_root?: string | null
+  bind_host?: string | null
+  bind_port?: number | null
+  password?: string | null
 }
 
 export interface ConfigBlockedRun {

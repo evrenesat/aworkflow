@@ -5,6 +5,7 @@ import { markUserActivity } from './activity'
 import { ProjectPicker } from './components/ProjectPicker'
 import { ProjectOverview } from './components/ProjectOverview'
 import { ConfigEditor } from './components/ConfigEditor'
+import { SettingsPanel } from './components/SettingsPanel'
 import { PlanPanel } from './components/PlanPanel'
 import { RunDashboard, type PendingSuccessorStart, type RunSelectionChange } from './components/RunDashboard'
 import * as api from './api'
@@ -26,15 +27,15 @@ type AuthGate = 'checking' | 'signedOut' | 'restoreFailed' | 'expired' | 'signed
 const NAV_ITEMS: Array<{ view: View; label: string; needsProject: boolean }> = [
   { view: 'projects', label: 'Projects', needsProject: false },
   { view: 'overview', label: 'Overview', needsProject: true },
-  { view: 'settings', label: 'Settings', needsProject: true },
+  { view: 'settings', label: 'Settings', needsProject: false },
   { view: 'plans', label: 'Plans', needsProject: true },
   { view: 'runs', label: 'Runs', needsProject: true },
 ]
 
 const readinessGuidance: Record<string, string> = {
   configuration_required:
-    'This project needs explicit configuration before workflows can start. '
-    + 'Review both documents, then validate and save the pair.',
+    'The shared AFlow configuration needs explicit settings before workflows can start. '
+    + 'Open Settings, review both documents, then validate and save the pair.',
   blocked:
     'The registered root is not currently a usable Git project root. '
     + 'Fix the directory (a valid Git commit HEAD is required), then re-check the project.',
@@ -356,14 +357,16 @@ export function App() {
   const handleConfigSaved = useCallback((saved: ProjectConfig) => {
     const readiness = saved.validation.state
     if (readiness === 'invalid') return
+    // The saved configuration is global: every registered project's
+    // readiness follows the same shared pair.
     setProjects((current) => current.map((project) => (
-      project.id === saved.project_id ? { ...project, readiness } : project
+      project.readiness === 'blocked' ? project : { ...project, readiness }
     )))
   }, [])
   const handleConfigReady = useCallback((saved: ProjectConfig) => {
     if (saved.validation.state !== 'ready') return
     setProjects((current) => current.map((project) => (
-      project.id === saved.project_id ? { ...project, readiness: 'ready' } : project
+      project.readiness === 'blocked' ? project : { ...project, readiness: 'ready' }
     )))
     applyQuery({ ...queryRef.current, view: 'plans', run: null }, 'push')
   }, [applyQuery])
@@ -522,6 +525,16 @@ export function App() {
       )}
 
       <main className="workspace-main">
+        {view === 'settings' && (
+          <div className="workspace-content">
+            <ConfigEditor
+              onDirtyChange={handleConfigDirty}
+              onSaved={handleConfigSaved}
+              onReady={handleConfigReady}
+            />
+            <SettingsPanel onDirtyChange={handleConfigDirty} />
+          </div>
+        )}
         {staleLinkTarget && view === 'projects' && (
           <div className="notice" role="alert">
             The link pointed to project <span className="mono">{staleLinkTarget}</span>, which is not in the
@@ -531,7 +544,8 @@ export function App() {
 
         {view === 'projects' && !selectedProject && (
           <p className="text-xs text-dim no-project-hint" role="note">
-            Overview, Settings, Plans, and Runs become available after you open a project below.
+            Overview, Plans, and Runs become available after you open a project below.
+            Settings is shared by every project.
           </p>
         )}
 
@@ -559,7 +573,7 @@ export function App() {
           <div className="card choose-project-state">
             <h2 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Choose a project first</h2>
             <p className="text-sm text-dim">
-              Overview, Settings, Plans, and Runs belong to a single project. Open one from the
+              Overview, Plans, and Runs belong to a single project. Open one from the
               project list to continue.
             </p>
             <div className="dashboard-actions">
@@ -570,20 +584,12 @@ export function App() {
           </div>
         )}
 
-        {view !== 'projects' && selectedProject && (
+        {view !== 'projects' && view !== 'settings' && selectedProject && (
           <div className="workspace-content">
             {view === 'overview' && (
               <ProjectOverview
                 project={selectedProject}
                 onOpenView={(next: ProjectView | 'projects') => switchView(next)}
-              />
-            )}
-            {view === 'settings' && (
-              <ConfigEditor
-                project={selectedProject}
-                onDirtyChange={handleConfigDirty}
-                onSaved={handleConfigSaved}
-                onReady={handleConfigReady}
               />
             )}
             {view === 'plans' && (

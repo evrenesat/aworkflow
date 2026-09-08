@@ -860,16 +860,34 @@ default `dev` dependency group rather than the installed runtime package.
 - **Local-only lifecycle.** Branch and worktree creation, feature branch setup, and merge handoff all operate on local refs only. The engine never fetches, pulls, or pushes. The primary checkout is the control root for run artifacts and merge verification even when normal steps execute inside a linked worktree.
 
 
-## Remote App (Separate Subproject)
+## Remote App and `aflow ui`
 
-The optional `apps/aflow_app/` application imports AFlow as a library and is
-excluded from the published wheel. Its FastAPI server and React client expose
-four product areas: registered projects, the canonical configuration pair,
-filesystem plans, and durable workflow runs.
+The `apps/aflow_app/` subproject remains the development/test entry point for
+the server sources, and the published `aworkflow` wheel now ships the same
+server package (`aflow_app_server`) plus the compiled web assets at the
+package-resource location `aflow/ui_web/` (built by the Hatch hook in
+`hatch_build.py`; `aflow/ui_assets.py` builds and atomically publishes assets
+for editable installs). `aflow ui` (`aflow/ui_cli.py`) is the one-command
+launcher: it resolves the global configuration through
+`aflow_app_server.config` (`config.toml`), performs first-run setup, owns the
+UI process lifecycle (foreground/daemon/status/stop) with a per-user record
+under `~/.config/aflow/ui/`, and wires the portable persistent unit adapter
+(`aflow/control_plane/persistent_units.py`) into the server's control plane so
+workflow units survive UI restarts on Linux and macOS. The FastAPI server and
+React client expose four product areas: registered projects, the shared
+global workflow configuration pair plus server settings, filesystem plans,
+and durable workflow runs.
 
 REST plus SSE is the canonical remote interface; MCP is an optional adapter
 to the same control-plane service. A remote ACP interface is deferred. Codex is
 an optional engine harness, and the web app has no provider-specific client.
+
+All projects read the one global workflow pair (`~/.config/aflow/aflow.toml`
+plus `workflows.toml`); every durably reserved run freezes an immutable copy
+under `.aflow/runs/<run_id>/config/` (`aflow/run_config_snapshot.py`) so
+global edits affect only new runs. Session cookies take their Secure
+attribute from the effective request scheme, which makes direct LAN/Tailscale
+HTTP work without weakening HTTPS deployments.
 
 The production backend binds only to `127.0.0.1:8765`. Tailscale Serve supplies
 the private MagicDNS HTTPS entry point; operators discover its advertised

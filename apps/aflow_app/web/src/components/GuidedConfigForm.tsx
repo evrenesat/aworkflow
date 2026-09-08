@@ -6,12 +6,10 @@ import type {
   GuidedProfileSuggestion,
   GuidedProfileSummary,
   ProjectConfigFormResponse,
-  ProjectInfo,
 } from '../types'
 import { Combobox } from './Combobox'
 
 interface GuidedConfigFormProps {
-  project: ProjectInfo
   /** Shared candidate pair owned by the enclosing editor. */
   aflowText: string
   workflowsText: string
@@ -74,7 +72,6 @@ function selectorModelEffort(
  * draft action never saves.  Advanced TOML remains the escape hatch.
  */
 export function GuidedConfigForm({
-  project,
   aflowText,
   workflowsText,
   onDraftChange,
@@ -95,7 +92,6 @@ export function GuidedConfigForm({
 
   const seqRef = useRef(0)
   const abortRef = useRef<AbortController | null>(null)
-  const projectRef = useRef(project.id)
   const draftRef = useRef<SubmittedTexts>({ aflow: aflowText, workflows: workflowsText })
   draftRef.current = { aflow: aflowText, workflows: workflowsText }
   const formSourceRef = useRef<SubmittedTexts | null>(null)
@@ -109,25 +105,10 @@ export function GuidedConfigForm({
     pendingCallbackRef.current?.(false)
   }, [])
 
-  if (projectRef.current !== project.id) {
-    // Switching projects clears every dependent choice before any render.
-    // (The shell only reaches this re-render after its dirty confirmation.)
-    projectRef.current = project.id
-    formSourceRef.current = null
-    starterTouchedRef.current = false
-    setStarter({ workflow: '', mainBranch: '', team: '' })
-    setProfileDraft({ harness: '', profile: '', model: '', effort: '' })
-    setRoleDraft({ role: '', selector: '' })
-    setTeamDraft({ team: '', role: '', selector: '' })
-    setNewTeamName('')
-    setMaxTurnsDraft('')
-    setFormError(null)
-    setActionError(null)
-  }
 
-  function isStaleResponse(projectId: string, seq: number, submitted: SubmittedTexts): boolean {
-    return projectRef.current !== projectId
-      || seq !== seqRef.current
+
+  function isStaleResponse(seq: number, submitted: SubmittedTexts): boolean {
+    return seq !== seqRef.current
       || draftRef.current.aflow !== submitted.aflow
       || draftRef.current.workflows !== submitted.workflows
   }
@@ -138,17 +119,16 @@ export function GuidedConfigForm({
     const controller = new AbortController()
     abortRef.current = controller
     const seq = ++seqRef.current
-    const projectId = project.id
     const submittedProfile = action?.type === 'upsert_profile' ? { ...profileDraft } : null
     setActionBusy(true)
     pendingCallbackRef.current?.(action !== null)
     try {
-      const response = await api.postProjectConfigForm(projectId, {
+      const response = await api.postGlobalConfigForm({
         aflow_toml: submitted.aflow,
         workflows_toml: submitted.workflows,
         action,
       }, { signal: controller.signal })
-      if (isStaleResponse(projectId, seq, submitted)) return
+      if (isStaleResponse(seq, submitted)) return
       setForm(response)
       if (action?.type === 'upsert_profile' && submittedProfile) {
         const accepted = response.form?.harnesses[action.harness]?.[action.profile]
@@ -178,7 +158,7 @@ export function GuidedConfigForm({
       }
     } catch (err) {
       if (controller.signal.aborted) return
-      if (isStaleResponse(projectId, seq, submitted)) return
+      if (isStaleResponse(seq, submitted)) return
       if (action) setActionError(errorMessage(err))
       else setFormError(errorMessage(err))
     } finally {
@@ -196,13 +176,12 @@ export function GuidedConfigForm({
       && source
       && source.aflow === aflowText
       && source.workflows === workflowsText
-      && projectRef.current === project.id
     ) {
       return
     }
     void runRequest(null)
     // The shared pair is the single input: any change re-projects the draft.
-  }, [project.id, aflowText, workflowsText]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [aflowText, workflowsText]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const defaults = form?.starter_defaults
   useEffect(() => {
@@ -224,11 +203,10 @@ export function GuidedConfigForm({
   // syntax error; both texts are then echoed back untouched.
   const syntaxBlocked = projection === null && syntaxIssues.length > 0
   // The held projection is only trustworthy while it was computed from the
-  // exact pair (and project) currently shown; anything else is pending or
-  // failed reprojection and must not render its configured choices.
+  // exact pair currently shown; anything else is pending or failed
+  // reprojection and must not render its configured choices.
   const projectionCurrent = form !== null
     && formSourceRef.current !== null
-    && projectRef.current === project.id
     && formSourceRef.current.aflow === aflowText
     && formSourceRef.current.workflows === workflowsText
 

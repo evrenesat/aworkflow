@@ -111,8 +111,13 @@ def test_repository_reads_historical_direct_cli_runs_without_enabling_control_pa
         (legacy_id, "legacy", "interrupted")
     ]
     assert metadata.read_bytes() == before
+    # The exact legacy id stays readable for preserved-run inspection, while
+    # control paths keep rejecting legacy ownership (resume/owner-stop check
+    # ownership, not just id shape). Truly malformed ids still raise.
+    events = repository.tail_events(legacy_id)
+    assert events == ()
     with pytest.raises(RunIdentityError):
-        repository.tail_events(legacy_id)
+        repository.tail_events("../escape")
 
 
 def test_repository_surfaces_malformed_owned_overrides(tmp_path: Path) -> None:

@@ -2008,6 +2008,27 @@ _REVIEW_SKILL_NAMES = frozenset({
 _PLAN_BRANCH_LINE_RE = re.compile(r"^(\s*-\s+Plan Branch:\s+`)([^`]*)(`.*)$", re.MULTILINE)
 
 
+def _resume_identity_config_dir(config: "ControllerConfig", config_dir: Path) -> Path:
+    """Report the original configuration path for a resumed run's identity.
+
+    When the controller loaded its configuration from the run's frozen
+    snapshot (worker/resume path), the fingerprint is identical but the
+    recorded identity path must remain the run's original configuration
+    location, so the persisted comparison stays stable across restarts.
+    """
+    from .run_config_snapshot import SnapshotError, load_run_config_snapshot
+
+    if not config.reserved_run_id:
+        return config_dir
+    try:
+        snapshot = load_run_config_snapshot(config.repo_root, config.reserved_run_id)
+    except SnapshotError:
+        return config_dir
+    if snapshot is None:
+        return config_dir
+    return Path(snapshot.origin_config_path)
+
+
 def _freeze_run_identity(
     workflow_name: str,
     workflow_config: WorkflowUserConfig,
@@ -5536,6 +5557,7 @@ def run_workflow(
     session_driver: SessionDriver | None = None,
     source_session_driver: SessionDriver | None = None,
     allow_existing_launch_manifest: bool = False,
+    snapshot_config: bool = True,
 ) -> ControllerRunResult:
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
@@ -5555,7 +5577,9 @@ def run_workflow(
     current_frozen_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
-        config_dir=config_dir,
+        config_dir=_resume_identity_config_dir(config, config_dir)
+        if resume is not None
+        else config_dir,
         continuation_from_branch=continuation_from_branch,
         continuation_from_head=continuation_from_head,
         continuation_mode=continuation_mode,
@@ -5681,6 +5705,43 @@ def run_workflow(
         raise WorkflowError(
             f"launch intent already exists for run '{reserved_run_id}'; refusing duplicate controller"
         )
+
+    from .run_config_snapshot import (
+        SnapshotError,
+        create_run_config_snapshot,
+        load_run_config_snapshot,
+    )
+
+    if launch_result.created and snapshot_config:
+        # Freeze the effective workflow pair before any startup answer or
+        # worker launch. A failed snapshot must never launch a worker.
+        # Direct library callers with a synthetic in-memory config may opt
+        # out; every CLI, daemon, and UI launch path keeps the default.
+        try:
+            create_run_config_snapshot(
+                repo_root=config.repo_root,
+                run_id=reserved_run_id,
+                config_path=config_dir,
+                workflow_name=workflow_name,
+                fingerprint=current_frozen_identity.config_fingerprint,
+            )
+        except SnapshotError as exc:
+            raise WorkflowError(f"cannot freeze run configuration: {exc}") from exc
+    else:
+        # A daemon reserved this run earlier; its snapshot must exist and
+        # match the manifest fingerprint before a worker attaches.
+        try:
+            existing_snapshot = load_run_config_snapshot(config.repo_root, reserved_run_id)
+        except SnapshotError as exc:
+            raise WorkflowError(str(exc)) from None
+        if (
+            existing_snapshot is not None
+            and existing_snapshot.fingerprint != current_frozen_identity.config_fingerprint
+        ):
+            raise WorkflowError(
+                f"run '{reserved_run_id}' configuration snapshot does not match "
+                "the launch intent; refusing to attach"
+            )
 
     _emit_event(observer, RunStartedEvent.create(
         workflow_name=workflow_name,

@@ -89,9 +89,28 @@ jobs:
         if: steps.version.outputs.should_publish == 'true'
         run: uv sync --frozen
 
+      - name: Set up Node (build-time only; the released wheel never needs it)
+        if: steps.version.outputs.should_publish == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/aflow_app/web/package-lock.json
+
       - name: Build distributions
         if: steps.version.outputs.should_publish == 'true'
         run: uv build
+
+      - name: Verify the wheel bundles the UI assets and server package
+        if: steps.version.outputs.should_publish == 'true'
+        run: |
+          python scripts/smoke_ui.py --verify-wheel dist/aworkflow-*.whl
+          uv build --sdist --out-dir dist-sdist
+          uv build --wheel dist-sdist/aworkflow-*.tar.gz --out-dir dist-from-sdist
+          python scripts/smoke_ui.py --verify-wheel dist-from-sdist/aworkflow-*.whl
+          # Publication ships exactly the validated wheel-from-checkout
+          # artifact; the sdist wheel proves reproducibility from source.
+          sha256sum dist/aworkflow-*.whl dist-from-sdist/aworkflow-*.whl
 
       - name: Publish to PyPI
         if: steps.version.outputs.should_publish == 'true'

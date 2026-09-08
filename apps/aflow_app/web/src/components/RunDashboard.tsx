@@ -722,8 +722,8 @@ export function RunDashboard({ projectId, requestedRunId = null, onRunSelectionC
       // The launch form projects the committed pair through the pure form
       // endpoint; a projection failure only blocks launch, never the runs.
       try {
-        const committedPair = await api.getProjectConfig(nextProjectId)
-        const projected = await api.postProjectConfigForm(nextProjectId, {
+        const committedPair = await api.getGlobalConfig()
+        const projected = await api.postGlobalConfigForm({
           aflow_toml: committedPair.aflow_toml,
           workflows_toml: committedPair.workflows_toml,
         })

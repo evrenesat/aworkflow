@@ -1,5 +1,26 @@
 # CLI Usage
 
+## UI
+
+```bash
+aflow ui                     # foreground; Ctrl+C stops the UI server only
+aflow ui --daemon            # detached; waits until the HTTP server is ready
+aflow ui --status            # report the server and its log location
+aflow ui --stop              # stop the server; workflow units keep running
+aflow ui --host H --port P   # override [server] bind settings for this process
+```
+
+The first launch configures the shared credential and projects root into
+`~/.config/aflow/config.toml`. Without a terminal, missing settings produce
+exact configuration instructions and a nonzero exit. `--daemon`, `--status`,
+and `--stop` are mutually exclusive; a second start reports the existing
+server and exits successfully. A port held by another program is an
+actionable error.
+
+Workflows launched by the UI run as detached worker units that survive UI
+shutdown and reconnect on restart; each run freezes its configuration at
+launch (see docs/runtime-behavior.md).
+
 ## Run
 
 Positional forms:

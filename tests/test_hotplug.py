@@ -220,6 +220,7 @@ def test_owned_executor_without_exact_resume_starts_fresh_session(tmp_path: Path
         _controller_config(),
         "live",
         config_dir=tmp_path,
+            snapshot_config=False,
         adapter=CodexAdapter(),
         session_driver=driver,
         resume=resume,
@@ -262,6 +263,7 @@ def test_live_run_workflow_consumes_semantic_session_output(tmp_path: Path) -> N
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=2),
         config, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
         runner=runner, session_driver=driver,
     )
     assert result.final_snapshot.is_complete
@@ -320,6 +322,7 @@ def test_live_run_workflow_activates_target_after_source_and_resumes_exact_sessi
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=3),
         config, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
         runner=runner, session_driver=driver, control_source=control_source,
     )
     assert result.final_snapshot.is_complete
@@ -381,6 +384,7 @@ def _run_pending_target_without_resume_driver(
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=3),
             config, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False,
             runner=runner, session_driver=driver, control_source=control_source,
             preflight_probe=preflight_probe,
         )
@@ -522,6 +526,7 @@ def _run_scripted_controller(
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=max_turns),
         config, "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
         runner=runner, session_driver=driver, control_source=control_source,
     )
     run_json = result.run_dir / "run.json"
@@ -568,6 +573,7 @@ def test_controller_second_changed_digest_while_pending_does_not_mutate_transact
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False,
             runner=lambda argv, **kwargs: (calls.append(tuple(argv)) or subprocess.CompletedProcess(argv, 0, "continue", "")),
             resume=resume,
         )
@@ -624,6 +630,7 @@ def test_retry_preserves_transaction_and_source_session_identity(tmp_path: Path)
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=2),
         _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
         runner=runner, session_driver=CodexAdapter().session_driver(exec_help="codex exec --json resume", resume_help="resume [SESSION_ID] -m, --model MODEL"),
         resume=resume, startup_retry=retry,
     )
@@ -646,7 +653,7 @@ def test_manager_one_turn_override_precedes_run_local_then_returns(tmp_path: Pat
         seen.append(argv[argv.index("--model") + 1])
         return subprocess.CompletedProcess(argv, 0, "continue", "")
     with pytest.raises(WorkflowError) as error:
-        run_workflow(ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=2, team="base"), config, "live", config_dir=tmp_path, adapter=CodexAdapter(), runner=runner, resume=resume)
+        run_workflow(ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=2, team="base"), config, "live", config_dir=tmp_path, snapshot_config=False, adapter=CodexAdapter(), runner=runner, resume=resume)
     state = json.loads((error.value.run_dir / "run.json").read_text(encoding="utf-8"))
     assert seen == ["high-model", "low-model"]
     assert state["pending_step_team_override"] is None
@@ -673,7 +680,7 @@ def test_crash_resume_before_target_start_or_success_keeps_transaction_nontermin
         provider_operations.append("source")
         return subprocess.CompletedProcess(argv, 0, '{"type":"thread.started","thread_id":"source"}\n{"type":"message.completed","text":"continue"}\n', "")
     with pytest.raises(WorkflowError) as error:
-        run_workflow(ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=3), config, "live", config_dir=tmp_path, adapter=CodexAdapter(), runner=crashing_runner, session_driver=driver, control_source=control)
+        run_workflow(ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=3), config, "live", config_dir=tmp_path, snapshot_config=False, adapter=CodexAdapter(), runner=crashing_runner, session_driver=driver, control_source=control)
     assert isinstance(error.value.__cause__, RuntimeError)
     run_dir = error.value.run_dir
     persisted = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
@@ -702,6 +709,7 @@ def test_crash_resume_before_target_start_or_success_keeps_transaction_nontermin
     resumed = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=2), config, "live",
         config_dir=tmp_path, adapter=CodexAdapter(), runner=resumed_runner,
+            snapshot_config=False,
         session_driver=driver, resume=resume,
     )
     after = json.loads((resumed.run_dir / "run.json").read_text(encoding="utf-8"))
@@ -879,6 +887,7 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
             run_workflow(
                 ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
                 _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                    snapshot_config=False,
                 runner=runner, session_driver=target_driver,
                 source_session_driver=source_driver, resume=resume, observer=observer,
             )
@@ -911,6 +920,7 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
     result = run_workflow(
         ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
         _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+            snapshot_config=False,
         runner=runner, session_driver=target_driver,
         source_session_driver=source_driver, resume=resume, observer=observer,
     )
@@ -978,6 +988,7 @@ def test_cross_harness_target_failure_restores_source_session_active(tmp_path: P
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False,
             runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "wire", ""),
             session_driver=TargetDriver(), source_session_driver=SourceDriver(), resume=resume,
         )
@@ -1128,6 +1139,7 @@ def test_run_resume_ambiguous_target_start_never_launches_harness(tmp_path: Path
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False,
             runner=lambda *args, **kwargs: calls.append(args) or subprocess.CompletedProcess(args[0], 0, "", ""),
             resume=resume,
         )
@@ -1157,6 +1169,7 @@ def test_run_resume_applied_transaction_is_normalized_into_history(tmp_path: Pat
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False,
             runner=lambda argv, **kwargs: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "DONE", ""),
             resume=resume,
         )
@@ -1219,6 +1232,7 @@ def test_run_resume_imports_durable_provider_result_once(tmp_path: Path, evidenc
         run_workflow(
             ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
             _controller_config(), "live", config_dir=tmp_path, adapter=CodexAdapter(),
+                snapshot_config=False,
             runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
             session_driver=driver, resume=resume,
         )

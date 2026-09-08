@@ -126,6 +126,7 @@ def _env(
         environment_file=environment_file,
         release_identity="test-release",
         daemon_factory=lambda config: AflowDaemon(config, units=units),
+        workflow_config_path=root / ".aflow" / "config" / "aflow.toml",
     )
     control.start()
     service = ProjectConfigService(

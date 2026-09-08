@@ -23,6 +23,15 @@ from aflow_app_server.project_registry import (
 )
 
 
+def _registry_pair_path(registry):
+    """Resolve the single registered project's pair path for these tests."""
+    records = registry.list_records()
+    if not records:
+        return registry.managed_root / "alpha" / ".aflow" / "config" / "aflow.toml"
+    record = records[0]
+    return registry.declared_root(record.id) / ".aflow" / "config" / "aflow.toml"
+
+
 def _git_project(root: Path, name: str, *, valid_config: bool = True) -> Path:
     project = root / name
     project.mkdir(parents=True)
@@ -183,6 +192,7 @@ def test_external_valid_record_is_immediately_addressable_and_daemon_is_cached(
         environment_file=environment_file,
         release_identity="test-release",
         daemon_factory=factory,
+        workflow_config_path=registry.managed_root / "alpha" / ".aflow" / "config" / "aflow.toml",
     )
     service.start()
     assert service.projects() == ()
@@ -194,35 +204,42 @@ def test_external_valid_record_is_immediately_addressable_and_daemon_is_cached(
     assert factories == [(managed / "alpha").resolve()]
 
 
-def test_unavailable_project_does_not_hide_healthy_project(tmp_path: Path) -> None:
+def test_all_projects_share_one_global_pair(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     managed.mkdir()
     _git_project(managed, "healthy")
-    broken = _git_project(managed, "broken", valid_config=False)
-    (broken / ".aflow" / "config" / "aflow.toml").write_text("not = [valid")
+    _git_project(managed, "second")
     executable, environment_file = _release_inputs(tmp_path)
     registry = ProjectRegistry(managed, tmp_path / "projects.json")
     registry.register("healthy", "Healthy", "healthy")
-    registry.register("broken", "Broken", "broken")
+    registry.register("second", "Second", "second")
+    # The single shared global pair lives outside any project.
+    global_pair = tmp_path / "global" / "aflow.toml"
+    global_pair.parent.mkdir(parents=True)
+    global_pair.write_text(
+        '[aflow]\ndefault_workflow = "managed"\n\n'
+        '[harness.codex.profiles.test]\nmodel = "test"\n\n'
+        '[roles]\nworker = "codex.test"\n\n[prompts]\np = "Work."\n'
+    )
+    global_pair.with_name("workflows.toml").write_text(
+        '[workflow.managed.steps.implement]\nrole = "worker"\n'
+        'prompts = ["p"]\ngo = [{ to = "END", when = "DONE" }]\n'
+    )
     service = ControlPlaneService(
         registry,
         aflow_executable=executable,
         environment_file=environment_file,
         release_identity="test-release",
         daemon_factory=lambda config: AflowDaemon(config, units=InMemoryUnitManager()),
+        workflow_config_path=global_pair,
     )
     service.start()
 
-    assert {project.project_id for project in service.projects()} == {"healthy", "broken"}
-    assert service.readiness() == {
-        "broken": "project_daemon_start_failed",
-        "healthy": None,
-    }
+    assert {project.project_id for project in service.projects()} == {"healthy", "second"}
+    assert service.readiness() == {"healthy": None, "second": None}
     assert service.capabilities("healthy").workflows == ("managed",)
-    with pytest.raises(ControlPlaneUnavailableError):
-        service.capabilities("broken")
-    assert service.ready_capabilities().keys() == {"healthy"}
-    assert service.readiness()["broken"] is not None
+    assert service.capabilities("second").workflows == ("managed",)
+    assert service.ready_capabilities().keys() == {"healthy", "second"}
 
 
 def test_unregistered_project_is_rejected_before_daemon_composition(tmp_path: Path) -> None:
@@ -244,6 +261,7 @@ def test_unregistered_project_is_rejected_before_daemon_composition(tmp_path: Pa
         environment_file=environment_file,
         release_identity="test-release",
         daemon_factory=factory,
+        workflow_config_path=registry.managed_root / "alpha" / ".aflow" / "config" / "aflow.toml",
     )
     with pytest.raises(ProjectNotAllowedError):
         service.capabilities("candidate")
@@ -269,6 +287,7 @@ def test_two_projects_keep_independent_run_roots_and_unregister_cache(
         environment_file=environment_file,
         release_identity="test-release",
         daemon_factory=lambda config: AflowDaemon(config, units=InMemoryUnitManager()),
+        workflow_config_path=_registry_pair_path(registry),
     )
 
     first_daemon = service._project("first").daemon
@@ -334,6 +353,7 @@ def test_cached_project_recovers_after_exact_root_is_restored(tmp_path: Path) ->
         environment_file=environment_file,
         release_identity="test-release",
         daemon_factory=lambda config: AflowDaemon(config, units=InMemoryUnitManager()),
+        workflow_config_path=_registry_pair_path(registry),
     )
     service.start()
     assert service.capabilities("alpha").workflows == ("managed",)

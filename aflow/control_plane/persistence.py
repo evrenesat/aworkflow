@@ -31,6 +31,9 @@ from .models import (
 
 RUN_ID_MAX_LENGTH = 64
 _RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+# Legacy direct-CLI runs recorded uppercase UTC stamps (20260729T093500Z-...);
+# they stay readable by exact id even though new ids are generated lowercase.
+_LEGACY_RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 _LAUNCH_PHASES = frozenset({
     "manifest_only",
     "launch_requested",
@@ -87,10 +90,18 @@ class ControlWriteResult:
 
 
 def validate_run_id(run_id: str) -> str:
-    """Validate the one lowercase identity usable in URLs, paths, and unit names."""
+    """Validate the one lowercase identity usable in URLs, paths, and unit names.
+
+    The exact legacy direct-CLI id shape (uppercase ``T``/``Z`` stamp) is also
+    accepted so preserved pre-control-plane runs remain inspectable by id;
+    newly generated ids are always lowercase.
+    """
     if not isinstance(run_id, str):
         raise RunIdentityError("run id must be a string")
-    if len(run_id) > RUN_ID_MAX_LENGTH or _RUN_ID_RE.fullmatch(run_id) is None:
+    if len(run_id) > RUN_ID_MAX_LENGTH or (
+        _RUN_ID_RE.fullmatch(run_id) is None
+        and _LEGACY_RUN_ID_RE.fullmatch(run_id) is None
+    ):
         raise RunIdentityError(
             "run id must be lowercase ASCII letters/digits/hyphens, bounded, and path-safe"
         )

@@ -323,6 +323,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 config, 'review', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CapturingAdapter(), runner=runner,
             )
 
@@ -414,6 +415,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 config, 'managed', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CapturingAdapter(), runner=runner,
             )
             assert captured[0] == ('worker', 'ROLE-PROMPT-SENTINEL')
@@ -484,6 +486,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "resume_override",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=lambda argv, **kwargs: subprocess.CompletedProcess(
                         argv, 0, "", ""
@@ -541,6 +544,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "resume_override",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     resume=resume,
@@ -882,6 +886,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "resume_override",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=first_resumed_runner,
                     resume=resume,
@@ -929,6 +934,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "resume_override",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=chained_runner,
                     resume=ResumeContext(
@@ -1041,6 +1047,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         workflow_config,
                         "resume_override",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                         resume=resume,
@@ -1136,6 +1143,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     _resume_override_workflow_config(),
                     "resume_override",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     resume=resume,
@@ -1275,6 +1283,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         workflow_config,
                         "resume_override",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                         resume=resume,
@@ -1333,6 +1342,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "resume_override",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=corrected_runner,
                     resume=resume,
@@ -1539,6 +1549,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "test",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -1604,6 +1615,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         workflow_config,
                         "simple",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -1652,6 +1664,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         workflow_config,
                         "simple",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -1699,6 +1712,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         workflow_config,
                         "simple",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -1746,6 +1760,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
                         _resume_override_workflow_config(), "resume_override",
                         config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                            snapshot_config=False,
                         resume=resume,
                     )
             runner.assert_not_called()
@@ -1824,6 +1839,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "test",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -1874,6 +1890,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     workflow_config,
                     "simple",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -1921,6 +1938,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         workflow_config,
                         "simple",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -2631,7 +2649,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert result.turns_completed == 1
             assert result.final_snapshot.is_complete
             assert call_count == 1
@@ -2654,7 +2672,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n- [x] step two\n')
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert result.turns_completed == 2
             assert result.final_snapshot.is_complete
             assert call_count == 2
@@ -2677,7 +2695,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=capturing_runner)
+            run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=capturing_runner)
 
     def test_active_plan_remains_unchanged_when_review_does_not_create_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2698,7 +2716,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'loop': WorkflowConfig(steps={'review': WorkflowStepConfig(role='architect', prompts=('review_prompt',), go=(GoTransition(to='implement'),)), 'implement': WorkflowStepConfig(role='architect', prompts=('impl_prompt',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='review')))}, first_step='review')}, prompts={'review_prompt': 'Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.', 'impl_prompt': 'Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=4)
             with pytest.raises(WorkflowError, match='reached max turns limit'):
-                run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=capturing_runner)
+                run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=capturing_runner)
             for p in captured_active_paths:
                 assert str(plan_path) == p
 
@@ -2725,7 +2743,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'loop': WorkflowConfig(steps={'review': WorkflowStepConfig(role='architect', prompts=('review_prompt',), go=(GoTransition(to='implement'),)), 'implement': WorkflowStepConfig(role='architect', prompts=('impl_prompt',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='review')))}, first_step='review')}, prompts={'review_prompt': 'Active: {ACTIVE_PLAN_PATH}. New: {NEW_PLAN_PATH}.', 'impl_prompt': 'Active: {ACTIVE_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=capturing_runner)
+            run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=capturing_runner)
             assert len(captured_active_paths) == 2
             assert captured_active_paths[0] == str(plan_path)
             expected_new = str(repo_root / 'plan-cp01-v01.md')
@@ -2783,6 +2801,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 wf_config,
                 'loop',
                 config_dir=config_dir,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=capturing_runner,
             )
@@ -2848,6 +2867,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 wf_config,
                 'loop',
                 config_dir=config_dir,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=capturing_runner,
             )
@@ -2889,6 +2909,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=config_dir,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -2910,7 +2931,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             wf_config = WorkflowUserConfig(roles={'reviewer': 'claude.opus', 'worker': 'opencode.turbo'}, harnesses={'claude': WorkflowHarnessConfig(profiles={'opus': HarnessProfileConfig(model='claude-opus-4')}), 'opencode': WorkflowHarnessConfig(profiles={'turbo': HarnessProfileConfig(model='glm-5-turbo')})}, workflows={'review_loop': WorkflowConfig(steps={'review_plan': WorkflowStepConfig(role='reviewer', prompts=('review_prompt',), go=(GoTransition(to='implement_plan'),)), 'implement_plan': WorkflowStepConfig(role='worker', prompts=('impl_prompt',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='review_plan')))}, first_step='review_plan')}, prompts={'review_prompt': 'Review the plan.', 'impl_prompt': 'Implement from {ACTIVE_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'review_loop', config_dir=config_dir, runner=capturing_runner)
+            result = run_workflow(controller_config, wf_config, 'review_loop', config_dir=config_dir, snapshot_config=False, runner=capturing_runner)
             assert result.turns_completed == 2
             assert result.final_snapshot.is_complete
             assert call_order == ['claude', 'opencode']
@@ -2930,6 +2951,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             with pytest.raises(WorkflowError) as ctx:
                 run_workflow(
                     controller_config, wf_config, 'simple', config_dir=config_dir,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=runner, observer=observer,
                 )
             run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -2989,6 +3011,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     wf_config,
                     "simple",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=lambda *args, **kwargs: pytest.fail(
                         "worker must not run after scope capture failure"
@@ -3015,7 +3038,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert 'no transition matched' in str(ctx.value)
             assert 'workflow.simple.steps.implement_plan' in str(ctx.value)
             assert 'DONE=False' in str(ctx.value)
@@ -3036,7 +3059,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'loop': WorkflowConfig(steps={'review': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='implement'),)), 'implement': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),))}, first_step='review')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert 'workflow.loop.steps.implement' in str(ctx.value)
             run_dir = ctx.value.run_dir
             assert run_dir is not None
@@ -3065,7 +3088,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
             with pytest.raises(WorkflowError):
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert ended_at_turn[0] == 5
 
     def test_workflow_missing_workflow_raises(self) -> None:
@@ -3075,7 +3098,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, WorkflowUserConfig(), 'nonexistent', config_dir=repo_root)
+                run_workflow(controller_config, WorkflowUserConfig(), 'nonexistent', config_dir=repo_root, snapshot_config=False)
             assert 'not found' in str(ctx.value)
 
     def test_workflow_extra_instructions_appended(self) -> None:
@@ -3097,7 +3120,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1, extra_instructions=('be careful', 'use tests'))
             with pytest.raises(WorkflowError, match='reached max turns limit'):
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CapturingAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CapturingAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
             assert len(captured_user_prompts) == 1
             assert 'Work from' in captured_user_prompts[0]
             assert 'be careful use tests' in captured_user_prompts[0]
@@ -3114,7 +3137,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert 'exited with code 1' in str(ctx.value)
 
     def test_workflow_prompt_render_failure_marks_run_failed_without_turn_artifacts(self) -> None:
@@ -3138,7 +3161,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             )
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
             assert 'prompt file not found' in str(ctx.value)
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[-1] / 'run.json').read_text(encoding='utf-8'))
@@ -3160,7 +3183,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END'),))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert result.turns_completed == 0
             assert result.final_snapshot.is_complete
             assert result.end_reason == 'already_complete'
@@ -3182,6 +3205,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             with pytest.raises(WorkflowError) as ctx:
                 run_workflow(
                     controller_config, wf_config, 'simple', config_dir=config_dir,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=runner, observer=observer,
                 )
             run_json = json.loads((ctx.value.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -3213,7 +3237,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
 
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='NEW_PLAN_EXISTS'),))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert result.turns_completed == 1
             assert result.end_reason == 'done'
             run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -3293,7 +3317,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert result.end_reason == 'done'
             assert result.final_snapshot.is_complete
 
@@ -3351,7 +3375,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
 
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             error_msg = str(ctx.value)
             assert 'Checkpoint 2: Current' in error_msg
             assert 'current checkpoint unchecked step count: 2' in error_msg
@@ -3382,6 +3406,7 @@ class RunlogSingleRunDirTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=10),
                 wf_config, 'loop', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             runs_root = repo_root / '.aflow' / 'runs'
             run_dirs = [d for d in runs_root.iterdir() if d.is_dir()]
@@ -3420,6 +3445,7 @@ class RunlogSingleRunDirTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=10),
                 wf_config, 'loop', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             assert all(n == 1 for n in observed_run_dirs), \
                 f"Run dir count changed during turns: {observed_run_dirs}"
@@ -3447,6 +3473,7 @@ class RunlogSingleRunDirTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=10),
                 wf_config, 'loop', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             runs_root = repo_root / '.aflow' / 'runs'
             run_dirs = [d for d in runs_root.iterdir() if d.is_dir()]
@@ -3507,6 +3534,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     session_driver=driver,
                     preflight_probe=NoOpHarnessPreflightProbe(),
@@ -3666,6 +3694,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     workflow_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=ReasonixAdapter(),
                     session_driver=driver,
                     preflight_probe=NoOpHarnessPreflightProbe(),
@@ -3755,6 +3784,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=observer,
@@ -3780,7 +3810,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END'),))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
-            result = run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3), wf_config, 'simple', config_dir=config_dir)
+            result = run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3), wf_config, 'simple', config_dir=config_dir, snapshot_config=False)
             run_dir = result.run_dir
             run_json = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
             assert run_json['workflow_name'] == 'simple'
@@ -3809,7 +3839,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')))}, first_step='implement_plan')},
                 prompts={'p': 'Work.'},
             )
-            result = run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5), wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5), wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             turn_dir = result.run_dir / 'turns' / 'turn-001'
             result_json = json.loads((turn_dir / 'result.json').read_text(encoding='utf-8'))
             assert result_json['step_name'] == 'implement_plan'
@@ -3832,7 +3862,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n- [x] step two\n')
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
-            result = run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5), wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+            result = run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5), wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             turn_dir = result.run_dir / 'turns' / 'turn-001'
             result_json = json.loads((turn_dir / 'result.json').read_text(encoding='utf-8'))
             assert result_json['original_plan_path'] == str(plan_path)
@@ -3862,6 +3892,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=config_dir,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -3923,6 +3954,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=config_dir,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -3970,6 +4002,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=config_dir,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -3997,6 +4030,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     _make_simple_wf_config(),
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -4058,6 +4092,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'managed',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -4125,6 +4160,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -4179,6 +4215,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -4226,6 +4263,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -4308,6 +4346,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=TrackingAdapter(),
                 runner=runner,
             )
@@ -4385,6 +4424,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=TrackingAdapter(),
                 runner=runner,
             )
@@ -4459,6 +4499,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=TrackingAdapter(),
                     runner=runner,
                 )
@@ -4539,6 +4580,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=TrackingAdapter(),
                     runner=runner,
                 )
@@ -4597,6 +4639,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -4660,6 +4703,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -4745,6 +4789,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -4862,6 +4907,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=TrackingAdapter(),
                 runner=runner,
             )
@@ -4919,6 +4965,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -4966,6 +5013,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=config_dir,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -5021,6 +5069,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                     wf_config,
                     'simple',
                     config_dir=config_dir,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -5041,7 +5090,7 @@ class WorkflowArtifactTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'noop', '')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             with pytest.raises(WorkflowError):
-                run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2), wf_config, 'simple', config_dir=config_dir, adapter=CodexAdapter(), runner=runner)
+                run_workflow(ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2), wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             run_dir = repo_root / '.aflow' / 'runs'
             run_dirs = sorted(run_dir.iterdir())
             assert len(run_dirs) == 1
@@ -5603,6 +5652,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                     wf_config,
                     'review_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     runner=lambda *args, **kwargs: runner_calls.append((args, kwargs)),
                     observer=observer,
                 )
@@ -5658,6 +5708,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                     self._make_review_wf_config(),
                     'review_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=observer,
@@ -5694,6 +5745,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 self._make_review_wf_config(),
                 'review_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -5735,6 +5787,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 self._make_review_wf_config(),
                 'review_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -5771,6 +5824,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 self._make_review_wf_config(),
                 'review_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -5803,6 +5857,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 _make_simple_wf_config(),
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -5825,6 +5880,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                         self._make_review_wf_config(),
                         'review_wf',
                         config_dir=repo_root,
+                            snapshot_config=False,
                         runner=lambda *args, **kwargs: pytest.fail('runner must not start'),
                         observer=observer,
                     )
@@ -5858,6 +5914,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                         self._make_review_wf_config(),
                         'review_wf',
                         config_dir=repo_root,
+                            snapshot_config=False,
                         resume=resume,
                     )
 
@@ -5886,6 +5943,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                         self._make_review_wf_config(),
                         'review_wf',
                         config_dir=repo_root,
+                            snapshot_config=False,
                     )
 
             reserve.assert_not_called()
@@ -5926,6 +5984,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                         parsed_plan=parsed,
                         startup_retry=startup_retry,
                         config_dir=repo_root,
+                            snapshot_config=False,
                     )
 
             reserve.assert_not_called()
@@ -5952,6 +6011,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                         'review_wf',
                         parsed_plan=prepared_snapshot,
                         config_dir=repo_root,
+                            snapshot_config=False,
                     )
 
             reserve.assert_not_called()
@@ -6041,7 +6101,7 @@ class WorkflowPreflightTests(unittest.TestCase):
 
             config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
             with pytest.raises(WorkflowError, match='reached max turns limit'):
-                run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, adapter=CodexAdapter(), runner=runner)
+                run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert call_count[0] == 1
 
     def test_preflight_skipped_for_non_review_workflow(self) -> None:
@@ -6063,7 +6123,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 prompts={'p': "Use 'aflow-execute-plan' skill."},
             )
             config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
-            result = run_workflow(config, wf_config, 'simple', config_dir=repo_root)
+            result = run_workflow(config, wf_config, 'simple', config_dir=repo_root, snapshot_config=False)
             assert result.end_reason == 'already_complete'
 
     def test_preflight_fails_for_git_tracking_only_inside_fence(self) -> None:
@@ -6074,7 +6134,7 @@ class WorkflowPreflightTests(unittest.TestCase):
             config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
             wf_config = self._make_review_wf_config()
             with pytest.raises(WorkflowError) as ctx:
-                run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, runner=lambda *a, **k: None)
+                run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, snapshot_config=False, runner=lambda *a, **k: None)
             assert 'Git Tracking' in str(ctx.value)
 
     def test_preflight_auto_refreshes_pristine_base_head_before_first_turn(self) -> None:
@@ -6114,6 +6174,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'simple', config_dir=repo_root,
+                        snapshot_config=False,
                     runner=runner,
                 )
             assert call_count[0] == 1
@@ -6149,6 +6210,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'simple', config_dir=repo_root,
+                        snapshot_config=False,
                     runner=runner,
                 )
             assert call_count[0] == 0
@@ -6184,6 +6246,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'simple', config_dir=repo_root,
+                        snapshot_config=False,
                     runner=runner,
                 )
             assert call_count[0] == 0
@@ -6222,6 +6285,7 @@ class WorkflowPreflightTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 wf_config, 'simple', config_dir=repo_root,
+                    snapshot_config=False,
                 runner=runner,
             )
             assert call_count[0] == 1
@@ -6275,6 +6339,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -6338,6 +6403,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert call_count[0] >= 2
@@ -6428,6 +6494,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'branch_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -6453,6 +6520,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'branch_wf', config_dir=repo_root,
+                        snapshot_config=False,
                 )
             assert 'main' in str(ctx.value)
             assert 'other' in str(ctx.value)
@@ -6567,6 +6635,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             workflow_config,
             "wt_wf",
             config_dir=root,
+                snapshot_config=False,
             adapter=CodexAdapter(),
             runner=runner,
         )
@@ -6671,6 +6740,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 workflow_config,
                 "wt_wf",
                 config_dir=root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=failing_runner,
                 resume=resume_a,
@@ -6700,6 +6770,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             workflow_config,
             "wt_wf",
             config_dir=root,
+                snapshot_config=False,
             adapter=CodexAdapter(),
             runner=completing_runner,
             resume=resume_b,
@@ -6724,6 +6795,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'branch_wf', config_dir=repo_root,
+                        snapshot_config=False,
                 )
             assert 'nonexistent' in str(ctx.value)
 
@@ -6749,6 +6821,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                 )
             assert 'primary repo root' in str(ctx.value)
             assert str(plan_path) in str(ctx.value)
@@ -6797,6 +6870,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             # Worktree workflow succeeded with untracked plan, proving the new sync support works
@@ -6847,6 +6921,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
 
@@ -6882,6 +6957,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
 
@@ -6923,6 +6999,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     run_workflow(
                         ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                         wf_config, 'wt_wf', config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(), runner=runner,
                     )
 
@@ -7059,6 +7136,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 runner=runner,
             )
 
@@ -7124,6 +7202,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 runner=runner,
             )
 
@@ -7169,6 +7248,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
 
@@ -7221,6 +7301,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
 
@@ -7270,6 +7351,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
 
@@ -7324,6 +7406,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
 
@@ -7365,6 +7448,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=runner,
                 )
 
@@ -7406,6 +7490,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             # Workflow succeeded with nested plan directories, proving sync creates parent dirs
@@ -7424,6 +7509,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                     wf_config, 'branch_wf', config_dir=repo_root,
+                        snapshot_config=False,
                 )
             assert 'uncommitted changes' in str(ctx.value)
 
@@ -7453,6 +7539,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert len(workflow_step_cwd) == 1
@@ -7486,6 +7573,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -7528,6 +7616,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert len(workflow_step_cwd) == 1
@@ -7574,6 +7663,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -7625,6 +7715,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=TrackingAdapter(), runner=runner,
             )
             assert len(captured_repo_roots) >= 1
@@ -7652,6 +7743,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'branch_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=first_runner,
                 )
@@ -7679,6 +7771,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'branch_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=resumed_runner,
                 resume=ResumeContext(
@@ -7733,6 +7826,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'simple',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 resume=ResumeContext(
@@ -7791,6 +7885,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=TrackingAdapter(), runner=runner,
             )
             assert len(captured_repo_roots) >= 1
@@ -7826,6 +7921,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert result.run_dir.is_relative_to(repo_root)
@@ -7855,6 +7951,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -7920,6 +8017,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             run_json = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
@@ -7965,6 +8063,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=first_runner,
                 )
 
@@ -7995,6 +8094,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=second_runner, resume=resume_ctx,
                 )
 
@@ -8059,6 +8159,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=failing_runner,
                 )
@@ -8087,6 +8188,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=failing_runner,
                     resume=resume_ctx,
@@ -8127,6 +8229,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=lambda argv, **kwargs: subprocess.CompletedProcess(
                         argv, 1, 'failed', 'first run failed'
@@ -8172,6 +8275,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=resumed_runner,
                     resume=resume_ctx,
@@ -8306,6 +8410,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'repair_loop',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 resume=ResumeContext(
@@ -8441,6 +8546,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'repair_loop',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     resume=ResumeContext(
@@ -8711,6 +8817,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'managed',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 resume=ResumeContext(
@@ -8851,6 +8958,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'repair_loop',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -8895,6 +9003,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=lambda argv, **kwargs: subprocess.CompletedProcess(
                         argv, 1, 'failed', 'first run failed'
@@ -8932,6 +9041,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     'wt_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=unexpected_runner,
                     resume=resume_ctx,
@@ -9060,6 +9170,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'repair_loop',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 resume=ResumeContext(
@@ -9138,6 +9249,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=first_runner,
                 )
 
@@ -9164,6 +9276,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=second_runner, resume=resume_ctx,
                 )
 
@@ -9203,6 +9316,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=first_runner,
                 )
 
@@ -9228,6 +9342,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=second_runner, resume=resume_ctx,
                 )
 
@@ -9254,6 +9369,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=first_runner,
                 )
 
@@ -9282,6 +9398,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result2 = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=second_runner, resume=resume_ctx,
             )
 
@@ -9311,6 +9428,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=first_runner,
                 )
 
@@ -9341,6 +9459,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             result2 = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'wt_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=second_runner, resume=resume_ctx,
             )
 
@@ -9402,6 +9521,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'branch_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 resume=ResumeContext(
@@ -9497,6 +9617,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 'wt_wf',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 resume=ResumeContext(
@@ -9553,6 +9674,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=first_runner,
                 )
 
@@ -9582,6 +9704,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'wt_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=second_runner, resume=resume_ctx,
                 )
 
@@ -9650,6 +9773,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     "repair",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -9705,6 +9829,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 wf_config,
                 "retry",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -9756,6 +9881,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     "legacy",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=lambda argv, **kwargs: subprocess.CompletedProcess(
                         argv, 0, "unexpected", ""
@@ -9817,6 +9943,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     wf_config,
                     "review",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -9888,6 +10015,7 @@ class StopMarkerTests(unittest.TestCase):
                     self._make_wf_config(),
                     'simple',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=RaisingObserver(),
@@ -9928,6 +10056,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             assert 'dirty worktree blocks verification' in str(ctx.value)
             assert 'AFLOW_STOP' in str(ctx.value)
@@ -9952,6 +10081,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     self._make_wf_config(), 'simple', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=runner,
                 )
             assert 'terminal owner boundary' in str(ctx.value)
@@ -9975,6 +10105,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             assert 'unrelated changes block this step' in str(ctx.value)
 
@@ -9996,6 +10127,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             run_dir = ctx.value.run_dir
             assert run_dir is not None
@@ -10022,6 +10154,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             turn_dir = ctx.value.run_dir / 'turns' / 'turn-001'
             result_json = json.loads((turn_dir / 'result.json').read_text(encoding='utf-8'))
@@ -10043,6 +10176,7 @@ class StopMarkerTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                 wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             assert result.turns_completed == 1
             assert result.final_snapshot.is_complete
@@ -10065,6 +10199,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             assert 'stdout reason' in str(ctx.value)
 
@@ -10086,6 +10221,7 @@ class StopMarkerTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                     wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                        snapshot_config=False,
                 )
             assert 'implementer requested stop without a reason' in str(ctx.value)
 
@@ -10113,6 +10249,7 @@ class StopMarkerTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
                 wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    snapshot_config=False,
             )
             assert result.turns_completed == 1
             assert result.final_snapshot.is_complete
@@ -10191,6 +10328,7 @@ class StopMarkerTests(unittest.TestCase):
                     workflow_config,
                     "wt_wf",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=fail_runner,
                 )
@@ -10229,6 +10367,7 @@ class StopMarkerTests(unittest.TestCase):
                 workflow_config,
                 "wt_wf",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=complete_runner,
                 resume=ResumeContext(
@@ -10268,6 +10407,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     'branch_wf',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -10311,6 +10451,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert call_count[0] >= 2, 'at least init + workflow step should be called'
@@ -10346,6 +10487,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert call_count[0] >= 2
@@ -10425,6 +10567,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                 wf_config, 'branch_wf', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=TrackingAdapter(), runner=runner,
             )
             assert bootstrap_invocation_model, 'bootstrap agent build_invocation was not called'
@@ -10446,6 +10589,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
                     wf_config, 'branch_wf', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=runner,
                 )
             assert 'AFLOW_STOP' in str(ctx.value) or 'repo init failed' in str(ctx.value)
@@ -10465,6 +10609,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     run_workflow(
                         ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                         wf_config, 'branch_wf', config_dir=repo_root,
+                            snapshot_config=False,
                     )
             assert 'git' in str(ctx.value).lower()
             assert 'install' in str(ctx.value).lower() or 'installed' in str(ctx.value).lower() or 'PATH' in str(ctx.value)
@@ -10490,6 +10635,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
                 wf_config, 'simple', config_dir=repo_root,
+                    snapshot_config=False,
             )
             assert result.end_reason == 'already_complete'
             assert not (repo_root / '.git').exists(), 'no git repo should be initialized for non-lifecycle workflows'
@@ -10565,6 +10711,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     'managed',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=observer,
@@ -10643,6 +10790,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     'managed',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -10700,6 +10848,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             result = run_workflow(
                 ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
                 wf_config, 'managed', config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(), runner=runner,
             )
             assert result.turns_completed == 1
@@ -10802,6 +10951,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 wf_config,
                 'managed',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -10980,6 +11130,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     workflow_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -11167,6 +11318,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 wf_config,
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -11384,6 +11536,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _pressure_workflow_config(role="reviewer"),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -11409,6 +11562,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _make_simple_wf_config(),
                     "simple",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -11447,6 +11601,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 _pressure_workflow_config(role="worker"),
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -11697,6 +11852,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     workflow_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=observer,
@@ -11968,6 +12124,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     workflow_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -12122,6 +12279,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                             _pressure_workflow_config(role="worker"),
                             "managed",
                             config_dir=repo_root,
+                                snapshot_config=False,
                             adapter=CodexAdapter(),
                             runner=runner,
                         )
@@ -12188,6 +12346,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _pressure_workflow_config(role="worker"),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -12230,6 +12389,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 _clean_end_manager_workflow_config(),
                 'managed',
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 observer=observer,
@@ -12318,6 +12478,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _clean_end_manager_workflow_config(),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=observer,
@@ -12394,6 +12555,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         _clean_end_manager_workflow_config(),
                         "managed",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -12462,6 +12624,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 _pressure_workflow_config(role="worker"),
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
             )
@@ -12535,6 +12698,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 _pressure_workflow_config(role="worker"),
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=runner,
                 observer=observer,
@@ -12621,6 +12785,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         _pressure_workflow_config(role="worker"),
                         "managed",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -12667,6 +12832,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _pressure_workflow_config(role="worker"),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -12706,6 +12872,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _pressure_workflow_config(role="worker"),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -12762,6 +12929,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         _pressure_workflow_config(role="worker"),
                         "managed",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -12894,6 +13062,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -12951,6 +13120,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _pressure_workflow_config(role="worker"),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )
@@ -13088,6 +13258,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     observer=RecordingObserver(),  # type: ignore[arg-type]
@@ -13257,6 +13428,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 wf_config,
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 adapter=CodexAdapter(),
                 runner=role_runner,
             )
@@ -13345,6 +13517,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 wf_config,
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 runner=runner,
             )
 
@@ -13421,6 +13594,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     _clean_end_manager_workflow_config(),
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                     banner=RecordingBanner(),  # type: ignore[arg-type]
@@ -13503,6 +13677,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                         _clean_end_manager_workflow_config(),
                         "managed",
                         config_dir=repo_root,
+                            snapshot_config=False,
                         adapter=CodexAdapter(),
                         runner=runner,
                     )
@@ -13625,6 +13800,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     runner=runner,
                     banner=RecordingBanner(),  # type: ignore[arg-type]
                     observer=RecordingObserver(),  # type: ignore[arg-type]
@@ -13704,6 +13880,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     wf_config,
                     "managed",
                     config_dir=repo_root,
+                        snapshot_config=False,
                     runner=runner,
                 )
 
@@ -13768,6 +13945,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
                     wf_config, 'managed', config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(), runner=runner,
                 )
             assert '# AFlow manager report' in str(error.value)
@@ -14085,6 +14263,7 @@ def _run_upgrade_resume_scenario(
         wf_config,
         "managed",
         config_dir=repo_root,
+            snapshot_config=False,
         adapter=CodexAdapter(),
         runner=runner,
         resume=resume,
@@ -14337,6 +14516,7 @@ def test_environment_preflight_zero_turn_block_is_terminal_and_artifact_free(
             _environment_preflight_test_config(),
             "preflight",
             config_dir=repo_root,
+                snapshot_config=False,
             runner=lambda *args, **kwargs: pytest.fail("blocked runner was called"),
             preflight_probe=probe,
         )
@@ -14372,6 +14552,7 @@ def test_environment_preflight_later_block_preserves_prior_turn(
             _environment_preflight_test_config(),
             "preflight",
             config_dir=repo_root,
+                snapshot_config=False,
             runner=runner,
             preflight_probe=probe,
         )
@@ -14409,6 +14590,7 @@ def test_custom_runner_without_probe_keeps_existing_behavior(
         _environment_preflight_test_config(),
         "preflight",
         config_dir=repo_root,
+            snapshot_config=False,
         runner=runner,
     )
 
@@ -14487,6 +14669,7 @@ def test_environment_preflight_blocks_manager_before_decision_artifact() -> None
                 wf_config,
                 "managed",
                 config_dir=repo_root,
+                    snapshot_config=False,
                 runner=runner,
                 preflight_probe=ManagerProbe(),
             )

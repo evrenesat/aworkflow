@@ -46,10 +46,7 @@ def _create(
     mode: str = "create",
     display_name: str | None = None,
     main_branch: str = "trunk",
-    initial_workflow: str | None = None,
-    initial_team: str | None = None,
     initialize_git: bool = False,
-    initialize_config: bool = False,
 ) -> dict[str, object]:
     return service.create_or_register(
         ProjectRequest(
@@ -57,10 +54,7 @@ def _create(
             relative_path=path,
             display_name=display_name,
             main_branch=main_branch,
-            initial_workflow=initial_workflow,
-            initial_team=initial_team,
             initialize_git=initialize_git,
-            initialize_config=initialize_config,
         )
     )
 
@@ -85,6 +79,17 @@ def _committed_repo(root: Path, name: str, file_body: str = "history") -> Path:
     return project
 
 
+@pytest.fixture(autouse=True)
+def _global_configuration_ready(monkeypatch):
+    """All projects read the global pair; tests pin its classification."""
+    monkeypatch.setattr(
+        "aflow_app_server.project_service.project_configuration_state",
+        lambda *args, **kwargs: "ready",
+    )
+    yield
+
+
+
 def _failing_register(self, project_id, display_name, relative_root):  # type: ignore[no-untyped-def]
     from aflow_app_server.project_registry import ProjectRegistryError
 
@@ -92,51 +97,33 @@ def _failing_register(self, project_id, display_name, relative_root):  # type: i
 
 
 class TestCreate:
-    def test_create_builds_verified_repository_and_starter_config(
+    def test_create_builds_verified_repository_without_local_config(
         self, tmp_path: Path
     ) -> None:
         service, registry, managed = _service(tmp_path)
-        result = _create(
-            service,
-            "alpha",
-            display_name="Alpha",
-            initial_workflow="build",
-            initial_team="crew",
-        )
+        result = _create(service, "alpha", display_name="Alpha")
 
         root = managed / "alpha"
         assert result["id"] == "alpha"
-        assert result["readiness"] == "configuration_required"
+        assert result["readiness"] == "ready"
         assert registry.get("alpha") is not None
         assert _git(root, "rev-parse", "--abbrev-ref", "HEAD") == "trunk"
         assert _git(root, "log", "--oneline").count("\n") == 0
         assert _git(root, "status", "--porcelain") == ""
         assert (root / ".gitignore").read_text() == ".aflow/\n"
         assert sorted(_git(root, "ls-files").splitlines()) == [".gitignore", "README.md"]
+        # Registration never writes project-local workflow configuration.
+        assert not (root / ".aflow").exists()
 
-        config_dir = root / ".aflow" / "config"
-        aflow_text = (config_dir / "aflow.toml").read_text()
-        workflows_text = (config_dir / "workflows.toml").read_text()
-        assert 'default_workflow = "build"' in aflow_text
-        assert '[teams."crew".roles]' in aflow_text
-        assert '[workflow.build]' in workflows_text
-        assert 'team = "crew"' in workflows_text
-        assert "codex" not in aflow_text.lower()
-        workflows_config = load_workflow_config(config_dir / "aflow.toml")
-        assert workflows_config.workflows["build"].main_branch == "trunk"
-        assert project_configuration_state(config_dir / "aflow.toml") == "configuration_required"
-
-    def test_create_uses_starter_default_workflow_and_registers_immediately(
+    def test_create_registers_project_for_global_configuration(
         self, tmp_path: Path
     ) -> None:
         service, registry, _ = _service(tmp_path)
         result = _create(service, "beta")
 
-        assert result["readiness"] == "configuration_required"
-        config_dir = (tmp_path / "managed" / "beta" / ".aflow" / "config")
-        assert 'default_workflow = "implement"' in (config_dir / "aflow.toml").read_text()
+        assert result["readiness"] == "ready"
         assert registry.get("beta") is not None
-        assert service.readiness("beta") == "configuration_required"
+        assert service.readiness("beta") == "ready"
 
     def test_create_nested_path_builds_in_existing_parent(self, tmp_path: Path) -> None:
         service, registry, managed = _service(tmp_path)
@@ -149,10 +136,7 @@ class TestCreate:
         assert registry.get("acme") is not None
         assert _git(root, "rev-parse", "--abbrev-ref", "HEAD") == "trunk"
         assert _git(root, "status", "--porcelain") == ""
-        workflows_config = load_workflow_config(
-            root / ".aflow" / "config" / "aflow.toml"
-        )
-        assert workflows_config.workflows["implement"].main_branch == "trunk"
+        assert not (root / ".aflow").exists()
         assert sorted(p.name for p in (managed / "clients").iterdir()) == ["acme"]
 
     def test_create_nested_missing_parent_is_rejected_without_tree_creation(
@@ -196,7 +180,7 @@ class TestRegister:
         assert _git(project, *status_args) == before_status
         assert registry.get("gamma") is not None
 
-    def test_register_initialize_config_refuses_existing_documents(
+    def test_register_ignores_existing_local_config_documents(
         self, tmp_path: Path
     ) -> None:
         service, registry, managed = _service(tmp_path)
@@ -204,9 +188,10 @@ class TestRegister:
         (project / ".aflow" / "config").mkdir(parents=True)
         (project / ".aflow" / "config" / "aflow.toml").write_text("# kept\n")
 
-        with pytest.raises(ProjectServiceError, match="refusing overwrite"):
-            _create(service, "gamma", mode="register", initialize_config=True)
-        assert registry.get("gamma") is None
+        result = _create(service, "gamma", mode="register")
+        assert result["id"] == "gamma"
+        assert registry.get("gamma") is not None
+        # Legacy project-local bytes are preserved and ignored.
         assert (project / ".aflow" / "config" / "aflow.toml").read_text() == "# kept\n"
 
     def test_register_non_git_requires_explicit_initialize_git(
@@ -241,15 +226,13 @@ class TestRegister:
             "fresh",
             mode="register",
             initialize_git=True,
-            initialize_config=True,
-            initial_workflow="build",
         )
 
         root = managed / "fresh"
-        assert result["readiness"] == "configuration_required"
+        assert result["readiness"] == "ready"
         assert _git(root, "rev-parse", "--abbrev-ref", "HEAD") == "trunk"
         assert _git(root, "status", "--porcelain") == ""
-        assert (root / ".aflow" / "config" / "aflow.toml").exists()
+        assert not (root / ".aflow").exists()
 
     def test_register_unborn_head_is_rejected_and_repository_preserved(
         self, tmp_path: Path
@@ -356,20 +339,18 @@ class TestRejectionsAndRollback:
         finally:
             subprocess.run = original_run  # type: ignore[assignment]
 
-    def test_config_failure_leaves_no_record_or_target(
+    def test_git_bootstrap_failure_leaves_no_record_or_target(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from aflow_app_server import project_service as project_service_module
 
         service, registry, managed = _service(tmp_path)
 
-        def failing_bootstrap(*args, **kwargs):  # type: ignore[no-untyped-def]
-            from aflow.config import ConfigError
-
-            raise ConfigError("starter unavailable")
+        def failing_git(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise project_service_module.ProjectServiceError("git unavailable")
 
         monkeypatch.setattr(
-            project_service_module, "bootstrap_project_config", failing_bootstrap
+            project_service_module, "_bootstrap_repository", failing_git
         )
         with pytest.raises(ProjectServiceError):
             _create(service, "noconfig")
@@ -388,7 +369,7 @@ class TestRejectionsAndRollback:
         assert not (managed / "ghost").exists()
         assert list(managed.glob(".aflow-create-*")) == []
 
-    def test_registry_failure_after_initialize_config_restores_existing_repository(
+    def test_registry_failure_after_register_restores_existing_repository(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         service, registry, managed = _service(tmp_path)
@@ -397,14 +378,13 @@ class TestRejectionsAndRollback:
         monkeypatch.setattr(ProjectRegistry, "register", _failing_register)
 
         with pytest.raises(Exception, match="registry rejected"):
-            _create(service, "gamma", mode="register", initialize_config=True)
+            _create(service, "gamma", mode="register")
 
         assert registry.get("gamma") is None
-        assert not (project / ".aflow").exists()
         assert _git(project, "rev-parse", "HEAD") == head
         assert _git(project, "status", "--porcelain") == ""
 
-    def test_registry_failure_after_initialize_config_keeps_preexisting_aflow(
+    def test_registry_failure_keeps_preexisting_aflow(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         service, registry, managed = _service(tmp_path)
@@ -414,38 +394,10 @@ class TestRejectionsAndRollback:
         monkeypatch.setattr(ProjectRegistry, "register", _failing_register)
 
         with pytest.raises(Exception, match="registry rejected"):
-            _create(service, "delta", mode="register", initialize_config=True)
+            _create(service, "delta", mode="register")
 
         assert registry.get("delta") is None
         assert (project / ".aflow" / "runs" / "marker").read_text() == "keep"
-        assert not (project / ".aflow" / "config").exists()
-        assert not (project / ".aflow" / "aflow.toml").exists()
-
-    def test_config_failure_after_empty_git_bootstrap_restores_empty_directory(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from aflow_app_server import project_service as project_service_module
-
-        service, _, managed = _service(tmp_path)
-        (managed / "fresh").mkdir()
-
-        def failing_bootstrap(*args, **kwargs):  # type: ignore[no-untyped-def]
-            from aflow.config import ConfigError
-
-            raise ConfigError("starter unavailable")
-
-        monkeypatch.setattr(
-            project_service_module, "bootstrap_project_config", failing_bootstrap
-        )
-        with pytest.raises(ProjectServiceError):
-            _create(
-                service,
-                "fresh",
-                mode="register",
-                initialize_git=True,
-                initialize_config=True,
-            )
-        assert list((managed / "fresh").iterdir()) == []
 
     def test_registry_failure_after_empty_git_bootstrap_restores_empty_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -469,15 +421,6 @@ class TestRejectionsAndRollback:
         assert not (managed / "alpha").exists()
         assert list(managed.glob(".aflow-create-*")) == []
         assert registry.list_records() == ()
-
-    def test_invalid_initial_workflow_rejected_before_mutation(
-        self, tmp_path: Path
-    ) -> None:
-        service, _, managed = _service(tmp_path)
-        with pytest.raises(ProjectServiceError, match="workflow-safe"):
-            _create(service, "alpha", initial_workflow="../escape")
-        assert not (managed / "alpha").exists()
-        assert list(managed.glob(".aflow-create-*")) == []
 
     def test_pre_existing_target_byte_identical_after_failed_create(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -775,17 +718,15 @@ class TestAuthenticatedApi:
                 "path": "alpha",
                 "display_name": "Alpha",
                 "main_branch": "trunk",
-                "initial_workflow": "build",
-                "initial_team": "crew",
             },
         )
         assert response.status_code == 201, response.text
-        assert response.json()["readiness"] == "configuration_required"
+        assert response.json()["readiness"] == "ready"
 
         listing = client.get("/api/projects")
         assert listing.status_code == 200
         assert [entry["id"] for entry in listing.json()] == ["alpha"]
-        assert listing.json()[0]["readiness"] == "configuration_required"
+        assert listing.json()[0]["readiness"] == "ready"
 
         # Register an existing repository (must hold a valid commit HEAD)
         project = managed / "beta"
@@ -800,7 +741,7 @@ class TestAuthenticatedApi:
         ), check=True)
         response = client.post(
             "/api/projects",
-            json={"mode": "register", "path": "beta", "initialize_config": True},
+            json={"mode": "register", "path": "beta"},
         )
         assert response.status_code == 201, response.text
         assert response.json()["id"] == "beta"

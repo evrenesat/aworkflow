@@ -19,29 +19,21 @@ export function ProjectCreateForm({ suggestions, onSubmit, onCancel }: ProjectCr
   const [path, setPath] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [mainBranch, setMainBranch] = useState('main')
-  const [initialWorkflow, setInitialWorkflow] = useState('')
-  const [initialTeam, setInitialTeam] = useState('')
   const [initializeGit, setInitializeGit] = useState(false)
-  const [initializeConfig, setInitializeConfig] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   async function handleSubmit() {
     if (!path.trim() || busy) return
-    // Hidden starter fields must never be submitted: register mode without
-    // configuration initialization writes no starter values at all.
-    const sendStarterValues = mode !== 'register' || initializeConfig
     const request: ProjectCreateRequest = {
       mode,
       path: path.trim(),
       display_name: displayName.trim() || null,
       main_branch: mainBranch.trim() || 'main',
-      initial_workflow: sendStarterValues ? initialWorkflow.trim() || null : null,
-      initial_team: sendStarterValues ? initialTeam.trim() || null : null,
+
     }
     if (mode === 'register') {
       request.initialize_git = initializeGit
-      request.initialize_config = initializeConfig
     }
     try {
       setBusy(true)
@@ -54,7 +46,6 @@ export function ProjectCreateForm({ suggestions, onSubmit, onCancel }: ProjectCr
     }
   }
 
-  const showStarterSettings = mode === 'create' || initializeConfig
 
   return (
     <form
@@ -92,13 +83,14 @@ export function ProjectCreateForm({ suggestions, onSubmit, onCancel }: ProjectCr
       {mode === 'create' ? (
         <p className="text-xs text-dim">
           Creating initializes a local Git repository on the chosen main branch with one
-          minimal initial commit and writes the starter configuration pair. Nothing is
-          pushed and no remote is configured.
+          minimal initial commit. Nothing is pushed and no remote is configured. Workflows,
+          teams, and harness settings come from the shared configuration in Settings.
         </p>
       ) : (
         <p className="text-xs text-dim">
           Adding records an existing directory beneath the managed root. Existing
-          commits, files, and configuration are never modified.
+          commits, files, and configuration are never modified. Workflows, teams, and
+          harness settings come from the shared configuration in Settings.
         </p>
       )}
 
@@ -163,29 +155,6 @@ export function ProjectCreateForm({ suggestions, onSubmit, onCancel }: ProjectCr
             onChange={(event) => setMainBranch(event.target.value)}
           />
         </label>
-        {showStarterSettings && (
-          <>
-            <label className="dashboard-field">
-              <span>Initial workflow (optional)</span>
-              <input
-                className="input mono"
-                aria-label="Initial workflow"
-                value={initialWorkflow}
-                onChange={(event) => setInitialWorkflow(event.target.value)}
-              />
-              <span className="text-xs text-dim">Starter default when empty.</span>
-            </label>
-            <label className="dashboard-field">
-              <span>Initial team (optional)</span>
-              <input
-                className="input mono"
-                aria-label="Initial team"
-                value={initialTeam}
-                onChange={(event) => setInitialTeam(event.target.value)}
-              />
-            </label>
-          </>
-        )}
       </div>
 
       {mode === 'register' && (
@@ -204,18 +173,6 @@ export function ProjectCreateForm({ suggestions, onSubmit, onCancel }: ProjectCr
             Confirmation required for directories that are not already Git repositories;
             only an empty directory can be initialized. Existing repositories keep their
             history unchanged.
-          </p>
-          <label className="form-check">
-            <input
-              type="checkbox"
-              checked={initializeConfig}
-              onChange={(event) => setInitializeConfig(event.target.checked)}
-            />
-            <span>Write the starter configuration pair if the directory has none</span>
-          </label>
-          <p className="text-xs text-dim">
-            Never overwrites existing <code>aflow.toml</code> / <code>workflows.toml</code>.
-            Optional starter settings appear only when this is chosen.
           </p>
         </div>
       )}

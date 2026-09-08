@@ -109,6 +109,7 @@ from .workflow import (
     move_completed_plan_to_done,
 )
 from .repartition import derive_generation_id
+from .run_config_snapshot import SnapshotError, load_run_config_snapshot
 from .runlog import load_run_json
 from .analyzer import resolve_run_id
 from .status import BannerRenderer, WorkflowGraphSource, build_workflow_show
@@ -162,6 +163,8 @@ class ResumeBootstrap:
     extra_instructions: tuple[str, ...]
     resume_context: ResumeContext
     frozen_run_identity: FrozenRunIdentity
+    config_path: Path
+    workflow_config: Any
 
 
 INSTALL_SKILLS_HELP = """\
@@ -1227,6 +1230,25 @@ def _bootstrap_resume_invocation(
             f"saved plan '{plan_path}' is not readable ({exc})",
         ) from exc
 
+    # A frozen snapshot is the run's saved configuration: resume always uses
+    # it, even when the global configuration has since changed or removed the
+    # workflow. Legacy runs without a snapshot keep comparing current config.
+    try:
+        snapshot = load_run_config_snapshot(repo_root, run_id)
+    except SnapshotError as exc:
+        raise ValueError(f"error: run '{resolved_run_id.name}' {exc}") from None
+    effective_config_path = config_path or (repo_root / "aflow.toml")
+    if snapshot is not None:
+        try:
+            workflow_config = load_workflow_config(snapshot.config_path)
+        except ConfigError as exc:
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' has an unusable saved "
+                f"configuration snapshot ({exc}); resume from this run is "
+                "unavailable. Start a fresh run to use the current configuration."
+            ) from None
+        effective_config_path = snapshot.config_path
+
     workflow_name = prev_run.get("workflow_name")
     if not isinstance(workflow_name, str) or not workflow_name.strip():
         raise _resume_metadata_error(
@@ -1244,7 +1266,11 @@ def _bootstrap_resume_invocation(
     current_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
-        config_dir=config_path or (repo_root / "aflow.toml"),
+        config_dir=(
+            Path(frozen_run_identity.config_path)
+            if snapshot is not None
+            else effective_config_path
+        ),
         continuation_from_branch=frozen_run_identity.continuation_from_branch,
         continuation_from_head=frozen_run_identity.continuation_from_head,
         continuation_mode=frozen_run_identity.continuation_mode,
@@ -1412,6 +1438,8 @@ def _bootstrap_resume_invocation(
         extra_instructions=saved_extra,
         resume_context=resume_context,
         frozen_run_identity=frozen_run_identity,
+        config_path=effective_config_path,
+        workflow_config=workflow_config,
     )
 
 
@@ -2480,6 +2508,35 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_stop_parser.add_argument("--repo-root", type=Path, default=None)
     daemon_stop_parser.add_argument("--stop-timeout", type=float, default=None)
 
+    ui_parser = subparsers.add_parser(
+        "ui",
+        description="Serve the AFlow web UI from any directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ui_lifecycle = ui_parser.add_mutually_exclusive_group()
+    ui_lifecycle.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Start the UI in the background and return once it is ready.",
+    )
+    ui_lifecycle.add_argument("--status", action="store_true", help="Report the UI server status and exit.")
+    ui_lifecycle.add_argument("--stop", action="store_true", help="Stop the UI server (running workflows are not signalled).")
+    ui_parser.add_argument("--host", type=str, default=None, help="Bind host override for this process (default: [server] bind_host).")
+    ui_parser.add_argument("--port", type=int, default=None, help="Bind port override for this process (default: [server] bind_port).")
+    ui_parser.add_argument(
+        "--ui-internal-serve",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+
+    ui_worker_parser = subparsers.add_parser(
+        "ui-worker",
+        help=argparse.SUPPRESS,
+    )
+    ui_worker_parser.add_argument("--receipt-dir", required=True, type=Path)
+    ui_worker_parser.add_argument("--nonce", required=True)
+    ui_worker_parser.add_argument("worker_argv", nargs=argparse.REMAINDER)
+
     return parser
 
 
@@ -2895,6 +2952,21 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "ui":
+        from .ui_cli import handle_ui_command
+
+        return handle_ui_command(args)
+
+    if args.command == "ui-worker":
+        from .ui_cli import handle_ui_worker_command
+
+        worker_argv = [arg for arg in args.worker_argv if arg != "--"]
+        if not worker_argv:
+            print("aflow ui-worker: no worker argv supplied after --", file=sys.stderr)
+            return 2
+        args.worker_argv = worker_argv
+        return handle_ui_worker_command(args)
+
     if args.command == "daemon-worker":
         from .daemon import worker_main
 
@@ -3180,8 +3252,14 @@ def main(argv: list[str] | None = None) -> int:
     startup_request = StartupRequest(
         repo_root=repo_root,
         plan_path=plan_path,
-        config_path=config_path,
-        workflow_config=workflow_config,
+        config_path=(
+            resume_bootstrap.config_path if resume_bootstrap is not None else config_path
+        ),
+        workflow_config=(
+            resume_bootstrap.workflow_config
+            if resume_bootstrap is not None
+            else workflow_config
+        ),
         workflow_name=startup_workflow_name,
         start_step=startup_start_step,
         max_turns=startup_max_turns,

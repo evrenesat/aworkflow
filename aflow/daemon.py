@@ -22,7 +22,7 @@ import sys
 import tempfile
 from threading import Event, RLock
 import time
-from typing import Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from aflow.api.models import (
     PreparedRun,
@@ -32,7 +32,13 @@ from aflow.api.models import (
 )
 from aflow.api.runner import execute_workflow
 from aflow.api.startup import StartupError, prepare_startup, prepare_startup_with_answer
-from aflow.config import WorkflowUserConfig, load_workflow_config
+from aflow.config import ConfigError, WorkflowUserConfig, load_workflow_config
+from aflow.run_config_snapshot import (
+    SnapshotError,
+    copy_run_config_snapshot,
+    create_run_config_snapshot,
+    load_run_config_snapshot,
+)
 from aflow.control_plane import (
     ControlConflictError,
     ControlPlaneApplication,
@@ -224,6 +230,23 @@ class AflowDaemon:
         return tuple(shutdown())
 
 
+def _bootstrap_config_path(bootstrap: Any, config: "DaemonConfig") -> Path:
+    """Prefer the resume bootstrap's frozen configuration path when present.
+
+    Resume bootstrap doubles in older tests may not carry the snapshot fields;
+    falling back to the daemon configuration preserves that contract.
+    """
+    value = getattr(bootstrap, "config_path", None)
+    return Path(value) if value is not None else config.config_path
+
+
+def _bootstrap_workflow_config(
+    bootstrap: Any, service: "DaemonService"
+) -> WorkflowUserConfig:
+    value = getattr(bootstrap, "workflow_config", None)
+    return value if value is not None else service._workflow_config
+
+
 class DaemonService:
     """Transport-neutral start, stop, resume, and journal polling operations."""
 
@@ -239,6 +262,17 @@ class DaemonService:
         self._lock = RLock()
         self._transient_extra_instructions: dict[str, tuple[str, ...]] = {}
 
+    def _refresh_workflow_config(self) -> None:
+        """Reload the workflow pair so global edits apply to new runs immediately.
+
+        Existing runs keep their frozen snapshots; only new-run selection and
+        reservation observe the refreshed configuration.
+        """
+        try:
+            self._workflow_config = load_workflow_config(self._config.config_path)
+        except ConfigError as exc:
+            raise DaemonError(f"workflow configuration is invalid: {exc}") from exc
+
     def start(
         self,
         request: StartupRequest,
@@ -248,6 +282,7 @@ class DaemonService:
     ) -> StartRunResult | StartupQuestionRecord:
         """Reserve durable intent before evaluating the interactive startup gate."""
         with self._lock, self._idempotency_lock("start", caller_scope, idempotency_key):
+            self._refresh_workflow_config()
             normalized = self._normalize_request(
                 request,
                 caller_scope=caller_scope,
@@ -302,9 +337,25 @@ class DaemonService:
                 return self._recover_start_manifest(
                     manifest, normalized, request_digest
                 )
+            try:
+                snapshot = create_run_config_snapshot(
+                    repo_root=self._config.repo_root,
+                    run_id=run_id,
+                    config_path=self._config.config_path,
+                    workflow_name=manifest.workflow_name,
+                    fingerprint=manifest.frozen_config_fingerprint,
+                    loader=load_workflow_config,
+                )
+            except SnapshotError as exc:
+                write_launch_phase(self._config.repo_root, run_id, "failed")
+                raise DaemonError(f"cannot freeze run configuration: {exc}") from exc
             record = self._new_start_record(
                 run_id=run_id,
-                request=replace(normalized, reserved_run_id=run_id),
+                request=replace(
+                    normalized,
+                    reserved_run_id=run_id,
+                    config_path=snapshot.config_path,
+                ),
                 request_digest=request_digest,
                 caller_scope=caller_scope,
                 idempotency_key=idempotency_key,
@@ -389,7 +440,7 @@ class DaemonService:
                 caller_scope=str(record["caller_scope"]),
                 restarted_from_run_id=request.restarted_from_run_id,
                 skipped_steps=_skipped_steps_for(
-                    self._workflow_config,
+                    request.workflow_config,
                     prepared_or_question.workflow_name,
                     prepared_or_question.start_step,
                 ),
@@ -527,13 +578,13 @@ class DaemonService:
                 workflow_name=bootstrap.workflow_name,
                 repo_root=self._config.repo_root,
                 plan_path=bootstrap.plan_path,
-                config_path=self._config.config_path,
+                config_path=_bootstrap_config_path(bootstrap, self._config),
                 max_turns=bootstrap.max_turns,
                 team=bootstrap.team,
                 extra_instructions=bootstrap.extra_instructions,
                 start_step=(
                     bootstrap.start_step
-                    or self._workflow_config.workflows[
+                    or _bootstrap_workflow_config(bootstrap, self).workflows[
                         bootstrap.workflow_name
                     ].first_step
                     or bootstrap.workflow_name
@@ -547,6 +598,7 @@ class DaemonService:
                 prepared=prepared,
                 caller_scope=caller_scope,
                 idempotency_key=prepared.idempotency_key or f"daemon-{run_id}",
+                workflow_config=_bootstrap_workflow_config(bootstrap, self),
             )
             request_digest = normalized_request_digest(manifest)
 
@@ -566,6 +618,40 @@ class DaemonService:
             record["manifest_request_digest"] = normalized_request_digest(manifest)
             self._create_record(record)
             return self._recover_resume_record(record, prepared=prepared, created=True)
+
+    def _freeze_resume_snapshot(
+        self,
+        *,
+        source_run_id: str,
+        run_id: str,
+        workflow_name: str,
+        fingerprint: str,
+    ) -> None:
+        """Give a resumed successor its own snapshot copied from its source.
+
+        The successor's manifest origin stays the source run's original
+        configuration location, so identity comparisons remain stable. Legacy
+        sources without a snapshot keep their current-config launch behavior.
+        """
+        try:
+            source_snapshot = load_run_config_snapshot(
+                self._config.repo_root, source_run_id
+            )
+        except SnapshotError as exc:
+            raise DaemonError(str(exc)) from exc
+        if source_snapshot is None:
+            return
+        try:
+            copy_run_config_snapshot(
+                self._config.repo_root,
+                source=source_snapshot,
+                run_id=run_id,
+                workflow_name=workflow_name,
+                fingerprint=fingerprint,
+            )
+        except SnapshotError as exc:
+            write_launch_phase(self._config.repo_root, run_id, "failed")
+            raise DaemonError(f"cannot freeze continuation configuration: {exc}") from exc
 
     def run_status(self, run_id: str) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
@@ -797,7 +883,7 @@ class DaemonService:
             caller_scope=str(record["caller_scope"]),
             restarted_from_run_id=request.restarted_from_run_id,
             skipped_steps=_skipped_steps_for(
-                self._workflow_config,
+                request.workflow_config,
                 prepared_or_question.workflow_name,
                 prepared_or_question.start_step,
             ),
@@ -993,13 +1079,13 @@ class DaemonService:
                 workflow_name=bootstrap.workflow_name,
                 repo_root=self._config.repo_root,
                 plan_path=bootstrap.plan_path,
-                config_path=self._config.config_path,
+                config_path=_bootstrap_config_path(bootstrap, self._config),
                 max_turns=bootstrap.max_turns,
                 team=bootstrap.team,
                 extra_instructions=bootstrap.extra_instructions,
                 start_step=(
                     bootstrap.start_step
-                    or self._workflow_config.workflows[
+                    or _bootstrap_workflow_config(bootstrap, self).workflows[
                         bootstrap.workflow_name
                     ].first_step
                     or bootstrap.workflow_name
@@ -1008,11 +1094,16 @@ class DaemonService:
                 idempotency_key=str(record["effective_idempotency_key"]),
                 caller_scope=str(record["caller_scope"]),
             )
+        else:
+            bootstrap = self._resume_bootstrap(
+                validate_run_id(str(record["resumed_from_run_id"]))
+            )
         manifest = self._manifest_for(
             run_id=run_id,
             prepared=prepared,
             caller_scope=str(record["caller_scope"]),
             idempotency_key=str(record["effective_idempotency_key"]),
+            workflow_config=_bootstrap_workflow_config(bootstrap, self),
         )
         if record.get("manifest_request_digest") != normalized_request_digest(manifest):
             raise DaemonError(
@@ -1032,6 +1123,14 @@ class DaemonService:
                 )
                 if persisted_manifest is None:
                     raise DaemonError("continuation manifest disappeared during replay")
+            # The manifest exists now, so the successor's run directory may be
+            # created; freeze its configuration copy from the source snapshot.
+            self._freeze_resume_snapshot(
+                source_run_id=validate_run_id(str(record["resumed_from_run_id"])),
+                run_id=run_id,
+                workflow_name=manifest.workflow_name,
+                fingerprint=manifest.frozen_config_fingerprint,
+            )
         else:
             self._assert_manifest_accepts_prepared(persisted_manifest, record, prepared)
         mutable = dict(record)
@@ -1289,12 +1388,13 @@ class DaemonService:
         prepared: PreparedRun,
         caller_scope: str,
         idempotency_key: str,
+        workflow_config: WorkflowUserConfig | None = None,
     ) -> LaunchManifest:
         from aflow.workflow import _freeze_run_identity
 
         frozen = _freeze_run_identity(
             prepared.workflow_name,
-            self._workflow_config,
+            workflow_config if workflow_config is not None else self._workflow_config,
             config_dir=self._config.config_path,
         )
         return LaunchManifest(
@@ -1487,13 +1587,20 @@ class DaemonService:
             for instruction in extra_instructions
             for argument in (f"--extra-instruction={instruction}",)
         )
+        try:
+            snapshot = load_run_config_snapshot(self._config.repo_root, run_id)
+        except SnapshotError as exc:
+            raise DaemonError(str(exc)) from exc
+        config_path = (
+            snapshot.config_path if snapshot is not None else self._config.config_path
+        )
         return (
             str(self._config.aflow_executable),
             "daemon-worker",
             "--repo-root",
             str(self._config.repo_root),
             "--config",
-            str(self._config.config_path),
+            str(config_path),
             "--run-id",
             run_id,
             *instruction_args,
@@ -1661,9 +1768,22 @@ class DaemonService:
         payload = record.get("request")
         if not isinstance(payload, Mapping):
             raise DaemonError("startup record does not contain a replayable request")
+        recorded_config = Path(str(payload["config_path"]))
+        workflow_config = self._workflow_config
+        if recorded_config.resolve() != self._config.config_path:
+            # The record was reserved against a frozen snapshot: a pending
+            # startup question belongs to that already-frozen intent, even
+            # across daemon restarts and later global configuration saves.
+            try:
+                workflow_config = load_workflow_config(recorded_config)
+            except ConfigError as exc:
+                raise DaemonError(
+                    "the run's frozen configuration snapshot is unusable: "
+                    f"{exc}"
+                ) from exc
         return _request_from_payload(
             payload,
-            workflow_config=self._workflow_config,
+            workflow_config=workflow_config,
             extra_instructions=self._transient_extra_instructions.get(
                 validate_run_id(str(record["run_id"])), ()
             ),

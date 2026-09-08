@@ -42,13 +42,14 @@ from .browser_session import (
     encode_session,
     verify_session,
 )
-from .config import ServerConfig
+from .config import ServerConfig, global_config_dir
 from .control_plane_service import (
     ControlPlaneServiceConfig,
     ControlPlaneService,
     ControlPlaneUnavailableError,
     ProjectNotAllowedError,
 )
+from .global_config_service import GlobalConfigService
 from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
 from .models import (
@@ -93,7 +94,6 @@ import aflow_app_server.plan_routes as plan_routes_module
 from .project_config_service import (
     ConfigValidationReport,
     ProjectConfigError,
-    ProjectConfigService,
     ProjectConfigRevisionConflict,
     ProjectConfigRunBlocked,
     ProjectConfigSnapshot,
@@ -110,10 +110,12 @@ from .project_service import (
 
 # Global state
 _config: ServerConfig | None = None
+_configured_config: ServerConfig | None = None
+_credential_provider: Any = None
+_global_config_service: Any = None
 _project_registry: ProjectRegistry | None = None
 _plan_service: PlanService | None = None
 _control_plane_service: ControlPlaneService | None = None
-_project_config_service: ProjectConfigService | None = None
 _seen_plugin_probe_fingerprints: set[str] = set()
 
 _EVENT_STREAM_POLL_INTERVAL_SECONDS = 0.1
@@ -244,10 +246,32 @@ def _maybe_log_plugin_probe(request: Request, body: bytes) -> None:
 
 
 def get_config() -> ServerConfig:
-    """Get the server configuration."""
+    """Get the server configuration, honoring live global credential rotation.
+
+    When the app is served by ``aflow ui``, configuration comes from the
+    global ``config.toml`` and is re-read whenever the file changes so a
+    password rotation invalidates sessions immediately. The legacy
+    deployment entry point keeps its startup-time environment config.
+    """
+    if _credential_provider is not None:
+        return _credential_provider.config()
     if _config is None:
         raise RuntimeError("Server not initialized")
     return _config
+
+
+def configure_server(config: ServerConfig, *, config_dir: Path | None = None) -> None:
+    """Inject the resolved configuration used by ``aflow ui``.
+
+    Must be called before the app lifespan runs. The lifespan uses this
+    configuration instead of the environment-driven legacy path, and a
+    global credential provider keeps authentication rotation live.
+    """
+    global _configured_config, _credential_provider
+    from .config import GlobalCredentialProvider, global_config_dir
+
+    _configured_config = config
+    _credential_provider = GlobalCredentialProvider(config_dir=config_dir or global_config_dir())
 
 
 def get_project_registry() -> ProjectRegistry:
@@ -274,14 +298,14 @@ def get_control_plane_service() -> ControlPlaneService:
     return _control_plane_service
 
 
-def get_project_config_service() -> ProjectConfigService:
-    """Return the registry-backed config text service."""
-    if _project_config_service is None:
+def get_global_config_service() -> "GlobalConfigService":
+    """Return the shared global workflow pair service."""
+    if _global_config_service is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "control_plane_unavailable"},
         )
-    return _project_config_service
+    return _global_config_service
 
 
 security = HTTPBearer(auto_error=False)
@@ -382,16 +406,25 @@ def _same_origin(request: Request) -> bool:
     )
 
 
-def _set_session_cookie(response: Response, value: str, max_age: int) -> None:
+def _set_session_cookie(response: Response, value: str, max_age: int, secure: bool) -> None:
     response.set_cookie(
         SESSION_COOKIE_NAME,
         value,
         max_age=max_age,
         httponly=True,
-        secure=True,
+        secure=secure,
         samesite="strict",
         path="/",
     )
+
+
+def _cookie_secure_for_request(request: Request) -> bool:
+    """Secure cookies only on HTTPS requests, per the effective request scheme.
+
+    Direct HTTP access (LAN/Tailscale) needs a non-Secure cookie; client-
+    supplied forwarded headers are deliberately not trusted.
+    """
+    return request.url.scheme == "https"
 
 
 def get_project_service() -> ProjectService:
@@ -405,10 +438,21 @@ def get_project_service() -> ProjectService:
 
 
 def _get_web_dist_dir() -> Path:
-    """Resolve the built web app directory."""
+    """Resolve the built web app directory.
+
+    An explicit ``AFLOW_APP_WEB_DIST`` override wins (legacy deployments).
+    Otherwise the assets bundled in the installed ``aflow`` package at
+    ``aflow/ui_web/`` are authoritative; the checkout's ``web/dist`` remains
+    a development fallback.
+    """
     override = os.environ.get("AFLOW_APP_WEB_DIST")
     if override:
         return Path(override).expanduser()
+    from aflow.ui_assets import published_assets_dir
+
+    bundled = published_assets_dir()
+    if bundled is not None:
+        return bundled
     return Path(__file__).resolve().parents[2].parent / "web" / "dist"
 
 
@@ -460,9 +504,13 @@ class _MCPMount(Mount):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize canonical project, plan, config, and run services."""
-    global _config, _project_registry, _plan_service, _control_plane_service, _project_config_service
+    global _config, _project_registry, _plan_service, _control_plane_service
+    global _global_config_service
 
-    _config = ServerConfig.from_env()
+    if _configured_config is not None:
+        _config = _configured_config
+    else:
+        _config = ServerConfig.from_env()
     errors = _config.validate()
     if errors:
         raise RuntimeError(f"Configuration errors: {', '.join(errors)}")
@@ -472,17 +520,33 @@ async def lifespan(app: FastAPI):
     )
     _project_registry = project_registry
     _plan_service = PlanService(project_registry)
-    _control_plane_service = ControlPlaneService(ControlPlaneServiceConfig(
+    service_config = ControlPlaneServiceConfig(
         registry=project_registry,
         aflow_executable=_config.aflow_executable,
         environment_file=_config.environment_file,
         release_identity=_config.release_identity,
         environment=_config.control_plane_environment,
-    ))
+    )
+    if _configured_config is not None:
+        # The aflow ui launcher path uses portable persistent units so
+        # workflow subprocesses outlive this server on Linux and macOS.
+        from dataclasses import replace
+
+        from aflow.control_plane.persistent_units import PersistentUnitManager
+
+        service_config = replace(
+            service_config,
+            unit_manager_factory=lambda: PersistentUnitManager(
+                executable=_config.aflow_executable,
+                projects_root=_config.managed_projects_root,
+            ),
+        )
+    _control_plane_service = ControlPlaneService(service_config)
     _control_plane_service.start()
-    _project_config_service = ProjectConfigService(
-        project_registry,
-        _control_plane_service,
+    from .config import global_config_dir
+
+    _global_config_service = GlobalConfigService(
+        config_dir=global_config_dir(),
         audit_path=_config.config_audit_path,
     )
     try:
@@ -493,7 +557,7 @@ async def lifespan(app: FastAPI):
         _project_registry = None
         _plan_service = None
         _control_plane_service = None
-        _project_config_service = None
+        _global_config_service = None
 
 
 app = FastAPI(
@@ -558,7 +622,7 @@ async def renew_browser_session(request: Request, call_next):
         and response.status_code < status.HTTP_400_BAD_REQUEST
     ):
         cookie = request.cookies.get(SESSION_COOKIE_NAME)
-        config = _config
+        config = get_config()
         if cookie and config is not None:
             try:
                 auth_token = config.current_auth_token()
@@ -570,7 +634,10 @@ async def renew_browser_session(request: Request, call_next):
                 except ValueError:
                     return response
                 _set_session_cookie(
-                    response, encode_session(auth_token), SESSION_MAX_AGE_SECONDS
+                    response,
+                    encode_session(auth_token),
+                    SESSION_MAX_AGE_SECONDS,
+                    secure=_cookie_secure_for_request(request),
                 )
     return response
 
@@ -695,7 +762,15 @@ async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse
 @app.exception_handler(ProjectServiceError)
 @app.exception_handler(ProjectConfigError)
 @app.exception_handler(PlanServiceError)
-async def rejected_operation_handler(_: Request, __: Exception) -> JSONResponse:
+async def rejected_operation_handler(_: Request, exception: Exception) -> JSONResponse:
+    logger = logging.getLogger("aflow_app_server.rejected")
+    if not any(isinstance(item, SensitiveDataFilter) for item in logger.filters):
+        logger.addFilter(SensitiveDataFilter())
+    logger.warning(
+        "rejected operation type=%s detail=%s",
+        type(exception).__name__,
+        exception,
+    )
     return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "operation_rejected")
 
 
@@ -1067,15 +1142,16 @@ class UpdateProjectRequest(BaseModel):
 
 
 class ProjectCreateRequest(BaseModel):
-    """Typed create/register contract with no executable, absolute path, or argv fields."""
+    """Typed create/register contract with no executable, absolute path, or argv fields.
+
+    Project-level starter configuration fields are removed: every project
+    uses the shared global configuration.
+    """
     mode: str
     path: str
     display_name: str | None = None
     main_branch: str = "main"
-    initial_workflow: str | None = None
-    initial_team: str | None = None
     initialize_git: bool = False
-    initialize_config: bool = False
 
 
 def _project_payload(registry: ProjectRegistry, project_id: str) -> dict[str, Any] | None:
@@ -1140,10 +1216,7 @@ def create_project(
         relative_path=request.path,
         display_name=request.display_name,
         main_branch=request.main_branch,
-        initial_workflow=request.initial_workflow,
-        initial_team=request.initial_team,
         initialize_git=request.initialize_git,
-        initialize_config=request.initialize_config,
     ))
 
 
@@ -1193,8 +1266,8 @@ def update_project(
     return project
 
 
-# Project configuration endpoints.  Exactly two documents are addressable;
-# no route, payload, or response field can name a third file.
+# Global configuration endpoints.  Exactly two workflow documents are
+# addressable; no route, payload, or response field can name a third file.
 def _config_validation_response(report: ConfigValidationReport) -> ConfigValidationModel:
     return ConfigValidationModel(
         state=report.state,  # type: ignore[arg-type]
@@ -1223,34 +1296,35 @@ def _config_response(snapshot: ProjectConfigSnapshot) -> ProjectConfigResponse:
 
 
 @app.get(
-    "/api/projects/{project_id}/config",
+    "/api/config",
     response_model=ProjectConfigResponse,
-    tags=["projects"],
+    tags=["settings"],
 )
-def get_project_config(
-    project_id: str,
+def get_global_config(
     _: str = Depends(verify_token),
-    service: ProjectConfigService = Depends(get_project_config_service),
+    service: GlobalConfigService = Depends(get_global_config_service),
 ) -> ProjectConfigResponse:
-    """Return both exact configuration texts with their combined revision."""
-    return _config_response(service.read(project_id))
+    """Return both exact global configuration texts with their revision.
+
+    Changes to this shared configuration affect new runs in all projects;
+    existing runs keep the configuration snapshot they were launched with.
+    """
+    return _config_response(service.read())
 
 
 @app.put(
-    "/api/projects/{project_id}/config",
+    "/api/config",
     response_model=ProjectConfigResponse,
-    tags=["projects"],
+    tags=["settings"],
 )
-def save_project_config(
-    project_id: str,
+def save_global_config(
     payload: ProjectConfigSavePayload,
     _: str = Depends(verify_token),
-    service: ProjectConfigService = Depends(get_project_config_service),
+    service: GlobalConfigService = Depends(get_global_config_service),
 ) -> ProjectConfigResponse:
     """Validate and atomically commit both documents as one revisioned pair."""
     return _config_response(
         service.save(
-            project_id,
             payload.aflow_toml,
             payload.workflows_toml,
             payload.expected_revision,
@@ -1260,20 +1334,197 @@ def save_project_config(
 
 
 @app.post(
-    "/api/projects/{project_id}/config/validate",
+    "/api/config/validate",
     response_model=ConfigValidationModel,
-    tags=["projects"],
+    tags=["settings"],
 )
-def validate_project_config(
-    project_id: str,
+def validate_global_config(
     payload: ProjectConfigValidatePayload,
     _: str = Depends(verify_token),
-    service: ProjectConfigService = Depends(get_project_config_service),
+    service: GlobalConfigService = Depends(get_global_config_service),
 ) -> ConfigValidationModel:
     """Validate a candidate pair through the production loader without saving."""
     return _config_validation_response(
-        service.validate_candidate(project_id, payload.aflow_toml, payload.workflows_toml)
+        service.validate_candidate(payload.aflow_toml, payload.workflows_toml)
     )
+
+
+# Global transport settings (config.toml).  The credential is write-only: it
+# never appears in responses, validation errors, logs, or audit records.
+class SettingsResponse(BaseModel):
+    bind_host: str
+    bind_port: int
+    managed_projects_root: str
+    password_set: bool
+    revision: str
+    advanced_toml: str
+    restart: dict[str, bool]
+
+
+class SettingsSavePayload(BaseModel):
+    expected_revision: str
+    advanced_toml: str | None = None
+    managed_projects_root: str | None = None
+    bind_host: str | None = None
+    bind_port: int | None = None
+    password: str | None = None
+
+
+_SETTINGS_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_SETTINGS_SECRET_KEYS = ("auth_token", "auth_token_file")
+
+
+def _settings_file(config_dir: Path) -> Path:
+    return config_dir / "config.toml"
+
+
+def _settings_revision(config_dir: Path) -> str:
+    try:
+        payload = _settings_file(config_dir).read_bytes()
+    except OSError:
+        payload = b""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _advanced_settings_toml(config_dir: Path) -> str:
+    """Render config.toml without any credential key for the advanced editor."""
+    import tomlkit
+
+    path = _settings_file(config_dir)
+    if not path.is_file():
+        return ""
+    document = tomlkit.parse(path.read_text(encoding="utf-8"))
+    server = document.get("server")
+    if isinstance(server, tomlkit.items.Table):
+        for key in _SETTINGS_SECRET_KEYS:
+            if key in server:
+                server.remove(key)
+    return tomlkit.dumps(document)
+
+
+def _apply_advanced_settings(config_dir: Path, text: str) -> dict[str, object]:
+    """Parse credential-free advanced TOML into bounded settings updates."""
+    import tomlkit
+
+    check_document_text_size = len(text.encode("utf-8"))
+    if check_document_text_size > 64 * 1024:
+        raise ProjectConfigError("advanced settings exceed the supported size")
+    document = tomlkit.parse(text)
+    updates: dict[str, object] = {}
+    server = document.get("server")
+    if server is not None and not isinstance(server, dict):
+        raise ProjectConfigError("[server] must be a table")
+    for key in _SETTINGS_SECRET_KEYS:
+        if isinstance(server, dict) and key in server:
+            raise ProjectConfigError(
+                f"the advanced settings editor must not contain [server] {key}; "
+                "use the password field to change the credential"
+            )
+    if isinstance(server, dict):
+        if "bind_host" in server:
+            updates["bind_host"] = str(server["bind_host"])
+        if "bind_port" in server:
+            updates["bind_port"] = int(server["bind_port"])
+    control_plane = document.get("control_plane")
+    if control_plane is not None and not isinstance(control_plane, dict):
+        raise ProjectConfigError("[control_plane] must be a table")
+    if isinstance(control_plane, dict) and "managed_projects_root" in control_plane:
+        updates["managed_projects_root"] = str(control_plane["managed_projects_root"])
+    return updates
+
+
+def _settings_response() -> SettingsResponse:
+    """Build the redacted settings report from live and on-disk state."""
+    live = _config
+    if live is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "control_plane_unavailable"},
+        )
+    current = get_config()
+    config_dir = global_config_dir()
+    try:
+        password_set = bool(current.current_auth_token())
+    except ValueError:
+        password_set = False
+    restart = {
+        "bind_host": current.bind_host != live.bind_host,
+        "bind_port": current.bind_port != live.bind_port,
+        "managed_projects_root": (
+            current.managed_projects_root != live.managed_projects_root
+        ),
+    }
+    root_text = str(current.managed_projects_root)
+    home_text = str(Path.home())
+    if root_text.startswith(home_text + "/"):
+        root_text = "~" + root_text[len(home_text):]
+    return SettingsResponse(
+        bind_host=current.bind_host,
+        bind_port=current.bind_port,
+        managed_projects_root=root_text,
+        password_set=password_set,
+        revision=_settings_revision(config_dir),
+        advanced_toml=_advanced_settings_toml(config_dir),
+        restart=restart,
+    )
+
+
+@app.get("/api/settings", response_model=SettingsResponse, tags=["settings"])
+def get_settings(
+    _: str = Depends(verify_token),
+) -> SettingsResponse:
+    """Report transport settings without ever revealing the credential."""
+    return _settings_response()
+
+
+@app.put("/api/settings", response_model=SettingsResponse, tags=["settings"])
+def save_settings(
+    payload: SettingsSavePayload,
+    _: str = Depends(verify_token),
+) -> SettingsResponse:
+    """Save transport settings; binding and root changes need a restart.
+
+    A password change takes effect immediately: session signing derives from
+    the credential, so old sessions are invalidated on the next request.
+    """
+    from .config import update_global_settings
+
+    config_dir = global_config_dir()
+    current_revision = _settings_revision(config_dir)
+    if not _SETTINGS_HEX_RE.fullmatch(payload.expected_revision):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "invalid_revision"},
+        )
+    if payload.expected_revision != current_revision:
+        raise ProjectConfigRevisionConflict(current_revision)
+    updates: dict[str, object] = {}
+    if payload.advanced_toml is not None:
+        try:
+            updates.update(_apply_advanced_settings(config_dir, payload.advanced_toml))
+        except Exception as exc:
+            if isinstance(exc, ProjectConfigError):
+                raise
+            raise ProjectConfigError(
+                f"advanced settings could not be applied: {exc}"
+            ) from exc
+    if payload.managed_projects_root is not None:
+        updates["managed_projects_root"] = payload.managed_projects_root
+    if payload.bind_host is not None:
+        updates["bind_host"] = payload.bind_host
+    if payload.bind_port is not None:
+        updates["bind_port"] = payload.bind_port
+    try:
+        update_global_settings(
+            config_dir,
+            auth_token=payload.password,
+            managed_projects_root=updates.get("managed_projects_root"),
+            bind_host=updates.get("bind_host"),
+            bind_port=updates.get("bind_port"),
+        )
+    except ValueError as exc:
+        raise ProjectConfigError(str(exc)) from exc
+    return _settings_response()
 
 
 # Browser session endpoints. Login exchanges the deployment bearer for a
@@ -1301,7 +1552,12 @@ def login_session(
             detail={"code": "origin_required"},
         )
     response.headers["Cache-Control"] = "no-store"
-    _set_session_cookie(response, encode_session(verified_token), SESSION_MAX_AGE_SECONDS)
+    _set_session_cookie(
+        response,
+        encode_session(verified_token),
+        SESSION_MAX_AGE_SECONDS,
+        secure=_cookie_secure_for_request(request),
+    )
     return {"authenticated": True}
 
 
@@ -1328,7 +1584,7 @@ def logout_session(request: Request, response: Response) -> None:
         SESSION_COOKIE_NAME,
         path="/",
         httponly=True,
-        secure=True,
+        secure=_cookie_secure_for_request(request),
         samesite="strict",
     )
 
@@ -1370,37 +1626,29 @@ def _probe_main_branch(root: Path) -> GuidedStarterDefaults:
 
 
 @app.post(
-    "/api/projects/{project_id}/config/form",
+    "/api/config/form",
     response_model=ProjectConfigFormResponse,
-    tags=["projects"],
+    tags=["settings"],
 )
-def project_config_form(
-    project_id: str,
+def global_config_form(
     payload: ProjectConfigFormPayload,
     _: str = Depends(verify_token),
-    registry: ProjectRegistry = Depends(get_project_registry),
 ) -> ProjectConfigFormResponse:
-    """Transform a candidate pair through the pure guided form; never saves.
+    """Transform a candidate global pair through the pure guided form; never saves.
 
-    The endpoint accepts no ``expected_revision`` and performs no registered
-    project write or reload.  The only registry use is resolving the registered
-    root for a bounded Git branch probe when starter defaults are requested.
+    The endpoint accepts no ``expected_revision`` and performs no write.  The
+    global configuration is not tied to one repository, so starter defaults
+    are only probed against a registered project when that project is named
+    explicitly via ``starter_project_id``.
     """
     starter_defaults: GuidedStarterDefaults | None = None
     wants_starter = (
         payload.action is None or isinstance(payload.action, BuildStarterAction)
     ) and payload.aflow_toml == "" and payload.workflows_toml == ""
     if wants_starter:
-        if registry.get(project_id) is None:
-            raise ProjectNotAllowedError("project is not registered")
-        try:
-            _, root = registry.resolve(project_id)
-        except ProjectRegistryError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": "project_root_unavailable"},
-            ) from exc
-        starter_defaults = _probe_main_branch(root)
+        starter_defaults = GuidedStarterDefaults(
+            workflow="implement", main_branch="main", main_branch_source="fallback"
+        )
     result = guided_form_response(
         payload.aflow_toml, payload.workflows_toml, payload.action
     )
@@ -1444,19 +1692,31 @@ async def serve_web_path(path: str) -> FileResponse:
 
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
-        detail="Web app is not built. Run `npm run build` in `apps/aflow_app/web`.",
+        detail=(
+            "Web app assets are unavailable. Normal aworkflow installations "
+            "bundle them; for a development checkout run "
+            "`npm run build` in `apps/aflow_app/web`."
+        ),
     )
 
 
-def run_server() -> None:
-    """Run the server (entry point for CLI)."""
+def run_server(config: ServerConfig | None = None) -> None:
+    """Run the server (entry point for the legacy ``aflow-app-server`` CLI).
+
+    With an explicit configuration (the ``aflow ui`` path) the app serves
+    with that resolved configuration; without one the environment-driven
+    deployment configuration is used unchanged.
+    """
     import uvicorn
 
-    config = ServerConfig.from_env()
-    errors = config.validate()
-    if errors:
-        print(f"Configuration errors: {', '.join(errors)}")
-        raise SystemExit(1)
+    if config is None:
+        config = ServerConfig.from_env()
+        errors = config.validate()
+        if errors:
+            print(f"Configuration errors: {', '.join(errors)}")
+            raise SystemExit(1)
+    else:
+        configure_server(config)
 
     uvicorn.run(
         "aflow_app_server.main:app",

@@ -26,6 +26,23 @@ uv tool install -e . --force
 aflow --help
 ```
 
+## Web UI
+
+The wheel bundles the compiled web UI, so `aflow ui` works with no Node/npm
+and no extra installation step:
+
+```bash
+uv tool install aworkflow
+cd /any/working/directory
+aflow ui          # first run asks for a password and the projects root
+```
+
+First-run setup writes `~/.config/aflow/config.toml` (mode 0600) with the
+shared credential, an explicit `bind_host = "0.0.0.0"`, and the projects
+root. Later launches need no prompts; `aflow ui --daemon` returns once the
+HTTP server is accepting requests. Editable development installs build the
+web assets automatically from `apps/aflow_app/web` when their sources change.
+
 ## First Run
 
 `aflow` reads `~/.config/aflow/aflow.toml` and a sibling `workflows.toml`.

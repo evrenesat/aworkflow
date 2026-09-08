@@ -357,47 +357,67 @@ The recovery handoff expects strict JSON with:
 - `suggested_keywords`
 - `suggested_action`
 
-## Project Starter Configuration
+## Global workflow configuration
 
-When the remote app creates a project or explicitly initializes configuration for
-a registered one, it writes a provider-neutral starter pair under
-`<project>/.aflow/config/`:
+All projects use one shared configuration pair: `~/.config/aflow/aflow.toml`
+plus its sibling `workflows.toml`. There is no per-project configuration
+layer; project-local `.aflow/config` documents from older setups are preserved
+byte-for-byte but ignored for new runs.
 
-- `aflow.toml` records the chosen initial workflow as `aflow.default_workflow`
-  and, when given, the named initial team under `[teams."<team>".roles]`.
-- `workflows.toml` defines one generic single-step workflow, wired to that team
-  when one was named, and records the request's validated `main_branch` in the
-  `[workflow]` lifecycle defaults (`main` when not specified).
+Readiness is global: a project is ready exactly when the shared pair parses,
+passes validation, and contains no `FILL_IN_MODEL` placeholders. Missing or
+invalid shared workflows surface one global setup path in the remote app,
+never a per-project starter wizard.
 
-The starter deliberately selects no harness provider. It declares a placeholder
-harness profile with `model = "FILL_IN_MODEL"`, which the engine loader accepts
-only while every profile of that harness remains a placeholder. The project is
-reported as `configuration_required` until explicit role selectors and harness
-profiles replace the placeholder; `aflow` and the remote app classify readiness
-through the normal loader and placeholder detection, not a second validator.
-Existing configuration documents are never overwritten.
+## Server settings (config.toml)
 
-## Remote project configuration
+Transport settings for `aflow ui` and the remote app live in the existing
+server configuration file `~/.config/aflow/config.toml`:
 
-The remote workflow control app edits the complete project configuration as one
-revisioned pair under the project .aflow/config directory:
+```toml
+[server]
+bind_host = "0.0.0.0"   # written explicitly by first-run setup
+bind_port = 8765
+auth_token = "..."      # or auth_token_file = "/path/to/file"
 
-- GET /api/projects/{project_id}/config returns the exact UTF-8 text of
-  aflow.toml and workflows.toml, their combined SHA-256 revision, and bounded
-  readiness details.
-- POST /api/projects/{project_id}/config/validate validates a candidate pair
-  without writing it. Diagnostics include only document names, line numbers,
-  and bounded semantic messages; prompts, tokens, and filesystem paths are
-  excluded.
-- PUT /api/projects/{project_id}/config requires both complete documents and
-  the revision returned by the read. A stale revision, invalid pair,
-  placeholder selector, or owned nonterminal/resume-compatible run rejects the
-  write before either file changes.
-- A successful write stages and fsyncs both documents, replaces them with
-  rollback handling, appends redacted revision metadata to server state, and
-  reloads capabilities for future runs. Existing workflow units and run
-  records retain their current configuration and controls.
+[control_plane]
+managed_projects_root = "~/code"
+```
 
+`aflow ui` writes missing keys on first launch (password asked twice without
+echo, projects root confirmed with `~/code` as the default) and stores the
+file with mode 0600. The credential is the existing shared login/bearer
+credential; rotating it invalidates browser sessions immediately because the
+session signing key derives from it. Unrelated keys, tables, and comments in
+an existing `config.toml` are preserved on writes.
+
+## Remote configuration editing
+
+The remote app edits the shared workflow pair as one revisioned pair:
+
+- GET /api/config returns the exact UTF-8 text of aflow.toml and
+  workflows.toml plus their combined SHA-256 revision.
+- POST /api/config/validate validates a candidate pair without writing it.
+- PUT /api/config requires both complete documents and the current revision.
+  A stale revision, invalid pair, or placeholder selector rejects the write
+  before either file changes. Running runs never block a save: each run
+  freezes its own configuration snapshot at launch, so edits affect only new
+  runs.
+- A successful write stages and fsyncs both documents atomically with
+  rollback handling and appends redacted revision metadata to the audit log.
+  The save and run-reservation snapshots share one configuration lock, so a
+  launch observes either the old pair or the new pair, never half of each.
+
+## Server settings API
+
+- GET /api/settings reports bind host/port, the projects root, whether a
+  password is set, the config.toml revision, an advanced TOML rendering that
+  omits both credential keys, and which keys need a restart to take effect.
+- PUT /api/settings accepts a revision, optional advanced TOML (credential
+  keys are rejected there; use the write-only password field), the projects
+  root, and an optional new password. Password changes apply immediately;
+  binding and root changes need `aflow ui --stop` plus a restart. Responses
+  and errors never contain the credential.
 
 ## ZCode profiles
 

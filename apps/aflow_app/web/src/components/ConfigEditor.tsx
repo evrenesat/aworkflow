@@ -2,10 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../api'
 import * as api from '../api'
 import type {
-  ConfigBlockedRun,
   ConfigValidation,
   ProjectConfig,
-  ProjectInfo,
 } from '../types'
 import { GuidedConfigForm } from './GuidedConfigForm'
 
@@ -13,7 +11,6 @@ type ConfigTab = 'aflow' | 'workflows'
 type EditorMode = 'guided' | 'toml'
 
 interface ConfigEditorProps {
-  project: ProjectInfo
   /** Reports unsaved text so the shell can guard navigation. */
   onDirtyChange: (dirty: boolean) => void
   /** Reports the canonical result of a successful save without navigating. */
@@ -27,7 +24,7 @@ interface ConflictState {
 }
 
 function stateText(state: ConfigValidation['state']): string {
-  if (state === 'ready') return 'Valid — the project configuration is ready.'
+  if (state === 'ready') return 'Valid — the shared configuration is ready.'
   if (state === 'configuration_required') {
     return 'Configuration required — set explicit model selectors before starting workflows.'
   }
@@ -43,7 +40,7 @@ function shortRevision(revision: string): string {
  * documents are validated and committed together under one combined
  * revision; local text is never discarded without explicit confirmation.
  */
-export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: ConfigEditorProps) {
+export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorProps) {
   const [snapshot, setSnapshot] = useState<ProjectConfig | null>(null)
   const [aflowText, setAflowText] = useState('')
   const [workflowsText, setWorkflowsText] = useState('')
@@ -58,7 +55,6 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [conflict, setConflict] = useState<ConflictState | null>(null)
-  const [blockers, setBlockers] = useState<ConfigBlockedRun[] | null>(null)
   const [confirmReload, setConfirmReload] = useState(false)
   const [loading, setLoading] = useState(true)
   const aflowTabRef = useRef<HTMLButtonElement | null>(null)
@@ -117,10 +113,9 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
     setError(null)
     setNotice(null)
     setConflict(null)
-    setBlockers(null)
     setConfirmReload(false)
     try {
-      const loaded = await api.getProjectConfig(project.id)
+      const loaded = await api.getGlobalConfig()
       setSnapshot(loaded)
       setAflowText(loaded.aflow_toml)
       setWorkflowsText(loaded.workflows_toml)
@@ -136,7 +131,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
     } finally {
       setLoading(false)
     }
-  }, [project.id])
+  }, [])
 
   useEffect(() => {
     void load()
@@ -149,7 +144,6 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
     setValidation(next.validation)
     setValidationPair({ aflow: next.aflow_toml, workflows: next.workflows_toml })
     setConflict(null)
-    setBlockers(null)
     setConfirmReload(false)
     setNotice(`${actionLabel} revision ${shortRevision(next.revision)}.`)
   }
@@ -160,7 +154,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
       setBusy('validate')
       setError(null)
       setNotice(null)
-      const result = await api.validateProjectConfig(project.id, submitted)
+      const result = await api.validateGlobalConfig(submitted)
       setValidation(result)
       setValidationPair({ aflow: submitted.aflow_toml, workflows: submitted.workflows_toml })
     } catch (err) {
@@ -176,7 +170,7 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
       setBusy('save')
       setError(null)
       setNotice(null)
-      const saved = await api.saveProjectConfig(project.id, {
+      const saved = await api.saveGlobalConfig({
         aflow_toml: aflowText,
         workflows_toml: workflowsText,
         expected_revision: snapshot.revision,
@@ -188,10 +182,6 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
       if (err instanceof ApiError && err.code === 'revision_conflict') {
         const current = err.detail.current_revision
         setConflict({ currentRevision: typeof current === 'string' ? current : 'unknown' })
-        setNotice(null)
-      } else if (err instanceof ApiError && err.code === 'config_save_blocked') {
-        const runs = Array.isArray(err.detail.blocking_runs) ? err.detail.blocking_runs : []
-        setBlockers(runs as ConfigBlockedRun[])
         setNotice(null)
       } else {
         setError(err instanceof Error ? err.message : 'Failed to save the configuration pair')
@@ -235,9 +225,9 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         <h3 style={{ fontWeight: 600 }}>Configuration</h3>
         {error && <div className="error-message" role="alert">{error}</div>}
         <p className="text-sm text-dim">
-          The pair <code>.aflow/config/aflow.toml</code> and <code>workflows.toml</code> could
-          not be read for this project. New projects receive the starter pair; registering an
-          existing project without configuration requires initializing it from the server.
+          The shared pair <code>aflow.toml</code> and <code>workflows.toml</code> in the global
+          AFlow configuration could not be read. Run <code>aflow ui</code> once to create it
+          from the packaged defaults, then retry.
         </p>
         <div className="dashboard-actions">
           <button className="btn btn-secondary" onClick={() => void load()}>Retry</button>
@@ -252,7 +242,8 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         <div>
           <h3 style={{ fontWeight: 600 }}>Configuration</h3>
           <div className="text-xs text-dim">
-            Both configuration files are checked and saved together.
+            These shared files apply to new runs in every project; existing runs keep the
+            configuration they were started with. Both files are checked and saved together.
           </div>
         </div>
         <span className="text-xs text-dim mono" title={snapshot.revision}>
@@ -290,21 +281,6 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
         </div>
       )}
 
-      {blockers && (
-        <div className="error-message" role="alert">
-          <p>Saving is blocked while these runs may still execute or resume:</p>
-          <ul className="blocked-runs">
-            {blockers.map((run) => (
-              <li key={run.run_id} className="mono text-sm">{run.run_id} — {run.status}</li>
-            ))}
-          </ul>
-          <p className="text-sm text-dim">
-            Stop or finish the runs above, then save again. Configuration edits apply to
-            future runs only.
-          </p>
-        </div>
-      )}
-
       <div role="group" aria-label="Settings views" className="config-tabs">
         <button
           className={`btn btn-sm ${mode === 'guided' ? 'btn-primary' : 'btn-secondary'}`}
@@ -324,7 +300,6 @@ export function ConfigEditor({ project, onDirtyChange, onSaved, onReady }: Confi
 
       <div hidden={mode !== 'guided'} className="guided-panel">
         <GuidedConfigForm
-          project={project}
           aflowText={aflowText}
           workflowsText={workflowsText}
           onDraftChange={(nextAflow, nextWorkflows) => {

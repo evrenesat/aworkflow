@@ -5,3 +5,13 @@
 - If a new startup flow would need interactive input, do not invent a non-interactive fallback.
 - Treat the plan file on disk as the source of truth for startup and retry behavior.
 - For AFlow development, install the intended checkout with `uv tool install -e . --force`, then exercise the installed `aflow` entry point. Never use `uv run aflow`; reserve `uv run` for tests, linters, and other project-scoped development commands.
+
+- `aflow ui` owns the UI process lifecycle: foreground/`--daemon` ownership
+  records live under `~/.config/aflow/ui/`, and `--stop` signals only the
+  recorded UI process. The private `aflow ui-worker` wrapper owns one
+  workflow process group and writes receipts under the run's durable
+  `units/` directory; its `shutdown` contract with `PersistentUnitManager`
+  is a no-op by design, so UI shutdown never signals workflow subprocesses.
+- Run configuration is frozen at reservation into
+  `.aflow/runs/<run_id>/config/`; never route worker, retry, or resume loads
+  around the snapshot, and never let a partial snapshot launch a worker.

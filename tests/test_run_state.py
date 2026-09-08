@@ -169,6 +169,7 @@ def test_owner_stop_terminalizes_at_the_existing_pre_turn_boundary(
         config,
         "live",
         config_dir=tmp_path,
+        snapshot_config=False,
         runner=lambda *args, **kwargs: pytest.fail("owner stop must precede child launch"),
     )
 
@@ -218,6 +219,7 @@ def test_reserved_run_id_collision_fails_before_launch_artifacts(tmp_path: Path)
             config,
             "live",
             config_dir=tmp_path,
+            snapshot_config=False,
             runner=lambda *args, **kwargs: pytest.fail("collision must precede child launch"),
         )
 

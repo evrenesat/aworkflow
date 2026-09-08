@@ -6,3 +6,6 @@ temp/
 /skills/.system/*
 /codex-ralph-loop-plugin/ralph-loop-claude/*
 t   
+# Generated AFlow UI web assets (built for editable installs)
+aflow/ui_web/
+apps/aflow_app/web/.ui-assets.lock

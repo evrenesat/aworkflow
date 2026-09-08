@@ -903,7 +903,7 @@ class ActivePlanLifecycleTests(unittest.TestCase):
                 },
             )
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, adapter=CodexAdapter(), runner=capturing_runner)
+            result = run_workflow(controller_config, wf_config, 'loop', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=capturing_runner)
             assert result.turns_completed == 3
             # Turn 1 (review): active should be original plan
             assert captured_active[0] == str(plan_path)
@@ -1004,6 +1004,7 @@ class ActivePlanLifecycleTests(unittest.TestCase):
                     wf_config,
                     'loop',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=capturing_runner,
                 )
@@ -1116,6 +1117,7 @@ class ActivePlanLifecycleTests(unittest.TestCase):
                     wf_config,
                     'loop',
                     config_dir=repo_root,
+                        snapshot_config=False,
                     adapter=CodexAdapter(),
                     runner=runner,
                 )

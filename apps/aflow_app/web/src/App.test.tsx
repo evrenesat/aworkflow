@@ -19,8 +19,8 @@ vi.mock('./api', () => ({
   getAuthToken: vi.fn(), setAuthToken: vi.fn(), clearAuthToken: vi.fn(),
   checkSession: vi.fn(), loginSession: vi.fn(), logoutSession: vi.fn(), setSessionExpiredHandler: vi.fn(),
   listProjects: vi.fn(), getProjectDiscovery: vi.fn(), getProject: vi.fn(), createProject: vi.fn(), unregisterProject: vi.fn(),
-  getProjectConfig: vi.fn(), saveProjectConfig: vi.fn(), validateProjectConfig: vi.fn(),
-  postProjectConfigForm: vi.fn(),
+  getGlobalConfig: vi.fn(), saveGlobalConfig: vi.fn(), validateGlobalConfig: vi.fn(),
+  postGlobalConfigForm: vi.fn(),
   listProjectPlans: vi.fn(), createProjectPlan: vi.fn(), readProjectPlan: vi.fn(),
   updateProjectPlan: vi.fn(), promoteProjectPlan: vi.fn(),
   listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(),
@@ -106,8 +106,8 @@ describe('App workspace shell', () => {
     vi.mocked(api.logoutSession).mockResolvedValue(undefined)
     vi.mocked(api.listProjects).mockResolvedValue([])
     vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload())
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse())
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload())
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse())
     vi.mocked(api.listProjectPlans).mockResolvedValue([])
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
       { project_id: 'alpha', root: '/srv/code/alpha', schema_version: 1 },
@@ -258,26 +258,23 @@ describe('App workspace shell', () => {
     // Server context names the managed root without listing filesystem choices.
     expect(screen.getByText('/srv/code').className).toContain('mono')
     expect(screen.queryByText(/\/srv\/code\//)).toBeNull()
-    expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).toBeNull()
     expect(screen.getByRole('button', { name: 'Plans' }).getAttribute('disabled')).not.toBeNull()
     expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('disabled')).not.toBeNull()
   })
 
-  it('registers a project with initialize-Git confirmation, initial workflow, and team', async () => {
+  it('registers a project with initialize-Git confirmation and no local config', async () => {
     vi.mocked(api.createProject).mockResolvedValue({
       id: 'beta', display_name: 'Beta', relative_root: 'beta',
-      root: '/srv/code/beta', created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required',
+      root: '/srv/code/beta', created_at: '2026-01-01T00:00:00Z', readiness: 'ready',
     })
     render(<App />)
     fireEvent.click(await screen.findByRole('radio', { name: /Register an existing directory/ }))
     fireEvent.change(screen.getByLabelText('Relative project path'), { target: { value: 'beta' } })
     fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'Beta' } })
-    // Starter settings stay hidden until initialization is explicitly chosen.
+    // Project-level starter fields no longer exist: configuration is global.
     expect(screen.queryByLabelText('Initial workflow')).toBeNull()
     fireEvent.click(screen.getByRole('checkbox', { name: /Initialize a Git repository/ }))
-    fireEvent.click(screen.getByRole('checkbox', { name: /Write the starter configuration pair/ }))
-    fireEvent.change(screen.getByLabelText('Initial workflow'), { target: { value: 'starter-flow' } })
-    fireEvent.change(screen.getByLabelText('Initial team'), { target: { value: 'core' } })
     vi.mocked(api.listProjects).mockResolvedValue([configProject])
     fireEvent.click(screen.getByRole('button', { name: 'Register project' }))
 
@@ -286,42 +283,19 @@ describe('App workspace shell', () => {
       path: 'beta',
       display_name: 'Beta',
       main_branch: 'main',
-      initial_workflow: 'starter-flow',
-      initial_team: 'core',
       initialize_git: true,
-      initialize_config: true,
     }))
-    await screen.findByLabelText('aflow.toml contents')
-    expect(screen.getByText(/needs explicit configuration/)).toBeDefined()
-    expect(screen.getByText('Configuration required')).toBeDefined()
+    // Readiness follows the shared global pair; a ready pair lands on Plans.
+    await screen.findByText('Beta Project')
   })
 
-  it('does not submit hidden starter values when register-mode initialization is off', async () => {
-    vi.mocked(api.createProject).mockRejectedValueOnce(new Error('operation_rejected'))
+  it('never renders project-level starter fields in register mode', async () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('radio', { name: /Register an existing directory/ }))
     fireEvent.change(screen.getByLabelText('Relative project path'), { target: { value: 'beta' } })
-    fireEvent.click(screen.getByRole('checkbox', { name: /Write the starter configuration pair/ }))
-    fireEvent.change(screen.getByLabelText('Initial workflow'), { target: { value: 'not a valid workflow' } })
-    fireEvent.change(screen.getByLabelText('Initial team'), { target: { value: 'ghost-team' } })
-    fireEvent.click(screen.getByRole('checkbox', { name: /Write the starter configuration pair/ }))
     expect(screen.queryByLabelText('Initial workflow')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Register project' }))
-
-    await waitFor(() => expect(api.createProject).toHaveBeenCalledWith({
-      mode: 'register',
-      path: 'beta',
-      display_name: null,
-      main_branch: 'main',
-      initial_workflow: null,
-      initial_team: null,
-      initialize_git: false,
-      initialize_config: false,
-    }))
-    // Re-enabling initialization preserves the entered values.
-    fireEvent.click(screen.getByRole('checkbox', { name: /Write the starter configuration pair/ }))
-    expect((screen.getByLabelText('Initial workflow') as HTMLInputElement).value).toBe('not a valid workflow')
-    expect((screen.getByLabelText('Initial team') as HTMLInputElement).value).toBe('ghost-team')
+    expect(screen.queryByLabelText('Initial team')).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: /Write the starter configuration pair/ })).toBeNull()
   })
 
   it('creates a new project and lands in configuration guidance', async () => {
@@ -339,11 +313,9 @@ describe('App workspace shell', () => {
       path: 'beta',
       display_name: null,
       main_branch: 'main',
-      initial_workflow: null,
-      initial_team: null,
     }))
     await screen.findByLabelText('aflow.toml contents')
-    expect(screen.getByText(/needs explicit configuration/)).toBeDefined()
+    expect(screen.getByText(/shared AFlow configuration needs explicit settings/)).toBeDefined()
   })
 
   it('keeps a successful creation selected when the refresh read fails', async () => {
@@ -388,10 +360,10 @@ describe('App workspace shell', () => {
 
   it('updates selected readiness from a successful ready configuration save', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([configProject])
-    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready'))
     // One server validates one pair one way: the projection of the committed
     // texts agrees with the ready save result.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /Beta Project/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
@@ -410,11 +382,11 @@ describe('App workspace shell', () => {
 
   it('keeps a dirty guided draft behind the navigation guard until a ready save', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
     // The committed snapshot is ready, but the guided candidate is not: the
     // report follows the candidate and offers no Go to plans shortcut.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse())
-    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse())
+    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready'))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
@@ -424,7 +396,7 @@ describe('App workspace shell', () => {
 
     // The dirty draft cannot bypass the unsaved-changes navigation guard.
     // The reprojection of the edited pair echoes the edited texts.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce({ ...guidedFormResponse(), aflow_toml: '# mine\n' })
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce({ ...guidedFormResponse(), aflow_toml: '# mine\n' })
     fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# mine\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
@@ -437,7 +409,7 @@ describe('App workspace shell', () => {
     await screen.findByText('Defaults')
     fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
     await screen.findByLabelText('New plan filename')
-    expect(api.saveProjectConfig).toHaveBeenCalledWith('alpha', expect.objectContaining({
+    expect(api.saveGlobalConfig).toHaveBeenCalledWith(expect.objectContaining({
       aflow_toml: '# mine\n',
       expected_revision: configPayload('ready').revision,
     }))
@@ -462,7 +434,7 @@ describe('App workspace shell', () => {
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('disabled')).toBeNull()
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
     expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('disabled')).not.toBeNull()
-    expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).toBeNull()
     expect(screen.getByRole('button', { name: 'Plans' }).getAttribute('disabled')).not.toBeNull()
     expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('disabled')).not.toBeNull()
     expect(await screen.findByPlaceholderText('team/project')).toBeDefined()
@@ -486,7 +458,7 @@ describe('App workspace shell', () => {
     expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
     fireEvent.click(refresh)
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
-    expect(api.getProjectConfig).not.toHaveBeenCalled()
+    expect(api.getGlobalConfig).not.toHaveBeenCalled()
   })
 
   it('renders readiness states accurately across registered projects', async () => {
@@ -572,8 +544,8 @@ describe('App workspace shell', () => {
     vi.mocked(api.listControlPlanePlans).mockResolvedValue([
       { path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 },
     ])
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
@@ -666,12 +638,8 @@ describe('App workspace shell', () => {
       path: 'tools/kilo',
       display_name: 'Kilo',
       main_branch: 'main',
-      initial_workflow: null,
-      initial_team: null,
       initialize_git: false,
-      initialize_config: false,
     }))
-    await screen.findByLabelText('aflow.toml contents')
   })
 
   it('preserves search and refreshes both lists when Add loses a race', async () => {
@@ -766,8 +734,8 @@ describe('App workspace shell', () => {
       ])
       vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })
       vi.mocked(api.listControlPlanePlans).mockResolvedValue([controlPlanePlan])
-      vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
-      vi.mocked(api.postProjectConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+      vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
       vi.mocked(api.listRunEvents).mockResolvedValue([])
       vi.mocked(api.getRunContext).mockResolvedValue({ run_id: 'run-linked', level: 'lite', data: {}, schema_version: 1 })
     }
@@ -979,16 +947,16 @@ describe('App workspace shell', () => {
       return { id: 'beta', display_name: 'Beta Project', relative_root: 'beta', root: '/srv/code/beta',
         created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required' }
     })
-    vi.mocked(api.getProjectConfig).mockImplementation(async () => projectConfig(saved))
-    vi.mocked(api.postProjectConfigForm).mockImplementation(async (_project, request) => {
+    vi.mocked(api.getGlobalConfig).mockImplementation(async () => projectConfig(saved))
+    vi.mocked(api.postGlobalConfigForm).mockImplementation(async (request) => {
       if (request.action) {
         expect(request.action).toEqual({ type: 'set_global_role', role: 'worker', selector: 'zcode.default' })
         return projection(true, true)
       }
       return projection(request.aflow_toml === readyToml)
     })
-    vi.mocked(api.saveProjectConfig).mockRejectedValueOnce(new Error('temporary save failure'))
-      .mockImplementation(async (_project, request) => {
+    vi.mocked(api.saveGlobalConfig).mockRejectedValueOnce(new Error('temporary save failure'))
+      .mockImplementation(async (request) => {
         expect(request).toEqual({ aflow_toml: readyToml, workflows_toml: workflows, expected_revision: 'a'.repeat(64) })
         saved = true
         return projectConfig(true)

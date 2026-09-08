@@ -356,6 +356,7 @@ def _run_manager_report_cli_case(
             workflow_config,
             "managed",
             config_dir=repo_root,
+            snapshot_config=False,
             runner=runner,
             banner=banner,
             observer=observer,
@@ -4802,6 +4803,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     workflow_config,
                     "test_workflow",
                     config_dir=config_path,
+                    snapshot_config=False,
                     adapter=CodexAdapter(),
                     resume=resume,
                 )

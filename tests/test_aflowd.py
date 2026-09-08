@@ -176,7 +176,7 @@ def test_daemon_git_tracking_preflight_failure_does_not_allocate_run_artifacts(
     units = InMemoryUnitManager()
     daemon, request = _daemon(tmp_path, monkeypatch, units)
     review_config = _review_workflow_config()
-    daemon.service._workflow_config = review_config
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: review_config)
     request = StartupRequest(
         repo_root=request.repo_root,
         plan_path=request.plan_path,
@@ -693,7 +693,7 @@ def test_daemon_typed_start_persists_canonical_step_and_redacted_instruction_dig
     units = InMemoryUnitManager()
     daemon, request = _daemon(tmp_path, monkeypatch, units)
     workflow_config = _two_step_workflow_config()
-    daemon.service._workflow_config = workflow_config
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: workflow_config)
     sentinel = "private-runtime-guidance-4f91"
     request = replace(
         request,
@@ -798,7 +798,7 @@ def test_daemon_rejects_excluded_step_before_reserving_run(
     units = InMemoryUnitManager()
     daemon, request = _daemon(tmp_path, monkeypatch, units)
     workflow_config = _two_step_workflow_config()
-    daemon.service._workflow_config = workflow_config
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: workflow_config)
     request = replace(
         request,
         workflow_config=workflow_config,
@@ -902,7 +902,7 @@ def test_startup_answer_selected_later_step_is_reported_as_skipped_without_manif
     units = InMemoryUnitManager()
     daemon, request = _daemon(tmp_path, monkeypatch, units)
     workflow_config = _two_step_workflow_config()
-    daemon.service._workflow_config = workflow_config
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: workflow_config)
     request = replace(request, workflow_config=workflow_config)
     monkeypatch.setattr(
         "aflow.daemon.prepare_startup",
@@ -1116,7 +1116,10 @@ def test_daemon_owner_stop_pending_question_remains_terminal_for_reads_and_answe
     record_bytes = record_path.read_bytes()
     manifest_bytes = manifest_path.read_bytes()
     plan_bytes = request.plan_path.read_bytes()
-    assert not run_dir.exists()
+    # The reservation freezes the run's configuration snapshot, so the run
+    # directory exists; no controller artifacts may exist before the answer.
+    assert sorted(path.name for path in run_dir.iterdir()) == ["config"]
+    assert (run_dir / "config" / "aflow.toml").is_file()
 
     stopped = daemon.service.owner_stop(
         pending.run_id,

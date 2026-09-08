@@ -125,10 +125,8 @@ export function ProjectPicker({
         path: candidate.relative_path,
         display_name: candidate.display_name,
         main_branch: 'main',
-        initial_workflow: null,
-        initial_team: null,
+
         initialize_git: false,
-        initialize_config: false,
       })
       await loadDiscovery()
     } catch (err) {

@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=3.2.0,<4.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sse-starlette>=2.2.0",
+    "pydantic>=2.0.0",
+    "tomlkit>=0.13.0",
 ]
 
 [project.urls]
@@ -21,6 +26,7 @@ Issues = "https://github.com/evrenesat/aworkflow/issues"
 dev = [
     "pytest>=8.0.0",
     "ruff==0.16.5",
+    "playwright>=1.49.0",
 ]
 
 [tool.ruff]
@@ -36,4 +42,21 @@ aworkflow = "aflow.cli:main"
 aflowd = "aflow.daemon:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aflow"]
+packages = ["aflow", "apps/aflow_app/server/src/aflow_app_server"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "aflow",
+    "apps/aflow_app/server/src/aflow_app_server",
+    "apps/aflow_app/web/src",
+    "apps/aflow_app/web/index.html",
+    "apps/aflow_app/web/package.json",
+    "apps/aflow_app/web/package-lock.json",
+    "apps/aflow_app/web/tsconfig.json",
+    "apps/aflow_app/web/tsconfig.node.json",
+    "apps/aflow_app/web/tsconfig.test.json",
+    "apps/aflow_app/web/vite.config.ts",
+]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"

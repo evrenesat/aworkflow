@@ -9,10 +9,10 @@ vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api')
   return {
     ...actual,
-    getProjectConfig: vi.fn(),
-    saveProjectConfig: vi.fn(),
-    validateProjectConfig: vi.fn(),
-    postProjectConfigForm: vi.fn(),
+    getGlobalConfig: vi.fn(),
+    saveGlobalConfig: vi.fn(),
+    validateGlobalConfig: vi.fn(),
+    postGlobalConfigForm: vi.fn(),
   }
 })
 
@@ -81,8 +81,8 @@ function renderEditor() {
 describe('ConfigEditor', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload())
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formPayload())
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload())
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formPayload())
   })
 
   it('loads both documents under one shared revision with accessible tabs', async () => {
@@ -112,65 +112,65 @@ describe('ConfigEditor', () => {
         ...configPayload().validation, placeholders: [], workflows: [], roles: [],
       },
     }
-    vi.mocked(api.getProjectConfig).mockResolvedValue(empty)
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(empty)
     const candidate = { ...empty.validation, state: 'ready' as const }
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formPayload({
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formPayload({
       aflow_toml: '', workflows_toml: '', validation: candidate,
     }))
-    vi.mocked(api.validateProjectConfig).mockResolvedValue(candidate)
+    vi.mocked(api.validateGlobalConfig).mockResolvedValue(candidate)
     renderEditor()
     await screen.findByText('Set up this project')
     expect(screen.getByText(/build a starter draft, then save both files/)).toBeDefined()
     expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
-    await waitFor(() => expect(api.validateProjectConfig).toHaveBeenCalled())
+    await waitFor(() => expect(api.validateGlobalConfig).toHaveBeenCalled())
     expect(screen.queryByText(/the project configuration is ready/)).toBeNull()
     expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
   })
 
   it('shows a load error with retry instead of inventing configuration text', async () => {
-    vi.mocked(api.getProjectConfig).mockRejectedValue(new Error('operation_rejected'))
+    vi.mocked(api.getGlobalConfig).mockRejectedValue(new Error('operation_rejected'))
     renderEditor()
     await screen.findByText(/operation_rejected/)
     expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload())
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload())
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     await screen.findByLabelText('aflow.toml contents')
   })
 
   it('validates the candidate pair without saving and renders bounded diagnostics', async () => {
-    vi.mocked(api.validateProjectConfig).mockResolvedValue(configPayload('invalid').validation)
+    vi.mocked(api.validateGlobalConfig).mockResolvedValue(configPayload('invalid').validation)
     renderEditor()
     await screen.findByLabelText('aflow.toml contents')
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# broken\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Validate' }))
 
-    await waitFor(() => expect(api.validateProjectConfig).toHaveBeenCalledWith('beta', {
+    await waitFor(() => expect(api.validateGlobalConfig).toHaveBeenCalledWith({
       aflow_toml: '# broken\n',
       workflows_toml: '# workflows\n',
     }))
     await screen.findByText(/Invalid configuration/)
     expect(screen.getByText(/unknown team reference/)).toBeDefined()
     expect(screen.getByText(/workflows\.toml:3/)).toBeDefined()
-    expect(api.saveProjectConfig).not.toHaveBeenCalled()
+    expect(api.saveGlobalConfig).not.toHaveBeenCalled()
   })
 
   it('saves both files atomically with the expected revision and refreshes the snapshot', async () => {
-    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready', revisionB))
+    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready', revisionB))
     // The server validates one pair one way: the projection of the committed
     // texts agrees with the save result instead of contradicting it.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(
       formPayload({ validation: configPayload('ready').validation }),
     )
     const onReady = vi.fn()
     const onDirty = vi.fn()
-    render(<ConfigEditor project={project} onDirtyChange={onDirty} onReady={onReady} />)
+    render(<ConfigEditor onDirtyChange={onDirty} onReady={onReady} />)
     await screen.findByLabelText('aflow.toml contents')
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# configured\n' } })
     await waitFor(() => expect(onDirty).toHaveBeenCalledWith(true))
     fireEvent.click(screen.getByRole('button', { name: 'Save both files' }))
 
-    await waitFor(() => expect(api.saveProjectConfig).toHaveBeenCalledWith('beta', {
+    await waitFor(() => expect(api.saveGlobalConfig).toHaveBeenCalledWith({
       aflow_toml: '# configured\n',
       workflows_toml: '# workflows\n',
       expected_revision: revisionA,
@@ -182,7 +182,7 @@ describe('ConfigEditor', () => {
   })
 
   it('preserves local text on a stale revision and reloads only after confirmation', async () => {
-    vi.mocked(api.saveProjectConfig).mockRejectedValue(
+    vi.mocked(api.saveGlobalConfig).mockRejectedValue(
       new ApiError(409, 'conflict', 'revision_conflict', { current_revision: revisionB }),
     )
     renderEditor()
@@ -194,33 +194,14 @@ describe('ConfigEditor', () => {
     expect(screen.getByText(new RegExp(revisionB.slice(0, 12)))).toBeDefined()
     expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# mine\n')
 
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready', revisionB))
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready', revisionB))
     fireEvent.click(screen.getByRole('button', { name: 'Reload server copy…' }))
     expect(screen.getByText(/Discard the local edits in both tabs/)).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Discard edits and reload' }))
-    await waitFor(() => expect(api.getProjectConfig).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
     await screen.findByText(`Revision ${revisionB.slice(0, 12)}`)
     expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# aflow config\n')
     expect(screen.queryByText(/changed on the server/)).toBeNull()
-  })
-
-  it('lists active-run blockers and keeps the draft editable when saving is blocked', async () => {
-    vi.mocked(api.saveProjectConfig).mockRejectedValue(
-      new ApiError(409, 'blocked', 'config_save_blocked', {
-        blocking_runs: [{ run_id: 'run-9', status: 'running' }],
-      }),
-    )
-    renderEditor()
-    await screen.findByText('Defaults')
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
-    fireEvent.change(screen.getByLabelText('workflows.toml contents'), { target: { value: '# tuned\n' } })
-    fireEvent.click(screen.getByRole('tab', { name: 'workflows.toml' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Save both files' }))
-
-    await screen.findByText(/Saving is blocked while these runs/)
-    expect(screen.getByText('run-9 — running')).toBeDefined()
-    expect(screen.getByText(/future runs only/)).toBeDefined()
-    expect((screen.getByLabelText('workflows.toml contents') as HTMLTextAreaElement).value).toBe('# tuned\n')
   })
 
   it('shows guided settings by default and shares one draft pair with Advanced TOML', async () => {
@@ -232,7 +213,7 @@ describe('ConfigEditor', () => {
     expect(screen.getByLabelText('aflow.toml contents').closest('.toml-panel')?.hidden).toBe(true)
 
     // The reprojection of the manual edit echoes the edited pair.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(
       formPayload({ aflow_toml: '# manual\n' }),
     )
     fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
@@ -247,10 +228,10 @@ describe('ConfigEditor', () => {
   })
 
   it('saves a guided draft with the last committed revision and continues to Plans once ready', async () => {
-    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready', revisionB))
+    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready', revisionB))
     const onReady = vi.fn()
     const onDirty = vi.fn()
-    render(<ConfigEditor project={project} onDirtyChange={onDirty} onReady={onReady} />)
+    render(<ConfigEditor onDirtyChange={onDirty} onReady={onReady} />)
     await screen.findByText('Defaults')
     // The draft action result is shared: an Advanced TOML edit becomes the
     // candidate pair that guided Save commits.
@@ -261,7 +242,7 @@ describe('ConfigEditor', () => {
     expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# starter pair\n')
 
     fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
-    await waitFor(() => expect(api.saveProjectConfig).toHaveBeenCalledWith('beta', {
+    await waitFor(() => expect(api.saveGlobalConfig).toHaveBeenCalledWith({
       aflow_toml: '# starter pair\n',
       workflows_toml: '# workflows\n',
       expected_revision: revisionA,
@@ -288,7 +269,7 @@ describe('ConfigEditor', () => {
   })
 
   it('replaces a committed ready report when the guided candidate is no longer ready', async () => {
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
     renderEditor()
     // The committed snapshot is ready, but the guided candidate response is
     // not: the visible report must follow the candidate, never the snapshot.
@@ -300,15 +281,15 @@ describe('ConfigEditor', () => {
   })
 
   it('marks the report stale during raw Advanced TOML edits and shows bounded guided updating', async () => {
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(
       formPayload({ validation: configPayload('ready').validation }),
     )
     renderEditor()
     await screen.findByText('Defaults')
     expect(screen.getByRole('button', { name: 'Go to plans' })).toBeDefined()
 
-    vi.mocked(api.postProjectConfigForm).mockImplementationOnce(() => new Promise(() => {}))
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(() => new Promise(() => {}))
     fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# edited\n' } })
     // Until the reprojection succeeds the ready result is marked stale and the
@@ -322,27 +303,27 @@ describe('ConfigEditor', () => {
 
   it('never offers Go to plans for a dirty candidate; only a ready save navigates', async () => {
     const onReady = vi.fn()
-    render(<ConfigEditor project={project} onDirtyChange={vi.fn()} onReady={onReady} />)
+    render(<ConfigEditor onDirtyChange={vi.fn()} onReady={onReady} />)
     await screen.findByText('Defaults')
     // The reprojection of the edited draft reports it ready and echoes the
     // edited pair, so the report is fresh — but the candidate is unsaved and
     // no path may bypass the dirty navigation guard.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(
       formPayload({ aflow_toml: '# candidate\n', validation: configPayload('ready').validation }),
     )
     fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# candidate\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Guided settings' }))
-    expect(await screen.findByText('Valid — the project configuration is ready.')).toBeDefined()
+    expect(await screen.findByText('Valid — the shared configuration is ready.')).toBeDefined()
     expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
     expect(screen.getByText('Defaults')).toBeDefined()
     expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# candidate\n')
 
     // After the commit the projection of the saved pair stays ready too.
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(
       formPayload({ validation: configPayload('ready').validation }),
     )
-    vi.mocked(api.saveProjectConfig).mockResolvedValue(configPayload('ready', revisionB))
+    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready', revisionB))
     fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
     await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1))
     expect(onReady).toHaveBeenCalledWith(expect.objectContaining({ revision: revisionB }))
@@ -354,17 +335,17 @@ describe('ConfigEditor', () => {
 describe('pending guided actions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.getProjectConfig).mockResolvedValue(configPayload('ready'))
-    vi.mocked(api.postProjectConfigForm).mockResolvedValue(formPayload({ validation: configPayload('ready').validation }))
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formPayload({ validation: configPayload('ready').validation }))
   })
 
   it.each([false, true])('does not navigate or save ahead of a pending action (dirty=%s)', async (dirty) => {
     const onReady = vi.fn()
     const onDirtyChange = vi.fn()
-    render(<ConfigEditor project={project} onDirtyChange={onDirtyChange} onReady={onReady} />)
+    render(<ConfigEditor onDirtyChange={onDirtyChange} onReady={onReady} />)
     await screen.findByText('Defaults')
     if (dirty) {
-      vi.mocked(api.postProjectConfigForm).mockResolvedValueOnce(formPayload({
+      vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce(formPayload({
         changed: true, aflow_toml: '# first edit\n', validation: configPayload('ready').validation,
       }))
       fireEvent.change(screen.getByLabelText('Max turns'), { target: { value: '2' } })
@@ -372,7 +353,7 @@ describe('pending guided actions', () => {
       await waitFor(() => expect((screen.getByRole('button', { name: 'Save both files' }) as HTMLButtonElement).disabled).toBe(false))
     }
     let release!: (value: ReturnType<typeof formPayload>) => void
-    vi.mocked(api.postProjectConfigForm).mockImplementationOnce(() => new Promise((resolve) => { release = resolve }))
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(() => new Promise((resolve) => { release = resolve }))
     fireEvent.change(screen.getByLabelText('Max turns'), { target: { value: '3' } })
     fireEvent.click(screen.getByRole('button', { name: 'Apply max turns' }))
     expect(onDirtyChange).toHaveBeenLastCalledWith(true)
@@ -387,19 +368,19 @@ describe('pending guided actions', () => {
       fireEvent.click(shortcut)
     }
     expect(onReady).not.toHaveBeenCalled()
-    expect(api.saveProjectConfig).not.toHaveBeenCalled()
+    expect(api.saveGlobalConfig).not.toHaveBeenCalled()
     release(formPayload({ changed: true, aflow_toml: '# latest action\n', validation: configPayload('ready').validation }))
     await waitFor(() => expect((screen.getByRole('button', { name: 'Save and continue to Plans' }) as HTMLButtonElement).disabled).toBe(false))
-    vi.mocked(api.saveProjectConfig).mockResolvedValue({ ...configPayload('ready', revisionB), aflow_toml: '# latest action\n' })
+    vi.mocked(api.saveGlobalConfig).mockResolvedValue({ ...configPayload('ready', revisionB), aflow_toml: '# latest action\n' })
     fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
     await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1))
-    expect(api.saveProjectConfig).toHaveBeenCalledWith('beta', expect.objectContaining({ aflow_toml: '# latest action\n' }))
+    expect(api.saveGlobalConfig).toHaveBeenCalledWith(expect.objectContaining({ aflow_toml: '# latest action\n' }))
   })
 
   it('lets Advanced TOML save after a failed read-only projection', async () => {
     renderEditor()
     await screen.findByText('Defaults')
-    vi.mocked(api.postProjectConfigForm).mockRejectedValueOnce(new Error('projection unavailable'))
+    vi.mocked(api.postGlobalConfigForm).mockRejectedValueOnce(new Error('projection unavailable'))
     fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# manual edit\n' } })
     await screen.findByText('projection unavailable')
