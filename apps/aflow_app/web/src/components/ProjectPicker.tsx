@@ -9,6 +9,7 @@ import type {
 import { readinessClass, readinessLabel } from '../readiness'
 import * as api from '../api'
 import { ProjectCreateForm } from './ProjectCreateForm'
+import { MenuItem, MoreMenu } from './MoreMenu'
 
 interface ProjectPickerProps {
   projects: ProjectInfo[]
@@ -24,37 +25,6 @@ interface ProjectPickerProps {
 function matchesQuery(query: string, ...texts: string[]): boolean {
   if (!query) return true
   return texts.some((text) => text.toLowerCase().includes(query))
-}
-
-/**
- * Shared candidate text.  Interactive behavior lives in the caller so an
- * unregistered candidate never exposes a no-op control.
- */
-function CandidateContent({
-  candidate,
-  registered,
-}: {
-  candidate: ProjectDiscoveryCandidate
-  registered: ProjectInfo | null
-}) {
-  return (
-    <>
-      <div className="content-button-row">
-        <span style={{ fontWeight: 600, overflowWrap: 'anywhere' }}>{candidate.display_name}</span>
-        {candidate.registered_project_id !== null && (
-          <span className="status-pill">Added</span>
-        )}
-      </div>
-      <span className="text-xs text-dim mono" style={{ overflowWrap: 'anywhere' }}>
-        {candidate.relative_path}
-      </span>
-      {!registered && candidate.add_blocker && (
-        <span className="text-xs text-dim">
-          Cannot be added: {candidate.add_blocker}.
-        </span>
-      )}
-    </>
-  )
 }
 
 /**
@@ -221,32 +191,16 @@ export function ProjectPicker({
             </div>
           )}
 
-          <div className="project-list" role="list">
+          <ul className="compact-list" role="list" aria-label="Added projects">
             {filteredProjects.map((project) => {
               const isSelected = selectedProjectId === project.id
               const confirming = confirmingUnregisterId === project.id
               return (
-                <div
+                <li
                   key={project.id}
                   role="listitem"
-                  className={`card card-interactive project-item ${isSelected ? 'selected' : ''}`}
+                  className={`compact-row ${isSelected ? 'selected' : ''}`}
                 >
-                  <button
-                    className="content-button"
-                    aria-pressed={isSelected}
-                    onClick={() => onSelectProject(project)}
-                  >
-                    <div className="content-button-row">
-                      <span style={{ fontWeight: 600, overflowWrap: 'anywhere' }}>{project.display_name}</span>
-                      <span className={readinessClass(project.readiness)}>
-                        {readinessLabel(project.readiness)}
-                      </span>
-                    </div>
-                    <span className="text-xs text-dim mono" style={{ overflowWrap: 'anywhere' }}>
-                      {project.current_path}
-                    </span>
-                  </button>
-
                   {confirming ? (
                     <div className="confirmation unregister-confirm">
                       <span className="text-sm">
@@ -263,22 +217,34 @@ export function ProjectPicker({
                       </div>
                     </div>
                   ) : (
-                    <div className="dashboard-actions">
-                      <button className="btn btn-secondary btn-sm" onClick={() => onSelectProject(project)}>
-                        Open
-                      </button>
+                    <>
                       <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}
+                        className="compact-row-main content-button"
+                        aria-pressed={isSelected}
+                        title={project.display_name}
+                        onClick={() => onSelectProject(project)}
                       >
-                        Unregister…
+                        <span className="row-title">
+                          {project.display_name}
+                          <span className={readinessClass(project.readiness)}>
+                            {readinessLabel(project.readiness)}
+                          </span>
+                        </span>
+                        <span className="row-subtitle text-dim mono">{project.current_path}</span>
                       </button>
-                    </div>
+                      <div className="compact-row-actions">
+                        <MoreMenu label={`More actions for project ${project.display_name}`}>
+                          <MenuItem danger onClick={() => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}>
+                            Unregister…
+                          </MenuItem>
+                        </MoreMenu>
+                      </div>
+                    </>
                   )}
-                </div>
+                </li>
               )
             })}
-          </div>
+          </ul>
 
           {unregisterError && <div className="error-message" role="alert">{unregisterError}</div>}
 
@@ -322,35 +288,44 @@ export function ProjectPicker({
             </div>
           )}
 
-          <div className="project-list" role="list">
+          <ul className="compact-list" role="list" aria-label="Available on this server">
             {filteredCandidates.map((candidate) => {
               const registered = candidate.registered_project_id !== null
                 ? projects.find((project) => project.id === candidate.registered_project_id) ?? null
                 : null
               return (
-                <div
+                <li
                   key={candidate.relative_path}
                   role="listitem"
-                  className="card card-interactive project-item"
+                  className="compact-row"
                 >
                   {registered ? (
                     <button
-                      className="content-button"
+                      className="compact-row-main content-button"
+                      title={candidate.display_name}
                       onClick={() => onSelectProject(registered)}
                     >
-                      <CandidateContent candidate={candidate} registered={registered} />
+                      <span className="row-title">
+                        {candidate.display_name}
+                        <span className="status-pill">Added</span>
+                      </span>
+                      <span className="row-subtitle text-dim mono">{candidate.relative_path}</span>
                     </button>
                   ) : (
-                    <div className="content-static">
-                      <CandidateContent candidate={candidate} registered={null} />
+                    <div className="compact-row-main">
+                      <span className="row-title">
+                        {candidate.display_name}
+                        {candidate.registered_project_id !== null && <span className="status-pill">Added</span>}
+                      </span>
+                      <span className="row-subtitle text-dim mono">{candidate.relative_path}</span>
+                      {candidate.add_blocker && (
+                        <span className="row-subtitle text-dim">
+                          Cannot be added: {candidate.add_blocker}.
+                        </span>
+                      )}
                     </div>
                   )}
-                  <div className="dashboard-actions">
-                    {registered && (
-                      <button className="btn btn-secondary btn-sm" onClick={() => onSelectProject(registered)}>
-                        Open
-                      </button>
-                    )}
+                  <div className="compact-row-actions">
                     {candidate.registered_project_id !== null && !registered && (
                       <button className="btn btn-secondary btn-sm" onClick={handleRefresh}>
                         Refresh to open
@@ -366,10 +341,10 @@ export function ProjectPicker({
                       </button>
                     )}
                   </div>
-                </div>
+                </li>
               )
             })}
-          </div>
+          </ul>
 
           {addError && (
             <div className="error-message" role="alert">

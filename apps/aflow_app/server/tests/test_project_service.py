@@ -9,7 +9,6 @@ import subprocess
 import pytest
 from fastapi.testclient import TestClient
 
-from aflow.config import load_workflow_config, project_configuration_state
 
 from aflow_app_server.config import ServerConfig
 from aflow_app_server.control_plane_service import ControlPlaneService

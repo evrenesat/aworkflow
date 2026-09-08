@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ProjectConfig, ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
-import { readinessClass, readinessLabel } from './readiness'
 import { markUserActivity } from './activity'
 import { ProjectPicker } from './components/ProjectPicker'
-import { ProjectOverview } from './components/ProjectOverview'
-import { ConfigEditor } from './components/ConfigEditor'
-import { SettingsPanel } from './components/SettingsPanel'
+import { GlobalSettings } from './components/GlobalSettings'
+import { GlobalRunOverview } from './components/GlobalRunOverview'
 import { PlanPanel } from './components/PlanPanel'
 import { RunDashboard, type PendingSuccessorStart, type RunSelectionChange } from './components/RunDashboard'
 import * as api from './api'
@@ -19,14 +17,12 @@ import {
 
 type View = WorkspaceQuery['view']
 
-type ProjectView = 'overview' | 'settings' | 'plans' | 'runs'
-
 /** Why the login gate is (or is not) shown. */
 type AuthGate = 'checking' | 'signedOut' | 'restoreFailed' | 'expired' | 'signedIn'
 
 const NAV_ITEMS: Array<{ view: View; label: string; needsProject: boolean }> = [
+  { view: 'all-runs', label: 'All runs', needsProject: false },
   { view: 'projects', label: 'Projects', needsProject: false },
-  { view: 'overview', label: 'Overview', needsProject: true },
   { view: 'settings', label: 'Settings', needsProject: false },
   { view: 'plans', label: 'Plans', needsProject: true },
   { view: 'runs', label: 'Runs', needsProject: true },
@@ -57,6 +53,10 @@ export function App() {
   const [projectsLoading, setProjectsLoading] = useState(true)
   const [projectsError, setProjectsError] = useState<string | null>(null)
   const [query, setQuery] = useState<WorkspaceQuery>(initialWorkspaceQuery)
+  const [visitedProjects, setVisitedProjects] = useState<string[]>([])
+  useEffect(() => {
+    if (query.project) setVisitedProjects(ids => ids.includes(query.project!) ? ids : [...ids, query.project!])
+  }, [query.project])
   const [staleLinkTarget, setStaleLinkTarget] = useState<string | null>(null)
   const [configDirty, setConfigDirty] = useState(false)
   const [planDirty, setPlanDirty] = useState(false)
@@ -194,12 +194,12 @@ export function App() {
   // After the registry fetch the public identifiers are validated: the
   // registered project id is the sole project authority. An unknown project
   // clears the scoped link with guidance instead of a substitute; a missing
-  // or unknown view normalizes to Overview; run ids are validated inside the
+  // or unknown view normalizes to Runs; run ids are validated inside the
   // Runs dashboard through the project-scoped direct run endpoint.
   useEffect(() => {
     if (authGate !== 'signedIn' || projectsLoading || projectsError) return
     if (query.project === null) {
-      applyQuery({ project: null, view: 'projects', run: null }, 'replace')
+      applyQuery({ project: null, view: ['settings', 'projects', 'all-runs'].includes(query.view) ? query.view : 'all-runs', run: null }, 'replace')
       return
     }
     if (!projects.some((project) => project.id === query.project)) {
@@ -209,7 +209,7 @@ export function App() {
     }
     setStaleLinkTarget(null)
     // Rewrite the address to the concrete workspace state (a missing or
-    // unknown view becomes overview; stray parameters are dropped).
+    // unknown view becomes Runs; stray parameters are dropped).
     applyQuery(query, 'replace')
   }, [applyQuery, authGate, projects, projectsError, projectsLoading, query])
 
@@ -237,6 +237,7 @@ export function App() {
 
   function resetWorkspace() {
     setProjects([])
+    setVisitedProjects([])
     setProjectsError(null)
     setStaleLinkTarget(null)
     applyQuery({ project: null, view: 'projects', run: null }, 'replace')
@@ -300,13 +301,13 @@ export function App() {
   function switchView(next: View) {
     if (next === query.view) return
     if (NAV_ITEMS.find((item) => item.view === next)?.needsProject && !selectedProject) return
-    requestGuarded(`leave the editor for ${next}`, () => applyQuery({ ...queryRef.current, view: next, run: null }, 'push'))
+    requestGuarded(`leave the editor for ${next}`, () => applyQuery({ ...queryRef.current, ...(next === 'all-runs' || next === 'projects' ? { project: null } : {}), view: next, run: null }, 'push'))
   }
 
   function openProject(project: ProjectInfo) {
     requestGuarded(`open ${project.display_name} with unsaved edits`, () => {
       setRunDashboardPlanPath(null)
-      applyQuery({ project: project.id, view: 'overview', run: null }, 'push')
+      applyQuery({ project: project.id, view: 'runs', run: null }, 'push')
     })
   }
 
@@ -363,18 +364,11 @@ export function App() {
       project.readiness === 'blocked' ? project : { ...project, readiness }
     )))
   }, [])
-  const handleConfigReady = useCallback((saved: ProjectConfig) => {
-    if (saved.validation.state !== 'ready') return
-    setProjects((current) => current.map((project) => (
-      project.readiness === 'blocked' ? project : { ...project, readiness: 'ready' }
-    )))
-    applyQuery({ ...queryRef.current, view: 'plans', run: null }, 'push')
-  }, [applyQuery])
 
   function handleOpenRunDashboard(planPath: string) {
     requestGuarded('leave the plan editor for the run dashboard', () => {
       setRunDashboardPlanPath(planPath)
-      applyQuery({ ...queryRef.current, view: 'runs', run: null }, 'push')
+      applyQuery({ ...queryRef.current, view: 'new-run', run: null }, 'push')
     })
   }
 
@@ -443,8 +437,9 @@ export function App() {
     <div className="app-shell">
       <header className="app-header">
         <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>aflow</h1>
-          <div className="text-xs text-dim truncate">Set up your code project, plan the work, and follow every run</div>
+          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }} className="truncate" title={selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}>
+            {selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}
+          </h1>
         </div>
         <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()} disabled={logoutPending}>
           {logoutPending ? 'Signing out…' : 'Logout'}
@@ -459,9 +454,8 @@ export function App() {
       )}
 
       <nav className="workspace-nav" aria-label="Workspace views">
-        {NAV_ITEMS.map((item) => (
+        {NAV_ITEMS.filter(item => !item.needsProject || selectedProject).map((item) => (
           <span key={item.view} className="nav-item-group">
-            {item.view === 'overview' && <span className="nav-separator" aria-hidden="true" />}
             <button
               className={`nav-tab ${view === item.view ? 'active' : ''}`}
               aria-current={view === item.view ? 'page' : undefined}
@@ -475,39 +469,11 @@ export function App() {
         ))}
       </nav>
 
-      {selectedProject && (
-        <div className="project-context-bar" aria-label="Selected project">
-          <div className="content-button-row" style={{ minWidth: 0 }}>
-            <strong className="truncate">{selectedProject.display_name}</strong>
-            <span className={readinessClass(selectedProject.readiness)}>
-              {readinessLabel(selectedProject.readiness)}
-            </span>
-            <span className="text-xs text-dim mono truncate">{selectedProject.current_path}</span>
-          </div>
-          <button
-            className="btn btn-secondary btn-sm"
-            onClick={() => requestGuarded('return to the project list', () => applyQuery({ ...queryRef.current, project: null, view: 'projects', run: null }, 'push'))}
-          >
-            Change project
-          </button>
-          {readinessGuidance[selectedProject.readiness] && (
-            <p className="text-xs readiness-note">
-              {readinessGuidance[selectedProject.readiness]}
-              {selectedProject.readiness === 'configuration_required' && view !== 'settings' && (
-                <button className="btn btn-secondary btn-sm" onClick={() => switchView('settings')}>
-                  Open settings
-                </button>
-              )}
-            </p>
-          )}
-        </div>
-      )}
-
-      {pendingSuccessorStart && (view !== 'runs' || query.project !== pendingSuccessorStart.projectId) && (
+      {pendingSuccessorStart && ((view !== 'runs' && view !== 'new-run') || query.project !== pendingSuccessorStart.projectId) && (
         <div className="notice" role="status">
           A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
           <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
-            applyQuery({ project: pendingSuccessorStart.projectId, view: 'runs', run: null }, 'push')
+            applyQuery({ project: pendingSuccessorStart.projectId, view: 'new-run', run: null }, 'push')
           })}>Resolve pending successor</button>
         </div>
       )}
@@ -525,28 +491,21 @@ export function App() {
       )}
 
       <main className="workspace-main">
+        {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={(project, run) => applyQuery({ project, view: 'runs', run }, 'push')} />}
         {view === 'settings' && (
-          <div className="workspace-content">
-            <ConfigEditor
+            <GlobalSettings
               onDirtyChange={handleConfigDirty}
               onSaved={handleConfigSaved}
-              onReady={handleConfigReady}
             />
-            <SettingsPanel onDirtyChange={handleConfigDirty} />
-          </div>
+        )}
+        {selectedProject && readinessGuidance[selectedProject.readiness] && view === 'settings' && (
+          <p className="notice" role="note">{readinessGuidance[selectedProject.readiness]}</p>
         )}
         {staleLinkTarget && view === 'projects' && (
           <div className="notice" role="alert">
             The link pointed to project <span className="mono">{staleLinkTarget}</span>, which is not in the
             registered project list. Its scoped link was cleared — open or add the project below.
           </div>
-        )}
-
-        {view === 'projects' && !selectedProject && (
-          <p className="text-xs text-dim no-project-hint" role="note">
-            Overview, Plans, and Runs become available after you open a project below.
-            Settings is shared by every project.
-          </p>
         )}
 
         {view === 'projects' && (
@@ -569,11 +528,11 @@ export function App() {
           </div>
         )}
 
-        {view !== 'projects' && !selectedProject && !(query.project !== null && projectsLoading) && (
+        {view !== 'all-runs' && view !== 'projects' && view !== 'settings' && !selectedProject && !(query.project !== null && projectsLoading) && (
           <div className="card choose-project-state">
             <h2 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Choose a project first</h2>
             <p className="text-sm text-dim">
-              Overview, Plans, and Runs belong to a single project. Open one from the
+              Plans and Runs belong to a single project. Open one from the
               project list to continue.
             </p>
             <div className="dashboard-actions">
@@ -584,36 +543,58 @@ export function App() {
           </div>
         )}
 
-        {view !== 'projects' && view !== 'settings' && selectedProject && (
+        {view === 'plans' && selectedProject && (
           <div className="workspace-content">
-            {view === 'overview' && (
-              <ProjectOverview
-                project={selectedProject}
-                onOpenView={(next: ProjectView | 'projects') => switchView(next)}
-              />
+            {selectedProject.readiness !== 'ready' && readinessGuidance[selectedProject.readiness] && (
+              <p className="notice" role="note">
+                {readinessGuidance[selectedProject.readiness]}
+                {selectedProject.readiness === 'configuration_required' && (
+                  <span className="dashboard-actions" style={{ justifyContent: 'flex-start' }}>
+                    <button className="btn btn-secondary btn-sm" onClick={() => switchView('settings')}>
+                      Open settings
+                    </button>
+                  </span>
+                )}
+              </p>
             )}
-            {view === 'plans' && (
-              <PlanPanel
-                project={selectedProject}
-                onDirtyChange={handlePlanDirty}
-                onOpenRunDashboard={handleOpenRunDashboard}
-              />
-            )}
-            {view === 'runs' && (
-              <RunDashboard
-                key={selectedProject.id}
-                projectId={selectedProject.id}
-                requestedRunId={query.run}
-                onRunSelectionChange={handleRunSelectionChange}
-                initialPlanPath={runDashboardPlanPath}
-                onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
-                pendingSuccessorStart={pendingSuccessorStart}
-                onPendingSuccessorStartChange={setPendingSuccessorStart}
-                onOpenSettings={() => switchView('settings')}
-              />
-            )}
+            <PlanPanel
+              project={selectedProject}
+              onDirtyChange={handlePlanDirty}
+              onOpenRunDashboard={handleOpenRunDashboard}
+            />
           </div>
         )}
+        {selectedProject && readinessGuidance[selectedProject.readiness] && (view === 'runs' || view === 'new-run') && (
+          <p className="notice" role="note">
+            {readinessGuidance[selectedProject.readiness]}
+            {selectedProject.readiness === 'configuration_required' && (
+              <span className="dashboard-actions" style={{ justifyContent: 'flex-start' }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => switchView('settings')}>
+                  Open settings
+                </button>
+              </span>
+            )}
+          </p>
+        )}
+        {visitedProjects.filter(id => projects.some(p => p.id === id)).map(id => (
+          <div key={id} hidden={query.project !== id || (view !== 'runs' && view !== 'new-run')}>
+            <RunDashboard
+              projectId={id}
+              visible={query.project === id && (view === 'runs' || view === 'new-run')}
+              page={query.project === id && view === 'new-run' ? 'new-run' : 'runs'}
+              requestedRunId={query.project === id ? query.run : null}
+              onRunSelectionChange={change => { if (queryRef.current.project === id) handleRunSelectionChange(change) }}
+              initialPlanPath={query.project === id ? runDashboardPlanPath : null}
+              onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
+              pendingSuccessorStart={pendingSuccessorStart}
+              onPendingSuccessorStartChange={setPendingSuccessorStart}
+              onOpenSettings={() => switchView('settings')}
+              onNewRun={() => applyQuery({ project: id, view: 'new-run', run: null }, 'push')}
+              onCancelNewRun={() => applyQuery({ project: id, view: 'runs', run: null }, 'push')}
+              onRunStarted={runId => { if (queryRef.current.project === id && ['runs', 'new-run'].includes(queryRef.current.view)) applyQuery({ project: id, view: 'runs', run: runId }, 'push') }}
+            />
+          </div>
+        ))}
       </main>
     </div>
   )

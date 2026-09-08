@@ -8,7 +8,7 @@ terminal connection.  The workflow controller remains the authority for its
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
@@ -32,6 +32,8 @@ from aflow.api.models import (
 )
 from aflow.api.runner import execute_workflow
 from aflow.api.startup import StartupError, prepare_startup, prepare_startup_with_answer
+from aflow.control_plane.models import startup_failure
+from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.config import ConfigError, WorkflowUserConfig, load_workflow_config
 from aflow.run_config_snapshot import (
     SnapshotError,
@@ -77,6 +79,14 @@ _MAX_EXTRA_INSTRUCTIONS_LENGTH = 4096
 
 class DaemonError(RuntimeError):
     """The daemon cannot safely carry out a lifecycle operation."""
+
+
+class DaemonStartupError(DaemonError):
+    """A reserved startup request failed with an already sanitized diagnostic."""
+
+    def __init__(self, run_id: str, message: str) -> None:
+        super().__init__(message)
+        self.run_id = run_id
 
 
 class DaemonNotReadyError(DaemonError):
@@ -281,7 +291,8 @@ class DaemonService:
         idempotency_key: str | None = None,
     ) -> StartRunResult | StartupQuestionRecord:
         """Reserve durable intent before evaluating the interactive startup gate."""
-        with self._lock, self._idempotency_lock("start", caller_scope, idempotency_key):
+        lineage_lock = self._durable_lock(".restart-locks", validate_run_id(request.restarted_from_run_id)) if request.restarted_from_run_id else nullcontext()
+        with self._lock, lineage_lock, self._idempotency_lock("start", caller_scope, idempotency_key):
             self._refresh_workflow_config()
             normalized = self._normalize_request(
                 request,
@@ -418,7 +429,11 @@ class DaemonService:
                     question, request, answer
                 )
             except StartupError as exc:
-                raise DaemonError(str(exc)) from exc
+                updated = dict(record)
+                updated["state"] = "needs_attention"
+                updated["startup_failure"] = startup_failure("preparation", str(exc))
+                self._write_record(updated)
+                raise DaemonStartupError(run_id, updated["startup_failure"]["message"]) from exc
             if isinstance(prepared_or_question, StartupQuestion):
                 updated = dict(record)
                 _record_answer(
@@ -536,6 +551,9 @@ class DaemonService:
                     )
                 return self._recover_resume_record(pending)
             source = self._application.repository.get_run_status(source_run_id)
+            worker = source.evidence.get("worker")
+            if isinstance(worker, Mapping) and not confirmed_inactive(worker):
+                raise DaemonError("source worker activity could not be confirmed inactive")
             if source.ownership != "control_plane":
                 raise DaemonError("legacy runs cannot be resumed by the control plane")
             unit_name = _unit_name(source_run_id)
@@ -660,15 +678,30 @@ class DaemonService:
             return status
         if status.ownership != "control_plane":
             return status
+        status = replace(status, evidence={**status.evidence, "can_resume": self._can_resume(status)})
+        try:
+            observed = self._application.units.get(_unit_name(run_id))
+            if observed is not None and observed.name == _unit_name(run_id) and status.evidence.get("worker") is None:
+                status = replace(status, evidence={**status.evidence, "unit_active": observed.is_active})
+        except Exception:
+            pass  # Unavailable observation is unknown, never inferred active.
         try:
             record = self._read_record(run_id)
         except DaemonError:
             return status
-        if record.get("state") == "awaiting_startup_answer":
+        if record.get("state") == "awaiting_startup_answer" and status.status not in {
+            "running", "completed", "failed", "interrupted",
+        }:
             return replace(
                 status,
                 status="awaiting_startup_answer",
                 reason="startup answer required before workflow unit creation",
+                evidence={
+                    **status.evidence,
+                    "startup_question": _question_record(
+                        run_id, _question_from_record(record), _question_generation(record)
+                    ).to_dict(),
+                },
             )
         prepared = record.get("prepared")
         if isinstance(prepared, Mapping):
@@ -685,6 +718,26 @@ class DaemonService:
                     skipped_steps=tuple(skipped),
                 )
         return status
+
+    def _can_resume(self, status: RunStatus) -> bool:
+        """Read-only admission preview; resume rechecks before any reservation."""
+        worker = status.evidence.get("worker")
+        if isinstance(worker, Mapping) and not confirmed_inactive(worker):
+            return False
+        if status.status not in {"failed", "interrupted", "needs_attention", "waiting_for_valid_override"}:
+            return False
+        if status.launch_phase in {None, "manifest_only", "launch_requested"}:
+            return False
+        if status.launch_phase == "launch_started" and status.status != "needs_attention":
+            return False
+        try:
+            observed = self._application.units.get(_unit_name(status.run_id))
+            if observed is not None and (observed.name != _unit_name(status.run_id) or observed.is_active):
+                return False
+            self._resume_bootstrap(status.run_id)
+        except Exception:
+            return False
+        return True
 
     def poll_events(
         self,
@@ -860,8 +913,9 @@ class DaemonService:
         except StartupError as exc:
             updated = dict(record)
             updated["state"] = "needs_attention"
+            updated["startup_failure"] = startup_failure("preparation", str(exc))
             self._write_record(updated)
-            raise DaemonError(str(exc)) from exc
+            raise DaemonStartupError(str(record["run_id"]), updated["startup_failure"]["message"]) from exc
         if isinstance(prepared_or_question, StartupQuestion):
             updated = dict(record)
             updated["state"] = "awaiting_startup_answer"
@@ -984,8 +1038,9 @@ class DaemonService:
                 )
         except Exception as exc:
             mutable["state"] = "needs_attention"
+            mutable["startup_failure"] = startup_failure("unit_launch", f"workflow unit failed to start: {exc}")
             self._write_record(mutable)
-            raise DaemonError(f"workflow unit failed to start: {exc}") from exc
+            raise DaemonStartupError(run_id, mutable["startup_failure"]["message"]) from exc
         write_launch_phase(self._config.repo_root, run_id, "unit_started")
         append_run_event(run_dir, "unit_started", {"unit_name": _unit_name(run_id)})
         mutable["state"] = "unit_started"
@@ -1188,6 +1243,7 @@ class DaemonService:
             request.restarted_from_run_id,
             successor_run_id=run_id,
             caller_scope=caller_scope,
+            successor_key=idempotency_key,
         )
         max_turns = request.max_turns if request.max_turns is not None else self._workflow_config.aflow.max_turns
         if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
@@ -1224,6 +1280,7 @@ class DaemonService:
         *,
         successor_run_id: str,
         caller_scope: str,
+        successor_key: str | None = None,
     ) -> None:
         if source_run_id is None:
             return
@@ -1231,6 +1288,9 @@ class DaemonService:
         if source_run_id == successor_run_id:
             raise DaemonError("a successor run cannot restart itself")
         source = self._application.repository.get_run_status(source_run_id)
+        worker = source.evidence.get("worker")
+        if isinstance(worker, Mapping) and not confirmed_inactive(worker):
+            raise DaemonError("restart predecessor worker activity could not be confirmed inactive")
         if source.ownership != "control_plane":
             raise DaemonError("legacy runs cannot be restart predecessors")
         manifest = self._application.repository.get_launch_manifest(source_run_id)
@@ -1245,15 +1305,24 @@ class DaemonService:
         if not same_project:
             raise DaemonError("restart predecessor belongs to a different project")
         self._assert_manifest_caller(source_run_id, caller_scope)
-        if source.status != "owner_stopped" or source.launch_phase != "owner_stopped":
+        failure = source.evidence.get("startup_failure")
+        confirmed_preparation_failure = (
+            source.status == "needs_attention"
+            and isinstance(failure, Mapping)
+            and failure.get("stage") == "preparation"
+            and source.evidence.get("no_agent_started") is True
+        )
+        failed_execution = source.status in {"failed", "interrupted"}
+        owner_stopped = source.status == "owner_stopped" and source.launch_phase == "owner_stopped"
+        if not (owner_stopped or failed_execution or confirmed_preparation_failure):
             raise DaemonError(
-                "restart predecessor must be terminal after an explicit owner stop"
+                "restart predecessor requires a confirmed failure or explicit owner stop"
             )
         source_events = self._application.repository.tail_events(
             source_run_id,
             limit=1_000,
         )
-        if not any(event.event_type == "owner_stopped" for event in source_events):
+        if owner_stopped and not any(event.event_type == "owner_stopped" for event in source_events):
             raise DaemonError(
                 "restart predecessor lacks explicit owner-stop evidence"
             )
@@ -1271,6 +1340,9 @@ class DaemonService:
             if ancestor.run_id in seen:
                 raise DaemonError("restart predecessor lineage is cyclic")
             seen.add(ancestor.run_id)
+            if Path(ancestor.project_root).resolve() != self._config.repo_root:
+                raise DaemonError("restart predecessor lineage belongs to a different project")
+            self._assert_manifest_caller(ancestor.run_id, caller_scope)
             if ancestor.restarted_from_run_id is None:
                 break
             ancestor = self._application.repository.get_launch_manifest(
@@ -1278,6 +1350,70 @@ class DaemonService:
             )
             if ancestor is None:
                 raise DaemonError("restart predecessor lineage is incomplete")
+        cursor = None
+        while True:
+            page = self._application.repository.list_runs(limit=100, cursor=cursor)
+            for sibling in page.runs:
+                if sibling.restarted_from_run_id != source_run_id or sibling.run_id == successor_run_id:
+                    continue
+                sibling_manifest = self._application.repository.get_launch_manifest(sibling.run_id)
+                if successor_key and sibling_manifest and sibling_manifest.idempotency_key == successor_key and _equivalent_caller_scope(sibling_manifest.caller_scope, caller_scope):
+                    continue  # Exact replay is verified against its request digest by start().
+                unit = self._application.units.get(_unit_name(sibling.run_id))
+                if unit is not None and unit.is_active:
+                    raise DaemonError("restart predecessor already has an active successor")
+                if sibling.status not in {"failed", "interrupted", "completed", "owner_stopped"} and not sibling.evidence.get("startup_failure"):
+                    raise DaemonError("restart predecessor already has an unresolved successor")
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+
+    def restart_options(self, run_id: str, *, caller_scope: str) -> dict[str, object]:
+        """Bounded read-only admission and public launch fields for a new attempt."""
+        run_id = validate_run_id(run_id)
+        self._assert_manifest_caller(run_id, caller_scope)
+        source = self._application.repository.get_run_status(run_id)
+        manifest = self._application.repository.get_launch_manifest(run_id)
+        if manifest is None:
+            raise DaemonError("restart predecessor has no launch manifest")
+        if Path(manifest.project_root).resolve() != self._config.repo_root:
+            raise DaemonError("restart predecessor belongs to a different project")
+        eligible = True
+        reason = None
+        try:
+            self._validate_restart_source(run_id, successor_run_id="restart-preview", caller_scope=caller_scope)
+        except DaemonError as exc:
+            eligible, reason = False, str(exc)[:300]
+        requires_stop = source.status in {"running", "paused", "waiting_for_input", "waiting_for_valid_override"}
+        extra = self._transient_extra_instructions.get(run_id, manifest.extra_instructions)
+        missing_extra = False
+        try:
+            record = self._read_record(run_id)
+            request = record.get("request", {})
+            digest = request.get("extra_instructions_digest") if isinstance(request, Mapping) else None
+            if digest not in {None, _extra_instructions_digest(extra)}:
+                try:
+                    extra = self._resume_bootstrap(run_id).extra_instructions
+                except Exception:
+                    missing_extra = True
+        except DaemonError:
+            pass
+        _validate_extra_instructions(extra)
+        return {
+            "eligible": eligible,
+            "reason": reason,
+            "requires_stop": requires_stop,
+            "run_id": run_id,
+            "extra_instructions_unavailable": missing_extra,
+            "options": {
+                "plan_path": str(Path(manifest.plan_path).resolve().relative_to(self._config.repo_root)),
+                "workflow_name": manifest.workflow_name,
+                "team": manifest.team,
+                "max_turns": manifest.max_turns,
+                "start_step": source.selected_start_step,
+                "extra_instructions": list(extra),
+            },
+        }
 
     def _recover_start_manifest(
         self,
@@ -1805,12 +1941,14 @@ def worker_main(
     extra_instructions: tuple[str, ...] = (),
 ) -> int:
     """Run a single daemon-prepared controller through the installed ``aflow`` entry point."""
+    stage = "configuration"
     try:
         root = Path(repo_root).resolve()
         config = Path(config_path).resolve()
         selected_run_id = validate_run_id(run_id)
         _validate_extra_instructions(extra_instructions)
         workflow_config = load_workflow_config(config)
+        stage = "snapshot_manifest"
         daemon_config = DaemonConfig(
             repo_root=root,
             config_path=config,
@@ -1832,6 +1970,7 @@ def worker_main(
             raise DaemonError("daemon worker has no immutable launch manifest")
         if manifest.intended_unit != _unit_name(selected_run_id):
             raise DaemonError("daemon worker manifest unit identity is invalid")
+        stage = "prepared_request"
         prepared, resume = _worker_prepared(
             record,
             manifest,
@@ -1842,6 +1981,7 @@ def worker_main(
         )
         from aflow.workflow import _freeze_run_identity
 
+        stage = "snapshot_validation"
         frozen = _freeze_run_identity(
             prepared.workflow_name, workflow_config, config_dir=config
         )
@@ -1849,13 +1989,24 @@ def worker_main(
             raise DaemonError(
                 "daemon worker frozen configuration does not match launch intent"
             )
+        stage = "controller_entry"
         execute_workflow(
             prepared,
             resume=resume,
             allow_existing_launch_manifest=True,
         )
     except Exception as exc:
-        print(f"aflow daemon worker: {exc}", file=sys.stderr)
+        from aflow.control_plane.models import startup_failure
+        from aflow.control_plane.persistent_units import _receipts_for, _write_receipt
+
+        failure = startup_failure(stage, str(exc))
+        try:
+            receipts = _receipts_for(_unit_name(validate_run_id(run_id)), Path(repo_root).resolve())
+            if receipts is not None and receipts.nonce == os.environ.get("AFLOW_WORKER_NONCE"):
+                _write_receipt(receipts.directory / "worker-error.json", {"schema": 1, "nonce": receipts.nonce, **failure}, exclusive=False)
+        except (OSError, ValueError):
+            print("aflow daemon worker: diagnostic persistence failed", file=sys.stderr)
+        print(f"aflow daemon worker: {failure['message']}", file=sys.stderr)
         return 1
     return 0
 

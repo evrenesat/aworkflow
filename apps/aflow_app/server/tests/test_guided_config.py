@@ -20,10 +20,13 @@ from aflow_app_server.models import (
     AddTeamAction,
     BuildStarterAction,
     ProjectConfigFormResponse,
+    RenamePromptAction,
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
+    SetPromptAction,
     SetTeamRoleAction,
+    SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
     UpsertProfileAction,
 )
@@ -635,6 +638,82 @@ class TestSyntaxRecovery:
         assert response.syntax_issues[0].document == "workflows.toml"
 
 
+class TestMalformedPromptShapes:
+    """Syntactically valid but mistyped prompt tables stay repairable.
+
+    Each shape must return the untouched documents with the production
+    validation diagnosis instead of a projection-time ValueError (HTTP 500).
+    """
+
+    def test_string_prompts_table_returns_diagnostics_without_projection(self) -> None:
+        broken = 'prompts = "wrong"\n' + AFLOW_TEXT.replace('[prompts]\np = "Work."\n', '')
+        response = _call(aflow_text=broken)
+        assert response.aflow_toml == broken
+        assert response.workflows_toml == WORKFLOWS_TEXT
+        assert response.form is None
+        assert response.syntax_issues == ()
+        assert response.validation.state == "invalid"
+        assert any("prompts" in issue.message for issue in response.validation.issues)
+
+    def test_string_roles_prompts_table_returns_diagnostics(self) -> None:
+        broken = AFLOW_TEXT.replace("[roles]\n", '[roles]\nprompts = "wrong"\n', 1)
+        response = _call(aflow_text=broken)
+        assert response.aflow_toml == broken
+        assert response.form is None
+        assert response.validation.state == "invalid"
+
+    def test_mistyped_team_prompts_entry_returns_diagnostics(self) -> None:
+        broken = AFLOW_TEXT.replace(
+            "[teams.crew.roles]",
+            "[teams.crew.prompts]\nworker = 5\n\n[teams.crew.roles]",
+            1,
+        )
+        response = _call(aflow_text=broken)
+        assert response.aflow_toml == broken
+        assert response.form is None
+        assert response.validation.state == "invalid"
+
+    def test_malformed_step_prompt_array_is_skipped_not_fatal(self) -> None:
+        broken = WORKFLOWS_TEXT.replace(
+            'prompts = ["p"]', 'prompts = "not-an-array"', 1
+        )
+        response = _call(workflows_text=broken)
+        assert response.workflows_toml == broken
+        assert response.validation.state == "invalid"
+        assert response.syntax_issues == ()
+
+    def test_mistyped_merge_prompt_is_reported_without_projection_crash(self) -> None:
+        broken = WORKFLOWS_TEXT + '[workflow.deliver.merge_prompt = 5]\n'
+        response = _call(workflows_text=broken)
+        assert response.workflows_toml == broken
+        assert response.validation.state == "invalid"
+
+    def test_rename_updates_merge_prompt_reference(self) -> None:
+        carrying = WORKFLOWS_TEXT.replace(
+            "[workflow.deliver.steps.implement]",
+            '[workflow.deliver]\nmerge_prompt = "p"\n\n[workflow.deliver.steps.implement]',
+            1,
+        )
+        response = _call(
+            workflows_text=carrying,
+            action=RenamePromptAction(type="rename_prompt", name="p", new_name="q"),
+        )
+        assert 'merge_prompt = "q"' in response.workflows_toml
+        assert 'prompts = ["q"]' in response.workflows_toml
+        assert response.form is not None
+        assert response.form.prompt_usages["q"]
+
+    def test_prompt_action_against_mistyped_table_is_a_bounded_rejection(self) -> None:
+        broken = 'prompts = "wrong"\n' + AFLOW_TEXT.replace('[prompts]\np = "Work."\n', '')
+        with pytest.raises(GuidedConfigError) as excinfo:
+            guided_form_response(
+                broken,
+                WORKFLOWS_TEXT,
+                SetPromptAction(type="set_prompt", name="x", text="y"),
+            )
+        assert excinfo.value.code == "invalid_field_type"
+
+
 class TestStarterProfileCleanup:
     # A seeded real profile keeps every selector below valid.
     SEEDED_AFLOW = (
@@ -693,3 +772,75 @@ class TestStarterProfileCleanup:
             ),
         )
         assert "[harness.starter.profiles.extra]" in seeded.aflow_toml
+
+
+class TestTeamUpgradeChains:
+    """Typed upgrade-link edits keep recovery links and graph checks intact."""
+
+    TWO_TEAMS = AFLOW_TEXT + '\n[teams.second.roles]\nworker = "codex.fast"\n'
+    LINKED = AFLOW_TEXT.replace(
+        "[teams.crew.roles]",
+        '[teams.crew]\nupgrade_to = "second"\nbackup_team = "second"\n\n[teams.crew.roles]',
+        1,
+    ) + '\n[teams.second.roles]\nworker = "codex.fast"\n'
+
+    def test_set_upgrade_link_updates_projection_and_bytes(self) -> None:
+        response = _call(
+            aflow_text=self.TWO_TEAMS,
+            action=SetTeamUpgradeAction(
+                type="set_team_upgrade", team="crew", upgrade_to="second"
+            ),
+        )
+        assert '[teams.crew]\nupgrade_to = "second"' in response.aflow_toml
+        assert response.form is not None
+        assert response.form.teams["crew"].upgrade_to == "second"
+        assert response.form.teams["second"].upgrade_to is None
+        assert response.validation.state == "ready"
+
+    def test_unset_upgrade_link_removes_only_that_link(self) -> None:
+        response = _call(
+            aflow_text=self.LINKED,
+            action=SetTeamUpgradeAction(
+                type="set_team_upgrade", team="crew", upgrade_to=None
+            ),
+        )
+        assert "upgrade_to" not in response.aflow_toml
+        assert 'backup_team = "second"' in response.aflow_toml
+        assert response.form is not None
+        assert response.form.teams["crew"].upgrade_to is None
+
+    def test_self_link_is_rejected(self) -> None:
+        with pytest.raises(GuidedConfigError) as excinfo:
+            _call(
+                aflow_text=self.TWO_TEAMS,
+                action=SetTeamUpgradeAction(
+                    type="set_team_upgrade", team="crew", upgrade_to="crew"
+                ),
+            )
+        assert excinfo.value.code == "invalid_action_value"
+
+    def test_unknown_target_is_rejected(self) -> None:
+        with pytest.raises(GuidedConfigError) as excinfo:
+            _call(
+                aflow_text=self.TWO_TEAMS,
+                action=SetTeamUpgradeAction(
+                    type="set_team_upgrade", team="crew", upgrade_to="ghost"
+                ),
+            )
+        assert excinfo.value.code == "unknown_team"
+
+    def test_cycle_is_reported_invalid_by_the_production_checks(self) -> None:
+        # crew already upgrades to second; linking second back to crew closes
+        # the cycle, which only the production graph checks may flag.
+        response = _call(
+            aflow_text=self.LINKED,
+            action=SetTeamUpgradeAction(
+                type="set_team_upgrade", team="second", upgrade_to="crew"
+            ),
+        )
+        assert response.changed is True
+        assert response.validation.state == "invalid"
+        assert any(
+            "cycle" in issue.message.lower() or "upgrade" in issue.message.lower()
+            for issue in response.validation.issues
+        )

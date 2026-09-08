@@ -37,18 +37,25 @@ describe('workspace URL state', () => {
 
   it('normalizes to concrete workspace state', () => {
     expect(normalizeWorkspaceQuery({ project: null, view: 'runs', run: 'run-1' })).toEqual({
-      project: null, view: 'projects', run: null,
+      project: null, view: 'all-runs', run: null,
     })
     expect(normalizeWorkspaceQuery({ project: 'alpha', view: null, run: null })).toEqual({
-      project: 'alpha', view: 'overview', run: null,
+      project: 'alpha', view: 'runs', run: null,
     })
     expect(normalizeWorkspaceQuery({ project: 'alpha', view: 'plans', run: null })).toEqual({
       project: 'alpha', view: 'plans', run: null,
     })
   })
 
+  it('keeps global Settings and normalizes legacy Overview links', () => {
+    expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?view=settings'))).toEqual({ project: null, view: 'settings', run: null })
+    expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?project=alpha&view=overview'))).toEqual({ project: 'alpha', view: 'runs', run: null })
+    expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?view=overview'))).toEqual({ project: null, view: 'all-runs', run: null })
+    expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?project=alpha&view=new-run'))).toEqual({ project: 'alpha', view: 'new-run', run: null })
+  })
+
   it('serializes in a fixed order and round-trips', () => {
-    expect(workspaceHref({ project: null, view: 'projects', run: null })).toBe('')
+    expect(workspaceHref({ project: null, view: 'projects', run: null })).toBe('?view=projects')
     expect(workspaceHref({ project: 'alpha', view: 'overview', run: null })).toBe('?project=alpha&view=overview')
     expect(workspaceHref({ project: 'alpha', view: 'runs', run: 'run-1' })).toBe('?project=alpha&view=runs&run=run-1')
     expect(workspaceHref({ project: 'alpha', view: 'runs', run: null })).toBe('?project=alpha&view=runs')

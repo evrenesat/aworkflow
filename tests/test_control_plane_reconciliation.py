@@ -170,3 +170,16 @@ def test_systemd_adapter_uses_bounded_argv_without_a_shell() -> None:
             "--property=Id,ActiveState,SubState,InvocationID,Result,MainPID",
         )
     ]
+
+
+def test_active_unit_retains_waiting_execution_status(tmp_path):
+    run_dir = _owned_running(tmp_path, status="waiting_for_valid_override")
+    from aflow.control_plane import append_run_event
+    append_run_event(run_dir, "reconciled", {"status": "running", "reason": "exact workflow unit is active"})
+    name = "aflow-run-owned-run.service"
+    units = InMemoryUnitManager({name: UnitState(name=name, active_state="active", sub_state="running")})
+    repository = RunRepository(tmp_path)
+    result = ReconciliationService(repository, units).reconcile_run("owned-run")
+    assert result.status == "waiting_for_valid_override"
+    assert repository.get_run_status("owned-run").status == "waiting_for_valid_override"
+    assert units.start_calls == []

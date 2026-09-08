@@ -53,6 +53,8 @@ class ReconciliationService:
             return result
 
     def _classify_owned(self, status: RunStatus) -> ReconciliationResult:
+        if status.evidence.get("worker") is not None and status.evidence.get("unit_active") is False:
+            return ReconciliationResult(status.run_id, status.status, status.reason or "Worker evidence observed", unit_name=status.unit_name, observed_unit_state="inactive")
         expected_name = f"aflow-run-{status.run_id}.service"
         manifest = self._repository.get_launch_manifest(status.run_id)
         if manifest is None:
@@ -79,7 +81,9 @@ class ReconciliationService:
         if observed is not None and observed.is_active:
             return ReconciliationResult(
                 status.run_id,
-                "running",
+                status.status if status.status in {
+                    "paused", "waiting_for_valid_override", "waiting_for_input",
+                } else "running",
                 "exact workflow unit is active",
                 unit_name=expected_name,
                 observed_unit_state=observed.active_state,
@@ -93,6 +97,11 @@ class ReconciliationService:
         observed: UnitState | None,
     ) -> ReconciliationResult:
         observed_state = observed.active_state if observed is not None else "missing"
+        if status.evidence.get("startup_state") == "needs_attention" and status.status == "needs_attention":
+            return ReconciliationResult(
+                status.run_id, "needs_attention", status.reason or "Startup did not complete",
+                unit_name=unit_name, observed_unit_state=observed_state,
+            )
         if status.status == "manifest_only" and status.launch_phase in {None, "manifest_only"}:
             return ReconciliationResult(
                 status.run_id,

@@ -42,6 +42,7 @@ from .models import (
     SetGlobalRoleAction,
     SetMaxTurnsAction,
     SetTeamRoleAction,
+    SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
     UpsertProfileAction,
 )
@@ -235,11 +236,133 @@ def _require_team(aflow_doc: TOMLDocument, name: str) -> Table:
     return team
 
 
+def _text_table(value: object, *, path: str) -> dict[str, str]:
+    """Return a plain text mapping; a malformed prompt table is a bounded error.
+
+    The production loader rejects these shapes at save time; the guided
+    projection must surface the same diagnosis instead of raising ValueError
+    (which would become HTTP 500 and hide the repair path).
+    """
+    if value is None:
+        return {}
+    if not _is_table(value):
+        raise GuidedConfigError(
+            "invalid_field_type", f"{path} must be a table of text values"
+        )
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(item, str):
+            raise GuidedConfigError(
+                "invalid_field_type", f"{path}.{key} must be text"
+            )
+        result[str(key)] = item
+    return result
+
+
+def prompt_reference_arrays(workflows_doc):
+    """Yield ``(path, array)`` for schema-defined named-prompt arrays only.
+
+    Malformed step or reference shapes are skipped here; the production
+    validation report is the authority that flags them as invalid.
+    """
+    root = workflows_doc.get("workflow")
+    if not _is_table(root):
+        return
+    for name, workflow in root.items():
+        if not _is_table(workflow):
+            continue
+        steps = workflow.get("steps")
+        if not _is_table(steps):
+            continue
+        for step, value in steps.items():
+            if _is_table(value) and isinstance(value.get("prompts"), list):
+                yield f"workflow.{name}.steps.{step}.prompts", value["prompts"]
+
+
+def merge_prompt_sites(workflows_doc):
+    """Yield ``(path, parent, key)`` for merge_prompt name references.
+
+    ``merge_prompt`` accepts a single name or an array of names; malformed
+    shapes are skipped and flagged by the production validation instead.
+    """
+    root = workflows_doc.get("workflow")
+    if not _is_table(root):
+        return
+    candidates = [("workflow", root)]
+    for name, workflow in root.items():
+        if _is_table(workflow):
+            candidates.append((f"workflow.{name}", workflow))
+    for prefix, table in candidates:
+        value = table.get("merge_prompt")
+        if isinstance(value, str) or isinstance(value, list):
+            yield f"{prefix}.merge_prompt", table, "merge_prompt"
+
+
+def apply_action_batch(aflow_text, workflows_text, actions):
+    """Transform in order; persistence validates the complete final candidate."""
+    for action in actions:
+        result = guided_form_response(aflow_text, workflows_text, action)
+        if result["syntax_issues"]:
+            raise GuidedConfigError("invalid_toml", "Correct Advanced TOML before applying guided changes")
+        aflow_text, workflows_text = result["aflow_toml"], result["workflows_toml"]
+    return aflow_text, workflows_text
+
+
 def _apply_action(
     action: GuidedConfigAction,
     aflow_doc: TOMLDocument,
     workflows_doc: TOMLDocument,
 ) -> None:
+    from .models import SetPromptAction, RenamePromptAction, SetRolePromptAction, MoveRolePromptAction
+
+    if isinstance(action, MoveRolePromptAction):
+        _require_role_name(aflow_doc, action.role, must_exist=True)
+        _require_role_name(aflow_doc, action.target_role, must_exist=True)
+        source = _require_team(aflow_doc, action.team) if action.team else _table(aflow_doc, "roles", path="roles")
+        target = _require_team(aflow_doc, action.target_team) if action.target_team else _table(aflow_doc, "roles", path="roles")
+        source_prompts = _table(source, "prompts", path="prompts")
+        target_prompts = _table(target, "prompts", path="prompts")
+        if action.role not in source_prompts or action.target_role in target_prompts:
+            raise GuidedConfigError("prompt_collision", "Move requires an existing override and an unused target")
+        target_prompts[action.target_role] = source_prompts.pop(action.role)
+        return
+
+    if isinstance(action, SetPromptAction):
+        prompts = _table(aflow_doc, "prompts", path="prompts")
+        if action.text is None:
+            prompts.pop(action.name, None)
+        else:
+            prompts[action.name] = action.text
+        return
+    if isinstance(action, RenamePromptAction):
+        prompts = _text_table(aflow_doc.get("prompts"), path="prompts")
+        if action.name not in prompts or action.new_name in prompts:
+            raise GuidedConfigError("prompt_collision", "The source prompt must exist and the target must be unused")
+        prompts_table = _table(aflow_doc, "prompts", path="prompts")
+        prompts_table[action.new_name] = prompts_table.pop(action.name)
+        for _, values in prompt_reference_arrays(workflows_doc):
+            for index, value in enumerate(values):
+                if value == action.name:
+                    values[index] = action.new_name
+        for _, parent, key in merge_prompt_sites(workflows_doc):
+            value = parent[key]
+            if isinstance(value, str):
+                if value == action.name:
+                    parent[key] = action.new_name
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    if item == action.name:
+                        value[index] = action.new_name
+        return
+    if isinstance(action, SetRolePromptAction):
+        _require_role_name(aflow_doc, action.role, must_exist=True)
+        owner = _require_team(aflow_doc, action.team) if action.team else _table(aflow_doc, "roles", path="roles")
+        prompts = _table(owner, "prompts", path="prompts")
+        if action.text is None:
+            prompts.pop(action.role, None)
+        else:
+            prompts[action.role] = action.text
+        return
     if isinstance(action, BuildStarterAction):
         raise GuidedConfigError(
             "invalid_action_state", "build_starter is handled before parsing"
@@ -287,6 +410,19 @@ def _apply_action(
         team_roles = _table(team, "roles", path=f"teams.{action.team}.roles")
         team_roles[action.role] = action.selector
         _cleanup_starter_profile(aflow_doc)
+        return
+    if isinstance(action, SetTeamUpgradeAction):
+        team = _require_team(aflow_doc, action.team)
+        if action.upgrade_to is None:
+            # Omission means unchanged; an explicit null removes the link.
+            team.pop("upgrade_to", None)
+            return
+        if action.upgrade_to == action.team:
+            raise GuidedConfigError(
+                "invalid_action_value", "a team cannot upgrade to itself"
+            )
+        _require_team(aflow_doc, action.upgrade_to)
+        team["upgrade_to"] = action.upgrade_to
         return
     raise GuidedConfigError(
         "unknown_action", f"unsupported guided action '{action.type}'"
@@ -419,7 +555,19 @@ def _projection(
                     for key, value in inner.items()
                     if isinstance(value, str)
                 }
-            teams[str(team_name)] = {"roles": team_roles}
+            team_upgrade = team_value.get("upgrade_to")
+            teams[str(team_name)] = {
+                "roles": team_roles,
+                "prompts": _text_table(
+                    team_value.get("prompts"),
+                    path=f"teams.{team_name}.prompts",
+                ),
+                # backup_team stays a distinct recovery field and is never
+                # surfaced as a quality-upgrade stage.
+                "upgrade_to": (
+                    team_upgrade if isinstance(team_upgrade, str) else None
+                ),
+            }
     workflow_default_teams: dict[str, str | None] = {}
     workflows: dict[str, dict[str, Any]] = {}
     workflow_table = workflows_doc.get("workflow")
@@ -478,8 +626,30 @@ def _projection(
                     for step_name, step_config in wf_config.steps.items()
                 }
                 workflow_default_teams[wf_name] = wf_config.team
+    named_prompts = _text_table(aflow_doc.get("prompts"), path="prompts")
+    role_prompts = (
+        _text_table(
+            roles_table.get("prompts") if _is_table(roles_table) else None,
+            path="roles.prompts",
+        )
+    )
+    usages: dict[str, list[str]] = {name: [] for name in named_prompts}
+    for path, values in prompt_reference_arrays(workflows_doc):
+        for name in named_prompts:
+            if name in values:
+                usages[name].append(path)
+    for path, parent, key in merge_prompt_sites(workflows_doc):
+        value = parent[key]
+        for name in named_prompts:
+            if (isinstance(value, str) and value == name) or (
+                isinstance(value, list) and name in value
+            ):
+                usages[name].append(path)
     return {
         "default_workflow": default_workflow,
+        "prompts": named_prompts,
+        "role_prompts": role_prompts,
+        "prompt_usages": {name: tuple(paths) for name, paths in usages.items()},
         "max_turns": max_turns,
         "harnesses": harnesses,
         "roles": roles,
@@ -662,6 +832,13 @@ def _finish(
     aflow_doc = _parse_document("aflow.toml", texts[0])
     workflows_doc = _parse_document("workflows.toml", texts[1])
     report = validate_candidate_pair(*texts)
+    try:
+        form = _projection(aflow_doc, workflows_doc, texts)
+    except GuidedConfigError:
+        # A syntactically valid but mistyped prompt table keeps both documents
+        # untouched: the production validation report carries the semantic
+        # error and the client repairs the raw text through Advanced TOML.
+        form = None
     return {
         "aflow_toml": texts[0],
         "workflows_toml": texts[1],
@@ -677,7 +854,7 @@ def _finish(
             "teams": report.teams,
             "roles": report.roles,
         },
-        "form": _projection(aflow_doc, workflows_doc, texts),
+        "form": form,
         "syntax_issues": (),
         "choices": _choices(aflow_doc, workflows_doc),
         "suggestions": suggestions,

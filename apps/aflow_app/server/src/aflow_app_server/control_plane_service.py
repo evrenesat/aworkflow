@@ -252,6 +252,11 @@ class ControlPlaneService:
     def run_status(self, project_id: str, run_id: str) -> RunStatus:
         return self._project(project_id).daemon.service.run_status(run_id)
 
+    def restart_options(self, project_id: str, run_id: str):
+        return self._project(project_id).daemon.service.restart_options(
+            run_id, caller_scope=self._caller_scope(project_id, "rest")
+        )
+
     def events(
         self,
         project_id: str,

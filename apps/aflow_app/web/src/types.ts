@@ -127,11 +127,14 @@ export interface GuidedWorkflowStepSummaries {
 }
 
 export interface GuidedFormProjection {
+  prompts?: Record<string, string>
+  role_prompts?: Record<string, string>
+  prompt_usages?: Record<string, string[]>
   default_workflow: string | null
   max_turns: number | null
   harnesses: Record<string, Record<string, GuidedProfileSummary>>
   roles: Record<string, string>
-  teams: Record<string, { roles: Record<string, string> }>
+  teams: Record<string, { roles: Record<string, string>; prompts?: Record<string, string>; upgrade_to?: string | null }>
   workflow_default_teams: Record<string, string | null>
   workflows: Record<string, GuidedWorkflowStepSummaries>
 }
@@ -173,6 +176,9 @@ export interface GuidedStarterDefaults {
 }
 
 export type GuidedConfigAction =
+  | { type: 'set_prompt'; name: string; text: string | null }
+  | { type: 'rename_prompt'; name: string; new_name: string }
+  | { type: 'set_role_prompt'; role: string; team?: string | null; text: string | null }
   | { type: 'build_starter'; workflow: string; main_branch: string; team?: string | null }
   | { type: 'set_default_workflow'; value: string }
   | { type: 'set_max_turns'; value: number | null }
@@ -180,6 +186,7 @@ export type GuidedConfigAction =
   | { type: 'set_global_role'; role: string; selector: string }
   | { type: 'add_team'; team: string }
   | { type: 'set_team_role'; team: string; role: string; selector: string }
+  | { type: 'set_team_upgrade'; team: string; upgrade_to: string | null }
   | { type: 'set_workflow_default_team'; workflow: string; team: string | null }
 
 export interface ProjectConfigFormRequest {
@@ -247,6 +254,10 @@ export interface ControlPlaneReadiness {
 }
 
 export interface RunStatus {
+  worker_exit?: { stage: string; reason: string | null; exit_code: number | null; exited_at: string | null; diagnostic_unavailable: boolean } | null
+  plan_path?: string | null
+  started_at?: string | null
+  ended_at?: string | null
   run_id: string
   status: string
   schema_version: number

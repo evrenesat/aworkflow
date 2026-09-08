@@ -693,10 +693,18 @@ def handle_ui_command(args) -> int:
 
 def handle_ui_worker_command(args) -> int:
     """Private `aflow ui-worker` wrapper: owns one workflow process group."""
-    receipt_dir = Path(args.receipt_dir).resolve()
+    from aflow.control_plane.persistent_units import _receipts_for
+    from aflow.control_plane.models import startup_failure
+    from threading import Thread
+
+    receipt_dir = Path(args.receipt_dir).absolute()
     nonce = getattr(args, "nonce", None)
     start = _read_worker_receipt(receipt_dir, "start.json")
-    if nonce is None or not isinstance(start, dict) or start.get("nonce") != nonce:
+    try:
+        receipts = _receipts_for(f"aflow-run-{receipt_dir.parent.name}.service", Path.cwd())
+    except ValueError:
+        receipts = None
+    if nonce is None or receipts is None or receipts.directory != receipt_dir or not isinstance(start, dict) or start.get("nonce") != nonce:
         print(
             "aflow ui-worker: the launch claim is missing or its invocation "
             "nonce does not match; refusing to start a workflow worker",
@@ -716,38 +724,97 @@ def handle_ui_worker_command(args) -> int:
         child = subprocess.Popen(
             inner,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             start_new_session=True,
             cwd=str(Path.cwd()),
+            env={**os.environ, "AFLOW_WORKER_NONCE": nonce},
         )
     except OSError as exc:
-        log_lines.append(f"spawn failed: {exc}")
+        log_lines.append(startup_failure("wrapper_spawn", f"spawn failed: {exc}")["message"])
         _write_worker_receipt(
             receipt_dir,
             "error.json",
             {
                 "schema": 1,
                 "nonce": nonce,
-                "error": f"failed to start the workflow worker: {exc}",
+                **startup_failure("wrapper_spawn", f"failed to start the workflow worker: {exc}"),
+                "error": startup_failure("wrapper_spawn", str(exc))["message"],
             },
         )
         _write_wrapper_log(receipt_dir, log_lines)
         return 127
     birth = process_birth_identity(child.pid)
-    _write_worker_receipt(
-        receipt_dir,
-        "child.json",
-        {
-            "schema": 1,
-            "nonce": nonce,
-            "pid": child.pid,
-            "pgid": child.pid,
-            "process_birth": birth,
-            "argv0": inner[0],
-        },
-    )
-    code = child.wait()
+    try:
+        _write_worker_receipt(
+            receipt_dir,
+            "child.json",
+            {
+                "schema": 1,
+                "nonce": nonce,
+                "pid": child.pid,
+                "pgid": child.pid,
+                "process_birth": birth,
+                "argv0": inner[0],
+            },
+        )
+    except OSError:
+        # A child with no durable identity cannot safely outlive its wrapper.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        child.stdout.close()
+        child.stderr.close()
+        try:
+            _write_worker_receipt(receipt_dir, "error.json", {"schema": 1, "nonce": nonce, **startup_failure("wrapper_receipt", "Could not persist worker process identity")})
+            _write_worker_receipt(receipt_dir, "exit.json", {"schema": 1, "nonce": nonce, "returncode": child.returncode, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        except OSError:
+            print("aflow ui-worker: receipt persistence failed", file=sys.stderr)
+        return 1
+    # One reader per stream avoids pipe-buffer deadlocks. Keep only complete,
+    # redacted lines; discard overlong lines rather than leaking a split secret.
+    tails = {"stdout": "", "stderr": ""}
+    def drain(stream, key):
+        pending = b""
+        dropping = False
+        while chunk := stream.read1(4096):
+            for piece in chunk.splitlines(keepends=True):
+                complete = piece.endswith((b"\n", b"\r"))
+                if not dropping:
+                    pending += piece
+                    if len(pending) > 8192:
+                        pending = b""
+                        dropping = True
+                if complete:
+                    line = "[overlong output line omitted]\n" if dropping else startup_failure("worker", pending.decode("utf-8", errors="replace"))["message"]
+                    tails[key] = (tails[key] + line)[-4096:]
+                    pending = b""
+                    dropping = False
+        if pending:
+            tails[key] = (tails[key] + startup_failure("worker", pending.decode("utf-8", errors="replace"))["message"])[-4096:]
+        stream.close()
+    readers = [Thread(target=drain, args=(child.stdout, "stdout")), Thread(target=drain, args=(child.stderr, "stderr"))]
+    for reader in readers:
+        reader.start()
+    persistence_error = None
+    while child.poll() is None:
+        try:
+            _write_worker_receipt(receipt_dir, "diagnostic.json", {"schema": 1, "nonce": nonce, **tails})
+        except OSError as exc:
+            persistence_error = exc
+        try:
+            child.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+    code = child.returncode
+    for reader in readers:
+        reader.join()
+    try:
+        _write_worker_receipt(receipt_dir, "diagnostic.json", {"schema": 1, "nonce": nonce, **tails})
+    except OSError as exc:
+        persistence_error = exc
     _write_worker_receipt(
         receipt_dir,
         "exit.json",
@@ -755,30 +822,29 @@ def handle_ui_worker_command(args) -> int:
             "schema": 1,
             "nonce": nonce,
             "returncode": code,
+            "diagnostic_write_failed": persistence_error is not None,
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     )
     _write_wrapper_log(receipt_dir, log_lines)
+    if persistence_error is not None:
+        print("aflow ui-worker: diagnostic persistence failed", file=sys.stderr)
+        return 1
     if code < 0:
         return 128 + (-code)
     return code
 
 
 def _read_worker_receipt(receipt_dir: Path, name: str) -> dict | None:
-    path = receipt_dir / name
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
+    from aflow.control_plane.persistent_units import _read_json
+
+    return _read_json(receipt_dir / name)
 
 
 def _write_worker_receipt(receipt_dir: Path, name: str, payload: dict[str, object]) -> None:
-    temp = receipt_dir / f".{name}.tmp"
-    temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temp, receipt_dir / name)
+    from aflow.control_plane.persistent_units import _write_receipt
+
+    _write_receipt(receipt_dir / name, payload, exclusive=False)
 
 
 def _write_wrapper_log(receipt_dir: Path, lines: list[str]) -> None:

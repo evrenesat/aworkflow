@@ -18,3 +18,5 @@
 - Run configuration is frozen at reservation into
   `.aflow/runs/<run_id>/config/`; never route worker, retry, or resume loads
   around the snapshot, and never let a partial snapshot launch a worker.
+
+- The detached wrapper owns bounded redacted stdout/stderr tails and final exit receipts. Drain both pipes concurrently, retain stream identity, and keep early exception records nonce-bound. Never redirect actual worker diagnostics to DEVNULL or put raw output into public events.

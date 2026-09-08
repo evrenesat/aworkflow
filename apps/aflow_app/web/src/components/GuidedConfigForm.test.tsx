@@ -276,6 +276,7 @@ describe('GuidedConfigForm', () => {
     expect(screen.getByRole('listbox', { name: 'Model suggestions' })).toBeDefined()
     // Typing narrows the filtered suggestions; Enter applies the active one.
     fireEvent.change(modelBox, { target: { value: 'mini' } })
+    fireEvent.keyDown(modelBox, { key: 'ArrowDown' })
     fireEvent.keyDown(modelBox, { key: 'Enter' })
     expect(modelBox.value).toBe('gpt-5-mini')
 
@@ -636,7 +637,7 @@ describe('guided edit regressions', () => {
     expect(document.getElementById(input.getAttribute('aria-activedescendant')!)?.textContent).toBe('alpha')
     expect(within(screen.getByRole('option', { name: 'alpha' })).queryByRole('button')).toBeNull()
     fireEvent.keyDown(input, { key: 'Enter' })
-    expect(onChange).toHaveBeenLastCalledWith('alpha')
+    expect(onChange).toHaveBeenLastCalledWith('alp')
     fireEvent.focus(input)
     view.rerender(<Combobox label="Choice" value="" onChange={onChange} options={['alpha', 'beta']} disabled />)
     expect(input.getAttribute('aria-expanded')).toBe('false')

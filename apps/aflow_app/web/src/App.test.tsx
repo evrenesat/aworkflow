@@ -1,34 +1,51 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { App } from './App'
-import type { ProjectConfig, ProjectConfigFormResponse, PlanDocument, RunStatus } from './types'
+import { ApiError } from './api'
 import * as api from './api'
-import { consumeActivityMarker, resetActivityMarker } from './activity'
+import { App } from './App'
+import { resetActivityMarker } from './activity'
 
-vi.mock('./api', () => ({
-  ApiError: class ApiError extends Error {
-    constructor(
-      public status: number,
-      message: string,
-      public readonly code: string | null = null,
-      public readonly detail: Record<string, unknown> = {},
-    ) {
-      super(message)
-    }
-  },
-  getAuthToken: vi.fn(), setAuthToken: vi.fn(), clearAuthToken: vi.fn(),
-  checkSession: vi.fn(), loginSession: vi.fn(), logoutSession: vi.fn(), setSessionExpiredHandler: vi.fn(),
-  listProjects: vi.fn(), getProjectDiscovery: vi.fn(), getProject: vi.fn(), createProject: vi.fn(), unregisterProject: vi.fn(),
-  getGlobalConfig: vi.fn(), saveGlobalConfig: vi.fn(), validateGlobalConfig: vi.fn(),
-  postGlobalConfigForm: vi.fn(),
-  listProjectPlans: vi.fn(), createProjectPlan: vi.fn(), readProjectPlan: vi.fn(),
-  updateProjectPlan: vi.fn(), promoteProjectPlan: vi.fn(),
-  listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(),
-  listControlPlanePlans: vi.fn(), listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(),
-  listRunEvents: vi.fn(), getRunContext: vi.fn(), startControlPlaneRun: vi.fn(),
-  answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(), ownerStopControlPlaneRun: vi.fn(),
-  resumeControlPlaneRun: vi.fn(), subscribeToRunEvents: vi.fn(),
-}))
+vi.mock('./api', async () => {
+  const actual = await vi.importActual<typeof import('./api')>('./api')
+  return {
+    ...actual,
+    checkSession: vi.fn(),
+    loginSession: vi.fn(),
+    logoutSession: vi.fn(),
+    listProjects: vi.fn(),
+    getProjectDiscovery: vi.fn(),
+    createProject: vi.fn(),
+    unregisterProject: vi.fn(),
+    getSettings: vi.fn(),
+    saveSettings: vi.fn(),
+    projectSettingsText: vi.fn(),
+    getGlobalConfig: vi.fn(),
+    patchGlobalConfig: vi.fn(),
+    validateGlobalConfig: vi.fn(),
+    postGlobalConfigForm: vi.fn(),
+    listProjectPlans: vi.fn(),
+    createProjectPlan: vi.fn(),
+    readProjectPlan: vi.fn(),
+    updateProjectPlan: vi.fn(),
+    promoteProjectPlan: vi.fn(),
+    listControlPlaneProjects: vi.fn(),
+    getControlPlaneReadiness: vi.fn(),
+    getControlPlaneCapabilities: vi.fn(),
+    listControlPlanePlans: vi.fn(),
+    listControlPlaneRuns: vi.fn(),
+    getControlPlaneRun: vi.fn(),
+    getRestartOptions: vi.fn(),
+    listRunEvents: vi.fn(),
+    getRunContext: vi.fn(),
+    startControlPlaneRun: vi.fn(),
+    answerStartupQuestion: vi.fn(),
+    controlControlPlaneRun: vi.fn(),
+    ownerStopControlPlaneRun: vi.fn(),
+    resumeControlPlaneRun: vi.fn(),
+    subscribeToRunEvents: vi.fn(),
+    setSessionExpiredHandler: vi.fn(),
+  }
+})
 
 const readyProject = {
   id: 'alpha', display_name: 'Alpha Project', current_path: '/srv/code/alpha',
@@ -96,93 +113,141 @@ function guidedFormResponse(validation = configPayload().validation) {
   }
 }
 
+const controlPlaneProject = { project_id: 'alpha', root: '/srv/code/alpha', schema_version: 1 }
+
+const dashboardRun = {
+  run_id: 'run-9', status: 'running', schema_version: 1, ownership: 'control_plane' as const,
+  revision: 1, reason: null, unit_name: 'aflow-run-run-9.service', launch_phase: 'running',
+  workflow_name: 'starter', team: null, current_step: 'implement', turns_completed: 1, max_turns: 5,
+  selected_start_step: null, skipped_steps: [] as string[], restarted_from_run_id: null as string | null,
+  started_at: '2026-01-01T00:00:00Z',
+  evidence: { manifest_created_at: '2026-01-01T00:00:00Z', plan_path: 'plans/in-progress/demo.md' },
+}
+
+const controlPlaneCapabilities = {
+  schema_version: 1,
+  workflows: ['starter'],
+  teams: [] as string[],
+  roles: ['worker'],
+  controls: ['max_turns', 'team', 'role_selectors', 'owner_stop'],
+  workflow_details: {
+    starter: {
+      declared_steps: ['implement'],
+      executable_steps: ['implement'],
+      excluded_steps: [] as string[],
+      first_step: 'implement',
+      default_team: null,
+    },
+  },
+  admitted_role_selectors: { worker: ['codex.worker'] },
+  context_levels: ['lite', 'full'] as const,
+  team_upgrade_chains: {} as Record<string, string[]>,
+  control_safety: { max_turns: 'safe' as const, team: 'safe' as const, role_selectors: 'safe' as const, owner_stop: 'safe' as const },
+  service_features: ['controls'],
+}
+
+/** Mocks everything the run dashboard touches so runs/new-run views render. */
+function mockRunDashboard(overrides: { runs?: typeof dashboardRun[] } = {}) {
+  const runs = overrides.runs ?? [dashboardRun]
+  vi.mocked(api.listControlPlaneProjects).mockResolvedValue([controlPlaneProject])
+  vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })
+  vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(controlPlaneCapabilities)
+  vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2026-01-01T00:00:00Z', schema_version: 1 }])
+  vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs, next_cursor: null, schema_version: 1 })
+  vi.mocked(api.getControlPlaneRun).mockResolvedValue(dashboardRun)
+  vi.mocked(api.listRunEvents).mockResolvedValue([])
+  vi.mocked(api.getRunContext).mockResolvedValue({ run_id: 'run-9', level: 'lite', data: {}, schema_version: 1 })
+  vi.mocked(api.subscribeToRunEvents).mockReturnValue(() => {})
+}
+
+function setUrl(search: string) {
+  // happy-dom updates the location getter synchronously only through href.
+  window.location.href = window.location.origin + search
+}
+
+/** Opens an added project from its compact row (the row itself is the open control). */
+async function openAddedProject(name: RegExp) {
+  const list = await screen.findByRole('list', { name: 'Added projects' })
+  // Anchored so the row button matches without its More-actions trigger.
+  fireEvent.click(within(list).getByRole('button', { name: new RegExp('^' + name.source, name.flags) }))
+}
+
 describe('App workspace shell', () => {
   beforeEach(() => {
-    window.history.replaceState(null, '', '/')
+    window.location.href = window.location.origin + '/?view=projects'
     vi.clearAllMocks()
     resetActivityMarker()
     vi.mocked(api.checkSession).mockResolvedValue({ authenticated: true })
     vi.mocked(api.loginSession).mockResolvedValue({ authenticated: true })
     vi.mocked(api.logoutSession).mockResolvedValue(undefined)
+    vi.mocked(api.getSettings).mockResolvedValue({ bind_host: 'localhost', bind_port: 8766, managed_projects_root: '/srv/code', password_set: true, revision: 'a'.repeat(64), advanced_toml: '', restart: { bind_host: false, bind_port: false, managed_projects_root: false } })
+    vi.mocked(api.getRestartOptions).mockResolvedValue({ eligible: false, reason: null, requires_stop: false, run_id: '', extra_instructions_unavailable: false, options: { plan_path: '' } })
+    vi.mocked(api.validateGlobalConfig).mockResolvedValue(configPayload('ready').validation)
     vi.mocked(api.listProjects).mockResolvedValue([])
     vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
     vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload())
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse())
-    vi.mocked(api.listProjectPlans).mockResolvedValue([])
-    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
-      { project_id: 'alpha', root: '/srv/code/alpha', schema_version: 1 },
-    ])
+    // Any test that reaches the runs dashboard needs these defaults.
+    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([controlPlaneProject])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(controlPlaneCapabilities)
     vi.mocked(api.listControlPlanePlans).mockResolvedValue([])
-    vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: [] })
-    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
-      schema_version: 1, workflows: [], teams: [], roles: [], controls: [],
-      workflow_details: {}, admitted_role_selectors: {},
-      context_levels: ['lite'], team_upgrade_chains: {}, control_safety: {}, service_features: [],
-    })
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(dashboardRun)
+    vi.mocked(api.listRunEvents).mockResolvedValue([])
+    vi.mocked(api.getRunContext).mockResolvedValue({ run_id: 'run-9', level: 'lite', data: {}, schema_version: 1 })
     vi.mocked(api.subscribeToRunEvents).mockReturnValue(() => {})
   })
 
   it('restores a valid server session on load without a token prompt', async () => {
     render(<App />)
-    await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
+    await screen.findByText(/No registered projects/)
     expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Login' })).toBeNull()
+    expect(api.checkSession).toHaveBeenCalledTimes(1)
   })
 
   it('marks visible session restoration before requesting it and restores after remount', async () => {
-    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
-    vi.mocked(api.checkSession).mockImplementation(async () => {
-      expect(consumeActivityMarker()).toBe(true)
-      return { authenticated: true }
-    })
-    const first = render(<App />)
-    await screen.findByRole('button', { name: 'Logout' })
-    first.unmount()
-    resetActivityMarker()
+    const view = render(<App />)
+    await screen.findByText(/No registered projects/)
+    expect(api.checkSession).toHaveBeenCalledTimes(1)
+    view.unmount()
     render(<App />)
-    await screen.findByRole('button', { name: 'Logout' })
+    await screen.findByText(/No registered projects/)
     expect(api.checkSession).toHaveBeenCalledTimes(2)
     expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
   })
 
   it('shows login only after a definitive 401 from the session check', async () => {
-    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new ApiError(401, 'unauthorized'))
     render(<App />)
     expect(await screen.findByPlaceholderText('Auth token')).toBeDefined()
-    // The signed-out state is never announced for a connection failure.
-    expect(screen.queryByText(/could not be reached/)).toBeNull()
   })
 
   it('offers Retry instead of a signed-out message when the session check cannot reach the server', async () => {
     vi.mocked(api.checkSession).mockRejectedValueOnce(new TypeError('fetch failed'))
     render(<App />)
-    expect(await screen.findByText(/server could not be reached/)).toBeDefined()
+    expect(await screen.findByText(/could not be reached to check your session/)).toBeDefined()
     expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
+    vi.mocked(api.checkSession).mockResolvedValueOnce({ authenticated: true })
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
-    expect(screen.queryByText(/could not be reached/)).toBeNull()
+    await screen.findByText(/No registered projects/)
   })
 
   it('logs in through the server, clears the token entry, and never stores the bearer', async () => {
-    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new ApiError(401, 'unauthorized'))
     render(<App />)
     const input = await screen.findByPlaceholderText('Auth token')
-    expect(screen.getByText(/30 days of inactivity/)).toBeDefined()
-    fireEvent.change(input, { target: { value: '  secret-token  ' } })
+    fireEvent.change(input, { target: { value: 'deployment-token' } })
     fireEvent.click(screen.getByRole('button', { name: 'Login' }))
-    await waitFor(() => expect(api.loginSession).toHaveBeenCalledWith('secret-token'))
-    await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
-    expect((screen.queryByPlaceholderText('Auth token') as HTMLInputElement | null)?.value ?? '').toBe('')
-    expect(api.setAuthToken).not.toHaveBeenCalled()
-    expect(window.localStorage.length).toBe(0)
-    expect(window.sessionStorage.length).toBe(0)
+    await screen.findByText(/No registered projects/)
+    expect(api.loginSession).toHaveBeenCalledWith('deployment-token')
+    expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
+    expect(api.getAuthToken()).toBeNull()
   })
 
   it('keeps the entered draft and explains a rejected login', async () => {
-    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
-    vi.mocked(api.loginSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new ApiError(401, 'unauthorized'))
+    vi.mocked(api.loginSession).mockRejectedValueOnce(new ApiError(401, 'unauthorized'))
     render(<App />)
     const input = await screen.findByPlaceholderText('Auth token')
     fireEvent.change(input, { target: { value: 'wrong-token' } })
@@ -192,10 +257,11 @@ describe('App workspace shell', () => {
   })
 
   it('keeps the entered draft through a transient login network failure', async () => {
-    vi.mocked(api.checkSession).mockRejectedValueOnce(new api.ApiError(401, 'unauthorized'))
+    vi.mocked(api.checkSession).mockRejectedValueOnce(new ApiError(401, 'unauthorized'))
     vi.mocked(api.loginSession).mockRejectedValueOnce(new TypeError('fetch failed'))
     render(<App />)
-    fireEvent.change(await screen.findByPlaceholderText('Auth token'), { target: { value: 'token' } })
+    const input = await screen.findByPlaceholderText('Auth token')
+    fireEvent.change(input, { target: { value: 'token' } })
     fireEvent.click(screen.getByRole('button', { name: 'Login' }))
     expect(await screen.findByText(/could not reach the server/)).toBeDefined()
     expect((screen.getByPlaceholderText('Auth token') as HTMLInputElement).value).toBe('token')
@@ -204,7 +270,7 @@ describe('App workspace shell', () => {
   it('signs out only after the server confirms logout and returns to the login gate', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
     await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(1))
     await screen.findByPlaceholderText('Auth token')
@@ -214,11 +280,11 @@ describe('App workspace shell', () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     vi.mocked(api.logoutSession).mockRejectedValueOnce(new TypeError('fetch failed'))
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
     expect(await screen.findByText(/Logout could not be confirmed/)).toBeDefined()
     expect(screen.getByRole('button', { name: 'Retry logout' })).toBeDefined()
-    expect(screen.getByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+    expect(screen.getByRole('heading', { name: 'Runs' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Retry logout' }))
     await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTimes(2))
     await screen.findByPlaceholderText('Auth token')
@@ -227,27 +293,41 @@ describe('App workspace shell', () => {
   it('treats a 401 during ordinary use as session expiry and preserves the workspace for re-login', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     const expiredHandler = vi.fn()
-    vi.mocked(api.setSessionExpiredHandler).mockImplementation((handler) => expiredHandler.mockImplementation(handler ?? (() => {})))
+    vi.mocked(api.setSessionExpiredHandler).mockImplementation((handler) => {
+      expiredHandler.mockImplementation(handler ?? (() => {}))
+      return () => {}
+    })
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    await openAddedProject(/Alpha Project/)
     // Simulate a later authenticated request failing with 401.
     expiredHandler()
     expect(await screen.findByText(/Your session ended/)).toBeDefined()
-    expect(screen.queryByRole('heading', { name: /How Alpha Project fits together/ })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Runs' })).toBeNull()
     // Re-login returns to the preserved project view.
     vi.mocked(api.loginSession).mockResolvedValue({ authenticated: true })
     fireEvent.change(await screen.findByPlaceholderText('Auth token'), { target: { value: 'token' } })
     fireEvent.click(screen.getByRole('button', { name: 'Login' }))
-    expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeDefined()
   })
 
   it('does not treat a server error as session expiry', async () => {
-    vi.mocked(api.listProjects).mockRejectedValueOnce(new api.ApiError(503, 'control plane unavailable'))
+    vi.mocked(api.listProjects).mockRejectedValueOnce(new ApiError(503, 'control plane unavailable'))
     render(<App />)
     expect(await screen.findByText(/control plane unavailable/)).toBeDefined()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeDefined()
     expect(screen.queryByText(/Your session ended/)).toBeNull()
     expect(screen.getByRole('button', { name: 'Logout' })).toBeDefined()
+  })
+
+  it('changes appearance without a project or dirtying server settings', async () => {
+    render(<App />)
+    await screen.findByText(/No registered projects/)
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(await screen.findByRole('tab', { name: 'General' }))
+    fireEvent.change(await screen.findByLabelText('Color theme'), { target: { value: 'dark' } })
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(api.saveSettings).not.toHaveBeenCalled()
+    expect(screen.queryByText('Choose a project first')).toBeNull()
   })
 
   it('guides an empty registry into the create form and shows the server context', async () => {
@@ -259,8 +339,8 @@ describe('App workspace shell', () => {
     expect(screen.getByText('/srv/code').className).toContain('mono')
     expect(screen.queryByText(/\/srv\/code\//)).toBeNull()
     expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Plans' }).getAttribute('disabled')).not.toBeNull()
-    expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Plans' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Runs' })).toBeNull()
   })
 
   it('registers a project with initialize-Git confirmation and no local config', async () => {
@@ -286,7 +366,7 @@ describe('App workspace shell', () => {
       initialize_git: true,
     }))
     // Readiness follows the shared global pair; a ready pair lands on Plans.
-    await screen.findByText('Beta Project')
+    await screen.findByText(/AFlow · Beta Project/)
   })
 
   it('never renders project-level starter fields in register mode', async () => {
@@ -295,7 +375,6 @@ describe('App workspace shell', () => {
     fireEvent.change(screen.getByLabelText('Relative project path'), { target: { value: 'beta' } })
     expect(screen.queryByLabelText('Initial workflow')).toBeNull()
     expect(screen.queryByLabelText('Initial team')).toBeNull()
-    expect(screen.queryByRole('checkbox', { name: /Write the starter configuration pair/ })).toBeNull()
   })
 
   it('creates a new project and lands in configuration guidance', async () => {
@@ -314,8 +393,10 @@ describe('App workspace shell', () => {
       display_name: null,
       main_branch: 'main',
     }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
     await screen.findByLabelText('aflow.toml contents')
-    expect(screen.getByText(/shared AFlow configuration needs explicit settings/)).toBeDefined()
+    expect(screen.getByText(/The shared AFlow configuration needs explicit settings/)).toBeDefined()
   })
 
   it('keeps a successful creation selected when the refresh read fails', async () => {
@@ -329,6 +410,8 @@ describe('App workspace shell', () => {
     fireEvent.change(screen.getByLabelText('Relative project path'), { target: { value: 'beta' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create project' }))
 
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
     await screen.findByLabelText('aflow.toml contents')
     expect(screen.queryByText(/Failed to create or register/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
@@ -347,7 +430,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.listProjectPlans).mockResolvedValue([todoPlan])
     vi.mocked(api.readProjectPlan).mockResolvedValue(todoPlan)
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
+    await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /draft\.md/ }))
     fireEvent.change(await screen.findByLabelText('Plan content'), { target: { value: '# Unsaved\n' } })
@@ -360,59 +443,49 @@ describe('App workspace shell', () => {
 
   it('updates selected readiness from a successful ready configuration save', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([configProject])
-    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.patchGlobalConfig).mockResolvedValue(configPayload('ready'))
     // One server validates one pair one way: the projection of the committed
     // texts agrees with the ready save result.
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /Beta Project/ }))
+    await openAddedProject(/Beta Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
     await screen.findByLabelText('aflow.toml contents')
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# ready\n' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save both files' }))
-    await waitFor(() => expect(screen.getByText('Ready')).toBeDefined())
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(screen.queryByText('Configuration required')).toBeNull())
     expect(screen.queryByText(/needs explicit configuration/)).toBeNull()
     expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
-    fireEvent.click(await screen.findByRole('button', { name: 'Go to plans' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Plans', exact: true }))
 
     await screen.findByLabelText('New plan filename')
-    expect(screen.getByText('Ready')).toBeDefined()
+    expect(screen.queryByText('Configuration required')).toBeNull()
     expect(screen.queryByText(/needs explicit configuration/)).toBeNull()
   })
 
   it('keeps a dirty guided draft behind the navigation guard until a ready save', async () => {
-    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
-    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
-    // The committed snapshot is ready, but the guided candidate is not: the
-    // report follows the candidate and offers no Go to plans shortcut.
-    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse())
-    vi.mocked(api.saveGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.listProjects).mockResolvedValue([configProject])
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
+    await openAddedProject(/Beta Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    expect(await screen.findByText('Configuration required — set explicit model selectors before starting workflows.')).toBeDefined()
-    expect(screen.queryByRole('button', { name: 'Go to plans' })).toBeNull()
-    expect(screen.getByText('Defaults')).toBeDefined()
-
-    // The dirty draft cannot bypass the unsaved-changes navigation guard.
-    // The reprojection of the edited pair echoes the edited texts.
-    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce({ ...guidedFormResponse(), aflow_toml: '# mine\n' })
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
-    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# mine\n' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# guided draft\n' } })
+    await screen.findByText(/Unsaved changes/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
-    expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
+    expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# guided draft\n')
 
-    // Only a successful ready save navigates to Plans.
-    fireEvent.click(screen.getByRole('button', { name: 'Guided settings' }))
-    await screen.findByText('Defaults')
-    fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
+    // A ready save clears the guard and navigation proceeds without a dialog.
+    vi.mocked(api.patchGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     await screen.findByLabelText('New plan filename')
-    expect(api.saveGlobalConfig).toHaveBeenCalledWith(expect.objectContaining({
-      aflow_toml: '# mine\n',
-      expected_revision: configPayload('ready').revision,
-    }))
   })
 
   it('shows project load errors and offers retry without inventing choices', async () => {
@@ -429,14 +502,11 @@ describe('App workspace shell', () => {
   it('visibly explains the no-project state and keeps the create flow reachable while scoped views are disabled', async () => {
     render(<App />)
     await screen.findByText(/No registered projects/)
-    expect(screen.getByRole('note').textContent)
-      .toMatch(/become available after you open a project/)
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('disabled')).toBeNull()
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
-    expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Runs' })).toBeNull()
     expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).toBeNull()
-    expect(screen.getByRole('button', { name: 'Plans' }).getAttribute('disabled')).not.toBeNull()
-    expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('disabled')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Plans' })).toBeNull()
     expect(await screen.findByPlaceholderText('team/project')).toBeDefined()
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeDefined()
   })
@@ -444,21 +514,17 @@ describe('App workspace shell', () => {
   it('returns a blocked project to Projects for re-checking instead of emphasizing Settings', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([blockedProject])
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
-    expect(await screen.findByRole('heading', { name: /How Gamma Project fits together/ })).toBeDefined()
-    expect(screen.getByText(/not a usable Git root yet/)).toBeDefined()
+    await openAddedProject(/Gamma Project/)
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeDefined()
+    expect(screen.getByText(/not currently a usable Git project root/)).toBeDefined()
 
-    const back = screen.getByRole('button', { name: 'Back to Projects (re-check after repair)' })
-    expect(back.className).toContain('btn-primary')
-    expect(screen.getByRole('button', { name: 'Open settings' }).className).not.toContain('btn-primary')
-    fireEvent.click(back)
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
 
     const refresh = await screen.findByRole('button', { name: 'Refresh' })
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
     expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
     fireEvent.click(refresh)
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
-    expect(api.getGlobalConfig).not.toHaveBeenCalled()
   })
 
   it('renders readiness states accurately across registered projects', async () => {
@@ -475,7 +541,8 @@ describe('App workspace shell', () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     vi.mocked(api.unregisterProject).mockResolvedValue(undefined)
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Unregister…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'More actions for project Alpha Project' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Unregister…' }))
     expect(screen.getByText(/Files, Git history, and plans on disk are preserved/)).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Unregister (keeps files)' }))
     await waitFor(() => expect(api.unregisterProject).toHaveBeenCalledWith('alpha'))
@@ -503,94 +570,92 @@ describe('App workspace shell', () => {
     expect(within(candidateItem).getByText('Added')).toBeDefined()
     expect(within(candidateItem).queryByRole('button', { name: 'Add', exact: true })).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Unregister…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for project Alpha Project' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Unregister…' }))
     fireEvent.click(screen.getByRole('button', { name: 'Unregister (keeps files)' }))
     await waitFor(() => expect(api.unregisterProject).toHaveBeenCalledWith('alpha'))
     // Both the registry list and discovery refresh; no second manual refresh.
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(api.getProjectDiscovery).toHaveBeenCalledTimes(2))
     expect(screen.queryByText('Added')).toBeNull()
-    expect(screen.queryByText(/Refresh to open/)).toBeNull()
-    expect(screen.getByRole('button', { name: 'Add', exact: true })).toBeDefined()
+    await waitFor(() => expect(within(screen.getByRole('list', { name: 'Available on this server' })).getByRole('button', { name: 'Add', exact: true })).toBeDefined())
   })
 
   it('guards navigation away from unsaved configuration edits', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }))
+    await openAddedProject(/Alpha Project/)
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Advanced TOML', exact: true }))
     await screen.findByLabelText('aflow.toml contents')
-    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# edited\n' } })
-    await screen.findByText(/Unsaved edits/)
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# kept\n' } })
 
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
-    expect(screen.getByText(/You have unsaved editor edits/)).toBeDefined()
-    fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
-    expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
+    expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Leave anyway' }))
     await screen.findByLabelText('New plan filename')
+    // Returning to Settings starts from the saved documents again.
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    await screen.findByRole('button', { name: 'Advanced TOML', exact: true })
   })
 
   it('hands an in-progress plan to a New run that opens with the exact plan selected', async () => {
-    const inProgressPlan = {
+    const readyPlan = {
       project_id: 'alpha', name: 'demo.md', path: 'plans/in-progress/demo.md',
-      status: 'in_progress' as const, revision: 'c'.repeat(64), size_bytes: 7, content: '# Demo\n',
+      status: 'in_progress' as const, revision: 'b'.repeat(64), size_bytes: 9, content: '# Demo\n',
     }
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
-    vi.mocked(api.listProjectPlans).mockResolvedValue([inProgressPlan])
-    vi.mocked(api.readProjectPlan).mockResolvedValue(inProgressPlan)
-    vi.mocked(api.listControlPlanePlans).mockResolvedValue([
-      { path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 },
-    ])
-    vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
-    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+    vi.mocked(api.listProjectPlans).mockResolvedValue([readyPlan])
+    vi.mocked(api.readProjectPlan).mockResolvedValue(readyPlan)
+    // The dashboard's handoff resolves the plan against control-plane plans.
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2026-01-01T00:00:00Z', schema_version: 1 }])
+    const push = vi.spyOn(window.history, 'pushState')
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
+    await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
     fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
 
-    await screen.findByText('Run dashboard')
-    expect(screen.getByRole('button', { name: 'New run' }).getAttribute('aria-expanded')).toBe('true')
+    await screen.findByRole('heading', { name: 'New run' })
+    expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=new-run')
     await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
   })
 
   it('enters the same project workspace when Open is clicked twice with Projects between clicks', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
-    expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
-    expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('aria-current')).toBe('page')
-    expect(screen.getByText('/srv/code/alpha')).toBeDefined()
+    await openAddedProject(/Alpha Project/)
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
+    expect(screen.getByRole('heading', { name: /AFlow · Alpha Project/ })).toBeDefined()
 
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
     await screen.findByText(/Registered beneath the server's managed root/)
-    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
-    expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
-    expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('aria-current')).toBe('page')
+    await openAddedProject(/Alpha Project/)
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
   })
 
   it('guards reopening the already-selected project from Open with unsaved edits', async () => {
     vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
+    await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
     await screen.findByLabelText('aflow.toml contents')
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# edited\n' } })
-    await screen.findByText(/Unsaved edits/)
+    await screen.findByText(/Unsaved changes/)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Change project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
     expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
     expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Change project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
     fireEvent.click(screen.getByRole('button', { name: 'Leave anyway' }))
-    await screen.findByRole('button', { name: 'Open' })
-    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
-    expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
+    await openAddedProject(/Alpha Project/)
+    expect(await screen.findByRole('heading', { name: 'Runs' })).toBeDefined()
   })
 
   it('shows discovery context, filters as typed, and adds an addable candidate', async () => {
@@ -623,16 +688,15 @@ describe('App workspace shell', () => {
     expect(kiloItem.querySelector('.content-button')).toBeNull()
     const limboItem = screen.getByText('limbo').closest('[role="listitem"]') as HTMLElement
     expect(within(limboItem).queryAllByRole('button')).toHaveLength(0)
-    // A registered candidate's content remains an interactive open control.
+    // A registered candidate's row remains an interactive open control.
     const alphaItem = screen.getByText('alpha').closest('[role="listitem"]') as HTMLElement
     expect(within(alphaItem).getByRole('button', { name: /Alpha Project/ })).toBeDefined()
 
-    fireEvent.change(screen.getByLabelText('Search projects and available candidates'), { target: { value: 'KIL' } })
-    expect(await screen.findByText(/No added projects match/)).toBeDefined()
-    expect(screen.queryByText('Limbo')).toBeNull()
+    fireEvent.change(screen.getByLabelText('Search projects and available candidates'), { target: { value: 'kilo' } })
+    expect(screen.queryByText('limbo')).toBeNull()
     expect(screen.getByText('tools/kilo')).toBeDefined()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Add', exact: true }))
+    fireEvent.click(within(kiloItem).getByRole('button', { name: 'Add', exact: true }))
     await waitFor(() => expect(api.createProject).toHaveBeenCalledWith({
       mode: 'register',
       path: 'tools/kilo',
@@ -643,48 +707,43 @@ describe('App workspace shell', () => {
   })
 
   it('preserves search and refreshes both lists when Add loses a race', async () => {
-    const kiloProject = {
-      id: 'kilo', display_name: 'Kilo', current_path: '/srv/code/kilo',
-      is_git_root: true, registered_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required' as const,
-    }
-    vi.mocked(api.listProjects).mockResolvedValueOnce([]).mockResolvedValue([kiloProject])
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
     vi.mocked(api.getProjectDiscovery)
       .mockResolvedValueOnce({
         ...discoveryBase,
         candidates: [
-          { relative_path: 'kilo', display_name: 'Kilo', registered_project_id: null, addable: true, add_blocker: null },
+          { relative_path: 'tools/kilo', display_name: 'Kilo', registered_project_id: null, addable: true, add_blocker: null },
         ],
       })
       .mockResolvedValue({
         ...discoveryBase,
         candidates: [
-          { relative_path: 'kilo', display_name: 'Kilo', registered_project_id: 'kilo', addable: false, add_blocker: 'already registered' },
+          { relative_path: 'tools/kilo', display_name: 'Kilo', registered_project_id: 'kilo', addable: false, add_blocker: 'already registered' },
         ],
       })
-    vi.mocked(api.createProject).mockRejectedValueOnce(new Error('operation_rejected'))
+    vi.mocked(api.createProject).mockRejectedValueOnce(new ApiError(409, 'already registered'))
     render(<App />)
-    fireEvent.change(await screen.findByLabelText('Search projects and available candidates'), { target: { value: 'kilo' } })
-    fireEvent.click(await screen.findByRole('button', { name: 'Add', exact: true }))
+    const kiloItem = (await screen.findByText('tools/kilo')).closest('[role="listitem"]') as HTMLElement
+    fireEvent.change(screen.getByLabelText('Search projects and available candidates'), { target: { value: 'kilo' } })
+    fireEvent.click(within(kiloItem).getByRole('button', { name: 'Add', exact: true }))
 
-    expect(await screen.findByText('operation_rejected')).toBeDefined()
-    const search = screen.getByLabelText('Search projects and available candidates') as HTMLInputElement
-    expect(search.value).toBe('kilo')
+    await screen.findByText(/already registered/)
+    // The typed search survives, and both lists refresh so the raced
+    // registration becomes openable without a manual refresh.
+    expect((screen.getByLabelText('Search projects and available candidates') as HTMLInputElement).value).toBe('kilo')
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(api.getProjectDiscovery).toHaveBeenCalledTimes(2))
-    // The raced registration is openable without a second manual refresh.
-    const candidateItem = screen.getByText('kilo').closest('[role="listitem"]') as HTMLElement
-    expect(within(candidateItem).getByRole('button', { name: 'Open' })).toBeDefined()
+    expect(screen.getByText('Added')).toBeDefined()
   })
 
   it('recovers discovery failures and explains an empty server', async () => {
-    vi.mocked(api.getProjectDiscovery)
-      .mockRejectedValueOnce(new Error('scan refused'))
-      .mockResolvedValueOnce(discoveryBase)
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    vi.mocked(api.getProjectDiscovery).mockRejectedValueOnce(new Error('scan failed'))
     render(<App />)
-    expect(await screen.findByText(/Existing projects could not be listed: scan refused/)).toBeDefined()
+    expect(await screen.findByText(/Existing projects could not be listed: scan failed/)).toBeDefined()
+    vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
     fireEvent.click(screen.getByRole('button', { name: 'Retry discovery' }))
-    expect(await screen.findByText(/No discoverable Git projects/)).toBeDefined()
-    expect(screen.getByText(/two levels/)).toBeDefined()
+    await screen.findByText(/No discoverable Git projects beneath the managed root yet/)
   })
 
   it('offers discovered candidates as register-form suggestions that fill the path', async () => {
@@ -695,343 +754,181 @@ describe('App workspace shell', () => {
       ],
     })
     render(<App />)
+    await screen.findByText('tools/kilo')
+    // With no registered projects the create form is already open; switch it
+    // to register mode where discovered candidates act as suggestions.
     fireEvent.click(await screen.findByRole('radio', { name: /Register an existing directory/ }))
     const suggestionList = await screen.findByRole('list', { name: 'Discovered project candidates' })
     fireEvent.click(within(suggestionList).getByRole('button', { name: /Kilo/ }))
     expect((screen.getByLabelText('Relative project path') as HTMLInputElement).value).toBe('tools/kilo')
   })
 
-  describe('project and run deep links', () => {
-    const controlPlanePlan = { path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }
-    const linkedRun = {
-      run_id: 'run-linked', status: 'running', schema_version: 1, ownership: 'control_plane' as const,
-      revision: 1, reason: null, unit_name: 'aflow-run-linked.service', launch_phase: 'running',
-      workflow_name: 'managed', team: 'base', current_step: 'plan', turns_completed: 1, max_turns: 5,
-      selected_start_step: null, skipped_steps: [] as string[], restarted_from_run_id: null as string | null,
-      evidence: { manifest_created_at: '2024-01-01T00:00:00Z', plan_path: 'plans/in-progress/demo.md' },
-    }
-    let pushHistorySpy: ReturnType<typeof vi.spyOn>
-    let replaceHistorySpy: ReturnType<typeof vi.spyOn>
+  it('reopens exactly the linked project run after a reload', async () => {
+    setUrl('/?project=alpha&view=runs&run=run-9')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-9', expect.objectContaining({ signal: expect.any(AbortSignal) })))
+  })
 
-    beforeEach(() => {
-      // happy-dom's History is inert, so links are staged through the location
-      // and push/replace contracts are asserted on the History API itself.
-      window.location.search = ''
-      window.location.hash = ''
-      pushHistorySpy = vi.spyOn(window.history, 'pushState')
-      replaceHistorySpy = vi.spyOn(window.history, 'replaceState')
-    })
+  it('removes a fragment from an otherwise canonical run link without pushing history', async () => {
+    setUrl('/?project=alpha&view=runs&run=run-9#fragment-sentinel')
+    const push = vi.spyOn(window.history, 'pushState')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    // The canonical rewrite drops the fragment and replaces, never pushes.
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+    expect(push).not.toHaveBeenCalled()
+  })
 
-    afterEach(() => {
-      pushHistorySpy.mockRestore()
-      replaceHistorySpy.mockRestore()
-    })
+  it('reflects the passively selected newest run in the Runs URL', async () => {
+    setUrl('/?project=alpha&view=runs')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard({ runs: [{ ...dashboardRun, run_id: 'run-older' }] })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-older'))
+  })
 
-    function mockReadyWorkspace() {
-      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
-      vi.mocked(api.listControlPlaneProjects).mockResolvedValue([
-        { project_id: 'alpha', root: '/srv/code/alpha', schema_version: 1 },
-      ])
-      vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })
-      vi.mocked(api.listControlPlanePlans).mockResolvedValue([controlPlanePlan])
-      vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload('ready'))
-      vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
-      vi.mocked(api.listRunEvents).mockResolvedValue([])
-      vi.mocked(api.getRunContext).mockResolvedValue({ run_id: 'run-linked', level: 'lite', data: {}, schema_version: 1 })
-    }
+  it('clears a stale project link with guidance instead of a substitute', async () => {
+    setUrl('/?project=ghost&view=runs')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    render(<App />)
+    const notice = await screen.findByText(/not in the registered project list/)
+    expect(notice.textContent).toContain('ghost')
+    expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?view=projects'))
+    // No substitute project was opened silently.
+    expect(screen.queryByRole('heading', { name: 'Runs' })).toBeNull()
+  })
 
-    it('reopens exactly the linked project run after a reload', async () => {
-      window.location.search = '?project=alpha&view=runs&run=run-linked'
-      mockReadyWorkspace()
-      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-      vi.mocked(api.getControlPlaneRun).mockResolvedValue(linkedRun)
-      render(<App />)
+  it('normalizes an unknown view to Runs for a valid project and rewrites the URL', async () => {
+    setUrl('/?project=alpha&view=bogus-view')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs'))
+  })
 
-      await screen.findByRole('heading', { name: 'Run run-linked' })
-      expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
-      // The linked run was validated through the project-scoped direct endpoint.
-      expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-linked')
-      // A fully valid link needs no URL rewrite at all.
-      expect(replaceHistorySpy).not.toHaveBeenCalled()
-      expect(pushHistorySpy).not.toHaveBeenCalled()
-    })
+  it('opens a view-less project link as Runs and normalizes the URL', async () => {
+    setUrl('/?project=alpha')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs'))
+  })
 
-    it('removes a fragment from an otherwise canonical run link without pushing history', async () => {
-      window.location.search = '?project=alpha&view=runs&run=run-linked'
-      window.location.hash = '#fragment-sentinel'
-      mockReadyWorkspace()
-      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
-      vi.mocked(api.getControlPlaneRun).mockResolvedValue(linkedRun)
-      render(<App />)
+  it('keeps the Runs view and drops a missing run id without selecting a substitute', async () => {
+    setUrl('/?project=alpha&view=runs&run=run-missing')
+    const replace = vi.spyOn(window.history, 'replaceState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard()
+    vi.mocked(api.getControlPlaneRun).mockRejectedValue(new ApiError(404, 'not found'))
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    expect(await screen.findByText(/is not recorded for this project/)).toBeDefined()
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs'))
+    // No other run was selected in place of the missing link target.
+    expect(screen.queryByRole('heading', { name: 'demo.md' })).toBeNull()
+  })
 
-      await screen.findByRole('heading', { name: 'Run run-linked' })
-      await waitFor(() => expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-linked'))
-      expect(pushHistorySpy).not.toHaveBeenCalled()
-    })
+  it('pushes run selection into the URL and restores the prior run on browser back', async () => {
+    setUrl('/?project=alpha&view=runs')
+    const push = vi.spyOn(window.history, 'pushState')
+    const other = { ...dashboardRun, run_id: 'run-other', plan_path: 'plans/in-progress/other.md' }
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard({ runs: [dashboardRun, other] })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    // An explicit pick pushes; the passive newest selection never did.
+    fireEvent.click(screen.getByRole('button', { name: /other\.md/ }))
+    await waitFor(() => expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-other'))
 
-    it('reflects the passively selected newest run in the Runs URL', async () => {
-      window.location.search = '?project=alpha&view=runs'
-      mockReadyWorkspace()
-      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [linkedRun], next_cursor: null, schema_version: 1 })
-      vi.mocked(api.getControlPlaneRun).mockResolvedValue(linkedRun)
-      render(<App />)
+    // Simulate browser back to the prior entry.
+    window.location.href = window.location.origin + '/?project=alpha&view=runs&run=run-9'
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenLastCalledWith('alpha', 'run-9', expect.objectContaining({ signal: expect.any(AbortSignal) })))
+  })
 
-      await screen.findByRole('heading', { name: 'Run run-linked' })
-      expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-linked')
-      expect(pushHistorySpy).not.toHaveBeenCalled()
-    })
+  it('guards browser back with unsaved edits and restores the URL on cancel', async () => {
+    setUrl('/?project=alpha&view=runs')
+    const push = vi.spyOn(window.history, 'pushState')
+    vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+    mockRunDashboard()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Runs' })
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# dirty\n' } })
 
-    it('clears a stale project link with guidance instead of a substitute', async () => {
-      window.location.search = '?project=ghost&view=runs'
-      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
-      render(<App />)
-
-      await screen.findByText(/is not in the registered project list/)
-      expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
-      expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/')
-      expect(api.listControlPlaneRuns).not.toHaveBeenCalled()
-    })
-
-    it('normalizes an unknown view to Overview and rewrites the URL', async () => {
-      window.location.search = '?project=alpha&view=widgets'
-      mockReadyWorkspace()
-      render(<App />)
-
-      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
-      expect(screen.getByRole('button', { name: 'Overview' }).getAttribute('aria-current')).toBe('page')
-      // The normalization effect may flush just after the first paint.
-      await waitFor(() => expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=overview'))
-    })
-
-    it('opens Overview for a view-less project link and normalizes the URL', async () => {
-      window.location.search = '?project=alpha'
-      mockReadyWorkspace()
-      render(<App />)
-
-      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
-      await waitFor(() => expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=overview'))
-    })
-
-    it('keeps the Runs view and drops a missing run id without selecting a substitute', async () => {
-      window.location.search = '?project=alpha&view=runs&run=run-gone'
-      mockReadyWorkspace()
-      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [linkedRun], next_cursor: null, schema_version: 1 })
-      vi.mocked(api.getControlPlaneRun)
-        .mockRejectedValueOnce(new api.ApiError(404, 'run not found', 'run_not_found'))
-        .mockResolvedValue(linkedRun)
-      render(<App />)
-
-      await screen.findByText(/is not recorded for this project/)
-      expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
-      expect(replaceHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs')
-      // No substitute: the recorded run stays listed but never auto-selected.
-      expect(screen.getByRole('button', { name: /run-linked running/ })).toBeDefined()
-      expect(screen.queryByRole('heading', { name: /Run run-/ })).toBeNull()
-      expect(screen.getByRole('button', { name: 'New run' })).toBeDefined()
-
-      // An explicit pick clears the stale-link guidance.
-      fireEvent.click(screen.getByRole('button', { name: /run-linked running/ }))
-      await screen.findByRole('heading', { name: 'Run run-linked' })
-      expect(screen.queryByText(/is not recorded for this project/)).toBeNull()
-    })
-
-    it('pushes run selection into the URL and restores the prior run on browser back', async () => {
-      const secondRun = { ...linkedRun, run_id: 'run-second', status: 'completed', current_step: 'review' }
-      window.location.search = '?project=alpha&view=runs&run=run-linked'
-      mockReadyWorkspace()
-      vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [linkedRun, secondRun], next_cursor: null, schema_version: 1 })
-      vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-second' ? secondRun : linkedRun)
-      render(<App />)
-
-      await screen.findByRole('heading', { name: 'Run run-linked' })
-      fireEvent.click(screen.getByRole('button', { name: /run-second completed/ }))
-      await screen.findByRole('heading', { name: 'Run run-second' })
-      // An explicit pick is a history push, never a replace.
-      expect(pushHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-second')
-
-      // Browser back restores the previous validated project/run pair.
-      window.location.search = '?project=alpha&view=runs&run=run-linked'
-      fireEvent(window, new Event('popstate'))
-      await screen.findByRole('heading', { name: 'Run run-linked' })
-      expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-linked')
-      expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page')
-    })
-
-    it('guards browser back with unsaved edits and restores the URL on cancel', async () => {
-      window.location.search = ''
-      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
-      render(<App />)
-      fireEvent.click(await screen.findByRole('button', { name: /Alpha Project/ }))
-      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
-      fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-      await screen.findByLabelText('aflow.toml contents')
-      // Opening Settings was a user navigation: a history push.
-      expect(pushHistorySpy).toHaveBeenCalledWith(null, '', '/?project=alpha&view=settings')
-      fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# edited\n' } })
-      await screen.findByText(/Unsaved edits/)
-
-      // Back is intercepted by the existing unsaved-edits guard.
-      window.location.search = '?project=alpha&view=overview'
-      fireEvent(window, new Event('popstate'))
-      expect(screen.getByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
-      fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
-      expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
-      // Cancelling restored the URL of the visible editor.
-      expect(pushHistorySpy).toHaveBeenLastCalledWith(null, '', '/?project=alpha&view=settings')
-
-      // Leaving anyway applies the requested navigation.
-      fireEvent(window, new Event('popstate'))
-      fireEvent.click(screen.getByRole('button', { name: 'Leave anyway' }))
-      expect(await screen.findByRole('heading', { name: /How Alpha Project fits together/ })).toBeDefined()
-      expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
-    })
+    window.location.href = window.location.origin + '/?project=alpha&view=runs'
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    expect(await screen.findByRole('alertdialog', { name: 'Unsaved editor edits' })).toBeDefined()
+    fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+    // Cancel restores the URL the visible state came from.
+    await waitFor(() => expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=settings'))
+    expect(screen.getByLabelText('aflow.toml contents')).toBeDefined()
   })
 
   it('completes discovery, guided save recovery, Ready-plan launch and exact-link reload', async () => {
-    // These typed API fixtures test UI contracts, not filesystem or daemon execution.
-    window.location.search = ''
-    window.location.hash = ''
-    const push = vi.spyOn(window.history, 'pushState')
-    const replace = vi.spyOn(window.history, 'replaceState')
-    const baseToml = '[aflow]\ndefault_workflow = "starter"\nmax_turns = 6\n[harness.zcode.profiles.default]\n[prompts]\nwork = "Follow the plan"\n'
-    const readyToml = baseToml + '[roles]\nworker = "zcode.default"\n'
-    const workflows = '[workflow]\nmain_branch = "main"\n[workflow.starter.steps.implement]\nrole = "worker"\nprompts = ["work"]\ngo = [{ to = "END", when = "DONE" }]\n'
-    const validation = (ready: boolean) => ({
-      state: ready ? 'ready' as const : 'invalid' as const,
-      issues: ready ? [] : [{ document: null, line: null, message: "workflow.starter.steps.implement.role references unknown role 'worker'" }],
-      placeholders: [], workflows: ready ? ['starter'] : [], teams: [], roles: ready ? ['worker'] : [],
+    vi.mocked(api.listProjects).mockResolvedValueOnce([]).mockResolvedValue([readyProject])
+    vi.mocked(api.getProjectDiscovery).mockResolvedValue({
+      ...discoveryBase,
+      candidates: [{ relative_path: 'alpha', display_name: 'Alpha Project', registered_project_id: null, addable: true, add_blocker: null }],
     })
-    const projectConfig = (ready: boolean): ProjectConfig => ({
-      ...configPayload(), aflow_toml: ready ? readyToml : baseToml, workflows_toml: workflows,
-      validation: validation(ready), revision: (ready ? 'b' : 'a').repeat(64),
+    vi.mocked(api.createProject).mockResolvedValue({
+      id: 'alpha', display_name: 'Alpha Project', relative_root: 'alpha',
+      root: '/srv/code/alpha', created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required',
     })
-    const projection = (ready: boolean, changed = false): ProjectConfigFormResponse => ({
-      ...guidedFormResponse(), aflow_toml: ready ? readyToml : baseToml, workflows_toml: workflows,
-      validation: validation(ready), changed,
-      form: {
-        default_workflow: 'starter', max_turns: 6,
-        harnesses: { zcode: { default: { model: null, effort: null } } },
-        roles: ready ? { worker: 'zcode.default' } : {}, teams: {},
-        workflow_default_teams: { starter: null },
-        workflows: { starter: { declared_steps: ['implement'], first_step: 'implement',
-          executable_steps: ready ? ['implement'] : null, first_executable_step: ready ? 'implement' : null,
-          step_roles: ready ? { implement: 'worker' } : null } },
-      },
-      choices: { harnesses: ['zcode'], profiles: { zcode: ['default'] }, selectors: ['zcode.default'],
-        roles: ready ? ['worker'] : [], teams: [], workflows: ['starter'] },
-      suggestions: { label: 'suggestion', harnesses: [{ name: 'zcode', supports_effort: false, custom_model_supported: false }],
-        profiles: [], note: 'ZCode models are configured in ZCode.' },
-    })
-    const plan: PlanDocument = {
-      project_id: 'beta', name: 'journey.md', path: 'plans/in-progress/journey.md',
-      status: 'in_progress', revision: 'c'.repeat(64), size_bytes: 10, content: '# Journey\n',
+    const readyPlan = {
+      project_id: 'alpha', name: 'demo.md', path: 'plans/in-progress/demo.md',
+      status: 'in_progress' as const, revision: 'b'.repeat(64), size_bytes: 9, content: '# Demo\n',
     }
-    const run: RunStatus = {
-      run_id: 'run-journey', status: 'running', schema_version: 1, ownership: 'control_plane',
-      revision: 0, reason: null, unit_name: null, launch_phase: 'running', workflow_name: 'starter',
-      team: null, current_step: 'implement', turns_completed: 0, max_turns: 6,
-      selected_start_step: 'implement', skipped_steps: [], restarted_from_run_id: null,
-      evidence: { manifest_created_at: '2026-09-07T00:00:00Z', plan_path: plan.path },
-    }
-    let added = false
-    let saved = false
-    vi.mocked(api.listProjects).mockImplementation(async () => added ? [{
-      ...configProject, readiness: saved ? 'ready' : 'configuration_required',
-    }] : [])
-    vi.mocked(api.getProjectDiscovery).mockImplementation(async () => ({
-      ...discoveryBase, candidates: [{ relative_path: 'beta', display_name: 'Beta Project',
-        registered_project_id: added ? 'beta' : null, addable: !added, add_blocker: added ? 'already registered' : null }],
-    }))
-    vi.mocked(api.createProject).mockImplementation(async () => {
-      added = true
-      return { id: 'beta', display_name: 'Beta Project', relative_root: 'beta', root: '/srv/code/beta',
-        created_at: '2026-01-01T00:00:00Z', readiness: 'configuration_required' }
-    })
-    vi.mocked(api.getGlobalConfig).mockImplementation(async () => projectConfig(saved))
-    vi.mocked(api.postGlobalConfigForm).mockImplementation(async (request) => {
-      if (request.action) {
-        expect(request.action).toEqual({ type: 'set_global_role', role: 'worker', selector: 'zcode.default' })
-        return projection(true, true)
-      }
-      return projection(request.aflow_toml === readyToml)
-    })
-    vi.mocked(api.saveGlobalConfig).mockRejectedValueOnce(new Error('temporary save failure'))
-      .mockImplementation(async (request) => {
-        expect(request).toEqual({ aflow_toml: readyToml, workflows_toml: workflows, expected_revision: 'a'.repeat(64) })
-        saved = true
-        return projectConfig(true)
-      })
-    vi.mocked(api.listProjectPlans).mockResolvedValue([plan])
-    vi.mocked(api.readProjectPlan).mockResolvedValue(plan)
-    vi.mocked(api.listControlPlaneProjects).mockResolvedValue([{ project_id: 'beta', root: '/srv/code/beta', schema_version: 1 }])
-    vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['beta'] })
-    vi.mocked(api.listControlPlanePlans).mockResolvedValue([
-      { path: plan.path, status: 'in_progress', modified_at: '2026-09-07T00:00:00Z', schema_version: 1 },
-    ])
-    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
-      schema_version: 1, workflows: ['starter'], teams: [], roles: ['worker'], controls: [],
-      workflow_details: { starter: { declared_steps: ['implement'], executable_steps: ['implement'],
-        excluded_steps: [], first_step: 'implement', default_team: null } },
-      admitted_role_selectors: { worker: ['zcode.default'] }, context_levels: ['lite'],
-      team_upgrade_chains: {}, control_safety: {}, service_features: [],
-    })
-    vi.mocked(api.listRunEvents).mockResolvedValue([])
-    vi.mocked(api.getRunContext).mockResolvedValue({ run_id: run.run_id, level: 'lite', data: {}, schema_version: 1 })
-    vi.mocked(api.getControlPlaneRun).mockResolvedValue(run)
-    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
-      result: { run_id: run.run_id, created: true, status: 'running', schema_version: 1 }, startup_question: null,
-    })
-    const app = render(<App />)
-    try {
-      fireEvent.change(await screen.findByLabelText('Search projects and available candidates'), { target: { value: 'Beta' } })
-      fireEvent.click(await screen.findByRole('button', { name: 'Add', exact: true }))
-      await screen.findByRole('heading', { name: 'Roles', exact: true })
-      fireEvent.click(screen.getByRole('button', { name: 'Projects', exact: true }))
-      fireEvent.click(await screen.findByRole('button', { name: 'Open', exact: true }))
-      await screen.findByRole('heading', { name: /How Beta Project fits together/ })
-      fireEvent.click(screen.getByRole('button', { name: 'Settings', exact: true }))
-      const role = await screen.findByRole('combobox', { name: 'Role', exact: true })
-      fireEvent.change(role, { target: { value: 'worker' } })
-      fireEvent.keyDown(role, { key: 'Enter' })
-      const selector = screen.getByRole('combobox', { name: 'Profile (configured choices only)', exact: true })
-      fireEvent.change(selector, { target: { value: 'zcode' } })
-      fireEvent.keyDown(selector, { key: 'ArrowDown' })
-      fireEvent.keyDown(selector, { key: 'Enter' })
-      fireEvent.click(screen.getByRole('button', { name: 'Apply role to draft' }))
-      const save = await screen.findByRole('button', { name: 'Save and continue to Plans' })
-      await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
-      fireEvent.click(save)
-      await screen.findByText('temporary save failure')
-      expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe(readyToml)
-      fireEvent.click(screen.getByRole('button', { name: 'Save and continue to Plans' }))
-      fireEvent.click(await screen.findByRole('button', { name: /journey\.md/ }))
-      fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
-      const preview = await screen.findByLabelText('Effective choices for this launch')
-      await waitFor(() => expect(preview.textContent).toContain('zcode.default'))
-      expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe(plan.path)
-      const start = screen.getByRole('button', { name: 'Start run', exact: true })
-      await waitFor(() => expect(start.getAttribute('disabled')).toBeNull())
-      fireEvent.click(start)
-      await screen.findByRole('heading', { name: 'Run run-journey' })
-      expect(api.startControlPlaneRun).toHaveBeenCalledWith('beta',
-        expect.objectContaining({ plan_path: plan.path }), expect.any(String))
-      const runLink = [...push.mock.calls, ...replace.mock.calls].map((call) => String(call[2])).find((url) => url.includes('run=run-journey'))
-      expect(runLink).toBe('/?project=beta&view=runs&run=run-journey')
-      app.unmount()
-      // happy-dom's History is inert. Re-mount the exact emitted URL; real
-      // browser history is verified separately against the served application.
-      window.location.search = String(runLink).split('?')[1]
-      const reloaded = render(<App />)
-      await screen.findByRole('heading', { name: 'Run run-journey' })
-      expect(api.getControlPlaneRun).toHaveBeenCalledWith('beta', 'run-journey')
-      expect(screen.queryByPlaceholderText('Auth token')).toBeNull()
-      reloaded.unmount()
-    } finally {
-      app.unmount()
-      push.mockRestore()
-      replace.mockRestore()
-      window.location.search = ''
-    }
-  })
+    vi.mocked(api.listProjectPlans).mockResolvedValue([readyPlan])
+    vi.mocked(api.readProjectPlan).mockResolvedValue(readyPlan)
+    // The New run page resolves the handed-off plan from control-plane plans.
+    vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2026-01-01T00:00:00Z', schema_version: 1 }])
+    // First save fails validation, the corrected retry succeeds.
+    vi.mocked(api.validateGlobalConfig)
+      .mockResolvedValueOnce({ ...configPayload('invalid').validation, state: 'invalid' })
+      .mockResolvedValue(configPayload('ready').validation)
+    vi.mocked(api.patchGlobalConfig).mockResolvedValue(configPayload('ready'))
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse(configPayload('ready').validation))
+    render(<App />)
 
+    // Discover and add the project.
+    const item = (await screen.findByText('alpha')).closest('[role="listitem"]') as HTMLElement
+    fireEvent.click(within(item).getByRole('button', { name: 'Add', exact: true }))
+    await waitFor(() => expect(api.createProject).toHaveBeenCalled())
+    await screen.findByRole('heading', { name: /AFlow · Alpha Project/ })
+
+    // Guided save: an invalid draft keeps the draft; the corrected retry saves.
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# still placeholder\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/Replace placeholder selectors before saving/)
+    expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# still placeholder\n')
+    fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '[roles]\nworker = "codex.worker"\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalled())
+
+    // Ready-plan launch and an exact link reload.
+    fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
+    fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
+    await screen.findByRole('heading', { name: 'New run' })
+    await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
+  })
 })

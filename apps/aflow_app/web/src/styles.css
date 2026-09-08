@@ -1,16 +1,18 @@
 :root {
-  color-scheme: dark;
-  --color-bg: #0f0f0f;
-  --color-surface: #1a1a1a;
-  --color-surface-hover: #242424;
-  --color-border: #333;
-  --color-text: #e8e8e8;
-  --color-text-dim: #999;
-  --color-primary: #4a9eff;
-  --color-primary-hover: #3a8eef;
-  --color-success: #4ade80;
-  --color-warning: #fbbf24;
-  --color-error: #f87171;
+  color-scheme: light;
+  --color-bg: #F5F3ED;
+  --color-surface: #FFFDFA;
+  --color-surface-hover: #E7E5DE;
+  --color-border: #85877E;
+  --color-text: #2F312D;
+  --color-text-dim: #62645C;
+  --color-primary: #3D755D;
+  --color-primary-hover: #32634E;
+  --color-on-accent: #FFFFFF;
+  --color-success: #306B45;
+  --color-warning: #805800;
+  --color-error: #AF3434;
+  --color-on-error: #FFFFFF;
   
   --spacing-xs: 0.25rem;
   --spacing-sm: 0.5rem;
@@ -79,6 +81,11 @@ a {
   text-decoration: none;
 }
 
+input::placeholder, textarea::placeholder {
+  color: var(--color-text-dim);
+  opacity: 1;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -93,7 +100,7 @@ a {
 
 .btn-primary {
   background: var(--color-primary);
-  color: white;
+  color: var(--color-on-accent);
 }
 
 .btn-primary:hover {
@@ -111,7 +118,7 @@ a {
 
 .btn-danger {
   background: var(--color-error);
-  color: white;
+  color: var(--color-on-error);
 }
 
 .btn-sm {
@@ -253,7 +260,7 @@ a {
 
 .error-message {
   padding: var(--spacing-md);
-  background: rgba(248, 113, 113, 0.1);
+  background: color-mix(in srgb, var(--color-error) 10%, var(--color-surface));
   border: 1px solid var(--color-error);
   border-radius: var(--radius-md);
   color: var(--color-error);
@@ -261,7 +268,7 @@ a {
 
 .success-message {
   padding: var(--spacing-md);
-  background: rgba(74, 222, 128, 0.1);
+  background: color-mix(in srgb, var(--color-success) 10%, var(--color-surface));
   border: 1px solid var(--color-success);
   border-radius: var(--radius-md);
   color: var(--color-success);
@@ -408,27 +415,20 @@ a {
   background: var(--color-surface-hover);
   color: var(--color-text-dim);
   font-size: 0.75rem;
-  text-transform: capitalize;
+
 }
 
 .status-awaiting {
-  background: rgba(96, 165, 250, 0.15);
+  background: color-mix(in srgb, var(--color-primary) 10%, var(--color-surface));
   color: var(--color-primary);
 }
 
-.notice,
-.context-disclosure {
+.notice {
   padding: var(--spacing-sm);
   border-left: 3px solid var(--color-primary);
   background: var(--color-surface-hover);
   color: var(--color-text-dim);
   font-size: 0.875rem;
-}
-
-.context-disclosure {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--spacing-sm);
 }
 
 .run-metadata {
@@ -534,31 +534,6 @@ a {
   width: 1px;
   margin: var(--spacing-xs) var(--spacing-sm);
   background: var(--color-border);
-}
-
-.project-context-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--spacing-sm) var(--spacing-md);
-  padding: var(--spacing-sm) var(--spacing-md);
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-surface);
-}
-
-.project-context-bar .content-button-row {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.readiness-note {
-  flex-basis: 100%;
-  display: flex;
-  align-items: center;
-  gap: var(--spacing-sm);
-  flex-wrap: wrap;
-  margin: 0;
-  color: var(--color-text-dim);
 }
 
 .choose-project-state {
@@ -785,17 +760,17 @@ a {
 }
 
 /* Readiness and validation states */.status-ready {
-  background: rgba(74, 222, 128, 0.15);
+  background: color-mix(in srgb, var(--color-success) 10%, var(--color-surface));
   color: var(--color-success);
 }
 
 .status-config {
-  background: rgba(251, 191, 36, 0.15);
+  background: color-mix(in srgb, var(--color-warning) 10%, var(--color-surface));
   color: var(--color-warning);
 }
 
 .status-blocked {
-  background: rgba(248, 113, 113, 0.15);
+  background: color-mix(in srgb, var(--color-error) 10%, var(--color-surface));
   color: var(--color-error);
 }
 
@@ -845,21 +820,6 @@ a {
 }
 
 @media (max-width: 640px) {
-  .project-context-bar .content-button-row {
-    flex-basis: 100%;
-    flex-wrap: wrap;
-  }
-
-  .project-context-bar .content-button-row > strong {
-    flex: 1;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .project-context-bar .content-button-row > .mono {
-    flex-basis: 100%;
-  }
-
   .workspace-nav {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -867,18 +827,14 @@ a {
     overflow-x: visible;
   }
 
-  .workspace-nav .nav-item-group:first-child {
-    grid-column: 1 / -1;
-  }
+
 
   .workspace-nav .nav-tab {
     width: 100%;
     padding-inline: var(--spacing-xs);
   }
 
-  .workspace-nav .nav-item-group:first-child .nav-tab {
-    width: auto;
-  }
+
 
   .workspace-nav .nav-separator {
     display: none;
@@ -956,6 +912,11 @@ a {
   position: relative;
   min-width: 0;
 }
+
+.combobox-control { display: flex; align-items: center; gap: var(--spacing-sm); min-width: 0; }
+.combobox-control .input { flex: 1 1 auto; min-width: 0; }
+.combobox-badge { flex-shrink: 0; white-space: nowrap; }
+.combobox-default-option { border-bottom: 1px solid var(--color-border); }
 
 .combobox input[role='combobox']:focus-visible {
   outline: 2px solid var(--color-primary);
@@ -1052,4 +1013,85 @@ a {
 .run-preview-list dd {
   margin: 0;
   font-size: 0.875rem;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #10141C;
+  --color-surface: #191F29;
+  --color-surface-hover: #262E3A;
+  --color-border: #717987;
+  --color-text: #BFBDB6;
+  --color-text-dim: #AAA99F;
+  --color-primary: #E6B450;
+  --color-primary-hover: #F2C76C;
+  --color-on-accent: #10141C;
+  --color-success: #8AC591;
+  --color-warning: #E6B450;
+  --color-error: #F28B82;
+  --color-on-error: #10141C;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+  color-scheme: dark;
+  --color-bg: #10141C;
+  --color-surface: #191F29;
+  --color-surface-hover: #262E3A;
+  --color-border: #717987;
+  --color-text: #BFBDB6;
+  --color-text-dim: #AAA99F;
+  --color-primary: #E6B450;
+  --color-primary-hover: #F2C76C;
+  --color-on-accent: #10141C;
+  --color-success: #8AC591;
+  --color-warning: #E6B450;
+  --color-error: #F28B82;
+  --color-on-error: #10141C;
+  }
+}
+:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 3px; }
+[hidden] { display: none !important; }
+/* Global settings keep fields readable at desktop and phone widths. */
+.settings-fields { display: flex; flex-direction: column; gap: var(--spacing-md); margin-block: var(--spacing-md); }
+.settings-fields label { display: flex; flex-direction: column; gap: var(--spacing-xs); }
+.settings-body { border: 0; padding: 0; min-width: 0; }
+.global-run-row { width: 100%; display: flex; flex-direction: column; gap: var(--spacing-xs); text-align: left; color: var(--color-text); cursor: pointer; overflow-wrap: anywhere; }
+.global-settings textarea { min-width: 0; width: 100%; }
+
+/* Team editors and the Add team form. */
+.add-team-form { display: flex; align-items: flex-end; gap: var(--spacing-sm); flex-wrap: wrap; }
+.add-team-form label { flex: 1 1 240px; display: flex; flex-direction: column; gap: var(--spacing-xs); }
+.add-team-error { color: var(--color-error); }
+.team-editor { border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+.team-editor legend { font-weight: 600; display: flex; align-items: center; gap: var(--spacing-xs); padding: 0 var(--spacing-xs); }
+.team-editor:focus-visible { outline: 2px solid var(--color-primary); }
+
+/* Prompt cards: compact header, secondary actions in a More menu. */
+.prompt-card-header { display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); min-width: 0; }
+.more-menu { position: relative; display: inline-flex; }
+.more-menu [role='menu'] { position: absolute; right: 0; top: calc(100% + 2px); z-index: 20; display: flex; flex-direction: column; min-width: 190px; padding: var(--spacing-xs); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); box-shadow: 0 4px 14px color-mix(in srgb, var(--color-text) 18%, transparent); }
+.prompt-usage-list { margin: 0; padding-left: var(--spacing-lg); display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+
+/* Sticky Settings toolbar keeps tabs and Save reachable during long scrolls. */
+/* Its containing block must span all fields, not shrink to the scroll viewport. */
+.global-settings { flex: 0 0 auto; }
+.settings-toolbar { position: sticky; top: 0; z-index: 15; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: var(--spacing-sm) 0; margin: 0; background: var(--color-bg); border-bottom: 1px solid var(--color-border); scroll-margin-top: 0; }
+.settings-toolbar .config-tabs { flex: 1 1 auto; min-width: 0; }
+.settings-body .settings-fields, .settings-body label, .settings-body input, .settings-body textarea, .settings-body select, .settings-body .card { scroll-margin-top: 4.5rem; }
+
+/* Compact project and run rows. */
+.compact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--spacing-sm); }
+.compact-row { display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: var(--spacing-sm) var(--spacing-md); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-height: var(--tap-target); min-width: 0; }
+.compact-row.selected { border-color: var(--color-primary); }
+.compact-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.compact-row-actions { display: flex; align-items: center; gap: var(--spacing-xs); flex-shrink: 0; position: relative; }
+.compact-row .row-title { font-weight: 600; overflow-wrap: anywhere; text-align: left; display: flex; align-items: center; gap: var(--spacing-sm); flex-wrap: wrap; }
+.compact-row .row-subtitle { font-size: 0.75rem; overflow-wrap: anywhere; text-align: left; }
+.compact-row:has(.content-button):hover { background: var(--color-surface-hover); border-color: var(--color-primary); }
+
+@media (max-width: 640px) {
+  .config-tabs { flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; }
+  .config-tabs .btn { scroll-snap-align: start; white-space: nowrap; }
+  .compact-row { flex-wrap: wrap; }
+  .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
 }

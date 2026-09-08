@@ -1,5 +1,35 @@
 # DEVLOG
 
+## 2026-09-08 — Global Settings, prompt editing, recovery, and All runs
+
+- Added global domain tabs with one Save all action and changed-only revisioned
+  configuration PATCH. Server fields save after workflow configuration; partial
+  failures retain unsaved drafts without resending acknowledged changes.
+- Added custom model/effort entry, named prompt CRUD/reference-aware rename, and
+  role/team text overrides. Advanced TOML shares the draft and preserves invalid
+  text for correction. No prompt store or workflow graph editor was introduced.
+- Fixed retained-dashboard handoffs and hidden streams. Added failed-source
+  restart admission/options, immutable UI source identity, durable sibling
+  reservation locking, and same-workflow retries with unchanged plan progress.
+- Added the default all-project run view with complete pagination, bounded fetch
+  concurrency, ongoing/recent classification, and browser-local recent count.
+- Verification uses disposable repositories and in-memory units. Existing user
+  runs and backups remain untouched; Reset Plan stays deferred to issue #34.
+
+## 2026-09-08 — Runs navigation, durable startup failures and appearance
+
+- Split New run from run history, removed Overview, and kept global Settings
+  available without project selection. Retained drafts, idempotency keys,
+  startup-answer generations and successor recovery across navigation.
+- Persisted bounded, redacted startup errors and exposed their reason and
+  reserved request identity through REST. Run timing now uses controller start
+  and terminal evidence; preparation failures never receive a running timer.
+- Added system-aware Light/Dark palettes, browser persistence and cross-tab
+  synchronization. Simplified details, diagnostics and relevant run controls.
+- Verified a real dirty-checkout rejection through the browser and after reload,
+  then completed a separate installed-entry-point NO-OP workflow in one turn.
+  All smoke artifacts belong to a disposable project; Doublangu was untouched.
+
 ## 2026-09-08 — Reusable NO-OP test plan
 
 - Added `aflow noop-plan` with a packaged checkpoint template and preserved-by-
@@ -894,3 +924,19 @@
 - Fixed the continuous deployer’s real preflight handoff: reserve a unique snapshot path, then release the empty directory so preflight creates it. The deployment fixture now rejects existing paths like the production script; the success regression fails before the fix.
 
 - CI process-cleanup assertions now recognize both a missing proc file and a process disappearing during the read as termination, with deterministic coverage of both Linux outcomes.
+
+## 2026-09-08 — Web UI usability follow-up (plan: aflow-web-ui-usability-review-followup-20260908)
+
+- Implemented the full review follow-up in `apps/aflow_app`: settings repair (mistyped prompt tables keep Advanced TOML usable with production diagnostics; confirmed reload truly discards every pending edit including the password, with epoch-guarded late responses), secondary prompt actions (More menu, Delete prompt… with confirm/Undo, "Used by" disclosures), one-click Diagnostics full context (acknowledgement removed, `level=full&full_scope=true` sent directly, stale responses rejected), compact project/run lists (semantic rows, row-as-open, Unregister behind a More menu), `AFlow · <project>` header without the project bar, sticky Settings toolbar with tabs+Save, visible launch defaults (`checkpoint_delivery · Default` style) with request-omission semantics for followed defaults, Team members + full worker upgrade chain previews, an explicit Add team form (draft-only until Save all, Enter support, inline validation), and typed `set_team_upgrade` edits of `[teams.<name>].upgrade_to` with cycles/missing targets surfaced field-level and validated by production graph checks at save.
+- Server: guided projection guards malformed prompt shapes (form omitted with unchanged documents instead of HTTP 500), hardened prompt-reference traversal (step arrays and string/array `merge_prompt`), `GuidedTeamSummary.upgrade_to`, and the closed `set_team_upgrade` action; `add_team` actions are ordered before dependent edits in net batches.
+- Verification: 212 web tests, 155 app-server tests across the prescribed suites, 145 core tests (+7 subtests), full server+core sweep 1762 passed (+222 subtests), `git diff --check` clean, `ruff` clean, `tsc`/vite build clean, and 33 headless-Chromium checks against the live deployment at `http://p100.tail0fad23.ts.net:8766` (header, compact lists, sticky tabs, prompt menus, Add team draft/discard, launch defaults before focus, one-click Diagnostics, mobile tablist). No real configuration was saved, no password rotated, no project unregistered, no run started during checks.
+
+### 2026-09-08 — Worker failure diagnostics follow-up
+
+Implemented exit-aware read-only status and guarded recovery, bounded redacted detached-child capture, early exception stages, unified dashboard refresh and summary/raw diagnostics. Fixed prompt Undo across tabs/multiple deletions and moved recent count editing exclusively to General. Preserved the existing dirty UI work and historical run artifacts.
+
+Verification exercises installed `aflow ui-worker` → real controlled child → receipts → repository/service → authenticated REST and Chromium, without restarting the service or page. Also exercises installed `aflow daemon-worker` configuration-load failure, high-volume stdout/stderr, redaction/caps, exit zero, signal termination, stale/malformed receipts and controller authority. No real owner workflow was launched or resumed.
+
+Owner follow-up: fixed the Settings toolbar disappearing on long scrolls by preventing its containing flex item from shrinking below its content. Chromium reproduced the original failure and verifies tabs/Save at 25%, 50%, 90% and full scroll on 390px/1365px light/dark layouts. Added `test_settings_browser.py` for the real layout boundary.
+
+Final verification: web tests (213), all server tests including Chromium layout (233), required worker/control-plane tests plus real-process diagnostics (82), and required API/auth/MCP/manager-context tests (89) passed. Web production build, Ruff and diff whitespace checks passed.

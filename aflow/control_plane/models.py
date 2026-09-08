@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Any, Literal, Mapping
 
 
@@ -28,6 +29,20 @@ _SECRET_FIELD_PARTS = (
 def utc_now() -> str:
     """Return a timezone-aware, JSON-safe timestamp."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def startup_failure(stage: str, message: str) -> dict[str, str]:
+    """Bound diagnostics after removing credential assignments and bearer text."""
+    message = re.sub(
+        r"""(?i)((?:token|secret|password|api[_-]?key)["']?\s*[:=]\s*)(["'])(.*?)\2""",
+        r"\1[redacted]", message, flags=re.DOTALL,
+    )
+    safe = re.sub(
+        r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|secret|password|api[_-]?key)\s*[:=]\s*[\"']?)([^\s\",'&]+)",
+        r"\1[redacted]", message,
+    )
+    safe = re.sub(r"(?i)\bbearer\s+[^\s,]+", "Bearer [redacted]", safe)
+    return bounded_redacted({"stage": stage, "message": safe, "timestamp": utc_now()})
 
 
 def bounded_redacted(value: Any, *, depth: int = 0) -> Any:
@@ -114,6 +129,9 @@ class RunStatus:
     ownership: Literal["control_plane", "legacy"] = "control_plane"
     revision: int = 0
     reason: str | None = None
+    plan_path: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
     unit_name: str | None = None
     launch_phase: str | None = None
     workflow_name: str | None = None
@@ -124,6 +142,7 @@ class RunStatus:
     selected_start_step: str | None = None
     skipped_steps: tuple[str, ...] = ()
     restarted_from_run_id: str | None = None
+    worker_exit: Mapping[str, Any] | None = None
     evidence: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

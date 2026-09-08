@@ -192,10 +192,11 @@ class TestWorkerWrapper:
         )
         assert ui_cli.handle_ui_worker_command(args) == 2
 
-    def test_wrapper_records_child_identity_and_exit(self, tmp_path) -> None:
-        receipt_dir = tmp_path / "units"
-        receipt_dir.mkdir()
-        (receipt_dir / "start.json").write_text(json.dumps({"nonce": "good"}))
+    def test_wrapper_records_child_identity_and_exit(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        receipt_dir = tmp_path / ".aflow/runs/test-worker/units"
+        receipt_dir.mkdir(parents=True)
+        (receipt_dir / "start.json").write_text(json.dumps({"schema": 1, "run_id": "test-worker", "unit": "aflow-run-test-worker.service", "nonce": "good"}))
 
         from types import SimpleNamespace
 

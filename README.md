@@ -8,6 +8,17 @@ The Python package is named `aworkflow`; it installs `aflow` and `aworkflow`
 as equivalent workflow commands. It also installs the optional `aflowd`
 durable control-plane service entry point.
 
+The remote app opens on All runs: every ongoing run across registered projects
+plus the latest 10 other runs (the count is a browser preference). Projects
+have separate Runs, Plans, and New run pages. Global Settings offers Agents &
+Roles, Teams, Workflows, Prompts, and General tabs with one changed-only save.
+Appearance follows the system by default; Light and Dark overrides
+persist in the browser. Startup failures retain their safe explanation after
+reload, and runtime starts only from execution evidence.
+Failed runs offer Resume when saved execution supports it, or Restart with
+editable launch options. Restart creates a new attempt using current settings
+and retains plan progress; Resume keeps the source configuration snapshot.
+
 ## How it works
 
 1. A workflow defines steps, transitions, roles, and optional git lifecycle
@@ -335,3 +346,5 @@ installation, activation, verification, and rollback.
 - [Python library API](docs/library-api.md)
 - [Remote app](docs/remote-app.md)
 - [Architecture](ARCHITECTURE.md)
+
+Worker failures before controller startup are now visible from validated detached-worker receipts. Diagnostics provides a readable summary and expandable raw details; the page Refresh updates run data together. The browser-local recent-run count is edited only in Settings → General.

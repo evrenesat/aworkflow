@@ -4,7 +4,7 @@
  * optional run id that is meaningful only on the Runs view.  Tokens,
  * prompts, context, idempotency keys, and plan contents never belong here.
  */
-export type WorkspaceView = 'overview' | 'settings' | 'plans' | 'runs'
+export type WorkspaceView = 'overview' | 'settings' | 'plans' | 'runs' | 'new-run' | 'projects' | 'all-runs'
 
 export interface WorkspaceQuery {
   project: string | null
@@ -19,7 +19,7 @@ export interface RawWorkspaceQuery {
   run: string | null
 }
 
-const WORKSPACE_VIEWS: readonly WorkspaceView[] = ['overview', 'settings', 'plans', 'runs']
+const WORKSPACE_VIEWS: readonly WorkspaceView[] = ['overview', 'settings', 'plans', 'runs', 'new-run', 'projects', 'all-runs']
 
 function nonEmpty(value: string | null): string | null {
   return value !== null && value.trim() !== '' ? value : null
@@ -37,12 +37,13 @@ export function parseWorkspaceQuery(search: string): RawWorkspaceQuery {
   }
 }
 
-/** Fills in the concrete workspace state a raw link means: no project is the Projects view, a project without a usable view is Overview. */
+/** Fills in the concrete workspace state a raw link means: no project is the Projects view, a project without a usable view is Runs; Settings is global. */
 export function normalizeWorkspaceQuery(raw: RawWorkspaceQuery): WorkspaceQuery {
-  if (raw.project === null) return { project: null, view: 'projects', run: null }
+  if (raw.view === 'all-runs' || raw.view === 'projects') return { project: null, view: raw.view, run: null }
+  if (raw.project === null) return { project: null, view: raw.view === 'settings' ? 'settings' : 'all-runs', run: null }
   return {
     project: raw.project,
-    view: raw.view ?? 'overview',
+    view: !raw.view || raw.view === 'overview' ? 'runs' : raw.view,
     run: raw.view === 'runs' ? raw.run : null,
   }
 }
@@ -51,7 +52,7 @@ export function normalizeWorkspaceQuery(raw: RawWorkspaceQuery): WorkspaceQuery 
 export function workspaceHref(query: WorkspaceQuery): string {
   const params = new URLSearchParams()
   if (query.project !== null) params.set('project', query.project)
-  if (query.view !== 'projects') params.set('view', query.view)
+  params.set('view', query.view)
   if (query.view === 'runs' && query.run !== null) params.set('run', query.run)
   const text = params.toString()
   return text ? `?${text}` : ''

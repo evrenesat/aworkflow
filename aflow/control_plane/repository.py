@@ -17,6 +17,7 @@ from .models import (
     ProjectRecord,
     RunPage,
     RunStatus,
+    bounded_redacted,
 )
 from .persistence import PersistenceError, RunIdentityError, read_events, validate_run_id
 
@@ -146,10 +147,13 @@ class RunRepository:
                 current_step=_optional_text(metadata.get("current_step_name")),
                 turns_completed=_optional_int(metadata.get("turns_completed")),
                 max_turns=max_turns,
+                plan_path=_optional_text(metadata.get("active_plan_path")) or _optional_text(metadata.get("plan_path")),
+                started_at=_optional_text(metadata.get("run_started_at")),
                 evidence={"recorded_status": metadata.get("status")},
             )
 
-        phase = self._launch_phase(valid)
+        phase_data = self._launch_state(valid)
+        phase = _optional_text(phase_data.get("phase"))
         reconciled = self._latest_reconciliation(run_dir) if run_dir.is_dir() else {}
         metadata_status = _optional_text(metadata.get("status"))
         reconciled_status = _optional_text(reconciled.get("status"))
@@ -157,7 +161,11 @@ class RunRepository:
         # observation is authoritative when its launch phase agrees.  This
         # prevents a pre-restart "running" reconciliation event from masking
         # durable completion after the independent workflow unit exits.
-        if metadata_status in {"completed", "failed", "interrupted"} and phase == metadata_status:
+        if metadata_status in {"completed", "failed", "interrupted"}:
+            recorded_status = metadata_status
+        elif reconciled_status == "running" and metadata_status in {
+            "paused", "waiting_for_valid_override", "waiting_for_input",
+        }:
             recorded_status = metadata_status
         else:
             recorded_status = reconciled_status or metadata_status
@@ -172,12 +180,36 @@ class RunRepository:
             status = "needs_attention"
         else:
             status = phase or "manifest_only"
-        return RunStatus(
+        startup = self._startup_record(valid)
+        failure = startup.get("startup_failure")
+        failure = bounded_redacted(failure) if isinstance(failure, Mapping) else None
+        startup_reason = None
+        # Active unit observations and controller terminal state take precedence.
+        if status not in {
+            "running", "completed", "failed", "interrupted", "owner_stopped",
+            "paused", "waiting_for_valid_override", "waiting_for_input",
+        }:
+            if startup.get("state") == "needs_attention":
+                status = "needs_attention"
+                startup_reason = (_optional_text(failure.get("message")) if failure else None) or (
+                    "Startup did not complete; the original error was not recorded."
+                )
+            elif startup.get("state") == "awaiting_startup_answer":
+                status = "awaiting_startup_answer"
+        ended_at = _optional_text(phase_data.get("updated_at")) if phase in {
+            "completed", "failed", "interrupted", "owner_stopped"
+        } else None
+        from .worker_diagnostics import project_worker_status
+
+        result = RunStatus(
             run_id=valid,
             status=status,
             ownership="control_plane",
             revision=self._override_revision(run_dir) if run_dir.is_dir() else 0,
-            reason=_optional_text(reconciled.get("reason")) or _optional_text(metadata.get("failure_reason")),
+            reason=startup_reason or _optional_text(metadata.get("failure_reason")) or _optional_text(reconciled.get("reason")),
+            plan_path=_optional_text(metadata.get("active_plan_path")) or manifest.plan_path,
+            started_at=_optional_text(metadata.get("run_started_at")),
+            ended_at=ended_at,
             unit_name=manifest.intended_unit or f"aflow-run-{valid}.service",
             launch_phase=phase,
             workflow_name=_optional_text(metadata.get("workflow_name")) or manifest.workflow_name,
@@ -190,10 +222,30 @@ class RunRepository:
             restarted_from_run_id=manifest.restarted_from_run_id,
             evidence={
                 "has_run_metadata": bool(metadata),
+                "controller_terminal": metadata_status in {"completed", "failed", "interrupted"},
                 "manifest_created_at": manifest.created_at,
                 "reconciled": bool(reconciled),
+                "startup_state": startup.get("state"),
+                "startup_failure": failure,
+                "no_agent_started": status != "running" and not metadata and phase in {None, "manifest_only"},
+                "overrides": self._override_summary(run_dir, metadata),
             },
         )
+        return project_worker_status(result, self.repo_root) if Path(manifest.project_root).resolve() == self.repo_root else result
+
+    def _startup_record(self, run_id: str) -> Mapping[str, Any]:
+        path = self._contained_path(".aflow", "start-requests", f"{run_id}.json")
+        if not path.exists():
+            return {}
+        if path.is_symlink():
+            raise RepositoryError("startup record may not be a symlink")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RepositorySchemaError("startup record is unreadable") from exc
+        if not isinstance(payload, Mapping) or payload.get("run_id") != run_id or payload.get("schema_version") != 1:
+            raise RepositorySchemaError("startup record has an unsupported schema")
+        return payload
 
     def list_runs(self, *, limit: int = 100, cursor: str | None = None) -> RunPage:
         """Return a stable, cursorable union of legacy and owned run identities."""
@@ -284,10 +336,10 @@ class RunRepository:
     def _launch_manifest_path(self, run_id: str) -> Path:
         return self._contained_path(".aflow", "launches", f"{run_id}.json")
 
-    def _launch_phase(self, run_id: str) -> str | None:
+    def _launch_state(self, run_id: str) -> Mapping[str, Any]:
         path = self._contained_path(".aflow", "launches", f"{run_id}.state.json")
         if not path.exists():
-            return None
+            return {}
         if path.is_symlink():
             raise RepositoryError("launch phase may not be a symlink")
         try:
@@ -301,7 +353,31 @@ class RunRepository:
             or not isinstance(payload.get("phase"), str)
         ):
             raise RepositorySchemaError("launch phase has an unsupported schema")
-        return str(payload["phase"])
+        return payload
+
+    def _override_summary(self, run_dir: Path, metadata: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        path = run_dir / "overrides.toml"
+        if not path.exists():
+            return None
+        if path.is_symlink():
+            raise RepositoryError("overrides.toml may not be a symlink")
+        loaded = load_override_request(path)
+        request = loaded.request
+        if request is None:
+            return None
+        acknowledgement = metadata.get("override_result")
+        acknowledged = isinstance(acknowledgement, Mapping) and acknowledgement.get("digest") == request.digest
+        state = "pending"
+        if acknowledged:
+            if acknowledgement.get("status") == "rejected":
+                state = "rejected"
+            elif acknowledgement.get("applied"):
+                state = "applied"
+        return bounded_redacted({
+            "state": state, "revision": request.revision,
+            "max_turns": request.max_turns, "team": request.team,
+            "role_selectors": request.role_selectors,
+        })
 
     def _parse_manifest(self, path: Path) -> LaunchManifest:
         try:

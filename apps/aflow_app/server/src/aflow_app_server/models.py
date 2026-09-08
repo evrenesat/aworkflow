@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aflow.control_plane import (
     CapabilitySet,
@@ -51,12 +51,16 @@ class CapabilityResponse(CanonicalTransportModel):
 
 
 class RunStatusResponse(CanonicalTransportModel):
+    worker_exit: Mapping[str, Any] | None = None
     run_id: str
     status: str
     schema_version: int
     ownership: Literal["control_plane", "legacy"]
     revision: int
     reason: str | None = None
+    plan_path: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
     unit_name: str | None = None
     launch_phase: str | None = None
     workflow_name: str | None = None
@@ -273,10 +277,45 @@ class SetTeamRoleAction(GuidedActionBase):
     selector: str = Field(min_length=1, max_length=192)
 
 
+class SetTeamUpgradeAction(GuidedActionBase):
+    """Link one team to the next quality-upgrade stage; null removes the link."""
+
+    type: Literal["set_team_upgrade"]
+    team: str = Field(min_length=1, max_length=64)
+    upgrade_to: str | None = Field(default=None, min_length=1, max_length=64)
+
+
 class SetWorkflowDefaultTeamAction(GuidedActionBase):
     type: Literal["set_workflow_default_team"]
     workflow: str = Field(min_length=1, max_length=64)
     team: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class SetPromptAction(GuidedActionBase):
+    type: Literal["set_prompt"]
+    name: str = Field(min_length=1, max_length=128)
+    text: str | None = Field(max_length=262144)
+
+
+class RenamePromptAction(GuidedActionBase):
+    type: Literal["rename_prompt"]
+    name: str = Field(min_length=1, max_length=128)
+    new_name: str = Field(min_length=1, max_length=128)
+
+
+class SetRolePromptAction(GuidedActionBase):
+    type: Literal["set_role_prompt"]
+    role: str = Field(min_length=1, max_length=64)
+    team: str | None = Field(default=None, min_length=1, max_length=64)
+    text: str | None = Field(max_length=262144)
+
+
+class MoveRolePromptAction(GuidedActionBase):
+    type: Literal["move_role_prompt"]
+    role: str = Field(min_length=1, max_length=64)
+    team: str | None = Field(default=None, min_length=1, max_length=64)
+    target_role: str = Field(min_length=1, max_length=64)
+    target_team: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 GuidedConfigAction = Annotated[
@@ -287,9 +326,26 @@ GuidedConfigAction = Annotated[
     | SetGlobalRoleAction
     | AddTeamAction
     | SetTeamRoleAction
-    | SetWorkflowDefaultTeamAction,
+    | SetTeamUpgradeAction
+    | SetWorkflowDefaultTeamAction
+    | SetPromptAction
+    | RenamePromptAction
+    | SetRolePromptAction
+    | MoveRolePromptAction,
     Field(discriminator="type"),
 ]
+
+
+class GlobalConfigPatchPayload(CanonicalTransportModel):
+    expected_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+    actions: list[GuidedConfigAction] | None = Field(default=None, min_length=1, max_length=256)
+    documents: dict[Literal["aflow.toml", "workflows.toml"], str] | None = None
+
+    @model_validator(mode="after")
+    def one_mode(self):
+        if (self.actions is None) == (self.documents is None) or self.documents == {}:
+            raise ValueError("provide actions or a nonempty documents map, exclusively")
+        return self
 
 
 class ProjectConfigFormPayload(CanonicalTransportModel):
@@ -321,9 +377,14 @@ class GuidedWorkflowStepSummaries(CanonicalTransportModel):
 
 class GuidedTeamSummary(CanonicalTransportModel):
     roles: Mapping[str, str]
+    prompts: Mapping[str, str] = Field(default_factory=dict)
+    upgrade_to: str | None = None
 
 
 class GuidedFormProjection(CanonicalTransportModel):
+    prompts: Mapping[str, str] = Field(default_factory=dict)
+    role_prompts: Mapping[str, str] = Field(default_factory=dict)
+    prompt_usages: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
     default_workflow: str | None = None
     max_turns: int | None = None
     harnesses: Mapping[str, Mapping[str, GuidedProfileSummary]]

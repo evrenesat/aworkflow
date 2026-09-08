@@ -616,6 +616,11 @@ def build_context_bundle(
         "run_metadata": bounded_redacted(metadata),
         "events": [event.to_dict() for event in read_events(root, limit=100)],
     }
+    from .worker_diagnostics import worker_evidence
+
+    worker = worker_evidence(root.parent.parent.parent, root.name, f"aflow-run-{root.name}.service")
+    if worker is not None:
+        data["worker"] = worker
     try:
         from aflow.manager_context import build_manager_context
 

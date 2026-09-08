@@ -180,6 +180,42 @@ def _prepared(request) -> PreparedRun:
     )
 
 
+def test_detached_early_worker_failure_is_visible_without_service_restart(control_client):
+    import shutil
+    import sys
+    from aflow.control_plane.persistent_units import PersistentUnitManager
+
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    unit = f"aflow-run-{run_id}.service"
+    manager = PersistentUnitManager(executable=shutil.which("aflow"))
+    manager.start(unit, (sys.executable, "-c", "import sys; print('rest-worker-marker token=PRIVATE-MARKER',file=sys.stderr); sys.exit(1)"), cwd=root)
+    monkeypatch.setattr(units, "get", manager.get)
+    path = root / ".aflow" / "runs" / run_id / "units" / "exit.json"
+    deadline = time.monotonic() + 10
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(.02)
+    assert path.exists()
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    for _ in range(2):
+        response = client.get(endpoint)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "failed"
+        assert payload["worker_exit"]["exit_code"] == 1
+        assert "rest-worker-marker" in payload["worker_exit"]["reason"]
+        assert "PRIVATE-MARKER" not in response.text
+        assert payload["evidence"]["can_resume"] is False
+        assert payload["started_at"] is None
+    assert client.get(endpoint + "/restart-options").json()["eligible"] is True
+    detail = client.get(endpoint + "/context?level=full&full_scope=true")
+    assert detail.status_code == 200 and "rest-worker-marker" in detail.text
+    assert "PRIVATE-MARKER" not in detail.text
+    assert not (path.parent.parent / "run.json").exists()
+
+
 def _start_pending(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     monkeypatch.setattr(
         "aflow.daemon.prepare_startup",
@@ -806,7 +842,6 @@ def test_rest_typed_successor_start_exposes_lineage_and_keeps_instruction_text_t
 def test_project_config_form_is_pure_authenticated_and_action_bounded(
     control_client,
 ) -> None:
-    from aflow.config import render_starter_documents
 
     client, root, _, _ = control_client
     config_dir = root.parent / "global"
@@ -909,7 +944,6 @@ def test_project_config_form_is_pure_authenticated_and_action_bounded(
 
 
 def test_project_config_form_build_starter_from_empty_pair(control_client) -> None:
-    from aflow.config import render_starter_documents
 
     client, root, _, _ = control_client
 
@@ -1106,3 +1140,45 @@ def test_project_config_form_branch_probe_falls_back_for_renderer_incompatible_b
     )
     assert built.status_code == 200
     assert built.json()["changed"] is True
+
+
+def test_real_dirty_startup_failure_survives_api_reload(control_client):
+    from aflow_app_server import main
+    client, root, units, _ = control_client
+    workflow_path = root.parent / "global" / "workflows.toml"
+    config_path = workflow_path.with_name("aflow.toml")
+    config_path.write_text(config_path.read_text().replace("[aflow]", '[aflow]\nteam_lead = "worker"'))
+    workflow_path.write_text(
+        '[workflow.managed]\nsetup = ["worktree", "branch"]\nteardown = ["merge", "rm_worktree"]\nmain_branch = "main"\n'
+        + workflow_path.read_text()
+    )
+    subprocess.run(["git", "checkout", "-b", "main"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-m", "fixture"], cwd=root, check=True, capture_output=True)
+    (root / "untracked-blocker.txt").write_text("dirty fixture")
+    main._control_plane_service.start()
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "dirty-failure"},
+        json={"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"},
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()["detail"]
+    assert error["code"] == "startup_failed", error
+    assert "untracked-blocker.txt" in error["message"]
+    assert units.start_calls == []
+    main._control_plane_service = ControlPlaneService(
+        main._project_registry,
+        aflow_executable=root / "release" / "bin" / "aflow",
+        environment_file=root / "aflowd.env", release_identity="test-release",
+        daemon_factory=lambda config: AflowDaemon(config, units=units),
+        workflow_config_path=config_path,
+    )
+    main._control_plane_service.start()
+    status = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{error['run_id']}").json()
+    assert status["status"] == "needs_attention"
+    assert status["reason"] == error["message"]
+    assert status["evidence"]["no_agent_started"] is True
+    assert status["started_at"] is None
+    assert status["plan_path"].endswith("plans/todo/test-plan.md")

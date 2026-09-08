@@ -817,6 +817,53 @@ def test_daemon_rejects_excluded_step_before_reserving_run(
     assert not launches.exists() or list(launches.glob("*.json")) == []
 
 
+@pytest.mark.parametrize("failure_kind", ["preparation", "execution"])
+def test_failed_restart_preserves_plan_and_source_failure(tmp_path, monkeypatch, failure_kind):
+    from aflow.api.startup import StartupError
+    from aflow.daemon import DaemonStartupError, DaemonAuthorizationError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    before_plan = request.plan_path.read_bytes()
+    if failure_kind == "preparation":
+        def reject(*args, **kwargs):
+            raise StartupError("Confirmed fixture preparation failure")
+        monkeypatch.setattr("aflow.daemon.prepare_startup", reject)
+        with pytest.raises(DaemonStartupError) as caught:
+            daemon.service.start(request, caller_scope="project:one", idempotency_key="failed-source")
+        source_id = caught.value.run_id
+    else:
+        monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+        source = daemon.service.start(request, caller_scope="project:one", idempotency_key="failed-source")
+        source_id = source.run_id
+        units.stop(f"aflow-run-{source_id}.service")
+        directory = request.repo_root / ".aflow" / "runs" / source_id
+        directory.mkdir(exist_ok=True)
+        (directory / "run.json").write_text(json.dumps({"status": "failed", "failure_reason": "fixture runtime failure"}))
+        write_launch_phase(request.repo_root, source_id, "failed")
+    source_before = daemon.service.run_status(source_id)
+    projection = daemon.service.restart_options(source_id, caller_scope="project:one")
+    assert projection["eligible"] is True
+    assert projection["options"]["workflow_name"] == "managed"
+    assert projection["options"]["plan_path"] == "plan.md"
+    assert request.plan_path.read_bytes() == before_plan
+    with pytest.raises(DaemonAuthorizationError):
+        daemon.service.restart_options(source_id, caller_scope="foreign")
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared_for_request)
+    successor = daemon.service.start(replace(request, restarted_from_run_id=source_id), caller_scope="project:one", idempotency_key="successor")
+    assert daemon.service.restart_options(source_id, caller_scope="project:one")["eligible"] is False
+    with pytest.raises(DaemonError, match="active successor"):
+        daemon.service.start(replace(request, restarted_from_run_id=source_id), caller_scope="project:one", idempotency_key="duplicate-successor")
+    replay = daemon.service.start(replace(request, restarted_from_run_id=source_id), caller_scope="project:one", idempotency_key="successor")
+    assert successor.run_id == replay.run_id
+    assert successor.run_id != source_id
+    after = daemon.service.run_status(source_id)
+    assert after.status == source_before.status
+    assert after.reason == source_before.reason
+    assert not any(event.event_type == "owner_stopped" for event in read_events(request.repo_root / ".aflow" / "runs" / source_id))
+    assert request.plan_path.read_bytes() == before_plan
+
+
 def test_daemon_restart_successor_requires_owner_stopped_inactive_source_and_keeps_lineage(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1154,3 +1201,40 @@ def test_daemon_owner_stop_pending_question_remains_terminal_for_reads_and_answe
     assert not (run_dir / "run.json").exists()
     assert units.start_calls == []
     assert units.stop_calls == []
+
+
+@pytest.mark.parametrize("stage", ["preparation", "unit_launch"])
+def test_startup_failure_survives_fresh_daemon_redacted_and_bounded(tmp_path, monkeypatch, stage):
+    from aflow.api.startup import StartupError
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    message = "blocked token=private-value password=another-value Bearer bearer-value secret=\'multi word credential\' " + "x" * 6000
+
+    def reject(*args, **kwargs):
+        raise StartupError(message)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", reject if stage == "preparation" else _prepared)
+    if stage == "unit_launch":
+        monkeypatch.setattr(units, "start", reject)
+    with pytest.raises(DaemonStartupError) as caught:
+        daemon.service.start(request, caller_scope="project:one", idempotency_key="failure")
+    run_id = caught.value.run_id
+    payload = json.loads((request.repo_root / ".aflow" / "start-requests" / f"{run_id}.json").read_text())
+    failure = payload["startup_failure"]
+    assert failure["stage"] == stage
+    assert len(failure["message"]) < 4200
+    assert failure["timestamp"]
+    assert "private-value" not in failure["message"]
+    assert "another-value" not in failure["message"]
+    assert "bearer-value" not in failure["message"]
+    assert "multi word credential" not in failure["message"]
+    fresh = AflowDaemon(daemon._config, units=units)
+    fresh.start()
+    status = fresh.service.run_status(run_id)
+    assert status.status == "needs_attention"
+    assert status.reason == failure["message"]
+    assert status.plan_path == str(request.plan_path)
+    assert status.started_at is None
+    assert status.evidence["no_agent_started"] == (stage == "preparation")

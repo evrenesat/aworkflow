@@ -88,6 +88,10 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     )
     monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", lambda **kwargs: bootstrap)
 
+    before = source_dir.joinpath("run.json").read_bytes()
+    assert daemon.service.run_status(source_id).evidence["can_resume"] is True
+    assert source_dir.joinpath("run.json").read_bytes() == before
+    assert units.start_calls == []
     continuation = daemon.service.resume(source_id, caller_scope="project:one", idempotency_key="resume-1")
     replay = daemon.service.resume(source_id, caller_scope="project:one", idempotency_key="resume-1")
 

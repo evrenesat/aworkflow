@@ -743,8 +743,11 @@ Startup models (`models.py`):
   and optional restarted_from_run_id metadata. Extra-instruction text stays
   transient while its digest binds idempotency.
 - A restart successor is a normal fresh launch with a new run ID. Its source
-  must have same-project control-plane ownership, an explicit owner-stop
-  terminal event, and an inactive exact unit. Resume remains the separate,
+  must have same-project control-plane ownership, confirmed failure or an
+  explicit owner-stop terminal event, and an inactive exact unit. A durable
+  source lock serializes reservations and rejects active/unresolved siblings.
+  Read-only restart-options shares admission and exposes bounded launch fields.
+  Resume remains the separate,
   strict saved-invocation continuation path.
 - The server's per-project lock covers config lookup, predecessor validation,
   and successor reservation/unit start. It is released after the unit is
@@ -943,8 +946,11 @@ reads, commits, capability loads, and launch reservation share one per-project
 lock so a launch cannot freeze a torn or superseded pair.
 
 The pure guided_config.py form endpoint projects or transforms the supplied
-configuration pair without saving it. Widgets and Advanced TOML share the same
-draft; project_config_service.py remains the sole save boundary. Suggestions
+configuration pair without saving it. GlobalSettings owns one draft across
+domain tabs; settingsDraft derives net typed actions. GlobalConfigService PATCH
+applies ordered actions or explicitly edited documents under the shared pair
+lock, validates the final pair, and retains rollback-safe writes. PUT remains
+compatible with existing callers. Suggestions
 are distinct from configured choices, and ZCode model/effort stay external.
 
 The guided configuration projection exposes each workflow's materialized
@@ -960,8 +966,40 @@ The React workspace keeps validated project/view/run identifiers in the URL.
 Project selection and run lookup remain registry-scoped; direct lookup restores
 older linked runs without substituting another selection. User navigation pushes
 history, while normalization and passive updates replace it. Dirty navigation is
-guarded; credentials and editor contents never enter links. Progress precedes
-the New run form, with technical metadata disclosed separately.
+guarded; credentials and editor contents never enter links. Runs contains history
+and details; project-scoped `view=new-run` renders `NewRunPage`. The workspace
+retains per-project dashboard state across navigation so pending writes, drafts
+and startup answers keep their original identity. Legacy Overview links replace
+to Runs. Diagnostics and Adjust run disclose technical evidence and live controls.
+Hidden dashboards suspend streams/timers and reject stale loads; plan handoffs
+resolve only against fresh project plans and survive transient failures.
+
+Unscoped URLs open All runs. The browser follows every project run-list cursor
+with at most four project fetches, keeps all ongoing runs, then limits recent
+non-ongoing records globally. It refreshes every ten seconds only while visible,
+cancels stale generations, and retains partial snapshots with an error label.
+The browser-local `aflow.recentRunsLimit` preference defaults to 10; it has no
+effect on retention. Exact project/run URLs preserve history navigation.
+
+Named prompts live in `[prompts]`; role/team prompt values are text overrides
+in `[roles.prompts]` and `[teams.<name>.prompts]`. Renames update only schema
+reference arrays in workflows, never arbitrary bodies. Save all validates dirty
+domains, saves workflow configuration first, then changed server fields with
+password rotation last. A later failure retains only unacknowledged edits;
+these two persistence domains are not one transaction.
+
+Preparation and unit-launch errors are bounded/redacted into the existing atomic
+startup request. Repository projection preserves the specific cause while active
+unit and controller terminal evidence retain authority. API status adds plan path,
+controller start time and terminal launch-phase time; manifest time remains submission
+time. Override acknowledgement is projected separately from requested values. Resume
+visibility uses a read-only daemon admission preview; the endpoint rechecks it
+before reserving a continuation.
+
+Browser appearance is independent of server settings: `aflow.appearance` stores
+System/Light/Dark, with OS and cross-tab listeners. A same-origin blocking script
+sets the root theme before paint, with CSS system fallback; semantic variables
+provide the supplied light and dark base palettes.
 
 The REST control-plane routes and `/mcp` mount delegate to the same durable
 `ControlPlaneService`. The HTTP layer does not own workflow processes. Bearer
@@ -1025,3 +1063,11 @@ browser -> canonical planning routes -> project authorization -> planning servic
 All state-changing routes require bearer-token authentication. The app is
 designed for authenticated local or LAN deployment, not direct internet
 exposure.
+
+### Detached worker diagnostics
+
+`worker_diagnostics.py` projects nonce-bound portable unit receipts on reads, shared by repository status, REST lists/details, recovery admission and reconciliation. Controller terminal state and owner stops retain authority; a live child contradicting an exit remains uncertain. Nonzero exits without controller metadata report startup failure; zero exits alone never prove workflow completion. Worker exit timing is separate from controller execution timing.
+
+The installed `ui-worker` wrapper drains both child pipes concurrently and atomically replaces `units/diagnostic.json` with redacted recent output (4,096 characters per stream, bounded line buffers; oversized lines omitted). It writes exit time/code even if diagnostic capture fails. `daemon-worker` writes a nonce-bound structured early exception with its stage. Context reads expose these bounded artifacts even without `run.json`.
+
+The dashboard coordinates manual, timer and stream refreshes, preserves selected-run state on partial failure and gives context a single loader with cancellation and stale-response guards. Summary fields are deterministic; raw artifacts are grouped under collapsed details. Settings owns outstanding prompt-deletion recovery across tabs and editor modes. Browser count edits commit only valid integers on blur/Enter.

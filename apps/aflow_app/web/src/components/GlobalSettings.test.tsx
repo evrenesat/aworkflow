@@ -1,0 +1,277 @@
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import * as api from '../api'
+import { GlobalSettings } from './GlobalSettings'
+import type { GuidedFormProjection, ProjectConfigFormResponse } from '../types'
+
+vi.mock('../api', () => ({ getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getSettings: vi.fn(), patchGlobalConfig: vi.fn(), saveSettings: vi.fn(), validateGlobalConfig: vi.fn(), projectSettingsText: vi.fn() }))
+const validation = { state: 'ready' as const, issues: [], placeholders: [], workflows: ['demo'], teams: [], roles: ['worker'] }
+const config = { project_id: 'global', revision: 'a'.repeat(64), aflow_toml: 'config', workflows_toml: 'workflows', documents: ['aflow.toml', 'workflows.toml'], validation }
+const server = { revision: 'b'.repeat(64), bind_host: 'localhost', bind_port: 8766, managed_projects_root: '/code', password_set: true, advanced_toml: 'server', restart: { bind_host: false, bind_port: false, managed_projects_root: false } }
+const form: GuidedFormProjection = { default_workflow: 'demo', max_turns: 5, harnesses: { codex: { worker: { model: 'model', effort: 'high' } } }, roles: { worker: 'codex.worker' }, teams: {}, workflows: {}, workflow_default_teams: {}, prompts: { work: 'Original' }, role_prompts: {} }
+const response: ProjectConfigFormResponse = { ...config, changed: false, syntax_issues: [], form, choices: { harnesses: ['codex'], profiles: { codex: ['worker'] }, selectors: ['codex.worker'], roles: ['worker'], teams: [], workflows: ['demo'] }, suggestions: { label: 'suggestion', note: '', harnesses: [{ name: 'codex', supports_effort: true, custom_model_supported: true }], profiles: [{ harness: 'codex', profile: 'worker', model: 'model', effort: 'high' }] } }
+describe('GlobalSettings', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+    vi.mocked(api.getGlobalConfig).mockResolvedValue(config)
+    vi.mocked(api.getSettings).mockResolvedValue(server)
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(response)
+    vi.mocked(api.validateGlobalConfig).mockResolvedValue(validation)
+    vi.mocked(api.patchGlobalConfig).mockResolvedValue(config)
+    vi.mocked(api.saveSettings).mockResolvedValue(server)
+  })
+  it('preserves all deleted prompts and unsaved text and rename across tabs', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({ ...response, form: { ...form, prompts: { work: 'Original', second: 'Second' } } })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.change(screen.getByLabelText('Prompt text work'), { target: { value: 'unsaved text' } })
+    fireEvent.change(screen.getByLabelText('Prompt key work'), { target: { value: 'renamed' } })
+    for (const key of ['work', 'second']) {
+      fireEvent.click(screen.getByRole('button', { name: `More actions for prompt ${key}` }))
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Delete prompt…' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Delete prompt' }))
+    }
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Undo deletion of work' }))
+    expect((screen.getByLabelText('Prompt text work') as HTMLTextAreaElement).value).toBe('unsaved text')
+    expect((screen.getByLabelText('Prompt key work') as HTMLInputElement).value).toBe('renamed')
+    expect(screen.getByRole('button', { name: 'Undo deletion of second' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Undo deletion of second' }))
+    expect((screen.getByLabelText('Prompt text second') as HTMLTextAreaElement).value).toBe('Second')
+  })
+  it('retains Undo on save failure and clears it after acknowledged save', async () => {
+    vi.mocked(api.patchGlobalConfig).mockRejectedValueOnce(new Error('conflict'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for prompt work' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete prompt…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete prompt' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/conflict.*Your remaining edits/)
+    expect(screen.getByRole('button', { name: 'Undo deletion of work' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/All changes saved/)
+    expect(screen.queryByRole('button', { name: 'Undo deletion of work' })).toBeNull()
+  })
+  it('keeps an Undo collision recoverable and clears recovery on explicit discard', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({ ...response, form: { ...form, prompts: { new_prompt: 'old text' } } })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for prompt new_prompt' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete prompt…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete prompt' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New prompt' }))
+    fireEvent.change(screen.getByLabelText('Prompt text new_prompt'), { target: { value: 'new text' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Undo deletion of new_prompt' }))
+    expect(screen.getByText(/Cannot restore new_prompt/)).toBeTruthy()
+    expect((screen.getByLabelText('Prompt text new_prompt') as HTMLTextAreaElement).value).toBe('new text')
+    expect(screen.getByRole('button', { name: 'Undo deletion of new_prompt' })).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Restore key new_prompt'), { target: { value: 'recovered_prompt' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Undo deletion of new_prompt' }))
+    expect((screen.getByLabelText('Prompt text recovered_prompt') as HTMLTextAreaElement).value).toBe('old text')
+    expect((screen.getByLabelText('Prompt text new_prompt') as HTMLTextAreaElement).value).toBe('new text')
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for prompt new_prompt' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete prompt…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete prompt' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Undo deletion of new_prompt' })).toBeNull())
+    confirm.mockRestore()
+  })
+  it('commits recent count only after editing, without configuration writes', async () => {
+    localStorage.setItem('aflow.recentRunsLimit', '10')
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    const input = screen.getByLabelText('Recent non-running runs shown') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '' } })
+    expect(input.value).toBe('')
+    expect(localStorage.getItem('aflow.recentRunsLimit')).toBe('10')
+    fireEvent.change(input, { target: { value: '25' } })
+    fireEvent.blur(input)
+    expect(localStorage.getItem('aflow.recentRunsLimit')).toBe('25')
+    fireEvent.change(input, { target: { value: '0' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(screen.getByText('Enter a positive whole number.')).toBeTruthy()
+    expect(localStorage.getItem('aflow.recentRunsLimit')).toBe('25')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+    expect(api.saveSettings).not.toHaveBeenCalled()
+  })
+  it('saves typed custom effort without Enter, omitting every untouched field', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'new-effort' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: 'new-effort' }] }))
+    expect(api.saveSettings).not.toHaveBeenCalled()
+  })
+  it('drops reverted edits and preserves prompt and server drafts across tabs', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const effort = await screen.findByLabelText('Effort codex.worker')
+    fireEvent.change(effort, { target: { value: 'custom' } }); fireEvent.change(effort, { target: { value: 'high' } })
+    expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.change(screen.getByLabelText('Prompt text work'), { target: { value: 'λ\n{task}' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.change(screen.getByLabelText('Bind host'), { target: { value: '0.0.0.0' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    expect((screen.getByLabelText('Prompt text work') as HTMLTextAreaElement).value).toBe('λ\n{task}')
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalledWith({ expected_revision: server.revision, bind_host: '0.0.0.0' }))
+    expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'set_prompt', name: 'work', text: 'λ\n{task}' }] })
+    expect(vi.mocked(api.patchGlobalConfig).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.saveSettings).mock.invocationCallOrder[0])
+  })
+  it('retains failed server edits without resending acknowledged workflow changes', async () => {
+    vi.mocked(api.saveSettings).mockRejectedValueOnce(new Error('conflict'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'custom' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.change(screen.getByLabelText('Bind host'), { target: { value: '0.0.0.0' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/Workflow configuration saved. Remaining settings were not saved/)
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.saveSettings).toHaveBeenCalledTimes(2))
+    expect(api.patchGlobalConfig).toHaveBeenCalledTimes(1)
+  })
+  it('creates a custom profile in the save action without a separate Apply', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('Harness'), { target: { value: 'codex' } })
+    fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'brand-new' } })
+    fireEvent.change(screen.getByLabelText('Model codex.brand-new'), { target: { value: 'new-model' } })
+    fireEvent.change(screen.getByLabelText('Effort codex.brand-new'), { target: { value: 'new-effort' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'brand-new', model: 'new-model', effort: 'new-effort' }] }))
+  })
+
+  it('includes an in-progress prompt rename in Save and preserves it across tabs', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    fireEvent.change(screen.getByLabelText('Prompt key work'), { target: { value: 'renamed' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Prompts' }))
+    expect((screen.getByLabelText('Prompt key work') as HTMLInputElement).value).toBe('renamed')
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'rename_prompt', name: 'work', new_name: 'renamed' }] }))
+  })
+
+  it('keeps Advanced TOML usable and saving when the guided projection fails', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockRejectedValue(new Error('projection failed'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByText(/guided settings view is unavailable/)
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML' }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML' }))
+    const aflowArea = (await screen.findByLabelText('aflow.toml contents')) as HTMLTextAreaElement
+    expect((screen.getByLabelText('workflows.toml contents') as HTMLTextAreaElement).value).toBe('workflows')
+    fireEvent.change(aflowArea, { target: { value: '[roles]\nworker = "codex.worker"\n' } })
+    vi.mocked(api.validateGlobalConfig).mockResolvedValue({ ...validation, state: 'ready' })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, documents: { 'aflow.toml': '[roles]\nworker = "codex.worker"\n' } }))
+  })
+
+  it('confirmed reload discards every pending edit including the password', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'custom' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    fireEvent.change(screen.getByLabelText('Bind host'), { target: { value: '0.0.0.0' } })
+    fireEvent.change(screen.getByLabelText('New password (leave empty to keep current)'), { target: { value: 'discarded-secret' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings' }))
+    expect(confirm).toHaveBeenCalledWith('Discard unsaved settings and reload?')
+    // The reloaded draft replaces every discarded edit.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Agents & Roles' }))
+    await waitFor(() => expect(((screen.getByLabelText('Effort codex.worker') as HTMLInputElement | null)?.value)).toBe('high'))
+    fireEvent.click(screen.getByRole('tab', { name: 'General' }))
+    expect((screen.getByLabelText('New password (leave empty to keep current)') as HTMLInputElement).value).toBe('')
+    expect((screen.getByLabelText('Bind host') as HTMLInputElement).value).toBe('localhost')
+    expect((screen.getByRole('button', { name: 'Save all changes' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(2))
+    expect(api.saveSettings).not.toHaveBeenCalled()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+
+  it('cancelled reload retains unsaved drafts', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'kept' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Reload server settings' }))
+    await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalledTimes(1))
+    expect((screen.getByLabelText('Effort codex.worker') as HTMLInputElement).value).toBe('kept')
+  })
+
+  it('adds a team to the draft by button and Enter, rejecting blank and duplicate names', async () => {
+    const onDirty = vi.fn()
+    render(<GlobalSettings onDirtyChange={onDirty} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    const input = screen.getByLabelText('New team name')
+    // A blank name is rejected without mutating anything.
+    fireEvent.click(screen.getByRole('button', { name: 'Add team' }))
+    expect(screen.getByRole('alert').textContent).toContain('Enter a team name')
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+    // Enter in the form invokes the same handler as the button.
+    fireEvent.change(input, { target: { value: 'ds4-stage2' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(screen.getByText(/new — saved with Save all/)).toBeDefined()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+    expect(onDirty).toHaveBeenLastCalledWith(true)
+    expect((screen.getByLabelText('New team name') as HTMLInputElement).value).toBe('')
+    // A duplicate name is rejected.
+    fireEvent.change(input, { target: { value: 'ds4-stage2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add team' }))
+    expect(screen.getByRole('alert').textContent).toContain('already exists')
+  })
+
+  it('creates two teams, assigns a role, links the chain, and sends add_team first in one Save', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    const input = screen.getByLabelText('New team name')
+    fireEvent.change(input, { target: { value: 'stage-one' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add team' }))
+    fireEvent.change(screen.getByLabelText('New team name'), { target: { value: 'stage-two' } })
+    fireEvent.keyDown(screen.getByLabelText('New team name'), { key: 'Enter' })
+
+    // The new teams are editable immediately: assign a role before saving.
+    const stageOne = screen.getByRole('group', { name: /stage-one/ })
+    const worker = within(stageOne).getByLabelText('Worker')
+    fireEvent.focus(worker)
+    fireEvent.change(worker, { target: { value: 'codex.worker' } })
+    fireEvent.keyDown(worker, { key: 'Enter' })
+    // Link the chain through the existing upgrade_to field.
+    fireEvent.change(screen.getByLabelText('Upgrade to for team stage-one'), { target: { value: 'stage-two' } })
+    const chainText = screen.getAllByText(/Worker chain:/).map(el => el.textContent).join(' ')
+    expect(chainText).toContain('stage-one (')
+    expect(chainText).toContain('→ stage-two (')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalled())
+    const actions = vi.mocked(api.patchGlobalConfig).mock.calls[0][0].actions as Array<Record<string, unknown>>
+    expect(actions).toEqual([
+      { type: 'add_team', team: 'stage-one' },
+      { type: 'add_team', team: 'stage-two' },
+      { type: 'set_team_role', team: 'stage-one', role: 'worker', selector: 'codex.worker' },
+      { type: 'set_team_upgrade', team: 'stage-one', upgrade_to: 'stage-two' },
+    ])
+  })
+
+  it('shows a field-level cycle error on the chain and never mutates the server on Add', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Teams' }))
+    const input = screen.getByLabelText('New team name')
+    fireEvent.change(input, { target: { value: 'alpha-team' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add team' }))
+    fireEvent.change(screen.getByLabelText('New team name'), { target: { value: 'beta-team' } })
+    fireEvent.keyDown(screen.getByLabelText('New team name'), { key: 'Enter' })
+
+    fireEvent.change(screen.getByLabelText('Upgrade to for team beta-team'), { target: { value: 'alpha-team' } })
+    fireEvent.change(screen.getByLabelText('Upgrade to for team alpha-team'), { target: { value: 'beta-team' } })
+    expect(screen.getAllByRole('alert').some(el => el.textContent.includes('cycle'))).toBe(true)
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+})

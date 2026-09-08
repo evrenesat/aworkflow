@@ -107,6 +107,31 @@ class GlobalConfigService:
             )
             return snapshot
 
+    def patch(self, payload) -> ProjectConfigSnapshot:
+        from .guided_config import apply_action_batch
+
+        with self._lock, configuration_pair_lock(self._config_dir):
+            current = self._snapshot()
+            if payload.expected_revision != current.revision:
+                raise ProjectConfigRevisionConflict(current.revision)
+            if payload.actions is not None:
+                texts = apply_action_batch(current.aflow_toml, current.workflows_toml, payload.actions)
+            else:
+                texts = (payload.documents.get("aflow.toml", current.aflow_toml),
+                         payload.documents.get("workflows.toml", current.workflows_toml))
+            if texts == (current.aflow_toml, current.workflows_toml):
+                return current
+            revisions = {"old": current.revision, "new": None}
+            try:
+                saved = self._save_locked(*texts, current.revision, revisions)
+            except Exception as exc:
+                _append_audit_line(self._audit_path, project_id="global", outcome=_failure_outcome(exc),
+                                   old_revision=revisions["old"], new_revision=revisions["new"], caller_scope="rest")
+                raise
+            _append_audit_line(self._audit_path, project_id="global", outcome="saved",
+                               old_revision=revisions["old"], new_revision=revisions["new"], caller_scope="rest")
+            return saved
+
     def _save_locked(
         self,
         aflow_text: str,
@@ -219,9 +244,11 @@ def _commit_pair_locked(
         first_temp, second_temp = staged
         first_target = document_path(config_dir, CONFIG_DOCUMENT_NAMES[0])
         second_target = document_path(config_dir, CONFIG_DOCUMENT_NAMES[1])
-        os.replace(first_temp, first_target)
+        if previous[0] != payloads[0]:
+            os.replace(first_temp, first_target)
         try:
-            os.replace(second_temp, second_target)
+            if previous[1] != payloads[1]:
+                os.replace(second_temp, second_target)
         except OSError as exc:
             _restore_document(first_target, previous[0])
             _fsync_directory(config_dir)

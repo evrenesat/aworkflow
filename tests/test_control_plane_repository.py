@@ -160,10 +160,45 @@ def test_status_reports_applied_turn_limit_not_pending_override(
 
     # Recording an override is not evidence that the engine applied it.
     assert repository.get_run_status(run_id).max_turns == 6
+    if owned:
+        assert repository.get_run_status(run_id).evidence["overrides"]["state"] == "pending"
 
     metadata["effective_max_turns"] = 8
+    from aflow.run_state import load_override_request
+    request = load_override_request(run_dir / "overrides.toml").request
+    metadata["override_result"] = {"digest": request.digest, "status": "accepted", "applied": True}
     metadata_path.write_text(json.dumps(metadata))
     before = metadata_path.read_bytes()
     assert repository.get_run_status(run_id).max_turns == 8
+    if owned:
+        assert repository.get_run_status(run_id).evidence["overrides"]["state"] == "applied"
     assert repository.list_runs().runs[0].max_turns == 8
     assert metadata_path.read_bytes() == before
+
+
+def test_old_startup_failure_is_read_only_and_active_terminal_authority_wins(tmp_path):
+    from aflow.control_plane import write_launch_phase
+    create_launch_manifest(tmp_path, _manifest("old-failure"))
+    requests = tmp_path / ".aflow" / "start-requests"
+    requests.mkdir()
+    record = requests / "old-failure.json"
+    record.write_text(json.dumps({"schema_version": 1, "run_id": "old-failure", "state": "needs_attention"}))
+    original = record.read_bytes()
+    repo = RunRepository(tmp_path)
+    status = repo.get_run_status("old-failure")
+    assert status.status == "needs_attention"
+    assert status.reason == "Startup did not complete; the original error was not recorded."
+    assert status.started_at is None
+    assert status.evidence["no_agent_started"] is True
+    run_dir = tmp_path / ".aflow" / "runs" / "old-failure"
+    run_dir.mkdir()
+    append_run_event(run_dir, "reconciled", {"status": "running", "reason": "exact workflow unit is active"})
+    assert repo.get_run_status("old-failure").status == "running"
+    assert repo.get_run_status("old-failure").evidence["no_agent_started"] is False
+    (run_dir / "run.json").write_text(json.dumps({"status": "completed", "run_started_at": "2026-09-08T10:00:00Z"}))
+    write_launch_phase(tmp_path, "old-failure", "completed")
+    completed = repo.get_run_status("old-failure")
+    assert completed.status == "completed"
+    assert completed.started_at == "2026-09-08T10:00:00Z"
+    assert completed.ended_at
+    assert record.read_bytes() == original

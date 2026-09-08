@@ -88,6 +88,7 @@ def fake_aflow(tmp_path: Path) -> Path:
             code = child.wait()
             write("exit.json", {
                 "schema": 1, "nonce": args.nonce, "returncode": code,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             })
             sys.exit(code if code >= 0 else 128 - code)
             """

@@ -27,7 +27,7 @@ The server binds to `127.0.0.1:8765` by default and serves the built web client 
 
 ## Web workspace
 
-The web client is a same-origin workspace for exactly one selected registered project at a time. Projects selects the workspace. Open enters that project’s Overview; Settings, Plans and Runs then belong to the selected project. The project name and path stay visible above these tabs.
+The web client is a same-origin workspace for exactly one selected registered project at a time. Projects selects the workspace; a project row (name and path) opens it. Runs and Plans appear only after project selection; global Settings remains available without a project. The upper-left header reads `AFlow · <selected project>` when a project is selected and `AFlow` otherwise; Projects remains the way to switch. Any project-readiness guidance appears inside the affected page (Plans, Runs, New run, or Settings), never as a separate project bar.
 
 Login sends the deployment bearer once in the `Authorization` header to `POST /api/session`; the server answers with a signed HttpOnly, Secure, SameSite=Strict cookie. Reloads and new same-origin tabs restore the session from that cookie (`GET /api/session`) without re-entering the token. The session rolls forward for 30 days from real visible dashboard activity (the client marks such requests with `X-AFlow-Activity: 1`, at most once per minute); background polling and the event stream never renew it. Expiry, an invalid cookie, or a server token rotation ends the session and the client shows sign-in again while preserving the current project and view. Logout (`DELETE /api/session`) expires the cookie immediately — use it on a shared browser. The bearer token is never stored in localStorage, sessionStorage, URLs, or readable cookies; it lives only in the login request. Header-only REST and MCP clients are unaffected.
 
@@ -39,7 +39,7 @@ Advanced TOML exposes the same two documents, not a second configuration source.
 
 Plans view: Draft, Ready and Done correspond to plans/todo, plans/in-progress and plans/done. Create and edit Markdown, Save, then Move to Ready when it is ready to run. Run this plan opens Runs with that exact Ready plan selected. Draft and Done plans cannot launch. Failed saves preserve text, and promotion never silently overwrites a destination.
 
-Runs view: selected-run progress and recent runs come first; New run is a secondary disclosure. The newest returned run is selected only when no run is already selected or requested. Plan, workflow, team and start-step widgets show available choices. The launch preview uses the saved configuration and resolves each step's role and profile, including team overrides. Missing choices and invalid turn limits explain why Start run is unavailable. Run settings distinguish pending changes from applied values; low-level unit, revision, ownership and raw context/event information is under Technical details.
+Runs shows history and selected-run details, with a prominent New run action opening a separate project-scoped page (`view=new-run`). Cancel returns to Runs; successful creation opens the exact returned run. Creation and startup-answer request identities survive navigation. The newest returned run is selected only when no run is already selected or requested. Plan, workflow, team and start-step widgets show available choices. The launch preview uses the saved configuration and resolves each step's role and profile, including team overrides. Missing choices and invalid turn limits explain why Start run is unavailable. Run settings distinguish pending changes from applied values; low-level unit, revision, ownership and raw context/event information is under Diagnostics.
 
 Project run list and selected-run overview:
 
@@ -54,6 +54,8 @@ Live event stream (SSE):
 Start form:
 
 - Typed fields only: plan, workflow, team, start step, max turns, and optional extra instructions (one bounded line per instruction, at most 8 lines of 512 characters). There is no raw argv or shell input anywhere.
+- Workflow and team selectors show the resolved effective name with a small Default indicator before focus (for example `checkpoint_delivery · Default`); focusing switches to a blank search query, blur/Escape restore the resolved label, and the open list offers a real-text "Use default …" row. An explicit selection is submitted verbatim; following a default stays an omission in the request, so the server applies the global default workflow / workflow default team.
+- A concise Team members table resolves each role relevant to the workflow (team override first, then the global fallback) with selector, model/effort, and source; other configured roles stay in a disclosure. The Worker upgrade chain lists every `upgrade_to` stage in order with each stage's own worker selector/model/effort and an expandable member view; the last stage is marked, `backup_team` failure recovery never appears as a stage, and malformed graphs surface actionable configuration errors.
 - Start-step choices come from the selected workflow's capability-admitted executable steps, labeled with their 1-based index; the form explains exactly which earlier executable steps will be recorded as skipped. The server accepts the step name or a 1-based numeric string and stores the canonical name.
 - The server answers a start with either a run or a startup question. All three question kinds are handled in the UI: `pick_step` (choose one of the offered steps) and the `confirm_recovery` / `confirm_worktree_dirty` confirmations (explicit confirm/decline sent as booleans). No run is displayed as started while a question is open.
 - Exact retries reuse the same idempotency key; changing the draft replaces the key. Every failure keeps the draft in the form.
@@ -67,18 +69,18 @@ Guided workflow change (restart):
 
 - Selecting a different workflow for a nonterminal owned run is a guided stop-then-start, never an in-place mutation. After explicit confirmation, the UI issues the owner stop with the expected revision, then polls the canonical status until that exact source run reports `owner_stopped` status **and** launch phase (the engine's own precondition) before submitting the preserved typed start draft with `restarted_from_run_id`. The wait is bounded.
 - If the stop is rejected, the revision changes, inactivity cannot be proven, the network fails, or the successor start fails, automation halts: no retry loops, no overlapping units, the draft stays in the form, and the authoritative source state is shown for an explicitly renewed attempt.
-- Explicit resume remains the separate same-workflow action for `needs_attention` runs and never accepts replacement launch choices. Legacy runs are read-only and offer no controls. Owner stop, restart, and Full context keep their existing confirmation and disclosure guards.
+- Explicit resume remains the separate same-workflow action for `needs_attention` runs and never accepts replacement launch choices. Legacy runs are read-only and offer no controls. Owner stop and workflow restart keep their explicit confirmations; Diagnostics shows a deterministic summary. Opening Raw details loads the best supported context level (sending `level=full&full_scope=true` where supported) without extra acknowledgement. The shared page Refresh retries failures; stale responses are rejected when selection changes.
 
-Run links contain only registered project ID, view and optional run ID. Reload and browser back/forward restore the requested workspace. An older linked run is fetched directly even when absent from the first page. Invalid project/run links show guidance instead of selecting another run; unknown views normalize to Overview. Copy link uses only validated identifiers. Tokens, configuration text and prompts never belong in links.
+Run links contain only registered project ID, view and optional run ID. Reload and browser back/forward restore the requested workspace. An older linked run is fetched directly even when absent from the first page. Invalid project/run links show guidance instead of selecting another run; unknown views and legacy Overview links normalize to Runs for valid projects. Copy link uses only validated identifiers. Tokens, configuration text and prompts never belong in links.
 
 ## Owner acceptance after deployment
 
 1. Use the actual private HTTPS address after deployment; confirm the installed release. Sign in once, refresh twice and open a new tab: the session should restore without another token.
-2. In Projects, open an already-added project and confirm Overview visibly opens. Navigate Settings → Plans → Runs, then back/forward, checking the selected project remains clear.
+2. In Projects, open an already-added project and confirm Runs visibly opens. Navigate Settings → Plans → Runs, then back/forward, checking the selected project remains clear.
 3. Prepare a disposable Git project with a committed README beneath the managed root. Find it by typing, click Add, and confirm its original files and commit are preserved.
 4. Build a starter draft. Choose the installed harness/profile and assign the worker role using keyboard suggestions. ZCode requires its existing host-side model configuration. Review help and validation, save, and confirm the project becomes Ready.
 5. Create a safe one-checkpoint Markdown plan that writes a disposable text file. Save and Move to Ready, use Run this plan, inspect the exact step/profile preview and start it. Follow the returned run, reload its link and verify both successful completion and the expected file contents.
-6. Check wide and narrow layouts, available choices, disabled-action explanations, progress and Technical details. Copy the run link and reopen it. Logout, then reload the other tab and confirm it requires sign-in.
+6. Check wide and narrow layouts, available choices, disabled-action explanations, progress and Diagnostics. Copy the run link and reopen it. Logout, then reload the other tab and confirm it requires sign-in.
 7. Unregister the disposable project after saving evidence; unregister must preserve its files. Keep the previous release available for rollback using the deployment runbook if acceptance fails.
 
 The App journey test mocks API responses and checks UI contracts, including recovery from a failed save. Server tests verify real validation, containment and persistence. Neither substitutes for the owner’s deployed browser and worker-output checks above.
@@ -123,13 +125,47 @@ environment_file = "/etc/aflowd/worker.env"
 - `DELETE /api/projects/{project_id}`
 - `GET /api/config` (the shared global pair)
 - `PUT /api/config`
+- `PATCH /api/config` (expected revision plus ordered typed actions or a partial documents map, exclusively)
 - `POST /api/config/validate`
 - `POST /api/config/form` (pure projection or one draft operation; does not save)
 - `GET /api/settings` and `PUT /api/settings` (transport settings; write-only password; restart-required reporting)
+- `POST /api/settings/preview` (pure projection of Advanced connection settings into supported fields)
 
 Project creation and registration accept only normalized paths relative to the managed root. Existing folders are added without renaming: the registry ID is an internal path-safe label, so basenames with underscores, uppercase letters, spaces, or non-ASCII characters get a deterministic safe ID (safe-slug basenames keep their exact name), and the discovered display name uses the actual folder name. Registration never modifies directory contents — no project-local configuration is written, because every project immediately uses the shared global configuration — and unregister removes the registry record after active-unit checks and never deletes repository files.
 
 Configuration reads return both exact texts, a combined SHA-256 revision, and bounded validation results. Saves require `expected_revision`, validate both candidates through the production loader, and atomically commit or restore the pair. Saves are never blocked by runs: every run freezes an immutable configuration snapshot at reservation (shared lock with saves), so edits apply to new runs in all projects only. Settings changes to bind host/port or the projects root report restart-required; password changes invalidate sessions immediately.
+
+Settings is global, even with no registered projects. Its freely selectable tabs
+are Agents & Roles, Teams, Workflows, Prompts, and General. Save all changes sends
+only net guided operations or deliberately edited Advanced documents, then only
+changed server fields. Password rotation is last. If server settings fail after
+workflow configuration saves, the UI reports partial success and retains the
+remaining edits. Revision conflicts require explicit reload/reapply.
+
+Model and supported effort fields accept custom text. Named prompts in `[prompts]`
+support creation, editing, rename with exact workflow-reference updates (including
+`merge_prompt` names and arrays), and deletion when unreferenced. Referenced prompts
+show a compact "Used by …" disclosure and offer no deletion; an unreferenced prompt
+keeps a small per-prompt More menu whose **Delete prompt…** action requires explicit
+confirmation, states that removal happens on Save all, and offers Undo until save —
+the server still rejects any referenced deletion. Role/team prompt overrides are
+literal text in `[roles.prompts]` and `[teams.<name>.prompts]`; removing a team
+override restores global inheritance. Installed skills and arbitrary files are
+outside the editor.
+
+Teams are created with an explicit **Add team** form (button or Enter) that adds the
+team to the unsaved draft immediately — it becomes selectable everywhere before Save
+all, and `add_team` actions precede their dependent edits in one changes-only batch.
+Each team editor shows the team name once in its heading, labels roles plainly
+(Worker, Reviewer, …), and exposes an **Upgrade to** selector editing the existing
+`[teams.<name>].upgrade_to` link (`set_team_upgrade`; null removes the link). The
+full ordered worker chain is displayed with per-stage worker selector/model/effort;
+cycles and missing targets show field-level errors, and production graph checks stay
+authoritative. `backup_team` remains a separate recovery field and never appears as
+an upgrade stage. A mistyped prompt table (for example `prompts = "wrong"`) no longer
+breaks the guided view: the saved documents stay editable under Advanced TOML with
+the production validation diagnosis, and confirmed reload discards every pending edit
+including the password.
 
 ## Plan API
 
@@ -151,10 +187,25 @@ A start request accepts typed plan_path, workflow_name, team, start_step,
 max_turns, bounded extra_instructions, and restarted_from_run_id. Unknown fields
 fail validation. Capabilities expose the ordered declared/executable/excluded
 workflow steps and admitted selectors so a client can construct valid choices.
-A restart predecessor must first be stopped through owner stop and have no
+A restart predecessor must have confirmed failure or explicit owner stop and no
 active exact unit; a successful request creates a new run and exposes immutable
 predecessor lineage. Resume continues the saved invocation and does not accept
 replacement launch choices.
+
+`GET /api/control-plane/projects/{project_id}/runs/{run_id}/restart-options`
+projects eligibility, a bounded reason, and original launch choices. Restart
+opens New run with an immutable source identity and permits the same workflow.
+An active source still follows stop/confirm-inactive before launch. Failed
+inactive sources require no artificial owner-stop. A new attempt retains plan
+progress and freezes current committed settings; it never restores backups.
+Extra instructions that were not durably retained must be re-entered explicitly.
+Reset Plan and backup management remain deferred to issue #34.
+
+The default All runs view includes every ongoing run plus the latest N other
+runs across all registered projects. N defaults to 10 and is saved only under
+`aflow.recentRunsLimit` in this browser; it does not delete history. Paused and
+input-waiting runs count as ongoing. Visible views refresh every ten seconds,
+with partial/stale results labelled and each row linking to its exact run.
 
 The `/mcp` streamable HTTP endpoint exposes the same canonical operations and bearer policy. The lightweight `aflow daemon` exposes the shared MCP contract without the web app.
 
@@ -166,3 +217,13 @@ npm --prefix apps/aflow_app/web test -- --run
 npm --prefix apps/aflow_app/web run build
 uv run ruff check apps/aflow_app/server/src apps/aflow_app/server/tests
 ```
+
+### Worker failures and diagnostics
+
+A detached worker that exits before controller metadata exists reports **Could not start**, its known exit code and worker exit time. Historical failures whose output was discarded say **Original worker error was not retained**. Unconfirmed worker activity reports **Needs attention** and does not admit recovery. A successful process exit alone is not workflow completion. Restart with options rechecks ownership and lineage; Resume still requires saved continuation state. Status reads do not rewrite run files.
+
+New workers retain bounded, redacted recent stdout/stderr in their owned receipt directory and structured early exceptions where possible. Overlong output lines are omitted; these are diagnostic tails, not complete logs. The single page **Refresh** updates the list, selected status, timeline and diagnostics. Automatic updates continue while visible. **Diagnostics summary** uses known fields; **Raw details** expands bounded artifacts by source. API/MCP Lite and Full remain compatible transport options.
+
+Set **Recent non-running runs shown** only in **Settings → General** (default 10). It remains browser-local under `aflow.recentRunsLimit` and does not change retention. Prompt deletion Undo survives Settings tabs and Advanced/guided navigation, supports multiple deletions, and remains available after a failed save; acknowledged save or explicit discard clears it. Conflicting keys must be resolved before Undo can restore the prompt.
+
+Settings tabs and Save remain pinned within the workspace scroller through the full form height, including long prompt lists on mobile.

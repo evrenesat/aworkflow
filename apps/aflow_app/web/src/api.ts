@@ -219,6 +219,16 @@ export async function saveGlobalConfig(request: ProjectConfigSaveRequest): Promi
   })
 }
 
+export async function patchGlobalConfig(request: { expected_revision: string } & (
+  { actions: import('./types').GuidedConfigAction[] } | { documents: Partial<Record<'aflow.toml' | 'workflows.toml', string>> }
+)): Promise<ProjectConfig> {
+  return fetchJson<ProjectConfig>(`${API_BASE}/config`, { method: 'PATCH', body: JSON.stringify(request) })
+}
+
+export async function projectSettingsText(advanced_toml: string): Promise<Partial<SettingsSaveRequest>> {
+  return fetchJson(`${API_BASE}/settings/preview`, { method: 'POST', body: JSON.stringify({ advanced_toml }) })
+}
+
 export async function validateGlobalConfig(request: ProjectConfigValidateRequest): Promise<ConfigValidation> {
   return fetchJson<ConfigValidation>(`${API_BASE}/config/validate`, {
     method: 'POST',
@@ -329,21 +339,36 @@ export async function listControlPlanePlans(projectId: string): Promise<ControlP
 export async function listControlPlaneRuns(
   projectId: string,
   request: { cursor?: string; limit?: number } = {},
+  options: { signal?: AbortSignal } = {},
 ): Promise<RunPage> {
-  return fetchJson<RunPage>(`${controlProjectPath(projectId)}/runs${buildQuery(request)}`)
+  return fetchJson<RunPage>(`${controlProjectPath(projectId)}/runs${buildQuery(request)}`, options)
 }
 
-export async function getControlPlaneRun(projectId: string, runId: string): Promise<RunStatus> {
-  return fetchJson<RunStatus>(`${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}`)
+export async function getControlPlaneRun(projectId: string, runId: string, options: { signal?: AbortSignal } = {}): Promise<RunStatus> {
+  return fetchJson<RunStatus>(`${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}`, options)
+}
+
+export interface RestartOptions {
+  eligible: boolean
+  reason: string | null
+  requires_stop: boolean
+  run_id: string
+  extra_instructions_unavailable: boolean
+  options: StartRunRequest
+}
+export async function getRestartOptions(projectId: string, runId: string): Promise<RestartOptions> {
+  return fetchJson(`${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}/restart-options`)
 }
 
 export async function listRunEvents(
   projectId: string,
   runId: string,
   request: { after_sequence?: number; limit?: number } = {},
+  options: { signal?: AbortSignal } = {},
 ): Promise<RunEvent[]> {
   const response = await fetchJson<RunEventTail>(
     `${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}/events${buildQuery(request)}`,
+    options,
   )
   return response.events
 }
@@ -353,12 +378,14 @@ export async function getRunContext(
   runId: string,
   level: 'lite' | 'full',
   fullScope = false,
+  options: { signal?: AbortSignal } = {},
 ): Promise<RunContext> {
   return fetchJson<RunContext>(
     `${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}/context${buildQuery({
       level,
       ...(level === 'full' ? { full_scope: fullScope } : {}),
     })}`,
+    options,
   )
 }
 

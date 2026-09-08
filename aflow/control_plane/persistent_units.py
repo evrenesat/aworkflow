@@ -27,6 +27,7 @@ shutdown must not signal workflow groups.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -105,9 +106,11 @@ def _write_receipt(path: Path, payload: Mapping[str, object], *, exclusive: bool
 
 
 def _read_json(path: Path) -> dict | None:
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return None
     try:
+        if path.stat().st_size > 65_536:
+            return None
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
@@ -130,8 +133,10 @@ def _receipts_for(name: str, cwd: Path) -> _UnitReceipts | None:
         raise ValueError("workflow unit name must use the aflow-run-<id>.service form")
     run_id = match.group("run_id")
     directory = Path(cwd) / ".aflow" / "runs" / run_id / "units"
+    if any(part.is_symlink() for part in (directory, *directory.parents)):
+        return None
     start = _read_json(directory / "start.json")
-    if start is None:
+    if start is None or type(start.get("schema")) is not int or start.get("schema") != 1 or start.get("run_id") != run_id or start.get("unit") != name:
         return None
     nonce = start.get("nonce")
     if not isinstance(nonce, str) or not nonce:
@@ -146,7 +151,28 @@ def _receipts_for(name: str, cwd: Path) -> _UnitReceipts | None:
 
 
 def _nonce_matches(receipt: dict | None, nonce: str) -> bool:
-    return isinstance(receipt, dict) and receipt.get("nonce") == nonce
+    return isinstance(receipt, dict) and type(receipt.get("schema")) is int and receipt.get("schema") == 1 and receipt.get("nonce") == nonce
+
+
+def _terminal_receipt(receipts: _UnitReceipts, path: Path) -> dict | None:
+    record = _read_json(path)
+    if not _nonce_matches(record, receipts.nonce):
+        return None
+    try:
+        at = datetime.fromisoformat(record["at"].replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            return None
+        if receipts.start.get("started_at"):
+            started = datetime.fromisoformat(receipts.start["started_at"].replace("Z", "+00:00"))
+            if started.tzinfo is None or at < started:
+                return None
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return None
+    if path.name == "exit.json" and type(record.get("returncode")) is not int:
+        return None
+    if path.name == "stopped.json" and record.get("result") != "stopped":
+        return None
+    return record
 
 
 class PersistentUnitManager:
@@ -355,7 +381,12 @@ class PersistentUnitManager:
                 self._receipt_roots[unit] = root
 
     def _observe(self, receipts: _UnitReceipts) -> UnitState:
-        stopped = _read_json(receipts.stopped)
+        child = _read_json(receipts.child)
+        if _nonce_matches(child, receipts.nonce):
+            pid, birth = child.get("pid"), child.get("process_birth")
+            if type(pid) is int and pid > 0 and child.get("pgid") == pid and isinstance(birth, str) and _process_alive(pid, birth):
+                return UnitState(name=receipts.name, active_state="active", sub_state="running", main_pid=pid)
+        stopped = _terminal_receipt(receipts, receipts.stopped)
         if _nonce_matches(stopped, receipts.nonce):
             return UnitState(
                 name=receipts.name,
@@ -363,8 +394,8 @@ class PersistentUnitManager:
                 sub_state="dead",
                 result="stopped",
             )
-        exit_receipt = _read_json(receipts.exit)
-        if _nonce_matches(exit_receipt, receipts.nonce):
+        exit_receipt = _terminal_receipt(receipts, receipts.exit)
+        if _nonce_matches(exit_receipt, receipts.nonce) and type(exit_receipt.get("returncode")) is int:
             code = exit_receipt.get("returncode")
             result = "success" if code == 0 else f"exit:{code}"
             return UnitState(
@@ -403,7 +434,7 @@ class PersistentUnitManager:
                 result="startup_lost",
             )
         birth = child.get("process_birth")
-        if not isinstance(birth, str) or not _process_alive(pid, birth):
+        if type(child.get("pid")) is not int or pid < 1 or child.get("pgid") != pid or not isinstance(birth, str) or not _process_alive(pid, birth):
             # The wrapper writes exit.json after the child exits; reaching
             # here means the wrapper died without recording a terminal result.
             return UnitState(

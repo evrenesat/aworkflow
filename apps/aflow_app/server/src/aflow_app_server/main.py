@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from starlette.routing import Match, Mount, get_route_path
 from starlette.types import Scope
@@ -34,7 +34,7 @@ from aflow.control_plane import (
     ServiceAuthorizationError,
 )
 from aflow.control_plane.persistence import PersistenceError
-from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict
+from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict, DaemonStartupError
 
 from .browser_session import (
     SESSION_COOKIE_NAME,
@@ -50,6 +50,7 @@ from .control_plane_service import (
     ProjectNotAllowedError,
 )
 from .global_config_service import GlobalConfigService
+from .models import GlobalConfigPatchPayload, CanonicalTransportModel
 from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
 from .models import (
@@ -652,6 +653,14 @@ def _error_response(status_code: int, code: str, **extra: Any) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": {"code": code, **extra}})
 
 
+@app.exception_handler(DaemonStartupError)
+async def startup_failure_handler(_: Request, exception: DaemonStartupError) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT, "startup_failed",
+        message=str(exception), run_id=exception.run_id,
+    )
+
+
 @app.exception_handler(ProjectNotAllowedError)
 async def project_not_allowed_handler(_: Request, __: ProjectNotAllowedError) -> JSONResponse:
     return _error_response(status.HTTP_404_NOT_FOUND, "project_not_found")
@@ -989,6 +998,16 @@ def run_context(
     )
 
 
+@app.get("/api/control-plane/projects/{project_id}/runs/{run_id}/restart-options", tags=["control-plane"])
+def control_plane_restart_options(
+    project_id: str,
+    run_id: str,
+    _: str = Depends(verify_token),
+    service: ControlPlaneService = Depends(get_control_plane_service),
+):
+    return service.restart_options(project_id, run_id)
+
+
 @app.get(
     "/api/control-plane/projects/{project_id}/runs/{run_id}",
     response_model=RunStatusResponse,
@@ -1312,6 +1331,15 @@ def get_global_config(
     return _config_response(service.read())
 
 
+@app.patch("/api/config", response_model=ProjectConfigResponse, tags=["settings"])
+def patch_global_config(
+    payload: GlobalConfigPatchPayload,
+    _: str = Depends(verify_token),
+    service: GlobalConfigService = Depends(get_global_config_service),
+) -> ProjectConfigResponse:
+    return _config_response(service.patch(payload))
+
+
 @app.put(
     "/api/config",
     response_model=ProjectConfigResponse,
@@ -1431,6 +1459,18 @@ def _apply_advanced_settings(config_dir: Path, text: str) -> dict[str, object]:
     if isinstance(control_plane, dict) and "managed_projects_root" in control_plane:
         updates["managed_projects_root"] = str(control_plane["managed_projects_root"])
     return updates
+
+
+class SettingsPreviewPayload(CanonicalTransportModel):
+    advanced_toml: str = Field(max_length=65536)
+
+
+@app.post("/api/settings/preview", tags=["settings"])
+def preview_settings(payload: SettingsPreviewPayload, _: str = Depends(verify_token)):
+    try:
+        return _apply_advanced_settings(global_config_dir(), payload.advanced_toml)
+    except (ValueError, TypeError) as exc:
+        raise ProjectConfigError("Invalid connection settings TOML") from exc
 
 
 def _settings_response() -> SettingsResponse:
