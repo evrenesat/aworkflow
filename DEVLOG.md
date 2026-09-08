@@ -1,5 +1,28 @@
 # DEVLOG
 
+## 2026-09-08 — Refresh unedited skill bundles without losing edits
+
+- Added an explicit `SkillStore.refresh_skills` path alongside revisioned
+  saves: missing canonical trees initialize from the package, trees matching
+  their recorded baseline refresh to incoming package files (including added
+  and removed resources with permission intent), and the baseline advances
+  only after a successful refresh.
+- Edited skill trees are preserved whole — saved `SKILL.md` plus every
+  supporting file — and reported `preserved_edited`; exact reversion to the
+  baseline makes a skill unedited again. Trees without metadata are adopted
+  only on an exact package match and otherwise protected with an unknown
+  baseline.
+- Refreshes stage and validate the incoming tree first, mutate under a
+  store-owned transaction marker with rollback material for touched files and
+  metadata, and restore the prior tree and baseline on ordinary I/O errors.
+  Interrupted transactions make reads and saves of that skill fail with an
+  incomplete-refresh error until the next explicit refresh verifies the
+  rollback; uncertain markers are never silently retired.
+- Documented the preserve-whole-edited-skill policy in `docs/installation.md`.
+  Verified 41 skill-store tests, 18 refresh tests, and ruff on the store;
+  the full store/install suites pass with the injected v1→v2 loader and the
+  real bundled package.
+
 ## 2026-09-08 — Preserve history browsing and acknowledgement retries
 
 - Refresh every loaded run-history page, reconcile removals, and retain the

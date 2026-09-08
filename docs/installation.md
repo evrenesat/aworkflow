@@ -111,6 +111,36 @@ Auto-install destination map:
 | `opencode` | `~/.config/opencode/skills` |
 | `claude` | `~/.claude/skills` |
 
+## Canonical Skill Store and Refresh Behavior
+
+AFlow keeps canonical skill content per OS account under
+`~/.config/aflow/skills/<name>/`. The first time a bundled skill is saved or
+explicitly refreshed, its complete packaged directory (including references,
+agents, and scripts with their permission intent) is materialized there and a
+baseline of the packaged file hashes is recorded under
+`~/.config/aflow/skills/.metadata/`. Reads never initialize, refresh, or
+reinstall anything; the effective `SKILL.md` is the saved canonical document
+when one exists and is valid, otherwise the packaged copy.
+
+Explicit reinstallation refreshes skills through the same store:
+
+- A skill whose files exactly match its recorded baseline is considered
+  unedited. Reinstallation replaces it with the currently packaged files and
+  records the new baseline, so unedited skills pick up package upgrades.
+- A skill with any changed, extra, missing, or otherwise customized file is
+  edited. The whole skill directory is preserved exactly as saved — both its
+  `SKILL.md` and its supporting files — and the upgrade leaves it untouched.
+  Reverting a skill to the exact recorded baseline makes it unedited again.
+- An existing skill directory without recorded metadata is adopted only when
+  it exactly matches the current package; otherwise it is preserved and
+  protected with an unknown baseline rather than guessed at or overwritten.
+
+Refreshes are explicit store operations, serialized with saves under one
+lock. An interrupted refresh is detected through a store transaction marker:
+reads of that skill fail with an incomplete-refresh error until the next
+explicit refresh verifiably restores the prior content, so uncertain content
+is never silently overwritten.
+
 ## Bundled Skill Inventory
 
 Default skills:

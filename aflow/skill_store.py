@@ -21,6 +21,22 @@ readers observe either the complete old or the complete new document. A save
 never touches supporting files or the recorded package baseline after
 initialization; refresh decisions compare against that baseline, not against
 the user's saved text.
+
+``SkillStore.refresh_skills(names)`` is the only explicit refresh entry point;
+runtime reads and saves never refresh anything. A canonical tree is unedited
+exactly when its complete relative-file inventory and content hashes match the
+recorded baseline; unedited trees are replaced with the incoming package
+files, while any changed, extra, missing, or irregular user file preserves the
+entire tree (``preserved_edited``). An existing tree without metadata is
+adopted only when it exactly matches the current package; otherwise it is
+preserved and protected with an unknown baseline. Refreshes stage and validate
+the full incoming tree first, mutate under a store-owned transaction marker
+holding only bounded relative paths and hashes, keep rollback material until
+the per-skill refresh succeeds, and roll back prior files plus metadata on
+ordinary I/O errors. A crash leaves the marker behind: reads and saves of that
+skill fail with an incomplete-refresh error until the next explicit refresh
+verifiably rolls the transaction back. Each skill's result is independent;
+there is no multi-skill batch transaction.
 """
 
 from __future__ import annotations
@@ -40,7 +56,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
-from typing import Iterator
+from typing import Callable, Iterable, Iterator
 
 import yaml
 
@@ -55,6 +71,8 @@ SKILL_DOCUMENT_NAME = "SKILL.md"
 METADATA_DIR_NAME = ".metadata"
 METADATA_SCHEMA_VERSION = 1
 STORE_LOCK_NAME = "store.lock"
+REFRESH_MARKER_SUFFIX = ".refresh.json"
+ROLLBACK_DIR_NAME = "rollback"
 MAX_SKILL_DOCUMENT_BYTES = 1024 * 1024
 _DEFAULT_ROOT = Path.home() / ".config" / "aflow" / "skills"
 _REVISION_RE = re.compile(r"[0-9a-f]{64}")
@@ -74,6 +92,10 @@ class SkillRevisionConflict(SkillStoreError):
     def __init__(self, current_revision: str) -> None:
         super().__init__("skill revision does not match the effective document")
         self.current_revision = current_revision
+
+
+class SkillRefreshIncomplete(SkillStoreError):
+    """An interrupted refresh transaction is pending for this skill."""
 
 
 @dataclass(frozen=True)
@@ -102,6 +124,24 @@ class SkillSaveResult:
     revision: str
     changed: bool
     materialized: bool
+
+
+@dataclass(frozen=True)
+class SkillRefreshResult:
+    """Per-skill acknowledgement of one explicit refresh.
+
+    ``status`` is ``initialized`` (missing canonical tree materialized from the
+    package), ``refreshed`` (an unedited or adopted tree now matches the
+    incoming package), ``preserved_edited`` (the whole tree was kept because it
+    is edited or has an unknown baseline), or ``failed`` with a bounded
+    ``error`` after any rollback.
+    """
+
+    name: str
+    status: str
+    changed: bool
+    edited: bool
+    error: str | None = None
 
 
 def sha256_revision(payload: bytes) -> str:
@@ -358,13 +398,36 @@ def _cleanup_staging(staging: Path) -> None:
         pass
 
 
+def _load_bundled_package_tree(name: str) -> list[tuple[str, bytes, int]]:
+    """Default package loader: the real bundled resources for one skill."""
+    return _collect_package_files(bundled_skill_resource(name))
+
+
+def _tree_matches_baseline(tree: dict[str, str | None], baseline: dict[str, str]) -> bool:
+    """A tree is unedited only with the exact baseline inventory and hashes.
+
+    Any symlink/irregular entry (``None``), extra file, missing file, or
+    changed content hash makes the tree edited.
+    """
+    if any(digest is None for digest in tree.values()):
+        return False
+    return {relative: digest for relative, digest in tree.items()} == baseline
+
+
 class SkillStore:
     """Revisioned, cross-process safe store for canonical skill documents."""
 
-    def __init__(self, root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        package_tree_loader: Callable[[str], list[tuple[str, bytes, int]]] | None = None,
+    ) -> None:
         if root is None:
             root = _DEFAULT_ROOT
         self._root = Path(root).expanduser().resolve()
+        if package_tree_loader is None:
+            package_tree_loader = _load_bundled_package_tree
+        self._package_tree_loader = package_tree_loader
 
     @property
     def root(self) -> Path:
@@ -377,12 +440,18 @@ class SkillStore:
     # ------------------------------------------------------------------ reads
 
     def list_skills(self) -> tuple[SkillDocument, ...]:
-        """List every registered bundled skill's effective document, purely."""
+        """List every registered bundled skill's effective document, purely.
+
+        A skill with a pending interrupted-refresh marker makes its read fail
+        with :class:`SkillRefreshIncomplete`; the listing is loud rather than
+        silently skipping uncertain content.
+        """
         return tuple(self.read(name) for name in BUNDLED_SKILL_NAMES)
 
     def read(self, name: str) -> SkillDocument:
         """Return the effective document for one skill without writing anything."""
         _require_safe_name(name)
+        self._require_no_incomplete_refresh(name)
         payload, source = self._effective_payload(name)
         validate_skill_document(name, payload)
         return SkillDocument(
@@ -419,6 +488,7 @@ class SkillStore:
             raise SkillStoreError(str(exc)) from exc
 
         with self._write_lock():
+            self._require_no_incomplete_refresh(name)
             current_payload, source = self._effective_payload(name)
             validate_skill_document(name, current_payload)
             current_revision = _sha256(current_payload)
@@ -448,6 +518,34 @@ class SkillStore:
     def _metadata_path(self, name: str) -> Path:
         return self.metadata_root / f"{name}.json"
 
+    def _transaction_path(self, name: str) -> Path:
+        return self.metadata_root / f"{name}{REFRESH_MARKER_SUFFIX}"
+
+    def _rollback_root(self, name: str) -> Path:
+        return self.metadata_root / "staging" / f"{name}.{ROLLBACK_DIR_NAME}"
+
+    def _package_tree(self, name: str) -> list[tuple[str, bytes, int]]:
+        """Load the incoming package resource tree for one bundled skill."""
+        try:
+            return self._package_tree_loader(name)
+        except SkillCatalogError as exc:
+            raise SkillStoreError(
+                f"skill '{name}' has no saved canonical document and no bundled "
+                f"resource: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise SkillStoreError(
+                f"cannot read bundled resources for '{name}': {exc}"
+            ) from exc
+
+    def _require_no_incomplete_refresh(self, name: str) -> None:
+        """Reject reads and saves while an interrupted refresh is pending."""
+        if _lstat(self._transaction_path(name)) is not None:
+            raise SkillRefreshIncomplete(
+                f"skill '{name}' has an interrupted refresh transaction; "
+                "run an explicit refresh to recover it before reading or saving"
+            )
+
     def _require_safe_root(self) -> None:
         root_stat = _lstat(self._root)
         if root_stat is not None and not stat.S_ISDIR(root_stat.st_mode):
@@ -472,19 +570,11 @@ class SkillStore:
             if not stat.S_ISREG(document_stat.st_mode):
                 raise SkillStoreError(f"canonical SKILL.md is not a regular file: {name}")
             return _read_no_follow(self._skill_document_path(name)), "saved"
-        try:
-            resource = bundled_skill_resource(name)
-        except SkillCatalogError as exc:
-            raise SkillStoreError(
-                f"skill '{name}' has no saved canonical document and no bundled resource: {exc}"
-            ) from exc
-        try:
-            with resource.joinpath(SKILL_DOCUMENT_NAME).open("rb") as handle:
-                return handle.read(), "bundled"
-        except OSError as exc:
-            raise SkillStoreError(
-                f"cannot read bundled SKILL.md resource for '{name}': {exc}"
-            ) from exc
+        package_files = self._package_tree(name)
+        package_payloads = {relative: payload for relative, payload, _ in package_files}
+        if SKILL_DOCUMENT_NAME not in package_payloads:
+            raise SkillStoreError(f"bundled skill '{name}' is missing its SKILL.md resource")
+        return package_payloads[SKILL_DOCUMENT_NAME], "bundled"
 
     def _load_metadata(self, name: str) -> dict:
         path = self._metadata_path(name)
@@ -511,6 +601,14 @@ class SkillStore:
                 f"skill baseline metadata for '{name}' has an unsupported schema"
             )
         files = metadata.get("files")
+        if files is None:
+            # An unknown/protected baseline: refresh must preserve the tree.
+            if metadata.get("protected") is not True:
+                raise SkillStoreError(
+                    f"skill baseline metadata for '{name}' has an unknown baseline "
+                    "without the protected marker"
+                )
+            return metadata
         if not isinstance(files, dict) or not files:
             raise SkillStoreError(
                 f"skill baseline metadata for '{name}' lists no baseline files"
@@ -522,6 +620,12 @@ class SkillStore:
                     f"skill baseline metadata for '{name}' has an invalid digest for {relative!r}"
                 )
         return metadata
+
+    def _try_load_metadata(self, name: str) -> dict | None:
+        """Return baseline metadata, or None when the tree has none yet."""
+        if _lstat(self._metadata_path(name)) is None:
+            return None
+        return self._load_metadata(name)
 
     def _require_managed_tree(self, name: str) -> None:
         self._load_metadata(name)
@@ -550,15 +654,35 @@ class SkillStore:
         finally:
             os.close(descriptor)
 
-    def _initialize_tree(self, name: str, saved_payload: bytes) -> None:
-        """Materialize the complete bundled directory, then replace SKILL.md.
+    def _metadata_bytes(self, name: str, files: dict | None, protected: bool = False) -> bytes:
+        metadata: dict = {
+            "schema_version": METADATA_SCHEMA_VERSION,
+            "skill": name,
+            "files": files,
+        }
+        if protected:
+            metadata["protected"] = True
+        return json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8") + b"\n"
 
-        Package resources are staged and validated first; the staged tree is
-        renamed into canonical storage, the package baseline metadata is
-        recorded, and only then is ``SKILL.md`` replaced with the saved bytes.
-        Any failure before the rename leaves the store unchanged.
+    def _record_baseline_metadata_locked(self, name: str, baseline: dict[str, str]) -> None:
+        _atomic_write(self._metadata_path(name), self._metadata_bytes(name, baseline))
+
+    def _record_protected_metadata_locked(self, name: str) -> None:
+        _atomic_write(self._metadata_path(name), self._metadata_bytes(name, None, protected=True))
+
+    def _materialize_tree_locked(
+        self,
+        name: str,
+        package_files: list[tuple[str, bytes, int]],
+        baseline: dict[str, str],
+    ) -> None:
+        """Stage, validate, and rename the package tree into canonical storage.
+
+        The staged tree is renamed into place (atomic for a missing or empty
+        target) and the package baseline metadata is recorded before any
+        ``SKILL.md`` replacement happens. A failure before the rename leaves
+        the store unchanged.
         """
-        self._require_safe_root()
         canonical_dir = self._skill_directory(name)
         existing = _lstat(canonical_dir)
         if existing is not None:
@@ -572,12 +696,6 @@ class SkillStore:
                 raise SkillStoreError(
                     f"refusing to initialize skill '{name}' over an existing unmanaged directory"
                 )
-        package_files = _collect_package_files(bundled_skill_resource(name))
-        package_payloads = {relative: payload for relative, payload, _ in package_files}
-        if SKILL_DOCUMENT_NAME not in package_payloads:
-            raise SkillStoreError(f"bundled skill '{name}' is missing its SKILL.md resource")
-        validate_skill_document(name, package_payloads[SKILL_DOCUMENT_NAME])
-        baseline = {relative: _sha256(payload) for relative, payload, _ in package_files}
 
         staging = (
             self.metadata_root
@@ -617,15 +735,348 @@ class SkillStore:
                     f"cannot materialize canonical skill directory for '{name}': {exc}"
                 ) from exc
             _fsync_directory(self._root)
-            metadata = {
-                "schema_version": METADATA_SCHEMA_VERSION,
-                "skill": name,
-                "files": baseline,
-            }
-            _atomic_write(
-                self._metadata_path(name),
-                json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8") + b"\n",
-            )
-            _atomic_write(self._skill_document_path(name), saved_payload)
+            self._record_baseline_metadata_locked(name, baseline)
         finally:
             _cleanup_staging(staging)
+
+    def _initialize_tree(self, name: str, saved_payload: bytes) -> None:
+        """Materialize the complete bundled directory, then replace SKILL.md."""
+        package_files = self._package_tree(name)
+        package_payloads = {relative: payload for relative, payload, _ in package_files}
+        if SKILL_DOCUMENT_NAME not in package_payloads:
+            raise SkillStoreError(f"bundled skill '{name}' is missing its SKILL.md resource")
+        validate_skill_document(name, package_payloads[SKILL_DOCUMENT_NAME])
+        baseline = {relative: _sha256(payload) for relative, payload, _ in package_files}
+        self._materialize_tree_locked(name, package_files, baseline)
+        _atomic_write(self._skill_document_path(name), saved_payload)
+
+    # --------------------------------------------------------------- refresh
+
+    def refresh_skills(self, names: Iterable[str]) -> tuple[SkillRefreshResult, ...]:
+        """Explicitly prepare/refresh selected bundled names under the store lock.
+
+        Missing canonical trees are initialized from the incoming package. A
+        tree exactly matching its recorded baseline is unedited and is replaced
+        with the incoming package files; its baseline advances only after the
+        refresh succeeds. Edited or unknown-baseline trees are preserved whole.
+        Interrupted refresh transactions are rolled back first. Each skill is
+        independent: a per-skill failure is reported in its own result and
+        never claims a whole-batch transaction.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            _require_safe_name(name)
+            try:
+                validate_bundled_skill_name(name)
+            except SkillCatalogError as exc:
+                raise SkillStoreError(str(exc)) from exc
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        with self._write_lock():
+            self._recover_interrupted_locked()
+            results: list[SkillRefreshResult] = []
+            for name in ordered:
+                try:
+                    self._require_no_incomplete_refresh(name)
+                    results.append(self._refresh_one_locked(name))
+                except (SkillStoreError, OSError) as exc:
+                    results.append(
+                        SkillRefreshResult(
+                            name=name,
+                            status="failed",
+                            changed=False,
+                            edited=False,
+                            error=str(exc),
+                        )
+                    )
+            return tuple(results)
+
+    def _refresh_one_locked(self, name: str) -> SkillRefreshResult:
+        self._require_safe_root()
+        canonical_dir = self._skill_directory(name)
+        directory_stat = _lstat(canonical_dir)
+        if directory_stat is not None and stat.S_ISLNK(directory_stat.st_mode):
+            raise SkillStoreError(
+                f"canonical skill directory must not be a symbolic link: {name}"
+            )
+        if directory_stat is not None and not stat.S_ISDIR(directory_stat.st_mode):
+            raise SkillStoreError(f"canonical skill path is not a directory: {name}")
+        incoming = self._package_tree(name)
+        incoming_payloads = {relative: payload for relative, payload, _ in incoming}
+        if SKILL_DOCUMENT_NAME not in incoming_payloads:
+            raise SkillStoreError(f"bundled skill '{name}' is missing its SKILL.md resource")
+        validate_skill_document(name, incoming_payloads[SKILL_DOCUMENT_NAME])
+        incoming_baseline = {relative: _sha256(payload) for relative, payload, _ in incoming}
+
+        if directory_stat is None or not any(canonical_dir.iterdir()):
+            self._materialize_tree_locked(name, incoming, incoming_baseline)
+            return SkillRefreshResult(
+                name=name, status="initialized", changed=True, edited=False
+            )
+
+        metadata = self._try_load_metadata(name)
+        tree = self._scan_tree_state(canonical_dir)
+        if metadata is None:
+            # Adopt only an exact match with the current package; never guess
+            # an earlier package version or import an installed copy.
+            if _tree_matches_baseline(tree, incoming_baseline):
+                self._record_baseline_metadata_locked(name, incoming_baseline)
+                return SkillRefreshResult(
+                    name=name, status="refreshed", changed=False, edited=False
+                )
+            self._record_protected_metadata_locked(name)
+            return SkillRefreshResult(
+                name=name, status="preserved_edited", changed=False, edited=True
+            )
+        baseline = metadata["files"]
+        if baseline is None or not _tree_matches_baseline(tree, baseline):
+            return SkillRefreshResult(
+                name=name, status="preserved_edited", changed=False, edited=True
+            )
+        changed = self._apply_refresh_locked(name, baseline, tree, incoming, incoming_baseline)
+        return SkillRefreshResult(name=name, status="refreshed", changed=changed, edited=False)
+
+    def _scan_tree_state(self, directory: Path) -> dict[str, str | None]:
+        """Hash every contained file; symlink/irregular entries map to None.
+
+        Store-owned metadata lives outside the tree, so it is never scanned.
+        """
+        state: dict[str, str | None] = {}
+
+        def walk(current: Path, prefix: str) -> None:
+            for child in current.iterdir():
+                relative = f"{prefix}{child.name}"
+                _require_safe_relative_path(relative)
+                try:
+                    child_stat = os.lstat(child)
+                except OSError as exc:
+                    raise SkillStoreError(
+                        f"cannot inspect skill tree entry {relative}: {exc}"
+                    ) from exc
+                if stat.S_ISLNK(child_stat.st_mode):
+                    state[relative] = None
+                elif stat.S_ISDIR(child_stat.st_mode):
+                    walk(child, relative + "/")
+                elif stat.S_ISREG(child_stat.st_mode):
+                    state[relative] = _sha256(_read_no_follow(child))
+                else:
+                    state[relative] = None
+
+        walk(directory, "")
+        return state
+
+    def _apply_refresh_locked(
+        self,
+        name: str,
+        baseline: dict[str, str],
+        tree: dict[str, str | None],
+        incoming: list[tuple[str, bytes, int]],
+        incoming_baseline: dict[str, str],
+    ) -> bool:
+        """Replace an unedited tree with the incoming package under a marker."""
+        canonical_dir = self._skill_directory(name)
+        incoming_relatives = {relative for relative, _, _ in incoming}
+        changes = [
+            (relative, payload, mode)
+            for relative, payload, mode in incoming
+            if tree.get(relative) != _sha256(payload)
+        ]
+        obsolete = [relative for relative in baseline if relative not in incoming_relatives]
+        if not changes and not obsolete:
+            return False
+
+        metadata_path = self._metadata_path(name)
+        metadata_bytes = _read_no_follow(metadata_path)
+        rollback_root = self._rollback_root(name)
+        rollback_files = rollback_root / "files"
+        if _lstat(self._transaction_path(name)) is None:
+            # No live transaction: any existing rollback material here is a
+            # leftover from a crash before its marker was written.
+            shutil.rmtree(rollback_root, ignore_errors=True)
+        try:
+            rollback_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SkillStoreError(
+                f"cannot stage rollback material for '{name}': {exc}"
+            ) from exc
+
+        entries: dict[str, dict[str, str | None]] = {}
+
+        def _backup(relative: str) -> str:
+            prior = _read_no_follow(canonical_dir / relative)
+            digest = _sha256(prior)
+            if tree.get(relative) != digest:
+                raise SkillStoreError(
+                    f"skill '{name}' changed during refresh preparation: {relative}"
+                )
+            backup = rollback_files / _require_safe_relative_path(relative)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(backup, prior)
+            return digest
+
+        try:
+            for relative, payload, _mode in changes:
+                new_digest = _sha256(payload)
+                old_digest = _backup(relative) if tree.get(relative) is not None else None
+                entries[relative] = {"old": old_digest, "new": new_digest}
+            for relative in obsolete:
+                entries[relative] = {"old": _backup(relative), "new": None}
+            # Keep the prior baseline metadata with the rollback material.
+            _atomic_write(rollback_root / "metadata.json", metadata_bytes)
+            if _sha256(_read_no_follow(rollback_root / "metadata.json")) != _sha256(
+                metadata_bytes
+            ):
+                raise SkillStoreError(
+                    f"cannot stage rollback metadata for '{name}'"
+                )
+            marker = {
+                "schema_version": METADATA_SCHEMA_VERSION,
+                "skill": name,
+                "metadata_sha256": _sha256(metadata_bytes),
+                "files": entries,
+            }
+            _atomic_write(
+                self._transaction_path(name),
+                json.dumps(marker, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+            )
+            try:
+                for relative, payload, mode in changes:
+                    target = canonical_dir / _require_safe_relative_path(relative)
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                    except OSError as exc:
+                        raise SkillStoreError(
+                            f"cannot create skill resource directory for {relative}: {exc}"
+                        ) from exc
+                    _atomic_write(target, payload)
+                    try:
+                        os.chmod(target, mode)
+                    except OSError as exc:
+                        raise SkillStoreError(
+                            f"cannot preserve permissions for {relative}: {exc}"
+                        ) from exc
+                for relative in obsolete:
+                    target = canonical_dir / _require_safe_relative_path(relative)
+                    try:
+                        os.unlink(target)
+                    except OSError as exc:
+                        raise SkillStoreError(
+                            f"cannot remove obsolete skill file {relative}: {exc}"
+                        ) from exc
+                    _fsync_directory(target.parent)
+                self._record_baseline_metadata_locked(name, incoming_baseline)
+            except (SkillStoreError, OSError):
+                # Ordinary I/O error: restore the prior per-skill tree and
+                # baseline before reporting the failure.
+                self._rollback_transaction_locked(name)
+                raise
+        except (SkillStoreError, OSError):
+            _cleanup_staging(rollback_root)
+            raise
+        # The per-skill refresh succeeded; retire its transaction marker.
+        try:
+            self._transaction_path(name).unlink()
+        except OSError as exc:
+            raise SkillStoreError(
+                f"cannot complete refresh transaction for '{name}': {exc}"
+            ) from exc
+        _cleanup_staging(rollback_root)
+        return True
+
+    def _recover_interrupted_locked(self) -> None:
+        """Finish rollback for every pending transaction marker, loudly.
+
+        A marker whose rollback material verifies is rolled back and retired;
+        an uncertain marker is left in place so reads of that skill keep
+        failing with an incomplete-refresh error instead of silently
+        overwriting uncertain content.
+        """
+        if not self.metadata_root.is_dir():
+            return
+        for marker_path in sorted(self.metadata_root.glob(f"*{REFRESH_MARKER_SUFFIX}")):
+            candidate = marker_path.name[: -len(REFRESH_MARKER_SUFFIX)]
+            try:
+                _require_safe_name(candidate)
+                self._rollback_transaction_locked(candidate)
+            except (SkillStoreError, OSError, ValueError):
+                continue
+
+    def _rollback_transaction_locked(self, name: str) -> None:
+        """Roll one pending transaction back; raise on any uncertain content."""
+        marker_path = self._transaction_path(name)
+        try:
+            marker = json.loads(_read_no_follow(marker_path).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise SkillStoreError(
+                f"skill '{name}' has an unreadable refresh transaction marker"
+            ) from exc
+        if (
+            not isinstance(marker, dict)
+            or marker.get("schema_version") != METADATA_SCHEMA_VERSION
+            or not isinstance(marker.get("files"), dict)
+        ):
+            raise SkillStoreError(
+                f"skill '{name}' has a malformed refresh transaction marker"
+            )
+        metadata_digest = marker.get("metadata_sha256")
+        if not isinstance(metadata_digest, str) or _REVISION_RE.fullmatch(metadata_digest) is None:
+            raise SkillStoreError(
+                f"skill '{name}' has a malformed refresh transaction marker"
+            )
+        canonical_dir = self._skill_directory(name)
+        rollback_root = self._rollback_root(name)
+        rollback_files = rollback_root / "files"
+        for relative, entry in marker["files"].items():
+            _require_safe_relative_path(relative)
+            if not isinstance(entry, dict):
+                raise SkillStoreError(
+                    f"skill '{name}' has a malformed refresh transaction entry"
+                )
+            old_digest = entry.get("old")
+            new_digest = entry.get("new")
+            for digest in (old_digest, new_digest):
+                if digest is not None and (
+                    not isinstance(digest, str) or _REVISION_RE.fullmatch(digest) is None
+                ):
+                    raise SkillStoreError(
+                        f"skill '{name}' has a malformed refresh transaction entry"
+                    )
+            target = canonical_dir / relative
+            if old_digest is None:
+                # The refresh added this file; remove it only if it still has
+                # the exact bytes the transaction wrote.
+                if _lstat(target) is None:
+                    continue
+                if new_digest is None or _sha256(_read_no_follow(target)) != new_digest:
+                    raise SkillStoreError(
+                        f"skill '{name}' rollback is uncertain for {relative!r}"
+                    )
+                try:
+                    os.unlink(target)
+                except OSError as exc:
+                    raise SkillStoreError(
+                        f"cannot roll back skill file {relative}: {exc}"
+                    ) from exc
+            else:
+                backup_bytes = _read_no_follow(rollback_files / relative)
+                if _sha256(backup_bytes) != old_digest:
+                    raise SkillStoreError(
+                        f"skill '{name}' rollback is uncertain for {relative!r}"
+                    )
+                _atomic_write(target, backup_bytes)
+        metadata_backup = _read_no_follow(rollback_root / "metadata.json")
+        if _sha256(metadata_backup) != metadata_digest:
+            raise SkillStoreError(
+                f"skill '{name}' rollback is uncertain for its baseline metadata"
+            )
+        _atomic_write(self._metadata_path(name), metadata_backup)
+        # The rollback is verified: retire the marker and its staging.
+        try:
+            marker_path.unlink()
+        except OSError as exc:
+            raise SkillStoreError(
+                f"cannot retire refresh transaction marker for '{name}': {exc}"
+            ) from exc
+        _cleanup_staging(rollback_root)
