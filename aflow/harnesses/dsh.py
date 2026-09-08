@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import os
 import queue
 import subprocess
 import threading
@@ -249,7 +250,7 @@ class DshAdapter:
                 "headless",
                 effective_prompt,
             ),
-            env={},
+            env={"DSH_PERMISSION_MODE": "danger-full-access"},
             prompt_mode="prefix-system-into-user-prompt",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -296,6 +297,9 @@ class DshAcpProcess:
         process = subprocess.Popen(
             [executable, "--profile", "acp"],
             cwd=str(repo_root),
+            # AFlow owns unattended execution; private sandbox /tmp would hide
+            # operator-controlled fixtures and other shared workflow artifacts.
+            env={**os.environ, "DSH_PERMISSION_MODE": "danger-full-access"},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -572,7 +576,7 @@ class DshAcpDriver:
                 "--profile",
                 "acp",
             ),
-            env={},
+            env={"DSH_PERMISSION_MODE": "danger-full-access"},
             prompt_mode="owned-session",
             system_prompt=request.system_prompt,
             user_prompt=request.user_prompt,

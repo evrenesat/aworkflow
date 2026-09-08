@@ -12,6 +12,13 @@ additional responsibilities differ.
 
 ## High-Level Data Flow
 
+`aflow noop-plan` copies a packaged template from `aflow/templates/` and creates
+external worker/reviewer playbooks. `noop_plan.py` interprets the bounded action
+grammar for `aflow noop-step`: system sleep, scoped marker cleanup/touch, hard
+failure, and reviewer rejection. It never edits plan progress or bypasses the
+workflow engine; real agents retain checkpoint bookkeeping and review duties.
+Playbooks are read per invocation, allowing operator-controlled test behavior.
+
 DSH ordinary workflow turns use an owned ACP stdio session. Discovery only
 negotiates capabilities; execution opens or resumes a session, selects the
 provider-qualified model followed by its dependent reasoning effort, verifies

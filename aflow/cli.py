@@ -2418,6 +2418,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install only the named skill(s). Can be repeated. Cannot be combined with --include-optional.",
     )
 
+    noop_parser = subparsers.add_parser(
+        "noop-plan", help="Copy the bundled NO-OP plan and initialize external playbooks.",
+        description="Create a fast checkpoint smoke plan; existing playbooks are preserved unless --reset is given.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    noop_parser.add_argument("--output", type=Path, default=Path("aflow-noop-plan.md"), help="Destination plan file.")
+    noop_parser.add_argument("--state-dir", type=Path, default=Path("/tmp/aflow_noop_plan"), help="External playbook and marker directory.")
+    noop_parser.add_argument("--checkpoints", type=int, default=3, help="Number of checkpoints (1–100).")
+    noop_parser.add_argument("--force", action="store_true", help="Replace the output plan.")
+    noop_parser.add_argument("--reset", action="store_true", help="Reset playbooks and CP markers.")
+    noop_step_parser = subparsers.add_parser(
+        "noop-step", help="Execute one external NO-OP playbook entry (used by the plan).",
+    )
+    noop_step_parser.add_argument("role", choices=("worker", "reviewer"))
+    noop_step_parser.add_argument("checkpoint", type=int)
+    noop_step_parser.add_argument("--state-dir", type=Path, default=Path("/tmp/aflow_noop_plan"))
+
     analyze_parser = subparsers.add_parser(
         "analyze",
         description="Analyze aflow run logs and extract high-signal debugging information.",
@@ -2937,6 +2954,20 @@ def main(argv: list[str] | None = None) -> int:
     tokens = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(tokens)
+
+    if args.command in {"noop-plan", "noop-step"}:
+        from .noop_plan import NoopError, execute_noop_step, install_noop_plan
+        try:
+            if args.command == "noop-plan":
+                print(install_noop_plan(args.output, state_dir=args.state_dir,
+                    checkpoints=args.checkpoints, force=args.force, reset=args.reset), end="")
+                return 0
+            code, message = execute_noop_step(args.role, args.checkpoint, state_dir=args.state_dir)
+            print(message)
+            return code
+        except (NoopError, OSError, subprocess.SubprocessError) as exc:
+            print(f"AFLOW_STOP: NO-OP fixture: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "install-skills":
         try:

@@ -70,6 +70,59 @@ or keyboard capture, and one final summary record per run. `aflow show` prints
 plain ASCII workflow graphs, roles, and teams. The CLI is a portable launcher
 and log stream; the remote web application is the interactive dashboard.
 
+## Reusable NO-OP smoke plan
+
+From a disposable Git repository, run:
+
+```bash
+aflow noop-plan
+aflow run --plan aflow-noop-plan.md --team TEAM_NAME --workflow WORKFLOW_NAME
+```
+
+The first command copies a bundled three-checkpoint plan into the current
+directory and creates `/tmp/aflow_noop_plan/worker.playbook`,
+`reviewer.playbook`, and `checkpoints/`. Defaults complete immediately: workers
+touch `CP_N.txt`, reviewers pass. Agents still use the selected workflow's
+normal plan bookkeeping, review, commit, and merge behavior.
+
+Edit playbooks to inject behavior (semicolon-separated actions, one entry per CP):
+
+```text
+# worker.playbook
+CP1: cleanup; done
+CP2: sleep 2; done
+CP3: fail BLAH BLAH
+
+# reviewer.playbook
+CP1: sleep 60; pass
+CP2: sleep 0; pass
+CP3: reject Retry after the operator changes this entry
+```
+
+`sleep` invokes the system command; `fail MESSAGE` reports `AFLOW_STOP` and
+halts; reviewer `reject MESSAGE` requests the normal repair/review path.
+Injected hard failures include `AFLOW_NOOP_MOCK_FAILURE`; fixture errors and
+provider failures do not, and must not be counted as successful fault injection.
+Worker `incomplete MESSAGE` leaves the checkpoint pending without a hard stop,
+so a reviewer/manager can exercise a configured quality-upgrade chain. Use a
+distinct message such as `MOCK_CAPABILITY_FAILURE` and change the playbook to
+`done` when the upgraded worker starts. Upgrades remain manager decisions;
+this action does not force routing or disguise real harness/provider errors.
+Missing entries succeed without delay. A successful worker touches its marker
+after all actions; `cleanup` deletes only numbered CP markers. Playbooks are
+read fresh each invocation and are never repaired by the agent. The plan uses
+`aflow noop-step worker|reviewer N --state-dir PATH` to execute these actions;
+the helper reports status but never edits the plan or commits.
+
+Use `--checkpoints N`, `--output PATH`, and `--state-dir PATH` to customize the
+fixture. Re-running preserves playbooks and markers. `--force` replaces the
+copied plan; `--reset` also resets playbooks and numbered markers. Use separate
+state directories for concurrent runs. This tests agents and workflow routing,
+not a deterministic harness exit code: agents must relay injected failures.
+The generator records the current branch when run inside Git, which supports
+in-place workflows; branch/worktree workflows replace it at startup. If you
+generate outside Git, initialize a branch and regenerate before an in-place run.
+
 ## Serve the web UI from any directory
 
 ```bash

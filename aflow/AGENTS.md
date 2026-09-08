@@ -1,6 +1,9 @@
 # AFlow Package Guidance
 
 - `aflow` is interactive-first.
+- Harness execution normally runs in a dedicated VM. Prefer each harness's
+  YOLO/full-access mode for unattended work; preserve access to the host's
+  workflow artifacts and shared external state (including `/tmp`).
 - Startup step picking and startup recovery can require a TTY.
 - If a new startup flow would need interactive input, do not invent a non-interactive fallback.
 - Treat the plan file on disk as the source of truth for startup and retry behavior.

@@ -1,5 +1,26 @@
 # DEVLOG
 
+## 2026-09-08 — Reusable NO-OP test plan
+
+- Added `aflow noop-plan` with a packaged checkpoint template and preserved-by-
+  default external playbooks. Output/count/state overrides and explicit reset
+  support repeated and isolated harness/team/workflow experiments.
+- Added `aflow noop-step` for deterministic sleep, marker, cleanup, failure,
+  reviewer-rejection, and recoverable worker-incompletion actions. Real agents
+  still perform normal plan and
+  review bookkeeping; the fixture makes no application changes.
+- Added CLI/action tests for defaults, live playbook edits, failure diagnostics,
+  preservation/reset, validation-before-actions, and scoped file handling.
+- The first live test exposed DSH's private sandbox `/tmp`. DSH now uses
+  full-access mode, matching AFlow's VM-oriented unattended harness policy.
+  The fixture explicitly forbids agents from recreating inaccessible state.
+- Validation: 297 tests plus wheel-resource execution passed. Live
+  `AstraGLMMuse` clean run `20260908t125833z-5ce674eb` completed DSH implementation
+  and Astra approval. Separate run `20260908t125833z-6ff0ddf3` completed the
+  labeled incomplete-worker → Astra rejection → manager-selected Muse upgrade
+  → Muse success → Astra approval path. Real fixture/setup failures were
+  diagnosed separately and were not counted as mock-test passes.
+
 ## 2026-09-08 — DSH ACP model selection
 
 - Added DSH ACP session discovery and execution with provider-qualified models,

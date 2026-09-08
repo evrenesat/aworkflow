@@ -237,3 +237,20 @@ def test_discovery_closes_probe_without_opening_session(monkeypatch):
     assert driver.capabilities.resume_with_model
     assert process.calls == [("initialize", {})]
     assert process.closed
+
+
+def test_acp_process_uses_full_access_and_preserves_environment(monkeypatch, tmp_path):
+    captured = {}
+    sentinel = object()
+    monkeypatch.setenv("AFLOW_TEST_INHERITED", "present")
+    monkeypatch.setenv("DSH_PERMISSION_MODE", "workspace-write")
+
+    def popen(argv, **kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(dsh.subprocess, "Popen", popen)
+    monkeypatch.setattr(dsh.DshAcpProcess, "__init__", lambda self, process: None)
+    dsh.DshAcpProcess.start(repo_root=tmp_path)
+    assert captured["env"]["DSH_PERMISSION_MODE"] == "danger-full-access"
+    assert captured["env"]["AFLOW_TEST_INHERITED"] == "present"

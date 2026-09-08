@@ -438,8 +438,10 @@ effort = "max"
 ```
 
 These selectors can serve ordinary worker and reviewer steps. AFlow verifies
-the model and effort through ACP before sending the prompt. Session resume
-and model changes are capability-gated. Manager and lifecycle roles should
+the model and effort through ACP before sending the prompt. Execution
+uses DSH full-access mode (`DSH_PERMISSION_MODE=danger-full-access`),
+matching AFlow's unattended VM model and keeping shared `/tmp` artifacts visible.
+Session resume and model changes are capability-gated. Manager and lifecycle roles should
 use another harness: per-call DSH model overrides require the session driver,
 and the plain headless adapter rejects them instead of using global defaults.
 No mid-turn steering or idempotent turn start is advertised.
