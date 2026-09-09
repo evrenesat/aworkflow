@@ -1,6 +1,6 @@
 # aflow manager context budget and failure evidence
 
-Status: Checkpoint 3 reviewed and approved through `cp3 v02`; Checkpoints 4–6 remain pending. Compatible implementation and prior CP1/CP2 approvals are retained.
+Status: Checkpoint 4 reviewed and approved through `cp4 v01`; Checkpoints 5–6 remain pending. Compatible implementation and prior CP1–CP3 approvals are retained.
 
 Execution amendment (2026-09-09): retain the owner-approved 40 KiB hard guard already in the current baseline. The later readable-output plan adds the separate 16 KiB current-summary target. Historical incident sizes below remain historical evidence.
 
@@ -16,6 +16,8 @@ The handoff also adds prompt-variable help beneath editors and readable sentence
 - Pre-Handoff Base HEAD: `93a54774d8f4a92e05d04f99b936f43c88ccf673`
 
 ### Review Log
+
+- 2026-09-09: Approved CP4 through `cp4 v01` using current-worktree fallback after `1130399`; no CP4 worker commit exists. Run `20260909t224505z-752d79ec`, worker turn 3 and active scope identify CP4 awaiting review despite CP5 being next unchecked. Reviewed sanitized later-boundary/rejection/repartition fixtures, separate-worktree executor and artifact checks, and read-only reconstruction. Verification: 153 manager/context/runlog tests, 43 runtime manager tests and 7 subtests passed with disposable HOME/configuration; diff check passed. Incident decision 20 reconstructed read-only: 37,979 pretty bytes versus 32,324 current wire bytes; decision artifact hashes and mtimes unchanged. This is a current reconstruction, not the stored fallback or a claim of original failed-wire identity. No material findings. CP5–6 remain pending; prior commits and lineage retained.
 
 - 2026-09-09: Approved CP3 through `cp3 v02` after its repair overlay (caller-specified cp04-v01 filename). Reviewed current worktree after `52c7d89` using fallback because no CP3 worker commit exists. The overlay identifies CP3 despite CP4 being next unchecked. Prior report diagnosis finding is resolved. Covered prelaunch budget evidence, bounded atomic diagnostics, retained checkpoint/turn references, terminal and legacy reports, and Resume compatibility. Verification: 203 tests and 7 subtests passed with disposable configuration; diff check passed. No material findings. CP4–6 remain pending; prior approvals and lineage retained.
 
@@ -172,7 +174,7 @@ Failure-artifact contract: store `rejected-context.json` and `rejected-user-prom
 
 **Blockers:** Stop and report if current-boundary authority cannot be distinguished from optional history without changing supported decision behavior, or overlapping unrelated edits make ownership ambiguous. Missing historical incident files are not a blocker for synthetic verification.
 
-### [ ] Checkpoint 4: Verify complete boundaries and document behavior
+### [x] Checkpoint 4: Verify complete boundaries and document behavior
 
 **Goal:** Real executor integration with deterministic fake harnesses passes for later boundaries, separate worktrees, oversized protected input and persistence failure.
 
@@ -182,11 +184,11 @@ Failure-artifact contract: store `rejected-context.json` and `rejected-user-prom
 
 **Steps:**
 
-- [ ] Build sanitized synthetic fixtures matching the incident's shape and field sizes; never commit Doublangu's raw context or prompts. Include multibyte text, long artifact paths, many historical decisions, active review rejection, Lite escalation to Full, and executor-added repartition history.
-- [ ] Drive the real context builder, serializer, budget check, executor and artifact writer with a deterministic fake harness in a disposable repository. Assert the exact prompt passed to the harness is within the limit and all protected fields and artifact references remain valid from a separate execution worktree.
-- [ ] Exercise a later boundary after additional decisions, not only the first resumed boundary. Verify bounded history growth, deterministic omission disclosure and readable omitted-history references.
-- [ ] Exercise irreducible overflow, diagnostic-storage cap and write failure. Assert no harness invocation and correct retained report/artifact metadata. Test that the historical fallback remains readable.
-- [ ] Reconstruct decision 20 read-only when local artifacts remain available and record actual before/after bytes. A missing real artifact does not justify changing live state; synthetic tests must remain sufficient for CI.
+- [x] Build sanitized synthetic fixtures matching the incident's shape and field sizes; never commit Doublangu's raw context or prompts. Include multibyte text, long artifact paths, many historical decisions, active review rejection, Lite escalation to Full, and executor-added repartition history.
+- [x] Drive the real context builder, serializer, budget check, executor and artifact writer with a deterministic fake harness in a disposable repository. Assert the exact prompt passed to the harness is within the limit and all protected fields and artifact references remain valid from a separate execution worktree.
+- [x] Exercise a later boundary after additional decisions, not only the first resumed boundary. Verify bounded history growth, deterministic omission disclosure and readable omitted-history references.
+- [x] Exercise irreducible overflow, diagnostic-storage cap and write failure. Assert no harness invocation and correct retained report/artifact metadata. Test that the historical fallback remains readable.
+- [x] Reconstruct decision 20 read-only when local artifacts remain available and record actual before/after bytes. A missing real artifact does not justify changing live state; synthetic tests must remain sufficient for CI.
 
 **Dependencies:** Checkpoints 1–3.
 

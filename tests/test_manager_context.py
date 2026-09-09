@@ -1614,6 +1614,274 @@ def test_v3_bounds_semantic_summaries_with_shared_marker(tmp_path: Path) -> None
     assert record["semantic_summary"] == result
 
 
+def test_v3_later_boundary_fixture_preserves_unicode_review_and_repartition_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Exercise the sanitized shape of the later-boundary incident."""
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    history_text = "historical revisión 東京 🚦 " + ("x" * 6_000)
+    for number in range(1, 21):
+        _write_turn(
+            run_dir,
+            number,
+            step="review" if number == 20 else "implement",
+            role="reviewer" if number == 20 else "implementer",
+            stdout=(
+                "レビュー rejected: " + history_text
+                if number == 20
+                else f"workflow result {number}: {history_text}"
+            ),
+        )
+        _write_json(
+            run_dir / "manager" / f"decision-{number:03d}" / "result.json",
+            {
+                "decision_number": number,
+                "finalized_turn_number": number,
+                "level": "lite",
+                "trigger": "post_turn",
+                "status": "accepted",
+                "action": "continue",
+                "reason": history_text,
+            },
+        )
+
+    scope_id = "plans/in-progress/plan.md::checkpoint-1::incident"
+    long_candidate_path = (
+        "manager/decision-020/repartition/"
+        + ("nested/" * 32)
+        + "candidate.md"
+    )
+    rejection = {
+        "scope_id": scope_id,
+        "rejection_number": 3,
+        "source_run_id": run_dir.name,
+        "review_turn_number": 20,
+        "review_step_name": "review",
+        "reviewer_selector": "codex.review",
+        "checkpoint_index": 1,
+        "checkpoint_name": "Checkpoint 1: Context",
+        "reviewed_implementation_turn_number": 19,
+        "reviewed_worker_team": "base",
+        "reviewed_worker_selector": "codex.worker",
+        "review_summary": "レビュー requires one bounded repair.",
+        "repair_plan_summary": "Keep the evidence boundary intact.",
+        "review_stdout_artifact_path": "turns/turn-020/stdout.txt",
+        "repair_plan_path": "plans/in-progress/repair-é.md",
+    }
+    repartition = {
+        "schema_version": 1,
+        "decision_number": 20,
+        "scope_id": scope_id,
+        "generation_id": "generation-20",
+        "envelope_sha256": "a" * 64,
+        "envelope_artifact_sha256": "b" * 64,
+        "source_plan_sha256": "c" * 64,
+        "proposal_sha256": "d" * 64,
+        "candidate_plan_sha256": "e" * 64,
+        "partition_ids": ["partition-1", "partition-2"],
+        "child_summaries": ["Part 1: 修复", "Part 2: Verify"],
+        "current_disposition": "review_current_partition",
+        "resolved_target_step": "implement",
+        "resolved_target_role": "implementer",
+        "current_partition_id": "partition-1",
+        "scope_pressure_reason": "the boundary needs two reviewable slices",
+        "envelope_artifact_path": "scopes/incident/envelope.json",
+        "proposal_artifact_path": long_candidate_path.replace(
+            "candidate.md", "proposal.json"
+        ),
+        "candidate_artifact_path": long_candidate_path,
+        "mechanical_validation_artifact_path": long_candidate_path.replace(
+            "candidate.md", "mechanical.json"
+        ),
+        "semantic_verdict_artifact_path": long_candidate_path.replace(
+            "candidate.md", "verdict.json"
+        ),
+    }
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary.update({
+        "context_schema_version": 4,
+        "active_implementation_scope": {
+            "scope_id": scope_id,
+            "checkpoint_index": 1,
+            "checkpoint_name": "Checkpoint 1: Context",
+            "opened_turn_number": 1,
+            "awaiting_review": True,
+            "attempt_count": 3,
+            "carried_reviewer_rejection_count": 2,
+        },
+        "review_rejection_history": [rejection],
+        "repartition_history": [repartition],
+        "evidence": "Lite escalated because rejection evidence needs Full review.",
+    })
+    separate_worktree = tmp_path / ("execution-" + ("é" * 16))
+    separate_worktree.mkdir()
+    monkeypatch.chdir(separate_worktree)
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        trigger="lite_escalation",
+        decision_number=21,
+        run_metadata={
+            "plan_path": str(plan),
+            "active_plan_path": str(plan),
+            "original_plan_path": str(plan),
+            "team": "base",
+            "turns_completed": 20,
+            "max_turns": 25,
+        },
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=True,
+    )
+    _, first_prompt = build_manager_prompts(context)
+    _, second_prompt = build_manager_prompts(context)
+    projected = json.loads(
+        first_prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+    )
+
+    assert first_prompt == second_prompt
+    assert len(first_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert projected["trigger"] == "lite_escalation"
+    assert projected["finished_turn"]["turn_number"] == 20
+    assert projected["controller_state"]["lite_evidence"] == (
+        "Lite escalated because rejection evidence needs Full review."
+    )
+    assert projected["controller_state"]["active_implementation_scope"][
+        "awaiting_review"
+    ] is True
+    assert projected["controller_state"]["checkpoint_repartitions"] == [
+        repartition
+    ]
+    assert projected["active_scope_rejection_ledger"][0][
+        "review_stdout_artifact_path"
+    ] == "turns/turn-020/stdout.txt"
+    assert projected["controller_state"]["latest_full_rejection"][
+        "review_summary"
+    ] == "レビュー requires one bounded repair."
+    assert projected["controller_state"]["checkpoint_repartitions"][0][
+        "candidate_artifact_path"
+    ] == long_candidate_path
+    assert len(projected["manager_decisions"]) <= 12
+    assert len(projected["run_extract"]) <= 12
+    disclosure = projected["history_disclosure"]
+    assert disclosure["omitted"]
+    assert any(
+        descriptor["category"] == "manager_decisions"
+        for descriptor in disclosure["omitted"]
+    )
+
+
+def test_v3_decision_twenty_reconstruction_is_read_only_and_byte_stable(
+    tmp_path: Path,
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    run_metadata = {
+        "plan_path": str(plan),
+        "active_plan_path": str(plan),
+        "original_plan_path": str(plan),
+        "team": "base",
+        "turns_completed": 20,
+        "max_turns": 25,
+    }
+    for number in range(1, 21):
+        _write_turn(
+            run_dir,
+            number,
+            step="implement",
+            role="implementer",
+            stdout=f"decision boundary {number} — 測定",
+        )
+        if number < 20:
+            _write_json(
+                run_dir / "manager" / f"decision-{number:03d}" / "result.json",
+                {
+                    "decision_number": number,
+                    "finalized_turn_number": number,
+                    "level": "full",
+                    "status": "accepted",
+                    "action": "continue",
+                    "reason": f"decision {number}",
+                },
+            )
+
+    stored = build_manager_context(
+        run_dir,
+        level="full",
+        trigger="post_turn",
+        decision_number=20,
+        run_metadata=run_metadata,
+        boundary=boundary,
+        turns=[
+            json.loads(
+                (run_dir / "turns" / f"turn-{number:03d}" / "result.json")
+                .read_text(encoding="utf-8")
+            )
+            | {"_turn_dir": run_dir / "turns" / f"turn-{number:03d}"}
+            for number in range(1, 21)
+        ],
+        active_plan_content=plan_text,
+        capture_evidence=False,
+    )
+    decision_dir = run_dir / "manager" / "decision-020"
+    _write_json(decision_dir / "context.json", stored)
+    _write_json(decision_dir / "result.json", {
+        "decision_number": 20,
+        "finalized_turn_number": 20,
+        "level": "full",
+        "status": "accepted",
+        "action": "continue",
+    })
+    _write_json(decision_dir / "boundary.json", {
+        "decision_number": 20,
+        "trigger": "post_turn",
+        "run_metadata": run_metadata,
+        "boundary": boundary,
+        "active_plan_content": plan_text,
+    })
+    tracked_paths = [
+        run_dir / "run.json",
+        decision_dir / "context.json",
+        decision_dir / "result.json",
+        decision_dir / "boundary.json",
+        *[
+            run_dir / "turns" / f"turn-{number:03d}" / filename
+            for number in range(1, 21)
+            for filename in ("result.json", "stdout.txt", "stderr.txt")
+        ],
+    ]
+    before = {
+        path: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in tracked_paths
+    }
+    _, before_prompt = build_manager_prompts(stored)
+    before_bytes = len(before_prompt.encode("utf-8"))
+
+    rebuilt = analyze_runs(AnalyzeRequest(
+        repo_root=run_dir.parent.parent.parent,
+        run_id=run_dir.name,
+        manager_context="full",
+        turn=20,
+    ))
+
+    _, after_prompt = build_manager_prompts(rebuilt)
+    after_bytes = len(after_prompt.encode("utf-8"))
+    after = {
+        path: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in tracked_paths
+    }
+    assert rebuilt == stored
+    assert before_bytes == after_bytes, (
+        f"decision-020 prompt bytes changed: before={before_bytes}, after={after_bytes}"
+    )
+    assert before_bytes <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert after == before
+
+
 def test_v3_live_capture_hash_mismatch_aborts_context_construction(
     tmp_path: Path,
 ) -> None:

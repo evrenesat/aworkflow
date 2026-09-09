@@ -11084,6 +11084,162 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 result_payload['invocation']['argv']
             )
 
+    def test_manager_context_worktree_integration_keeps_primary_evidence_and_budget(
+        self,
+    ) -> None:
+        """The real executor keeps reference roots valid across a worktree."""
+        from aflow.manager import MANAGER_INLINE_CONTEXT_MAX_BYTES
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch="main")
+            worktree_root = root / "worktrees"
+            worktree_root.mkdir()
+            relative_plan = Path("plans") / "in-progress" / (
+                "incident-" + ("é" * 12) + ".md"
+            )
+            plan_path = repo_root / relative_plan
+            plan_path.parent.mkdir(parents=True)
+            plan_body = "\n".join(
+                f"Evidence row {number:04d}: historical 東京 review signal 🚦"
+                for number in range(2_400)
+            )
+            plan_text = (
+                "# Plan\n\n### [ ] Checkpoint 1: Worktree boundary\n"
+                "- [ ] preserve evidence\n\n"
+                + plan_body
+                + "\n"
+            )
+            completed_plan_text = plan_text.replace(
+                "### [ ] Checkpoint 1: Worktree boundary",
+                "### [x] Checkpoint 1: Worktree boundary",
+            ).replace("- [ ] preserve evidence", "- [x] preserve evidence")
+            assert len(plan_text.encode("utf-8")) > 60_000
+            _write_plan(plan_path, plan_text)
+            _git_force_commit_file(repo_root, plan_path)
+
+            base_config = _make_worktree_wf_config(
+                main_branch="main",
+                worktree_root=str(worktree_root),
+            )
+            base_workflow = base_config.workflows["wt_wf"]
+            profiles = dict(base_config.harnesses["codex"].profiles)
+            profiles.update({
+                "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                "manager-full": HarnessProfileConfig(model="manager-full"),
+            })
+            harnesses = dict(base_config.harnesses)
+            harnesses["codex"] = replace(
+                base_config.harnesses["codex"], profiles=profiles
+            )
+            workflow_config = replace(
+                base_config,
+                roles={
+                    **base_config.roles,
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses=harnesses,
+                workflows={
+                    "wt_wf": replace(base_workflow, manager_enabled=True),
+                },
+                manager=ManagerConfig(
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                ),
+            )
+            manager_prompts: list[str] = []
+            manager_contexts: list[dict[str, object]] = []
+            execution_roots: list[Path] = []
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                cwd = Path(kwargs["cwd"])
+                if model == "m":
+                    execution_roots.append(cwd)
+                    execution_plan = cwd / relative_plan
+                    execution_plan.write_text(completed_plan_text, encoding="utf-8")
+                    _git_force_commit_file(cwd, execution_plan)
+                    return subprocess.CompletedProcess(
+                        argv, 0, "worktree worker complete", ""
+                    )
+
+                assert model in {"manager-lite", "manager-full"}
+                effective_prompt = _runner_prompt(argv, kwargs)
+                user_prompt = effective_prompt[
+                    effective_prompt.index("MANAGER_RUNTIME_JSON:"):
+                ]
+                manager_prompts.append(user_prompt)
+                user_manifest = user_prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                context = json.loads(user_manifest)
+                manager_contexts.append(context)
+                assert len(user_prompt.encode("utf-8")) <= (
+                    MANAGER_INLINE_CONTEXT_MAX_BYTES
+                )
+                assert cwd != repo_root.resolve()
+                roots = context["controller_state"]["artifact_roots"]
+                assert roots["repository"] == str(repo_root.resolve())
+                assert Path(roots["run"]).is_dir()
+                assert context["finished_turn"]["raw_artifacts"]
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "continue",
+                    "reason": "The compact worktree evidence supports END.",
+                    "next_step_notes": [],
+                    "stop_report": None,
+                }), "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=2,
+                ),
+                workflow_config,
+                "wt_wf",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert len(manager_prompts) == 1
+            assert len(manager_contexts) == 1
+            assert execution_roots
+            execution_root = execution_roots[0]
+            assert execution_root != repo_root.resolve()
+            assert not execution_root.exists()
+            prompt = manager_prompts[0]
+            user_manifest = prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+            assert "Evidence row" not in prompt
+            assert len(user_manifest.encode("utf-8")) <= 16_384
+
+            run_dir = result.run_dir
+            context = manager_contexts[0]
+            roots = context["controller_state"]["artifact_roots"]
+            assert Path(roots["run"]).resolve() == run_dir.resolve()
+            for artifact in context["finished_turn"]["raw_artifacts"]:
+                assert (run_dir / artifact["path"]).is_file()
+            plan_reference = context["evidence"]["active_plan"]["reference"]
+            evidence_path = repo_root / plan_reference["path"]
+            assert evidence_path.is_file()
+            assert hashlib.sha256(evidence_path.read_bytes()).hexdigest() == (
+                plan_reference["sha256"]
+            )
+            decision_dir = run_dir / "manager" / "decision-001"
+            assert (decision_dir / "user-prompt.txt").read_text(
+                encoding="utf-8"
+            ) == prompt
+            result_payload = json.loads(
+                (decision_dir / "result.json").read_text(encoding="utf-8")
+            )
+            assert result_payload["status"] == "accepted"
+            assert result_payload["prompt_metrics"]["user_prompt_bytes"] == len(
+                prompt.encode("utf-8")
+            )
+
     def test_manager_gate_and_executor_use_live_team_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

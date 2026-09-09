@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-09 — Verify complete manager boundaries (Checkpoint 4)
+
+- Reviewer approved CP4 through `cp4 v01`: 153 manager/context/runlog tests,
+  43 runtime manager tests and 7 subtests passed with disposable configuration.
+  Read-only incident decision-20 reconstruction measured 37,979 pretty bytes
+  versus 32,324 current wire bytes; decision artifact hashes/mtimes stayed
+  unchanged. These are reconstruction measurements, not original wire bytes.
+- Added sanitized later-boundary fixtures with multibyte summaries, long
+  artifact references, active review rejection, Lite-to-Full escalation, and
+  executor-provided repartition history. Read-only decision-20 reconstruction
+  now asserts unchanged artifacts and exact prompt bytes before and after.
+- Added a real deterministic fake-harness worktree integration proving that
+  manager prompts stay within the hard limit while primary repository/run
+  evidence and turn references remain resolvable.
+
 ## 2026-09-09 — Approve budget-failure diagnostics (Checkpoint 3)
 
 - Retain rejected manager input with bounded atomic diagnostics and accurate prelaunch budget reports, preserving checkpoint/turn references and terminal incident evidence.

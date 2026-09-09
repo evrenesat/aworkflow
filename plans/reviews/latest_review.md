@@ -1,13 +1,17 @@
-# Checkpoint 3 review — cp3 v02
+# Checkpoint 4 review
 
-Target: current uncommitted CP3 implementation and completed repair overlay after `52c7d89` (`cp2 v01`) on `codex/aflow-dogfood-20260909`. Worktree fallback was used because this handoff has no CP3 worker commit. The active overlay explicitly covers CP3 despite its cp04-v01 filename; CP4 is next unchecked and is outside this review.
+Reviewed through `cp4 v01` on `codex/aflow-dogfood-20260909`.
 
-Original ledger: `plans/in-progress/aflow-manager-context-budget-followup-20260908.md`. Active overlay: `plans/in-progress/aflow-manager-context-budget-followup-20260908-cp04-v01.md`.
+Original and active plan: `plans/in-progress/aflow-manager-context-budget-followup-20260908.md`.
 
-Scope: budget exception evidence, executor prelaunch handling, atomic diagnostics and the 256 KiB storage cap, retained checkpoint/turn references, budget-failure report diagnosis, terminal incident preservation, legacy reports, and Resume compatibility. The previous report-diagnosis finding is resolved. No production code was changed by the reviewer.
+Used current-worktree fallback after CP3 approval `1130399`, because no CP4 worker commit exists. The selected run `20260909t224505z-752d79ec` identifies worker turn 3 and an active CP4 scope awaiting review; CP5 is only the next unchecked checkpoint. The reviewed slice consists of the pending tests, DEVLOG entry, and intentional checkpoint ledger updates. Prior approval commits and lineage are preserved.
 
-Verification: 203 tests and 7 subtests passed across manager, manager context, runlog, control-plane Resume, and runtime manager tests (232 unrelated runtime tests deselected). Tests used disposable Path.home() configuration while respecting test-specific temporary HOME overrides. The diff check passed. The original base remains reachable and the branch matches the ledger.
+Scope: sanitized later-boundary Unicode/history/rejection/escalation/repartition fixtures, deterministic reconstruction, and real fake-harness executor verification from a separate worktree. Existing regressions cover budget rejection, diagnostic caps and persistence failures; existing architecture documentation already describes these behaviors.
 
-Zero findings survived the material finding admission gate. CP3 is approved through the reviewer-owned `cp3 v02` commit. The original ledger records approval; CP4–6 remain unchecked. Prior CP1/CP2 commits and lineage are preserved without squash or public push. The previous review was rotated byte-for-byte unchanged.
+Verification: 153 manager/context/runlog tests and 43 runtime manager tests plus 7 subtests passed with disposable HOME and configuration. `git diff --check` passed. An initial Path.home mock interfered with an existing test's own HOME override; the corrected isolated run passed without code changes.
+
+Read-only incident decision-20 reconstruction: 37,979 pretty-printed bytes versus 32,324 current wire bytes. Decision artifact hashes and mtimes remained unchanged. These are current reconstructed bytes, not the persisted fallback or a claim of byte identity with the original failure.
+
+Findings: none admitted by the material-code-review gate. CP4 approved; CP5–6 remain unchecked. No follow-up fix plan needed.
 
 No material findings
