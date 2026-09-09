@@ -13864,6 +13864,197 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert run_json["status"] == "failed"
             assert failure in run_json["failure_reason"]
 
+    def _run_manager_input_budget_rejection(
+        self, candidate_size: int,
+    ) -> tuple[Path, dict[str, object], dict[str, object], dict[str, object], str]:
+        from aflow.manager import ManagerInlineContextLimitError
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo_root = Path(temporary.name)
+        plan_path = repo_root / "plan.md"
+        _write_plan(plan_path, _VALID_PLAN)
+        candidate_prompt = "REJECTED-MANAGER-CANDIDATE-" + ("x" * candidate_size)
+        captured_context: dict[str, object] = {}
+        provider_models: list[str] = []
+
+        def reject_manager_input(context, **kwargs):
+            captured_context.update(json.loads(json.dumps(context)))
+            total_bytes = len(candidate_prompt.encode("utf-8"))
+            raise ManagerInlineContextLimitError(
+                "manager inline context exceeds the 40960-byte hard limit: "
+                f"total_bytes={total_bytes}; synthetic=1",
+                context=context,
+                user_prompt=candidate_prompt,
+            )
+
+        def runner(argv, **kwargs):
+            model = argv[argv.index("--model") + 1]
+            provider_models.append(model)
+            if model != "worker":
+                pytest.fail("manager provider launched after budget rejection")
+            _write_plan(plan_path, _COMPLETE_PLAN)
+            return subprocess.CompletedProcess(argv, 0, "work complete", "")
+
+        with patch(
+            "aflow.workflow.build_manager_prompts",
+            side_effect=reject_manager_input,
+        ):
+            with pytest.raises(WorkflowError) as raised:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                    ),
+                    _clean_end_manager_workflow_config(),
+                    "managed",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+        assert provider_models == ["worker"]
+        run_dir = raised.value.run_dir
+        assert run_dir is not None
+        result_path = run_dir / "manager" / "decision-001" / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        diagnostic = result["diagnostic"]
+        stored_context = json.loads(
+            result_path.with_name("context.json").read_text(encoding="utf-8")
+        )
+        assert result["status"] == "invalid"
+        assert result["failure_stage"] == "prelaunch"
+        assert result["failure_kind"] == "manager_input_budget"
+        assert result["failure_reason"] == (
+            "Manager input exceeds its byte budget before provider launch."
+        )
+        assert "Manager input exceeds its byte budget before provider launch." in (
+            result["error"]
+        )
+        assert stored_context["failure_kind"] == "manager_input_budget"
+        assert stored_context["finished_turn"]["turn_number"] == 1
+        assert stored_context["finished_turn"]["raw_artifacts"]
+        assert stored_context["plan_state"]["active_plan_path"] == str(plan_path)
+        assert diagnostic["kind"] == "manager_input_budget"
+        assert diagnostic["failure_stage"] == "manager_input_budget"
+        assert diagnostic["attempted_bytes"] == len(
+            candidate_prompt.encode("utf-8")
+        )
+        assert diagnostic["permitted_bytes"] == 40 * 1024
+        assert diagnostic["field_byte_counts"]
+        report = (run_dir / "manager-report.md").read_text(encoding="utf-8")
+        assert "Manager input exceeds its byte budget before provider launch." in (
+            report
+        )
+        assert "The manager provider was not launched." in report
+        assert "unavailable, invalid, or illegal" not in report
+        assert str(plan_path) in report
+        assert "Checkpoint 1: First" in report
+        assert "turns/turn-001/stdout.txt" in report
+        return run_dir, result, diagnostic, captured_context, candidate_prompt
+
+    def test_manager_input_budget_rejection_stores_bounded_candidate(self) -> None:
+        run_dir, result, diagnostic, candidate_context, candidate_prompt = (
+            self._run_manager_input_budget_rejection(64)
+        )
+
+        assert diagnostic["status"] == "stored"
+        assert diagnostic["body_omitted"] is False
+        decision_dir = run_dir / "manager" / "decision-001"
+        rejected_context_path = decision_dir / "rejected-context.json"
+        rejected_prompt_path = decision_dir / "rejected-user-prompt.txt"
+        assert rejected_context_path.is_file()
+        assert rejected_prompt_path.is_file()
+        assert rejected_prompt_path.read_text(encoding="utf-8") == candidate_prompt
+        assert json.loads(rejected_context_path.read_text(encoding="utf-8")) == (
+            candidate_context
+        )
+        assert diagnostic["rejected_context_retained"] is True
+        assert diagnostic["rejected_user_prompt_retained"] is True
+        assert set(diagnostic["retained_artifacts"]) == {
+            "manager/decision-001/rejected-context.json",
+            "manager/decision-001/rejected-user-prompt.txt",
+        }
+        context_bytes = rejected_context_path.read_bytes()
+        prompt_bytes = rejected_prompt_path.read_bytes()
+        assert diagnostic["rejected_context_bytes"] == len(context_bytes)
+        assert diagnostic["rejected_user_prompt_bytes"] == len(prompt_bytes)
+        assert diagnostic["combined_body_bytes"] == len(context_bytes) + len(prompt_bytes)
+        assert result["diagnostic"]["rejected_context_sha256"] == hashlib.sha256(
+            context_bytes
+        ).hexdigest()
+        assert result["diagnostic"]["rejected_user_prompt_sha256"] == hashlib.sha256(
+            prompt_bytes
+        ).hexdigest()
+
+    def test_manager_input_budget_rejection_omits_over_cap_bodies(self) -> None:
+        from aflow.runlog import MANAGER_REJECTED_DIAGNOSTIC_MAX_BYTES
+
+        run_dir, _, diagnostic, _, _ = self._run_manager_input_budget_rejection(
+            MANAGER_REJECTED_DIAGNOSTIC_MAX_BYTES + 1
+        )
+
+        assert diagnostic["status"] == "omitted"
+        assert diagnostic["body_omitted"] is True
+        decision_dir = run_dir / "manager" / "decision-001"
+        assert not (decision_dir / "rejected-context.json").exists()
+        assert not (decision_dir / "rejected-user-prompt.txt").exists()
+        assert diagnostic["rejected_context_retained"] is False
+        assert diagnostic["rejected_user_prompt_retained"] is False
+        assert diagnostic["retained_artifacts"] == []
+        assert diagnostic["rejected_context_sha256"]
+        assert diagnostic["rejected_user_prompt_sha256"]
+
+    def test_manager_input_budget_diagnostic_write_failure_is_honest(self) -> None:
+        import aflow.runlog as runlog_module
+        from aflow.runlog import (
+            manager_decision_paths,
+            write_manager_budget_diagnostics,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            config = ControllerConfig(
+                repo_root=repo_root,
+                plan_path=repo_root / "plan.md",
+                max_turns=1,
+            )
+            paths = create_run_paths(config)
+            artifact_paths = manager_decision_paths(paths, 1)
+            artifact_paths.directory.mkdir(parents=True)
+            original_write = runlog_module._write_atomic_bytes
+
+            def fail_prompt_write(path: Path, payload: bytes) -> None:
+                if path.name == "rejected-user-prompt.txt":
+                    raise OSError("simulated rejected-prompt write failure")
+                original_write(path, payload)
+
+            with patch(
+                "aflow.runlog._write_atomic_bytes",
+                side_effect=fail_prompt_write,
+            ):
+                diagnostic = write_manager_budget_diagnostics(
+                    paths,
+                    artifact_paths,
+                    context={"schema_version": 3, "finished_turn": {"turn_number": 1}},
+                    user_prompt="candidate prompt",
+                    metadata={
+                        "kind": "manager_input_budget",
+                        "failure_stage": "manager_input_budget",
+                    },
+                )
+
+            assert diagnostic["status"] == "write_failed"
+            assert diagnostic["body_omitted"] is True
+            assert diagnostic["rejected_context_retained"] is True
+            assert diagnostic["rejected_user_prompt_retained"] is False
+            assert diagnostic["retained_artifacts"] == [
+                "manager/decision-001/rejected-context.json"
+            ]
+            assert "simulated rejected-prompt write failure" in diagnostic["write_error"]
+            assert (artifact_paths.directory / "rejected-context.json").is_file()
+            assert not (artifact_paths.directory / "rejected-user-prompt.txt").exists()
+
     def test_manager_missing_skill_fails_closed_without_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

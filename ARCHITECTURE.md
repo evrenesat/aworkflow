@@ -196,6 +196,14 @@ bytes and per-top-level-field byte counts only. Non-sensitive prompt metrics
 `referenced_artifact_count`, `referenced_artifact_bytes`) persist in the
 manager result; referenced artifact bytes are evidence the manager may read and
 are labeled in analysis output as not model-input bytes.
+If the context was built successfully but the exact user prompt still exceeds
+the hard limit, the manager boundary remains a prelaunch failure without a
+provider call. The result records the budget failure kind and bounded diagnostic
+metadata; complete rejected context and prompt bodies are atomically retained
+in the decision directory only when their combined size is at most 256 KiB.
+Otherwise the metadata retains their exact sizes and SHA-256 digests with
+`body_omitted`; the provider-safe `context.json` keeps current boundary and
+finished-turn references separately.
 
 Manager adapters must advertise the fail-closed `manager_workspace_read`
 capability (`HarnessAdapter.manager_workspace_read`) to run reference-only

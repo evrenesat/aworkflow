@@ -1,6 +1,6 @@
 # aflow manager context budget and failure evidence
 
-Status: Checkpoint 2 reviewed and approved through `cp2 v01`; Checkpoints 3–6 remain pending. Existing compatible serialization work and Checkpoint 1 approval were retained.
+Status: Checkpoint 3 reviewed and approved through `cp3 v02`; Checkpoints 4–6 remain pending. Compatible implementation and prior CP1/CP2 approvals are retained.
 
 Execution amendment (2026-09-09): retain the owner-approved 40 KiB hard guard already in the current baseline. The later readable-output plan adds the separate 16 KiB current-summary target. Historical incident sizes below remain historical evidence.
 
@@ -16,6 +16,10 @@ The handoff also adds prompt-variable help beneath editors and readable sentence
 - Pre-Handoff Base HEAD: `93a54774d8f4a92e05d04f99b936f43c88ccf673`
 
 ### Review Log
+
+- 2026-09-09: Approved CP3 through `cp3 v02` after its repair overlay (caller-specified cp04-v01 filename). Reviewed current worktree after `52c7d89` using fallback because no CP3 worker commit exists. The overlay identifies CP3 despite CP4 being next unchecked. Prior report diagnosis finding is resolved. Covered prelaunch budget evidence, bounded atomic diagnostics, retained checkpoint/turn references, terminal and legacy reports, and Resume compatibility. Verification: 203 tests and 7 subtests passed with disposable configuration; diff check passed. No material findings. CP4–6 remain pending; prior approvals and lineage retained.
+
+- 2026-09-09: Reviewed CP3 worker turn 5 against `52c7d89` using worktree fallback; no CP3 approval. One material finding: the failure report ignores the new budget-failure kind and still diagnoses unavailable/invalid manager output before any provider launch. Reopened CP3 and its first step; retained compatible implementation and other completed steps. Fix overlay: `aflow-manager-context-budget-followup-20260908-cp04-v01.md` (caller-specified filename; CP3 scope). Verification: 42 runtime manager tests plus 7 subtests; 159 manager/context/runlog/Resume tests; diff check passed with disposable configuration.
 
 - 2026-09-09: Approved Checkpoint 2 through `cp2 v01`, reviewing the uncommitted worker turn 3 changes after `b6b0a14` (worktree fallback; no CP2 worker commit). Run `20260909t214357z-0efa55a8` and the worker handoff identify Checkpoint 2 despite the next unchecked checkpoint being 3. Covered bounded v3 history, omission references, protected authority, and repartition-aware prompt measurement. Verification: 111 manager/context tests; 39 runtime manager tests and 7 subtests; `git diff --check` passed. Tests used disposable configuration roots. No material findings; Checkpoints 3–6 remain unchecked.
 
@@ -138,7 +142,7 @@ History-reference contract: use bounded descriptors per source run and category 
 
 **Blockers:** Stop and report if current-boundary authority cannot be distinguished from optional history without changing supported decision behavior, or overlapping unrelated edits make ownership ambiguous. Missing historical incident files are not a blocker for synthetic verification.
 
-### [ ] Checkpoint 3: Retain budget-failure diagnostics
+### [x] Checkpoint 3: Retain budget-failure diagnostics
 
 **Goal:** Irreducible overflow launches no provider, reports the correct failure stage and retains known checkpoint/turn references and bounded diagnostic evidence.
 
@@ -148,11 +152,11 @@ History-reference contract: use bounded descriptors per source run and category 
 
 **Steps:**
 
-- [ ] Distinguish context construction failure from `ManagerInlineContextLimitError` after successful construction. Use a precise failure reason such as “Manager input exceeds its byte budget before provider launch.” Do not describe this as unavailable or invalid manager output.
-- [ ] Preserve the successfully built diagnostic context and exact serialized candidate before substituting the provider-safe fallback. Store in the same decision directory using existing atomic artifact conventions; expose bounded references rather than embedding oversized content in events or reports. Apply a separate bounded diagnostic-storage cap (256 KiB); if exceeded, retain size/digest/per-field counts and explicitly mark body omission.
-- [ ] Keep known original/active plan, current checkpoint, finished turn and stdout/stderr references in the failure report. Do not replace them with null or “unknown” merely because the input exceeded a limit.
-- [ ] Record attempted bytes, permitted bytes, reduction counts, failure stage and diagnostic artifact references. On evidence-write failure, report that failure honestly; do not claim retained artifacts exist.
-- [ ] Keep the rejected manager boundary resumable through existing durable state. Recovery must preserve unfinished work and revalidate review/manager decisions through existing admission; no fabricated continue decision and no automatic retry loop against unchanged oversized input.
+- [x] Distinguish context construction failure from `ManagerInlineContextLimitError` after successful construction. Use a precise failure reason such as “Manager input exceeds its byte budget before provider launch.” Do not describe this as unavailable or invalid manager output.
+- [x] Preserve the successfully built diagnostic context and exact serialized candidate before substituting the provider-safe fallback. Store in the same decision directory using existing atomic artifact conventions; expose bounded references rather than embedding oversized content in events or reports. Apply a separate bounded diagnostic-storage cap (256 KiB); if exceeded, retain size/digest/per-field counts and explicitly mark body omission.
+- [x] Keep known original/active plan, current checkpoint, finished turn and stdout/stderr references in the failure report. Do not replace them with null or “unknown” merely because the input exceeded a limit.
+- [x] Record attempted bytes, permitted bytes, reduction counts, failure stage and diagnostic artifact references. On evidence-write failure, report that failure honestly; do not claim retained artifacts exist.
+- [x] Keep the rejected manager boundary resumable through existing durable state. Recovery must preserve unfinished work and revalidate review/manager decisions through existing admission; no fabricated continue decision and no automatic retry loop against unchanged oversized input.
 
 Failure-artifact contract: store `rejected-context.json` and `rejected-user-prompt.txt` in the current decision directory only when their combined encoded size is at most 256 KiB. Otherwise omit both bodies and retain digest, exact sizes, field counts and `body_omitted: true` in the result diagnostic metadata. Preserve the provider-safe fallback separately in the existing context artifact. Use existing atomic writes and contained-path validation; partial write failures must identify which artifacts were actually retained.
 

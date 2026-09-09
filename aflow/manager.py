@@ -941,6 +941,28 @@ class ManagerInlineContextLimitError(ValueError):
     no field content, prompt text, secret-bearing paths, or environment data.
     """
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        context: Mapping[str, Any] | None = None,
+        user_prompt: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.context = deepcopy(dict(context)) if context is not None else None
+        self.user_prompt = user_prompt
+        self.attempted_bytes = (
+            len(user_prompt.encode("utf-8"))
+            if isinstance(user_prompt, str)
+            else None
+        )
+        self.permitted_bytes = MANAGER_INLINE_CONTEXT_MAX_BYTES
+        self.field_byte_counts = (
+            dict(_per_field_utf8_byte_counts(context))
+            if context is not None
+            else {}
+        )
+
 
 def enforce_manager_inline_context_budget(
     context: Mapping[str, Any], user_prompt: str
@@ -955,7 +977,9 @@ def enforce_manager_inline_context_budget(
     raise ManagerInlineContextLimitError(
         "manager inline context exceeds the "
         f"{MANAGER_INLINE_CONTEXT_MAX_BYTES}-byte hard limit: "
-        f"total_bytes={total_bytes}; {field_counts}"
+        f"total_bytes={total_bytes}; {field_counts}",
+        context=context,
+        user_prompt=user_prompt,
     )
 
 
@@ -1165,7 +1189,35 @@ def render_manager_stop_report(
     finished_turn = context.get("finished_turn") if isinstance(context.get("finished_turn"), Mapping) else {}
     controller = context.get("controller_state") if isinstance(context.get("controller_state"), Mapping) else {}
     plan_state = context.get("plan_state") if isinstance(context.get("plan_state"), Mapping) else {}
+    current_checkpoint: Any = plan_state.get("current_checkpoint")
+    if current_checkpoint is None:
+        for snapshot_key in ("snapshot_before", "snapshot_after"):
+            snapshot = finished_turn.get(snapshot_key)
+            if not isinstance(snapshot, Mapping):
+                continue
+            current_checkpoint = snapshot.get("current_checkpoint_name")
+            if current_checkpoint is None:
+                current_checkpoint = snapshot.get("current_checkpoint")
+            if current_checkpoint is not None:
+                break
+    if isinstance(current_checkpoint, Mapping):
+        current_checkpoint = (
+            current_checkpoint.get("name")
+            or current_checkpoint.get("checkpoint_name")
+            or current_checkpoint.get("index")
+        )
     if stop_report is None:
+        failure_kind = context.get("failure_kind")
+        if not isinstance(failure_kind, str):
+            failure_kind = controller.get("failure_kind")
+        budget_failure = failure_kind == "manager_input_budget"
+        manager_failure_reason = context.get("manager_failure_reason")
+        if not isinstance(manager_failure_reason, str) or not manager_failure_reason.strip():
+            manager_failure_reason = controller.get("manager_failure_reason")
+        if not isinstance(manager_failure_reason, str) or not manager_failure_reason.strip():
+            manager_failure_reason = (
+                "Manager input exceeds its byte budget before provider launch."
+            )
         terminal_incident = bool(controller.get("terminal"))
         incident_reason = next((
             str(value)
@@ -1184,13 +1236,24 @@ def render_manager_stop_report(
             if terminal_incident and incident_reason is not None
             else protocol_failure
         )
-        root_cause = (
-            f"The controller reached a terminal workflow incident. "
-            f"The manager response was also unavailable, invalid, or illegal: "
-            f"{protocol_failure}"
-            if terminal_incident and incident_reason is not None
-            else "Manager output was unavailable, invalid, or illegal for the current controller boundary."
-        )
+        if budget_failure:
+            root_cause = (
+                f"The controller reached a terminal workflow incident. "
+                f"{manager_failure_reason} The manager provider was not launched."
+                if terminal_incident and incident_reason is not None
+                else (
+                    f"{manager_failure_reason} "
+                    "The manager provider was not launched."
+                )
+            )
+        else:
+            root_cause = (
+                f"The controller reached a terminal workflow incident. "
+                f"The manager response was also unavailable, invalid, or illegal: "
+                f"{protocol_failure}"
+                if terminal_incident and incident_reason is not None
+                else "Manager output was unavailable, invalid, or illegal for the current controller boundary."
+            )
         evidence_items = (
             finished_turn.get("error"),
             finished_turn.get("status"),
@@ -1231,7 +1294,7 @@ def render_manager_stop_report(
         f"- Terminal status: {'terminal incident' if controller.get('terminal') else finished_turn.get('status', 'unknown')}",
         f"- Original plan: {plan_state.get('original_plan_path', 'unknown')}",
         f"- Active plan: {plan_state.get('active_plan_path', 'unknown')}",
-        f"- Checkpoint: {plan_state.get('current_checkpoint', 'unknown')}",
+        f"- Checkpoint: {current_checkpoint if current_checkpoint is not None else 'unknown'}",
         f"- Proposed controller action: {controller.get('proposed_action', 'unknown')}",
         f"- Branch: {controller.get('workspace_state', {}).get('branch', 'unknown') if isinstance(controller.get('workspace_state'), Mapping) else 'unknown'}",
         f"- HEAD: {controller.get('workspace_state', {}).get('head', 'unknown') if isinstance(controller.get('workspace_state'), Mapping) else 'unknown'}",

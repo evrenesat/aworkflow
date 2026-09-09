@@ -47,6 +47,7 @@ SHELL_PROCESS_NAMES = frozenset({
     "zsh",
 })
 _SHELL_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+MANAGER_REJECTED_DIAGNOSTIC_MAX_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,31 @@ def _write_atomic_json(path: Path, payload: dict[str, object]) -> None:
             pass
 
 
+def _write_atomic_bytes(path: Path, payload: bytes) -> None:
+    """Durably replace one byte artifact without exposing a partial write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def manager_decision_paths(paths: RunPaths, decision_number: int) -> ManagerDecisionPaths:
     if decision_number < 1:
         raise ValueError("manager decision numbers start at 1")
@@ -156,6 +182,156 @@ def manager_decision_paths(paths: RunPaths, decision_number: int) -> ManagerDeci
     )
 
 
+def _manager_diagnostic_path(
+    paths: RunPaths,
+    artifact_paths: ManagerDecisionPaths,
+    filename: str,
+) -> tuple[Path, str]:
+    """Resolve one diagnostic path only beneath this run's decision directory."""
+    _run_dir_is_direct_child(paths)
+    run_root = paths.run_dir.resolve()
+    expected_manager = paths.run_dir / "manager"
+    if expected_manager.is_symlink() or not expected_manager.is_dir():
+        raise ValueError(f"manager artifact directory is not a regular directory: {expected_manager}")
+    directory = artifact_paths.directory
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError(f"manager decision directory is not a regular directory: {directory}")
+    try:
+        relative_directory = directory.resolve().relative_to(run_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"manager diagnostic directory escapes this run: {directory}"
+        ) from exc
+    if relative_directory.parts != ("manager", directory.name):
+        raise ValueError(
+            f"manager diagnostic directory is not the current decision directory: {directory}"
+        )
+    destination = directory / filename
+    try:
+        relative = destination.resolve(strict=False).relative_to(run_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"manager diagnostic artifact escapes this run: {destination}"
+        ) from exc
+    if relative.parts != (*relative_directory.parts, filename):
+        raise ValueError(
+            f"manager diagnostic artifact is outside its decision directory: {destination}"
+        )
+    return destination, relative.as_posix()
+
+
+def write_manager_budget_diagnostics(
+    paths: RunPaths,
+    artifact_paths: ManagerDecisionPaths,
+    *,
+    context: Mapping[str, Any],
+    user_prompt: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    """Persist bounded evidence for a rejected manager input.
+
+    The rejected bodies are written only as complete atomic files. The returned
+    metadata describes both candidate bodies even when the cap or a write
+    failure prevents retaining them.
+    """
+    diagnostic = dict(metadata or {})
+    diagnostic.setdefault("storage_cap_bytes", MANAGER_REJECTED_DIAGNOSTIC_MAX_BYTES)
+    context_path: Path | None = None
+    prompt_path: Path | None = None
+    context_relative: str | None = None
+    prompt_relative: str | None = None
+    try:
+        context_path, context_relative = _manager_diagnostic_path(
+            paths, artifact_paths, "rejected-context.json"
+        )
+        prompt_path, prompt_relative = _manager_diagnostic_path(
+            paths, artifact_paths, "rejected-user-prompt.txt"
+        )
+        context_bytes = (
+            json.dumps(
+                dict(context), indent=2, sort_keys=True, ensure_ascii=False
+            )
+            + "\n"
+        ).encode("utf-8")
+        prompt_bytes = user_prompt.encode("utf-8")
+    except (OSError, TypeError, UnicodeError, ValueError) as exc:
+        return {
+            **diagnostic,
+            "status": "write_failed",
+            "body_omitted": True,
+            "retained_artifacts": [],
+            "write_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    context_digest = hashlib.sha256(context_bytes).hexdigest()
+    prompt_digest = hashlib.sha256(prompt_bytes).hexdigest()
+    combined_bytes = len(context_bytes) + len(prompt_bytes)
+    diagnostic.update({
+        "combined_body_bytes": combined_bytes,
+        "rejected_context_sha256": context_digest,
+        "rejected_context_bytes": len(context_bytes),
+        "rejected_user_prompt_sha256": prompt_digest,
+        "rejected_user_prompt_bytes": len(prompt_bytes),
+    })
+    if combined_bytes > MANAGER_REJECTED_DIAGNOSTIC_MAX_BYTES:
+        return {
+            **diagnostic,
+            "status": "omitted",
+            "body_omitted": True,
+            "rejected_context_path": None,
+            "rejected_user_prompt_path": None,
+            "rejected_context_retained": False,
+            "rejected_user_prompt_retained": False,
+            "retained_artifacts": [],
+        }
+
+    retained: list[str] = []
+    try:
+        if (
+            context_path is None
+            or context_relative is None
+            or prompt_path is None
+            or prompt_relative is None
+        ):
+            raise ValueError("manager diagnostic paths were not resolved")
+        _write_atomic_bytes(context_path, context_bytes)
+        retained.append(context_relative)
+        _write_atomic_bytes(prompt_path, prompt_bytes)
+        retained.append(prompt_relative)
+    except (OSError, ValueError) as exc:
+        context_retained = context_path is not None and context_path.is_file()
+        prompt_retained = prompt_path is not None and prompt_path.is_file()
+        retained = [
+            relative
+            for relative, present in (
+                (context_relative, context_retained),
+                (prompt_relative, prompt_retained),
+            )
+            if present and relative is not None
+        ]
+        return {
+            **diagnostic,
+            "status": "write_failed",
+            "body_omitted": len(retained) != 2,
+            "rejected_context_path": context_relative if context_retained else None,
+            "rejected_user_prompt_path": prompt_relative if prompt_retained else None,
+            "rejected_context_retained": context_retained,
+            "rejected_user_prompt_retained": prompt_retained,
+            "retained_artifacts": retained,
+            "write_error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        **diagnostic,
+        "status": "stored",
+        "body_omitted": False,
+        "rejected_context_path": context_relative,
+        "rejected_user_prompt_path": prompt_relative,
+        "rejected_context_retained": True,
+        "rejected_user_prompt_retained": True,
+        "retained_artifacts": retained,
+    }
+
+
 def write_manager_artifacts(
     paths: RunPaths,
     *,
@@ -167,8 +343,15 @@ def write_manager_artifacts(
     stderr: str = "",
     result: Mapping[str, Any] | None = None,
     boundary: Mapping[str, Any] | None = None,
+    rejected_context: Mapping[str, Any] | None = None,
+    rejected_user_prompt: str | None = None,
+    diagnostic_metadata: Mapping[str, Any] | None = None,
 ) -> ManagerDecisionPaths:
     """Persist exact manager inputs and outputs outside workflow turn artifacts."""
+    if (rejected_context is None) != (rejected_user_prompt is None):
+        raise ValueError(
+            "rejected context and rejected user prompt must be supplied together"
+        )
     artifact_paths = manager_decision_paths(paths, decision_number)
     artifact_paths.directory.mkdir(parents=True, exist_ok=False)
     _write_json(artifact_paths.context, dict(context))
@@ -176,7 +359,16 @@ def write_manager_artifacts(
     artifact_paths.user_prompt.write_text(user_prompt, encoding="utf-8")
     artifact_paths.stdout.write_text(stdout, encoding="utf-8")
     artifact_paths.stderr.write_text(stderr, encoding="utf-8")
-    _write_json(artifact_paths.result, dict(result or {}))
+    result_payload = dict(result or {})
+    if rejected_context is not None and rejected_user_prompt is not None:
+        result_payload["diagnostic"] = write_manager_budget_diagnostics(
+            paths,
+            artifact_paths,
+            context=rejected_context,
+            user_prompt=rejected_user_prompt,
+            metadata=diagnostic_metadata,
+        )
+    _write_atomic_json(artifact_paths.result, result_payload)
     if boundary is not None:
         _write_json(artifact_paths.boundary, dict(boundary))
     return artifact_paths

@@ -1,5 +1,10 @@
 # DEVLOG
 
+## 2026-09-09 — Approve budget-failure diagnostics (Checkpoint 3)
+
+- Retain rejected manager input with bounded atomic diagnostics and accurate prelaunch budget reports, preserving checkpoint/turn references and terminal incident evidence.
+- Approved CP3 through `cp3 v02`; 203 tests and 7 subtests passed with disposable configuration, plus the diff check. CP4 integration coverage remains pending.
+
 ## 2026-09-09 — Bound optional manager history (Checkpoint 2)
 
 - Approved deterministic v3 history projection, bounded omission descriptors,

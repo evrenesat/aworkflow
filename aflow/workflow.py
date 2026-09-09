@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
@@ -30,6 +31,7 @@ from .config import (
 from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
+    ManagerInlineContextLimitError,
     ManagerNoteAuthorityError,
     build_manager_note_correction_prompts,
     build_manager_note_correction_result,
@@ -128,6 +130,52 @@ from aflow.api.events import (
 
 PROCESS_POLL_INTERVAL_SECONDS = 0.05
 BANNER_REFRESH_INTERVAL_SECONDS = 1.0
+MANAGER_INPUT_BUDGET_FAILURE_REASON = (
+    "Manager input exceeds its byte budget before provider launch."
+)
+
+
+def _manager_budget_diagnostic_metadata(
+    context: Mapping[str, object],
+    error: ManagerInlineContextLimitError,
+) -> dict[str, object]:
+    """Return bounded, non-body metadata for one rejected manager input."""
+    disclosure = context.get("history_disclosure")
+    reduction_order: list[str] = []
+    reduced_categories: list[str] = []
+    omitted_counts: dict[str, int] = {}
+    if isinstance(disclosure, Mapping):
+        reduction_order = [
+            value for value in disclosure.get("reduction_order", ())
+            if isinstance(value, str)
+        ]
+        reduced_categories = [
+            value for value in disclosure.get("reduced_categories", ())
+            if isinstance(value, str)
+        ]
+        omitted = disclosure.get("omitted")
+        if isinstance(omitted, list):
+            for descriptor in omitted:
+                if not isinstance(descriptor, Mapping):
+                    continue
+                category = descriptor.get("category")
+                count = descriptor.get("omitted_count")
+                if (
+                    isinstance(category, str)
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                ):
+                    omitted_counts[category] = count
+    return {
+        "kind": "manager_input_budget",
+        "failure_stage": "manager_input_budget",
+        "attempted_bytes": error.attempted_bytes,
+        "permitted_bytes": error.permitted_bytes,
+        "field_byte_counts": dict(error.field_byte_counts),
+        "reduction_order": reduction_order,
+        "reduced_categories": reduced_categories,
+        "omitted_counts": omitted_counts,
+    }
 
 
 @dataclass(frozen=True)
@@ -150,51 +198,136 @@ def _manager_prelaunch_failure_context(
     boundary: FinalizedTurnBoundary,
     metadata: Mapping[str, object],
     workspace_state: Mapping[str, object],
+    source_context: Mapping[str, object] | None = None,
+    failure_stage: str = "prelaunch",
+    failure_message: str = "manager context was unavailable before provider launch",
 ) -> dict[str, object]:
-    """Return a safe minimal context when provider input could not be built."""
+    """Return a safe context when provider input could not be built.
+
+    A successful context build may still fail at the input-budget guard. In
+    that case keep its current boundary evidence in the provider-safe fallback
+    while the complete candidate is retained separately as diagnostic evidence.
+    """
+    source = source_context if isinstance(source_context, Mapping) else {}
+    source_schema = source.get("schema_version")
     schema_version = (
-        MANAGER_CONTEXT_SCHEMA_VERSION_V3
-        if boundary.context_schema_version >= 4
-        else boundary.context_schema_version
+        source_schema
+        if isinstance(source_schema, int) and not isinstance(source_schema, bool)
+        else (
+            MANAGER_CONTEXT_SCHEMA_VERSION_V3
+            if boundary.context_schema_version >= 4
+            else boundary.context_schema_version
+        )
     )
-    return {
+    source_finished = source.get("finished_turn")
+    finished_turn = (
+        deepcopy(dict(source_finished))
+        if isinstance(source_finished, Mapping)
+        else {
+            "turn_number": boundary.finalized_turn_number,
+            "status": "manager-prelaunch-failure",
+            "raw_artifacts": [],
+        }
+    )
+    raw_artifacts = finished_turn.get("raw_artifacts")
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        turn_artifact_path = boundary.artifact_path.rstrip("/")
+        finished_turn["raw_artifacts"] = [
+            {"path": f"{turn_artifact_path}/stdout.txt"},
+            {"path": f"{turn_artifact_path}/stderr.txt"},
+        ]
+    finished_turn.setdefault("turn_number", boundary.finalized_turn_number)
+    if not isinstance(finished_turn.get("error"), str):
+        finished_turn["error"] = failure_message
+    finished_turn["manager_failure_reason"] = failure_message
+
+    source_plan_state = source.get("plan_state")
+    plan_state = (
+        deepcopy(dict(source_plan_state))
+        if isinstance(source_plan_state, Mapping)
+        else {
+            "original_plan_path": metadata.get("original_plan_path"),
+            "active_plan_path": metadata.get("active_plan_path"),
+            "current_checkpoint": None,
+        }
+    )
+    source_controller = source.get("controller_state")
+    controller_state = (
+        deepcopy(dict(source_controller))
+        if isinstance(source_controller, Mapping)
+        else {}
+    )
+    # Historical rows are retained by the rejected-context diagnostic, not by
+    # the provider-safe fallback that remains readable in context.json.
+    controller_state.pop("checkpoint_repartitions", None)
+    controller_state.update({
+        "terminal": controller_state.get("terminal", boundary.terminal),
+        "proposed_action": controller_state.get(
+            "proposed_action", boundary.proposed_action
+        ),
+        "proposed_next_step": controller_state.get(
+            "proposed_next_step", boundary.proposed_transition
+        ),
+        "baseline_team": controller_state.get(
+            "baseline_team", boundary.baseline_team
+        ),
+        "eligible_actions": controller_state.get(
+            "eligible_actions", list(boundary.eligible_actions)
+        ),
+        "workspace_state": controller_state.get(
+            "workspace_state", dict(workspace_state)
+        ),
+        "lite_evidence": controller_state.get("lite_evidence", failure_message),
+        "manager_failure_reason": failure_message,
+        "failure_stage": failure_stage,
+    })
+    source_evidence = source.get("evidence")
+    evidence = (
+        deepcopy(dict(source_evidence))
+        if isinstance(source_evidence, Mapping)
+        else {
+            "available": False,
+            "reason": failure_message,
+        }
+    )
+    source_disclosure = source.get("plan_content_disclosure")
+    plan_content_disclosure = (
+        deepcopy(dict(source_disclosure))
+        if isinstance(source_disclosure, Mapping)
+        else {
+            "active_plan": "unavailable",
+            "original_plan": "unavailable",
+            "checkpoint": "unavailable",
+        }
+    )
+    fallback: dict[str, object] = {
         "schema_version": schema_version,
         "run_id": run_id,
         "decision_number": decision_number,
         "level": level,
         "trigger": trigger,
-        "finished_turn": {
-            "turn_number": boundary.finalized_turn_number,
-            "status": "manager-prelaunch-failure",
-            "error": "manager context was unavailable before provider launch",
-            "raw_artifacts": [],
-        },
+        "finished_turn": finished_turn,
         "run_extract": [],
-        "plan_state": {
-            "original_plan_path": metadata.get("original_plan_path"),
-            "active_plan_path": metadata.get("active_plan_path"),
-            "current_checkpoint": None,
-        },
-        "controller_state": {
-            "terminal": boundary.terminal,
-            "proposed_action": boundary.proposed_action,
-            "proposed_next_step": boundary.proposed_transition,
-            "baseline_team": boundary.baseline_team,
-            "eligible_actions": list(boundary.eligible_actions),
-            "workspace_state": dict(workspace_state),
-            "lite_evidence": "manager context was unavailable before provider launch",
-        },
-        "evidence": {
-            "available": False,
-            "reason": "manager context was unavailable before provider launch",
-        },
-        "plan_content_disclosure": {
-            "active_plan": "unavailable",
-            "original_plan": "unavailable",
-            "checkpoint": "unavailable",
-        },
+        "plan_state": plan_state,
+        "controller_state": controller_state,
+        "evidence": evidence,
+        "plan_content_disclosure": plan_content_disclosure,
         "manager_prelaunch_failure": True,
+        "failure_stage": failure_stage,
+        "manager_failure_reason": failure_message,
     }
+    for key in (
+        "history_disclosure",
+        "active_scope_rejection_ledger",
+        "implementation_attempts",
+        "change_surface_evidence",
+        "manager_note_scope",
+        "retry_manager_note_scope",
+        "scope_pressure_detected",
+    ):
+        if key in source:
+            fallback[key] = deepcopy(source[key])
+    return fallback
 
 
 def _manager_repo_fingerprint(
@@ -318,6 +451,10 @@ class _ManagerCallExecutor:
         system_prompt = ""
         user_prompt = ""
         prelaunch_failure = False
+        budget_failure = False
+        diagnostic_context: Mapping[str, object] | None = None
+        diagnostic_user_prompt: str | None = None
+        diagnostic_metadata: Mapping[str, object] | None = None
         stdout = ""
         stderr = ""
         result_payload: dict[str, object] = {
@@ -352,10 +489,51 @@ class _ManagerCallExecutor:
                         boundary.repartition_history
                     )
             boundary_payload["captured_plan_state"] = context["plan_state"]
-            system_prompt, user_prompt = build_manager_prompts(
-                context,
-                skill_name=self.workflow_config.manager.skill,
-            )
+            try:
+                system_prompt, user_prompt = build_manager_prompts(
+                    context,
+                    skill_name=self.workflow_config.manager.skill,
+                )
+            except ManagerInlineContextLimitError as exc:
+                budget_failure = True
+                prelaunch_failure = True
+                diagnostic_context = (
+                    exc.context
+                    if isinstance(exc.context, Mapping)
+                    else context
+                )
+                diagnostic_user_prompt = (
+                    exc.user_prompt
+                    if isinstance(exc.user_prompt, str)
+                    else user_prompt
+                )
+                error = str(exc)
+                if MANAGER_INPUT_BUDGET_FAILURE_REASON not in error:
+                    error = f"{error}; {MANAGER_INPUT_BUDGET_FAILURE_REASON}"
+                diagnostic_metadata = _manager_budget_diagnostic_metadata(
+                    diagnostic_context,
+                    exc,
+                )
+                context = _manager_prelaunch_failure_context(
+                    run_id=self.state.run_id,
+                    decision_number=decision_number,
+                    level=level,
+                    trigger=boundary.trigger,
+                    boundary=boundary,
+                    metadata=metadata,
+                    workspace_state=boundary_payload["workspace_state"],
+                    source_context=diagnostic_context,
+                    failure_stage="prelaunch",
+                    failure_message=MANAGER_INPUT_BUDGET_FAILURE_REASON,
+                )
+                context["failure_kind"] = "manager_input_budget"
+                result_payload.update({
+                    "status": "invalid",
+                    "failure_stage": "prelaunch",
+                    "failure_kind": "manager_input_budget",
+                    "failure_reason": MANAGER_INPUT_BUDGET_FAILURE_REASON,
+                    "error": error,
+                })
         except (OSError, UnicodeError, ValueError, WorkflowError, SkillStoreError) as exc:
             prelaunch_failure = True
             error = str(exc)
@@ -514,6 +692,15 @@ class _ManagerCallExecutor:
                 "boundary": persisted_boundary_payload,
                 "active_plan_content": persisted_active_plan_content,
             },
+            rejected_context=(
+                diagnostic_context if budget_failure else None
+            ),
+            rejected_user_prompt=(
+                diagnostic_user_prompt if budget_failure else None
+            ),
+            diagnostic_metadata=(
+                diagnostic_metadata if budget_failure else None
+            ),
         )
         correction_consumed = False
         if (

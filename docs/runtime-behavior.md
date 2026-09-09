@@ -828,3 +828,19 @@ integration; it does not launch another checkpoint or workflow harness.
 ### Resume after manager context-budget rejection
 
 A failed run whose recorded manager result identifies a post-turn, prelaunch context-budget rejection may resume its saved finalized-turn boundary, including when all implementation checkpoints are checked. Admission validates the matching manager decision and turn artifacts and refuses already-consumed boundaries. Resume retries supervision before following the saved transition; it does not rerun the completed worker or treat pending review as finished.
+
+The manager result keeps `failure_stage = "prelaunch"` for admission compatibility
+and records `failure_kind = "manager_input_budget"` plus the precise budget
+reason. Its bounded `diagnostic` metadata records attempted and permitted prompt
+bytes, per-field byte counts, history-reduction counts, digests and sizes for
+the rejected context/prompt, and the retained artifact paths. Complete
+`rejected-context.json` and `rejected-user-prompt.txt` bodies are written
+atomically in the same decision directory only when their combined UTF-8 size
+is at most 256 KiB. Larger bodies are omitted with `body_omitted = true`; a
+partial write records exactly which body, if any, was retained. The existing
+`context.json` remains the provider-safe fallback and retains the known
+checkpoint, finished-turn, and stdout/stderr references.
+The generated `manager-report.md` diagnoses this case as manager input exceeding
+the byte budget before provider launch; it does not describe the absent response
+as invalid or unavailable manager output. Terminal workflow incident evidence is
+reported separately when present.

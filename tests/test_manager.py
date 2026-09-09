@@ -667,6 +667,101 @@ def test_terminal_fallback_report_preserves_incident_before_protocol_error() -> 
     assert "## Summary\nharness 'reasonix' exited with code 2" in report
     assert "The controller reached a terminal workflow incident." in report
     assert "Manager decision error: next_step_notes must be an array" in report
+    assert "unavailable, invalid, or illegal" in report
+
+
+def test_budget_failure_report_diagnoses_prelaunch_overflow_and_references_state() -> None:
+    report = render_manager_stop_report(
+        context={
+            "run_id": "run-1",
+            "decision_number": 2,
+            "level": "lite",
+            "trigger": "post_turn",
+            "failure_kind": "manager_input_budget",
+            "manager_failure_reason": (
+                "Manager input exceeds its byte budget before provider launch."
+            ),
+            "finished_turn": {
+                "turn_number": 4,
+                "status": "completed",
+                "raw_artifacts": [
+                    {"path": "turns/turn-004/stdout.txt"},
+                    {"path": "turns/turn-004/stderr.txt"},
+                ],
+            },
+            "controller_state": {
+                "terminal": False,
+                "baseline_team": "ds4_lite",
+                "proposed_action": "continue",
+            },
+            "plan_state": {
+                "original_plan_path": "plans/original.md",
+                "active_plan_path": "plans/active.md",
+                "current_checkpoint": "Checkpoint 3: Retain budget-failure diagnostics",
+            },
+        },
+        failure_reason=(
+            "manager inline context exceeds the 40960-byte hard limit; "
+            "Manager input exceeds its byte budget before provider launch."
+        ),
+    )
+
+    assert (
+        "Manager input exceeds its byte budget before provider launch."
+        in report
+    )
+    assert "The manager provider was not launched." in report
+    assert "unavailable, invalid, or illegal" not in report
+    assert "plans/original.md" in report
+    assert "plans/active.md" in report
+    assert "Checkpoint 3: Retain budget-failure diagnostics" in report
+    assert "turns/turn-004/stdout.txt" in report
+    assert "turns/turn-004/stderr.txt" in report
+
+
+def test_terminal_budget_failure_report_preserves_incident_and_prelaunch_cause() -> None:
+    report = render_manager_stop_report(
+        context={
+            "run_id": "run-1",
+            "decision_number": 3,
+            "level": "full",
+            "trigger": "terminal_turn",
+            "failure_kind": "manager_input_budget",
+            "manager_failure_reason": (
+                "Manager input exceeds its byte budget before provider launch."
+            ),
+            "finished_turn": {
+                "turn_number": 7,
+                "status": "harness-failed",
+                "raw_artifacts": [
+                    {"path": "turns/turn-007/stdout.txt"},
+                    {"path": "turns/turn-007/stderr.txt"},
+                ],
+            },
+            "controller_state": {
+                "terminal": True,
+                "baseline_team": "ds4_lite",
+                "lite_evidence": "harness 'reasonix' exited with code 2",
+            },
+            "plan_state": {
+                "original_plan_path": "plans/original.md",
+                "active_plan_path": "plans/active.md",
+                "current_checkpoint": "Checkpoint 3: Retain budget-failure diagnostics",
+            },
+        },
+        failure_reason=(
+            "manager inline context exceeds the 40960-byte hard limit; "
+            "Manager input exceeds its byte budget before provider launch."
+        ),
+    )
+
+    assert "## Summary\nharness 'reasonix' exited with code 2" in report
+    assert "The controller reached a terminal workflow incident." in report
+    assert "Manager input exceeds its byte budget before provider launch." in report
+    assert "The manager provider was not launched." in report
+    assert "unavailable, invalid, or illegal" not in report
+    assert "Checkpoint 3: Retain budget-failure diagnostics" in report
+    assert "turns/turn-007/stdout.txt" in report
 
 
 def test_manager_role_and_one_edge_upgrade_use_baseline_routing_only() -> None:
