@@ -532,8 +532,8 @@ class TestSave:
         with pytest.raises(ProjectConfigRunBlocked) as running_block:
             service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
         # The controller has not written run metadata yet, so the durable
-        # status is the unit_started launch phase; it must block either way.
-        assert running_block.value.blocking_runs == ((run_id, "unit_started"),)
+        # status is the launch_started phase; it must block either way.
+        assert running_block.value.blocking_runs == ((run_id, "launch_started"),)
 
         control.owner_stop(
             PROJECT_ID, run_id, expected_revision=0, idempotency_key="stop-running"
@@ -635,7 +635,7 @@ class TestSave:
         with pytest.raises(ProjectConfigRunBlocked) as exc_info:
             service.save(PROJECT_ID, aflow_text, workflows_text, before_revision)
 
-        assert exc_info.value.blocking_runs[0][1] == "running"
+        assert exc_info.value.blocking_runs[0][1] == "needs_attention"
 
     def test_save_allows_migrated_identical_config_with_old_frozen_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -186,6 +186,27 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
         browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
         try:
             page = browser.new_page(viewport={'width': 1365, 'height': 900})
+            page.add_init_script("""
+                (() => {
+                    const nativeFetch = window.fetch.bind(window);
+                    let skillsListRequests = 0;
+                    window.__releaseAflowSkillsList = null;
+                    window.fetch = async (input, init) => {
+                        const response = await nativeFetch(input, init);
+                        const url = typeof input === 'string' ? input : input.url;
+                        if (new URL(url, window.location.href).pathname === '/api/skills') {
+                            skillsListRequests += 1;
+                            if (skillsListRequests === 2) {
+                                await new Promise(resolve => {
+                                    window.__releaseAflowSkillsList = resolve;
+                                });
+                                window.__releaseAflowSkillsList = null;
+                            }
+                        }
+                        return response;
+                    };
+                })();
+            """)
             page.goto(url)
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
@@ -208,6 +229,11 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                     assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width
             # One shared install action on the clean registry, then an edit.
             page.get_by_role('button', name='Install/reinstall all', exact=True).click()
+            page.wait_for_function("typeof window.__releaseAflowSkillsList === 'function'")
+            area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
+            assert area.is_disabled()
+            assert page.get_by_text('Install finished', exact=False).count() == 0
+            page.evaluate("window.__releaseAflowSkillsList()")
             page.get_by_text('Install finished').wait_for()
             area.fill(original + '\n\nBrowser edit.\n')
             install = page.get_by_role('button', name='Install/reinstall all', exact=True)

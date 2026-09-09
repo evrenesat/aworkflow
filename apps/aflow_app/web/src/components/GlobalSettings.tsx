@@ -157,7 +157,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
     setSkills(null); setSkillsError(null); setSelectedSkill(''); setSkillContents({}); setSkillRevisions({}); setSkillDrafts({})
     skillInflight.current.clear()
-    setSkillContentLoading(false); setSkillContentError(null); setInstallResult(null); setInstallError(null)
+    setSkillContentLoading(false); setInstallResult(null); setInstallError(null); setInstalling(false)
+    setSkillContentError(null)
     void load()
   }
   async function retryProjection() {
@@ -343,31 +344,45 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     try {
       const result = await api.installSkills()
       if (epochRef.current !== epoch) return
-      setInstallResult(result)
-      // Refresh rewrites unedited canonical trees: reload clean baselines so the
-      // new bytes are reflected. No draft can be dirty here; drop no-op duplicates.
-      const list = await api.listSkills()
-      if (epochRef.current !== epoch) return
-      setSkills(list); setSkillsError(null); setSkillDrafts({})
-      setSkillContents({})
-      setSkillRevisions(Object.fromEntries(list.map(skill => [skill.name, skill.revision])))
-      const next = selectedSkill && list.some(skill => skill.name === selectedSkill) ? selectedSkill : list[0]?.name ?? ''
-      setSelectedSkill(next)
-      // Reload the selected baseline immediately so an edit cannot save
-      // against a cleared revision; other skills reload lazily on selection.
-      if (next) {
-        setSkillContentLoading(true); setSkillContentError(null)
-        try {
-          const detail: SkillDetail = await api.readSkill(next)
-          if (epochRef.current !== epoch) return
-          setSkillContents({ [next]: detail.content })
-          setSkillRevisions(revisions => ({ ...revisions, [next]: detail.revision }))
-        } catch (reason) {
-          if (epochRef.current !== epoch) return
-          setSkillContentError(reason instanceof Error ? reason.message : 'Could not load the skill content.')
-        } finally {
-          if (epochRef.current === epoch) setSkillContentLoading(false)
+      let refreshError: unknown = null
+      try {
+        // Refresh rewrites unedited canonical trees: reload clean baselines so the
+        // new bytes are reflected. No draft can be dirty here; drop no-op duplicates.
+        const list = await api.listSkills()
+        if (epochRef.current !== epoch) return
+        setSkills(list); setSkillsError(null); setSkillDrafts({})
+        setSkillContents({})
+        setSkillRevisions(Object.fromEntries(list.map(skill => [skill.name, skill.revision])))
+        const next = selectedSkill && list.some(skill => skill.name === selectedSkill) ? selectedSkill : list[0]?.name ?? ''
+        setSelectedSkill(next)
+        // Reload the selected baseline immediately so an edit cannot save
+        // against a cleared revision; other skills reload lazily on selection.
+        if (next) {
+          setSkillContentLoading(true); setSkillContentError(null)
+          try {
+            const detail: SkillDetail = await api.readSkill(next)
+            if (epochRef.current !== epoch) return
+            setSkillContents({ [next]: detail.content })
+            setSkillRevisions(revisions => ({ ...revisions, [next]: detail.revision }))
+          } catch (reason) {
+            if (epochRef.current !== epoch) return
+            refreshError = reason
+            setSkillContentError(reason instanceof Error ? reason.message : 'Could not load the skill content.')
+          } finally {
+            if (epochRef.current === epoch) setSkillContentLoading(false)
+          }
         }
+      } catch (reason) {
+        if (epochRef.current !== epoch) return
+        refreshError = reason
+      }
+      if (epochRef.current !== epoch) return
+      // Do not announce completion or clear the editor until every baseline
+      // refresh has settled; installing keeps the textarea disabled meanwhile.
+      setInstallResult(result)
+      if (refreshError) {
+        const message = refreshError instanceof Error ? refreshError.message : 'Could not reload skill baselines.'
+        setInstallError(`Installation finished, but skill baselines could not be refreshed: ${message}`)
       }
     } catch (reason) {
       if (epochRef.current !== epoch) return

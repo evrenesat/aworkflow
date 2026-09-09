@@ -446,6 +446,59 @@ describe('GlobalSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await waitFor(() => expect(api.saveSkill).toHaveBeenCalledWith('aflow-manager', { content: `${skillContent('aflow-manager')}\nPost-refresh edit.\n`, expected_revision: 'f'.repeat(64) }))
   })
+  it('keeps skill editing disabled until the install refresh settles', async () => {
+    let resolveRefreshList!: (value: typeof skillSummaries) => void
+    let resolveRefreshDetail!: (value: ReturnType<typeof skillDetail>) => void
+    const refreshList = new Promise<typeof skillSummaries>(resolve => { resolveRefreshList = resolve })
+    const refreshDetail = new Promise<ReturnType<typeof skillDetail>>(resolve => { resolveRefreshDetail = resolve })
+    let listCalls = 0
+    vi.mocked(api.listSkills).mockImplementation(async () => {
+      listCalls += 1
+      return listCalls === 2 ? refreshList : skillSummaries
+    })
+    let contentReads = 0
+    vi.mocked(api.readSkill).mockImplementation((name: string) => {
+      contentReads += 1
+      return contentReads === 1
+        ? Promise.resolve(skillDetail(name, skillSummaries.find(skill => skill.name === name)!.revision))
+        : refreshDetail
+    })
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    const install = screen.getByRole('button', { name: 'Install/reinstall all' })
+    fireEvent.click(install)
+    await waitFor(() => expect(api.listSkills).toHaveBeenCalledTimes(2))
+    expect(area.disabled).toBe(true)
+    expect(screen.queryByText(/Install finished/)).toBeNull()
+
+    resolveRefreshList(skillSummaries.map(skill => skill.name === 'aflow-manager' ? { ...skill, revision: 'f'.repeat(64) } : skill))
+    await waitFor(() => expect(api.readSkill.mock.calls.length).toBeGreaterThan(1))
+    expect(screen.queryByLabelText('SKILL.md for aflow-manager')).toBeNull()
+    expect(screen.queryByText(/Install finished/)).toBeNull()
+
+    resolveRefreshDetail(skillDetail('aflow-manager', 'f'.repeat(64)))
+    await screen.findByText(/Install finished/)
+    const refreshed = screen.getByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    expect(refreshed.disabled).toBe(false)
+    fireEvent.change(refreshed, { target: { value: `${skillContent('aflow-manager')}\nAfter refresh.\n` } })
+    expect(refreshed.value).toContain('After refresh.')
+    expect((screen.getByRole('button', { name: 'Install/reinstall all' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+  it('reports a failed install refresh and restores skill editing', async () => {
+    vi.mocked(api.listSkills).mockResolvedValueOnce(skillSummaries).mockRejectedValueOnce(new Error('refresh failed'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills' }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    fireEvent.click(screen.getByRole('button', { name: 'Install/reinstall all' }))
+    await screen.findByText(/Install finished/)
+    await screen.findByText(/refresh failed/)
+    expect(area.disabled).toBe(false)
+    fireEvent.change(area, { target: { value: `${skillContent('aflow-manager')}\nRecovered edit.\n` } })
+    expect(area.value).toContain('Recovered edit.')
+  })
   it('shows saved-but-uninstalled and optional guidance without an edited-reinstall button', async () => {
     const listed = [
       { ...skillSummaries[0] },

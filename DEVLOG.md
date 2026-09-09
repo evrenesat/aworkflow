@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-09 — Keep Skills edits safe during install refresh
+
+- Settings keeps the Skills editor disabled until the shared install result,
+  refreshed registry, and selected skill content have all settled. Refresh
+  failures remain visible and controls recover without discarding a draft.
+- Added deferred unit and Chromium coverage for the post-install list boundary,
+  selected-content refresh, failed reload recovery, and real linked saves.
+
 ## 2026-09-09 — Replace stale instructions during CLI resume
 
 - Explicit CLI resume now replaces saved extra instructions when text follows

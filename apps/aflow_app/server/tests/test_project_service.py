@@ -31,6 +31,38 @@ def _release_inputs(tmp_path: Path) -> tuple[Path, Path]:
     return executable, environment_file
 
 
+def _write_workflow_config(config_dir: Path) -> Path:
+    """Create the valid disposable global pair used by daemon-backed tests."""
+    config_path = config_dir / "aflow.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        """
+[aflow]
+default_workflow = "managed"
+
+[harness.codex.profiles.test]
+model = "test"
+
+[roles]
+worker = "codex.test"
+
+[prompts]
+p = "Work."
+""".strip()
+        + "\n"
+    )
+    config_path.with_name("workflows.toml").write_text(
+        """
+[workflow.managed.steps.implement]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "END", when = "DONE" }]
+""".strip()
+        + "\n"
+    )
+    return config_path
+
+
 def _service(tmp_path: Path, control_plane: ControlPlaneService | None = None) -> tuple[ProjectService, ProjectRegistry, Path]:
     managed = tmp_path / "managed"
     managed.mkdir(exist_ok=True)
@@ -639,12 +671,14 @@ class TestUnregister:
         service, registry, managed = _service(tmp_path)
         _create(service, "alpha")
         executable, environment_file = _release_inputs(tmp_path)
+        config_path = _write_workflow_config(tmp_path / "global")
         control_plane = ControlPlaneService(
             registry,
             aflow_executable=executable,
             environment_file=environment_file,
             release_identity="test-release",
             daemon_factory=lambda config: AflowDaemon(config, units=InMemoryUnitManager()),
+            workflow_config_path=config_path,
         )
         service = ProjectService(registry, control_plane)
 
@@ -675,6 +709,7 @@ class TestAuthenticatedApi:
         managed = tmp_path / "managed"
         managed.mkdir()
         executable, environment_file = _release_inputs(tmp_path)
+        config_path = _write_workflow_config(tmp_path / "global")
         config = ServerConfig(
             bind_host="127.0.0.1",
             bind_port=8765,
@@ -693,6 +728,7 @@ class TestAuthenticatedApi:
             aflow_executable=executable,
             environment_file=environment_file,
             release_identity="test-release",
+            workflow_config_path=config_path,
         )
         main_module._control_plane_service.start()
         client = TestClient(main_module.app, raise_server_exceptions=False)

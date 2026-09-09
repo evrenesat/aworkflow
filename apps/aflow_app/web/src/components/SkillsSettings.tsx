@@ -82,6 +82,7 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
         className="input mono config-textarea"
         rows={20}
         aria-label={`SKILL.md for ${active.name}`}
+        disabled={installing}
         value={draft ?? content}
         onChange={e => onEdit(active.name, e.target.value)}
       /></label>}
