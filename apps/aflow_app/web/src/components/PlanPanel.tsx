@@ -111,7 +111,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
     try {
       setBusy(true)
       setError(null)
-      const created = await api.createProjectPlan(project.id, { name, content: '# Plan\n\n' })
+      const created = await api.createProjectPlan(project.id, { name })
       setNewName('')
       await refresh()
       await openPlan(created)

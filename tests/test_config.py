@@ -97,7 +97,8 @@ def test_override_loader_rejects_unsafe_or_invalid_schema(
 
 def test_manager_config_is_optional_and_defaults_to_disabled() -> None:
     config = WorkflowUserConfig()
-    assert config.manager.enabled is False
+    assert config.manager.lite_role is None
+    assert config.manager.full_role is None
     assert config.manager.full_after_stalled_turns == 2
     assert config.manager.skill == "aflow-manager"
     assert config.manager.repartition_skill == "aflow-repartition-checkpoint"
@@ -107,11 +108,14 @@ def test_manager_config_rejects_missing_role_and_upgrade_cycle() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = _write_config(
             Path(tmpdir),
-            '[manager]\nenabled = true\nlite_role = "manager_lite"\nfull_role = "manager_full"\n\n'
+            '[manager]\nlite_role = "manager_lite"\nfull_role = "manager_full"\n\n'
             '[harness.codex.profiles.nano]\nmodel = "nano"\n\n'
             '[roles]\nmanager_lite = "codex.nano"\nmanager_full = "codex.nano"\n\n'
             '[teams.a]\nupgrade_to = "b"\n\n'
-            '[teams.b]\nupgrade_to = "a"\n',
+            '[teams.b]\nupgrade_to = "a"\n\n'
+            '[workflow.managed]\nmanager_enabled = true\n\n'
+            '[workflow.managed.steps.s]\nrole = "manager_lite"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n'
+            '[prompts]\np = "do it"\n',
         )
         with pytest.raises(ConfigError) as ctx:
             load_workflow_config(config_path)
@@ -120,11 +124,223 @@ def test_manager_config_rejects_missing_role_and_upgrade_cycle() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = _write_config(
             Path(tmpdir),
-            '[manager]\nenabled = true\nlite_role = "manager_lite"\n\n',
+            '[manager]\nlite_role = "manager_lite"\n\n'
+            '[harness.codex.profiles.nano]\nmodel = "nano"\n\n'
+            '[roles]\nmanager_lite = "codex.nano"\n\n'
+            '[workflow.managed]\nmanager_enabled = true\n\n'
+            '[workflow.managed.steps.s]\nrole = "manager_lite"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n'
+            '[prompts]\np = "do it"\n',
         )
         with pytest.raises(ConfigError) as ctx:
             load_workflow_config(config_path)
-        assert "full_role is required" in str(ctx.value)
+        assert "manager.full_role is required" in str(ctx.value)
+
+
+_MANAGER_TEST_BASE = (
+    '[harness.codex.profiles.nano]\nmodel = "nano"\n\n'
+    '[roles]\nworker = "codex.nano"\nmanager_lite = "codex.nano"\nmanager_full = "codex.nano"\n\n'
+    '[manager]\nlite_role = "manager_lite"\nfull_role = "manager_full"\n\n'
+    '[prompts]\np = "do it"\n'
+)
+
+_MANAGER_TEST_STEP = (
+    '[workflow.{name}.steps.s]\nrole = "worker"\nprompts = ["p"]\ngo = [{{ to = "END" }}]\n'
+)
+
+
+def _managed_config(tmp_path: Path, workflow_text: str) -> Path:
+    return _write_config(tmp_path, _MANAGER_TEST_BASE + workflow_text)
+
+
+def test_workflow_manager_enabled_defaults_to_disabled_when_omitted() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                '[workflow.plain]\n'
+                + _MANAGER_TEST_STEP.format(name="plain"),
+            )
+        )
+        assert config.workflows["plain"].manager_enabled is False
+
+
+def test_workflow_manager_enabled_preserves_explicit_true_and_false() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                '[workflow.on]\nmanager_enabled = true\n'
+                + _MANAGER_TEST_STEP.format(name="on")
+                + '[workflow.off]\nmanager_enabled = false\n'
+                + _MANAGER_TEST_STEP.format(name="off"),
+            )
+        )
+        assert config.workflows["on"].manager_enabled is True
+        assert config.workflows["off"].manager_enabled is False
+
+
+def test_workflow_manager_enabled_default_and_override_precedence() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        enabled_by_default = load_workflow_config(
+            _managed_config(
+                Path(tmpdir) / "a",
+                '[workflow]\nmanager_enabled = true\n\n'
+                '[workflow.inheriting]\n'
+                + _MANAGER_TEST_STEP.format(name="inheriting")
+                + '[workflow.opted_out]\nmanager_enabled = false\n'
+                + _MANAGER_TEST_STEP.format(name="opted_out"),
+            )
+        )
+        assert enabled_by_default.workflows["inheriting"].manager_enabled is True
+        assert enabled_by_default.workflows["opted_out"].manager_enabled is False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        opted_in = load_workflow_config(
+            _managed_config(
+                Path(tmpdir) / "b",
+                '[workflow.opted_in]\nmanager_enabled = true\n'
+                + _MANAGER_TEST_STEP.format(name="opted_in"),
+            )
+        )
+        assert opted_in.workflows["opted_in"].manager_enabled is True
+
+
+def test_workflow_manager_enabled_alias_inherits_base_and_explicit_wins() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                '[workflow.base]\nmanager_enabled = true\n'
+                + _MANAGER_TEST_STEP.format(name="base")
+                + '[workflow.child]\nextends = "base"\n'
+                + '[workflow.silenced]\nextends = "base"\nmanager_enabled = false\n'
+                + '[workflow.quiet]\n'
+                + _MANAGER_TEST_STEP.format(name="quiet")
+                + '[workflow.loud]\nextends = "quiet"\nmanager_enabled = true\n',
+            )
+        )
+        assert config.workflows["base"].manager_enabled is True
+        assert config.workflows["child"].manager_enabled is True
+        assert config.workflows["silenced"].manager_enabled is False
+        assert config.workflows["quiet"].manager_enabled is False
+        assert config.workflows["loud"].manager_enabled is True
+
+
+def test_workflow_manager_enabled_ignores_launch_default_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _managed_config(
+                Path(tmpdir),
+                '[aflow]\ndefault_workflow = "other"\n\n'
+                '[workflow.other]\nmanager_enabled = true\n'
+                + _MANAGER_TEST_STEP.format(name="other")
+                + '[workflow.plain]\n'
+                + _MANAGER_TEST_STEP.format(name="plain"),
+            )
+        )
+        assert config.workflows["other"].manager_enabled is True
+        assert config.workflows["plain"].manager_enabled is False
+
+
+def test_workflow_manager_enabled_rejects_non_boolean_values() -> None:
+    for source in (
+        '[workflow]\nmanager_enabled = "yes"\n',
+        "[workflow]\nmanager_enabled = 1\n",
+        '[workflow.flagged]\nmanager_enabled = "true"\n',
+        "[workflow.flagged]\nmanager_enabled = 0\n",
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ConfigError, match=r"manager_enabled must be a boolean"):
+                load_workflow_config(
+                    _managed_config(
+                        Path(tmpdir),
+                        source + _MANAGER_TEST_STEP.format(name="flagged"),
+                    )
+                )
+
+
+def test_workflow_manager_enabled_rejects_step_level_flags() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ConfigError, match="is not accepted"):
+            load_workflow_config(
+                _managed_config(
+                    Path(tmpdir),
+                    '[workflow.flagged.steps.s]\nrole = "worker"\nprompts = ["p"]\n'
+                    "go = [{ to = \"END\" }]\nmanager_enabled = true\n",
+                )
+            )
+
+
+def test_old_global_manager_enabled_is_rejected_with_replacement() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ConfigError) as ctx:
+            load_workflow_config(
+                _write_config(
+                    Path(tmpdir),
+                    "[manager]\nenabled = true\n",
+                )
+            )
+        message = str(ctx.value)
+        assert "[workflow].manager_enabled" in message
+        assert "[workflow.<name>].manager_enabled" in message
+        assert "workflows.toml" in message
+
+
+def test_disabled_workflows_do_not_require_manager_roles() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(
+            _write_config(
+                Path(tmpdir),
+                '[harness.codex.profiles.nano]\nmodel = "nano"\n\n'
+                '[roles]\nworker = "codex.nano"\n\n'
+                '[prompts]\np = "do it"\n\n'
+                '[workflow.plain]\n'
+                + _MANAGER_TEST_STEP.format(name="plain"),
+            )
+        )
+        assert config.workflows["plain"].manager_enabled is False
+        assert config.manager.lite_role is None
+
+
+def test_enabled_workflow_validates_roles_against_selected_team() -> None:
+    team_text = (
+        '[harness.codex.profiles.nano]\nmodel = "nano"\n\n'
+        '[roles]\nworker = "codex.nano"\nmanager_lite = "codex.nano"\nmanager_full = "codex.nano"\n\n'
+        '[teams.solo.roles]\nmanager_lite = "codex.nano"\nmanager_full = "codex.nano"\n\n'
+        '[manager]\nlite_role = "manager_lite"\nfull_role = "manager_full"\n\n'
+        '[prompts]\np = "do it"\n\n'
+        '[workflow.teamed]\nteam = "solo"\nmanager_enabled = true\n'
+        '[workflow.teamed.steps.s]\nrole = "worker"\nprompts = ["p"]\ngo = [{ to = "END" }]\n'
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = load_workflow_config(_write_config(Path(tmpdir), team_text))
+        assert config.workflows["teamed"].manager_enabled is True
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Drop manager_lite from both global and team roles so the enabled
+        # workflow's team/global resolution fails.
+        unresolvable = team_text.replace('manager_lite = "codex.nano"\n', "")
+        with pytest.raises(ConfigError, match="cannot be resolved through"):
+            load_workflow_config(_write_config(Path(tmpdir), unresolvable))
+
+
+def test_manager_config_still_rejects_malformed_fields() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ConfigError, match="full_after_stalled_turns"):
+            load_workflow_config(
+                _write_config(
+                    Path(tmpdir),
+                    "[manager]\nfull_after_stalled_turns = 0\n",
+                )
+            )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ConfigError, match="unsupported keys"):
+            load_workflow_config(
+                _write_config(
+                    Path(tmpdir),
+                    "[manager]\npriority = 1\n",
+                )
+            )
 
 class AflowSectionConfigTests(unittest.TestCase):
 

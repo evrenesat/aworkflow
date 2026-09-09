@@ -51,6 +51,7 @@ from .manager_context import (
     summarize_repair_plan,
     summarize_review_rejection,
 )
+from .skill_store import SkillStoreError
 from .git_status import (
     classify_dirtiness_by_prefix,
     is_lifecycle_owned_path,
@@ -218,6 +219,7 @@ def _manager_repo_fingerprint(
 @dataclass(frozen=True)
 class _ManagerCallExecutor:
     workflow_config: WorkflowUserConfig
+    workflow_name: str
     max_turns: int
     state: ControllerState
     run_paths: RunPaths
@@ -351,7 +353,7 @@ class _ManagerCallExecutor:
                 context,
                 skill_name=self.workflow_config.manager.skill,
             )
-        except (OSError, UnicodeError, ValueError, WorkflowError) as exc:
+        except (OSError, UnicodeError, ValueError, WorkflowError, SkillStoreError) as exc:
             prelaunch_failure = True
             error = str(exc)
             context = _manager_prelaunch_failure_context(
@@ -389,7 +391,8 @@ class _ManagerCallExecutor:
             if prelaunch_failure:
                 raise ManagerDecisionError(error or "manager context was unavailable before provider launch")
             role_resolution = resolve_manager_role(
-                self.workflow_config, level=level, baseline_team=baseline_team_name  # type: ignore[arg-type]
+                self.workflow_config, level=level, baseline_team=baseline_team_name,  # type: ignore[arg-type]
+                workflow_name=self.workflow_name,
             )
             manager_profile = resolve_profile(role_resolution.selector, self.workflow_config, step_path="manager")
             manager_adapter = self.adapter or get_adapter(manager_profile.harness_name)
@@ -561,6 +564,7 @@ class _ManagerCallExecutor:
                         context,
                         original_decision=original_candidate,
                         violation=note_violation,
+                        skill_name=self.workflow_config.manager.skill,
                     )
                 )
                 correction_invoked = True
@@ -636,7 +640,7 @@ class _ManagerCallExecutor:
                 error = None
                 correction_status = "accepted"
                 correction_result.update({"status": "accepted", **corrected.to_dict()})
-            except (ManagerDecisionError, ValueError, WorkflowError) as exc:
+            except (ManagerDecisionError, ValueError, WorkflowError, SkillStoreError) as exc:
                 if isinstance(exc, WorkflowError) and exc.failure_kind == "environment_preflight":
                     raise
                 parsed = None
@@ -864,12 +868,22 @@ class _RepartitionCycleExecutor:
         correction_findings: tuple[str, ...] = ()
         rejected_proposal_sha256: str | None = None
         for attempt_number in (1, 2):
-            propose_system, propose_user = build_repartition_prompts(
-                base_payload,
-                mode="propose",
-                skill_name=self.workflow_config.manager.repartition_skill,
-                correction_findings=correction_findings,
-            )
+            try:
+                propose_system, propose_user = build_repartition_prompts(
+                    base_payload,
+                    mode="propose",
+                    skill_name=self.workflow_config.manager.repartition_skill,
+                    correction_findings=correction_findings,
+                )
+            except (OSError, UnicodeError, ValueError, SkillStoreError) as exc:
+                reason = f"cannot build repartition proposal prompt: {exc}"
+                pending = replace(
+                    pending, stage="failed", attempt_count=attempt_number,
+                    failed_stage="propose-prompt",
+                    failure_reason=reason,
+                )
+                self.persist_repartition(pending)
+                self.fail_manager_gate(decision_context, reason=reason)
             prepared_invocation = self.prepare_repartition_invocation(
                 system_prompt=propose_system,
                 user_prompt=propose_user,
@@ -1073,11 +1087,24 @@ class _RepartitionCycleExecutor:
                 "candidate_plan_sha256": candidate_sha256,
                 "mechanical_validation": mechanical_payload,
             }
-            validate_system, validate_user = build_repartition_prompts(
-                validate_payload,
-                mode="validate",
-                skill_name=self.workflow_config.manager.repartition_skill,
-            )
+            try:
+                validate_system, validate_user = build_repartition_prompts(
+                    validate_payload,
+                    mode="validate",
+                    skill_name=self.workflow_config.manager.repartition_skill,
+                )
+            except (OSError, UnicodeError, ValueError, SkillStoreError) as exc:
+                reason = f"cannot build repartition validation prompt: {exc}"
+                write_repartition_artifact(
+                    attempt_paths.result,
+                    {"status": "failed", "stage": "validate-prompt", "reason": reason},
+                )
+                pending = replace(
+                    pending, stage="failed", failed_stage="validate-prompt",
+                    failure_reason=reason,
+                )
+                self.persist_repartition(pending)
+                self.fail_manager_gate(decision_context, reason=reason)
             write_repartition_artifact(
                 attempt_paths.validate_system_prompt, validate_system,
             )
@@ -1567,13 +1594,13 @@ class _ManagerGateCoordinator:
     ) -> str:
         """Accept or replace the controller transition after a durable turn."""
         run_paths = self.run_metadata.paths
-        if scope_pressure_reason is not None and not self.workflow_config.manager.enabled:
+        if scope_pressure_reason is not None and not self.workflow.manager_enabled:
             raise WorkflowError(
                 f"AFLOW_SCOPE_PRESSURE detected ('{scope_pressure_reason}') but manager supervision is disabled; "
                 f"scope-pressure rerouting requires an enabled manager",
                 run_dir=run_paths.run_dir,
             )
-        if not self.workflow_config.manager.enabled:
+        if not self.workflow.manager_enabled:
             return proposed_transition
         if scope_pressure_reason is not None:
             self.state.scope_pressure_reason = scope_pressure_reason
@@ -7138,7 +7165,7 @@ def run_workflow(
 
         def _supervise_scheduled_recovery() -> None:
             """Offer the already-finalized operational retry to the manager."""
-            if not workflow_config.manager.enabled:
+            if not wf.manager_enabled:
                 return
             backup_team, _ = resolve_backup_team(active_team_name, workflow_config.teams)
             backup_selector: str | None = None
@@ -7315,7 +7342,7 @@ def run_workflow(
             # Manager supervision owns unmatched operational incidents.  Do
             # not invoke the older team-lead handoff first: the finalized turn
             # below is routed as one Full, stop-only boundary instead.
-            if workflow_config.manager.enabled:
+            if wf.manager_enabled:
                 return False
             if team_lead_role is None:
                 return False
@@ -8020,6 +8047,7 @@ def run_workflow(
 
     manager_call_executor = _ManagerCallExecutor(
         workflow_config=workflow_config,
+        workflow_name=workflow_name,
         max_turns=config.max_turns,
         state=state,
         run_paths=run_paths,
@@ -8071,6 +8099,7 @@ def run_workflow(
     ) -> HarnessInvocation:
         role_resolution = resolve_manager_role(
             workflow_config, level="full", baseline_team=baseline_team_name,
+            workflow_name=workflow_name,
         )
         profile = resolve_profile(
             role_resolution.selector, workflow_config,
@@ -8096,6 +8125,7 @@ def run_workflow(
         )
         role_resolution = resolve_manager_role(
             workflow_config, level="full", baseline_team=baseline_team_name,
+            workflow_name=workflow_name,
         )
         profile = resolve_profile(
             role_resolution.selector, workflow_config,
@@ -8193,7 +8223,7 @@ def run_workflow(
         output therefore falls through to the same deterministic report rather
         than accidentally opening a second manager loop.
         """
-        if not workflow_config.manager.enabled:
+        if not wf.manager_enabled:
             return None
         boundary = FinalizedTurnBoundary(
             finalized_turn_number=state.active_turn,

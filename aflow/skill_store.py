@@ -74,8 +74,16 @@ STORE_LOCK_NAME = "store.lock"
 REFRESH_MARKER_SUFFIX = ".refresh.json"
 ROLLBACK_DIR_NAME = "rollback"
 MAX_SKILL_DOCUMENT_BYTES = 1024 * 1024
-_DEFAULT_ROOT = Path.home() / ".config" / "aflow" / "skills"
 _REVISION_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def default_store_root() -> Path:
+    """Return the account-level canonical root for the executing account.
+
+    This is resolved on every call (not at import time) so each manager
+    invocation observes the current account's store.
+    """
+    return Path.home() / ".config" / "aflow" / "skills"
 
 
 class SkillStoreError(RuntimeError):
@@ -423,7 +431,7 @@ class SkillStore:
         package_tree_loader: Callable[[str], list[tuple[str, bytes, int]]] | None = None,
     ) -> None:
         if root is None:
-            root = _DEFAULT_ROOT
+            root = default_store_root()
         self._root = Path(root).expanduser().resolve()
         if package_tree_loader is None:
             package_tree_loader = _load_bundled_package_tree

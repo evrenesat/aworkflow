@@ -5,6 +5,7 @@
 setup = ["worktree", "branch"]
 teardown = ["merge", "rm_worktree"]
 main_branch = "main"
+manager_enabled = true
 
 # Ralph loop, single-step implementation with no review phase.
 [workflow.ralph.steps.implement_plan]

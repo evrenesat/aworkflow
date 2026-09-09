@@ -38,3 +38,7 @@
   `SKILL.md` atomically and never touch supporting files or the recorded
   package baseline. Never edit package resources or a repository checkout on
   behalf of a store request, and never traverse a symlinked store entry.
+  Manager prompt builders (`aflow/manager.py`) read the configured skill's
+  validated Markdown body live once per invocation and pass it as the system
+  instruction; Python contributes only structured runtime data, and skill
+  failures become prelaunch failures before any provider starts.

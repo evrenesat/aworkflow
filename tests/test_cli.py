@@ -286,6 +286,7 @@ def _run_manager_report_cli_case(
     config_path = repo_root / "aflow.toml"
     config_path.write_text("", encoding="utf-8")
     workflow = WorkflowConfig(
+        manager_enabled=True,
         steps={"impl": WorkflowStepConfig(
             role="architect",
             prompts=("p",),
@@ -307,7 +308,6 @@ def _run_manager_report_cli_case(
         workflows={"managed": workflow},
         prompts={"p": "Work."},
         manager=ManagerConfig(
-            enabled=True,
             lite_role="manager_lite",
             full_role="manager_full",
         ),

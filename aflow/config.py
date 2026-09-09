@@ -83,7 +83,7 @@ class AflowSection:
     worktree_root: str | None = None
 
 
-WORKFLOW_LIFECYCLE_KEYS = frozenset({"setup", "teardown", "main_branch", "merge_prompt"})
+WORKFLOW_LIFECYCLE_KEYS = frozenset({"setup", "teardown", "main_branch", "merge_prompt", "manager_enabled"})
 
 VALID_LIFECYCLE_COMBOS: frozenset[tuple[tuple[str, ...], tuple[str, ...]]] = frozenset({
     ((), ()),
@@ -98,6 +98,7 @@ class WorkflowLifecycleDefaults:
     teardown: tuple[str, ...] = ()
     main_branch: str | None = None
     merge_prompt: tuple[str, ...] = ()
+    manager_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,6 @@ class TeamConfig:
 
 @dataclass(frozen=True)
 class ManagerConfig:
-    enabled: bool = False
     lite_role: str | None = None
     full_role: str | None = None
     full_after_stalled_turns: int = 2
@@ -174,6 +174,11 @@ class WorkflowConfig:
     teardown: tuple[str, ...] | None = None
     main_branch: str | None = None
     merge_prompt: tuple[str, ...] | None = None
+    # Declared supervision flag: None means "not explicitly set" (inherit from
+    # concrete base workflow, else workflow defaults, else disabled). After
+    # _materialize_workflows this is always a resolved bool; resolve by
+    # presence, never truthiness, so explicit false overrides inherited true.
+    manager_enabled: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -366,19 +371,18 @@ def _parse_team_config(raw: Mapping[str, object], *, path: str) -> TeamConfig:
 
 
 def _parse_manager_config(raw: Mapping[str, object], *, path: str) -> ManagerConfig:
-    allowed = {"enabled", "lite_role", "full_role", "full_after_stalled_turns", "skill", "repartition_skill"}
+    if "enabled" in raw:
+        raise ConfigError(
+            f"{path}.enabled was removed; configure interstep supervision with "
+            "[workflow].manager_enabled or [workflow.<name>].manager_enabled "
+            "in workflows.toml instead"
+        )
+    allowed = {"lite_role", "full_role", "full_after_stalled_turns", "skill", "repartition_skill"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ConfigError(f"unsupported keys in {path}: {', '.join(unknown)}")
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise ConfigError(f"{path}.enabled must be a boolean")
     lite_role = _optional_text(raw.get("lite_role"), path=f"{path}.lite_role")
     full_role = _optional_text(raw.get("full_role"), path=f"{path}.full_role")
-    if enabled and lite_role is None:
-        raise ConfigError(f"{path}.lite_role is required when {path}.enabled is true")
-    if enabled and full_role is None:
-        raise ConfigError(f"{path}.full_role is required when {path}.enabled is true")
     full_after_stalled_turns = raw.get("full_after_stalled_turns", 2)
     if (
         not isinstance(full_after_stalled_turns, int)
@@ -389,7 +393,6 @@ def _parse_manager_config(raw: Mapping[str, object], *, path: str) -> ManagerCon
     skill = _optional_text(raw.get("skill"), path=f"{path}.skill") or "aflow-manager"
     repartition_skill = _optional_text(raw.get("repartition_skill"), path=f"{path}.repartition_skill") or "aflow-repartition-checkpoint"
     return ManagerConfig(
-        enabled=enabled,
         lite_role=lite_role,
         full_role=full_role,
         full_after_stalled_turns=full_after_stalled_turns,
@@ -601,6 +604,11 @@ def _parse_workflow_steps(
         if first_step is None:
             first_step = step_key
         step_table = _require_table(step_value, path=f"{path}.{step_key}")
+        if "manager_enabled" in step_table:
+            raise ConfigError(
+                f"{path}.{step_key}.manager_enabled is not accepted; configure "
+                "manager supervision on the workflow or [workflow] defaults instead"
+            )
         allowed = {"role", "prompts", "go"}
         unknown = sorted(set(step_table) - allowed)
         if unknown:
@@ -655,6 +663,7 @@ def _parse_workflow_definition(
         "teardown",
         "main_branch",
         "merge_prompt",
+        "manager_enabled",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -687,6 +696,12 @@ def _parse_workflow_definition(
         wf_merge_prompt = _parse_lifecycle_array(
             raw["merge_prompt"], path=f"{path}.merge_prompt"
         )
+    wf_manager_enabled: bool | None = None
+    if "manager_enabled" in raw:
+        manager_value = raw["manager_enabled"]
+        if not isinstance(manager_value, bool):
+            raise ConfigError(f"{path}.manager_enabled must be a boolean")
+        wf_manager_enabled = manager_value
     steps: dict[str, WorkflowStepConfig] = {}
     first_step: str | None = None
     if wf_extends is None:
@@ -715,6 +730,7 @@ def _parse_workflow_definition(
         teardown=wf_teardown,
         main_branch=wf_main_branch,
         merge_prompt=wf_merge_prompt,
+        manager_enabled=wf_manager_enabled,
     )
 
 
@@ -725,6 +741,7 @@ def _parse_workflow_lifecycle_defaults(
     teardown: tuple[str, ...] = ()
     main_branch: str | None = None
     merge_prompt: tuple[str, ...] = ()
+    manager_enabled: bool = False
     if "setup" in raw:
         setup = _parse_lifecycle_array(raw["setup"], path=f"{path}.setup")
     if "teardown" in raw:
@@ -735,11 +752,17 @@ def _parse_workflow_lifecycle_defaults(
         merge_prompt = _parse_lifecycle_array(
             raw["merge_prompt"], path=f"{path}.merge_prompt"
         )
+    if "manager_enabled" in raw:
+        default_value = raw["manager_enabled"]
+        if not isinstance(default_value, bool):
+            raise ConfigError(f"{path}.manager_enabled must be a boolean")
+        manager_enabled = default_value
     return WorkflowLifecycleDefaults(
         setup=setup,
         teardown=teardown,
         main_branch=main_branch,
         merge_prompt=merge_prompt,
+        manager_enabled=manager_enabled,
     )
 
 
@@ -844,6 +867,7 @@ def _materialize_workflows(
                 teardown=raw_wf.teardown if raw_wf.teardown is not None else lifecycle_defaults.teardown,
                 main_branch=raw_wf.main_branch if raw_wf.main_branch is not None else lifecycle_defaults.main_branch,
                 merge_prompt=raw_wf.merge_prompt if raw_wf.merge_prompt is not None else lifecycle_defaults.merge_prompt,
+                manager_enabled=raw_wf.manager_enabled if raw_wf.manager_enabled is not None else lifecycle_defaults.manager_enabled,
             )
             _validate_workflow_transitions(concrete.steps, path=f"{path}.{name}")
         else:
@@ -877,6 +901,7 @@ def _materialize_workflows(
                 teardown=raw_wf.teardown if raw_wf.teardown is not None else base.teardown,
                 main_branch=raw_wf.main_branch if raw_wf.main_branch is not None else base.main_branch,
                 merge_prompt=raw_wf.merge_prompt if raw_wf.merge_prompt is not None else base.merge_prompt,
+                manager_enabled=raw_wf.manager_enabled if raw_wf.manager_enabled is not None else base.manager_enabled,
             )
             _validate_workflow_transitions(concrete.steps, path=f"{path}.{name}")
         resolving.remove(name)
@@ -1379,27 +1404,27 @@ def validate_workflow_config(
     validate_team_graph("backup_team")
     validate_team_graph("upgrade_to")
 
-    if config.manager.enabled:
-        assert config.manager.lite_role is not None
-        assert config.manager.full_role is not None
-        manager_roles = (config.manager.lite_role, config.manager.full_role)
-        for role in manager_roles:
-            if role not in config.roles and not any(role in team.roles for team in config.teams.values()):
-                errors.append(
-                    f"manager role '{role}' cannot be resolved through global or team roles"
-                )
-
     for wf_name, wf_config in config.workflows.items():
         if wf_config.extends is not None:
             errors.append(
                 f"workflow.{wf_name}.extends should not be present after materialization"
             )
         known_roles = set(config.roles)
-        if config.manager.enabled:
-            assert config.manager.lite_role is not None
-            assert config.manager.full_role is not None
+        if wf_config.manager_enabled:
+            lite_role = config.manager.lite_role
+            full_role = config.manager.full_role
+            if lite_role is None:
+                errors.append(
+                    f"manager.lite_role is required for enabled workflow '{wf_name}'"
+                )
+            if full_role is None:
+                errors.append(
+                    f"manager.full_role is required for enabled workflow '{wf_name}'"
+                )
             team_roles = config.teams.get(wf_config.team).roles if wf_config.team in config.teams else {}
-            for manager_role in (config.manager.lite_role, config.manager.full_role):
+            for manager_role in (lite_role, full_role):
+                if manager_role is None:
+                    continue
                 if manager_role not in team_roles and manager_role not in config.roles:
                     errors.append(
                         f"workflow.{wf_name} manager role '{manager_role}' cannot be resolved through "

@@ -112,6 +112,16 @@ def test_every_control_plane_operation_rejects_an_unauthenticated_request(auth_c
         assert response.status_code == 401, f"{method.upper()} {path} was not protected"
 
 
+def test_skills_endpoints_reject_unauthenticated_requests(auth_client) -> None:
+    client, _, _ = auth_client
+    assert client.get("/api/skills").status_code == 401
+    assert client.get("/api/skills/aflow-plan").status_code == 401
+    assert client.put("/api/skills/aflow-plan", json={}).status_code == 401
+    assert client.post("/api/skills/validate", json={}).status_code == 401
+    assert client.post("/api/skills/install").status_code == 401
+    assert client.get("/api/skills", headers=_bearer("first-rotating-token")).status_code == 200
+
+
 def test_token_file_rotation_is_immediate_and_never_returned(auth_client) -> None:
     client, token_file, _ = auth_client
     protected = "/api/control-plane/projects"

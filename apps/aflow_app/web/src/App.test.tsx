@@ -23,6 +23,11 @@ vi.mock('./api', async () => {
     patchGlobalConfig: vi.fn(),
     validateGlobalConfig: vi.fn(),
     postGlobalConfigForm: vi.fn(),
+    listSkills: vi.fn(),
+    readSkill: vi.fn(),
+    saveSkill: vi.fn(),
+    validateSkills: vi.fn(),
+    installSkills: vi.fn(),
     listProjectPlans: vi.fn(),
     createProjectPlan: vi.fn(),
     readProjectPlan: vi.fn(),
@@ -187,6 +192,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
     vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload())
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse())
+    vi.mocked(api.listSkills).mockResolvedValue([])
     // Any test that reaches the runs dashboard needs these defaults.
     vi.mocked(api.listControlPlaneProjects).mockResolvedValue([controlPlaneProject])
     vi.mocked(api.getControlPlaneReadiness).mockResolvedValue({ ready: true, projects: ['alpha'] })

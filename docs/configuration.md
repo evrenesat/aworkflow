@@ -157,10 +157,11 @@ each ordinary turn's durable prompt artifacts.
 
 ## Interstep Manager Supervision
 
-Manager supervision is an opt-in control gate for existing configurations. A
-freshly bootstrapped config enables it, while a config with no `[manager]`
-section preserves the prior workflow, recovery, turn-count, and merge behavior.
-Add the following roles and section to opt in safely:
+Manager supervision is an opt-in control gate per workflow. A freshly
+bootstrapped config enables it through the `[workflow]` defaults, while a
+config with no `manager_enabled` flag anywhere preserves the prior workflow,
+recovery, turn-count, and merge behavior. Add the following roles and sections
+to opt in safely:
 
 ```toml
 [roles]
@@ -169,7 +170,6 @@ manager_lite = "codex.luna-max"
 manager_full = "codex.sol-high"
 
 [manager]
-enabled = true
 lite_role = "manager_lite"
 full_role = "manager_full"
 full_after_stalled_turns = 2
@@ -177,7 +177,26 @@ skill = "aflow-manager"
 repartition_skill = "aflow-repartition-checkpoint"
 ```
 
-`lite_role` and `full_role` are required when `enabled = true`, must be
+```toml
+# workflows.toml
+[workflow]
+manager_enabled = true
+
+[workflow.ralph]
+manager_enabled = false
+```
+
+Omission is disabled: a workflow without the flag inherits its concrete base
+workflow's value (for aliases), else the `[workflow]` default, else disabled.
+Resolution is by presence, never truthiness, so an explicit `false` overrides
+an inherited `true`. The launch-default workflow is unrelated to inheritance.
+Only actual TOML booleans are accepted, and no per-step flag exists. The old
+global `[manager].enabled` is rejected with a message naming this replacement.
+Saving a flag affects new runs; an active or resumed run keeps the frozen
+value from its configuration snapshot while subsequent manager calls still
+read current saved skill text.
+
+`lite_role` and `full_role` are required for each enabled workflow, must be
 non-empty role names, and resolve through the run's baseline team before the
 global `[roles]` map. This means they use normal harness/profile selection;
 the manager is never routed through a temporary implementation upgrade.
@@ -187,9 +206,19 @@ did not change. An unchanged `implement → review` sequence is progress, not a
 two-turn stall. Two unchanged reviewer outcomes select Full immediately after
 the second rejection, but only within the currently open original-checkpoint
 scope.
-`skill` defaults to `aflow-manager`. Each manager prompt requests that configured
-skill when the harness supports skills and also carries the complete strict JSON
-contract inline, so protocol correctness does not depend on skill installation.
+`skill` defaults to `aflow-manager`. The controller reads that configured
+skill's current canonical `SKILL.md` bytes immediately before every ordinary,
+note-correction, proposal, validation, and correction invocation and passes the
+complete validated Markdown body as the system instruction; Python contributes
+only structured runtime data (mode, level, eligible actions, proposed
+transition, findings, and limits). A save between two invocations changes the
+next invocation's bytes, while the configured skill names, role routing, and
+workflow configuration stay frozen in the run snapshot. An explicitly
+configured non-bundled name resolves read-only from the account skill store
+and must exist as a valid document; a missing or invalid skill fails the call
+before any provider is invoked, and the engine never falls back to built-in
+prose. Output parsing, eligibility checks, note authority, and repartition
+validation remain enforced in code.
 `repartition_skill` defaults to `aflow-repartition-checkpoint`. The same resolved
 `full_role` performs both strict read-only repartition subcalls; no third role is
 introduced. The controller freezes both skill names in the run configuration.

@@ -476,9 +476,10 @@ On the last allowed turn:
 
 ## Interstep Manager Supervision
 
-With `[manager].enabled = true`, AFlow runs a read-only manager after every
-finalized workflow turn and before applying the controller's proposed
-transition, recovery, retry, or `END`. A manager call is not a workflow turn:
+When the selected workflow has supervision enabled (`manager_enabled`), AFlow
+runs a read-only manager after every finalized workflow turn and before
+applying the controller's proposed transition, recovery, retry, or `END`.
+A manager call is not a workflow turn:
 it does not increase `turns_completed`, consume `max_turns`, create a checkpoint
 commit, or trigger same-step caps.
 

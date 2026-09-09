@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic_core import core_schema
 
 from aflow.control_plane import (
     CapabilitySet,
@@ -15,6 +16,7 @@ from aflow.control_plane import (
     StartRunResult,
     StartupQuestionRecord,
 )
+from aflow.skill_catalog import BUNDLED_SKILL_NAMES
 
 
 class CanonicalTransportModel(BaseModel):
@@ -295,6 +297,30 @@ class SetWorkflowDefaultTeamAction(GuidedActionBase):
     team: str | None = Field(default=None, min_length=1, max_length=64)
 
 
+class SetDefaultManagerEnabledAction(GuidedActionBase):
+    """Set or delete the `[workflow].manager_enabled` default declaration.
+
+    ``value=None`` deletes only that flag; ``True``/``False`` writes it at
+    the exact table. ``StrictBool`` rejects non-boolean coercion (``1``,
+    ``"true"``) at the contract boundary.
+    """
+
+    type: Literal["set_default_manager_enabled"]
+    value: StrictBool | None
+
+
+class SetWorkflowManagerEnabledAction(GuidedActionBase):
+    """Set or delete one workflow's declared ``manager_enabled`` override.
+
+    ``value=None`` deletes only that workflow's flag so it inherits again;
+    inherited values are never written back into the workflow table.
+    """
+
+    type: Literal["set_workflow_manager_enabled"]
+    workflow: str = Field(min_length=1, max_length=64)
+    value: StrictBool | None
+
+
 class SetPromptAction(GuidedActionBase):
     type: Literal["set_prompt"]
     name: str = Field(min_length=1, max_length=128)
@@ -332,6 +358,8 @@ GuidedConfigAction = Annotated[
     | SetTeamRoleAction
     | SetTeamUpgradeAction
     | SetWorkflowDefaultTeamAction
+    | SetDefaultManagerEnabledAction
+    | SetWorkflowManagerEnabledAction
     | SetPromptAction
     | RenamePromptAction
     | SetRolePromptAction
@@ -377,6 +405,14 @@ class GuidedWorkflowStepSummaries(CanonicalTransportModel):
     # Exact declared role per materialized executable step; None when the
     # production loader could not materialize the workflow.
     step_roles: Mapping[str, str] | None = None
+    # Declared manager_enabled override (None when omitted/inherited).
+    manager_enabled: bool | None = None
+    # Canonical resolved value: declared override → concrete base → defaults
+    # → False. Omitted defaults resolve to False, never None.
+    effective_manager_enabled: bool = False
+    # Where the effective value came from: "workflow" (explicit override),
+    # "base:<name>" (alias inherits its concrete base), or "defaults".
+    manager_enabled_source: str = "defaults"
 
 
 class GuidedTeamSummary(CanonicalTransportModel):
@@ -396,6 +432,8 @@ class GuidedFormProjection(CanonicalTransportModel):
     teams: Mapping[str, GuidedTeamSummary]
     workflow_default_teams: Mapping[str, str | None]
     workflows: Mapping[str, GuidedWorkflowStepSummaries]
+    # Declared `[workflow].manager_enabled` default (None when omitted).
+    default_manager_enabled: bool | None = None
 
 
 class GuidedConfiguredChoices(CanonicalTransportModel):
@@ -462,6 +500,141 @@ class ProjectDiscoveryResponse(CanonicalTransportModel):
     skipped_unreadable: int
     truncated: bool
     limits: Mapping[str, int]
+
+
+class SkillLinkStatusModel(CanonicalTransportModel):
+    """Link state of one skill at one known mapped harness destination."""
+
+    destination: str
+    harnesses: tuple[str, ...]
+    detected_harnesses: tuple[str, ...]
+    linked: bool
+
+
+class SkillSummaryModel(CanonicalTransportModel):
+    """One registered bundled skill: revision, edit state, and link status."""
+
+    name: str
+    default: bool
+    revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: Literal["bundled", "saved"]
+    edited: bool
+    installed: bool
+    links: tuple[SkillLinkStatusModel, ...]
+    detected_harnesses: tuple[str, ...]
+
+
+class SkillDetailModel(SkillSummaryModel):
+    """One skill entry plus its effective SKILL.md content."""
+
+    content: str = Field(max_length=2_000_000)
+
+
+class SkillSavePayload(CanonicalTransportModel):
+    """Save exactly one canonical SKILL.md; no paths, scripts, or homes."""
+
+    content: str = Field(max_length=2_000_000)
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SurrogateTolerantStr(str):
+    """A `str` that validation accepts even with lone surrogates.
+
+    Pydantic-core's default `str` validator rejects lone surrogates
+    (`string_unicode`), which would keep unencodable skill content from ever
+    reaching read-only validation. The skills validate endpoint must report
+    such content as a bounded per-entry `skill_invalid` verdict instead, so
+    this type preserves the `str` contract (including the 2_000_000-character
+    limit) while deferring encodability checks to the service layer.
+    """
+
+    _MAX_LENGTH = 2_000_000
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        return core_schema.no_info_plain_validator_function(
+            cls._validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                str, return_schema=core_schema.str_schema()
+            ),
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, schema, handler):
+        return {"type": "string", "maxLength": cls._MAX_LENGTH}
+
+    @classmethod
+    def _validate(cls, value):
+        if not isinstance(value, str):
+            raise ValueError("Input should be a valid string")
+        if len(value) > cls._MAX_LENGTH:
+            raise ValueError(
+                f"String should have at most {cls._MAX_LENGTH} characters"
+            )
+        return cls(value)
+
+
+class SkillValidateEntryModel(CanonicalTransportModel):
+    name: str = Field(min_length=1, max_length=255)
+    content: SurrogateTolerantStr
+    expected_revision: str = Field(min_length=1, max_length=64)
+
+
+class SkillValidatePayload(CanonicalTransportModel):
+    entries: list[SkillValidateEntryModel] = Field(
+        min_length=1, max_length=len(BUNDLED_SKILL_NAMES)
+    )
+
+    @model_validator(mode="after")
+    def no_duplicate_names(self):
+        names = [entry.name for entry in self.entries]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate skill names are not allowed")
+        return self
+
+
+class SkillValidateEntryResult(CanonicalTransportModel):
+    name: str
+    ok: bool
+    current_revision: str | None = None
+    error_code: str | None = None
+    error: str | None = None
+
+
+class SkillValidateResponse(CanonicalTransportModel):
+    entries: tuple[SkillValidateEntryResult, ...]
+
+
+class SkillRefreshModel(CanonicalTransportModel):
+    name: str
+    status: str
+    changed: bool
+    edited: bool
+    error: str | None = None
+
+
+class SkillInstallOperationModel(CanonicalTransportModel):
+    harness: str
+    skill: str
+    destination: str
+    status: str
+    error_code: str | None = None
+    error: str | None = None
+    displaced_path: str | None = None
+
+
+class SkillInstallResponse(CanonicalTransportModel):
+    mode: str
+    succeeded: bool
+    cancelled: bool
+    refresh: tuple[SkillRefreshModel, ...]
+    operations: tuple[SkillInstallOperationModel, ...]
+
+
+class SkillInstallPayload(CanonicalTransportModel):
+    """Empty install body: the shared default auto installer decides targets."""
+
+    confirm: Literal[True] | None = None
 
 
 def canonical_contract_payloads() -> dict[str, dict[str, Any]]:

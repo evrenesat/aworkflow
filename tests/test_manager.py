@@ -10,10 +10,12 @@ from aflow.config import (
     HarnessProfileConfig,
     ManagerConfig,
     TeamConfig,
+    WorkflowConfig,
     WorkflowHarnessConfig,
     WorkflowUserConfig,
 )
 from aflow.manager import (
+    MAX_MANAGER_NOTE_LENGTH,
     MAX_MANAGER_NOTES,
     ManagerDecisionError,
     ManagerNoteAuthorityError,
@@ -26,9 +28,16 @@ from aflow.manager import (
     parse_manager_decision,
     render_manager_stop_report,
     resolve_manager_role,
+    resolve_manager_skill_body,
     validate_manager_decision,
     validate_manager_note_authority,
     validate_manager_note_correction,
+)
+from aflow.skill_store import (
+    SkillRefreshIncomplete,
+    SkillStore,
+    SkillStoreError,
+    parse_skill_document,
 )
 from aflow.plan import PlanSnapshot
 from aflow.run_state import (
@@ -82,7 +91,8 @@ def _config(*, upgraded_selector: str = "codex.high") -> WorkflowUserConfig:
             "high": TeamConfig(roles={"worker": upgraded_selector}, upgrade_to="max"),
             "max": TeamConfig(roles={"worker": "codex.max"}),
         },
-        manager=ManagerConfig(enabled=True, lite_role="manager_lite", full_role="manager_full"),
+        manager=ManagerConfig(lite_role="manager_lite", full_role="manager_full"),
+        workflows={"managed": WorkflowConfig(manager_enabled=True)},
     )
 
 
@@ -96,6 +106,41 @@ def _decision(**overrides: object) -> str:
     }
     payload.update(overrides)
     return json.dumps(payload)
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _bundled_skill_body(name: str) -> str:
+    text = (
+        _REPO_ROOT / "aflow" / "bundled_skills" / name / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    return parse_skill_document(name, text).body
+
+
+def _temp_store(tmp_path: Path) -> SkillStore:
+    return SkillStore(root=tmp_path / "skills")
+
+
+def _write_custom_skill(root: Path, name: str, body: str) -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: \"Custom test skill.\"\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def _split_manager_user(user: str) -> tuple[dict[str, object], dict[str, object]]:
+    runtime_text, context_text = user.split("\nMANAGER_CONTEXT_JSON:\n", 1)
+    return (
+        json.loads(runtime_text.removeprefix("MANAGER_RUNTIME_JSON:\n")),
+        json.loads(context_text),
+    )
 
 
 def test_decision_protocol_rejects_unknown_fields_and_illegal_combinations() -> None:
@@ -404,7 +449,8 @@ def test_note_authority_plan_selection_only_keeps_correction_contract() -> None:
     )
 
 
-def test_note_correction_prompt_is_compact_and_preserves_decision_fields() -> None:
+def test_note_correction_prompt_is_compact_and_preserves_decision_fields(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
     context = {
         "decision_number": 11,
         "level": "lite",
@@ -435,9 +481,12 @@ def test_note_correction_prompt_is_compact_and_preserves_decision_fields() -> No
         context,
         original_decision=original,
         violation=violation,
+        store=store,
     )
     payload = json.loads(user.removeprefix("MANAGER_NOTE_CORRECTION_JSON:\n"))
 
+    assert payload["mode"] == "note_correction"
+    assert payload["skill_name"] == "aflow-manager"
     assert payload["decision_number"] == 11
     assert payload["level"] == "lite"
     assert payload["trigger"] == "reviewer_rejection"
@@ -448,10 +497,18 @@ def test_note_correction_prompt_is_compact_and_preserves_decision_fields() -> No
     assert payload["violation"]["category"] == "plan_selection"
     assert "SECRET PLAN PROSE" not in user
     assert "mutable_workspace_state" not in user
+    # The system instruction is the live skill body: correction terms live in
+    # the skill's note-correction section, not in Python prose.
+    assert system == _bundled_skill_body("aflow-manager")
+    normalized = _normalized(system)
+    assert "## Note-correction mode" in system
     for verb in ("use", "follow", "switch to", "replace", "adopt", "work from"):
-        assert f"'{verb}'" in system
-    assert "Preserve schema_version, action, reason, and stop_report exactly" in system
-    assert "only rewrite or remove next_step_notes" in system
+        assert f"`{verb}`" in normalized
+    assert (
+        "Preserve `schema_version`, `action`, `reason`, and `stop_report` exactly"
+        in normalized
+    )
+    assert "only rewrite or remove `next_step_notes`" in normalized
     assert "observable requirement" in system
     assert "verification evidence" in system
 
@@ -614,7 +671,9 @@ def test_terminal_fallback_report_preserves_incident_before_protocol_error() -> 
 
 def test_manager_role_and_one_edge_upgrade_use_baseline_routing_only() -> None:
     config = _config()
-    resolved = resolve_manager_role(config, level="lite", baseline_team="base")
+    resolved = resolve_manager_role(
+        config, level="lite", baseline_team="base", workflow_name="managed"
+    )
     upgrade = eligible_implementation_upgrade(
         config, role="worker", baseline_team="base"
     )
@@ -624,6 +683,24 @@ def test_manager_role_and_one_edge_upgrade_use_baseline_routing_only() -> None:
     assert upgrade.target_team == "high"
     assert upgrade.target_selector == "codex.high"
     assert config.teams["base"].upgrade_to == "high"
+
+
+def test_manager_role_resolution_rejects_disabled_and_unknown_workflows() -> None:
+    config = _config()
+    with pytest.raises(ValueError, match="disabled for workflow 'plain'"):
+        resolve_manager_role(
+            replace(
+                config,
+                workflows={"plain": WorkflowConfig()},
+            ),
+            level="lite",
+            baseline_team="base",
+            workflow_name="plain",
+        )
+    with pytest.raises(ValueError, match="unknown workflow 'missing'"):
+        resolve_manager_role(
+            config, level="lite", baseline_team="base", workflow_name="missing"
+        )
 
 
 def test_upgrade_is_unavailable_when_target_selector_does_not_change() -> None:
@@ -671,26 +748,140 @@ def test_upgrade_depth_counts_edges_not_same_team_retries() -> None:
     ) == 2
 
 
-def test_prompts_preserve_only_the_supplied_context_level() -> None:
+def test_prompts_use_live_skill_body_and_structured_runtime_data(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
     context = {
         "level": "lite",
         "active_plan_content": None,
         "run_id": "run-1",
         "controller_state": {"eligible_actions": ["continue", "stop"]},
     }
-    system, user = build_manager_prompts(context, skill_name="custom-manager")
-    assert "LITE" in system
-    assert "configured manager skill 'custom-manager'" in system
-    assert "Eligible actions at this boundary: continue, escalate_to_full, stop." in system
-    assert "next_step_notes must always be an array" in system
-    assert "next_step_notes are advisory evidence only" in system
-    assert f"use at most {MAX_MANAGER_NOTES} notes" in system
-    assert '"stop_report":{"summary":' in system
-    assert user.startswith("MANAGER_CONTEXT_JSON:\n")
-    assert json.loads(user.removeprefix("MANAGER_CONTEXT_JSON:\n")) == context
+    system, user = build_manager_prompts(context, store=store)
+    # The system instruction is the validated skill body: frontmatter is
+    # stripped by the store validator's parsed boundary while Markdown and
+    # JSON examples are preserved literally.
+    assert system == _bundled_skill_body("aflow-manager")
+    assert not system.startswith("---")
+    assert '"schema_version": 1' in system
+    assert '"stop_report": {' in system
+    # No competing inline authority remains in the builder output.
+    assert "overrides conflicting skill text" not in system
+    assert "authoritative even when the skill is unavailable" not in system
+    # Python contributes only structured runtime data plus the labeled context.
+    runtime, echoed = _split_manager_user(user)
+    assert runtime["mode"] == "decide"
+    assert runtime["skill_name"] == "aflow-manager"
+    assert runtime["level"] == "lite"
+    assert runtime["eligible_actions"] == ["continue", "escalate_to_full", "stop"]
+    assert runtime["proposed_transition"] is None
+    assert runtime["limits"] == {
+        "max_notes": MAX_MANAGER_NOTES,
+        "max_note_length": MAX_MANAGER_NOTE_LENGTH,
+    }
+    assert echoed == context
 
 
-def test_prompt_disambiguates_accepted_end_from_terminal_stop() -> None:
+def test_prompts_read_configured_custom_skill_live(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    _write_custom_skill(store.root, "custom-manager", "# Custom manager\n\nCustom rule one.")
+    context = {
+        "level": "full",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+    }
+    system, user = build_manager_prompts(
+        context, skill_name="custom-manager", store=store
+    )
+    assert "Custom rule one." in system
+    assert not system.startswith("---")
+    runtime, echoed = _split_manager_user(user)
+    assert runtime["skill_name"] == "custom-manager"
+    assert runtime["level"] == "full"
+    assert echoed == context
+    # Rewriting the canonical document changes the next invocation's bytes.
+    _write_custom_skill(store.root, "custom-manager", "# Custom manager\n\nCustom rule two.")
+    resystem, _ = build_manager_prompts(
+        context, skill_name="custom-manager", store=store
+    )
+    assert "Custom rule two." in resystem
+    assert "Custom rule one." not in resystem
+
+
+def test_prompts_fail_closed_for_missing_custom_skill(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    context = {
+        "level": "full",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+    }
+    # A missing explicitly selected skill is an error, never permission to
+    # continue with an empty system prompt or a prose fallback.
+    with pytest.raises(SkillStoreError, match="no saved canonical document"):
+        build_manager_prompts(
+            context, skill_name="custom-manager", store=store
+        )
+    with pytest.raises(SkillStoreError, match="no saved canonical document"):
+        resolve_manager_skill_body("custom-manager", store=store)
+
+
+def test_prompts_reject_unsafe_custom_skill_names(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    for name in ("../escape", "a/b", "..", ""):
+        with pytest.raises(SkillStoreError, match="skill name"):
+            resolve_manager_skill_body(name, store=store)
+
+
+def test_prompts_fail_closed_for_invalid_canonical_skill(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    skill_dir = store.root / "aflow-manager"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text("not a skill document\n", encoding="utf-8")
+    context = {
+        "level": "lite",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+    }
+    with pytest.raises(SkillStoreError):
+        build_manager_prompts(context, store=store)
+
+
+def test_prompts_fail_closed_for_interrupted_refresh(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    marker_dir = store.root / ".metadata"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / "aflow-manager.refresh.json").write_text("{}\n", encoding="utf-8")
+    context = {
+        "level": "lite",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+    }
+    with pytest.raises(SkillRefreshIncomplete):
+        build_manager_prompts(context, store=store)
+
+
+def test_saved_skill_edit_changes_next_invocation_bytes(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    context = {
+        "level": "lite",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue", "stop"]},
+    }
+    first_system, _ = build_manager_prompts(context, store=store)
+    assert "LIVE-EDIT-MARKER" not in first_system
+    current = store.read("aflow-manager")
+    edited = current.content.replace(
+        "You supervise the controller's next action",
+        "You supervise the controller's next action\n\nLIVE-EDIT-MARKER",
+    )
+    assert edited != current.content
+    store.save("aflow-manager", edited, expected_revision=current.revision)
+    second_system, _ = build_manager_prompts(context, store=store)
+    assert "LIVE-EDIT-MARKER" in second_system
+    assert "LIVE-EDIT-MARKER" not in first_system
+    assert second_system != first_system
+
+
+def test_prompt_disambiguates_accepted_end_from_terminal_stop(tmp_path: Path) -> None:
     context = {
         "level": "full",
         "run_id": "run-1",
@@ -700,20 +891,30 @@ def test_prompt_disambiguates_accepted_end_from_terminal_stop() -> None:
         },
     }
 
-    system, _ = build_manager_prompts(context)
+    store = _temp_store(tmp_path)
+    system, user = build_manager_prompts(context, store=store)
 
+    # END/stop semantics live in the skill's terminal-transitions section;
+    # Python contributes the proposed transition as structured data.
+    normalized = _normalized(system)
     assert (
-        "continue accepts the controller's proposed transition; when that "
-        "transition is END, continue approves terminal completion"
-    ) in system
-    assert "Stop always fails the run" in system
-    assert "never to approve or summarize successful completion" in system
-    assert "The proposed transition is END" in system
-    assert "choose continue with empty next_step_notes" in system
-    assert "stop_report must describe the unresolved failure or blocker" in system
+        "`continue` accepts the controller's proposed transition; when that "
+        "transition is `END`, `continue` approves terminal completion"
+    ) in normalized
+    assert "`stop` always fails the run" in normalized
+    assert "Never use it to approve or summarize successful completion" in normalized
+    assert (
+        "choose `continue` with empty `next_step_notes`" in normalized
+    )
+    assert (
+        "stop_report` must describe the unresolved failure or blocker"
+        in normalized
+    )
+    runtime, _ = _split_manager_user(user)
+    assert runtime["proposed_transition"] == "END"
 
 
-def test_lite_prompt_cause_based_first_rejection_does_not_force_upgrade() -> None:
+def test_lite_prompt_cause_based_first_rejection_does_not_force_upgrade(tmp_path: Path) -> None:
     context = {
         "level": "lite",
         "active_plan_content": None,
@@ -733,17 +934,24 @@ def test_lite_prompt_cause_based_first_rejection_does_not_force_upgrade() -> Non
         },
     }
 
-    system, _ = build_manager_prompts(context)
+    store = _temp_store(tmp_path)
+    system, user = build_manager_prompts(context, store=store)
 
-    # Cause-based policy: both continue and upgrade are legal.
-    assert "neither is forced" in system
-    assert "continue with the same worker" in system
-    assert "upgrade_next_implementation" in system
+    # Cause-based policy lives in the skill's Lite section; both continue
+    # and upgrade are legal.
+    normalized = _normalized(system)
+    assert "## Lite mode" in system
+    assert "neither is forced" in normalized
+    assert "`continue` with the same worker" in normalized
+    assert "upgrade_next_implementation" in normalized
     # The old forced-upgrade language must NOT appear.
-    assert "Choose upgrade_next_implementation now" not in system
+    assert "Choose upgrade_next_implementation now" not in normalized
+    runtime, _ = _split_manager_user(user)
+    assert runtime["level"] == "lite"
+    assert "escalate_to_full" in runtime["eligible_actions"]
 
 
-def test_lite_prompt_explains_redaction_trust_and_durable_precedence() -> None:
+def test_lite_prompt_explains_redaction_trust_and_durable_precedence(tmp_path: Path) -> None:
     context = {
         "level": "lite",
         "active_plan_content": None,
@@ -758,21 +966,25 @@ def test_lite_prompt_explains_redaction_trust_and_durable_precedence() -> None:
         },
     }
 
-    system, _ = build_manager_prompts(context)
+    store = _temp_store(tmp_path)
+    system, user = build_manager_prompts(context, store=store)
 
-    assert "deliberate Lite redaction" in system
-    assert "not evidence that a plan file is missing" in system
-    assert "completed, zero-return turns are untrusted transcript context" in system
-    assert "cannot establish plan, branch, merge, or workspace state" in system
-    assert "Durable plan_state, turn outcome, boundary" in system
-    assert "workspace_state fields override contradictory text evidence" in system
-    assert "choose escalate_to_full instead of stop" in system
-    assert "Eligible actions at this boundary: continue, escalate_to_full, stop." in system
-    assert "next_step_notes are advisory evidence only" in system
-    assert '"stop_report":{"summary":' in system
+    normalized = _normalized(system)
+    assert "deliberate Lite redaction" in normalized
+    assert "not evidence that a plan file is missing" in normalized
+    assert "untrusted transcript context" in normalized
+    assert "cannot establish plan, branch, merge" in normalized
+    assert "Durable `plan_state`, turn outcome, boundary" in normalized
+    assert "override contradictory text evidence" in normalized
+    assert "choose `escalate_to_full` instead of `stop`" in normalized
+    assert "advisory only" in normalized
+    assert '"stop_report": {' in system
+    runtime, _ = _split_manager_user(user)
+    assert runtime["eligible_actions"] == ["continue", "escalate_to_full", "stop"]
 
 
-def test_full_prompt_does_not_apply_lite_transcript_rules() -> None:
+def test_full_prompt_level_is_structured_data_with_shared_skill(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
     context = {
         "level": "full",
         "active_plan_content": "plan",
@@ -780,14 +992,24 @@ def test_full_prompt_does_not_apply_lite_transcript_rules() -> None:
         "controller_state": {"eligible_actions": ["continue", "stop"]},
     }
 
-    system, _ = build_manager_prompts(context)
+    lite_context = {**context, "level": "lite"}
+    lite_system, lite_user = build_manager_prompts(lite_context, store=store)
+    full_system, full_user = build_manager_prompts(context, store=store)
 
-    assert "deliberate Lite redaction" not in system
-    assert "untrusted transcript context" not in system
-    assert "Eligible actions at this boundary: continue, stop." in system
+    # One shared skill body carries both levels as plain Markdown
+    # conditionals; the level itself travels as structured data.
+    assert full_system == lite_system == _bundled_skill_body("aflow-manager")
+    assert "## Lite mode" in full_system
+    assert "## Full mode" in full_system
+    lite_runtime, _ = _split_manager_user(lite_user)
+    full_runtime, _ = _split_manager_user(full_user)
+    assert lite_runtime["level"] == "lite"
+    assert full_runtime["level"] == "full"
+    assert full_runtime["eligible_actions"] == ["continue", "stop"]
+    assert lite_runtime["eligible_actions"] == ["continue", "escalate_to_full", "stop"]
 
 
-def test_full_prompt_includes_repartition_guidance() -> None:
+def test_full_prompt_includes_repartition_guidance(tmp_path: Path) -> None:
     context = {
         "level": "full",
         "active_plan_content": None,
@@ -802,34 +1024,62 @@ def test_full_prompt_includes_repartition_guidance() -> None:
         },
     }
 
-    system, _ = build_manager_prompts(context)
+    store = _temp_store(tmp_path)
+    system, user = build_manager_prompts(context, store=store)
 
-    assert "repartition_current_checkpoint splits the current" in system
-    assert "Do not name workflow steps, teams, or business logic" in system
-    assert "next_step_notes must be []" in system
+    normalized = _normalized(system)
+    assert "repartition_current_checkpoint" in normalized
+    assert "splits the current checkpoint into smaller children" in normalized
+    assert "Do not name workflow steps, teams, or business logic" in normalized
+    assert "must be `[]`" in normalized
+    runtime, _ = _split_manager_user(user)
+    assert "repartition_current_checkpoint" in runtime["eligible_actions"]
 
 
-def test_repartition_subcall_prompts_have_authoritative_strict_contracts() -> None:
+def test_repartition_subcall_prompts_use_live_skill_and_structured_payload(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
+    _write_custom_skill(
+        store.root, "custom-repartition", "# Custom repartition contract."
+    )
     payload = {"envelope": {"canonical_envelope_sha256": "a" * 64}}
     propose_system, propose_user = build_repartition_prompts(
         payload,
         mode="propose",
         skill_name="custom-repartition",
         correction_findings=("Keep the verification obligation.",),
+        store=store,
     )
     validate_system, validate_user = build_repartition_prompts(
-        payload, mode="validate",
+        payload, mode="validate", store=store,
     )
 
-    assert "inline contract and rules below are authoritative" in propose_system
-    assert "single correction attempt" in propose_system
-    assert "custom-repartition" in propose_system
+    # A configured custom skill is read live with no inline fallback.
+    assert "Custom repartition contract." in propose_system
+    assert "authoritative even when the skill is unavailable" not in propose_system
     assert propose_user.startswith("REPARTITION_PROPOSE_CONTEXT_JSON:\n")
-    assert json.loads(
+    propose_payload = json.loads(
         propose_user.removeprefix("REPARTITION_PROPOSE_CONTEXT_JSON:\n")
-    )["correction_findings"] == ["Keep the verification obligation."]
-    assert "Independently compare the exact envelope" in validate_system
+    )
+    assert propose_payload["mode"] == "propose"
+    assert propose_payload["skill_name"] == "custom-repartition"
+    assert propose_payload["correction_findings"] == ["Keep the verification obligation."]
+    # The bundled skill carries both strict mode contracts.
+    assert validate_system == _bundled_skill_body("aflow-repartition-checkpoint")
+    assert propose_system != validate_system
+    normalized = _normalized(validate_system)
+    assert "## Propose Mode" in validate_system
+    assert "## Validate Mode" in validate_system
+    assert "single bounded correction attempt" in normalized
+    assert "Independently compare the exact envelope" in normalized
+    assert '"current_disposition": "review_current_partition"' in validate_system
+    assert '"verdict": "accept"' in validate_system
     assert validate_user.startswith("REPARTITION_VALIDATE_CONTEXT_JSON:\n")
+    validate_payload = json.loads(
+        validate_user.removeprefix("REPARTITION_VALIDATE_CONTEXT_JSON:\n")
+    )
+    assert validate_payload["mode"] == "validate"
+    assert validate_payload["skill_name"] == "aflow-repartition-checkpoint"
+    assert "correction_findings" not in validate_payload
 
 
 def test_pending_repartition_and_attempt_artifacts_round_trip(tmp_path: Path) -> None:
@@ -1140,30 +1390,31 @@ def test_strict_manager_resume_rejects_repartition_history_that_would_be_dropped
         manager_resume_fields_strict(payload)
 
 
-def test_v3_prompt_system_instructions_reference_artifacts_only() -> None:
+def test_v3_prompt_system_instructions_reference_artifacts_only(tmp_path: Path) -> None:
+    store = _temp_store(tmp_path)
     context = {
         "schema_version": 3,
         "level": "full",
         "run_id": "run-1",
         "controller_state": {"eligible_actions": ["continue"]},
     }
-    system, _ = build_manager_prompts(context)
-    assert "overrides conflicting skill text" in system
+    system, user = build_manager_prompts(context, store=store)
+    # Reference-root guidance lives in the skill; the builder keeps no
+    # competing inline authority and keeps the existing context label.
+    assert "overrides conflicting skill text" not in system
+    normalized = _normalized(system)
+    assert "reference-only" in normalized
+    assert "Read the referenced checkpoint artifact first" in normalized
+    assert "do not search for alternate plan files" in normalized
+    assert "`controller_state.artifact_roots`, not your working directory" in normalized
+    assert "against `artifact_roots.run`" in normalized
+    assert "against `artifact_roots.repository`" in normalized
     assert (
-        "Plan and checkpoint content is referenced, not inlined" in system
+        "read the referenced active/full plan artifact only when necessary"
+        in normalized
     )
-    assert (
-        "artifact paths in MANAGER_CONTEXT_JSON use the absolute bases" in system
-    )
-    assert "controller_state.artifact_roots, not your working directory" in system
-    assert "against artifact_roots.run" in system
-    assert "against artifact_roots.repository" in system
-    assert "Read the referenced checkpoint artifact first" in system
-    assert (
-        "Read the referenced active/full plan artifact only if the compact "
-        "evidence is insufficient" in system
-    )
-    assert "do not search for alternate plan files" in system
+    assert "The execution worktree may differ from both artifact roots" in normalized
+    assert "\nMANAGER_CONTEXT_JSON:\n" in user
 
 
 def test_prompt_hard_limit_fails_closed_before_provider_start() -> None:

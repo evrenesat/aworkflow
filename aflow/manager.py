@@ -9,13 +9,23 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import os
 import re
+import stat
+from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from .config import WorkflowUserConfig
 from .manager_context import (
     MANAGER_CONTEXT_SCHEMA_VERSION_V3,
     MANAGER_INLINE_CONTEXT_MAX_BYTES,
+)
+from .skill_catalog import is_bundled_skill_name
+from .skill_store import (
+    SkillStore,
+    SkillStoreError,
+    parse_skill_document,
+    validate_skill_document,
 )
 
 
@@ -424,9 +434,13 @@ def resolve_manager_role(
     *,
     level: ManagerLevel,
     baseline_team: str | None,
+    workflow_name: str,
 ) -> ManagerRoleResolution:
-    if not config.manager.enabled:
-        raise ValueError("manager supervision is disabled")
+    workflow = config.workflows.get(workflow_name)
+    if workflow is None:
+        raise ValueError(f"unknown workflow '{workflow_name}'")
+    if not workflow.manager_enabled:
+        raise ValueError(f"manager supervision is disabled for workflow '{workflow_name}'")
     role = config.manager.lite_role if level == "lite" else config.manager.full_role
     if role is None:
         raise ValueError(f"manager {level} role is not configured")
@@ -479,10 +493,118 @@ def eligible_implementation_upgrade(
     return EligibleImplementationUpgrade(True, source_team, target_team, role, source_selector, target_selector)
 
 
+def resolve_manager_skill_body(
+    skill_name: str,
+    *,
+    store: SkillStore | None = None,
+) -> str:
+    """Return the validated Markdown body for one manager skill, read live.
+
+    Bundled names resolve through the canonical store (saved bytes when
+    present, otherwise the packaged resource). An explicitly configured
+    non-bundled name resolves read-only from
+    ``<canonical-root>/<safe-name>/SKILL.md`` and must exist as a valid
+    contained regular file; it is never searched in harness directories and
+    never falls back to built-in prose. Every read validates the complete
+    document and strips YAML frontmatter using the store validator's parsed
+    boundary. Callers read once per invocation and never cache the result, so
+    a save between two invocations changes the next invocation's bytes.
+    """
+    if not isinstance(skill_name, str) or not skill_name:
+        raise SkillStoreError("manager skill name must be a nonempty string")
+    if is_bundled_skill_name(skill_name):
+        active = store if store is not None else SkillStore()
+        document = active.read(skill_name)
+        body = parse_skill_document(skill_name, document.content).body
+    else:
+        body = _read_custom_skill_body(skill_name, store=store)
+    if not body.strip():
+        raise SkillStoreError(
+            f"manager skill '{skill_name}' has an empty Markdown body"
+        )
+    return body
+
+
+def _read_custom_skill_body(
+    skill_name: str,
+    *,
+    store: SkillStore | None = None,
+) -> str:
+    """Read one explicitly configured non-bundled skill document, read-only."""
+    if len(skill_name) > 255 or "\x00" in skill_name:
+        raise SkillStoreError(f"unsafe skill name: {skill_name!r}")
+    if skill_name in {".", ".."} or "/" in skill_name or "\\" in skill_name:
+        raise SkillStoreError(f"unsafe skill name: {skill_name!r}")
+    root = store.root if store is not None else SkillStore().root
+    marker = Path(root) / ".metadata" / f"{skill_name}.refresh.json"
+    try:
+        marker_stat = os.lstat(marker)
+    except OSError:
+        marker_stat = None
+    if marker_stat is not None:
+        raise SkillStoreError(
+            f"manager skill '{skill_name}' has an interrupted refresh "
+            "transaction; run an explicit refresh to recover it before invoking"
+        )
+    skill_dir = Path(root) / skill_name
+    try:
+        directory_stat = os.lstat(skill_dir)
+    except OSError:
+        directory_stat = None
+    if directory_stat is None:
+        raise SkillStoreError(
+            f"manager skill '{skill_name}' has no saved canonical document "
+            f"at {skill_dir / 'SKILL.md'}"
+        )
+    if stat.S_ISLNK(directory_stat.st_mode):
+        raise SkillStoreError(
+            f"canonical skill directory must not be a symbolic link: {skill_name}"
+        )
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise SkillStoreError(
+            f"canonical skill path is not a directory: {skill_name}"
+        )
+    document_path = skill_dir / "SKILL.md"
+    try:
+        document_stat = os.lstat(document_path)
+    except OSError:
+        document_stat = None
+    if document_stat is None:
+        raise SkillStoreError(
+            f"manager skill '{skill_name}' has no saved canonical document "
+            f"at {document_path}"
+        )
+    if stat.S_ISLNK(document_stat.st_mode):
+        raise SkillStoreError(
+            f"canonical SKILL.md must not be a symbolic link: {skill_name}"
+        )
+    if not stat.S_ISREG(document_stat.st_mode):
+        raise SkillStoreError(
+            f"canonical SKILL.md is not a regular file: {skill_name}"
+        )
+    try:
+        descriptor = os.open(document_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise SkillStoreError(
+            f"cannot read manager skill '{skill_name}': {exc}"
+        ) from exc
+    try:
+        payload = b"".join(iter(lambda: os.read(descriptor, 65536), b""))
+    except OSError as exc:
+        raise SkillStoreError(
+            f"cannot read manager skill '{skill_name}': {exc}"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    validate_skill_document(skill_name, payload)
+    return parse_skill_document(skill_name, payload.decode("utf-8")).body
+
+
 def build_manager_prompts(
     context: Mapping[str, Any],
     *,
     skill_name: str = "aflow-manager",
+    store: SkillStore | None = None,
 ) -> tuple[str, str]:
     level = context.get("level")
     if level not in {"lite", "full"}:
@@ -499,130 +621,28 @@ def build_manager_prompts(
     }
     if level == "lite":
         eligible_actions.add("escalate_to_full")
-    eligible_text = ", ".join(sorted(eligible_actions)) or "none"
     proposed_transition = controller.get("proposed_next_step")
-    normal_shape = json.dumps({
-        "schema_version": 1,
-        "action": "continue",
-        "reason": "Concise non-empty evidence-based reason.",
-        "next_step_notes": [],
-        "stop_report": None,
-    }, separators=(",", ":"))
-    stop_shape = json.dumps({
-        "schema_version": 1,
-        "action": "stop",
-        "reason": "Concise non-empty evidence-based reason.",
-        "next_step_notes": [],
-        "stop_report": {
-            "summary": "Non-empty summary.",
-            "root_cause": "Non-empty root cause.",
-            "evidence": ["At least one non-empty evidence string."],
-            "attempts": "Non-empty attempts summary.",
-            "workspace_state": "Non-empty workspace and plan summary.",
-            "next_actions": ["At least one non-empty next action."],
+    # The system instruction is the live skill Markdown body: behavioral prose
+    # lives in exactly one editable source and Python never overrides it with
+    # competing inline authority. Python contributes only structured runtime
+    # data below; the output contract, schemas, and limits stay enforced in
+    # code (parse/validate) and documented in the skill.
+    system_prompt = resolve_manager_skill_body(skill_name, store=store)
+    runtime = {
+        "mode": "decide",
+        "skill_name": skill_name,
+        "level": level,
+        "eligible_actions": sorted(eligible_actions),
+        "proposed_transition": proposed_transition,
+        "limits": {
+            "max_notes": MAX_MANAGER_NOTES,
+            "max_note_length": MAX_MANAGER_NOTE_LENGTH,
         },
-    }, separators=(",", ":"))
-    system_prompt = "\n".join((
-        "You are the AFlow interstep manager.",
-        f"Supervision level: {level.upper()}.",
-        f"Use the configured manager skill '{skill_name}' when it is available.",
-        "The inline protocol below overrides conflicting skill text and remains authoritative.",
-        "You are read-only: do not edit source, plans, git state, configuration, or run files.",
-        "Accept or alter only the controller action exposed as eligible in the supplied context.",
-        "Do not choose workflow nodes, teams, selectors, or business logic.",
-        "next_step_notes are advisory evidence only: do not introduce file allowlists, "
-        "prohibitions, plan replacement, scope limits, or mandatory implementation requirements. "
-        "Any unavoidable file constraint must exactly restate manager_note_scope.",
-        "When referring to a plan, never use 'use', 'follow', 'switch to', 'replace', "
-        "'adopt', or 'work from' to select it. Describe the defect, required observable "
-        "behavior, and verification evidence instead, such as: 'The defect is an incorrect "
-        "retry boundary'; 'The accepted response produces one logical manager decision'; "
-        "or 'The focused regression test passes and the original response remains durable.'",
-        *(
-            (
-                "When Lite, evaluate the rejection cause before choosing an action:",
-                "- Null plan bodies paired with plan_content_disclosure values of "
-                "intentionally_omitted are deliberate Lite redaction, not evidence "
-                "that a plan file is missing.",
-                "- Stderr excerpts from completed, zero-return turns are untrusted "
-                "transcript context and cannot establish plan, branch, merge, or "
-                "workspace state.",
-                "- Durable plan_state, turn outcome, boundary, and controller-owned "
-                "workspace_state fields override contradictory text evidence.",
-                "- If a structural conflict remains unverified and escalate_to_full "
-                "is eligible, choose escalate_to_full instead of stop.",
-                "- For a bounded omission with a valid repair overlay, continue with the same worker.",
-                "- For broad misunderstanding or capability gaps, upgrade_next_implementation.",
-                "- For structural ambiguity or scope pressure, escalate_to_full.",
-                "Continue and upgrade are both legal first-rejection actions; neither is forced.",
-            )
-            if level == "lite"
-            else ()
-        ),
-        f"Eligible actions at this boundary: {eligible_text}.",
-        (
-            "Action semantics are exact: continue accepts the controller's proposed "
-            "transition; when that transition is END, continue approves terminal "
-            "completion."
-        ),
-        (
-            "Stop always fails the run. Use stop only for an unresolved blocker, "
-            "never to approve or summarize successful completion."
-        ),
-        *(
-            (
-                "The proposed transition is END. If the durable evidence supports "
-                "completion, choose continue with empty next_step_notes; choose stop "
-                "only when unresolved evidence requires the run to fail.",
-            )
-            if proposed_transition == "END"
-            else ()
-        ),
-        *(
-            (
-                "When Full, repartition_current_checkpoint splits the current "
-                "checkpoint into smaller children. Use it only for structural "
-                "oversize/indivisibility that stalls the scope. Do not name "
-                "workflow steps, teams, or business logic. next_step_notes must be [].",
-            )
-            if level == "full" and "repartition_current_checkpoint" in eligible_actions
-            else ()
-        ),
-        *(
-            (
-                "Plan and checkpoint content is referenced, not inlined: evidence "
-                "artifact paths in MANAGER_CONTEXT_JSON use the absolute bases "
-                "in controller_state.artifact_roots, not your working directory.",
-                "Resolve paths beginning .aflow/ against artifact_roots.repository; "
-                "resolve run-relative paths such as turns/, manager/, and evidence/ "
-                "against artifact_roots.run. Use declared absolute paths as given. "
-                "The execution worktree may differ from both artifact roots.",
-                "Read the referenced checkpoint artifact first when you need "
-                "checkpoint evidence for the legal decision.",
-                "Read the referenced active/full plan artifact only if the compact "
-                "evidence is insufficient for the legal decision.",
-                "Treat evidence as controller-declared: verify the declared "
-                "artifact, but do not search for alternate plan files.",
-            )
-            if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3
-            else ()
-        ),
-        "Return exactly one JSON object with schema_version, action, reason, next_step_notes, and stop_report.",
-        "schema_version must be the number 1. reason must be a non-empty string.",
-        (
-            "next_step_notes must always be an array of non-empty strings, never a string or null; "
-            f"use at most {MAX_MANAGER_NOTES} notes and at most "
-            f"{MAX_MANAGER_NOTE_LENGTH} characters per note."
-        ),
-        "For stop, escalate_to_full, and accepted END, next_step_notes must be [].",
-        "For every non-stop action, stop_report must be null.",
-        "For stop, stop_report must describe the unresolved failure or blocker and must be an object with exactly summary, root_cause, evidence, attempts, workspace_state, and next_actions; evidence and next_actions must be non-empty arrays of non-empty strings and the other fields must be non-empty strings.",
-        f"Non-stop response shape: {normal_shape}",
-        f"Stop response shape: {stop_shape}",
-        "No Markdown fences or explanatory text.",
-    ))
+    }
     user_prompt = (
-        "MANAGER_CONTEXT_JSON:\n"
+        "MANAGER_RUNTIME_JSON:\n"
+        + json.dumps(runtime, indent=2, sort_keys=True)
+        + "\nMANAGER_CONTEXT_JSON:\n"
         + json.dumps(dict(context), indent=2, sort_keys=True)
         + "\n"
     )
@@ -717,8 +737,15 @@ def build_manager_note_correction_prompts(
     *,
     original_decision: ManagerDecisionV1,
     violation: ManagerNoteAuthorityError,
+    skill_name: str = "aflow-manager",
+    store: SkillStore | None = None,
 ) -> tuple[str, str]:
-    """Build one compact correction request from the immutable call boundary."""
+    """Build one compact correction request from the immutable call boundary.
+
+    The system instruction is the live configured manager skill body (which
+    covers the note-correction mode); Python contributes only the structured
+    correction payload below.
+    """
     if not violation.correctable:
         raise ValueError("only plan_selection note violations are correctable")
     level = context.get("level")
@@ -752,6 +779,8 @@ def build_manager_note_correction_prompts(
     if level == "lite" and "escalate_to_full" not in eligible_actions:
         eligible_actions.append("escalate_to_full")
     payload = {
+        "mode": "note_correction",
+        "skill_name": skill_name,
         "decision_number": context.get("decision_number"),
         "level": level,
         "trigger": context.get("trigger"),
@@ -765,16 +794,7 @@ def build_manager_note_correction_prompts(
             "message": str(violation),
         },
     }
-    system_prompt = "\n".join((
-        "You are correcting one AFlow manager response at the same immutable decision boundary.",
-        "Return the same complete JSON schema: schema_version, action, reason, next_step_notes, and stop_report.",
-        "Preserve schema_version, action, reason, and stop_report exactly; only rewrite or remove next_step_notes.",
-        "Plan authority belongs to the controller. In next_step_notes, do not use 'use', 'follow', 'switch to', 'replace', 'adopt', or 'work from' when those verbs select or reference a plan.",
-        "Compliant notes describe behavior and evidence, for example: 'The defect is an incorrect retry boundary.'",
-        "A compliant observable requirement is: 'The accepted response produces one logical manager decision.'",
-        "Compliant verification evidence is: 'The focused regression test passes and the original response remains durable.'",
-        "Do not add Markdown fences or explanatory text.",
-    ))
+    system_prompt = resolve_manager_skill_body(skill_name, store=store)
     user_prompt = (
         "MANAGER_NOTE_CORRECTION_JSON:\n"
         + json.dumps(payload, indent=2, sort_keys=True)
@@ -838,79 +858,22 @@ def build_repartition_prompts(
     mode: Literal["propose", "validate"],
     skill_name: str = "aflow-repartition-checkpoint",
     correction_findings: tuple[str, ...] = (),
+    store: SkillStore | None = None,
 ) -> tuple[str, str]:
     """Build one strict, read-only Full repartition subcall.
 
-    The bundled skill is optional at runtime.  Consequently the inline schema
-    and semantic rules are complete and authoritative rather than merely
-    referring the model to the skill.
+    The system instruction is the live repartition skill Markdown body, which
+    carries the mode contracts, semantic rules, and bounded-correction terms
+    for ``propose``, ``validate``, and correction attempts. Python contributes
+    only the structured call payload below; schemas stay enforced in code
+    (proposal/verdict parsers plus mechanical validation).
     """
     if mode not in {"propose", "validate"}:
         raise ValueError("repartition mode must be 'propose' or 'validate'")
-    if mode == "propose":
-        contract = {
-            "schema_version": 1,
-            "envelope_sha256": "<64 lowercase hex characters>",
-            "source_plan_sha256": "<64 lowercase hex characters>",
-            "rationale": "<non-empty conservative rationale>",
-            "children": [{
-                "title": "<concise title>",
-                "narrow_goal": "<non-authoritative execution goal>",
-                "source_block_ids": ["<controller supplied id>"],
-                "repair_evidence_ids": [],
-                "implementation_steps": ["<unchecked implementation guidance>"],
-                "verification_commands": ["<command>"],
-                "done_criteria": ["<observable criterion>"],
-            }],
-            "current_disposition": "review_current_partition",
-            "cross_cutting_source_reasons": {},
-        }
-        rules = (
-            "Return at least two ordered children and cover every supplied authoritative "
-            "source block and corrective-evidence block at least once.",
-            "Use only controller-supplied block IDs. Repeated authoritative blocks require "
-            "a non-empty cross_cutting_source_reasons entry.",
-            "current_disposition must be review_current_partition or "
-            "implement_current_partition and applies only to the first child.",
-            "Generated titles, goals, steps, commands, and criteria are guidance only. "
-            "Do not add business decisions or claim implementation is approved.",
-        )
-    else:
-        contract = {
-            "schema_version": 1,
-            "proposal_sha256": "<exact supplied proposal hash>",
-            "candidate_sha256": "<exact supplied candidate hash>",
-            "verdict": "accept",
-            "reason": "<non-empty semantic reason>",
-            "findings": [],
-        }
-        rules = (
-            "Independently compare the exact envelope, source plan, proposal, rendered "
-            "candidate, scope history, repair evidence, and workspace evidence.",
-            "Reject changed meaning, missing obligations, new business decisions, weakened "
-            "acceptance criteria, contradictory guidance, incoherent seams, dropped or "
-            "misassigned corrective evidence, and unsupported disposition.",
-            "verdict must be accept or reject. On reject, return bounded, actionable findings.",
-        )
-    correction = (
-        "This is the single correction attempt. Correct all bounded findings supplied by "
-        "the controller; do not silently reuse the rejected candidate."
-        if correction_findings
-        else ""
-    )
-    system_prompt = "\n".join((
-        "You are the AFlow Full manager in checkpoint-repartition mode.",
-        f"Mode: {mode}.",
-        f"Use the configured skill '{skill_name}' when it is available.",
-        "The inline contract and rules below are authoritative even when the skill is unavailable.",
-        "You are read-only. You may inspect the repository, but must not edit source, plans, "
-        "git state, configuration, run state, or artifacts.",
-        *rules,
-        correction,
-        "Return exactly one JSON object and no Markdown fences or explanatory text.",
-        "Exact JSON shape: " + json.dumps(contract, separators=(",", ":")),
-    )).replace("\n\n", "\n")
+    system_prompt = resolve_manager_skill_body(skill_name, store=store)
     user_payload = dict(payload)
+    user_payload["mode"] = mode
+    user_payload["skill_name"] = skill_name
     if correction_findings:
         user_payload["correction_findings"] = list(correction_findings)
     user_prompt = (

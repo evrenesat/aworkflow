@@ -203,10 +203,11 @@ escalation each lead to one Full decision from the same finalized-turn evidence
 with Full eligibility restored. Full `stop` and `stop` at every non-clean
 boundary retain the normal failure path. The controller never infers success or
 failure from manager `reason`, `stop_report`, or other free text.
-Every manager prompt names the configured manager skill and embeds the complete
-closed JSON protocol, including the structured stop-report shape. Invalid
-manager output at a terminal incident cannot replace the original controller
-failure as the report's primary cause.
+Every manager prompt passes the configured skill's live validated Markdown
+body as the system instruction with structured runtime data in the user
+prompt; the closed JSON protocol, including the structured stop-report shape,
+stays enforced in code. Invalid manager output at a terminal incident cannot
+replace the original controller failure as the report's primary cause.
 Manager invocation and note-correction execution is owned by one private,
 module-level `_ManagerCallExecutor` with explicit stable dependencies, while
 the changing plan and step identities plus the current baseline team remain
@@ -388,11 +389,11 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - **`[aflow]`** section: `default_workflow`, `keep_runs`, `max_turns`, `retry_inconsistent_checkpoint_state`, `banner_files_limit`, `max_same_step_turns`, `team_lead`, `branch_prefix`, `worktree_prefix`, `worktree_root`.
 - **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
 - **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining. Nested `prompts` tables provide static per-role system guidance; active-team values replace global values for ordinary workflow turns only.
-- **`[manager]`**: optional interstep supervision with Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
+- **`[manager]`**: Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. Roles are required only for workflows with supervision enabled. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
 - **`[error_handling.harness_error_recovery]`**: ordered recovery rules, `max_consecutive_recoveries`, and the bundled fallback skill name used when deterministic matching cannot decide safely.
 - **`[prompts]`** section: named prompt templates.
-- Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) inherited by all workflows that don't override them. Not a runnable workflow.
-- **`[workflow.<name>]`** tables in `workflows.toml`: concrete workflows define `steps`, alias workflows use `extends` and optional `team`. Both may override lifecycle defaults with `setup`, `teardown`, `main_branch`, and `merge_prompt`.
+- Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) plus `manager_enabled` (default `false`), inherited by all workflows that don't override them. Not a runnable workflow.
+- **`[workflow.<name>]`** tables in `workflows.toml`: concrete workflows define `steps`, alias workflows use `extends` and optional `team`. Both may override lifecycle defaults with `setup`, `teardown`, `main_branch`, and `merge_prompt`, and may set `manager_enabled` (aliases inherit their concrete base when omitted). The flag resolves per selected workflow and freezes at run reservation.
 - Concrete and alias workflows may also set `exclude = ["step_name"]` to remove declared steps from the executable graph while keeping them visible to `aflow show` and status records. Alias exclusions are applied after inheritance.
 - **`[workflow.<name>.steps.<step>]`** tables: `role` (global role key), `prompts` (list of prompt keys), `go` (transition array with `to` and optional `when` condition).
 
@@ -912,7 +913,7 @@ default `dev` dependency group rather than the installed runtime package.
 - **Interactive startup decisions are structured.** Startup decisions that require human input are represented as `StartupQuestion` objects with a `kind` enum, prompt text, and metadata. The CLI renders these as TTY prompts; library callers can present them in any UI or handle them programmatically via `prepare_startup_with_answer()`.
 - **Condition-based transitions.** Step transitions use a small expression language over three boolean symbols rather than hardcoded control flow. This keeps workflow definitions declarative.
 - **Structured run logging.** Every turn's prompts, outputs, and snapshots are persisted to `.aflow/runs/` for debugging and auditability. Old runs are pruned automatically.
-- **Skills as Markdown.** The bundled skills are plain SKILL.md files that get copied into each harness's skill directory. The default set stays separate from the optional `aflow-assistant` helper. They contain behavioral instructions that the agent reads at runtime, not executable code.
+- **Skills as Markdown.** The bundled skills are plain SKILL.md files installed as absolute directory symlinks from each harness's skill directory to the account-local canonical store (`~/.config/aflow/skills/<name>`), never copied. The default set stays separate from the optional `aflow-assistant` helper. They contain behavioral instructions that the agent reads at runtime, not executable code; manager instruction bodies are read live from the canonical Markdown on every invocation while names and configuration stay frozen in the run snapshot.
 - **Local-only lifecycle.** Branch and worktree creation, feature branch setup, and merge handoff all operate on local refs only. The engine never fetches, pulls, or pushes. The primary checkout is the control root for run artifacts and merge verification even when normal steps execute inside a linked worktree.
 
 

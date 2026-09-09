@@ -24,6 +24,12 @@ import type {
   RunStatus,
   SettingsResponse,
   SettingsSaveRequest,
+  SkillDetail,
+  SkillInstallResult,
+  SkillSaveRequest,
+  SkillSummary,
+  SkillValidateEntry,
+  SkillValidateEntryResult,
   StartRunRequest,
   StartRunResponse,
   StartRunResult,
@@ -250,6 +256,38 @@ export async function postGlobalConfigForm(
   )
 }
 
+/** Bundled skills: reads are pure, saves compare-and-swap canonical SKILL.md. */
+export async function listSkills(): Promise<SkillSummary[]> {
+  return fetchJson<SkillSummary[]>(`${API_BASE}/skills`)
+}
+
+export async function readSkill(name: string): Promise<SkillDetail> {
+  return fetchJson<SkillDetail>(`${API_BASE}/skills/${encodeURIComponent(name)}`)
+}
+
+export async function saveSkill(name: string, request: SkillSaveRequest): Promise<SkillDetail> {
+  return fetchJson<SkillDetail>(`${API_BASE}/skills/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    body: JSON.stringify(request),
+  })
+}
+
+export async function validateSkills(entries: SkillValidateEntry[]): Promise<SkillValidateEntryResult[]> {
+  const response = await fetchJson<{ entries: SkillValidateEntryResult[] }>(`${API_BASE}/skills/validate`, {
+    method: 'POST',
+    body: JSON.stringify({ entries }),
+  })
+  return response.entries
+}
+
+/** Refresh and link the default bundled skills through the shared installer. */
+export async function installSkills(): Promise<SkillInstallResult> {
+  return fetchJson<SkillInstallResult>(`${API_BASE}/skills/install`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
 /** Transport settings; the credential is write-only and never echoed back. */
 export async function getSettings(): Promise<SettingsResponse> {
   return fetchJson<SettingsResponse>(`${API_BASE}/settings`)
@@ -268,7 +306,7 @@ export async function listProjectPlans(projectId: string, status?: PlanStatus): 
 
 export async function createProjectPlan(
   projectId: string,
-  request: { name: string; content: string },
+  request: { name: string; content?: string | null },
 ): Promise<PlanDocument> {
   return fetchJson<PlanDocument>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/plans`, {
     method: 'POST',

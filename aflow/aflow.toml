@@ -81,11 +81,11 @@ workflow-specific AFlow review skill for checkpoint and plan bookkeeping,
 lifecycle actions, and conflicting output requirements.
 """
 
-# Interstep supervision is enabled for newly bootstrapped configuration. Lite is
+# Interstep supervision is enabled for newly bootstrapped configuration through
+# [workflow].manager_enabled in workflows.toml. Lite is
 # the normal path; Full is selected after the configured semantic-stall limit or
 # when the controller identifies an ambiguous terminal condition.
 [manager]
-enabled = true
 lite_role = 'manager_lite'
 full_role = 'manager_full'
 full_after_stalled_turns = 2

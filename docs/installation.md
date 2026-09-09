@@ -79,8 +79,10 @@ advertise both. Deployment requires explicit per-run authorization. The
 optional `aflow-assistant` skill is not installed
 unless you ask for it. Keep the legacy recovery skill installed even when using
 manager supervision: manager-disabled configurations retain that recovery path.
-Manager and repartition prompts also carry their complete JSON contracts inline,
-so a missing static skill does not weaken protocol validation.
+Manager and repartition prompts use the live saved skill bytes as their system
+instruction, so editing a skill changes the next manager invocation. A missing
+or invalid skill fails the call before any provider is invoked; saved edits
+never weaken the code-enforced protocol validation.
 
 Auto mode:
 
