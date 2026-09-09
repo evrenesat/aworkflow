@@ -1141,7 +1141,7 @@ class WorkflowCliTests(unittest.TestCase):
 
         assert result.extra_instructions == ()
 
-    def test_resume_bootstrap_rejects_explicit_empty_extra_instructions_when_saved_nonempty(
+    def test_resume_bootstrap_replaces_or_clears_saved_extra_instructions(
         self,
     ) -> None:
         import aflow.cli as cli_module
@@ -1152,8 +1152,8 @@ class WorkflowCliTests(unittest.TestCase):
             "aflow.cli.resolve_run_id",
             return_value=(Path(run_dir.name), "explicit_run_id"),
         ), patch("aflow.cli.load_run_json", return_value=prev_run):
-            with pytest.raises(ValueError, match="resume extra-instructions mismatch"):
-                cli_module._bootstrap_resume_invocation(
+            for replacement in [(), ("Follow current plan progress; preserve recovery artifacts.",)]:
+                result = cli_module._bootstrap_resume_invocation(
                     repo_root=repo_root,
                     workflow_config=workflow_config,
                     requested_run_id=run_dir.name,
@@ -1162,11 +1162,27 @@ class WorkflowCliTests(unittest.TestCase):
                     team_arg=None,
                     start_step_arg=None,
                     max_turns_arg=None,
-                    extra_instructions_arg=(),
+                    extra_instructions_arg=replacement,
                     extra_instructions_provided=True,
                 )
+                assert result.extra_instructions == replacement
+                assert prev_run["extra_instructions"] == ["keep the patch focused"]
+                detected = cli_module._detect_resume_candidate(
+                    repo_root=repo_root,
+                    workflow_config=workflow_config.workflows[result.workflow_name],
+                    workflow_name=result.workflow_name,
+                    plan_path=result.plan_path,
+                    team=result.team,
+                    selected_start_step=result.start_step,
+                    max_turns=result.max_turns,
+                    extra_instructions=result.extra_instructions,
+                    requested_run_id=run_dir.name,
+                    require_resume=True,
+                    resume_bootstrap=result,
+                )
+                assert detected is result.resume_context
 
-    def test_plan_free_resume_explicit_empty_extra_instructions_reaches_bootstrap_conflict(
+    def test_plan_free_resume_explicit_empty_extra_instructions_reaches_startup(
         self,
     ) -> None:
         import aflow.cli as cli_module
@@ -1175,7 +1191,7 @@ class WorkflowCliTests(unittest.TestCase):
         repo_root, run_dir, workflow_config, prev_run = self._resume_bootstrap_fixture(tmp_path)
         config_path = repo_root / "aflow.toml"
         stderr = io.StringIO()
-        startup = Mock()
+        startup = Mock(return_value=None)
         with patch.object(
             cli_module,
             "_bootstrap_config_files",
@@ -1196,9 +1212,10 @@ class WorkflowCliTests(unittest.TestCase):
             status = cli_module.main(["run", "--resume", run_dir.name, "--"])
 
         assert status == 1
-        assert "resume extra-instructions mismatch" in stderr.getvalue()
+        assert "mismatch" not in stderr.getvalue()
         load_run_json.assert_called_once_with(run_dir)
-        startup.assert_not_called()
+        startup.assert_called_once()
+        assert startup.call_args.args[0].extra_instructions == ()
 
     def test_resume_explicit_and_auto_reject_path_shaped_ids_before_loading_or_startup(
         self,
@@ -2134,10 +2151,6 @@ class WorkflowCliTests(unittest.TestCase):
             ({"workflow_arg": "other_workflow"}, "resume workflow mismatch"),
             ({"team_arg": "other-team"}, "resume team mismatch"),
             ({"max_turns_arg": 30}, "resume max-turns mismatch"),
-            (
-                {"extra_instructions_arg": ("override",)},
-                "resume extra-instructions mismatch",
-            ),
         )
         for kwargs, message in cases:
             with self.subTest(message=message):

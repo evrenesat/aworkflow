@@ -88,7 +88,7 @@ bodies, base64 evidence, or reviewer transcripts. Reviewer stdout is
 referenced through its durable turn artifact.
 
 - The exact UTF-8 inline user prompt targets 16 KiB (`MANAGER_INLINE_CONTEXT_TARGET_BYTES`)
-  and is hard-limited to 32 KiB (`MANAGER_INLINE_CONTEXT_MAX_BYTES`) before any
+  and is hard-limited to 40 KiB (`MANAGER_INLINE_CONTEXT_MAX_BYTES`) before any
   provider process starts. Exceeding the hard limit fails closed with a fixed
   error containing total bytes and per-top-level-field byte counts only.
 - Bounded semantic fields (results, reasons, rejection summaries, diagnostic
@@ -434,6 +434,11 @@ after reconciliation reports `needs_attention`. Do not restart an exact
 workflow unit to recover it: the daemon records the ambiguity and an explicit
 resume creates a new linked continuation. An owner stop is terminal.
 
+A recorded controller failure or interruption can also resume directly once
+the worker and unit are confirmed inactive, even when the launch receipt still
+says `launch_started`. A killed launch without controller terminal evidence
+must first be reconciled to `needs_attention`.
+
 REST and MCP fresh starts share one typed StartupRequest. Capability discovery
 lists each workflow's declared, executable, and excluded steps, canonical first
 step, default team, configured roles/teams, admitted selectors, and public
@@ -448,6 +453,12 @@ gets a new run ID and normal frozen-config validation. Resume remains strict
 continuation of the saved invocation. Bounded extra instructions affect the
 request digest and worker prompt but their text is omitted from control-plane
 manifests, start records, events, and status.
+
+For CLI resume, omitted extra instructions retain the predecessor's text.
+`aflow run --resume RUN_ID -- replacement text` replaces it for the successor;
+`aflow run --resume RUN_ID --` clears it. The predecessor and its prompt
+artifacts remain unchanged. Use run-wide instructions for continuing rules,
+not a recovery action that becomes stale after its checkpoint is approved.
 
 `aflow-guard-development-run` remains opt-in supervision for the exact run a
 user explicitly asks it to guard, particularly normal direct-CLI and legacy
@@ -804,3 +815,7 @@ A failed terminal merge is the sole complete-plan resume case. The durable run
 must record `transition_end`, a complete snapshot, failed merge metadata with a
 reason, and configured merge teardown. Its successor retries only terminal
 integration; it does not launch another checkpoint or workflow harness.
+
+### Resume after manager context-budget rejection
+
+A failed run whose recorded manager result identifies a post-turn, prelaunch context-budget rejection may resume its saved finalized-turn boundary, including when all implementation checkpoints are checked. Admission validates the matching manager decision and turn artifacts and refuses already-consumed boundaries. Resume retries supervision before following the saved transition; it does not rerun the completed worker or treat pending review as finished.

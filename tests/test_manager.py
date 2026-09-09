@@ -1166,6 +1166,20 @@ def test_v3_prompt_system_instructions_reference_artifacts_only() -> None:
     assert "do not search for alternate plan files" in system
 
 
+def test_manager_prompt_accepts_40_kib_and_rejects_one_more_utf8_byte() -> None:
+    from aflow.manager import (
+        MANAGER_INLINE_CONTEXT_MAX_BYTES,
+        ManagerInlineContextLimitError,
+        enforce_manager_inline_context_budget,
+    )
+
+    assert MANAGER_INLINE_CONTEXT_MAX_BYTES == 40 * 1024
+    prompt = "é" * (20 * 1024)
+    enforce_manager_inline_context_budget({}, prompt)
+    with pytest.raises(ManagerInlineContextLimitError):
+        enforce_manager_inline_context_budget({}, prompt + "x")
+
+
 def test_prompt_hard_limit_fails_closed_before_provider_start() -> None:
     from aflow.manager import (
         MANAGER_INLINE_CONTEXT_MAX_BYTES,
@@ -1188,6 +1202,26 @@ def test_prompt_hard_limit_fails_closed_before_provider_start() -> None:
     assert "schema_version=" in message
     assert oversized["bloat"][:40] not in message
     assert len(message) < 600
+
+
+@pytest.mark.parametrize("summary", ["x" * 60, "é" * 60])
+def test_v3_prompt_budget_excludes_pretty_printing_without_losing_evidence(summary) -> None:
+    from aflow.manager import MANAGER_INLINE_CONTEXT_MAX_BYTES
+
+    context = {
+        "schema_version": 3, "level": "lite", "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+        "run_extract": [
+            {"number": i, "semantic_summary": summary,
+             "details": [{"text": "evidence"} for _ in range(70)]}
+            for i in range(12)
+        ],
+    }
+    pretty = "MANAGER_CONTEXT_JSON:\n" + json.dumps(context, indent=2, sort_keys=True) + "\n"
+    assert len(pretty.encode("utf-8")) > MANAGER_INLINE_CONTEXT_MAX_BYTES
+    _, prompt = build_manager_prompts(context)
+    assert len(prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert json.loads(prompt.split("\n", 1)[1]) == context
 
 
 def test_v3_prompt_metrics_count_references_without_bodies() -> None:

@@ -569,6 +569,7 @@ class DaemonService:
             if (
                 source.launch_phase == "launch_started"
                 and source.status != "needs_attention"
+                and not source.evidence.get("controller_terminal")
             ):
                 raise DaemonError(
                     "a killed launched run must be reconciled before explicit resume"
@@ -732,7 +733,11 @@ class DaemonService:
             return False
         if status.launch_phase in {None, "manifest_only", "launch_requested"}:
             return False
-        if status.launch_phase == "launch_started" and status.status != "needs_attention":
+        if (
+            status.launch_phase == "launch_started"
+            and status.status != "needs_attention"
+            and not status.evidence.get("controller_terminal")
+        ):
             return False
         try:
             observed = self._application.units.get(_unit_name(status.run_id))
@@ -1503,10 +1508,18 @@ class DaemonService:
             )
         from aflow.workflow import _freeze_run_identity
 
+        try:
+            snapshot = load_run_config_snapshot(self._config.repo_root, manifest.run_id)
+        except SnapshotError as exc:
+            raise DaemonError(str(exc)) from exc
+        workflow_config = (
+            load_workflow_config(snapshot.config_path)
+            if snapshot is not None else self._workflow_config
+        )
         frozen = _freeze_run_identity(
             prepared.workflow_name,
-            self._workflow_config,
-            config_dir=self._config.config_path,
+            workflow_config,
+            config_dir=Path(snapshot.origin_config_path) if snapshot is not None else self._config.config_path,
         )
         if manifest.frozen_config_fingerprint != frozen.config_fingerprint:
             raise DaemonError(

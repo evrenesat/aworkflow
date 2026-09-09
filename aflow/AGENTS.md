@@ -24,3 +24,7 @@
 - Manager evidence belongs to the primary repository's run directory, which may
   differ from its execution worktree. Schema-v3 context declares both artifact
   roots; preserve repository-relative versus run-relative reference semantics.
+
+- Schema-v3 manager prompts use compact UTF-8 JSON under the existing 40 KiB
+  hard limit. Formatting must not consume the evidence budget; retain all fields
+  and reject genuinely oversized payloads before provider launch.

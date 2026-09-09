@@ -181,7 +181,7 @@ contexts reference these files instead of copying bodies:
   selectors 1/2 rebuild schema v1 for historical analysis.
 
 Manager prompts inline only the compact manifest. The exact UTF-8 user prompt
-targets 16 KiB and is hard-limited to 32 KiB before any provider process
+targets 16 KiB and is hard-limited to 40 KiB before any provider process
 starts; an oversized compact manifest fails with a fixed error carrying total
 bytes and per-top-level-field byte counts only. Non-sensitive prompt metrics
 (`system_prompt_bytes`, `user_prompt_bytes`, `argv_bytes`,
@@ -462,7 +462,10 @@ classifier while retaining its backup-plan and active-plan allowances.
    linked-worktree runs), status is `failed`, `running`, or
    `waiting_for_valid_override`, and the resolved invocation still matches on
    repo root, workflow name, authoritative original plan path, effective team,
-   selected start step, max turns, extra instructions, and lifecycle setup.
+   selected start step, max turns, and lifecycle setup. Explicit CLI resume
+   inherits extra instructions when omitted, replaces them with text after
+   `--`, and clears them with a bare `--`; only the successor records the
+   replacement. Automatic candidate matching still compares instructions.
    Normally `last_snapshot.is_complete != true` and no `merge_status` exists.
    The sole exception is a completed `transition_end` run with failed merge
    status and reason plus configured merge teardown; its successor retries only

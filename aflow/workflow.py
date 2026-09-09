@@ -2022,13 +2022,22 @@ def _resume_identity_config_dir(
     """
     from .run_config_snapshot import SnapshotError, load_run_config_snapshot
 
-    if not config.reserved_run_id:
-        return config_dir
+    snapshot_run_id = config.reserved_run_id
+    if not snapshot_run_id:
+        # Direct CLI resume loads the predecessor snapshot before reserving
+        # its successor. Recognize only the exact repository-owned path.
+        candidate = config_dir.resolve()
+        runs_root = (config.repo_root / ".aflow" / "runs").resolve()
+        if candidate.parent.name != "config" or candidate.parent.parent.parent != runs_root:
+            return config_dir
+        snapshot_run_id = candidate.parent.parent.name
     try:
-        snapshot = load_run_config_snapshot(config.repo_root, config.reserved_run_id)
+        snapshot = load_run_config_snapshot(config.repo_root, snapshot_run_id)
     except SnapshotError:
         return config_dir
     if snapshot is None:
+        return config_dir
+    if not config.reserved_run_id and snapshot.config_path.resolve() != config_dir.resolve():
         return config_dir
     return Path(saved_identity.config_path if saved_identity is not None else snapshot.origin_config_path)
 
@@ -2465,6 +2474,9 @@ def load_scope_evidence_for_resume(
             manager_dir=source_root / "manager",
             run_json=source_root / "run.json",
         )
+        # An inherited envelope retains its original artifact paths while
+        # each continuation owns copied, digest-addressed evidence bytes.
+        envelope = _rebase_scope_envelope_evidence(paths, envelope)
         # Resolve both references through the source runlog validator. This
         # checks containment, digest, byte size, UTF-8, and checkpoint span.
         resolve_envelope_texts(paths, envelope)
@@ -6237,7 +6249,9 @@ def run_workflow(
     terminal_integration_only = bool(
         resume is not None and resume.terminal_integration_only
     )
-    if done and not terminal_integration_only:
+    if done and not terminal_integration_only and not (
+        resume is not None and resume.pending_finalized_turn is not None
+    ):
         prior_original_plan_path = original_plan_path
         finalized_original_plan_path = _finalize_original_plan_if_complete(
             config.repo_root,

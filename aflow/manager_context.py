@@ -35,9 +35,9 @@ MAX_MANAGER_NOTE_SCOPE_PATHS = 32
 MAX_MANAGER_NOTE_SCOPE_PATH_LENGTH = 240
 MAX_MANAGER_NOTE_SCOPE_IDENTITY_LENGTH = 512
 # Prompt budgets: the inline manager user manifest targets 16 KiB and is
-# hard-limited to 32 KiB before any provider process starts.
+# hard-limited to 40 KiB before any provider process starts.
 MANAGER_INLINE_CONTEXT_TARGET_BYTES = 16 * 1024
-MANAGER_INLINE_CONTEXT_MAX_BYTES = 32 * 1024
+MANAGER_INLINE_CONTEXT_MAX_BYTES = 40 * 1024
 MANAGER_SUMMARY_MAX_CHARS = 2_000
 MANAGER_RUN_EXTRACT_MAX_RECORDS = 12
 # One shared deterministic truncation marker for every bounded semantic

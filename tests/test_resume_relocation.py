@@ -349,3 +349,14 @@ def test_schema_v2_scope_evidence_is_bound_and_rebased_for_continuation(tmp_path
     rebased = _rebase_scope_envelope_evidence(continuation_paths, parse_envelope_bytes(envelope_bytes))
     assert resolve_envelope_texts(continuation_paths, rebased)[0] == plan_text
     assert envelope_bytes == envelope_path.read_bytes()
+    # A second resume reads the unchanged inherited envelope but must bind
+    # the evidence copied into its immediate predecessor, not the first run.
+    for relative in artifacts:
+        (source / relative).unlink()
+    assert load_scope_evidence_for_resume(continuation, scope, envelope_bytes) == artifacts
+    assert envelope_bytes == envelope_path.read_bytes()
+    checkpoint_artifact = continuation / next(path for path in artifacts if "/checkpoints/" in path)
+    checkpoint_artifact.write_bytes(b"corrupt")
+    from aflow.workflow import WorkflowError
+    with pytest.raises(WorkflowError, match="cannot bind scope envelope evidence"):
+        load_scope_evidence_for_resume(continuation, scope, envelope_bytes)

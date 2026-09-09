@@ -1386,12 +1386,7 @@ def _bootstrap_resume_invocation(
             f"error: resume max-turns mismatch: requested {max_turns_arg}, "
             f"but run '{resolved_run_id.name}' saved {max_turns}."
         )
-    if extra_instructions_provided and extra_instructions_arg != saved_extra:
-        raise ValueError(
-            f"error: resume extra-instructions mismatch: requested "
-            f"{list(extra_instructions_arg)!r}, but run '{resolved_run_id.name}' "
-            f"saved {list(saved_extra)!r}."
-        )
+    effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
     mismatch_reason = _resume_candidate_mismatch_reason(
         prev_run,
@@ -1435,7 +1430,7 @@ def _bootstrap_resume_invocation(
         team=effective_saved_team,
         start_step=saved_start_step,
         max_turns=max_turns,
-        extra_instructions=saved_extra,
+        extra_instructions=effective_extra,
         resume_context=resume_context,
         frozen_run_identity=frozen_run_identity,
         config_path=effective_config_path,
@@ -1455,6 +1450,7 @@ def _resume_candidate_mismatch_reason(
     current_extra_instructions: tuple[str, ...],
     *,
     allow_team_override: bool = False,
+    allow_extra_instructions_override: bool = False,
 ) -> str | None:
     """Check if the previous run is a valid resume candidate for the current invocation.
 
@@ -1507,6 +1503,7 @@ def _resume_candidate_mismatch_reason(
         isinstance(last_snapshot, dict)
         and last_snapshot.get("is_complete") is True
         and not terminal_integration_only
+        and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
     ):
         return "its last saved plan snapshot was already complete"
 
@@ -1543,7 +1540,10 @@ def _resume_candidate_mismatch_reason(
         return "its max-turns value does not match this invocation"
 
     prev_extra_instructions = prev_run.get("extra_instructions")
-    if not isinstance(prev_extra_instructions, list) or tuple(prev_extra_instructions) != current_extra_instructions:
+    if not isinstance(prev_extra_instructions, list) or (
+        not allow_extra_instructions_override
+        and tuple(prev_extra_instructions) != current_extra_instructions
+    ):
         return "its extra instructions do not match this invocation"
 
     if terminal_integration_only:
@@ -1635,13 +1635,54 @@ def _interrupted_resume_step(
     return current_step_name
 
 
+def _manager_budget_prelaunch_failed(run_dir: Path, prev_run: Mapping[str, object]) -> bool:
+    """Recognize one durable, unlaunched manager context-budget failure."""
+    number = prev_run.get("manager_decision_number")
+    turn = prev_run.get("active_turn")
+    if (
+        prev_run.get("status") != "failed"
+        or not isinstance(number, int) or isinstance(number, bool) or number < 1
+        or not isinstance(turn, int) or isinstance(turn, bool) or turn < 1
+    ):
+        return False
+    try:
+        result = json.loads((run_dir / "manager" / f"decision-{number:03d}" / "result.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(result, Mapping)
+        and result.get("decision_number") == number
+        and result.get("finalized_turn_number") == turn
+        and result.get("failure_stage") == "prelaunch"
+        and result.get("status") == "invalid"
+        and result.get("trigger") == "post_turn"
+        and isinstance(result.get("error"), str)
+        and result["error"].startswith("manager inline context exceeds the ")
+    )
+
+
+def _completed_manager_budget_boundary_pending(prev_run: Mapping[str, object], repo_root: Path) -> bool:
+    run_dir_value = prev_run.get("run_dir")
+    if not isinstance(run_dir_value, str):
+        return False
+    run_dir = Path(run_dir_value)
+    if not run_dir.is_absolute():
+        run_dir = repo_root / run_dir
+    if run_dir.resolve().parent != (repo_root / ".aflow" / "runs").resolve():
+        return False
+    if not _manager_budget_prelaunch_failed(run_dir, prev_run):
+        return False
+    pending = _pending_finalized_resume_turn(run_dir, prev_run)
+    return pending is not None and pending.snapshot_after.is_complete
+
+
 def _pending_finalized_resume_turn(
     run_dir: Path,
     prev_run: Mapping[str, object],
 ) -> PendingFinalizedTurn | None:
     """Recover a completed harness turn whose manager boundary never ran."""
     preflight = prev_run.get("environment_preflight")
-    blocked_manager_boundary = (
+    blocked_manager_boundary = _manager_budget_prelaunch_failed(run_dir, prev_run) or (
         prev_run.get("status") == "failed"
         and prev_run.get("failure_kind") == "environment_preflight"
         and isinstance(preflight, Mapping)
@@ -2180,6 +2221,7 @@ def _detect_resume_candidate(
             resume_bootstrap is not None
             and resume_bootstrap.resume_context.resume_team_override is not None
         ),
+        allow_extra_instructions_override=resume_bootstrap is not None,
     )
     if reason is not None:
         if require_resume:

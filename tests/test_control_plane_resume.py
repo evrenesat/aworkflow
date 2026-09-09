@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ from aflow.api.models import PreparedRun
 from aflow.config import GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
 from aflow.control_plane import InMemoryUnitManager, LaunchManifest, create_launch_manifest, read_events, write_launch_phase
 from aflow.control_plane.repository import RunRepository
-from aflow.daemon import AflowDaemon, DaemonConfig, _worker_prepared
+from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError, _worker_prepared
 
 
 def _workflow_config() -> WorkflowUserConfig:
@@ -31,7 +32,8 @@ def _workflow_config() -> WorkflowUserConfig:
 
 
 @pytest.mark.parametrize("source_phase", ("unit_started", "launch_started"))
-def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Path, monkeypatch, source_phase: str) -> None:
+@pytest.mark.parametrize("source_status,reconcile", (("running", True), ("failed", True), ("interrupted", True), ("running", False)))
+def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Path, monkeypatch, source_phase: str, source_status: str, reconcile: bool) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     config_path = repo_root / "aflow.toml"
@@ -62,7 +64,7 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     source_dir = repo_root / ".aflow" / "runs" / source_id
     source_dir.mkdir()
     source_dir.joinpath("run.json").write_text(
-        '{"status":"running","workflow_name":"managed","team":null,"selected_start_step":null}'
+        '{"status":"' + source_status + '","workflow_name":"managed","team":null,"selected_start_step":null}'
     )
     write_launch_phase(repo_root, source_id, source_phase)
     units = InMemoryUnitManager()
@@ -76,7 +78,7 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
         ),
         units=units,
     )
-    daemon.start()
+    daemon.start(persist_reconciliation=reconcile)
     bootstrap = SimpleNamespace(
         workflow_name="managed",
         plan_path=plan_path,
@@ -89,6 +91,19 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", lambda **kwargs: bootstrap)
 
     before = source_dir.joinpath("run.json").read_bytes()
+    if source_phase == "launch_started" and not reconcile:
+        # Exercise the admission guard before an activity projection has
+        # converted a killed launch into needs_attention.
+        repository = daemon.application.repository
+        source = repository.get_run_status(source_id)
+        assert not source.evidence["controller_terminal"]
+        monkeypatch.setattr(repository, "get_run_status", lambda _: replace(source, status="running"))
+        with pytest.raises(DaemonError, match="must be reconciled"):
+            daemon.service.resume(source_id, caller_scope="project:one", idempotency_key="resume-1")
+        assert units.start_calls == []
+        assert list(source_dir.parent.iterdir()) == [source_dir]
+        assert source_dir.joinpath("run.json").read_bytes() == before
+        return
     assert daemon.service.run_status(source_id).evidence["can_resume"] is True
     assert source_dir.joinpath("run.json").read_bytes() == before
     assert units.start_calls == []
@@ -114,7 +129,7 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     assert resume_context is bootstrap.resume_context
     source_events = read_events(source_dir)
     assert [event.event_type for event in source_events].count("resume_requested") == 1
-    assert source_dir.joinpath("run.json").read_text().startswith('{"status":"running"')
+    assert source_dir.joinpath("run.json").read_bytes() == before
 
 
 def test_daemon_rejects_legacy_resume_before_reserving_continuation(

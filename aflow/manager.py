@@ -623,7 +623,11 @@ def build_manager_prompts(
     ))
     user_prompt = (
         "MANAGER_CONTEXT_JSON:\n"
-        + json.dumps(dict(context), indent=2, sort_keys=True)
+        + (
+            json.dumps(dict(context), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+            if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+            else json.dumps(dict(context), indent=2, sort_keys=True)
+        )
         + "\n"
     )
     enforce_manager_inline_context_budget(context, user_prompt)
@@ -654,7 +658,7 @@ class ManagerInlineContextLimitError(ValueError):
 def enforce_manager_inline_context_budget(
     context: Mapping[str, Any], user_prompt: str
 ) -> None:
-    """Enforce the 32 KiB prelaunch hard limit on the exact UTF-8 user prompt."""
+    """Enforce the 40 KiB prelaunch hard limit on the exact UTF-8 user prompt."""
     total_bytes = len(user_prompt.encode("utf-8"))
     if total_bytes <= MANAGER_INLINE_CONTEXT_MAX_BYTES:
         return

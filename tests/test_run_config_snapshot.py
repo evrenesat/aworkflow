@@ -177,6 +177,24 @@ def test_snapshot_detects_unstable_manual_edits(tmp_path, global_pair, monkeypat
     assert not snapshot_directory(repo, "20260908t000000z-00000005").exists()
 
 
+def test_cli_resume_identity_uses_validated_predecessor_snapshot(tmp_path, global_pair):
+    from aflow.workflow import ControllerConfig, _resume_identity_config_dir
+
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    config = load_workflow_config(config_path)
+    identity = _freeze_run_identity("simple", config, config_dir=config_path)
+    snapshot = create_run_config_snapshot(
+        repo_root=repo, run_id="20260908t000000z-00000009",
+        config_path=config_path, workflow_name="simple",
+        fingerprint=identity.config_fingerprint,
+    )
+    controller = ControllerConfig(repo_root=repo, plan_path=repo / "plan.md")
+    assert _resume_identity_config_dir(controller, snapshot.config_path, identity) == config_path
+    unrelated = snapshot.config_path.with_name("other.toml")
+    assert _resume_identity_config_dir(controller, unrelated, identity) == unrelated
+
+
 def test_global_edit_after_snapshot_keeps_original_runnable(tmp_path, global_pair):
     """Config A stays resumable after global config B is saved (scenario 3)."""
     home, config_path = global_pair
@@ -208,6 +226,50 @@ def test_global_edit_after_snapshot_keeps_original_runnable(tmp_path, global_pai
     # so a legacy current-config comparison cannot silently substitute it.
     current = load_workflow_config(config_path)
     assert "simple" not in current.workflows
+
+
+def test_daemon_prepared_launch_validates_snapshot_after_global_edit(tmp_path, global_pair):
+    from aflow.api.models import PreparedRun
+    from aflow.control_plane import InMemoryUnitManager
+    from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
+
+    _, config_path = global_pair
+    repo = _repo(tmp_path)
+    original = load_workflow_config(config_path)
+    fingerprint = _freeze_run_identity("simple", original, config_dir=config_path).config_fingerprint
+    run_id = "20260909t000000z-00000001"
+    snapshot = create_run_config_snapshot(
+        repo_root=repo, run_id=run_id, config_path=config_path,
+        workflow_name="simple", fingerprint=fingerprint,
+    )
+    config_path.write_text(config_path.read_text().replace("test-model", "new-global-model"))
+    executable = repo / "aflow"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    environment_file = repo / "aflow.env"
+    environment_file.write_text("")
+    plan = repo / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] work\n")
+    daemon = AflowDaemon(DaemonConfig(
+        repo_root=repo, config_path=config_path, aflow_executable=executable,
+        environment_file=environment_file, release_identity="test",
+    ), units=InMemoryUnitManager())
+    daemon.start()
+    prepared = PreparedRun(
+        workflow_name="simple", repo_root=repo, plan_path=plan,
+        config_path=snapshot.config_path, max_turns=2, start_step="implement_plan",
+        team=None, extra_instructions=(),
+    )
+    manifest = daemon.service._manifest_for(
+        run_id=run_id, prepared=prepared, caller_scope="test",
+        idempotency_key="resume-1", workflow_config=original,
+    )
+    manifest = replace(manifest, intended_unit=f"aflow-run-{run_id}.service")
+    record = {"run_id": run_id, "effective_idempotency_key": "resume-1", "caller_scope": "test"}
+    daemon.service._assert_manifest_accepts_prepared(manifest, record, prepared)
+    snapshot.config_path.write_text(snapshot.config_path.read_text() + "# tampered\n")
+    with pytest.raises(DaemonError, match="was modified"):
+        daemon.service._assert_manifest_accepts_prepared(manifest, record, prepared)
 
 
 def test_copy_run_config_snapshot_preserves_origin(tmp_path, global_pair):

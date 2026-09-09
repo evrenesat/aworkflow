@@ -1,5 +1,62 @@
 # DEVLOG
 
+## 2026-09-09 — Replace stale instructions during CLI resume
+
+- Explicit CLI resume now replaces saved extra instructions when text follows
+  `--`, clears them with a bare `--`, and inherits them when omitted. Keep
+  automatic candidate matching strict and preserve predecessor evidence.
+- Doublangu's CP7 reviewer repeated CP6 review after checkpoint-specific
+  restart instructions were replayed as run-wide text. This change permits
+  correction without a fresh worktree or manual run-state edits. Explicit
+  review targeting and scoped recovery notes are planned separately.
+- Verification: 153 CLI tests and 127 subtests passed, including replacement,
+  clearing, preserved predecessor text and downstream resume admission.
+
+## 2026-09-09 — Validate resumed launches against their frozen configuration
+
+- Prepared-launch validation now loads the verified per-run configuration
+  snapshot, preserving its origin for fingerprint computation, instead of
+  comparing a resumed run against the daemon's current global configuration.
+- Regression covers a global model edit after reservation and continued
+  rejection when the saved snapshot is modified.
+- Verification: 74 snapshot/control-plane/daemon CLI tests passed; Ruff and
+  `git diff --check` passed.
+
+## 2026-09-09 — Bind copied scope evidence on repeated resume
+
+- Rebind inherited schema-v2 envelope paths in memory to the immediate source
+  run's copied evidence before resume validation. Envelopes remain unchanged;
+  digest, size, containment, UTF-8 and checkpoint-span validation still apply.
+- Doublangu's second resume otherwise looked for its first run's paths and
+  rejected valid copied evidence. Extend the continuation regression to remove
+  the ancestor evidence, bind the local copy, and reject a corrupted copy.
+- Verification: 191 relocation/resume/CLI tests and 128 subtests passed;
+  Ruff and `git diff --check` passed.
+
+## 2026-09-09 — Resume recorded controller failures
+
+- Allow an explicit daemon resume when the controller has durably finished,
+  even if the detached launch receipt still says `launch_started`. The former
+  guard incorrectly classified Doublangu's recorded checkpoint-review failure
+  as a killed process; reconciliation intentionally retained its terminal state.
+- Keep inactive-worker/unit checks and resume bootstrap validation. A launched
+  process without controller terminal evidence still requires reconciliation.
+- Extend resume tests across failed/interrupted controller states and verify
+  unreconciled killed launches cannot allocate a successor.
+- Verification: 28 resume/repository/reconciliation/service tests passed;
+  Ruff and `git diff --check` passed.
+
+## 2026-09-08 — Avoid formatting-induced manager context failures
+
+- Serialize schema-v3 manager prompts as compact UTF-8 JSON. Preserve every
+  field and the 32768-byte hard limit; legacy serialization remains unchanged.
+- Reconstructed Doublangu decision 20 from its saved boundary: pretty JSON was
+  33611 bytes, compact JSON 28754 bytes, with identical decoded content. The
+  original failure reported 33646 bytes; the read-only reconstruction is not
+  claimed byte-identical to the original prompt.
+- Added ASCII/Unicode regressions where formatting alone exceeds the cap and
+  verified existing oversized-input rejection. Manager/context tests: 98 passed.
+
 ## 2026-09-08 — Preserve history browsing and acknowledgement retries
 
 - Refresh every loaded run-history page, reconcile removals, and retain the
@@ -999,3 +1056,10 @@ Verification exercises installed `aflow ui-worker` → real controlled child →
 Owner follow-up: fixed the Settings toolbar disappearing on long scrolls by preventing its containing flex item from shrinking below its content. Chromium reproduced the original failure and verifies tabs/Save at 25%, 50%, 90% and full scroll on 390px/1365px light/dark layouts. Added `test_settings_browser.py` for the real layout boundary.
 
 Final verification: web tests (213), all server tests including Chromium layout (233), required worker/control-plane tests plus real-process diagnostics (82), and required API/auth/MCP/manager-context tests (89) passed. Web production build, Ruff and diff whitespace checks passed.
+
+## 2026-09-09 — Manager context recovery headroom
+
+- Raise the manager inline user-prompt hard limit from 32 to 40 KiB so the completed-checkpoint continuation can reach review after a 33,576-byte context rejection. Retain the 16 KiB target and prelaunch UTF-8 byte enforcement. Compact summaries with disk-backed history are planned separately.
+
+- Recovery also recognizes a durable manager context-budget prelaunch failure after a completed worker turn. Resume replays its validated manager boundary rather than rejecting the completed plan or skipping pending review; unrelated completed-run and consumed-boundary gates remain intact.
+- Preserve original configuration identity during direct CLI resume from a validated predecessor snapshot; retain fingerprint checks and reject unrelated paths.
