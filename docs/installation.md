@@ -59,10 +59,14 @@ aflow run path/to/plan.md
 
 ## Install Bundled Skills
 
-`aflow install-skills` copies the default bundled skills, including
+`aflow install-skills` refreshes the default bundled skills, including
 `aflow-harness-recovery-lead`, the read-only `aflow-manager`, and the strict
-read-only `aflow-repartition-checkpoint`, plus `material-code-review`, into every detected supported harness
-skill directory. The default `aflow-guard-development-run` skill launches new
+read-only `aflow-repartition-checkpoint`, plus `material-code-review`, in the
+canonical skill store and links them into every detected supported harness
+skill directory. Each link is an absolute directory symlink to
+`~/.config/aflow/skills/<name>`, so a saved skill edit is immediately visible
+through every linked harness without reinstalling. The default
+`aflow-guard-development-run` skill launches new
 legacy runs in tmux, then attaches one observer-only 30-minute heartbeat to the
 task that requested supervision. It stays silent while healthy, never repairs
 or steers implementation, audits the terminal result, and then stops. Remote
@@ -90,6 +94,12 @@ Manual destination:
 aflow install-skills ~/.claude/skills
 ```
 
+Manual destinations may not overlap the canonical skill store, and arbitrary
+other paths are accepted. Existing real skill directories at a destination are
+set aside and replaced by the link; unrelated destination entries are never
+touched, and the legacy `~/.config/opencode/skills` copy location is not
+migrated.
+
 Selection flags:
 
 - `--include-optional` installs the default bundled skills plus optional bundled skills, including `aflow-assistant`.
@@ -100,16 +110,25 @@ Selection flags:
 
 Auto-install destination map:
 
-| Harness | Destination |
-|---------|-------------|
-| `codex` | `~/.agents/skills` |
-| `copilot` | `~/.agents/skills` |
-| `gemini` | `~/.agents/skills` |
-| `pi` | `~/.agents/skills` |
-| `kiro` | `~/.kiro/skills` |
-| `muse` | `~/.agents/skills` |
-| `opencode` | `~/.config/opencode/skills` |
-| `claude` | `~/.claude/skills` |
+| Harness | Executable | Destination |
+|---------|------------|-------------|
+| `claude` | `claude` | `~/.claude/skills` |
+| `kiro` | `kiro-cli` | `~/.kiro/skills` |
+| `zcode` | `zcode` | `~/.zcode/skills` |
+| `codex` | `codex` | `~/.agents/skills` |
+| `copilot` | `copilot` | `~/.agents/skills` |
+| `dsh` | `dsh` | `~/.agents/skills` |
+| `gemini` | `gemini` | `~/.agents/skills` |
+| `muse` | `muse` | `~/.agents/skills` |
+| `opencode` | `opencode` | `~/.agents/skills` |
+| `pi` | `pi` | `~/.agents/skills` |
+| `reasonix` | `reasonix` | `~/.agents/skills` |
+
+The eight harnesses that share `~/.agents/skills` are deduplicated into one
+destination operation per selected skill. Repeating an installation is safe:
+correct links are left alone, wrong or dangling links are replaced, and the
+batch stops at the first failure with the remaining operations reported as
+unattempted.
 
 ## Canonical Skill Store and Refresh Behavior
 

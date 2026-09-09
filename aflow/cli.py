@@ -168,25 +168,35 @@ class ResumeBootstrap:
 
 
 INSTALL_SKILLS_HELP = """\
-Auto mode: omit DESTINATION to install the default bundled skills into each supported harness skill
-directory for the harness CLIs found on PATH.
+Auto mode: omit DESTINATION to refresh the default bundled skills in the canonical
+store and link them into each supported harness skill directory for the harness
+CLIs found on PATH.
 
-Manual mode: provide DESTINATION to install the default bundled skills into that root, one
-subdirectory per skill.
+Manual mode: provide DESTINATION to link the default bundled skills into that
+root, one subdirectory per skill. Destinations may not overlap the canonical
+skill store.
 
 Selection flags:
   --include-optional    Include optional bundled skills in the installation.
   --only SKILL          Install only the named skill(s). Can be repeated. Cannot be combined
                         with --include-optional.
 
+Installation links each skill as an absolute directory symlink to its saved copy
+in ~/.config/aflow/skills/<name>, so editing a saved skill updates every linked
+harness without reinstalling.
+
 Supported auto targets:
   claude -> ~/.claude/skills
+  kiro -> ~/.kiro/skills
+  zcode -> ~/.zcode/skills
   codex -> ~/.agents/skills
   copilot -> ~/.agents/skills
+  dsh -> ~/.agents/skills
   gemini -> ~/.agents/skills
-  kiro -> ~/.kiro/skills
-  opencode -> ~/.config/opencode/skills
+  muse -> ~/.agents/skills
+  opencode -> ~/.agents/skills
   pi -> ~/.agents/skills
+  reasonix -> ~/.agents/skills
 """
 
 
@@ -2933,12 +2943,25 @@ class TerminalObserver(ExecutionObserver):
         pass
 
 
+def _install_skills_exit_code(result) -> int:
+    """Wrap the structured installer result into the CLI exit convention."""
+    from .skill_installer import InstallResult
+
+    if result is None:
+        return 0
+    if isinstance(result, InstallResult):
+        if result.cancelled:
+            return 0
+        return 0 if result.succeeded else 1
+    return 0
+
+
 def run_install_skills(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(["install-skills"] + ([] if argv is None else argv))
     try:
         only_skills = _deduplicate_preserve_order(tuple(args.only)) if args.only else None
-        install_skills(
+        result = install_skills(
             destination=args.destination,
             yes=args.yes,
             only_skills=only_skills,
@@ -2947,7 +2970,7 @@ def run_install_skills(argv: list[str] | None = None) -> int:
     except InstallerError as exc:
         print(exc, file=sys.stderr)
         return 1
-    return 0
+    return _install_skills_exit_code(result)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2972,7 +2995,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install-skills":
         try:
             only_skills = _deduplicate_preserve_order(tuple(args.only)) if args.only else None
-            install_skills(
+            result = install_skills(
                 destination=args.destination,
                 yes=args.yes,
                 only_skills=only_skills,
@@ -2981,7 +3004,7 @@ def main(argv: list[str] | None = None) -> int:
         except InstallerError as exc:
             print(exc, file=sys.stderr)
             return 1
-        return 0
+        return _install_skills_exit_code(result)
 
     if args.command == "ui":
         from .ui_cli import handle_ui_command
