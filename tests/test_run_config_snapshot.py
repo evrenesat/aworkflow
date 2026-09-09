@@ -272,6 +272,32 @@ def test_daemon_prepared_launch_validates_snapshot_after_global_edit(tmp_path, g
         daemon.service._assert_manifest_accepts_prepared(manifest, record, prepared)
 
 
+def test_workflow_flag_edit_after_snapshot_keeps_original_frozen(tmp_path, global_pair):
+    """A live manager_enabled edit affects new runs, never the snapshot."""
+    home, config_path = global_pair
+    repo = _repo(tmp_path)
+    workflow_config = load_workflow_config(config_path)
+    assert workflow_config.workflows["simple"].manager_enabled is False
+    fingerprint = _freeze_run_identity("simple", workflow_config, config_dir=config_path).config_fingerprint
+    run_id = "20260908t000000z-00000009"
+    snapshot = create_run_config_snapshot(
+        repo_root=repo, run_id=run_id, config_path=config_path,
+        workflow_name="simple", fingerprint=fingerprint,
+    )
+
+    # A live edit enables supervision for subsequently reserved runs.
+    home.joinpath(".config/aflow/workflows.toml").write_text(
+        VALID_WORKFLOWS + "\n[workflow]\nmanager_enabled = true\n",
+        encoding="utf-8",
+    )
+
+    # The frozen snapshot still resolves the original disabled value.
+    loaded = load_workflow_config(snapshot.config_path)
+    assert loaded.workflows["simple"].manager_enabled is False
+    recomputed = _freeze_run_identity("simple", loaded, config_dir=Path(snapshot.origin_config_path))
+    assert recomputed.config_fingerprint == fingerprint
+
+
 def test_copy_run_config_snapshot_preserves_origin(tmp_path, global_pair):
     home, config_path = global_pair
     repo = _repo(tmp_path)

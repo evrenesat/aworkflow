@@ -100,19 +100,20 @@ describe('PlanPanel', () => {
   })
 
   it('creates a plan in the todo lifecycle and opens it', async () => {
+    const template = '# Plan\n\n## Summary\n\nDescribe the desired behavior.\n\n## Git Tracking\n\n- Plan Branch: ``\n- Pre-Handoff Base HEAD: ``\n\n### [ ] Checkpoint 1: Describe the first deliverable\n'
     const created: PlanDocument = { ...todoPlan, size_bytes: 8 }
     vi.mocked(api.createProjectPlan).mockResolvedValue(created)
-    vi.mocked(api.readProjectPlan).mockResolvedValue({ ...created, content: '# Plan\n\n' })
+    vi.mocked(api.readProjectPlan).mockResolvedValue({ ...created, content: template })
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     fireEvent.change(screen.getByLabelText('New plan filename'), { target: { value: 'plan-a.md' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create plan' }))
 
     await waitFor(() => expect(api.createProjectPlan).toHaveBeenCalledWith('alpha', {
       name: 'plan-a.md',
-      content: '# Plan\n\n',
     }))
     await screen.findByLabelText('Plan content')
-    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Plan\n\n')
+    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe(template)
+    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toContain('### [ ] Checkpoint 1:')
     await waitFor(() => expect(api.listProjectPlans).toHaveBeenCalledTimes(2))
   })
 

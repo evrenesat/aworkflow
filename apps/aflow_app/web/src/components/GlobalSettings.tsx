@@ -7,8 +7,10 @@ import { RecentRunsLimit } from './GlobalRunOverview'
 import { Combobox } from './Combobox'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { PromptsSettings, type DeletedPrompt } from './PromptsSettings'
+import { SkillsSettings } from './SkillsSettings'
+import type { SkillDetail, SkillInstallResult, SkillSummary } from '../types'
 
-const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'General'] as const
+const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General'] as const
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 
 export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dirty: boolean) => void; onSaved: (saved: ProjectConfig) => void }) {
@@ -40,6 +42,20 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [newTeamError, setNewTeamError] = useState<string | null>(null)
   const [pendingFocusTeam, setPendingFocusTeam] = useState<string | null>(null)
   const [starter, setStarter] = useState({ workflow: 'cp', main_branch: 'main' })
+  // Skills domain: list, per-skill content/revision baselines, and drafts are
+  // owned here so switching skill, tab, or Advanced TOML preserves them.
+  // Skills never enter TOML documents and stay usable without the config projection.
+  const [skills, setSkills] = useState<SkillSummary[] | null>(null)
+  const [skillsError, setSkillsError] = useState<string | null>(null)
+  const [selectedSkill, setSelectedSkill] = useState('')
+  const [skillContents, setSkillContents] = useState<Record<string, string>>({})
+  const [skillRevisions, setSkillRevisions] = useState<Record<string, string>>({})
+  const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
+  const [skillContentLoading, setSkillContentLoading] = useState(false)
+  const [skillContentError, setSkillContentError] = useState<string | null>(null)
+  const [installing, setInstalling] = useState(false)
+  const [installResult, setInstallResult] = useState<SkillInstallResult | null>(null)
+  const [installError, setInstallError] = useState<string | null>(null)
   // Bumped by every load/discard so a response that resolves after an
   // explicit discard can never restore cleared edits.
   const epochRef = useRef(0)
@@ -71,25 +87,77 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setServer(saved); setServerText(saved.advanced_toml)
     setServerDraft({ bind_host: saved.bind_host, bind_port: String(saved.bind_port), managed_projects_root: saved.managed_projects_root })
   }
+  function acceptSkills(list: SkillSummary[], epoch: number) {
+    if (epochRef.current !== epoch) return
+    setSkills(list); setSkillsError(null)
+    setSelectedSkill(current => (current && list.some(skill => skill.name === current) ? current : list[0]?.name ?? ''))
+  }
+  /** Loads one skill's content/revision baseline on selection; drafts win over reloads. */
+  async function ensureSkillContent(name: string, epoch: number) {
+    if (!name || skillContents[name] !== undefined || skillInflight.current.has(name)) return
+    skillInflight.current.add(name)
+    setSkillContentLoading(true); setSkillContentError(null)
+    try {
+      const detail: SkillDetail = await api.readSkill(name)
+      if (epochRef.current !== epoch) return
+      setSkillContents(contents => (contents[name] === undefined ? { ...contents, [name]: detail.content } : contents))
+      setSkillRevisions(revisions => (revisions[name] === undefined ? { ...revisions, [name]: detail.revision } : revisions))
+      setSkills(list => list?.map(skill => (skill.name === name
+        ? { ...skill, revision: detail.revision, source: detail.source, edited: detail.edited, installed: detail.installed, links: detail.links, detected_harnesses: detail.detected_harnesses }
+        : skill)) ?? null)
+    } catch (reason) {
+      if (epochRef.current !== epoch) return
+      setSkillContentError(reason instanceof Error ? reason.message : 'Could not load the skill content.')
+    } finally {
+      skillInflight.current.delete(name)
+      if (epochRef.current === epoch) setSkillContentLoading(false)
+    }
+  }
+  const skillInflight = useRef(new Set<string>())
+  function selectSkill(name: string) {
+    setSelectedSkill(name)
+    void ensureSkillContent(name, epochRef.current)
+  }
+  // Selection defaults arrive asynchronously from the skill list; fetch the
+  // baseline content for whatever ends up selected.
+  useEffect(() => {
+    if (selectedSkill && skillContents[selectedSkill] === undefined && !skillInflight.current.has(selectedSkill)) {
+      void ensureSkillContent(selectedSkill, epochRef.current)
+    }
+  }, [selectedSkill, skills, skillContents]) // eslint-disable-line react-hooks/exhaustive-deps
   async function load() {
     const epoch = ++epochRef.current
     setBusy(true); setError(null)
     const results = await Promise.allSettled([
       api.getGlobalConfig().then(saved => acceptConfig(saved, epoch)), api.getSettings().then(saved => acceptServer(saved, epoch)),
+      api.listSkills().then(list => acceptSkills(list, epoch)),
     ])
     if (epochRef.current !== epoch) return
     const failures = results.filter(result => result.status === 'rejected')
-    if (failures.length) setError('Some settings could not be loaded. Reload to retry.')
+    if (failures.length) {
+      if (results[2]?.status === 'rejected') {
+        const reason = (results[2] as PromiseRejectedResult).reason
+        setSkillsError(reason instanceof Error ? reason.message : 'Could not load the skill list.')
+      }
+      setError('Some settings could not be loaded. Reload to retry.')
+    }
     setBusy(false)
+    const loaded = results[2]?.status === 'fulfilled' ? ((results[2] as unknown as PromiseFulfilledResult<SkillSummary[]>).value ?? []) : []
+    const current = selectedSkill || loaded[0]?.name || ''
+    if (current) void ensureSkillContent(current, epoch)
   }
   /** Explicit confirmed discard: every pending edit is dropped up front. */
   function discardAndReload() {
     setDeletedPrompts([])
+    // Bumping the epoch invalidates stale skill reads/saves as well as config loads.
     epochRef.current += 1
     setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
     setPendingNames({}); setRawEdited(false); setError(null); setNotice(null); setProjectionError(null)
     setTexts(['', '']); setSnapshot(null); setProjection(null); setBaseline(null); setDraft(null)
     setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
+    setSkills(null); setSkillsError(null); setSelectedSkill(''); setSkillContents({}); setSkillRevisions({}); setSkillDrafts({})
+    skillInflight.current.clear()
+    setSkillContentLoading(false); setSkillContentError(null); setInstallResult(null); setInstallError(null)
     void load()
   }
   async function retryProjection() {
@@ -108,7 +176,10 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const configDirty = (rawEdited && Object.keys(documents).length > 0) || actions.length > 0 || Object.entries(pendingNames).some(([name, target]) => name !== target && name in (draft?.prompts ?? {}))
   const pendingCreation = Object.values(newProfile).some(Boolean) || Object.values(newRole).some(Boolean)
   const serverDirty = Boolean(server && (password || serverText !== server.advanced_toml || serverDraft.bind_host !== server.bind_host || serverDraft.bind_port !== String(server.bind_port) || serverDraft.managed_projects_root !== server.managed_projects_root))
-  const dirty = configDirty || pendingCreation || serverDirty
+  // Skill drafts live outside TOML documents and join the same dirty guard.
+  const dirtySkillNames = Object.keys(skillDrafts).filter(name => skillContents[name] !== undefined && skillDrafts[name] !== skillContents[name]).sort()
+  const skillsDirty = dirtySkillNames.length > 0
+  const dirty = configDirty || pendingCreation || serverDirty || skillsDirty
   useEffect(() => { onDirtyChange(dirty); return () => onDirtyChange(false) }, [dirty, onDirtyChange])
   useEffect(() => {
     if (!dirty) return
@@ -201,6 +272,48 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     }
     return { pair, result }
   }
+  // Manager supervision preview: declared flags resolve canonically
+  // (override → concrete base → defaults → false) on the server. While the
+  // draft carries unsaved manager declarations, refresh only the effective
+  // values/sources from the server projection and keep the pending
+  // declarations; replies superseded by newer edits are discarded.
+  const managerPreviewSeq = useRef(0)
+  const managerDeclarations = draft ? JSON.stringify([draft.default_manager_enabled ?? null, Object.keys(draft.workflows).sort().map(name => [name, draft.workflows[name].manager_enabled ?? null])]) : ''
+  useEffect(() => {
+    if (!draft || !baseline || !snapshot) return
+    const operations = settingsActions(baseline, draft)
+    if (!operations.some(action => action.type === 'set_default_manager_enabled' || action.type === 'set_workflow_manager_enabled')) return
+    const seq = ++managerPreviewSeq.current
+    const requested = managerDeclarations
+    previewActions(operations).then(({ result }) => {
+      if (managerPreviewSeq.current !== seq || !result?.form) return
+      const projected = result.form
+      setDraft(next => {
+        if (!next || managerPreviewSeq.current !== seq) return next
+        // Declarations moved on while the preview was in flight: a newer
+        // preview owns the display, or none does when the edit reverted to
+        // a clean state. Never apply a resolution to other declarations.
+        const current = JSON.stringify([next.default_manager_enabled ?? null, Object.keys(next.workflows).sort().map(name => [name, next.workflows[name].manager_enabled ?? null])])
+        if (current !== requested) return next
+        const workflows = { ...next.workflows }
+        for (const [name, summary] of Object.entries(next.workflows)) {
+          const resolved = projected.workflows[name]
+          workflows[name] = {
+            ...summary,
+            effective_manager_enabled: resolved?.effective_manager_enabled ?? summary.effective_manager_enabled ?? false,
+            manager_enabled_source: resolved?.manager_enabled_source ?? summary.manager_enabled_source ?? 'defaults',
+          }
+        }
+        return { ...next, workflows }
+      })
+    }).catch(() => { /* keep the last known effective values */ })
+  }, [managerDeclarations]) // eslint-disable-line react-hooks/exhaustive-deps
+  /** Human-readable source for one workflow's resolved supervision value. */
+  function managerSourceLabel(source: string | null | undefined): string {
+    if (source?.startsWith('base:')) return `base ${source.slice('base:'.length)}`
+    if (source === 'workflow') return 'this workflow'
+    return 'defaults'
+  }
   async function toggleAdvanced() {
     setBusy(true); setError(null)
     try {
@@ -222,13 +335,72 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not switch editors') }
     finally { setBusy(false) }
   }
+  /** Shared installer action: one call, no draft changes, then clean baselines reload. */
+  async function installSkillsAction() {
+    if (installing || skillsDirty) return
+    const epoch = epochRef.current
+    setInstalling(true); setInstallError(null); setInstallResult(null)
+    try {
+      const result = await api.installSkills()
+      if (epochRef.current !== epoch) return
+      setInstallResult(result)
+      // Refresh rewrites unedited canonical trees: reload clean baselines so the
+      // new bytes are reflected. No draft can be dirty here; drop no-op duplicates.
+      const list = await api.listSkills()
+      if (epochRef.current !== epoch) return
+      setSkills(list); setSkillsError(null); setSkillDrafts({})
+      setSkillContents({})
+      setSkillRevisions(Object.fromEntries(list.map(skill => [skill.name, skill.revision])))
+      const next = selectedSkill && list.some(skill => skill.name === selectedSkill) ? selectedSkill : list[0]?.name ?? ''
+      setSelectedSkill(next)
+      // Reload the selected baseline immediately so an edit cannot save
+      // against a cleared revision; other skills reload lazily on selection.
+      if (next) {
+        setSkillContentLoading(true); setSkillContentError(null)
+        try {
+          const detail: SkillDetail = await api.readSkill(next)
+          if (epochRef.current !== epoch) return
+          setSkillContents({ [next]: detail.content })
+          setSkillRevisions(revisions => ({ ...revisions, [next]: detail.revision }))
+        } catch (reason) {
+          if (epochRef.current !== epoch) return
+          setSkillContentError(reason instanceof Error ? reason.message : 'Could not load the skill content.')
+        } finally {
+          if (epochRef.current === epoch) setSkillContentLoading(false)
+        }
+      }
+    } catch (reason) {
+      if (epochRef.current !== epoch) return
+      setInstallError(reason instanceof Error ? reason.message : 'Installation failed.')
+    } finally {
+      if (epochRef.current === epoch) setInstalling(false)
+    }
+  }
+  function applySkillAck(acked: SkillDetail) {
+    setSkillContents(contents => ({ ...contents, [acked.name]: acked.content }))
+    setSkillRevisions(revisions => ({ ...revisions, [acked.name]: acked.revision }))
+    setSkillDrafts(drafts => { const next = { ...drafts }; delete next[acked.name]; return next })
+    setSkills(list => list?.map(skill => (skill.name === acked.name
+      ? { ...skill, revision: acked.revision, source: acked.source, edited: acked.edited, installed: acked.installed, links: acked.links, detected_harnesses: acked.detected_harnesses }
+      : skill)) ?? null)
+  }
   async function save() {
-    if (!snapshot || busy) return
+    if (busy) return
+    const epoch = epochRef.current
     setBusy(true); setError(null); setNotice(null)
     let configSaved = false
+    const savedSkills: string[] = []
     try {
-      const operations = candidate().actions
       // Validate all dirty domains before the first write; password is in the final write.
+      // Skills prevalidate read-only; every PUT repeats its checks under the store lock.
+      const skillCandidates = dirtySkillNames.map(name => ({ name, content: skillDrafts[name], expected_revision: skillRevisions[name] ?? '' }))
+      if (skillCandidates.length) {
+        const verdicts = await api.validateSkills(skillCandidates)
+        if (epochRef.current !== epoch) return
+        const rejected = verdicts.filter(entry => !entry.ok)
+        if (rejected.length) throw new Error(rejected.map(entry => `${entry.name}: ${entry.error ?? entry.error_code ?? 'rejected'}`).join(' '))
+      }
+      const operations = candidate().actions
       const serverUpdates: SettingsSaveRequest = { expected_revision: server?.revision ?? '' }
       if (serverDirty && server) {
         const projected = serverText !== server.advanced_toml ? await api.projectSettingsText(serverText) : {}
@@ -241,26 +413,58 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         if (serverUpdates.bind_port !== undefined && (!Number.isInteger(serverUpdates.bind_port) || Number(serverUpdates.bind_port) < 1 || Number(serverUpdates.bind_port) > 65535)) throw new Error('Server port must be between 1 and 65535.')
         if (password) serverUpdates.password = password
       }
+      // Workflow configuration saves first so later skill failures keep acknowledged config.
       if (configDirty || pendingCreation) {
+        if (!snapshot) throw new Error('Workflow settings have not loaded.')
         const pair = (await previewActions(operations)).pair
         const validation = await api.validateGlobalConfig(pair)
         if (validation.state === 'invalid' || validation.placeholders.length) throw new Error(validation.issues.map(issue => issue.message).join(' ') || 'Replace placeholder selectors before saving.')
         const saved = await api.patchGlobalConfig({ expected_revision: snapshot.revision, ...(rawEdited ? { documents: changedDocuments(snapshot, [pair.aflow_toml, pair.workflows_toml]) } : { actions: operations }) })
+        if (epochRef.current !== epoch) return
         // Acknowledged writes are cleared even if a later projection or server write fails.
         if (selectedPrompt.startsWith('named:') && pendingNames[selectedPrompt.slice(6)]) setSelectedPrompt(`named:${pendingNames[selectedPrompt.slice(6)]}`)
         configSaved = true; setDeletedPrompts([]); setSnapshot(saved); setTexts([saved.aflow_toml, saved.workflows_toml]); setBaseline(candidate().form); setDraft(candidate().form); setPendingNames({}); setRawEdited(false)
         setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
         onSaved(saved)
         await acceptConfig(saved, epochRef.current)
+        if (epochRef.current !== epoch) return
       }
-      if (Object.keys(serverUpdates).length > 1) { acceptServer(await api.saveSettings(serverUpdates), epochRef.current); setPassword('') }
+      // Dirty skills save in sorted name order; each clears only on its own
+      // acknowledgement, so a 409/network/write failure preserves the rest.
+      for (const name of dirtySkillNames) {
+        try {
+          const acked = await api.saveSkill(name, { content: skillDrafts[name], expected_revision: skillRevisions[name] ?? '' })
+          if (epochRef.current !== epoch) return
+          savedSkills.push(name)
+          applySkillAck(acked)
+        } catch (reason) {
+          if (epochRef.current !== epoch) return
+          const detail = (reason as { detail?: { current_revision?: string } })?.detail
+          const current = typeof detail?.current_revision === 'string' ? ` (server revision ${detail.current_revision.slice(0, 12)}…)` : ''
+          throw new Error(`Skill ${name} was not saved${current}: ${reason instanceof Error ? reason.message : 'save failed'}. Saved skills stay saved; remaining drafts are kept`)
+        }
+      }
+      if (Object.keys(serverUpdates).length > 1) {
+        if (!server) throw new Error('Server settings have not loaded.')
+        acceptServer(await api.saveSettings(serverUpdates), epochRef.current); setPassword('')
+      }
       else if (server) setServerText(server.advanced_toml)
-      setNotice('All changes saved. New runs use the saved configuration; existing runs keep their snapshot.')
+      if (epochRef.current !== epoch) return
+      const parts: string[] = []
+      if (configSaved) parts.push('Workflow settings saved; new runs use the saved configuration, existing runs keep their snapshot.')
+      if (savedSkills.length) parts.push(`Skill text saved for ${savedSkills.join(', ')}; the next manager invocation uses it.`)
+      setNotice(parts.length ? parts.join(' ') : 'All changes saved.')
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Save failed'
-      setError(`${configSaved ? 'Workflow configuration saved. Remaining settings were not saved. ' : ''}${message}. Your remaining edits are retained; reload explicitly to reapply after a conflict.`)
+      const acknowledged = configSaved && savedSkills.length
+        ? `Workflow configuration saved. Skills saved: ${savedSkills.join(', ')}.`
+        : configSaved
+          ? 'Workflow configuration saved. Remaining settings were not saved.'
+          : savedSkills.length ? `Skills saved: ${savedSkills.join(', ')}.` : null
+      setError(`${acknowledged ? `${acknowledged} ` : ''}${message}. Your remaining edits are retained; reload explicitly to reapply after a conflict.`)
     } finally { setBusy(false) }
   }
+  const effectiveSkill = selectedSkill || skills?.[0]?.name || ''
   const selectors = draft ? Object.entries(draft.harnesses).flatMap(([h, profiles]) => Object.keys(profiles).map(p => `${h}.${p}`)) : []
   function profileFields(harness: string, profile: string, model: string, effort: string, update: (field: 'model' | 'effort', text: string) => void) {
     const suggestions = projection?.suggestions.profiles.filter(p => p.harness === harness) ?? []
@@ -290,7 +494,23 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
     </div>
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <label key={index}>{index ? 'workflows.toml' : 'aflow.toml'}<textarea className="input mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></label>)}</div> : tab === 'General' ? <div className="settings-fields">
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <label key={index}>{index ? 'workflows.toml' : 'aflow.toml'}<textarea className="input mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></label>)}</div> : tab === 'Skills' ? <SkillsSettings
+      skills={skills}
+      loadError={skillsError}
+      selected={effectiveSkill}
+      onSelect={selectSkill}
+      content={effectiveSkill && skillContents[effectiveSkill] !== undefined ? skillContents[effectiveSkill] : null}
+      contentLoading={skillContentLoading}
+      contentError={skillContentError}
+      draft={effectiveSkill && skillDrafts[effectiveSkill] !== undefined ? skillDrafts[effectiveSkill] : null}
+      unsavedNames={dirtySkillNames}
+      onEdit={(name, text) => setSkillDrafts(drafts => ({ ...drafts, [name]: text }))}
+      hasUnsavedEdits={skillsDirty}
+      onInstall={() => void installSkillsAction()}
+      installing={installing}
+      installResult={installResult}
+      installError={installError}
+    /> : tab === 'General' ? <div className="settings-fields">
       <AppearanceSelector /><RecentRunsLimit />
       <h3>Server settings</h3>
       {server && Object.values(server.restart).some(Boolean) && <p role="status">Saved server binding or root changes require a server restart.</p>}
@@ -330,7 +550,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           </fieldset>
         })}
       </SidebarEditorLayout>}
-      {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} navigation={<div>{['Defaults', ...Object.keys(draft.workflows).sort()].map(name => <button className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={Object.keys(draft.workflows)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{workflow}</h3><p>{(value.executable_steps ?? value.declared_steps).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{Object.keys(draft.teams).map(team => <option key={team}>{team}</option>)}</select></label></div>)}</div></SidebarEditorLayout>}
+      {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} navigation={<div>{['Defaults', ...Object.keys(draft.workflows).sort()].map(name => <button className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={Object.keys(draft.workflows)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{workflow}</h3><p>{(value.executable_steps ?? value.declared_steps).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{Object.keys(draft.teams).map(team => <option key={team}>{team}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${workflow}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
       {tab === 'Prompts' && <PromptsSettings selected={selectedPrompt} onSelect={setSelectedPrompt} draft={draft} change={change} names={pendingNames} rename={(name, target) => setPendingNames({ ...pendingNames, [name]: target })}
         deleted={deletedPrompts}
         onDelete={(name, text) => {

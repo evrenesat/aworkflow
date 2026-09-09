@@ -1,6 +1,7 @@
 from tests._support import *  # noqa: F401,F403
 from contextlib import nullcontext
 from dataclasses import replace
+from unittest.mock import patch
 import errno
 import hashlib
 from typing import Mapping
@@ -27,6 +28,7 @@ from aflow.run_state import (
     resolve_resume_override,
 )
 from aflow.runlog import RunMetadataWriter, create_run_paths
+from aflow.skill_store import SkillStore
 from aflow.workflow import (
     _execute_init_repo_handoff,
     _freeze_run_identity,
@@ -190,6 +192,7 @@ def _resume_override_context(
 def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
     """Build a minimal supervised workflow for pressure-boundary regressions."""
     workflow = WorkflowConfig(
+        manager_enabled=True,
         steps={
             "step": WorkflowStepConfig(
                 role=role,
@@ -216,7 +219,6 @@ def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
         workflows={"managed": workflow},
         prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
         manager=ManagerConfig(
-            enabled=True,
             lite_role="manager_lite",
             full_role="manager_full",
         ),
@@ -225,6 +227,7 @@ def _pressure_workflow_config(*, role: str) -> WorkflowUserConfig:
 
 def _clean_end_manager_workflow_config() -> WorkflowUserConfig:
     workflow = WorkflowConfig(
+        manager_enabled=True,
         steps={
             "impl": WorkflowStepConfig(
                 role="architect",
@@ -248,7 +251,6 @@ def _clean_end_manager_workflow_config() -> WorkflowUserConfig:
         workflows={"managed": workflow},
         prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
         manager=ManagerConfig(
-            enabled=True,
             lite_role="manager_lite",
             full_role="manager_full",
         ),
@@ -372,6 +374,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     )
 
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={'review': WorkflowStepConfig(
                     role='reviewer', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
                 )},
@@ -393,7 +396,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 workflows={'managed': workflow},
                 prompts={'p': 'Review the plan.'},
                 manager=ManagerConfig(
-                    enabled=True, lite_role='manager_lite', full_role='manager_full',
+                    lite_role='manager_lite', full_role='manager_full',
                 ),
             )
             calls = 0
@@ -4053,6 +4056,7 @@ class WorkflowArtifactTests(unittest.TestCase):
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={'impl': WorkflowStepConfig(
                     role='worker',
                     prompts=('p',),
@@ -4072,7 +4076,6 @@ class WorkflowArtifactTests(unittest.TestCase):
                 workflows={'managed': workflow},
                 prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role='manager_full',
                     full_role='manager_full',
                 ),
@@ -8698,6 +8701,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             (source_turn / 'stderr.txt').write_text('', encoding='utf-8')
 
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     'review': WorkflowStepConfig(
                         role='reviewer',
@@ -8751,7 +8755,6 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 workflows={'managed': workflow},
                 prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role='manager_lite',
                     full_role='manager_full',
                     full_after_stalled_turns=99,
@@ -10646,6 +10649,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={'impl': WorkflowStepConfig(
                     role='architect',
                     prompts=('p',),
@@ -10667,7 +10671,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={'managed': workflow},
                 prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role='manager_lite',
                     full_role='manager_full',
                 ),
@@ -10738,6 +10741,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={'impl': WorkflowStepConfig(
                     role='architect', prompts=('p',), go=(GoTransition(to='END'),),
                 )},
@@ -10757,7 +10761,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={'managed': workflow},
                 prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role='manager_lite',
                     full_role='manager_full',
                 ),
@@ -10809,6 +10812,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={'impl': WorkflowStepConfig(
                     role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
                 )},
@@ -10827,7 +10831,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 })},
                 workflows={'managed': workflow},
                 prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
-                manager=ManagerConfig(enabled=True, lite_role='manager_lite', full_role='manager_full'),
+                manager=ManagerConfig(lite_role='manager_lite', full_role='manager_full'),
             )
             calls = 0
 
@@ -10879,6 +10883,83 @@ class LifecycleBootstrapTests(unittest.TestCase):
             stored = json.loads((decision_dir / 'context.json').read_text(encoding='utf-8'))
             assert rebuilt == stored
 
+    def test_selected_workflow_flag_routes_supervised_and_unsupervised_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            steps = {'impl': WorkflowStepConfig(
+                role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'),),
+            )}
+            wf_config = WorkflowUserConfig(
+                roles={
+                    'architect': 'codex.default',
+                    'manager_lite': 'codex.nano',
+                    'manager_full': 'codex.high',
+                },
+                harnesses={'codex': WorkflowHarnessConfig(profiles={
+                    'default': HarnessProfileConfig(model='default'),
+                    'nano': HarnessProfileConfig(model='nano'),
+                    'high': HarnessProfileConfig(model='high'),
+                })},
+                workflows={
+                    'supervised': WorkflowConfig(
+                        manager_enabled=True, steps=dict(steps), first_step='impl',
+                    ),
+                    'plain': WorkflowConfig(
+                        steps=dict(steps), first_step='impl',
+                    ),
+                },
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+                manager=ManagerConfig(lite_role='manager_lite', full_role='manager_full'),
+            )
+            assert wf_config.workflows['supervised'].manager_enabled is True
+            assert not wf_config.workflows['plain'].manager_enabled
+
+            def make_runner():
+                calls = 0
+
+                def runner(argv, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        _write_plan(plan_path, _COMPLETE_PLAN)
+                        return subprocess.CompletedProcess(argv, 0, 'work complete', '')
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        'schema_version': 1,
+                        'action': 'continue',
+                        'reason': 'The completed plan permits END.',
+                        'next_step_notes': [],
+                        'stop_report': None,
+                    }), '')
+                runner.calls = lambda: calls  # type: ignore[attr-defined]
+                return runner
+
+            supervised_runner = make_runner()
+            supervised = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config, 'supervised', config_dir=repo_root,
+                    snapshot_config=False,
+                adapter=CodexAdapter(), runner=supervised_runner,
+            )
+            assert supervised_runner.calls() == 2
+            supervised_decision = supervised.run_dir / 'manager' / 'decision-001'
+            assert (supervised_decision / 'result.json').is_file()
+            assert json.loads(
+                (supervised_decision / 'result.json').read_text(encoding='utf-8')
+            )['status'] == 'accepted'
+
+            _write_plan(plan_path, _VALID_PLAN)
+            plain_runner = make_runner()
+            plain = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config, 'plain', config_dir=repo_root,
+                    snapshot_config=False,
+                adapter=CodexAdapter(), runner=plain_runner,
+            )
+            assert plain_runner.calls() == 1
+            assert not (plain.run_dir / 'manager').exists()
+
     def test_incident_shaped_64kib_plan_manager_prompt_is_compact(self) -> None:
         """The 2026-09-02 incident shape: a 64 KiB active plan must yield a
         compact reference-only manager prompt and can never fail execve with
@@ -10902,6 +10983,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert 60_000 <= len(completed_plan_text.encode('utf-8')) <= 68_000
             _write_plan(plan_path, plan_text)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={'impl': WorkflowStepConfig(
                     role='architect', prompts=('p',),
                     go=(GoTransition(to='END', when='DONE'),),
@@ -10922,7 +11004,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={'managed': workflow},
                 prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role='manager_lite',
                     full_role='manager_full',
                 ),
@@ -11009,6 +11090,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
@@ -11073,7 +11155,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                     full_after_stalled_turns=99,
@@ -11176,6 +11257,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             _write_plan(plan_path, original_plan_text)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
@@ -11233,7 +11315,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                     full_after_stalled_turns=99,
@@ -11642,6 +11723,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             boundary_observations: list[str] = []
             parent_scope_ids: list[str] = []
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
@@ -11685,7 +11767,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                 ),
@@ -11922,6 +12003,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             high_worker_calls = 0
             boundary_observations: list[str] = []
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
@@ -11972,7 +12054,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                 ),
@@ -12730,6 +12811,80 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert [event.decision_number for event in started].count(1) == 1
             assert [event.decision_number for event in decided].count(1) == 1
 
+    def test_manager_prompts_read_saved_skill_between_fake_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            home_dir = repo_root / "home"
+            home_dir.mkdir()
+            skills_root = home_dir / ".config" / "aflow" / "skills"
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            manager_prompts: list[str] = []
+            worker_prompts: list[str] = []
+
+            def decision() -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
+                    "action": "continue",
+                    "reason": "Durable state supports the proposed review.",
+                    "next_step_notes": [],
+                    "stop_report": None,
+                }), "")
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                if model == "default":
+                    worker_prompts.append(_runner_prompt(argv, kwargs))
+                    if len(worker_prompts) == 1:
+                        return subprocess.CompletedProcess(
+                            argv, 0,
+                            "AFLOW_SCOPE_PRESSURE: decision 1 needs supervision",
+                            "",
+                        )
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(argv, 0, "completed", "")
+                assert model.startswith("manager-")
+                manager_prompts.append(_runner_prompt(argv, kwargs))
+                if len(manager_prompts) == 1:
+                    # A save between two invocations changes the next
+                    # invocation's bytes while the earlier artifact is stable.
+                    store = SkillStore(root=skills_root)
+                    current = store.read("aflow-manager")
+                    assert "LIVE-WORKFLOW-MARKER" not in current.content
+                    store.save(
+                        "aflow-manager",
+                        current.content + "\nLIVE-WORKFLOW-MARKER\n",
+                        expected_revision=current.revision,
+                    )
+                return decision()
+
+            with patch.dict(os.environ, {"HOME": str(home_dir)}):
+                result = run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                    _pressure_workflow_config(role="worker"),
+                    "managed",
+                    config_dir=repo_root,
+                        snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert result.turns_completed == 2
+            assert len(manager_prompts) == 2
+            assert "LIVE-WORKFLOW-MARKER" not in manager_prompts[0]
+            assert "LIVE-WORKFLOW-MARKER" in manager_prompts[1]
+            first_artifact = (
+                result.run_dir / "manager" / "decision-001" / "system-prompt.txt"
+            ).read_text(encoding="utf-8")
+            second_artifact = (
+                result.run_dir / "manager" / "decision-002" / "system-prompt.txt"
+            ).read_text(encoding="utf-8")
+            assert "LIVE-WORKFLOW-MARKER" not in first_artifact
+            assert "LIVE-WORKFLOW-MARKER" in second_artifact
+            # The persisted artifact renders the exact invoked system bytes.
+            assert manager_prompts[0].startswith(first_artifact)
+            assert manager_prompts[1].startswith(second_artifact)
+
     def test_manager_note_correction_failures_do_not_retry_or_launch_worker(self) -> None:
         cases = {
             "invalid-json": subprocess.CompletedProcess([], 0, "not JSON", ""),
@@ -12961,6 +13116,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 ).replace("- [ ] step one", "- [x] step one")
                 _write_plan(plan_path, in_progress_plan)
                 workflow = WorkflowConfig(
+                    manager_enabled=True,
                     steps={"implement": WorkflowStepConfig(
                         role="worker",
                         prompts=("p",),
@@ -12994,7 +13150,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                     workflows={"managed": workflow},
                     prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                     manager=ManagerConfig(
-                        enabled=True,
                         lite_role="manager_lite",
                         full_role="manager_full",
                     ),
@@ -13147,6 +13302,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             _git_commit_file(repo_root, plan_path)
 
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement_plan": WorkflowStepConfig(
                         role="worker",
@@ -13189,7 +13345,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                 ),
@@ -13283,8 +13438,9 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert context["controller_state"]["proposed_next_step"] == (  # type: ignore[index]
                 "review_cp_implementation"
             )
-            assert "untrusted transcript context" in manager_prompts[0]
-            assert "Durable plan_state" in manager_prompts[0]
+            normalized_prompt = " ".join(manager_prompts[0].split())
+            assert "untrusted transcript context" in normalized_prompt
+            assert "Durable `plan_state`" in normalized_prompt
 
             run_dirs = list((repo_root / ".aflow" / "runs").iterdir())
             assert len(run_dirs) == 1
@@ -13316,6 +13472,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 "# Plan\n\n### [ ] Checkpoint 1: Repair\n- [ ] finish repair\n",
             )
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
@@ -13356,7 +13513,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                     full_after_stalled_turns=99,
@@ -13462,6 +13618,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={"impl": WorkflowStepConfig(
                     role="architect",
                     prompts=("p",),
@@ -13487,7 +13644,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                 ),
@@ -13708,12 +13864,62 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert run_json["status"] == "failed"
             assert failure in run_json["failure_reason"]
 
+    def test_manager_missing_skill_fails_closed_without_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            home_dir = repo_root / "home"
+            home_dir.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            provider_models: list[str] = []
+            base_config = _clean_end_manager_workflow_config()
+            wf_config = replace(
+                base_config,
+                manager=replace(base_config.manager, skill="missing-custom-skill"),
+            )
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index("--model") + 1]
+                provider_models.append(model)
+                assert model == "worker", "manager provider launched after prelaunch failure"
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "work complete", "")
+
+            with patch.dict(os.environ, {"HOME": str(home_dir)}):
+                with pytest.raises(WorkflowError) as raised:
+                    run_workflow(
+                        ControllerConfig(
+                            repo_root=repo_root, plan_path=plan_path, max_turns=2,
+                        ),
+                        wf_config,
+                        "managed",
+                        config_dir=repo_root,
+                            snapshot_config=False,
+                        adapter=CodexAdapter(),
+                        runner=runner,
+                    )
+
+            # A missing explicitly selected skill is a prelaunch failure: the
+            # provider never starts and the bounded error is persisted.
+            assert provider_models == ["worker"]
+            run_dir = raised.value.run_dir
+            assert run_dir is not None
+            result_paths = sorted(
+                (run_dir / "manager").glob("decision-*/result.json")
+            )
+            assert len(result_paths) == 1
+            result = json.loads(result_paths[0].read_text(encoding="utf-8"))
+            assert result["status"] == "invalid"
+            assert result["failure_stage"] == "prelaunch"
+            assert "missing-custom-skill" in result["error"]
+
     def test_manager_non_end_lite_stop_emits_report_then_stops_banner_before_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "impl": WorkflowStepConfig(
                         role="architect",
@@ -13745,7 +13951,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                 ),
@@ -13822,6 +14027,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / "plan.md"
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     "implement": WorkflowStepConfig(
                         role="worker",
@@ -13849,7 +14055,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 workflows={"managed": workflow},
                 prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
                 manager=ManagerConfig(
-                    enabled=True,
                     lite_role="manager_lite",
                     full_role="manager_full",
                 ),
@@ -13899,6 +14104,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
             workflow = WorkflowConfig(
+                manager_enabled=True,
                 steps={
                     'impl': WorkflowStepConfig(
                         role='architect', prompts=('p',), go=(GoTransition(to='impl'),),
@@ -13922,7 +14128,7 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 })},
                 workflows={'managed': workflow}, prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
                 aflow=AflowSection(max_same_step_turns=1),
-                manager=ManagerConfig(enabled=True, lite_role='manager_lite', full_role='manager_full'),
+                manager=ManagerConfig(lite_role='manager_lite', full_role='manager_full'),
             )
 
             def runner(argv, **kwargs):
@@ -14005,6 +14211,7 @@ def _run_upgrade_resume_scenario(
     _write_plan(worktree_path / "repair.md", repair_text)
 
     workflow = WorkflowConfig(
+        manager_enabled=True,
         steps={
             "implement": WorkflowStepConfig(
                 role="worker",
@@ -14055,7 +14262,6 @@ def _run_upgrade_resume_scenario(
         workflows={"managed": workflow},
         prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
         manager=ManagerConfig(
-            enabled=True,
             lite_role="manager_lite",
             full_role="manager_full",
             full_after_stalled_turns=99,
@@ -14603,6 +14809,7 @@ def test_environment_preflight_blocks_manager_before_decision_artifact() -> None
         plan_path = repo_root / "plan.md"
         _write_plan(plan_path, _VALID_PLAN)
         workflow = WorkflowConfig(
+            manager_enabled=True,
             steps={
                 "impl": WorkflowStepConfig(
                     role="architect",
@@ -14632,7 +14839,6 @@ def test_environment_preflight_blocks_manager_before_decision_artifact() -> None
             workflows={"managed": workflow},
             prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
             manager=ManagerConfig(
-                enabled=True,
                 lite_role="manager_lite",
                 full_role="manager_full",
             ),

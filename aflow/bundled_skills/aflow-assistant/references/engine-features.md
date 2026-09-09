@@ -111,9 +111,8 @@ self-references, and cannot form cycles.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `enabled` | bool | `false` | Opt-in interstep supervision. Fresh bootstraps ship `true`. |
-| `lite_role` | string | - | Required when enabled; resolves through baseline team then global roles. |
-| `full_role` | string | - | Required when enabled; same resolution rule. Also performs repartition subcalls. |
+| `lite_role` | string | - | Required for each workflow with `manager_enabled = true`; resolves through baseline team then global roles. |
+| `full_role` | string | - | Required for each workflow with `manager_enabled = true`; same resolution rule. Also performs repartition subcalls. |
 | `full_after_stalled_turns` | int | `2` | Consecutive unchanged same-step executions before Full is chosen. Must be ≥ 1. |
 | `skill` | string | `"aflow-manager"` | Skill name requested in manager prompts (frozen into run config). |
 | `repartition_skill` | string | `"aflow-repartition-checkpoint"` | Skill name for repartition proposal/validation subcalls. |
@@ -153,6 +152,12 @@ Bare `[workflow]` is the defaults table, not a runnable workflow:
 - `teardown` (array, default `[]`)
 - `main_branch` (string, default none)
 - `merge_prompt` (array of prompt keys, default `[]`)
+- `manager_enabled` (bool, default `false`) — opt-in interstep supervision.
+  `[workflow.<name>].manager_enabled` overrides it per workflow (explicit
+  `false` wins over inherited `true`); aliases inherit their concrete base.
+  Omitted everywhere means disabled. The old global `[manager].enabled` is
+  rejected. The flag is frozen per run at reservation: later edits affect
+  new runs only.
 
 Accepted lifecycle combinations (validated):
 
@@ -171,9 +176,10 @@ workflow's team or global roles.
 - `validate_workflow_config` checks: default workflow exists; every role
   selector is fully qualified and references a configured harness/profile;
   role prompts reference known roles; team roles/prompts resolve; backup and
-  upgrade chains are acyclic; manager roles resolve; step roles and prompt
-  keys exist; lifecycle combos are valid; merge teardown has a resolvable
-  team lead.
+  upgrade chains are acyclic; manager roles resolve for each enabled
+  workflow against its team/global roles (disabled workflows need no manager
+  roles); step roles and prompt keys exist; lifecycle combos are valid;
+  merge teardown has a resolvable team lead.
 - Runs freeze a fingerprint of the resolved workflow, roles, teams, harness
   profiles, manager policy, and error-handling config into `run.json`.
   Resume requires the frozen identity to match the currently loaded config.
@@ -463,11 +469,11 @@ run directory, and must not traverse symlinks; writes are atomic
 
 ## 7. Manager Supervision
 
-With `[manager].enabled = true`, a read-only manager runs after every
-finalized workflow turn and before applying the controller's proposed
-transition, recovery, retry, or `END`. Manager calls are not turns: they do
-not advance `turns_completed`, consume `max_turns`, create checkpoint
-commits, or trigger same-step caps.
+When the selected workflow has supervision enabled (`manager_enabled`), a
+read-only manager runs after every finalized workflow turn and before
+applying the controller's proposed transition, recovery, retry, or `END`.
+Manager calls are not turns: they do not advance `turns_completed`, consume
+`max_turns`, create checkpoint commits, or trigger same-step caps.
 
 Levels:
 

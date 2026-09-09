@@ -57,6 +57,67 @@
 - Added ASCII/Unicode regressions where formatting alone exceeds the cap and
   verified existing oversized-input rejection. Manager/context tests: 98 passed.
 
+## 2026-09-09 — Skills settings, workflow supervision, and draft template
+
+- Manager instructions now come from live skill Markdown: the three prompt
+  builders contribute only structured runtime data while `aflow-manager`
+  (ordinary, note-correction) and `aflow-repartition-checkpoint` (proposal,
+  validation, bounded correction) skills supply the system text, read once per
+  invocation with no caching. Missing/invalid skills fail before any provider
+  starts. Verified with builder parity tests and a fake run proving a save
+  between two decisions affects only the later invocation/artifact.
+- Replaced global `[manager].enabled` with per-workflow `manager_enabled`
+  (optional declared flag, `False` shipped default, workflow override →
+  concrete base → defaults → `false` presence-based precedence). Only real
+  TOML booleans are accepted; step-level flags and the old global are
+  rejected with a targeted message. `resolve_manager_role` takes the selected
+  workflow explicitly; frozen run snapshots keep their value while live edits
+  affect new runs. Covered by parser/precedence/validation, fake-run routing,
+  and snapshot-freeze tests.
+- Authenticated Skills API (`GET /api/skills`, detail, `PUT`, batched
+  `POST /api/skills/validate` with per-entry verdicts, `POST
+  /api/skills/install`) shares the canonical store and the CLI installer
+  service (absolute directory symlinks over the exact eleven-harness map,
+  refresh-preserving-edits, structured partial results). Lone-surrogate
+  validate content returns a bounded per-entry `skill_invalid` verdict (HTTP
+  200) instead of an opaque error; covered by an ASCII-escaped `\ud800`
+  regression test.
+- Settings gained a Skills editor (bundled registry, `SKILL.md` textarea,
+  parent-owned drafts/revisions, save coordinator ordering workflow config →
+  skills → credentials with per-domain acknowledgement) plus Workflows
+  supervision controls (Defaults Enabled/Disabled; per-workflow
+  Inherit/Enabled/Disabled with effective value and source). New web drafts
+  start from a packaged parser-valid checkpoint template; explicit content
+  stays byte-for-byte and no new plan validator exists.
+- Verified with the handoff suites (core, server incl. Chromium skills/draft
+  smokes, full web suite, production build, ruff, `git diff --check`) except
+  pre-existing environmental failures proven identical on the untouched base.
+  Automated checks prove filesystem propagation through links, not native
+  discovery inside the external harness CLIs (not installed here).
+
+## 2026-09-08 — Refresh unedited skill bundles without losing edits
+
+- Added an explicit `SkillStore.refresh_skills` path alongside revisioned
+  saves: missing canonical trees initialize from the package, trees matching
+  their recorded baseline refresh to incoming package files (including added
+  and removed resources with permission intent), and the baseline advances
+  only after a successful refresh.
+- Edited skill trees are preserved whole — saved `SKILL.md` plus every
+  supporting file — and reported `preserved_edited`; exact reversion to the
+  baseline makes a skill unedited again. Trees without metadata are adopted
+  only on an exact package match and otherwise protected with an unknown
+  baseline.
+- Refreshes stage and validate the incoming tree first, mutate under a
+  store-owned transaction marker with rollback material for touched files and
+  metadata, and restore the prior tree and baseline on ordinary I/O errors.
+  Interrupted transactions make reads and saves of that skill fail with an
+  incomplete-refresh error until the next explicit refresh verifies the
+  rollback; uncertain markers are never silently retired.
+- Documented the preserve-whole-edited-skill policy in `docs/installation.md`.
+  Verified 41 skill-store tests, 18 refresh tests, and ruff on the store;
+  the full store/install suites pass with the injected v1→v2 loader and the
+  real bundled package.
+
 ## 2026-09-08 — Preserve history browsing and acknowledgement retries
 
 - Refresh every loaded run-history page, reconcile removals, and retain the

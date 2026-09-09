@@ -28,3 +28,21 @@
 - Schema-v3 manager prompts use compact UTF-8 JSON under the existing 40 KiB
   hard limit. Formatting must not consume the evidence budget; retain all fields
   and reject genuinely oversized payloads before provider launch.
+
+- The canonical skill store (`~/.config/aflow/skills/`, resolved through the
+  executing account's `Path.home()`) is owned by `aflow/skill_store.py`; the
+  bundled registry lives in `aflow/skill_catalog.py`. Reads are pure and must
+  never create, initialize, refresh, or reinstall anything. The effective
+  `SKILL.md` is saved canonical bytes when valid, otherwise the package
+  resource; a malformed canonical document is an error, never a silent
+  fallback. Saves are SHA-256-revision compare-and-swap under the single
+  store lock in `.metadata/`, which sits outside every installed skill
+  directory alongside version-1 baseline metadata. Saves materialize the
+  complete bundled tree on first initialization only; afterwards they replace
+  `SKILL.md` atomically and never touch supporting files or the recorded
+  package baseline. Never edit package resources or a repository checkout on
+  behalf of a store request, and never traverse a symlinked store entry.
+  Manager prompt builders (`aflow/manager.py`) read the configured skill's
+  validated Markdown body live once per invocation and pass it as the system
+  instruction; Python contributes only structured runtime data, and skill
+  failures become prelaunch failures before any provider starts.

@@ -38,12 +38,14 @@ from .models import (
     AddTeamAction,
     BuildStarterAction,
     GuidedConfigAction,
+    SetDefaultManagerEnabledAction,
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
     SetTeamRoleAction,
     SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
+    SetWorkflowManagerEnabledAction,
     UpsertProfileAction,
 )
 from .project_config_service import (
@@ -424,9 +426,54 @@ def _apply_action(
         _require_team(aflow_doc, action.upgrade_to)
         team["upgrade_to"] = action.upgrade_to
         return
+    if isinstance(action, SetDefaultManagerEnabledAction):
+        _require_manager_enabled_value(action.value)
+        if action.value is None:
+            # Null deletes only the flag; never create a table to delete from,
+            # so removing an absent default stays a net no-op.
+            _delete_key(workflows_doc.get("workflow"), "manager_enabled")
+            return
+        defaults_table = _table(workflows_doc, "workflow", path="workflow")
+        defaults_table["manager_enabled"] = action.value
+        return
+    if isinstance(action, SetWorkflowManagerEnabledAction):
+        _require_manager_enabled_value(action.value)
+        _require_workflow(workflows_doc, action.workflow)
+        root = workflows_doc.get("workflow")
+        if not _is_table(root):  # pragma: no cover - guaranteed by _require_workflow
+            raise GuidedConfigError("unknown_workflow", f"workflow '{action.workflow}' is not defined in workflows.toml")
+        wf_table = root.get(action.workflow)
+        if not _is_table(wf_table):  # pragma: no cover - guaranteed by _require_workflow
+            raise GuidedConfigError("unknown_workflow", f"workflow '{action.workflow}' is not defined in workflows.toml")
+        if action.value is None:
+            # Null deletes only that workflow's override so it inherits again;
+            # inherited values are never written back into the workflow table.
+            _delete_key(wf_table, "manager_enabled")
+            return
+        # Explicit false is a real declaration: never use truthiness here.
+        wf_table["manager_enabled"] = action.value
+        return
     raise GuidedConfigError(
         "unknown_action", f"unsupported guided action '{action.type}'"
     )
+
+
+def _require_manager_enabled_value(value: object) -> None:
+    """Reject non-boolean flag values that bypassed strict model validation."""
+    if value is not None and not isinstance(value, bool):
+        raise GuidedConfigError(
+            "invalid_action_value", "manager_enabled value must be a boolean or null"
+        )
+
+
+def _delete_key(table: object, key: str) -> None:
+    """Delete one key from a parsed table without touching anything else.
+
+    Uses membership plus ``del`` so both regular and out-of-order tables are
+    supported; a missing table or key stays a no-op.
+    """
+    if _is_table(table) and key in table:
+        del table[key]
 
 
 def _require_role_name(
@@ -493,6 +540,44 @@ def _apply_upsert_profile(action: UpsertProfileAction, aflow_doc: TOMLDocument) 
             profile_table.pop("effort", None)
         else:
             profile_table["effort"] = action.effort
+
+
+def _manager_source(
+    declared: bool | None, extends: str | None, known: set[str]
+) -> str:
+    """Label where one workflow's effective supervision comes from.
+
+    ``"workflow"`` for an explicit override, ``"base:<name>"`` when an alias
+    inherits its concrete base, otherwise ``"defaults"``.
+    """
+    if declared is not None:
+        return "workflow"
+    if extends is not None and extends in known:
+        return f"base:{extends}"
+    return "defaults"
+
+
+def _fallback_effective(
+    declared: bool | None,
+    extends: str | None,
+    declared_map: dict[str, tuple[bool | None, str | None]],
+    default: bool | None,
+) -> bool:
+    """Best-effort precedence read when canonical resolution is unavailable.
+
+    Mirrors the production declared → base → defaults → False order for a
+    single alias hop (aliases cannot extend aliases); the validation report
+    stays authoritative for the underlying error.
+    """
+    if declared is not None:
+        return declared
+    if extends is not None and extends in declared_map:
+        base_declared = declared_map[extends][0]
+        if base_declared is not None:
+            return base_declared
+    if default is not None:
+        return default
+    return False
 
 
 def _projection(
@@ -570,8 +655,17 @@ def _projection(
             }
     workflow_default_teams: dict[str, str | None] = {}
     workflows: dict[str, dict[str, Any]] = {}
+    # Declared `[workflow].manager_enabled` default; None when omitted.
+    default_manager_enabled: bool | None = None
+    # Per-workflow declared override plus the raw extends target, so the
+    # source label can distinguish an explicit flag from base/default
+    # inheritance without reimplementing canonical resolution.
+    declared_manager: dict[str, tuple[bool | None, str | None]] = {}
     workflow_table = workflows_doc.get("workflow")
     if _is_table(workflow_table):
+        raw_default = workflow_table.get("manager_enabled")
+        if isinstance(raw_default, bool):
+            default_manager_enabled = raw_default
         for wf_name in _workflow_names(workflows_doc):
             wf_table = workflow_table.get(wf_name)
             if not _is_table(wf_table):
@@ -579,6 +673,12 @@ def _projection(
             raw_team = wf_table.get("team")
             workflow_default_teams[wf_name] = (
                 raw_team if isinstance(raw_team, str) else None
+            )
+            raw_manager = wf_table.get("manager_enabled")
+            raw_extends = wf_table.get("extends")
+            declared_manager[wf_name] = (
+                raw_manager if isinstance(raw_manager, bool) else None,
+                raw_extends if isinstance(raw_extends, str) else None,
             )
             declared: list[str] = []
             steps_table = wf_table.get("steps")
@@ -591,8 +691,12 @@ def _projection(
                 "executable_steps": None,
                 "first_executable_step": None,
                 "step_roles": None,
+                "manager_enabled": declared_manager[wf_name][0],
+                "effective_manager_enabled": False,
+                "manager_enabled_source": "defaults",
             }
     report = validate_candidate_pair(*texts)
+    materialized: set[str] = set()
     if report.state != "invalid":
         with tempfile.TemporaryDirectory(prefix="aflow-guided-form-") as temporary:
             temp_dir = Path(temporary)
@@ -603,6 +707,7 @@ def _projection(
             except ConfigError:
                 config = None
         if config is not None:
+            materialized = set(config.workflows)
             for wf_name, wf_config in config.workflows.items():
                 summary = workflows.setdefault(
                     wf_name,
@@ -612,6 +717,9 @@ def _projection(
                         "executable_steps": None,
                         "first_executable_step": None,
                         "step_roles": None,
+                        "manager_enabled": None,
+                        "effective_manager_enabled": False,
+                        "manager_enabled_source": "defaults",
                     },
                 )
                 # The materialized config resolves aliases ('extends') and
@@ -626,6 +734,30 @@ def _projection(
                     for step_name, step_config in wf_config.steps.items()
                 }
                 workflow_default_teams[wf_name] = wf_config.team
+                # Effective supervision always comes from the canonical
+                # resolver; the raw declaration only decides the source label.
+                declared, extends = declared_manager.get(wf_name, (None, None))
+                summary["manager_enabled"] = declared
+                summary["effective_manager_enabled"] = bool(wf_config.manager_enabled)
+                summary["manager_enabled_source"] = _manager_source(
+                    declared, extends, set(declared_manager)
+                )
+    for wf_name, summary in workflows.items():
+        if wf_name in materialized:
+            continue
+        # No canonical resolution exists for this workflow (semantically
+        # invalid pair or unloadable config). Project the same declared →
+        # base → defaults → False precedence best-effort so the client still
+        # shows which declaration each workflow carries; the validation
+        # report remains the authority on the underlying error.
+        declared, extends = declared_manager.get(wf_name, (None, None))
+        summary["manager_enabled"] = declared
+        summary["manager_enabled_source"] = _manager_source(
+            declared, extends, set(declared_manager)
+        )
+        summary["effective_manager_enabled"] = _fallback_effective(
+            declared, extends, declared_manager, default_manager_enabled
+        )
     named_prompts = _text_table(aflow_doc.get("prompts"), path="prompts")
     role_prompts = (
         _text_table(
@@ -656,6 +788,7 @@ def _projection(
         "teams": teams,
         "workflow_default_teams": workflow_default_teams,
         "workflows": workflows,
+        "default_manager_enabled": default_manager_enabled,
     }
 
 

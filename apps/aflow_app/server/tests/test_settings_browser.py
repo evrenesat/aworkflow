@@ -1,8 +1,24 @@
 """Real Chromium assertions for independently scrolling settings editors."""
 import json
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from test_control_plane_api import control_client, live_server, TOKEN  # noqa: F401
+from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
+
+
+HARNESS_EXECUTABLES = (
+    "claude",
+    "codex",
+    "copilot",
+    "dsh",
+    "gemini",
+    "kiro-cli",
+    "muse",
+    "opencode",
+    "pi",
+    "reasonix",
+    "zcode",
+)
 
 
 def pane_metrics(page):
@@ -88,6 +104,122 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
             assert page.get_by_role('tab').count() == 0
             assert page.locator('.sidebar-editor-layout').count() == 0
             page.get_by_role('button', name='Guided settings', exact=True).click()
-            assert page.get_by_role('tab').count() == 5
+            assert page.get_by_role('tab').count() == 6
+        finally:
+            browser.close()
+
+
+def test_new_draft_plan_template_smoke(control_client, monkeypatch):
+    """Create a draft from the web UI and prove it starts from the skeleton.
+
+    Uses the disposable registered project: New draft sends a name-only
+    request, the editor shows one open checkpoint with implementation and
+    verification tasks plus blank Git Tracking fields, and the normal
+    save/promote flow still accepts the untouched placeholders (no new
+    validator blocks the lifecycle).
+    """
+    from aflow_app_server import main, config as config_module
+    _, root, _, _ = control_client
+    config_dir = root.parent / 'global'
+    monkeypatch.setattr(main, 'global_config_dir', lambda: config_dir)
+    monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+    with live_server() as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+        try:
+            page = browser.new_page(viewport={'width': 1365, 'height': 900})
+            page.goto(url)
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
+            page.goto(f'{url}/?project={PROJECT_ID}&view=plans')
+            page.get_by_label('New plan filename').fill('draft-smoke.md')
+            page.get_by_role('button', name='Create plan', exact=True).click()
+            area = page.get_by_label('Plan content')
+            area.wait_for()
+            content = area.input_value()
+            assert '### [ ] Checkpoint 1:' in content
+            assert '- [ ] Specify the files and concrete changes needed' in content
+            assert '- [ ] Specify and run the checks that demonstrate' in content
+            assert '- Plan Branch: ``' in content
+            assert '- Pre-Handoff Base HEAD: ``' in content
+            # Normal save flow works on the untouched skeleton.
+            page.get_by_role('button', name='Save', exact=True).click()
+            page.wait_for_timeout(500)
+            assert page.get_by_label('Plan content').input_value() == content
+            # Untouched placeholders do not block promotion: no new validator.
+            page.get_by_role('button', name='Move to Ready', exact=True).click()
+            page.get_by_text('Ready — runnable').wait_for()
+            assert (root / 'plans' / 'in-progress' / 'draft-smoke.md').read_text() == content
+        finally:
+            browser.close()
+
+
+def test_skills_edit_save_and_install_through_links(control_client, tmp_path, monkeypatch):
+    """Edit bundled Markdown in Settings and prove bytes flow through real links.
+
+    Every HOME, PATH executable, store, destination, and link lives beneath a
+    disposable directory: stub harness executables stand in for the eleven
+    supported harnesses and no live home is ever mutated.
+    """
+    from aflow_app_server import main, config as config_module
+    _, root, _, _ = control_client
+    home = tmp_path / "skills-home"
+    home.mkdir()
+    bindir = tmp_path / "skills-bin"
+    bindir.mkdir()
+    for executable in HARNESS_EXECUTABLES:
+        stub = bindir / executable
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+    # Pin browser discovery before HOME is replaced: the disposable HOME must
+    # not relocate Playwright's own cache.
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(bindir))
+    config_dir = root.parent / 'global'
+    monkeypatch.setattr(main, 'global_config_dir', lambda: config_dir)
+    monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+    with live_server() as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+        try:
+            page = browser.new_page(viewport={'width': 1365, 'height': 900})
+            page.goto(url)
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
+            page.get_by_role('button', name='Settings', exact=True).click()
+            page.get_by_role('tab', name='Skills', exact=True).click()
+            nav = page.locator('.sidebar-editor-navigation')
+            nav.get_by_role('button', name='aflow-plan', exact=True).click()
+            area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
+            area.wait_for()
+            original = area.input_value()
+            assert 'aflow-plan' in original
+            for theme in ('light', 'dark'):
+                page.get_by_role('tab', name='General', exact=True).click()
+                page.get_by_label('Color theme').select_option(theme)
+                page.get_by_role('tab', name='Skills', exact=True).click()
+                for width, height in ((1365, 900), (390, 844)):
+                    page.set_viewport_size({'width': width, 'height': height})
+                    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                    save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
+                    assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width
+            # One shared install action on the clean registry, then an edit.
+            page.get_by_role('button', name='Install/reinstall all', exact=True).click()
+            page.get_by_text('Install finished').wait_for()
+            area.fill(original + '\n\nBrowser edit.\n')
+            install = page.get_by_role('button', name='Install/reinstall all', exact=True)
+            assert install.is_disabled()
+            assert page.get_by_text('Save your skill edits first').count() > 0
+            page.get_by_role('button', name='Save all changes', exact=True).click()
+            page.get_by_text('the next manager invocation uses it').wait_for()
+            for destination in ('.claude/skills', '.agents/skills', '.kiro/skills', '.zcode/skills'):
+                linked = home / destination / 'aflow-plan' / 'SKILL.md'
+                assert linked.read_text() == original + '\n\nBrowser edit.\n', linked
+                assert os.readlink(home / destination / 'aflow-plan') == str(
+                    home / '.config' / 'aflow' / 'skills' / 'aflow-plan'
+                )
         finally:
             browser.close()

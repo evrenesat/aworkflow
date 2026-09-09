@@ -12,15 +12,22 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from aflow.config import load_workflow_config, render_starter_documents
 
-from aflow_app_server.guided_config import GuidedConfigError, guided_form_response
+from aflow_app_server.guided_config import (
+    GuidedConfigError,
+    apply_action_batch,
+    guided_form_response,
+)
 from aflow_app_server.models import (
     AddTeamAction,
     BuildStarterAction,
+    ProjectConfigFormPayload,
     ProjectConfigFormResponse,
     RenamePromptAction,
+    SetDefaultManagerEnabledAction,
     SetDefaultWorkflowAction,
     SetGlobalRoleAction,
     SetMaxTurnsAction,
@@ -28,6 +35,7 @@ from aflow_app_server.models import (
     SetTeamRoleAction,
     SetTeamUpgradeAction,
     SetWorkflowDefaultTeamAction,
+    SetWorkflowManagerEnabledAction,
     UpsertProfileAction,
 )
 
@@ -589,6 +597,354 @@ class TestRoleTargetValidation:
                 )
             )
         assert exc_info.value.code == "unknown_role"
+
+
+class TestManagerEnabled:
+    # Enabling supervision requires manager roles; pairs that enable a
+    # workflow use this text so they stay valid and exercise the canonical
+    # materialized path instead of the invalid-pair fallback.
+    MANAGER_AFLOW = (
+        AFLOW_TEXT + '\n[manager]\nlite_role = "worker"\nfull_role = "worker"\n'
+    )
+    ALIAS_WORKFLOWS = WORKFLOWS_TEXT + (
+        "\n[workflow.quiet]\n"
+        "manager_enabled = false\n"
+        "\n"
+        "[workflow.quiet.steps.implement]\n"
+        "role = \"worker\"\n"
+        "prompts = [\"p\"]\n"
+        "go = [{ to = \"END\", when = \"DONE\" }]\n"
+        "\n"
+        "[workflow.child]\n"
+        "extends = \"deliver\"\n"
+        "\n"
+        "[workflow.muted]\n"
+        "extends = \"quiet\"\n"
+    )
+
+    def test_omitted_everywhere_is_disabled_with_declared_nulls(self) -> None:
+        response = _call()
+        assert response.validation.state == "ready"
+        form = response.form
+        assert form is not None
+        assert form.default_manager_enabled is None
+        deliver = form.workflows["deliver"]
+        assert deliver.manager_enabled is None
+        assert deliver.effective_manager_enabled is False
+        assert deliver.manager_enabled_source == "defaults"
+
+    def test_set_default_true_propagates_without_touching_workflows(self) -> None:
+        response = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=True
+            ),
+        )
+        assert response.changed is True
+        assert response.validation.state == "ready"
+        assert "manager_enabled = true" in response.workflows_toml
+        # Only the default table gains the flag; no workflow table is written.
+        assert response.workflows_toml.count("manager_enabled") == 1
+        form = response.form
+        assert form is not None
+        assert form.default_manager_enabled is True
+        deliver = form.workflows["deliver"]
+        assert deliver.manager_enabled is None
+        assert deliver.effective_manager_enabled is True
+        assert deliver.manager_enabled_source == "defaults"
+
+    def test_explicit_false_overrides_true_default_and_stays_declared(self) -> None:
+        defaulted = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=True
+            ),
+        )
+        assert defaulted.validation.state == "ready"
+        response = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            workflows_text=defaulted.workflows_toml,
+            action=SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled", workflow="deliver", value=False
+            ),
+        )
+        assert "manager_enabled = false" in response.workflows_toml
+        form = response.form
+        assert form is not None
+        assert form.default_manager_enabled is True
+        deliver = form.workflows["deliver"]
+        # Explicit false is a real declaration: presence, not truthiness.
+        assert deliver.manager_enabled is False
+        assert deliver.effective_manager_enabled is False
+        assert deliver.manager_enabled_source == "workflow"
+
+    def test_alias_inherits_base_and_explicit_override_wins(self) -> None:
+        response = _call(workflows_text=self.ALIAS_WORKFLOWS)
+        assert response.validation.state == "ready"
+        form = response.form
+        assert form is not None
+        assert form.default_manager_enabled is None
+        assert form.workflows["quiet"].manager_enabled is False
+        assert form.workflows["quiet"].effective_manager_enabled is False
+        assert form.workflows["quiet"].manager_enabled_source == "workflow"
+        # An alias with no flag inherits its concrete base, not the default.
+        child = form.workflows["child"]
+        assert child.manager_enabled is None
+        assert child.effective_manager_enabled is False
+        assert child.manager_enabled_source == "base:deliver"
+        muted = form.workflows["muted"]
+        assert muted.manager_enabled is None
+        assert muted.effective_manager_enabled is False
+        assert muted.manager_enabled_source == "base:quiet"
+
+        enabled_base = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            workflows_text=self.ALIAS_WORKFLOWS,
+            action=SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled", workflow="deliver", value=True
+            ),
+        )
+        assert enabled_base.validation.state == "ready"
+        assert enabled_base.form is not None
+        assert enabled_base.form.workflows["child"].effective_manager_enabled is True
+        assert (
+            enabled_base.form.workflows["child"].manager_enabled_source
+            == "base:deliver"
+        )
+        # The quiet subtree is unaffected by the deliver change.
+        assert enabled_base.form.workflows["muted"].effective_manager_enabled is False
+
+        silenced = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            workflows_text=enabled_base.workflows_toml,
+            action=SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled", workflow="child", value=False
+            ),
+        )
+        assert silenced.validation.state == "ready"
+        assert silenced.form is not None
+        assert silenced.form.workflows["child"].manager_enabled is False
+        assert silenced.form.workflows["child"].effective_manager_enabled is False
+        assert silenced.form.workflows["child"].manager_enabled_source == "workflow"
+
+        # Every projected effective value matches the canonical resolver.
+        with tempfile.TemporaryDirectory() as temporary:
+            temp_dir = Path(temporary)
+            (temp_dir / "aflow.toml").write_text(silenced.aflow_toml, encoding="utf-8")
+            (temp_dir / "workflows.toml").write_text(
+                silenced.workflows_toml, encoding="utf-8"
+            )
+            config = load_workflow_config(temp_dir / "aflow.toml")
+        for name, wf_config in config.workflows.items():
+            assert (
+                silenced.form.workflows[name].effective_manager_enabled
+                == wf_config.manager_enabled
+            )
+
+    def test_base_wins_over_default_for_aliases(self) -> None:
+        defaulted = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            workflows_text=self.ALIAS_WORKFLOWS,
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=True
+            ),
+        )
+        assert defaulted.validation.state == "ready"
+        form = defaulted.form
+        assert form is not None
+        # deliver inherits the true default; child follows deliver.
+        assert form.workflows["child"].effective_manager_enabled is True
+        assert form.workflows["child"].manager_enabled_source == "base:deliver"
+        # quiet explicitly opts out, and muted follows quiet, not the default.
+        assert form.workflows["muted"].effective_manager_enabled is False
+        assert form.workflows["muted"].manager_enabled_source == "base:quiet"
+
+    def test_delete_override_and_default_restore_inheritance(self) -> None:
+        flagged = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            workflows_text=self.ALIAS_WORKFLOWS,
+            action=SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled", workflow="child", value=True
+            ),
+        )
+        assert flagged.validation.state == "ready"
+        assert flagged.form is not None
+        assert flagged.form.workflows["child"].effective_manager_enabled is True
+        cleared = _call(
+            aflow_text=self.MANAGER_AFLOW,
+            workflows_text=flagged.workflows_toml,
+            action=SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled", workflow="child", value=None
+            ),
+        )
+        assert "manager_enabled" not in cleared.workflows_toml.split("[workflow.child]")[1].split("[workflow.")[0]
+        assert cleared.form is not None
+        assert cleared.form.workflows["child"].manager_enabled is None
+        assert cleared.form.workflows["child"].effective_manager_enabled is False
+        assert cleared.form.workflows["child"].manager_enabled_source == "base:deliver"
+
+        defaulted = _call(
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=True
+            )
+        )
+        undefaulted = _call(
+            workflows_text=defaulted.workflows_toml,
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=None
+            ),
+        )
+        assert "manager_enabled" not in undefaulted.workflows_toml
+        assert undefaulted.form is not None
+        assert undefaulted.form.default_manager_enabled is None
+        assert undefaulted.form.workflows["deliver"].effective_manager_enabled is False
+
+    def test_delete_absent_default_is_a_net_noop(self) -> None:
+        response = _call(
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=None
+            )
+        )
+        assert response.changed is False
+        assert response.workflows_toml == WORKFLOWS_TEXT
+        assert response.form is not None
+        assert response.form.default_manager_enabled is None
+
+    def test_unknown_workflow_is_rejected(self) -> None:
+        with pytest.raises(GuidedConfigError) as exc_info:
+            _call(
+                action=SetWorkflowManagerEnabledAction(
+                    type="set_workflow_manager_enabled", workflow="ghost", value=True
+                )
+            )
+        assert exc_info.value.code == "unknown_workflow"
+
+    def test_nonboolean_values_are_rejected_without_coercion(self) -> None:
+        with pytest.raises(ValidationError):
+            SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=1  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValidationError):
+            SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled",
+                workflow="deliver",
+                value="true",  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValidationError):
+            ProjectConfigFormPayload(
+                aflow_toml=AFLOW_TEXT,
+                workflows_toml=WORKFLOWS_TEXT,
+                action={
+                    "type": "set_workflow_manager_enabled",
+                    "workflow": "deliver",
+                    "value": 0,
+                },
+            )
+
+    def test_edits_preserve_comments_and_sibling_keys(self) -> None:
+        workflows_text = WORKFLOWS_TEXT.replace(
+            "[workflow]\n",
+            "# Supervision default lives here.\n[workflow]\n",
+            1,
+        )
+        response = _call(
+            workflows_text=workflows_text,
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=False
+            ),
+        )
+        assert "# Supervision default lives here." in response.workflows_toml
+        assert 'main_branch = "main"' in response.workflows_toml
+        # Explicit false is written, not dropped as falsy.
+        assert "manager_enabled = false" in response.workflows_toml
+        assert response.form is not None
+        assert response.form.default_manager_enabled is False
+        assert response.form.workflows["deliver"].effective_manager_enabled is False
+
+    def test_raw_and_typed_edits_project_identically(self) -> None:
+        raw_text = WORKFLOWS_TEXT.replace(
+            "[workflow]\n",
+            "[workflow]\nmanager_enabled = true\n",
+            1,
+        )
+        raw_text = raw_text.replace(
+            "[workflow.deliver.steps.implement]\n",
+            "[workflow.deliver]\nmanager_enabled = false\n\n[workflow.deliver.steps.implement]\n",
+            1,
+        )
+        raw = _call(workflows_text=raw_text)
+        typed = _call(
+            action=SetDefaultManagerEnabledAction(
+                type="set_default_manager_enabled", value=True
+            )
+        )
+        typed = _call(
+            workflows_text=typed.workflows_toml,
+            action=SetWorkflowManagerEnabledAction(
+                type="set_workflow_manager_enabled", workflow="deliver", value=False
+            ),
+        )
+        assert raw.form is not None and typed.form is not None
+        assert raw.form.default_manager_enabled == typed.form.default_manager_enabled
+        assert (
+            raw.form.workflows["deliver"].model_dump()
+            == typed.form.workflows["deliver"].model_dump()
+        )
+
+    def test_mixed_batch_applies_in_order_and_rejects_unknowns(self) -> None:
+        aflow_text, workflows_text = apply_action_batch(
+            AFLOW_TEXT,
+            WORKFLOWS_TEXT,
+            [
+                SetDefaultManagerEnabledAction(
+                    type="set_default_manager_enabled", value=True
+                ),
+                SetWorkflowManagerEnabledAction(
+                    type="set_workflow_manager_enabled",
+                    workflow="deliver",
+                    value=False,
+                ),
+            ],
+        )
+        form = guided_form_response(aflow_text, workflows_text)["form"]
+        assert form["default_manager_enabled"] is True
+        assert form["workflows"]["deliver"]["manager_enabled"] is False
+        assert form["workflows"]["deliver"]["effective_manager_enabled"] is False
+        assert form["workflows"]["deliver"]["manager_enabled_source"] == "workflow"
+        with pytest.raises(GuidedConfigError):
+            apply_action_batch(
+                AFLOW_TEXT,
+                WORKFLOWS_TEXT,
+                [
+                    SetDefaultManagerEnabledAction(
+                        type="set_default_manager_enabled", value=True
+                    ),
+                    SetWorkflowManagerEnabledAction(
+                        type="set_workflow_manager_enabled",
+                        workflow="ghost",
+                        value=False,
+                    ),
+                ],
+            )
+
+    def test_invalid_pair_still_projects_declared_precedence(self) -> None:
+        broken = AFLOW_TEXT.replace('worker = "codex.fast"', 'worker = "codex.missing"')
+        workflows_text = self.ALIAS_WORKFLOWS.replace(
+            "[workflow]\n",
+            "[workflow]\nmanager_enabled = true\n",
+            1,
+        )
+        response = _call(aflow_text=broken, workflows_text=workflows_text)
+        assert response.validation.state == "invalid"
+        assert response.form is not None
+        assert response.form.default_manager_enabled is True
+        deliver = response.form.workflows["deliver"]
+        assert deliver.manager_enabled is None
+        assert deliver.effective_manager_enabled is True
+        assert deliver.manager_enabled_source == "defaults"
+        muted = response.form.workflows["muted"]
+        assert muted.effective_manager_enabled is False
+        assert muted.manager_enabled_source == "base:quiet"
 
 
 class TestZCodeFieldOwnership:

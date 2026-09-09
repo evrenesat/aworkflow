@@ -127,6 +127,55 @@ def test_team_chain_creation_links_and_reload_parity(service):
     assert reprojected['teams'] == form['teams']
 
 
+def test_manager_enabled_default_and_override_roundtrip(service):
+    # Enabling supervision requires manager roles; seed them with a raw save
+    # before exercising the typed supervision actions.
+    patch(service, documents={
+        'aflow.toml': AFLOW + '\n[manager]\nlite_role = "worker"\nfull_role = "worker"\n',
+        'workflows.toml': WORKFLOWS,
+    })
+    result = patch(service, actions=[
+        dict(type='set_default_manager_enabled', value=True),
+        dict(type='set_workflow_manager_enabled', workflow='demo', value=False),
+    ])
+    assert 'manager_enabled = true' in result.workflows_toml
+    assert 'manager_enabled = false' in result.workflows_toml
+    # The seeded aflow document keeps its comment and manager roles.
+    assert '# preserve this comment' in result.aflow_toml
+    assert 'lite_role = "worker"' in result.aflow_toml
+    form = guided_form_response(result.aflow_toml, result.workflows_toml)['form']
+    assert form['default_manager_enabled'] is True
+    demo = form['workflows']['demo']
+    assert demo['manager_enabled'] is False
+    assert demo['effective_manager_enabled'] is False
+    assert demo['manager_enabled_source'] == 'workflow'
+    # Save/reload parity: the reloaded pair projects identically.
+    reprojected = guided_form_response(service.read().aflow_toml, service.read().workflows_toml)['form']
+    assert reprojected['default_manager_enabled'] is True
+    assert reprojected['workflows']['demo'] == demo
+    # Deleting the override restores inheritance from the saved default.
+    cleared = patch(service, actions=[dict(type='set_workflow_manager_enabled', workflow='demo', value=None)])
+    cleared_form = guided_form_response(cleared.aflow_toml, cleared.workflows_toml)['form']
+    assert cleared_form['workflows']['demo']['manager_enabled'] is None
+    assert cleared_form['workflows']['demo']['effective_manager_enabled'] is True
+    assert cleared_form['workflows']['demo']['manager_enabled_source'] == 'defaults'
+    assert cleared_form['default_manager_enabled'] is True
+
+def test_manager_enabled_rejects_unknowns_coercion_and_stale_revisions(service):
+    from aflow_app_server.guided_config import GuidedConfigError
+    before = service.read()
+    with pytest.raises(GuidedConfigError):
+        patch(service, actions=[dict(type='set_workflow_manager_enabled', workflow='ghost', value=True)])
+    with pytest.raises(ValidationError):
+        patch(service, actions=[dict(type='set_default_manager_enabled', value=1)])
+    with pytest.raises(ProjectConfigRevisionConflict):
+        service.patch(GlobalConfigPatchPayload(
+            expected_revision='0' * 64,
+            actions=[dict(type='set_default_manager_enabled', value=True)],
+        ))
+    assert service.read() == before
+
+
 def test_team_upgrade_cycle_is_rejected_without_writes(service):
     before = service.read()
     with pytest.raises(ProjectConfigError):

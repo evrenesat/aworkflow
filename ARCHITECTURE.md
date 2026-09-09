@@ -203,10 +203,11 @@ escalation each lead to one Full decision from the same finalized-turn evidence
 with Full eligibility restored. Full `stop` and `stop` at every non-clean
 boundary retain the normal failure path. The controller never infers success or
 failure from manager `reason`, `stop_report`, or other free text.
-Every manager prompt names the configured manager skill and embeds the complete
-closed JSON protocol, including the structured stop-report shape. Invalid
-manager output at a terminal incident cannot replace the original controller
-failure as the report's primary cause.
+Every manager prompt passes the configured skill's live validated Markdown
+body as the system instruction with structured runtime data in the user
+prompt; the closed JSON protocol, including the structured stop-report shape,
+stays enforced in code. Invalid manager output at a terminal incident cannot
+replace the original controller failure as the report's primary cause.
 Manager invocation and note-correction execution is owned by one private,
 module-level `_ManagerCallExecutor` with explicit stable dependencies, while
 the changing plan and step identities plus the current baseline team remain
@@ -341,7 +342,7 @@ Entry point. Exposes three subcommands:
   - Two positionals are resolved intelligently by file existence and workflow name validity; one positional is always treated as the plan path.
   - `--start-step`/`-ss` accepts either a workflow step name or a 1-based numeric index into the declared workflow step order.
   - `--resume [RUN_ID]` forces resume mode. With no `RUN_ID`, the CLI must resolve a resumable previous run from shell-local state or fail. With `RUN_ID`, the CLI resumes that exact run or fails.
-- **`aflow install-skills [destination]`** -- copies bundled skills into harness skill directories.
+- **`aflow install-skills [destination]`** -- refreshes bundled skills in the canonical store and links them into harness skill directories.
   - The default install set includes `aflow-harness-recovery-lead` and `aflow-manager`.
   - `--include-optional` adds optional bundled skills such as `aflow-assistant`.
   - `--only` installs exactly the named skill(s).
@@ -388,11 +389,11 @@ Loads `~/.config/aflow/aflow.toml` plus sibling `workflows.toml` (bootstrapped f
 - **`[aflow]`** section: `default_workflow`, `keep_runs`, `max_turns`, `retry_inconsistent_checkpoint_state`, `banner_files_limit`, `max_same_step_turns`, `team_lead`, `branch_prefix`, `worktree_prefix`, `worktree_root`.
 - **`[harness.<name>.profiles.<profile>]`** tables: `model`, optional `effort` per harness profile.
 - **`[roles]`** and **`[teams.<name>]`** tables: role-to-selector mappings, with team tables allowed to override a subset of the global map and optionally name a `backup_team` for harness recovery chaining. Nested `prompts` tables provide static per-role system guidance; active-team values replace global values for ordinary workflow turns only.
-- **`[manager]`**: optional interstep supervision with Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
+- **`[manager]`**: Lite and Full role names, a semantic-stall threshold, `skill`, and the read-only `repartition_skill`. Roles are required only for workflows with supervision enabled. `upgrade_to` on a team is a separate one-edge implementation-quality route; both it and `backup_team` are acyclic validated team graphs.
 - **`[error_handling.harness_error_recovery]`**: ordered recovery rules, `max_consecutive_recoveries`, and the bundled fallback skill name used when deterministic matching cannot decide safely.
 - **`[prompts]`** section: named prompt templates.
-- Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) inherited by all workflows that don't override them. Not a runnable workflow.
-- **`[workflow.<name>]`** tables in `workflows.toml`: concrete workflows define `steps`, alias workflows use `extends` and optional `team`. Both may override lifecycle defaults with `setup`, `teardown`, `main_branch`, and `merge_prompt`.
+- Bare **`[workflow]`** table in `workflows.toml`: lifecycle defaults (`setup`, `teardown`, `main_branch`, `merge_prompt`) plus `manager_enabled` (default `false`), inherited by all workflows that don't override them. Not a runnable workflow.
+- **`[workflow.<name>]`** tables in `workflows.toml`: concrete workflows define `steps`, alias workflows use `extends` and optional `team`. Both may override lifecycle defaults with `setup`, `teardown`, `main_branch`, and `merge_prompt`, and may set `manager_enabled` (aliases inherit their concrete base when omitted). The flag resolves per selected workflow and freezes at run reservation.
 - Concrete and alias workflows may also set `exclude = ["step_name"]` to remove declared steps from the executable graph while keeping them visible to `aflow show` and status records. Alias exclusions are applied after inheritance.
 - **`[workflow.<name>.steps.<step>]`** tables: `role` (global role key), `prompts` (list of prompt keys), `go` (transition array with `to` and optional `when` condition).
 
@@ -690,8 +691,14 @@ and applicable teams, then each declared step labeled `[executable]` or
 `when <condition>` annotations. Skipped start-step names appear in status
 records as words.
 
+### `skill_catalog.py`
+Owns the bundled skill registry and package-resource lookup: `BUNDLED_SKILL_METADATA` with `DEFAULT_BUNDLED_SKILL_NAMES`, `OPTIONAL_BUNDLED_SKILL_NAMES`, and the sorted `BUNDLED_SKILL_NAMES` inventory, plus exact-name validation and `discover_bundled_skills()` over `importlib.resources`. The module depends only on package resources so the installer and the skill store share one registry without importing each other. `skill_installer` re-exports the registry names its CLI contract has always exposed.
+
 ### `skill_installer.py`
-Discovers the thirteen default bundled skills plus the optional bundled skills from package resources, and copies the selected set into harness-specific skill directories. `BUNDLED_SKILL_NAMES` is the full sorted inventory of valid bundled skill names, while `DEFAULT_BUNDLED_SKILL_NAMES` and `OPTIONAL_BUNDLED_SKILL_NAMES` preserve install behavior. The default inventory includes `aflow-harness-recovery-lead`, the same-task `aflow-guard-development-run`, and `material-code-review`. Supports auto-detection (looks for harness CLIs on PATH) and manual mode (explicit destination path). Handles duplicate destinations when multiple harnesses share a path (e.g., codex, copilot, gemini, muse, and pi all use `~/.agents/skills`).
+One shared installation service behind `aflow install-skills`: it refreshes the selected bundled skills in the canonical store (through `skill_store.py`) and links each selected skill into every destination with an absolute directory symlink to `~/.config/aflow/skills/<name>` — nothing copies skill trees. The exact eleven-harness map is detected with `shutil.which` (including `kiro-cli` for kiro): `claude` → `~/.claude/skills`, `kiro` → `~/.kiro/skills`, `zcode` → `~/.zcode/skills`, and the eight harnesses `codex`, `copilot`, `dsh`, `gemini`, `muse`, `opencode`, `pi`, and `reasonix` share `~/.agents/skills` as one deduplicated operation per selected skill. Installations keep the existing selection semantics (default set excludes `aflow-assistant`, `--include-optional` adds it, repeated `--only` deduplicates, manual destinations, preview, cancellation, noninteractive `--yes`, and no-target errors). Links are idempotent; wrong or dangling links are replaced in place; an existing real directory is renamed to a unique temporary sibling, linked, and then removed, with the exact owned path reported if cleanup fails and the directory restored if linking fails. Manual destinations overlapping the canonical store are rejected, and the legacy `~/.config/opencode/skills` location is never migrated. Every run returns a structured `InstallResult` with per-skill/destination status (`linked`, `already_linked`, `failed`, `unattempted`), the canonical refresh status, and bounded error codes; the batch stops at the first mutation failure. The registry itself lives in `skill_catalog.py` and is re-exported here.
+
+### `skill_store.py`
+Owns the canonical per-account skill document store at `Path.home() / '.config' / 'aflow' / 'skills'`. Reads are pure: the effective `SKILL.md` is the saved canonical file when present, otherwise that name's bundled package resource, and a malformed canonical document is a bounded error rather than a silent package fallback. Reads never create, initialize, refresh, or reinstall anything. Documents are validated completely (UTF-8, no NUL bytes, at most 1 MiB, YAML frontmatter whose `name` matches and whose `description` is a nonempty string, nonempty Markdown body) with a safe YAML parser that rejects anchors/aliases before expansion; extra safe frontmatter fields are permitted and the Markdown body is never executed or templated. `save(name, content, expected_revision)` is a compare-and-swap on the SHA-256 revision of the effective `SKILL.md` UTF-8 bytes, compared and written under one POSIX advisory lock shared by later refresh flows. Identical bytes are a no-op; first initialization stages and validates the complete bundled directory, materializes it into canonical storage (preserving file permission/executable intent), records version-1 baseline metadata (per-file SHA-256 plus relative filenames of the package bytes) under `.metadata/<name>.json`, and only then atomically replaces `SKILL.md` through a same-directory temporary file with fsync and rename. Baseline metadata and the lock live outside installed skill directories; user saves never advance the baseline or touch supporting files. Canonical skill directories/files, baseline metadata, and resource paths must be real, contained, no-follow entries — symlink escapes and unmanaged pre-existing trees yield bounded errors with saved bytes unchanged.
 
 ### `bundled_skills/`
 Thirteen default skill definitions plus one optional shipped skill installed into harness skill directories:
@@ -847,7 +854,9 @@ aflow/
   runlog.py            # run/turn artifact persistence
   status.py            # plain append-only status records on stderr
   git_status.py        # git snapshot helpers (probe, baseline, summary)
+  skill_catalog.py     # bundled skill registry and package-resource lookup
   skill_installer.py   # bundled skill installer
+  skill_store.py       # canonical per-account skill document store (revisions, lock)
   aflow.toml           # global config, harness profiles, roles, teams, prompts
   workflows.toml       # workflow definitions and aliases
   harnesses/
@@ -907,7 +916,7 @@ default `dev` dependency group rather than the installed runtime package.
 - **Interactive startup decisions are structured.** Startup decisions that require human input are represented as `StartupQuestion` objects with a `kind` enum, prompt text, and metadata. The CLI renders these as TTY prompts; library callers can present them in any UI or handle them programmatically via `prepare_startup_with_answer()`.
 - **Condition-based transitions.** Step transitions use a small expression language over three boolean symbols rather than hardcoded control flow. This keeps workflow definitions declarative.
 - **Structured run logging.** Every turn's prompts, outputs, and snapshots are persisted to `.aflow/runs/` for debugging and auditability. Old runs are pruned automatically.
-- **Skills as Markdown.** The bundled skills are plain SKILL.md files that get copied into each harness's skill directory. The default set stays separate from the optional `aflow-assistant` helper. They contain behavioral instructions that the agent reads at runtime, not executable code.
+- **Skills as Markdown.** The bundled skills are plain SKILL.md files installed as absolute directory symlinks from each harness's skill directory to the account-local canonical store (`~/.config/aflow/skills/<name>`), never copied. The default set stays separate from the optional `aflow-assistant` helper. They contain behavioral instructions that the agent reads at runtime, not executable code; manager instruction bodies are read live from the canonical Markdown on every invocation while names and configuration stay frozen in the run snapshot.
 - **Local-only lifecycle.** Branch and worktree creation, feature branch setup, and merge handoff all operate on local refs only. The engine never fetches, pulls, or pushes. The primary checkout is the control root for run artifacts and merge verification even when normal steps execute inside a linked worktree.
 
 

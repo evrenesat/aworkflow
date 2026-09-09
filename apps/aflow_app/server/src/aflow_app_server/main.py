@@ -108,6 +108,26 @@ from .project_service import (
     ProjectServiceError,
     project_readiness,
 )
+from aflow.skill_store import (
+    SkillRefreshIncomplete,
+    SkillRevisionConflict,
+    SkillStoreError,
+    SkillValidationError,
+)
+from .skill_service import SkillInstallError, SkillNotFound, SkillService
+from .models import (
+    SkillDetailModel,
+    SkillInstallOperationModel,
+    SkillInstallPayload,
+    SkillInstallResponse,
+    SkillLinkStatusModel,
+    SkillRefreshModel,
+    SkillSavePayload,
+    SkillSummaryModel,
+    SkillValidateEntryResult,
+    SkillValidatePayload,
+    SkillValidateResponse,
+)
 
 
 # Global state
@@ -716,6 +736,64 @@ async def config_revision_conflict_handler(
         status.HTTP_409_CONFLICT,
         "revision_conflict",
         current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(SkillNotFound)
+async def skill_not_found_handler(_: Request, __: SkillNotFound) -> JSONResponse:
+    return _error_response(status.HTTP_404_NOT_FOUND, "skill_not_found")
+
+
+@app.exception_handler(SkillRevisionConflict)
+async def skill_revision_conflict_handler(
+    _: Request, exc: SkillRevisionConflict
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_409_CONFLICT,
+        "revision_conflict",
+        current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(SkillInstallError)
+async def skill_install_rejected_handler(
+    _: Request, exc: SkillInstallError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        exc.code,
+        message=" ".join(str(exc).split())[:300],
+    )
+
+
+@app.exception_handler(SkillValidationError)
+async def skill_invalid_handler(
+    _: Request, exc: SkillValidationError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "skill_invalid",
+        message=" ".join(str(exc).split())[:300],
+    )
+
+
+@app.exception_handler(SkillRefreshIncomplete)
+async def skill_refresh_incomplete_handler(
+    _: Request, exc: SkillRefreshIncomplete
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "skill_refresh_incomplete",
+        message=" ".join(str(exc).split())[:300],
+    )
+
+
+@app.exception_handler(SkillStoreError)
+async def skill_error_handler(_: Request, exc: SkillStoreError) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "skill_error",
+        message=" ".join(str(exc).split())[:300],
     )
 
 
@@ -1410,6 +1488,145 @@ def validate_global_config(
     """Validate a candidate pair through the production loader without saving."""
     return _config_validation_response(
         service.validate_candidate(payload.aflow_toml, payload.workflows_toml)
+    )
+
+
+def _skill_summary_response(entry) -> SkillSummaryModel:
+    return SkillSummaryModel(
+        name=entry.name,
+        default=entry.default,
+        revision=entry.revision,
+        source=entry.source,  # type: ignore[arg-type]
+        edited=entry.edited,
+        installed=entry.installed,
+        links=tuple(
+            SkillLinkStatusModel(
+                destination=link.destination,
+                harnesses=link.harnesses,
+                detected_harnesses=link.detected_harnesses,
+                linked=link.linked,
+            )
+            for link in entry.links
+        ),
+        detected_harnesses=entry.detected_harnesses,
+    )
+
+
+def _skill_service() -> SkillService:
+    """Build the account-local skill facade for the running server process."""
+    return SkillService()
+
+
+@app.get("/api/skills", response_model=tuple[SkillSummaryModel, ...], tags=["settings"])
+def list_skills(_: str = Depends(verify_token)) -> tuple[SkillSummaryModel, ...]:
+    """List exactly the registered bundled skills with revision/edit/link state.
+
+    Reads are pure: nothing is initialized, refreshed, or installed.
+    """
+    return tuple(_skill_summary_response(entry) for entry in _skill_service().list_entries())
+
+
+@app.get("/api/skills/{name}", response_model=SkillDetailModel, tags=["settings"])
+def read_skill(name: str, _: str = Depends(verify_token)) -> SkillDetailModel:
+    """Return one bundled skill entry plus its effective SKILL.md content."""
+    entry, content = _skill_service().read_entry(name)
+    summary = _skill_summary_response(entry)
+    return SkillDetailModel(**summary.model_dump(mode="python"), content=content)
+
+
+@app.put("/api/skills/{name}", response_model=SkillDetailModel, tags=["settings"])
+def save_skill(
+    name: str,
+    payload: SkillSavePayload,
+    _: str = Depends(verify_token),
+) -> SkillDetailModel:
+    """Compare-and-swap one canonical SKILL.md without installing anything."""
+    entry, content = _skill_service().save_entry(
+        name, payload.content, payload.expected_revision
+    )
+    summary = _skill_summary_response(entry)
+    return SkillDetailModel(**summary.model_dump(mode="python"), content=content)
+
+
+@app.post(
+    "/api/skills/validate",
+    response_model=SkillValidateResponse,
+    tags=["settings"],
+)
+def validate_skills(
+    payload: SkillValidatePayload,
+    _: str = Depends(verify_token),
+) -> SkillValidateResponse:
+    """Prevalidate save candidates read-only; PUT repeats checks under its lock."""
+    results = _skill_service().validate_batch(
+        (
+            {
+                "name": entry.name,
+                "content": entry.content,
+                "expected_revision": entry.expected_revision,
+            }
+            for entry in payload.entries
+        )
+    )
+    return SkillValidateResponse(
+        entries=tuple(
+            SkillValidateEntryResult(
+                name=result.name,
+                ok=result.ok,
+                current_revision=result.current_revision,
+                error_code=result.error_code,
+                error=result.error,
+            )
+            for result in results
+        )
+    )
+
+
+@app.post(
+    "/api/skills/install",
+    response_model=SkillInstallResponse,
+    tags=["settings"],
+)
+def install_skills_route(
+    payload: SkillInstallPayload | None = None,
+    _: str = Depends(verify_token),
+) -> SkillInstallResponse:
+    """Refresh and link the default bundled skills via the shared installer.
+
+    The request body stays empty; selection, detection, and deduplication
+    match CLI ``install-skills --yes`` (optional skills excluded). Saving
+    never installs: a saved-but-uninstalled skill only links after this call.
+    """
+    del payload
+    result = _skill_service().install_default()
+    return SkillInstallResponse(
+        mode=result.mode,
+        succeeded=result.succeeded,
+        cancelled=result.cancelled,
+        refresh=tuple(
+            SkillRefreshModel(
+                name=item.name,
+                status=item.status,
+                changed=item.changed,
+                edited=item.edited,
+                error=item.error,
+            )
+            for item in result.refresh
+        ),
+        operations=tuple(
+            SkillInstallOperationModel(
+                harness=item.harness,
+                skill=item.skill,
+                destination=str(item.destination),
+                status=item.status,
+                error_code=item.error_code,
+                error=item.error,
+                displaced_path=str(item.displaced_path)
+                if item.displaced_path is not None
+                else None,
+            )
+            for item in result.operations
+        ),
     )
 
 

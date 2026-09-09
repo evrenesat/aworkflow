@@ -17,7 +17,7 @@ class StrictModel(BaseModel):
 
 class PlanCreatePayload(StrictModel):
     name: str
-    content: str
+    content: str | None = None
 
 class PlanUpdatePayload(StrictModel):
     content: str

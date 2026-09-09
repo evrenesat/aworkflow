@@ -124,6 +124,12 @@ export interface GuidedWorkflowStepSummaries {
   first_executable_step: string | null
   /** Exact declared role per materialized executable step; null when unavailable. */
   step_roles?: Record<string, string> | null
+  /** Declared manager_enabled override; null when omitted (inherits). */
+  manager_enabled?: boolean | null
+  /** Canonical resolved value: override → concrete base → defaults → false. */
+  effective_manager_enabled?: boolean
+  /** Where the effective value came from: "workflow", "base:<name>", or "defaults". */
+  manager_enabled_source?: string
 }
 
 export interface GuidedFormProjection {
@@ -137,6 +143,8 @@ export interface GuidedFormProjection {
   teams: Record<string, { roles: Record<string, string>; prompts?: Record<string, string>; upgrade_to?: string | null }>
   workflow_default_teams: Record<string, string | null>
   workflows: Record<string, GuidedWorkflowStepSummaries>
+  /** Declared `[workflow].manager_enabled` default; null when omitted (disabled). */
+  default_manager_enabled?: boolean | null
 }
 
 export interface GuidedConfiguredChoices {
@@ -188,11 +196,81 @@ export type GuidedConfigAction =
   | { type: 'set_team_role'; team: string; role: string; selector: string }
   | { type: 'set_team_upgrade'; team: string; upgrade_to: string | null }
   | { type: 'set_workflow_default_team'; workflow: string; team: string | null }
+  | { type: 'set_default_manager_enabled'; value: boolean | null }
+  | { type: 'set_workflow_manager_enabled'; workflow: string; value: boolean | null }
 
 export interface ProjectConfigFormRequest {
   aflow_toml: string
   workflows_toml: string
   action?: GuidedConfigAction | null
+}
+
+/** Bundled skill entries served by the account-local Skills API. */
+export interface SkillLinkStatus {
+  destination: string
+  harnesses: string[]
+  detected_harnesses: string[]
+  linked: boolean
+}
+
+export interface SkillSummary {
+  name: string
+  default: boolean
+  revision: string
+  source: 'bundled' | 'saved'
+  edited: boolean
+  installed: boolean
+  links: SkillLinkStatus[]
+  detected_harnesses: string[]
+}
+
+export interface SkillDetail extends SkillSummary {
+  content: string
+}
+
+export interface SkillSaveRequest {
+  content: string
+  expected_revision: string
+}
+
+export interface SkillValidateEntry {
+  name: string
+  content: string
+  expected_revision: string
+}
+
+export interface SkillValidateEntryResult {
+  name: string
+  ok: boolean
+  current_revision: string | null
+  error_code: string | null
+  error: string | null
+}
+
+export interface SkillRefreshEntry {
+  name: string
+  status: string
+  changed: boolean
+  edited: boolean
+  error: string | null
+}
+
+export interface SkillInstallOperation {
+  harness: string
+  skill: string
+  destination: string
+  status: string
+  error_code: string | null
+  error: string | null
+  displaced_path: string | null
+}
+
+export interface SkillInstallResult {
+  mode: string
+  succeeded: boolean
+  cancelled: boolean
+  refresh: SkillRefreshEntry[]
+  operations: SkillInstallOperation[]
 }
 
 export interface ProjectConfigFormResponse {

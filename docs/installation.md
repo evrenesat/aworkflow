@@ -59,10 +59,14 @@ aflow run path/to/plan.md
 
 ## Install Bundled Skills
 
-`aflow install-skills` copies the default bundled skills, including
+`aflow install-skills` refreshes the default bundled skills, including
 `aflow-harness-recovery-lead`, the read-only `aflow-manager`, and the strict
-read-only `aflow-repartition-checkpoint`, plus `material-code-review`, into every detected supported harness
-skill directory. The default `aflow-guard-development-run` skill launches new
+read-only `aflow-repartition-checkpoint`, plus `material-code-review`, in the
+canonical skill store and links them into every detected supported harness
+skill directory. Each link is an absolute directory symlink to
+`~/.config/aflow/skills/<name>`, so a saved skill edit is immediately visible
+through every linked harness without reinstalling. The default
+`aflow-guard-development-run` skill launches new
 legacy runs in tmux, then attaches one observer-only 30-minute heartbeat to the
 task that requested supervision. It stays silent while healthy, never repairs
 or steers implementation, audits the terminal result, and then stops. Remote
@@ -75,8 +79,10 @@ advertise both. Deployment requires explicit per-run authorization. The
 optional `aflow-assistant` skill is not installed
 unless you ask for it. Keep the legacy recovery skill installed even when using
 manager supervision: manager-disabled configurations retain that recovery path.
-Manager and repartition prompts also carry their complete JSON contracts inline,
-so a missing static skill does not weaken protocol validation.
+Manager and repartition prompts use the live saved skill bytes as their system
+instruction, so editing a skill changes the next manager invocation. A missing
+or invalid skill fails the call before any provider is invoked; saved edits
+never weaken the code-enforced protocol validation.
 
 Auto mode:
 
@@ -90,6 +96,12 @@ Manual destination:
 aflow install-skills ~/.claude/skills
 ```
 
+Manual destinations may not overlap the canonical skill store, and arbitrary
+other paths are accepted. Existing real skill directories at a destination are
+set aside and replaced by the link; unrelated destination entries are never
+touched, and the legacy `~/.config/opencode/skills` copy location is not
+migrated.
+
 Selection flags:
 
 - `--include-optional` installs the default bundled skills plus optional bundled skills, including `aflow-assistant`.
@@ -100,16 +112,55 @@ Selection flags:
 
 Auto-install destination map:
 
-| Harness | Destination |
-|---------|-------------|
-| `codex` | `~/.agents/skills` |
-| `copilot` | `~/.agents/skills` |
-| `gemini` | `~/.agents/skills` |
-| `pi` | `~/.agents/skills` |
-| `kiro` | `~/.kiro/skills` |
-| `muse` | `~/.agents/skills` |
-| `opencode` | `~/.config/opencode/skills` |
-| `claude` | `~/.claude/skills` |
+| Harness | Executable | Destination |
+|---------|------------|-------------|
+| `claude` | `claude` | `~/.claude/skills` |
+| `kiro` | `kiro-cli` | `~/.kiro/skills` |
+| `zcode` | `zcode` | `~/.zcode/skills` |
+| `codex` | `codex` | `~/.agents/skills` |
+| `copilot` | `copilot` | `~/.agents/skills` |
+| `dsh` | `dsh` | `~/.agents/skills` |
+| `gemini` | `gemini` | `~/.agents/skills` |
+| `muse` | `muse` | `~/.agents/skills` |
+| `opencode` | `opencode` | `~/.agents/skills` |
+| `pi` | `pi` | `~/.agents/skills` |
+| `reasonix` | `reasonix` | `~/.agents/skills` |
+
+The eight harnesses that share `~/.agents/skills` are deduplicated into one
+destination operation per selected skill. Repeating an installation is safe:
+correct links are left alone, wrong or dangling links are replaced, and the
+batch stops at the first failure with the remaining operations reported as
+unattempted.
+
+## Canonical Skill Store and Refresh Behavior
+
+AFlow keeps canonical skill content per OS account under
+`~/.config/aflow/skills/<name>/`. The first time a bundled skill is saved or
+explicitly refreshed, its complete packaged directory (including references,
+agents, and scripts with their permission intent) is materialized there and a
+baseline of the packaged file hashes is recorded under
+`~/.config/aflow/skills/.metadata/`. Reads never initialize, refresh, or
+reinstall anything; the effective `SKILL.md` is the saved canonical document
+when one exists and is valid, otherwise the packaged copy.
+
+Explicit reinstallation refreshes skills through the same store:
+
+- A skill whose files exactly match its recorded baseline is considered
+  unedited. Reinstallation replaces it with the currently packaged files and
+  records the new baseline, so unedited skills pick up package upgrades.
+- A skill with any changed, extra, missing, or otherwise customized file is
+  edited. The whole skill directory is preserved exactly as saved — both its
+  `SKILL.md` and its supporting files — and the upgrade leaves it untouched.
+  Reverting a skill to the exact recorded baseline makes it unedited again.
+- An existing skill directory without recorded metadata is adopted only when
+  it exactly matches the current package; otherwise it is preserved and
+  protected with an unknown baseline rather than guessed at or overwritten.
+
+Refreshes are explicit store operations, serialized with saves under one
+lock. An interrupted refresh is detected through a store transaction marker:
+reads of that skill fail with an incomplete-refresh error until the next
+explicit refresh verifiably restores the prior content, so uncertain content
+is never silently overwritten.
 
 ## Bundled Skill Inventory
 

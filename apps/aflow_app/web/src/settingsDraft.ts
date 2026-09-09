@@ -39,6 +39,19 @@ export function settingsActions(base: GuidedFormProjection, draft: GuidedFormPro
   for (const [workflow, team] of Object.entries(draft.workflow_default_teams)) {
     if (base.workflow_default_teams[workflow] !== team) actions.push({ type: 'set_workflow_default_team', workflow, team })
   }
+  // Manager supervision declarations use presence, never truthiness: explicit
+  // false is a real declaration and null removes the flag so it inherits.
+  // Omitted (undefined) reads as null, so merely loading a projection with an
+  // omitted default emits no action.
+  if ((draft.default_manager_enabled ?? null) !== (base.default_manager_enabled ?? null)) {
+    actions.push({ type: 'set_default_manager_enabled', value: draft.default_manager_enabled ?? null })
+  }
+  for (const [workflow, value] of Object.entries(draft.workflows)) {
+    const declared = value.manager_enabled ?? null
+    if ((base.workflows[workflow]?.manager_enabled ?? null) !== declared) {
+      actions.push({ type: 'set_workflow_manager_enabled', workflow, value: declared })
+    }
+  }
   const diffText = (before: Record<string, string>, after: Record<string, string>, make: (key: string, text: string | null) => GuidedConfigAction) => {
     for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
       if (before[key] !== after[key]) actions.push(make(key, after[key] ?? null))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from importlib.resources import files
 import os
 from pathlib import Path
 import re
@@ -31,6 +32,18 @@ class PlanRevisionConflict(PlanServiceError):
     def __init__(self, current_revision: str) -> None:
         super().__init__("plan revision does not match")
         self.current_revision = current_revision
+
+
+def _load_draft_template() -> str:
+    """Load the packaged new-draft skeleton before any file is written.
+
+    Only a null/omitted create payload reaches this loader; every explicit
+    string (including empty text) stays authoritative with the caller.
+    """
+    try:
+        return files("aflow").joinpath("templates/draft-plan.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise PlanServiceError("plan template is unavailable") from exc
 
 @dataclass(frozen=True)
 class PlanDocument:
@@ -89,7 +102,9 @@ class PlanService:
             data = self._read_regular(path)
             return self._document(project_id, status_value, name, data, include_content=True)
 
-    def create(self, project_id: str, name: str, content: str) -> PlanDocument:
+    def create(self, project_id: str, name: str, content: str | None = None) -> PlanDocument:
+        if content is None:
+            content = _load_draft_template()
         data = self._validate_content(content)
         with self._project_lock(project_id):
             root = self._root(project_id)

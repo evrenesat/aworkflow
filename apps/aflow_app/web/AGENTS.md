@@ -3,6 +3,12 @@
 - `GlobalSettings` owns the cross-tab draft; `settingsDraft` emits net changes.
   Keep one save coordinator, preserve conflicts and accurately clear only
   acknowledged persistence domains. Browser preferences never enter server writes.
+  Skills drafts and baselines live in `GlobalSettings` indexed by exact skill
+  name (`SkillsSettings` only renders); they join dirty/navigation guards, never
+  enter TOML, stay usable without the config projection, and save after workflow
+  config in sorted name order with per-skill acknowledgement. Install runs the
+  shared installer once, stays disabled while any skill is dirty, and reloads
+  clean baselines afterwards.
   New teams are created in the draft by the Add team form (`add_team` actions
   precede dependent edits); `set_team_upgrade` edits only the team's own link.
 - Keep destructive prompt actions secondary: referenced prompts offer no

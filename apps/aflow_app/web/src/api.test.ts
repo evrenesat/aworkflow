@@ -283,6 +283,43 @@ describe('workflow control API client', () => {
     }))
   })
 
+  it('reads, prevalidates, revision-saves, and installs bundled skills', async () => {
+    const summary = {
+      name: 'aflow-manager', default: true, revision: 'c'.repeat(64), source: 'bundled',
+      edited: false, installed: true, links: [], detected_harnesses: [],
+    }
+    mockOkJson([summary])
+    expect(await api.listSkills()).toEqual([summary])
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/skills', expect.anything())
+
+    mockOkJson({ ...summary, content: 'skill text' })
+    expect((await api.readSkill('aflow-manager')).content).toBe('skill text')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/skills/aflow-manager', expect.anything())
+
+    mockOkJson({ entries: [{ name: 'aflow-manager', ok: true, current_revision: 'c'.repeat(64), error_code: null, error: null }] })
+    expect(await api.validateSkills([{ name: 'aflow-manager', content: 'skill text', expected_revision: 'c'.repeat(64) }])).toHaveLength(1)
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/skills/validate', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ entries: [{ name: 'aflow-manager', content: 'skill text', expected_revision: 'c'.repeat(64) }] }),
+    }))
+
+    // Save bodies carry only content and the baseline revision: no paths or homes.
+    mockOkJson({ ...summary, content: 'new text' })
+    await api.saveSkill('aflow-manager', { content: 'new text', expected_revision: 'c'.repeat(64) })
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/skills/aflow-manager', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ content: 'new text', expected_revision: 'c'.repeat(64) }),
+    }))
+
+    // Install invokes the one shared action with an empty body, exactly once per call.
+    mockOkJson({ mode: 'auto', succeeded: true, cancelled: false, refresh: [], operations: [] })
+    await api.installSkills()
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/skills/install', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({}),
+    }))
+  })
+
   it('transforms a candidate pair through the pure form endpoint without a revision', async () => {
     api.setAuthToken('test-token')
     const validation = {
