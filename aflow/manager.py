@@ -8,6 +8,7 @@ the controller integration that follows in a later checkpoint.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from copy import deepcopy
 import json
 import os
 import re
@@ -600,6 +601,277 @@ def _read_custom_skill_body(
     return parse_skill_document(skill_name, payload.decode("utf-8")).body
 
 
+def _serialize_manager_user_prompt(
+    runtime: Mapping[str, Any], context: Mapping[str, Any]
+) -> str:
+    """Serialize the exact manager user-prompt wire payload once."""
+    context_json = (
+        json.dumps(
+            dict(context),
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+        else json.dumps(dict(context), indent=2, sort_keys=True)
+    )
+    return (
+        "MANAGER_RUNTIME_JSON:\n"
+        + json.dumps(runtime, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+        + "\nMANAGER_CONTEXT_JSON:\n"
+        + context_json
+        + "\n"
+    )
+
+
+_HISTORY_REDUCTION_DETAILS: dict[str, tuple[str, str]] = {
+    "run_extract_manager_decisions": (
+        "decision_number",
+        "manager/decision-{decision_number:03d}",
+    ),
+    "manager_decisions": (
+        "decision_number",
+        "manager/decision-{decision_number:03d}",
+    ),
+    "workflow_turns": (
+        "turn_number",
+        "turns/turn-{turn_number:03d}",
+    ),
+}
+
+
+def _merge_omitted_ranges(
+    existing: Any, numbers: list[int]
+) -> tuple[int, list[dict[str, int]]]:
+    intervals: list[tuple[int, int]] = []
+    if isinstance(existing, list):
+        for item in existing:
+            if not isinstance(item, Mapping):
+                continue
+            start, end = item.get("start"), item.get("end")
+            if (
+                isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and start <= end
+            ):
+                intervals.append((start, end))
+    intervals.extend((number, number) for number in numbers)
+    if not intervals:
+        return 0, []
+    intervals.sort()
+    merged: list[list[int]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    ranges = [{"start": start, "end": end} for start, end in merged]
+    return sum(end - start + 1 for start, end in merged), ranges
+
+
+def _record_history_reduction(
+    context: dict[str, Any],
+    disclosure: dict[str, Any],
+    *,
+    category: str,
+    records: list[Mapping[str, Any]],
+) -> None:
+    number_key, relative_path_pattern = _HISTORY_REDUCTION_DETAILS[category]
+    numbers = [
+        value
+        for record in records
+        for value in (record.get(number_key),)
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if not numbers:
+        return
+    controller = context.get("controller_state")
+    roots = controller.get("artifact_roots") if isinstance(controller, Mapping) else None
+    artifact_root = (
+        roots.get("run")
+        if isinstance(roots, Mapping) and isinstance(roots.get("run"), str)
+        else None
+    )
+    source_run_id = context.get("run_id")
+    source_run_id = source_run_id if isinstance(source_run_id, str) else "unknown"
+    omitted = disclosure.setdefault("omitted", [])
+    if not isinstance(omitted, list):
+        omitted = []
+        disclosure["omitted"] = omitted
+    descriptor = next(
+        (
+            item
+            for item in omitted
+            if isinstance(item, dict)
+            and item.get("source_run_id") == source_run_id
+            and item.get("category") == category
+        ),
+        None,
+    )
+    if descriptor is None:
+        descriptor = {
+            "source_run_id": source_run_id,
+            "category": category,
+            "artifact_root": artifact_root,
+            "relative_path_pattern": relative_path_pattern,
+            "omitted_count": 0,
+            "omitted_ranges": [],
+        }
+        omitted.append(descriptor)
+    elif descriptor.get("artifact_root") is None and artifact_root is not None:
+        descriptor["artifact_root"] = artifact_root
+    count, ranges = _merge_omitted_ranges(
+        descriptor.get("omitted_ranges"), sorted(set(numbers))
+    )
+    descriptor["omitted_count"] = count
+    descriptor["omitted_ranges"] = ranges
+    reduced_categories = disclosure.setdefault("reduced_categories", [])
+    if isinstance(reduced_categories, list) and category not in reduced_categories:
+        reduced_categories.append(category)
+    reduction_order = disclosure.setdefault("reduction_order", [])
+    if isinstance(reduction_order, list) and category not in reduction_order:
+        reduction_order.append(category)
+
+
+def _update_history_retained_counts(
+    context: dict[str, Any], disclosure: dict[str, Any]
+) -> None:
+    run_extract = context.get("run_extract")
+    manager_decisions = context.get("manager_decisions")
+    controller = context.get("controller_state")
+    repartitions = controller.get("checkpoint_repartitions") if isinstance(controller, Mapping) else None
+    run_records = [item for item in run_extract if isinstance(item, Mapping)] if isinstance(run_extract, list) else []
+    manager_records = [item for item in manager_decisions if isinstance(item, Mapping)] if isinstance(manager_decisions, list) else []
+    disclosure["retained_counts"] = {
+        "run_extract": len(run_records),
+        "run_extract_manager_decisions": sum(
+            item.get("kind") == "manager_decision" for item in run_records
+        ),
+        "manager_decisions": len(manager_records),
+        "workflow_turns": sum(
+            item.get("kind") == "workflow_turn" for item in run_records
+        ),
+        "checkpoint_repartitions": (
+            len(repartitions) if isinstance(repartitions, list) else 0
+        ),
+    }
+
+
+def _reduce_v3_history_for_budget(
+    runtime: Mapping[str, Any], context: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Remove only optional historical records until the exact wire prompt fits."""
+    initial_prompt = _serialize_manager_user_prompt(runtime, context)
+    if len(initial_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES:
+        return context
+
+    has_optional_history = any(
+        isinstance(item, Mapping)
+        for item in context.get("run_extract", ())
+    ) or any(
+        isinstance(item, Mapping)
+        for item in context.get("manager_decisions", ())
+    )
+    if not has_optional_history:
+        return context
+
+    candidate = deepcopy(dict(context))
+    raw_disclosure = candidate.get("history_disclosure")
+    disclosure = (
+        deepcopy(dict(raw_disclosure))
+        if isinstance(raw_disclosure, Mapping)
+        else {"reduction_order": [], "reduced_categories": [], "omitted": []}
+    )
+    candidate["history_disclosure"] = disclosure
+
+    def fits() -> bool:
+        return len(_serialize_manager_user_prompt(runtime, candidate).encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+
+    run_extract = [
+        dict(item)
+        for item in candidate.get("run_extract", [])
+        if isinstance(item, Mapping)
+    ]
+    duplicate_manager_records = [
+        item for item in run_extract if item.get("kind") == "manager_decision"
+    ]
+    if duplicate_manager_records:
+        run_extract = [
+            item for item in run_extract if item.get("kind") != "manager_decision"
+        ]
+        candidate["run_extract"] = run_extract
+        _record_history_reduction(
+            candidate,
+            disclosure,
+            category="run_extract_manager_decisions",
+            records=duplicate_manager_records,
+        )
+        _update_history_retained_counts(candidate, disclosure)
+        if fits():
+            return candidate
+
+    manager_decisions = [
+        dict(item)
+        for item in candidate.get("manager_decisions", [])
+        if isinstance(item, Mapping)
+    ]
+    manager_decisions.sort(
+        key=lambda item: (
+            item.get("decision_number", 0),
+            item.get("turn_number", 0),
+        )
+    )
+    candidate["manager_decisions"] = manager_decisions
+    while manager_decisions and not fits():
+        removed = manager_decisions.pop(0)
+        _record_history_reduction(
+            candidate,
+            disclosure,
+            category="manager_decisions",
+            records=[removed],
+        )
+        _update_history_retained_counts(candidate, disclosure)
+    if fits():
+        return candidate
+
+    while run_extract and not fits():
+        workflow_candidates = [
+            (index, item)
+            for index, item in enumerate(run_extract)
+            if item.get("kind") == "workflow_turn"
+        ]
+        workflow_index = min(
+            workflow_candidates,
+            key=lambda pair: (
+                pair[1].get("turn_number", pair[1].get("number", 0)),
+                pair[0],
+            ),
+            default=(None, None),
+        )
+        if workflow_index[0] is None:
+            break
+        removed = run_extract.pop(workflow_index[0])
+        candidate["run_extract"] = run_extract
+        _record_history_reduction(
+            candidate,
+            disclosure,
+            category="workflow_turns",
+            records=[removed],
+        )
+        _update_history_retained_counts(candidate, disclosure)
+    if fits():
+        return candidate
+
+    # The executor-added repartition history is included before this exact
+    # measurement and remains controller-owned boundary history.  If it still
+    # prevents a fit after optional history is removed, the hard guard leaves
+    # the explicit prelaunch failure for the diagnostic checkpoint.
+    _update_history_retained_counts(candidate, disclosure)
+    return candidate
+
+
 def build_manager_prompts(
     context: Mapping[str, Any],
     *,
@@ -639,18 +911,13 @@ def build_manager_prompts(
             "max_note_length": MAX_MANAGER_NOTE_LENGTH,
         },
     }
-    user_prompt = (
-        "MANAGER_RUNTIME_JSON:\n"
-        + json.dumps(runtime, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
-        + "\nMANAGER_CONTEXT_JSON:\n"
-        + (
-            json.dumps(dict(context), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
-            if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3
-            else json.dumps(dict(context), indent=2, sort_keys=True)
-        )
-        + "\n"
+    prompt_context = (
+        _reduce_v3_history_for_budget(runtime, context)
+        if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+        else context
     )
-    enforce_manager_inline_context_budget(context, user_prompt)
+    user_prompt = _serialize_manager_user_prompt(runtime, prompt_context)
+    enforce_manager_inline_context_budget(prompt_context, user_prompt)
     return system_prompt, user_prompt
 
 

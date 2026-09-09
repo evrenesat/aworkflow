@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-09-09 — Bound optional manager history (Checkpoint 2)
+
+- Approved deterministic v3 history projection, bounded omission descriptors,
+  and exact-byte reduction while retaining current boundary authority.
+  Repartition history participates in final prompt measurement.
+- Verification: 111 manager/context tests, 39 runtime manager tests and 7
+  subtests passed with disposable configuration roots; no material findings.
+  Budget-failure diagnostics remain assigned to Checkpoint 3.
+
 ## 2026-09-09 — Keep Skills edits safe during install refresh
 
 - Settings keeps the Skills editor disabled until the shared install result,

@@ -20,6 +20,7 @@ from aflow.manager_context import (
 from aflow.manager import (
     ManagerDecisionV1,
     ManagerNoteAuthorityError,
+    build_manager_prompts,
     build_manager_note_correction_prompts,
 )
 from aflow.stop_marker import detect_stop_marker
@@ -1302,6 +1303,7 @@ def test_schema_v2_scope_pressure_reason_in_controller_state(tmp_path: Path) -> 
 from aflow.manager_context import (
     MANAGER_CONTEXT_SCHEMA_VERSION_V2,
     MANAGER_CONTEXT_SCHEMA_VERSION_V3,
+    MANAGER_INLINE_CONTEXT_MAX_BYTES,
     MANAGER_INLINE_CONTEXT_TARGET_BYTES,
     MANAGER_RUN_EXTRACT_MAX_RECORDS,
     TRUNCATION_MARKER,
@@ -1480,6 +1482,116 @@ def test_v3_run_extract_is_bounded_to_twelve_records(tmp_path: Path) -> None:
 
     assert len(context["run_extract"]) <= MANAGER_RUN_EXTRACT_MAX_RECORDS
     assert context["run_extract"][-1]["number"] == 15
+
+
+@pytest.mark.parametrize("history_size", [20, 100, 1_000])
+def test_v3_long_history_is_bounded_with_resolvable_omission_references(
+    tmp_path: Path, monkeypatch, history_size: int
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    for number in range(1, history_size + 1):
+        _write_turn(
+            run_dir,
+            number,
+            step="implement",
+            role="implementer",
+            stdout=f"workflow result {number}",
+        )
+        _write_json(
+            run_dir / "manager" / f"decision-{number:03d}" / "result.json",
+            {
+                "decision_number": number,
+                "finalized_turn_number": number,
+                "level": "lite",
+                "trigger": "post_turn",
+                "status": "accepted",
+                "action": "continue",
+                "reason": f"manager decision {number}",
+            },
+        )
+
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    repartition = {
+        "schema_version": 1,
+        "decision_number": history_size,
+        "scope_id": "scope-1",
+        "generation_id": "generation-1",
+        "envelope_sha256": "a" * 64,
+        "envelope_artifact_sha256": "b" * 64,
+        "source_plan_sha256": "c" * 64,
+        "proposal_sha256": "d" * 64,
+        "candidate_plan_sha256": "e" * 64,
+        "partition_ids": ["partition-1"],
+        "child_summaries": ["Partition 1"],
+        "current_disposition": "implement_current_partition",
+        "resolved_target_step": "implement",
+        "resolved_target_role": "worker",
+        "current_partition_id": "partition-1",
+        "scope_pressure_reason": None,
+        "envelope_artifact_path": "scopes/scope-1/envelope.json",
+        "proposal_artifact_path": "manager/decision-020/repartition/proposal.json",
+        "candidate_artifact_path": "manager/decision-020/repartition/candidate.md",
+        "mechanical_validation_artifact_path": "manager/decision-020/repartition/mechanical.json",
+        "semantic_verdict_artifact_path": "manager/decision-020/repartition/verdict.json",
+    }
+    boundary["repartition_history"] = [repartition]
+
+    separate_worktree = tmp_path / "separate-worktree"
+    separate_worktree.mkdir()
+    monkeypatch.chdir(separate_worktree)
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        decision_number=history_size + 1,
+        boundary=boundary,
+        active_plan_content=plan.read_text(encoding="utf-8"),
+        capture_evidence=True,
+    )
+
+    assert context["schema_version"] == MANAGER_CONTEXT_SCHEMA_VERSION_V3
+    manager_decisions = context["manager_decisions"]
+    assert [item["decision_number"] for item in manager_decisions] == list(
+        range(max(1, history_size - MANAGER_RUN_EXTRACT_MAX_RECORDS + 1), history_size + 1)
+    )
+    assert context["controller_state"]["checkpoint_repartitions"] == [repartition]
+    assert len(context["run_extract"]) <= MANAGER_RUN_EXTRACT_MAX_RECORDS
+    for record in context["run_extract"]:
+        if record["kind"] == "manager_decision":
+            assert isinstance(record["decision_number"], int)
+            assert isinstance(record["turn_number"], int)
+            assert record["artifact_path"].startswith("manager/decision-")
+        else:
+            assert record["kind"] == "workflow_turn"
+            assert isinstance(record["turn_number"], int)
+            assert record["artifact_path"] == (
+                f"turns/turn-{record['turn_number']:03d}"
+            )
+
+    disclosure = context["history_disclosure"]
+    assert disclosure["reduced_categories"] == []
+    assert disclosure["reduction_order"] == []
+    assert disclosure["retained_counts"]["manager_decisions"] <= 12
+    descriptors = {
+        item["category"]: item for item in disclosure["omitted"]
+    }
+    assert {"run_extract_manager_decisions", "manager_decisions", "workflow_turns"} <= set(
+        descriptors
+    )
+    for category, descriptor in descriptors.items():
+        assert descriptor["source_run_id"] == run_dir.name
+        assert descriptor["artifact_root"] == str(run_dir.resolve())
+        assert descriptor["omitted_count"] > 0
+        assert descriptor["omitted_ranges"]
+        first_range = descriptor["omitted_ranges"][0]
+        if category == "workflow_turns":
+            referenced = run_dir / "turns" / f"turn-{first_range['start']:03d}"
+        else:
+            referenced = run_dir / "manager" / f"decision-{first_range['start']:03d}"
+        assert referenced.is_dir()
+
+    _, user_prompt = build_manager_prompts(context)
+    assert len(user_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
 
 
 def test_v3_bounds_semantic_summaries_with_shared_marker(tmp_path: Path) -> None:

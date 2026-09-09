@@ -1,6 +1,6 @@
 # aflow manager context budget and failure evidence
 
-Status: Checkpoint 1 reviewed and approved through `cp1 v01`; Checkpoints 2–6 remain pending. Existing compatible serialization work was retained.
+Status: Checkpoint 2 reviewed and approved through `cp2 v01`; Checkpoints 3–6 remain pending. Existing compatible serialization work and Checkpoint 1 approval were retained.
 
 Execution amendment (2026-09-09): retain the owner-approved 40 KiB hard guard already in the current baseline. The later readable-output plan adds the separate 16 KiB current-summary target. Historical incident sizes below remain historical evidence.
 
@@ -16,6 +16,8 @@ The handoff also adds prompt-variable help beneath editors and readable sentence
 - Pre-Handoff Base HEAD: `93a54774d8f4a92e05d04f99b936f43c88ccf673`
 
 ### Review Log
+
+- 2026-09-09: Approved Checkpoint 2 through `cp2 v01`, reviewing the uncommitted worker turn 3 changes after `b6b0a14` (worktree fallback; no CP2 worker commit). Run `20260909t214357z-0efa55a8` and the worker handoff identify Checkpoint 2 despite the next unchecked checkpoint being 3. Covered bounded v3 history, omission references, protected authority, and repartition-aware prompt measurement. Verification: 111 manager/context tests; 39 runtime manager tests and 7 subtests; `git diff --check` passed. Tests used disposable configuration roots. No material findings; Checkpoints 3–6 remain unchecked.
 
 - 2026-09-09: Approved Checkpoint 1 through `cp1 v01` using the current worktree fallback at base `93a5477`. Run `20260909t214357z-0efa55a8` identifies worker turn 1 and Checkpoint 1 as awaiting review; the next-checkpoint snapshot already points to Checkpoint 2. Retained the existing compact serializer and added exact final-wire boundary regression. Verification: 56 manager tests passed with disposable `Path.home()` configuration; `git diff --check` passed. No material findings. Checkpoints 2–6 remain unchecked.
 
@@ -105,7 +107,7 @@ Read nearer instructions before modifying their directories. Inspect the existin
 
 **Blockers:** Stop and report if current-boundary authority cannot be distinguished from optional history without changing supported decision behavior, or overlapping unrelated edits make ownership ambiguous. Missing historical incident files are not a blocker for synthetic verification.
 
-### [ ] Checkpoint 2: Bound optional manager history
+### [x] Checkpoint 2: Bound optional manager history
 
 **Goal:** Long-history fixtures fit deterministically while preserving protected authority and resolvable omitted-history references.
 
@@ -115,12 +117,12 @@ Read nearer instructions before modifying their directories. Inspect the existin
 
 **Steps:**
 
-- [ ] Build a deterministic v3 history projection. Initially retain at most 12 recent manager decisions, matching the existing run-extract cap. Keep chronological order with explicit decision numbers and turn numbers; never mix the two numbering domains when selecting the newest records.
-- [ ] Protect current boundary authority: finished-turn outcome and exact artifact references; eligible actions and proposed transition; current plan/checkpoint state; active scope/rejection state; current Lite-to-Full escalation evidence; current/retry note scopes; continuation and workspace state; validated evidence references and artifact roots. Historical copies of these facts must not replace their current authoritative fields.
-- [ ] Give omitted history exact controller-owned artifact references and explicit omitted counts. Use the existing per-decision directories and turn artifacts rather than copying histories into a second database. Declare the relevant run/root for cross-run references. Do not inline historical prompt bodies or bulk raw reviewer output.
-- [ ] Measure after all executor additions, including checkpoint repartition history. If the prompt still exceeds the cap, remove optional history oldest-first: duplicated historical manager records in run extract first, then older manager-decision history, then older workflow-turn history. Preserve any record required by active rejection/attempt authority in the protected sections before reducing its historical duplicate.
-- [ ] Stop reducing when exact serialized input fits. Record which categories were reduced and their omitted counts; include that disclosure in the measured payload. Keep the latest relevant failure/rejection evidence and escalation reason. Do not truncate paths, digests, JSON structures, legal actions, or review verdicts to force a fit.
-- [ ] If protected current evidence alone exceeds the cap, produce the explicit diagnosable failure in stage 3. Do not call the provider or treat missing information as approval.
+- [x] Build a deterministic v3 history projection. Initially retain at most 12 recent manager decisions, matching the existing run-extract cap. Keep chronological order with explicit decision numbers and turn numbers; never mix the two numbering domains when selecting the newest records.
+- [x] Protect current boundary authority: finished-turn outcome and exact artifact references; eligible actions and proposed transition; current plan/checkpoint state; active scope/rejection state; current Lite-to-Full escalation evidence; current/retry note scopes; continuation and workspace state; validated evidence references and artifact roots. Historical copies of these facts must not replace their current authoritative fields.
+- [x] Give omitted history exact controller-owned artifact references and explicit omitted counts. Use the existing per-decision directories and turn artifacts rather than copying histories into a second database. Declare the relevant run/root for cross-run references. Do not inline historical prompt bodies or bulk raw reviewer output.
+- [x] Measure after all executor additions, including checkpoint repartition history. If the prompt still exceeds the cap, remove optional history oldest-first: duplicated historical manager records in run extract first, then older manager-decision history, then older workflow-turn history. Preserve any record required by active rejection/attempt authority in the protected sections before reducing its historical duplicate.
+- [x] Stop reducing when exact serialized input fits. Record which categories were reduced and their omitted counts; include that disclosure in the measured payload. Keep the latest relevant failure/rejection evidence and escalation reason. Do not truncate paths, digests, JSON structures, legal actions, or review verdicts to force a fit.
+- [x] If protected current evidence alone exceeds the cap, produce the explicit diagnosable failure in stage 3. Do not call the provider or treat missing information as approval.
 
 History-reference contract: use bounded descriptors per source run and category containing the declared artifact root, existing relative directory/filename pattern, omitted count and numeric ranges. Merge adjacent ranges; do not add one inline reference for every omitted record. If descriptors or protected fields alone cannot fit, use Checkpoint 3's explicit failure. Preserve actual IDs and resolve only files owned by the declared run; never glob unrelated runs. This is reference metadata, not a second history store.
 

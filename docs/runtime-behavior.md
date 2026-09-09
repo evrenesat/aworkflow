@@ -93,8 +93,16 @@ referenced through its durable turn artifact.
   error containing total bytes and per-top-level-field byte counts only.
 - Bounded semantic fields (results, reasons, rejection summaries, diagnostic
   excerpts) are capped at 2,000 characters (`MANAGER_SUMMARY_MAX_CHARS`) with
-  one shared deterministic truncation marker; the run extract is limited to the
-  12 newest records.
+  one shared deterministic truncation marker. Schema-v3 manager decisions are
+  selected by decision number and workflow turns by turn number, with explicit
+  fields for both domains. The context retains at most 12 manager decisions and
+  12 mixed run-extract records. Omitted history is disclosed through measured
+  `history_disclosure` descriptors containing the source run, artifact root,
+  existing relative path pattern, omitted count, and merged numeric ranges.
+  When the exact final wire prompt remains over the hard cap, optional history
+  is removed oldest-first: duplicate manager rows in the run extract, older
+  manager decisions, then older workflow turns. Current boundary authority and
+  durable references are never replaced by those historical projections.
 - Non-sensitive prompt metrics persist in the manager result:
   `system_prompt_bytes`, `user_prompt_bytes`, `argv_bytes`,
   `referenced_artifact_count`, `referenced_artifact_bytes`. Referenced

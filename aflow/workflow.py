@@ -342,7 +342,10 @@ class _ManagerCallExecutor:
                 active_plan_content=captured_active_plan,
                 capture_evidence=True,
             )
-            if boundary.context_schema_version >= 3:
+            if (
+                boundary.context_schema_version >= 3
+                and context.get("schema_version") != MANAGER_CONTEXT_SCHEMA_VERSION_V3
+            ):
                 controller_state = context.get("controller_state")
                 if isinstance(controller_state, dict):
                     controller_state["checkpoint_repartitions"] = list(

@@ -176,9 +176,17 @@ contexts reference these files instead of copying bodies:
   repository-relative artifact paths, SHA-256 hashes, byte sizes, checkpoint
   line/byte ranges, and disclosure state. Reviewer stdout is referenced through
   its durable turn artifact and never copied. Bounded semantic fields share one
-  deterministic truncation marker at 2,000 characters, and the run extract is
-  capped at the 12 newest records. Selector 3 still rebuilds schema v2 exactly;
-  selectors 1/2 rebuild schema v1 for historical analysis.
+  deterministic truncation marker at 2,000 characters. Manager history is
+  projected by decision number and workflow history by turn number, each with
+  explicit numbering fields; the v3 run extract is capped at the 12 newest
+  projected records and the manager-decision list at the 12 newest decisions.
+  Omitted history is disclosed as bounded descriptors containing the source run,
+  declared artifact root, relative path pattern, omitted count, and merged
+  numeric ranges. The exact prompt serializer measures this disclosure after
+  controller-added repartition history; if needed it removes duplicate manager
+  rows, older manager decisions, and older workflow turns in that order while
+  preserving current boundary authority. Selector 3 still rebuilds schema v2
+  exactly; selectors 1/2 rebuild schema v1 for historical analysis.
 
 Manager prompts inline only the compact manifest. The exact UTF-8 user prompt
 targets 16 KiB and is hard-limited to 40 KiB before any provider process

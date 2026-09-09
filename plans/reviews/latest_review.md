@@ -1,16 +1,32 @@
-# Checkpoint 1 review — cp1 v01
+# Checkpoint 2 review — 2026-09-09
 
 Original and active plan: `plans/in-progress/aflow-manager-context-budget-followup-20260908.md`.
-Branch: `codex/aflow-dogfood-20260909`. Base: `93a54774d8f4a92e05d04f99b936f43c88ccf673`.
+Branch: `codex/aflow-dogfood-20260909`.
 
-Reviewed the current worktree fallback: no checkpoint commit exists for this plan after its base. Earlier cp-prefixed commits belong to other plans. Durable run `20260909t214357z-0efa55a8` identifies worker turn 1, Checkpoint 1, and awaiting-review state; Checkpoint 2 is the next unchecked checkpoint, not this review target.
+Reviewed worker turn 3 of run `20260909t214357z-0efa55a8`, using the current
+worktree fallback after approved `cp1 v01` (`b6b0a14`). There was no CP2 worker
+commit; the immediately preceding worker handoff explicitly completed CP2.
+The next unchecked checkpoint (3) was not the review target. The pre-handoff
+base `93a54774d8f4a92e05d04f99b936f43c88ccf673` remains reachable.
 
-Scope: the 47-line regression addition in `tests/test_manager.py`, together with existing `aflow/manager.py` serialization, byte enforcement and metrics, and the executor's use of the same prompt. Compact v3 encoding preserves decoded evidence; the complete wire prompt includes runtime/context prefixes and the final newline. The exact limit is accepted and one byte over is rejected before invocation construction. Existing Unicode and lossless regression coverage remains compatible. Later history reduction and overflow diagnostics belong to subsequent checkpoints.
+Scope: bounded v3 manager/workflow history, explicit numbering, omitted-history
+artifact descriptors, byte-driven optional-history reduction, preservation of
+current authority, and inclusion of repartition history before measurement.
+Schema-v1/v2 compatibility and the existing 40960-byte guard were also checked.
+Implementation and documentation remain compatible with the original plan.
 
-Verification: 56 tests passed in `tests/test_manager.py` using `uv run python` and a disposable `Path.home()` configuration root; `git diff --check` passed. Branch and reachable pre-handoff base verified. No production edits, live settings changes, history rewrites, or public pushes.
+Verification:
+- Manager/context suites: 111 passed.
+- Runtime manager suite: 39 passed, 7 subtests passed, 232 deselected.
+- Tests used disposable configuration roots. An initial runtime-suite failure
+  was caused by the review wrapper masking a test-local HOME override; rerunning
+  with test-local isolation respected passed without production changes.
+- `git diff --check` passed.
 
-Findings: none admitted under the material-code-review gate.
+Findings: none met the material-code-review admission gate.
 
-Checkpoint 1 approved through `cp1 v01`; Checkpoints 2–6 remain unchecked. Reviewer approval commit includes the retained test and reviewer-owned bookkeeping.
+Checkpoint 2 approved through `cp2 v01`; the reviewer approval commit retains
+prior approved lineage and includes the worker changes and review bookkeeping.
+Checkpoints 3–6 remain unchecked; no fix plan is required.
 
 No material findings

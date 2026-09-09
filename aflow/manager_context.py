@@ -7,7 +7,7 @@ captured plan solely to derive bounded controller-owned scope metadata.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -174,6 +174,7 @@ class ManagerContextV3:
     controller_state: dict[str, Any]
     evidence: dict[str, Any]
     plan_content_disclosure: dict[str, str]
+    history_disclosure: dict[str, Any] = field(default_factory=dict)
     active_scope_rejection_ledger: tuple[dict[str, Any], ...] = ()
     implementation_attempts: dict[str, Any] | None = None
     manager_decisions: tuple[dict[str, Any], ...] = ()
@@ -989,6 +990,195 @@ def _manager_records(run_dir: Path, *, before_decision_number: int | None = None
     return records
 
 
+def _manager_history_records(
+    run_dir: Path, *, before_decision_number: int | None = None
+) -> list[dict[str, Any]]:
+    """Read manager history with explicit decision/turn domains for schema v3."""
+    root = run_dir / "manager"
+    records: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return records
+    for decision_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        result_path = decision_dir / "result.json"
+        if not result_path.is_file():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        raw_number = result.get("decision_number")
+        if isinstance(raw_number, int) and not isinstance(raw_number, bool):
+            decision_number = raw_number
+        else:
+            decision_number = len(records) + 1
+        if (
+            before_decision_number is not None
+            and decision_number >= before_decision_number
+        ):
+            continue
+        raw_turn_number = result.get("finalized_turn_number")
+        turn_number = (
+            raw_turn_number
+            if isinstance(raw_turn_number, int) and not isinstance(raw_turn_number, bool)
+            else None
+        )
+        action = result.get("action")
+        reason = result.get("reason")
+        records.append({
+            "kind": "manager_decision",
+            "decision_number": decision_number,
+            "turn_number": turn_number,
+            "status": result.get("status") if isinstance(result.get("status"), str) else None,
+            "level": result.get("level") if isinstance(result.get("level"), str) else None,
+            "trigger": result.get("trigger") if isinstance(result.get("trigger"), str) else None,
+            "action": action if isinstance(action, str) else None,
+            "reason": reason if isinstance(reason, str) else None,
+            "semantic_summary": reason if isinstance(reason, str) else None,
+            "routing": {"action": action} if isinstance(action, str) else {},
+            "artifact_path": str(decision_dir.relative_to(run_dir)),
+        })
+    records.sort(key=lambda item: item["decision_number"])
+    return records
+
+
+def _v3_workflow_history_records(
+    run_dir: Path, turns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Convert workflow turns to a v3 record with an explicit turn number."""
+    records: list[dict[str, Any]] = []
+    for turn in turns:
+        compact = asdict(_compact_turn(run_dir, turn))
+        turn_number = compact.pop("number")
+        compact.update({
+            "number": turn_number,
+            "turn_number": turn_number,
+            "artifact_path": f"turns/turn-{turn_number:03d}",
+        })
+        records.append(compact)
+    records.sort(key=lambda item: item["turn_number"])
+    return records
+
+
+def _merge_history_ranges(
+    numbers: list[int],
+) -> list[dict[str, int]]:
+    """Return compact inclusive ranges for a set of positive integers."""
+    values = sorted(set(number for number in numbers if number >= 0))
+    if not values:
+        return []
+    ranges: list[dict[str, int]] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append({"start": start, "end": previous})
+        start = previous = value
+    ranges.append({"start": start, "end": previous})
+    return ranges
+
+
+def _history_descriptor(
+    run_dir: Path,
+    *,
+    category: str,
+    relative_path_pattern: str,
+    number_key: str,
+    records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    numbers = [
+        value
+        for record in records
+        for value in (record.get(number_key),)
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if not numbers:
+        return None
+    return {
+        "source_run_id": run_dir.name,
+        "category": category,
+        "artifact_root": str(run_dir.resolve()),
+        "relative_path_pattern": relative_path_pattern,
+        "omitted_count": len(set(numbers)),
+        "omitted_ranges": _merge_history_ranges(numbers),
+    }
+
+
+def _v3_history_disclosure(
+    run_dir: Path,
+    *,
+    workflow_records: list[dict[str, Any]],
+    manager_records: list[dict[str, Any]],
+    run_extract: list[dict[str, Any]],
+    retained_manager_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    retained_workflow_numbers = {
+        record.get("turn_number")
+        for record in run_extract
+        if record.get("kind") == "workflow_turn"
+        and isinstance(record.get("turn_number"), int)
+    }
+    retained_extract_decisions = {
+        record.get("decision_number")
+        for record in run_extract
+        if record.get("kind") == "manager_decision"
+        and isinstance(record.get("decision_number"), int)
+    }
+    retained_manager_numbers = {
+        record.get("decision_number")
+        for record in retained_manager_records
+        if isinstance(record.get("decision_number"), int)
+    }
+    omitted = []
+    descriptor = _history_descriptor(
+        run_dir,
+        category="run_extract_manager_decisions",
+        relative_path_pattern="manager/decision-{decision_number:03d}",
+        number_key="decision_number",
+        records=[
+            record for record in manager_records
+            if record.get("decision_number") not in retained_extract_decisions
+        ],
+    )
+    if descriptor is not None:
+        omitted.append(descriptor)
+    descriptor = _history_descriptor(
+        run_dir,
+        category="manager_decisions",
+        relative_path_pattern="manager/decision-{decision_number:03d}",
+        number_key="decision_number",
+        records=[
+            record for record in manager_records
+            if record.get("decision_number") not in retained_manager_numbers
+        ],
+    )
+    if descriptor is not None:
+        omitted.append(descriptor)
+    descriptor = _history_descriptor(
+        run_dir,
+        category="workflow_turns",
+        relative_path_pattern="turns/turn-{turn_number:03d}",
+        number_key="turn_number",
+        records=[
+            record for record in workflow_records
+            if record.get("turn_number") not in retained_workflow_numbers
+        ],
+    )
+    if descriptor is not None:
+        omitted.append(descriptor)
+    return {
+        "reduction_order": [],
+        "reduced_categories": [],
+        "retained_counts": {
+            "run_extract": len(run_extract),
+            "run_extract_manager_decisions": len(retained_extract_decisions),
+            "manager_decisions": len(retained_manager_records),
+            "workflow_turns": len(retained_workflow_numbers),
+        },
+        "omitted": omitted,
+    }
+
+
 def build_manager_context(
     run_dir: Path,
     *,
@@ -1571,6 +1761,13 @@ def build_manager_context(
         "repository": str(_v3_run_paths(run_dir).repo_root.resolve()),
         "run": str(run_dir.resolve()),
     }
+    boundary_repartition_history = boundary.get("repartition_history")
+    if isinstance(boundary_repartition_history, (list, tuple)):
+        v3_controller_state["checkpoint_repartitions"] = [
+            dict(record)
+            for record in boundary_repartition_history
+            if isinstance(record, Mapping)
+        ]
     if validated_envelope is not None:
         summary: dict[str, Any] = {
             "available": True,
@@ -1638,13 +1835,41 @@ def build_manager_context(
         "review_stdout_artifact_path": row.get("review_stdout_artifact_path"),
         "repair_plan_path": row.get("repair_plan_path"),
     } for row in active_rejections)
+    v3_manager_history = _manager_history_records(
+        run_dir, before_decision_number=decision_number
+    )
+    v3_workflow_history = _v3_workflow_history_records(run_dir, turns)
+    retained_manager_history = v3_manager_history[-MANAGER_RUN_EXTRACT_MAX_RECORDS:]
+    recent_workflow_history = v3_workflow_history[-MANAGER_RUN_EXTRACT_MAX_RECORDS:]
+    recent_manager_for_extract = [
+        record
+        for record in retained_manager_history
+        if isinstance(record.get("turn_number"), int)
+    ]
+    v3_run_extract = recent_workflow_history + recent_manager_for_extract
+    v3_run_extract.sort(key=lambda item: (
+        item.get("turn_number", 0),
+        item.get("kind") != "workflow_turn",
+        item.get("decision_number", 0),
+    ))
+    v3_run_extract = v3_run_extract[-MANAGER_RUN_EXTRACT_MAX_RECORDS:]
+    history_disclosure = _v3_history_disclosure(
+        run_dir,
+        workflow_records=v3_workflow_history,
+        manager_records=v3_manager_history,
+        run_extract=v3_run_extract,
+        retained_manager_records=retained_manager_history,
+    )
     v3_manager_decisions = tuple({
         "decision_number": row.get("decision_number"),
+        "turn_number": row.get("turn_number"),
+        "status": row.get("status"),
+        "level": row.get("level"),
+        "trigger": row.get("trigger"),
         "action": row.get("action"),
         "reason": _v3_bounded_text(row.get("reason")),
-        "level": row.get("level"),
-    } for row in manager_decisions)
-    v3_run_extract = context.run_extract
+        "artifact_path": row.get("artifact_path"),
+    } for row in retained_manager_history)
     reviewer_turn_numbers = {
         turn.get("turn_number")
         for turn in turns
@@ -1662,8 +1887,12 @@ def build_manager_context(
         else:
             record["semantic_summary"] = _v3_bounded_text(record.get("semantic_summary"))
         bounded_extract.append(record)
-    bounded_extract.sort(key=lambda item: (item.get("number", 0), item.get("kind") != "workflow_turn"))
-    v3_run_extract = tuple(bounded_extract[-MANAGER_RUN_EXTRACT_MAX_RECORDS:])
+    bounded_extract.sort(key=lambda item: (
+        item.get("turn_number", 0),
+        item.get("kind") != "workflow_turn",
+        item.get("decision_number", 0),
+    ))
+    v3_run_extract = tuple(bounded_extract)
     v3_context = ManagerContextV3(
         schema_version=MANAGER_CONTEXT_SCHEMA_VERSION_V3,
         run_id=context.run_id,
@@ -1676,6 +1905,7 @@ def build_manager_context(
         controller_state=v3_controller_state,
         evidence=evidence,
         plan_content_disclosure=plan_content_disclosure,
+        history_disclosure=history_disclosure,
         active_scope_rejection_ledger=v3_ledger,
         implementation_attempts=scoped_attempts,
         manager_decisions=v3_manager_decisions,

@@ -1523,6 +1523,168 @@ def test_v3_prompt_budget_excludes_pretty_printing_without_losing_evidence(summa
     assert compact_context == context
 
 
+def test_v3_history_reduction_preserves_current_authority_and_reports_ranges() -> None:
+    from aflow.manager import MANAGER_INLINE_CONTEXT_MAX_BYTES
+
+    history_text = "historical evidence " + ("x" * 6_000)
+    context = {
+        "schema_version": 3,
+        "run_id": "run-1",
+        "decision_number": 99,
+        "level": "full",
+        "trigger": "review_rejected",
+        "finished_turn": {
+            "turn_number": 99,
+            "status": "completed",
+            "semantic_result": {"result": "current boundary result"},
+            "raw_artifacts": [
+                {"path": "turns/turn-099/stdout.txt", "byte_size": 128},
+            ],
+        },
+        "run_extract": [
+            {
+                "kind": "manager_decision",
+                "decision_number": number,
+                "turn_number": number,
+                "semantic_summary": history_text,
+                "artifact_path": f"manager/decision-{number:03d}",
+            }
+            for number in range(1, 13)
+        ] + [
+            {
+                "kind": "workflow_turn",
+                "number": number,
+                "turn_number": number,
+                "semantic_summary": history_text,
+                "artifact_path": f"turns/turn-{number:03d}",
+            }
+            for number in range(1, 13)
+        ],
+        "manager_decisions": [
+            {
+                "decision_number": number,
+                "turn_number": number,
+                "status": "accepted",
+                "level": "full",
+                "trigger": "post_turn",
+                "action": "continue",
+                "reason": history_text,
+                "artifact_path": f"manager/decision-{number:03d}",
+            }
+            for number in range(1, 13)
+        ],
+        "plan_state": {
+            "active_plan_path": "plans/in-progress/plan.md",
+            "current_checkpoint": {
+                "index": 2,
+                "name": "Checkpoint 2: History",
+            },
+        },
+        "controller_state": {
+            "eligible_actions": ["continue", "escalate_to_full", "stop"],
+            "proposed_next_step": "review",
+            "lite_evidence": "Lite escalated because rejection evidence needs Full review.",
+            "workspace_state": {
+                "branch": "feature/history",
+                "head": "a" * 40,
+                "dirty_worktree": "",
+            },
+            "artifact_roots": {
+                "repository": "/repo",
+                "run": "/repo/.aflow/runs/run-1",
+            },
+            "latest_full_rejection": {
+                "rejection_number": 2,
+                "review_summary": "The current implementation needs one bounded fix.",
+                "review_stdout_artifact_path": "turns/turn-098/stdout.txt",
+            },
+        },
+        "evidence": {
+            "active_plan": {
+                "available": True,
+                "reference": {
+                    "kind": "plan",
+                    "path": ".aflow/runs/run-1/evidence/plans/plan.md",
+                    "sha256": "b" * 64,
+                    "byte_size": 128,
+                },
+            },
+        },
+        "plan_content_disclosure": {
+            "active_plan": "referenced",
+            "original_plan": "referenced",
+            "checkpoint": "referenced",
+        },
+        "active_scope_rejection_ledger": [
+            {
+                "rejection_number": 2,
+                "source_run_id": "run-1",
+                "review_turn_number": 98,
+                "review_stdout_artifact_path": "turns/turn-098/stdout.txt",
+            }
+        ],
+        "manager_note_scope": {
+            "active_plan_identity": "plans/in-progress/plan.md::checkpoint-2",
+            "allowed_paths": ["aflow/manager_context.py"],
+        },
+        "retry_manager_note_scope": {
+            "active_plan_identity": "plans/in-progress/repair.md::checkpoint-2",
+            "allowed_paths": ["tests/test_manager_context.py"],
+        },
+        "history_disclosure": {
+            "reduction_order": [],
+            "reduced_categories": [],
+            "retained_counts": {},
+            "omitted": [],
+        },
+    }
+
+    _, prompt = build_manager_prompts(context)
+    assert len(prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    _, projected = _split_manager_user(prompt)
+
+    for key in (
+        "finished_turn",
+        "plan_state",
+        "controller_state",
+        "evidence",
+        "plan_content_disclosure",
+        "active_scope_rejection_ledger",
+        "manager_note_scope",
+        "retry_manager_note_scope",
+    ):
+        assert projected[key] == context[key]
+    assert all(
+        item.get("kind") != "manager_decision"
+        for item in projected["run_extract"]
+    )
+    disclosure = projected["history_disclosure"]
+    assert disclosure["reduction_order"][:3] == [
+        "run_extract_manager_decisions",
+        "manager_decisions",
+        "workflow_turns",
+    ]
+    assert len(projected["manager_decisions"]) < len(context["manager_decisions"])
+    assert len(projected["run_extract"]) < 12
+    assert disclosure["retained_counts"]["run_extract"] == len(
+        projected["run_extract"]
+    )
+    assert disclosure["retained_counts"]["manager_decisions"] == len(
+        projected["manager_decisions"]
+    )
+    for descriptor in disclosure["omitted"]:
+        assert descriptor["source_run_id"] == "run-1"
+        assert descriptor["artifact_root"] == "/repo/.aflow/runs/run-1"
+        assert descriptor["omitted_count"] > 0
+        assert descriptor["omitted_ranges"]
+        assert descriptor["omitted_ranges"] == [
+            {
+                "start": descriptor["omitted_ranges"][0]["start"],
+                "end": descriptor["omitted_ranges"][-1]["end"],
+            }
+        ]
+
+
 def test_v3_prompt_metrics_count_references_without_bodies() -> None:
     from aflow.manager import manager_prompt_metrics
 
