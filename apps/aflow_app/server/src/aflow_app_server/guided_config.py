@@ -67,6 +67,94 @@ _SUGGESTION_NOTE = (
 STARTER_PLACEHOLDER_MODEL = "FILL_IN_MODEL"
 _STARTER_PROFILE_PATH = ("harness", "starter", "profiles", "default")
 
+# Keep this catalog in the guided projection rather than configuration data:
+# it is editor-only help and never participates in an action or TOML write.
+# The server contract test compares these tokens with both replacement layers
+# in ``aflow.workflow`` so new production substitutions cannot silently omit
+# editor documentation.
+PROMPT_TEMPLATE_VARIABLE_CATALOG: tuple[dict[str, object], ...] = (
+    {
+        "token": "{ORIGINAL_PLAN_PATH}",
+        "description": "The original input plan path for this run.",
+        "scope": "Named workflow step prompts and named merge prompts.",
+        "absent_value": "Always receives the controller's original plan path when rendered.",
+        "example": "plans/request.md",
+        "applicable_prompt_types": ("workflow step prompt", "merge prompt"),
+    },
+    {
+        "token": "{ACTIVE_PLAN_PATH}",
+        "description": "The active plan path for the current workflow step.",
+        "scope": "Named workflow step prompts and named merge prompts.",
+        "absent_value": "Always receives the controller's active plan path when rendered.",
+        "example": "plans/request-cp02-v01.md",
+        "applicable_prompt_types": ("workflow step prompt", "merge prompt"),
+    },
+    {
+        "token": "{NEW_PLAN_PATH}",
+        "description": "The controller-provided destination for a possible follow-up plan.",
+        "scope": "Named workflow step prompts and named merge prompts.",
+        "absent_value": "Always receives the generated follow-up-plan destination; it is not a resolved run preview.",
+        "example": "plans/request-cp02-v01.md",
+        "applicable_prompt_types": ("workflow step prompt", "merge prompt"),
+    },
+    {
+        "token": "{NEXT_CP}",
+        "description": "The current unchecked checkpoint index in the active plan.",
+        "scope": "Named workflow step prompts and named merge prompts.",
+        "absent_value": "Renders as '-' when no unchecked checkpoint index is available.",
+        "example": "2",
+        "applicable_prompt_types": ("workflow step prompt", "merge prompt"),
+    },
+    {
+        "token": "{WORK_ON_NEXT_CHECKPOINT_CMD}",
+        "description": "An instruction to work only on the current checkpoint, not a shell command.",
+        "scope": "Named workflow step prompts and named merge prompts.",
+        "absent_value": "Renders as an empty string when no unchecked checkpoint index is available.",
+        "example": "Work only on Checkpoint #2. Do not repeat earlier checkpoints, and do not skip ahead.",
+        "applicable_prompt_types": ("workflow step prompt", "merge prompt"),
+    },
+    {
+        "token": "{MAIN_BRANCH}",
+        "description": "The configured branch that receives a lifecycle merge.",
+        "scope": "Named merge prompts only; not substituted in ordinary step prompts.",
+        "absent_value": "Not substituted outside a merge prompt.",
+        "example": "main",
+        "applicable_prompt_types": ("merge prompt",),
+    },
+    {
+        "token": "{FEATURE_BRANCH}",
+        "description": "The feature branch created for this lifecycle run.",
+        "scope": "Named merge prompts only; not substituted in ordinary step prompts.",
+        "absent_value": "Not substituted outside a merge prompt.",
+        "example": "aflow/request-cp02",
+        "applicable_prompt_types": ("merge prompt",),
+    },
+    {
+        "token": "{PRIMARY_REPO_ROOT}",
+        "description": "The primary checkout root used to coordinate the lifecycle merge.",
+        "scope": "Named merge prompts only; not substituted in ordinary step prompts.",
+        "absent_value": "Not substituted outside a merge prompt.",
+        "example": "/workspace/project",
+        "applicable_prompt_types": ("merge prompt",),
+    },
+    {
+        "token": "{EXECUTION_REPO_ROOT}",
+        "description": "The repository root where the workflow executes.",
+        "scope": "Named merge prompts only; not substituted in ordinary step prompts.",
+        "absent_value": "Not substituted outside a merge prompt.",
+        "example": "/workspace/project",
+        "applicable_prompt_types": ("merge prompt",),
+    },
+    {
+        "token": "{FEATURE_WORKTREE_PATH}",
+        "description": "The linked feature worktree path for this lifecycle run.",
+        "scope": "Named merge prompts only; not substituted in ordinary step prompts.",
+        "absent_value": "Renders as an empty string when the lifecycle has no feature worktree.",
+        "example": "/workspace/project/.worktrees/request-cp02",
+        "applicable_prompt_types": ("merge prompt",),
+    },
+)
+
 
 class GuidedConfigError(RuntimeError):
     """A bounded, actionable guided-config rejection with a stable code."""
@@ -782,6 +870,7 @@ def _projection(
         "prompts": named_prompts,
         "role_prompts": role_prompts,
         "prompt_usages": {name: tuple(paths) for name, paths in usages.items()},
+        "template_variables": PROMPT_TEMPLATE_VARIABLE_CATALOG,
         "max_turns": max_turns,
         "harnesses": harnesses,
         "roles": roles,

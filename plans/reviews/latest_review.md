@@ -1,17 +1,15 @@
-# Checkpoint 4 review
+# Checkpoint 5 review
 
-Reviewed through `cp4 v01` on `codex/aflow-dogfood-20260909`.
+Reviewed CP5 for the original and active plan `plans/in-progress/aflow-manager-context-budget-followup-20260908.md` on branch `codex/aflow-dogfood-20260909`.
 
-Original and active plan: `plans/in-progress/aflow-manager-context-budget-followup-20260908.md`.
+Target: current-worktree fallback after CP4 approval `986300d`; no CP5 worker commit exists. Run `20260909t224505z-752d79ec`, worker turn 5, and the CP5 scope envelope establish the immediately preceding attempt. The next unchecked checkpoint is CP6, which is outside this review.
 
-Used current-worktree fallback after CP3 approval `1130399`, because no CP4 worker commit exists. The selected run `20260909t224505z-752d79ec` identifies worker turn 3 and an active CP4 scope awaiting review; CP5 is only the next unchecked checkpoint. The reviewed slice consists of the pending tests, DEVLOG entry, and intentional checkpoint ledger updates. Prior approval commits and lineage are preserved.
+Scope: the ten ordinary/merge prompt substitutions, typed read-only guided catalog, named prompt help, literal role/team override disclosure, unavailable-help behavior, save metadata exclusion, and directly related documentation. Reviewed implementation against production renderers and editor/save paths using the material finding admission gate, exclusions, and proportionate-fix discipline.
 
-Scope: sanitized later-boundary Unicode/history/rejection/escalation/repartition fixtures, deterministic reconstruction, and real fake-harness executor verification from a separate worktree. Existing regressions cover budget rejection, diagnostic caps and persistence failures; existing architecture documentation already describes these behaviors.
+Verification: 65 guided-config tests and 7 renderer regressions passed with disposable HOME/configuration; all 256 web tests passed; production build and git diff --check passed. React act warnings did not fail the web suite. Bounded worker handoff evidence records successful Chromium placement at 1280px desktop and 390px mobile without a selected project; Chromium was not independently rerun in this review.
 
-Verification: 153 manager/context/runlog tests and 43 runtime manager tests plus 7 subtests passed with disposable HOME and configuration. `git diff --check` passed. An initial Path.home mock interfered with an existing test's own HOME override; the corrected isolated run passed without code changes.
+Findings: none.
 
-Read-only incident decision-20 reconstruction: 37,979 pretty-printed bytes versus 32,324 current wire bytes. Decision artifact hashes and mtimes remained unchanged. These are current reconstructed bytes, not the persisted fallback or a claim of byte identity with the original failure.
-
-Findings: none admitted by the material-code-review gate. CP4 approved; CP5–6 remain unchecked. No follow-up fix plan needed.
+Approval: approve CP5 as `cp5 v01`, retain prior approvals and implementation lineage, and leave CP6 unchecked. No fix plan is needed.
 
 No material findings

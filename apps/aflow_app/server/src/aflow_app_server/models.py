@@ -421,10 +421,22 @@ class GuidedTeamSummary(CanonicalTransportModel):
     upgrade_to: str | None = None
 
 
+class GuidedTemplateVariable(CanonicalTransportModel):
+    """Read-only editor help for one production prompt substitution."""
+
+    token: str
+    description: str
+    scope: str
+    absent_value: str
+    example: str
+    applicable_prompt_types: tuple[str, ...]
+
+
 class GuidedFormProjection(CanonicalTransportModel):
     prompts: Mapping[str, str] = Field(default_factory=dict)
     role_prompts: Mapping[str, str] = Field(default_factory=dict)
     prompt_usages: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    template_variables: tuple[GuidedTemplateVariable, ...] = Field(default_factory=tuple)
     default_workflow: str | None = None
     max_turns: int | None = None
     harnesses: Mapping[str, Mapping[str, GuidedProfileSummary]]

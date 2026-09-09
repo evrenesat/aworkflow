@@ -49,6 +49,18 @@ describe('changed-only settings', () => {
   it('emits no manager action merely from loading an omitted default', () => {
     expect(settingsActions(baseline, structuredClone(baseline))).toEqual([])
   })
+  it('keeps read-only template help metadata out of save actions', () => {
+    const draft = structuredClone(baseline)
+    draft.template_variables = [{
+      token: '{NEXT_CP}',
+      description: 'Checkpoint index',
+      scope: 'Workflow prompts',
+      absent_value: '-',
+      example: '2',
+      applicable_prompt_types: ['workflow step prompt'],
+    }]
+    expect(settingsActions(baseline, draft)).toEqual([])
+  })
   it('emits net manager changes with presence semantics, never truthiness', () => {
     const enabled = structuredClone(baseline)
     enabled.default_manager_enabled = true

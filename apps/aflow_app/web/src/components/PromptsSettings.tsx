@@ -2,14 +2,16 @@ import { useState } from 'react'
 import type { GuidedFormProjection } from '../types'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MenuItem, MoreMenu } from './MoreMenu'
+import { TemplateVariablesHelp } from './TemplateVariablesHelp'
 
 type ChangeFn = (update: (value: GuidedFormProjection) => void) => void
 
-function NamedPromptCard({ name, text, displayName, usages, rename, change, onDelete }: {
+function NamedPromptCard({ name, text, displayName, usages, templateVariables, rename, change, onDelete }: {
   name: string
   text: string
   displayName: string
   usages: readonly string[]
+  templateVariables: GuidedFormProjection['template_variables']
   rename: (name: string, target: string) => void
   change: ChangeFn
   onDelete: () => void
@@ -38,6 +40,7 @@ function NamedPromptCard({ name, text, displayName, usages, rename, change, onDe
       <>
         <label>Prompt key <input className="input" value={displayName} aria-label={`Prompt key ${name}`} onChange={e => rename(name, e.target.value)} /></label>
         <label>Prompt text <textarea className="input" rows={7} aria-label={`Prompt text ${name}`} value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></label>
+        <TemplateVariablesHelp variables={templateVariables} context="named" />
         {referenced
           ? <details className="prompt-usages">
               <summary className="text-xs">Used by {usages.length} configured reference{usages.length === 1 ? '' : 's'}</summary>
@@ -104,6 +107,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
       text={text}
       displayName={names[name] ?? name}
       usages={draft.prompt_usages?.[name] ?? []}
+      templateVariables={draft.template_variables}
       rename={rename}
       change={change}
       onDelete={() => onDelete(name, text)}
@@ -112,6 +116,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
       {role && <>
         <span>{role in map ? 'Explicit override' : team ? 'Inherited global text' : 'Default role prompt'}</span>
         <textarea className="input" rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} />
+        <TemplateVariablesHelp variables={draft.template_variables} context="role" />
         {role in map && <button className="btn btn-secondary" onClick={() => setRoleText(null)}>Remove override</button>}
         {role in map && <details><summary>Move override</summary>
           <label>Target role<select className="input" value={targetRole} onChange={e => setTargetRole(e.target.value)}><option value="">Choose role</option>{Object.keys(draft.roles).map(key => <option key={key}>{key}</option>)}</select></label>

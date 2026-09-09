@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-09 — Document prompt template variables (Checkpoint 5)
+
+- Added read-only template-variable metadata to the guided configuration
+  projection, sourced from both ordinary and merge prompt renderers. The web
+  prompt editors now show scope, fallback behavior, and illustrative examples;
+  role/team overrides explicitly remain literal text.
+- Verification: guided-config 65 passed; renderer prompt regression 7 passed;
+  focused web settings tests 75 passed plus 8 save-draft tests; web build and
+  `git diff --check` clean.
+  Disposable Chromium checks confirmed the reference below the editor and
+  within both 1280px desktop and 390px mobile viewports with no project selected.
+
 ## 2026-09-09 — Verify complete manager boundaries (Checkpoint 4)
 
 - Reviewer approved CP4 through `cp4 v01`: 153 manager/context/runlog tests,

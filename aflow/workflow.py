@@ -3244,6 +3244,26 @@ def _resolve_prompt_file_path(
     return config_dir / location
 
 
+PROMPT_TEMPLATE_VARIABLES: tuple[str, ...] = (
+    "{ORIGINAL_PLAN_PATH}",
+    "{ACTIVE_PLAN_PATH}",
+    "{NEW_PLAN_PATH}",
+    "{NEXT_CP}",
+    "{WORK_ON_NEXT_CHECKPOINT_CMD}",
+)
+
+# These variables are applied only by ``render_merge_prompt`` after the
+# general prompt substitutions above.  Keep the declaration close to the
+# production renderer so editor help can be checked against both layers.
+MERGE_PROMPT_TEMPLATE_VARIABLES: tuple[str, ...] = (
+    "{MAIN_BRANCH}",
+    "{FEATURE_BRANCH}",
+    "{PRIMARY_REPO_ROOT}",
+    "{EXECUTION_REPO_ROOT}",
+    "{FEATURE_WORKTREE_PATH}",
+)
+
+
 def render_prompt(
     prompt_text: str,
     *,
@@ -3282,11 +3302,15 @@ def render_prompt(
                     f"Work only on Checkpoint #{checkpoint_index}. "
                     "Do not repeat earlier checkpoints, and do not skip ahead."
                 )
-    prompt_text = prompt_text.replace("{ORIGINAL_PLAN_PATH}", str(original_plan_path))
-    prompt_text = prompt_text.replace("{NEW_PLAN_PATH}", str(new_plan_path))
-    prompt_text = prompt_text.replace("{ACTIVE_PLAN_PATH}", str(active_plan_path))
-    prompt_text = prompt_text.replace("{NEXT_CP}", next_checkpoint)
-    prompt_text = prompt_text.replace("{WORK_ON_NEXT_CHECKPOINT_CMD}", work_on_next_checkpoint_cmd)
+    replacements = {
+        "{ORIGINAL_PLAN_PATH}": str(original_plan_path),
+        "{NEW_PLAN_PATH}": str(new_plan_path),
+        "{ACTIVE_PLAN_PATH}": str(active_plan_path),
+        "{NEXT_CP}": next_checkpoint,
+        "{WORK_ON_NEXT_CHECKPOINT_CMD}": work_on_next_checkpoint_cmd,
+    }
+    for variable in PROMPT_TEMPLATE_VARIABLES:
+        prompt_text = prompt_text.replace(variable, replacements[variable])
     return prompt_text
 
 
@@ -5231,11 +5255,15 @@ def render_merge_prompt(
         active_plan_path=active_plan_path,
     )
     worktree_path_str = str(exec_ctx.worktree_path) if exec_ctx.worktree_path else ""
-    rendered = rendered.replace("{MAIN_BRANCH}", exec_ctx.main_branch)
-    rendered = rendered.replace("{FEATURE_BRANCH}", exec_ctx.feature_branch)
-    rendered = rendered.replace("{PRIMARY_REPO_ROOT}", str(exec_ctx.primary_repo_root))
-    rendered = rendered.replace("{EXECUTION_REPO_ROOT}", str(exec_ctx.execution_repo_root))
-    rendered = rendered.replace("{FEATURE_WORKTREE_PATH}", worktree_path_str)
+    replacements = {
+        "{MAIN_BRANCH}": exec_ctx.main_branch,
+        "{FEATURE_BRANCH}": exec_ctx.feature_branch,
+        "{PRIMARY_REPO_ROOT}": str(exec_ctx.primary_repo_root),
+        "{EXECUTION_REPO_ROOT}": str(exec_ctx.execution_repo_root),
+        "{FEATURE_WORKTREE_PATH}": worktree_path_str,
+    }
+    for variable in MERGE_PROMPT_TEMPLATE_VARIABLES:
+        rendered = rendered.replace(variable, replacements[variable])
     return rendered
 
 

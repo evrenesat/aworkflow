@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from aflow.config import load_workflow_config, render_starter_documents
+from aflow.workflow import MERGE_PROMPT_TEMPLATE_VARIABLES, PROMPT_TEMPLATE_VARIABLES
 
 from aflow_app_server.guided_config import (
     GuidedConfigError,
@@ -149,6 +150,31 @@ class TestNoOpAndPreservation:
         assert deliver.declared_steps == ("implement", "verify")
         assert deliver.executable_steps == ("implement", "verify")
         assert deliver.first_executable_step == "implement"
+
+    def test_projection_catalog_covers_every_production_prompt_variable(self) -> None:
+        response = _call()
+        form = response.form
+        assert form is not None
+        variables = form.template_variables
+        expected_tokens = PROMPT_TEMPLATE_VARIABLES + MERGE_PROMPT_TEMPLATE_VARIABLES
+        assert tuple(variable.token for variable in variables) == expected_tokens
+        assert len({variable.token for variable in variables}) == len(expected_tokens)
+
+        by_token = {variable.token: variable for variable in variables}
+        assert by_token["{ORIGINAL_PLAN_PATH}"].description == (
+            "The original input plan path for this run."
+        )
+        assert by_token["{NEXT_CP}"].absent_value == (
+            "Renders as '-' when no unchecked checkpoint index is available."
+        )
+        assert by_token["{WORK_ON_NEXT_CHECKPOINT_CMD}"].example == (
+            "Work only on Checkpoint #2. Do not repeat earlier checkpoints, "
+            "and do not skip ahead."
+        )
+        assert by_token["{MAIN_BRANCH}"].applicable_prompt_types == ("merge prompt",)
+        assert by_token["{FEATURE_WORKTREE_PATH}"].absent_value == (
+            "Renders as an empty string when the lifecycle has no feature worktree."
+        )
 
     def test_semantically_incomplete_draft_stays_projectable(self) -> None:
         broken = AFLOW_TEXT.replace('worker = "codex.fast"', 'worker = "codex.missing"')

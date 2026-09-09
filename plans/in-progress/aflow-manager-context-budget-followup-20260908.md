@@ -1,6 +1,6 @@
 # aflow manager context budget and failure evidence
 
-Status: Checkpoint 4 reviewed and approved through `cp4 v01`; Checkpoints 5–6 remain pending. Compatible implementation and prior CP1–CP3 approvals are retained.
+Status: Checkpoint 5 reviewed and approved through `cp5 v01`; Checkpoint 6 remains pending. Compatible implementation and prior CP1–CP4 approvals are retained.
 
 Execution amendment (2026-09-09): retain the owner-approved 40 KiB hard guard already in the current baseline. The later readable-output plan adds the separate 16 KiB current-summary target. Historical incident sizes below remain historical evidence.
 
@@ -16,6 +16,8 @@ The handoff also adds prompt-variable help beneath editors and readable sentence
 - Pre-Handoff Base HEAD: `93a54774d8f4a92e05d04f99b936f43c88ccf673`
 
 ### Review Log
+
+- 2026-09-09: Approved CP5 through `cp5 v01` using current-worktree fallback after `986300d`; no CP5 worker commit exists. Run `20260909t224505z-752d79ec`, worker turn 5 and its CP5 scope envelope identify the reviewed checkpoint despite CP6 being next unchecked. Covered ten-variable renderer/catalog coverage, named and literal role/team editor help, missing-help editing and metadata-free saves. Reviewer verification: 65 guided-config tests, 7 renderer regressions, all 256 web tests, production build and diff check passed; Python checks used disposable HOME/configuration. Bounded worker evidence records Chromium placement at desktop 1280px and mobile 390px with no project selected; reviewer did not rerun Chromium. No material findings. CP6 remains pending and prior approvals/lineage are retained.
 
 - 2026-09-09: Approved CP4 through `cp4 v01` using current-worktree fallback after `1130399`; no CP4 worker commit exists. Run `20260909t224505z-752d79ec`, worker turn 3 and active scope identify CP4 awaiting review despite CP5 being next unchecked. Reviewed sanitized later-boundary/rejection/repartition fixtures, separate-worktree executor and artifact checks, and read-only reconstruction. Verification: 153 manager/context/runlog tests, 43 runtime manager tests and 7 subtests passed with disposable HOME/configuration; diff check passed. Incident decision 20 reconstructed read-only: 37,979 pretty bytes versus 32,324 current wire bytes; decision artifact hashes and mtimes unchanged. This is a current reconstruction, not the stored fallback or a claim of original failed-wire identity. No material findings. CP5–6 remain pending; prior commits and lineage retained.
 
@@ -202,7 +204,7 @@ Failure-artifact contract: store `rejected-context.json` and `rejected-user-prom
 
 **Blockers:** Stop and report if current-boundary authority cannot be distinguished from optional history without changing supported decision behavior, or overlapping unrelated edits make ownership ambiguous. Missing historical incident files are not a blocker for synthetic verification.
 
-### [ ] Checkpoint 5: Explain supported template variables under prompt editors
+### [x] Checkpoint 5: Explain supported template variables under prompt editors
 
 **Goal:** Every prompt editor shows a compact reference beneath its text field explaining every supported template variable, including `{WORK_ON_NEXT_CHECKPOINT_CMD}`, without requiring a selected project or plan.
 
@@ -212,10 +214,10 @@ Failure-artifact contract: store `rejected-context.json` and `rejected-user-prom
 
 **Steps:**
 
-- [ ] Inventory all supported prompt substitutions and their applicable prompt types from production rendering code. Expose a typed read-only variable catalog through the existing guided projection: exact token, concise description, availability/scope, absent-value behavior, and illustrative example. Keep metadata out of configuration mutation payloads. Add a contract test ensuring catalog coverage of the actual supported substitutions so a later variable cannot silently lack editor help.
-- [ ] Document the five currently verified tokens accurately: `{ORIGINAL_PLAN_PATH}` is the original input plan path; `{ACTIVE_PLAN_PATH}` is the current step's active plan path; `{NEW_PLAN_PATH}` is the controller-provided new-plan destination (trace call sites to explain when it is used); `{NEXT_CP}` is the current unchecked checkpoint index, or `-` when none is available; `{WORK_ON_NEXT_CHECKPOINT_CMD}` expands to the instruction to work only on that checkpoint, not a shell command, and is empty when no checkpoint index is available. Its example for checkpoint 2 must reflect the existing renderer: “Work only on Checkpoint #2. Do not repeat earlier checkpoints, and do not skip ahead.” Inventory any additional supported variables before declaring coverage complete.
-- [ ] Render a shared “Template variables” reference immediately below each prompt text editor, including role/team prompt overrides where supported. Show exact tokens in code styling and explanations in normal text; list all applicable supported variables, not only those already used in the draft. Keep the short reference visible by default. Examples are illustrative, never claimed to be resolved values from an unselected run. Unsupported editor contexts must explain applicability instead of implying substitutions occur there.
-- [ ] Verify newly created prompts receive the same help; switching prompts/tabs retains drafts; variable reference renders with no project selected; help refresh/load failures cannot block editing or discard draft text. Do not add new warnings or block saving because a draft contains unknown brace text; preserve the renderer's existing behavior.
+- [x] Inventory all supported prompt substitutions and their applicable prompt types from production rendering code. Expose a typed read-only variable catalog through the existing guided projection: exact token, concise description, availability/scope, absent-value behavior, and illustrative example. Keep metadata out of configuration mutation payloads. Add a contract test ensuring catalog coverage of the actual supported substitutions so a later variable cannot silently lack editor help.
+- [x] Document the five currently verified tokens accurately: `{ORIGINAL_PLAN_PATH}` is the original input plan path; `{ACTIVE_PLAN_PATH}` is the current step's active plan path; `{NEW_PLAN_PATH}` is the controller-provided new-plan destination (trace call sites to explain when it is used); `{NEXT_CP}` is the current unchecked checkpoint index, or `-` when none is available; `{WORK_ON_NEXT_CHECKPOINT_CMD}` expands to the instruction to work only on that checkpoint, not a shell command, and is empty when no checkpoint index is available. Its example for checkpoint 2 must reflect the existing renderer: “Work only on Checkpoint #2. Do not repeat earlier checkpoints, and do not skip ahead.” Inventory any additional supported variables before declaring coverage complete.
+- [x] Render a shared “Template variables” reference immediately below each prompt text editor, including role/team prompt overrides where supported. Show exact tokens in code styling and explanations in normal text; list all applicable supported variables, not only those already used in the draft. Keep the short reference visible by default. Examples are illustrative, never claimed to be resolved values from an unselected run. Unsupported editor contexts must explain applicability instead of implying substitutions occur there.
+- [x] Verify newly created prompts receive the same help; switching prompts/tabs retains drafts; variable reference renders with no project selected; help refresh/load failures cannot block editing or discard draft text. Do not add new warnings or block saving because a draft contains unknown brace text; preserve the renderer's existing behavior.
 
 **Dependencies:** Independent of Checkpoints 1–4; numbered here to keep one durable ledger.
 

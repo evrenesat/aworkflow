@@ -153,6 +153,13 @@ literal text in `[roles.prompts]` and `[teams.<name>.prompts]`; removing a team
 override restores global inheritance. Installed skills and arbitrary files are
 outside the editor.
 
+Each prompt text editor shows a **Template variables** reference. Named workflow
+and merge prompts document the plan/checkpoint variables (`{ORIGINAL_PLAN_PATH}`,
+`{ACTIVE_PLAN_PATH}`, `{NEW_PLAN_PATH}`, `{NEXT_CP}`, and
+`{WORK_ON_NEXT_CHECKPOINT_CMD}`); merge-only execution variables are labeled by
+scope. Examples are illustrative rather than values from a selected run. Role
+and team overrides remain literal text and are not passed through this renderer.
+
 Teams are created with an explicit **Add team** form (button or Enter) that adds the
 team to the unsaved draft immediately — it becomes selectable everywhere before Save
 all, and `add_team` actions precede their dependent edits in one changes-only batch.

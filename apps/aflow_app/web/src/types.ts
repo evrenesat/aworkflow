@@ -132,10 +132,21 @@ export interface GuidedWorkflowStepSummaries {
   manager_enabled_source?: string
 }
 
+export interface GuidedTemplateVariable {
+  token: string
+  description: string
+  scope: string
+  absent_value: string
+  example: string
+  applicable_prompt_types: string[]
+}
+
 export interface GuidedFormProjection {
   prompts?: Record<string, string>
   role_prompts?: Record<string, string>
   prompt_usages?: Record<string, string[]>
+  /** Read-only help metadata; never included in guided save actions. */
+  template_variables?: GuidedTemplateVariable[]
   default_workflow: string | null
   max_turns: number | null
   harnesses: Record<string, Record<string, GuidedProfileSummary>>
