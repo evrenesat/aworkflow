@@ -1431,6 +1431,53 @@ def test_manager_prompt_accepts_40_kib_and_rejects_one_more_utf8_byte() -> None:
         enforce_manager_inline_context_budget({}, prompt + "x")
 
 
+def test_v3_prompt_boundary_uses_exact_final_wire_serialization() -> None:
+    from aflow.manager import (
+        MANAGER_INLINE_CONTEXT_MAX_BYTES,
+        ManagerInlineContextLimitError,
+        manager_prompt_metrics,
+    )
+
+    context = {
+        "schema_version": 3,
+        "level": "full",
+        "run_id": "run-1",
+        "controller_state": {"eligible_actions": ["continue"]},
+        # Calibrate the payload from the complete builder output so the test
+        # covers the runtime prefix, delimiter, JSON, and final newline.
+        "padding": "",
+    }
+    _, base_prompt = build_manager_prompts(context)
+    base_bytes = len(base_prompt.encode("utf-8"))
+    assert base_bytes < MANAGER_INLINE_CONTEXT_MAX_BYTES
+    context["padding"] = "x" * (MANAGER_INLINE_CONTEXT_MAX_BYTES - base_bytes)
+
+    system_prompt, prompt = build_manager_prompts(context)
+    assert prompt.startswith("MANAGER_RUNTIME_JSON:\n")
+    assert prompt.count("\nMANAGER_CONTEXT_JSON:\n") == 1
+    assert prompt.endswith("\n")
+    assert len(prompt.encode("utf-8")) == MANAGER_INLINE_CONTEXT_MAX_BYTES
+    _, decoded_context = _split_manager_user(prompt)
+    assert decoded_context == context
+
+    metrics = manager_prompt_metrics(
+        context,
+        system_prompt=system_prompt,
+        user_prompt=prompt,
+    )
+    assert metrics["user_prompt_bytes"] == MANAGER_INLINE_CONTEXT_MAX_BYTES
+
+    over_limit = dict(context)
+    over_limit["padding"] += "x"
+    with pytest.raises(
+        ManagerInlineContextLimitError,
+        match=rf"total_bytes={MANAGER_INLINE_CONTEXT_MAX_BYTES + 1}\b",
+    ):
+        # The builder rejects the final wire string before the executor can
+        # resolve or launch a provider invocation.
+        build_manager_prompts(over_limit)
+
+
 def test_prompt_hard_limit_fails_closed_before_provider_start() -> None:
     from aflow.manager import (
         MANAGER_INLINE_CONTEXT_MAX_BYTES,
