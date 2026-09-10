@@ -18,9 +18,13 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp4 v01` — approved.
+- Last Reviewed Checkpoint: `cp5 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp5 v01` from the immediately preceding worker's repaired worktree against approved CP4 `62d8ac9`; worktree fallback used because no pending CP5 commit exists (zero intervening implementation commits). The cp06-v01 non-checkpoint overlay is resolved: admission validates the preserved pending next_step before status fallbacks. Reviewed shared live admission, capabilities, HTTP/MCP errors and runtime boundary validation. Verification: 423 passed, 43 subtests; diff check passed. No material findings. CP6 remains unchecked; manager 40 KiB hard guard and 16 KiB compact summary retained.
+
+- 2026-09-10: Rejected pending CP5 worker worktree against approved CP4 `62d8ac9`; worktree fallback used because no pending CP5 commit exists (zero intervening implementation commits). Scoped service/API/MCP/runtime/hotplug verification: 421 passed, 43 subtests; diff check passed. Synthetic reproduction confirms P2: admission ignores a pending next_step correction and rejects a valid team update against the removed old step. CP5 approval unchecked; compatible implementation retained; CP6 untouched. Non-checkpoint repair overlay `live-configuration-without-snapshot-gates-20260909-cp06-v01.md` targets original CP5 despite filename. Manager 40 KiB hard guard and 16 KiB compact summary retained.
 
 - 2026-09-10: Approved `cp4 v01` from the immediately preceding worker’s repaired worktree against approved CP3 `4ea9810`; worktree fallback used because no pending CP4 commit exists (zero intervening implementation commits). The cp05-v01 non-checkpoint repair overlay is resolved. Live cross-harness mappings use captured source facts and existing hotplug transactions in ordinary and retry turns; completed handovers are reused. Scoped verification: 226 passed; diff check passed. No material findings. CP5 remains unchecked; manager 40 KiB hard guard and 16 KiB compact summary retained.
 
@@ -179,7 +183,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** A provider's existing driver cannot enact a changed setting or hand over: report its concrete limitation; do not silently reuse the old model or invent an unverified provider capability.
 
-### [ ] Checkpoint 5: Validate controls against current configuration before writing
+### [x] Checkpoint 5: Validate controls against current configuration before writing
 
 **Goal:** All remote controls accept new valid teams/profiles and reject unusable requests immediately without interrupting the run.
 
@@ -189,10 +193,10 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Inject the configured live source through the existing composition root. Share pure override-target validation with runtime so team/profile/current step rules agree; no provider subprocess in admission. Resolve request replacements before validating old selections; allow owner stop without loading TOML.
-- [ ] After authorization/idempotent replay and before CAS persistence, load current config and validate the proposed effective controls. Invalid requests return the existing validation-error shape with actionable field/target details. No file bytes, revision or accepted-control event changes on rejection. Preserve stale-revision and request-idempotency semantics.
-- [ ] Make capability/option reads use current definitions. HTTP and MCP use the same service behavior and existing error contract; correct field mapping where needed. Boundary revalidation remains mandatory because a later edit can invalidate an admitted request, handled nonfatally by checkpoint 3.
-- [ ] Add service and HTTP/MCP tests for new team plus new profile, unknown target rejection, config edit between acceptance/application, stale revision, replay and owner stop with invalid config.
+- [x] Inject the configured live source through the existing composition root. Share pure override-target validation with runtime so team/profile/current step rules agree; no provider subprocess in admission. Resolve request replacements before validating old selections; allow owner stop without loading TOML.
+- [x] After authorization/idempotent replay and before CAS persistence, load current config and validate the proposed effective controls. Invalid requests return the existing validation-error shape with actionable field/target details. No file bytes, revision or accepted-control event changes on rejection. Preserve stale-revision and request-idempotency semantics.
+- [x] Make capability/option reads use current definitions. HTTP and MCP use the same service behavior and existing error contract; correct field mapping where needed. Boundary revalidation remains mandatory because a later edit can invalidate an admitted request, handled nonfatally by checkpoint 3.
+- [x] Add service and HTTP/MCP tests for new team plus new profile, unknown target rejection, config edit between acceptance/application, stale revision, replay and owner stop with invalid config.
 
 **Dependencies:** Checkpoints 2–3; use checkpoint 4 integration for end-to-end provider assertions.
 

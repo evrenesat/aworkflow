@@ -18,6 +18,7 @@ from aflow_app_server.main import app
 from test_control_plane_api import (
     PROJECT_ID,
     TOKEN,
+    _add_live_control_targets,
     _prepared,
     control_client as _control_client_fixture,  # noqa: F401
 )
@@ -418,6 +419,88 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
         units.start_calls[-1][1][-1]
         == "--extra-instruction=mcp-runtime-guidance"
     )
+
+
+def test_mcp_control_uses_live_targets_and_matches_rest_validation(mcp_client) -> None:
+    client, root, _, monkeypatch = mcp_client
+    config_path = root.parent / "global" / "aflow.toml"
+    _add_live_control_targets(config_path)
+    capabilities = _mcp_tool(
+        client,
+        "get_project_capabilities",
+        {"project_id": PROJECT_ID},
+    )
+    assert "new" in capabilities["teams"]
+    assert "reasonix.new" in capabilities["admitted_role_selectors"]["worker"]
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    started = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "idempotency_key": "mcp-live-start-1",
+        },
+    )
+    run_id = started["result"]["run_id"]
+    accepted = _mcp_tool(
+        client,
+        "control_run",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 0,
+            "team": "new",
+            "role_selectors": {"worker": "reasonix.new"},
+            "idempotency_key": "mcp-live-control-1",
+        },
+    )
+    assert accepted["revision"] == 1
+
+    rejected_mcp = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "control_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": run_id,
+                "expected_revision": 1,
+                "role_selectors": {"worker": "reasonix.missing"},
+                "idempotency_key": "mcp-live-control-invalid",
+            },
+        },
+    )
+    assert rejected_mcp["result"]["isError"] is True
+    assert rejected_mcp["result"]["content"][0]["text"] == "validation_error"
+
+    rejected_rest = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "rest-live-control-invalid"},
+        json={
+            "expected_revision": 1,
+            "role_selectors": {"worker": "reasonix.missing"},
+        },
+    )
+    assert rejected_rest.status_code == 422
+    assert rejected_rest.json()["detail"]["code"] == "validation_error"
+    assert rejected_rest.json()["detail"]["field"] == "role_selectors.worker"
+    assert rejected_rest.json()["detail"]["target"] == "reasonix.missing"
+
+    config_path.write_text("[", encoding="utf-8")
+    stopped = _mcp_tool(
+        client,
+        "owner_stop",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 1,
+            "idempotency_key": "mcp-live-stop-1",
+        },
+    )
+    assert stopped["launch_phase"] == "owner_stopped"
 
 
 def test_mcp_client_template_is_secret_free_and_requires_write_approval() -> None:

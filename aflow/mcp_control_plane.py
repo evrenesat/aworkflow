@@ -17,6 +17,7 @@ from fastmcp.exceptions import ResourceError, ToolError
 from aflow.control_plane import (
     ControlConflictError,
     ControlIdempotencyConflict,
+    ControlValidationError,
     RepositoryNotFoundError,
     RestartRequiredControlError,
     RunControlRequest,
@@ -58,6 +59,8 @@ def _public_error_code(
     for error_type, code in (extra_error_codes or {}).items():
         if isinstance(exc, error_type):
             return code
+    if isinstance(exc, ControlValidationError):
+        return exc.code
     if isinstance(exc, RepositoryNotFoundError):
         return "run_not_found"
     if isinstance(exc, (ControlIdempotencyConflict, DaemonIdempotencyConflict)):

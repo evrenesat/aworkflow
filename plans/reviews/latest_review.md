@@ -1,19 +1,13 @@
-# CP4 review — approved
+# CP5 review — approved
 
-Reviewed through `cp4 v01` on `codex/aflow-dogfood-20260909`. Target: the immediately preceding worker’s repaired CP4 worktree against approved CP3 `4ea9810`. Worktree fallback was used because no pending CP4 commit exists; zero implementation commits intervene. Older approved checkpoint commits are not review targets.
+Reviewed through `cp5 v01` on `codex/aflow-dogfood-20260909`. Target: the immediately preceding worker's repaired original CP5 worktree against approved CP4 `62d8ac91c870d8a939dbc6bc4f65e40b7446aad4`. Worktree fallback was used because no pending CP5 commit exists; zero implementation commits intervene. Older approval commits are the base, not the review target.
 
-Authority: original `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`, CP4, and non-checkpoint repair overlay `live-configuration-without-snapshot-gates-20260909-cp05-v01.md`. Scope: session identity and current execution settings, cached supervision refresh, cross-harness continuity, and completed handover reuse. CP5 and whole-plan completion are outside this review.
+Authority: original `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`, CP5, and non-checkpoint overlay `live-configuration-without-snapshot-gates-20260909-cp06-v01.md`. The overlay filename does not advance checkpoint scope. Covered shared live control admission, capability loading, HTTP/MCP error mapping, runtime boundary validation and synthetic regression tests.
 
-Findings: none. The repaired shared reconciliation path compares the current worker target to captured active source session facts and reuses the existing hotplug transaction builder and handover protocol. Synthetic ordinary and pending-retry cases remove the source profile, select a newly added different-harness target, and verify a single source handover, target model/effort, handover appendix and applied transaction. Same-name profile edits and equivalent selector aliases preserve supported session continuity. Resume reuses validated completed handover artifacts. Cached supervision refresh retains manager decision history. No candidate survived the material finding admission gate.
+Findings: none. The repair resolves the effective pending next_step before status fallbacks, matching the override preserved by CAS and selected by runtime. Tests verify valid corrections are accepted and invalid pending steps leave bytes, revision and events unchanged. Current team/profile replacements, authorization, idempotent replay, stale revisions, owner-stop with broken configuration, and nonfatal boundary revalidation remain covered. No candidate survived the material finding admission gate.
 
-Verification:
+Verification: `uv run pytest tests/test_control_plane_services.py tests/test_control_plane_capabilities.py tests/test_run_state.py apps/aflow_app/server/tests/test_control_plane_api.py apps/aflow_app/server/tests/test_mcp.py tests/test_runtime.py tests/test_live_config_runtime.py tests/test_hotplug.py -q` — 423 passed, 43 subtests passed; one dependency deprecation warning. `git diff --check` passed. Branch matches the plan; the unchanged pre-handoff base remains reachable. Manager source is unchanged and retains its 40 KiB hard guard and 16 KiB compact summary target. Verification used synthetic providers and temporary fixtures.
 
-- `uv run pytest tests/test_live_config_runtime.py tests/test_hotplug.py tests/test_manager.py tests/test_manager_context.py tests/test_resume_manager_budget.py -q`: 226 passed.
-- `git diff --check`: passed.
-- Branch matches the original plan; pre-handoff base remains reachable.
-- Manager context remains unchanged at the 40 KiB hard guard and 16 KiB compact summary target.
-- Synthetic providers and temporary fixtures only; no real global configuration, skills, services, deployments or public pushes.
-
-CP4 approved with one reviewer-owned `cp4 v01` commit. Only original CP4 approval and review metadata advance; CP5 remains unchecked. The CP4 repair overlay is resolved; no new repair plan is required. Compatible preceding implementation is retained without squash. The prior review is archived byte-for-byte.
+CP5 approved with one reviewer-owned `cp5 v01` commit. Only original CP5 approval and review metadata advance; CP6 remains unchecked. The active repair overlay is resolved; no new fix plan is needed. Compatible implementation is retained without squash. Prior review archived byte-for-byte. No public push, global configuration/skills change, or service change.
 
 No material findings

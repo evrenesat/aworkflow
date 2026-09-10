@@ -532,12 +532,8 @@ def _render_toml(payload: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def compare_and_swap_overrides(
-    repo_root: Path,
-    run_id: str,
-    request: RunControlRequest,
-) -> ControlWriteResult:
-    """Apply live-safe controls through `overrides.toml` with a revision CAS."""
+def validate_control_request(request: RunControlRequest) -> None:
+    """Validate request-only control constraints without reading run state."""
     if request.unsafe_changes:
         raise RestartRequiredControlError(tuple(sorted(str(key) for key in request.unsafe_changes)))
     if request.expected_revision < 0:
@@ -546,8 +542,24 @@ def compare_and_swap_overrides(
         raise ValueError("max_turns must be positive")
     if request.team is not None and not request.team.strip():
         raise ValueError("team must be non-empty")
-    if any(not role.strip() or not selector.strip() or "." not in selector for role, selector in request.role_selectors.items()):
+    if any(
+        not isinstance(role, str)
+        or not role.strip()
+        or not isinstance(selector, str)
+        or not selector.strip()
+        or "." not in selector
+        for role, selector in request.role_selectors.items()
+    ):
         raise ValueError("role selectors must be non-empty fully qualified selectors")
+
+
+def compare_and_swap_overrides(
+    repo_root: Path,
+    run_id: str,
+    request: RunControlRequest,
+) -> ControlWriteResult:
+    """Apply live-safe controls through `overrides.toml` with a revision CAS."""
+    validate_control_request(request)
     run_dir = _safe_run_dir(repo_root, run_id)
     if not run_dir.is_dir():
         raise PersistenceError(f"run '{run_id}' does not exist")

@@ -1,11 +1,13 @@
-"""Frozen capability discovery derived from the existing AFlow configuration."""
+"""Live capability discovery derived from the current AFlow configuration."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from aflow.config import WorkflowUserConfig, load_workflow_config
+from aflow.config import WorkflowUserConfig
 from aflow.harnesses import ADAPTERS
+from aflow.live_config import load_live_config
 
 from .models import CapabilitySet, WorkflowCapability
 
@@ -15,13 +17,14 @@ class CapabilityError(ValueError):
 
 
 class CapabilityService:
-    """Translate loaded configuration into one stable, transport-neutral model."""
+    """Translate the current configuration into one transport-neutral model."""
 
     def __init__(
         self,
         config: WorkflowUserConfig | None = None,
         *,
         config_path: Path | None = None,
+        config_loader: Callable[[], WorkflowUserConfig] | None = None,
         service_features: tuple[str, ...] = (
             "run_repository",
             "capabilities",
@@ -31,14 +34,26 @@ class CapabilityService:
             "unit_manager",
         ),
     ) -> None:
-        if config is None and config_path is None:
-            raise CapabilityError("config or config_path is required")
+        if config_loader is not None and config_path is not None:
+            raise CapabilityError("pass only one of config_loader and config_path")
+        if config is None and config_path is None and config_loader is None:
+            raise CapabilityError("config, config_path, or config_loader is required")
         self._config = config
         self._config_path = Path(config_path) if config_path is not None else None
+        if config_loader is not None:
+            self._config_loader = config_loader
+        elif self._config_path is not None:
+            self._config_loader = lambda: load_live_config(self._config_path).workflow_config
+        else:
+            self._config_loader = None
         self._service_features = tuple(sorted(set(service_features)))
 
     def get(self) -> CapabilitySet:
-        config = self._config or load_workflow_config(self._config_path)  # type: ignore[arg-type]
+        config = self._config
+        if config is None:
+            if self._config_loader is None:
+                raise CapabilityError("a configuration loader is required")
+            config = self._config_loader()
         team_chains = {
             team: self._team_chain(config, team)
             for team in sorted(config.teams)

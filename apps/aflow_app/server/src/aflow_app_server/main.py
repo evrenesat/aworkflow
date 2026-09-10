@@ -28,6 +28,7 @@ from aflow.config import ConfigError, validate_starter_main_branch
 from aflow.control_plane import (
     ControlConflictError,
     ControlIdempotencyConflict,
+    ControlValidationError,
     RepositoryNotFoundError,
     RestartRequiredControlError,
     RunIdentityError,
@@ -716,6 +717,19 @@ async def control_conflict_handler(_: Request, exc: ControlConflictError) -> JSO
         status.HTTP_409_CONFLICT,
         "revision_conflict",
         current_revision=exc.current_revision,
+    )
+
+
+@app.exception_handler(ControlValidationError)
+async def control_validation_handler(
+    _: Request, exc: ControlValidationError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        exc.code,
+        field=exc.field,
+        target=exc.target,
+        message=" ".join(exc.message.split())[:300],
     )
 
 

@@ -104,6 +104,7 @@ from .recovery import (
     TeamLeadRecoveryDecisionError,
 )
 from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
+from .control_plane.validation import ControlValidationError, validate_override_targets
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
     build_handover_context_v1, render_handover_prompt, validate_handover_output,
@@ -9525,74 +9526,38 @@ def run_workflow(
                     f"workflow '{workflow_name}'"
                 )
             target_team = request.team or state.current_team
-            if validation_error is None and request.team is not None:
-                if request.team not in workflow_config.teams:
-                    validation_error = f"team '{request.team}' is not configured"
-                else:
-                    try:
-                        _resolve_step_runtime(
-                            wf.steps[target_step],
-                            workflow_config,
-                            team_name=target_team,
-                            step_path=(
-                                f"workflow.{workflow_name}.steps.{target_step}"
-                            ),
-                        )
-                    except Exception as exc:
-                        validation_error = (
-                            f"team '{request.team}' is incompatible with step "
-                            f"'{target_step}': {exc}"
-                        )
-            if (
-                validation_error is None
-                and request.max_turns is not None
-                and request.max_turns < state.turns_completed
-            ):
-                validation_error = (
-                    f"max_turns ({request.max_turns}) cannot be below completed "
-                    f"turns ({state.turns_completed})"
-                )
             if validation_error is None:
-                allowed_roles = {
-                    candidate.role for candidate in wf.steps.values()
-                    if candidate.role not in {
-                        "manager", "lifecycle", "initialization", "merge", "recovery"
-                    } and "." not in candidate.role
-                }
-                configured_selectors = {
-                    f"{harness_name}.{profile_name}"
-                    for harness_name, harness in workflow_config.harnesses.items()
-                    for profile_name in harness.profiles
-                }
-                unknown_roles = sorted(set(request.role_selectors) - allowed_roles)
-                unknown_selectors = sorted(
-                    set(request.role_selectors.values()) - configured_selectors
+                try:
+                    validate_override_targets(
+                        workflow_config,
+                        workflow_name=workflow_name,
+                        step_name=target_step,
+                        team=target_team,
+                        role_selectors={
+                            **state.role_selectors,
+                            **request.role_selectors,
+                        },
+                        max_turns=request.max_turns,
+                        completed_turns=state.turns_completed,
+                        step_field="next_step",
+                    )
+                except ControlValidationError as exc:
+                    validation_error = str(exc)
+            if validation_error is None and request.role_selectors:
+                terminal_hotplug_stages = {"applied", "failed"}
+                in_progress = tuple(
+                    transaction for transaction in (
+                        state.current_hotplug_transaction,
+                        state.pending_hotplug_transaction,
+                    )
+                    if transaction is not None
+                    and transaction.stage not in terminal_hotplug_stages
                 )
-                if unknown_roles:
+                if in_progress:
                     validation_error = (
-                        "roles contains undeclared ordinary roles: "
-                        + ", ".join(unknown_roles)
+                        "hotplug_in_progress: a non-terminal hotplug transaction "
+                        "must be completed before accepting another roles digest"
                     )
-                elif unknown_selectors:
-                    validation_error = (
-                        "roles contains selectors not configured in current configuration: "
-                        + ", ".join(unknown_selectors)
-                    )
-                elif request.role_selectors:
-                    terminal_hotplug_stages = {"applied", "failed"}
-                    in_progress = tuple(
-                        transaction for transaction in (
-                            state.current_hotplug_transaction,
-                            state.pending_hotplug_transaction,
-                        )
-                        if transaction is not None
-                        and transaction.stage not in terminal_hotplug_stages
-                    )
-                    if in_progress:
-                        validation_error = (
-                            "hotplug_in_progress: a non-terminal hotplug transaction "
-                            "must be completed before accepting another roles digest"
-                        )
 
         if validation_error is not None or request is None:
             digest = (

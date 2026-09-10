@@ -17,6 +17,7 @@ from .models import (
 )
 from .application import ControlPlaneApplication, compose_control_plane
 from .capabilities import CapabilityError, CapabilityService
+from .validation import ControlValidationError, validate_override_targets
 from .persistence import (
     ControlConflictError,
     ControlWriteResult,
@@ -32,6 +33,7 @@ from .persistence import (
     read_events,
     reserve_run_id,
     validate_run_id,
+    validate_control_request,
     write_launch_phase,
 )
 from .reconciliation import ReconciliationService
@@ -74,6 +76,8 @@ __all__ = [
     "compose_control_plane",
     "CapabilityError",
     "CapabilityService",
+    "ControlValidationError",
+    "validate_override_targets",
     "ControlConflictError",
     "ControlWriteResult",
     "EventJournal",
@@ -88,6 +92,7 @@ __all__ = [
     "read_events",
     "reserve_run_id",
     "validate_run_id",
+    "validate_control_request",
     "write_launch_phase",
     "ReconciliationService",
     "RepositoryError",

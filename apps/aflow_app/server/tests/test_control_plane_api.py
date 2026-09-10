@@ -103,6 +103,16 @@ go = [{ to = "END", when = "DONE" }]
     )
 
 
+def _add_live_control_targets(path: Path) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[harness.reasonix.profiles.new]\n"
+            'model = "new-model"\n'
+            "\n[teams.new.roles]\n"
+            'worker = "reasonix.new"\n'
+        )
+
+
 @pytest.fixture
 def control_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from aflow_app_server import main
@@ -564,6 +574,69 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     )
     assert stopped.status_code == 200
     assert stopped.json()["launch_phase"] == "owner_stopped"
+
+
+def test_control_admission_uses_live_targets_and_preserves_rejected_state(
+    control_client,
+) -> None:
+    client, root, _, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    config_path = root.parent / "global" / "aflow.toml"
+    _add_live_control_targets(config_path)
+
+    capabilities = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/capabilities"
+    )
+    assert capabilities.status_code == 200
+    assert "new" in capabilities.json()["teams"]
+    assert "reasonix.new" in capabilities.json()["admitted_role_selectors"]["worker"]
+
+    accepted = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "live-target-1"},
+        json={
+            "expected_revision": 0,
+            "team": "new",
+            "role_selectors": {"worker": "reasonix.new"},
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["revision"] == 1
+    override_path = root / ".aflow" / "runs" / run_id / "overrides.toml"
+    original_bytes = override_path.read_bytes()
+    original_events = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/events?limit=1000"
+    ).json()["events"]
+
+    rejected = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "live-target-invalid"},
+        json={
+            "expected_revision": 1,
+            "role_selectors": {"worker": "reasonix.missing"},
+        },
+    )
+    assert rejected.status_code == 422
+    assert rejected.json() == {
+        "detail": {
+            "code": "validation_error",
+            "field": "role_selectors.worker",
+            "target": "reasonix.missing",
+            "message": (
+                "roles contains selectors not configured in current configuration: "
+                "reasonix.missing"
+            ),
+        }
+    }
+    assert override_path.read_bytes() == original_bytes
+    assert client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    ).json()["revision"] == 1
+    assert client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/events?limit=1000"
+    ).json()["events"] == original_events
 
 
 def test_event_stream_delivers_events_appended_after_connection(control_client) -> None:
