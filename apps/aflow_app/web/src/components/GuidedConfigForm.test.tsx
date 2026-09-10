@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Combobox } from './Combobox'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import type { ProjectConfigFormResponse } from '../types'
@@ -93,6 +93,12 @@ function setup(texts: { aflow?: string; workflows?: string } = {}) {
   return { props, onDraftChange: props.onDraftChange, onCandidateValidation: props.onCandidateValidation, onRequestAdvanced: props.onRequestAdvanced, view }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 function pickOption(combobox: HTMLElement, name: RegExp | string) {
   fireEvent.focus(combobox)
   const option = screen.getAllByRole('option', { name }).find(
@@ -133,17 +139,27 @@ describe('GuidedConfigForm', () => {
   })
 
   it('builds a starter draft from the empty pair using detected Git defaults', async () => {
-    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
-      aflow_toml: '',
-      workflows_toml: '',
-      form: { default_workflow: null, max_turns: null, harnesses: {}, roles: {}, teams: {}, workflow_default_teams: {}, workflows: {} },
-      choices: emptyChoices,
-      starter_defaults: { workflow: 'implement', team: null, main_branch: 'trunk', main_branch_source: 'git_head' },
-    }))
+    const starterReady = deferred<ProjectConfigFormResponse>()
+    vi.mocked(api.postGlobalConfigForm).mockImplementationOnce(() => starterReady.promise)
     const { onDraftChange } = setup({ aflow: '', workflows: '' })
+    expect(screen.queryByRole('button', { name: 'Build starter draft' })).toBeNull()
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      starterReady.resolve(formResponse({
+        aflow_toml: '',
+        workflows_toml: '',
+        form: { default_workflow: null, max_turns: null, harnesses: {}, roles: {}, teams: {}, workflow_default_teams: {}, workflows: {} },
+        choices: emptyChoices,
+        starter_defaults: { workflow: 'implement', team: null, main_branch: 'trunk', main_branch_source: 'git_head' },
+      }))
+      await starterReady.promise
+    })
     const build = await screen.findByRole('button', { name: 'Build starter draft' })
-    expect((screen.getByLabelText('Workflow') as HTMLInputElement).value).toBe('implement')
-    expect((screen.getByLabelText('Main branch') as HTMLInputElement).value).toBe('trunk')
+    await waitFor(() => {
+      expect((screen.getByLabelText('Workflow') as HTMLInputElement).value).toBe('implement')
+      expect((screen.getByLabelText('Main branch') as HTMLInputElement).value).toBe('trunk')
+    })
 
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(formResponse({
       aflow_toml: '# starter aflow\n',

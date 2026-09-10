@@ -1,0 +1,150 @@
+HISTORY: Reviewer controlled comparison, 2026-09-10 UTC; base HEAD 1153d35f3b2c5b43950c04d24447535b8d4df022.
+HISTORY: Disposable before/after copies use identical current test source. Before replaces only RunDashboard.tsx with HEAD. Active files were never swapped.
+HISTORY: Command in each copy: npm test -- --run src/components/RunDashboard.test.tsx -t 'does not let an older selected-run read replace an acknowledged control revision'
+HISTORY: Ordering: initial list revision0; direct detail promise held; first mutation acknowledgement revision1 observed; held detail resolves revision0; edit13; second payload asserted exactly revision1/max_turns13.
+HISTORY: before upsertRun source:
+HISTORY: function upsertRun(current: RunStatus[], next: RunStatus): RunStatus[] {
+HISTORY:   const existing = current.findIndex((run) => run.run_id === next.run_id)
+HISTORY:   if (existing < 0) return [...current, next]
+HISTORY:   return current.map((run) => run.run_id === next.run_id ? { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) } : run)
+HISTORY: }
+HISTORY: before output:
+HISTORY:
+HISTORY: > aflow-app-web@0.1.0 test
+HISTORY: > vitest --run src/components/RunDashboard.test.tsx -t does not let an older selected-run read replace an acknowledged control revision
+HISTORY:
+HISTORY:
+HISTORY:  RUN  v1.6.1 /tmp/aflow-cp1-review-order-ltxc6zr3/before
+HISTORY:
+HISTORY:  ❯ src/components/RunDashboard.test.tsx  (84 tests | 1 failed | 83 skipped) 292ms
+HISTORY:    ❯ src/components/RunDashboard.test.tsx > RunDashboard > does not let an older selected-run read replace an acknowledged control revision
+HISTORY:      → expected { expected_revision: +0, …(2) } to deeply equal { expected_revision: 1, max_turns: 13 }
+HISTORY:
+HISTORY: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+HISTORY:
+HISTORY:  FAIL  src/components/RunDashboard.test.tsx > RunDashboard > does not let an older selected-run read replace an acknowledged control revision
+HISTORY: AssertionError: expected { expected_revision: +0, …(2) } to deeply equal { expected_revision: 1, max_turns: 13 }
+HISTORY:
+HISTORY: - Expected
+HISTORY: + Received
+HISTORY:
+HISTORY:   Object {
+HISTORY: -   "expected_revision": 1,
+HISTORY: +   "expected_revision": 0,
+HISTORY:     "max_turns": 13,
+HISTORY: +   "team": "full",
+HISTORY:   }
+HISTORY:
+HISTORY:  ❯ src/components/RunDashboard.test.tsx:968:57
+HISTORY:     966|     fireEvent.click(save)
+HISTORY:     967|     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenC…
+HISTORY:     968|     expect(api.controlControlPlaneRun.mock.calls[1][2]).toEqual({ expe…
+HISTORY:        |                                                         ^
+HISTORY:     969|   })
+HISTORY:     970|
+HISTORY:
+HISTORY: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+HISTORY:
+HISTORY:  Test Files  1 failed (1)
+HISTORY:       Tests  1 failed | 83 skipped (84)
+HISTORY:    Start at  19:15:02
+HISTORY:    Duration  3.06s (transform 1.47s, setup 28ms, collect 1.93s, tests 292ms, environment 194ms, prepare 147ms)
+HISTORY:
+HISTORY: after upsertRun source:
+HISTORY: function upsertRun(current: RunStatus[], next: RunStatus): RunStatus[] {
+HISTORY:   const existing = current.findIndex((run) => run.run_id === next.run_id)
+HISTORY:   if (existing < 0) return [...current, next]
+HISTORY:   return current.map((run) => {
+HISTORY:     if (run.run_id !== next.run_id || run.revision > next.revision) return run
+HISTORY:     return { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) }
+HISTORY:   })
+HISTORY: }
+HISTORY: after output:
+HISTORY:
+HISTORY: > aflow-app-web@0.1.0 test
+HISTORY: > vitest --run src/components/RunDashboard.test.tsx -t does not let an older selected-run read replace an acknowledged control revision
+HISTORY:
+HISTORY:
+HISTORY:  RUN  v1.6.1 /tmp/aflow-cp1-review-order-ltxc6zr3/after
+HISTORY:
+HISTORY:  ✓ src/components/RunDashboard.test.tsx  (84 tests | 83 skipped) 238ms
+HISTORY:
+HISTORY:  Test Files  1 passed (1)
+HISTORY:       Tests  1 passed | 83 skipped (84)
+HISTORY:    Start at  19:15:02
+HISTORY:    Duration  2.95s (transform 1.33s, setup 41ms, collect 1.90s, tests 238ms, environment 173ms, prepare 138ms)
+HISTORY:
+HISTORY: Regression source:
+HISTORY:   it('does not let an older selected-run read replace an acknowledged control revision', async () => {
+HISTORY:     const staleRun = { ...ownedRun, revision: 0, team: 'base', max_turns: 8 }
+HISTORY:     const acknowledgedRun = { ...ownedRun, revision: 1, team: 'full', max_turns: 12 }
+HISTORY:     const detailReady = deferred<typeof staleRun>()
+HISTORY:     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [staleRun], next_cursor: null, schema_version: 1 })
+HISTORY:     vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => detailReady.promise)
+HISTORY:     vi.mocked(api.controlControlPlaneRun).mockResolvedValue({
+HISTORY:       revision: 1,
+HISTORY:       changed: true,
+HISTORY:       owner_stop: false,
+HISTORY:       run: acknowledgedRun,
+HISTORY:     })
+HISTORY:     renderDashboard({ requestedRunId: staleRun.run_id })
+HISTORY:
+HISTORY:     await waitForControlAdmission('Selector for Worker')
+HISTORY:     fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '12' } })
+HISTORY:     fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
+HISTORY:     fireEvent.change(screen.getByLabelText('Selector for Worker'), { target: { value: 'harness/impl-b' } })
+HISTORY:     const save = screen.getByRole('button', { name: 'Save run settings' })
+HISTORY:     await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
+HISTORY:     fireEvent.click(save)
+HISTORY:     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
+HISTORY:       'control-project',
+HISTORY:       'run-owned',
+HISTORY:       { expected_revision: 0, max_turns: 12, team: 'full', role_selectors: { worker: 'harness/impl-b' } },
+HISTORY:       expect.stringMatching(/^control-/),
+HISTORY:     ))
+HISTORY:     await waitFor(() => expect(screen.getByText(/revision 1\. The engine applies them at the next safe boundary/)).toBeDefined())
+HISTORY:
+HISTORY:     // This direct read began before the write acknowledgement and settles after it.
+HISTORY:     await act(async () => {
+HISTORY:       detailReady.resolve(staleRun)
+HISTORY:       await detailReady.promise
+HISTORY:     })
+HISTORY:
+HISTORY:     fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '13' } })
+HISTORY:     fireEvent.click(save)
+HISTORY:     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledTimes(2))
+HISTORY:     expect(api.controlControlPlaneRun.mock.calls[1][2]).toEqual({ expected_revision: 1, max_turns: 13 })
+HISTORY:   })
+HISTORY: Worker required full-suite invocation: /bin/bash -lc 'npm --prefix apps/aflow_app/web test -- --run'
+HISTORY: Exit: 1
+HISTORY: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+HISTORY:  FAIL  src/App.test.tsx > App workspace shell > keeps the workspace and offers retryable feedback when logout cannot be confirmed
+HISTORY: TestingLibraryElementError: Unable to find an accessible element with the role "heading" and name "Runs"
+HISTORY: Here are the accessible roles:
+HISTORY:   banner:
+HISTORY:   Name "":
+HISTORY:  ❯ node_modules/@testing-library/dom/dist/query-helpers.js:95:19
+HISTORY:  ❯ src/App.test.tsx:334:19
+HISTORY:     332|     expect(await screen.findByText(/Logout could not be confirmed/)).t…
+HISTORY:     333|     expect(screen.getByRole('button', { name: 'Retry logout' })).toBeD…
+HISTORY:     334|     expect(screen.getByRole('heading', { name: 'Runs' })).toBeDefined()
+HISTORY:        |                   ^
+HISTORY:     335|     fireEvent.click(screen.getByRole('button', { name: 'Retry logout' …
+HISTORY:     336|     await waitFor(() => expect(api.logoutSession).toHaveBeenCalledTime…
+HISTORY:  FAIL  src/components/RunDashboard.test.tsx > RunDashboard > disambiguates colliding live role controls and sends the exact raw role key
+HISTORY: AssertionError: expected "spy" to be called with arguments: [ Array(4) ]
+HISTORY: Received:
+HISTORY: Number of calls: 0
+HISTORY: [36m</html>[39m
+HISTORY:  ❯ src/components/RunDashboard.test.tsx:1029:60
+HISTORY:     1027|     fireEvent.click(screen.getByRole('button', { name: 'Save run setti…
+HISTORY:     1028|
+HISTORY:     1029|     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenC…
+HISTORY:        |                                                            ^
+HISTORY:     1030|       'control-project',
+HISTORY:     1031|       'run-owned',
+HISTORY:  ❯ runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12
+HISTORY:  Test Files  2 failed | 16 passed (18)
+HISTORY:       Tests  2 failed | 313 passed (315)
+HISTORY:    Start at  19:04:39
+HISTORY:    Duration  33.21s (transform 4.31s, setup 1.06s, collect 15.45s, tests 51.08s, environment 10.90s, prepare 7.75s)

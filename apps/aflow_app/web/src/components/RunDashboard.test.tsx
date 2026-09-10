@@ -927,6 +927,47 @@ describe('RunDashboard', () => {
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
+  it('does not let an older selected-run read replace an acknowledged control revision', async () => {
+    const staleRun = { ...ownedRun, revision: 0, team: 'base', max_turns: 8 }
+    const acknowledgedRun = { ...ownedRun, revision: 1, team: 'full', max_turns: 12 }
+    const detailReady = deferred<typeof staleRun>()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [staleRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => detailReady.promise)
+    vi.mocked(api.controlControlPlaneRun).mockResolvedValue({
+      revision: 1,
+      changed: true,
+      owner_stop: false,
+      run: acknowledgedRun,
+    })
+    renderDashboard({ requestedRunId: staleRun.run_id })
+
+    await waitForControlAdmission('Selector for Worker')
+    fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '12' } })
+    fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
+    fireEvent.change(screen.getByLabelText('Selector for Worker'), { target: { value: 'harness/impl-b' } })
+    const save = screen.getByRole('button', { name: 'Save run settings' })
+    await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
+    fireEvent.click(save)
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      'run-owned',
+      { expected_revision: 0, max_turns: 12, team: 'full', role_selectors: { worker: 'harness/impl-b' } },
+      expect.stringMatching(/^control-/),
+    ))
+    await waitFor(() => expect(screen.getByText(/revision 1\. The engine applies them at the next safe boundary/)).toBeDefined())
+
+    // This direct read began before the write acknowledgement and settles after it.
+    await act(async () => {
+      detailReady.resolve(staleRun)
+      await detailReady.promise
+    })
+
+    fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '13' } })
+    fireEvent.click(save)
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(api.controlControlPlaneRun.mock.calls[1][2]).toEqual({ expected_revision: 1, max_turns: 13 })
+  })
+
   it('offers only capability-admitted selector values and explains the next safe boundary', async () => {
     vi.mocked(api.controlControlPlaneRun).mockResolvedValue({
       revision: 2,
@@ -982,6 +1023,7 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Selector for Code review (code_review)')
     expect(screen.getByLabelText('Selector for Code review (code__review)')).toBeTruthy()
     expect(screen.getByLabelText('Selector for Unique role')).toBeTruthy()
+    await waitForControlAdmission('Selector for Code review (code__review)')
     fireEvent.change(screen.getByLabelText('Selector for Code review (code__review)'), { target: { value: 'harness/impl-b' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
 

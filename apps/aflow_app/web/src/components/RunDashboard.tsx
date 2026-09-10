@@ -220,7 +220,10 @@ function mergeEvents(current: RunEvent[], next: RunEvent[]): RunEvent[] {
 function upsertRun(current: RunStatus[], next: RunStatus): RunStatus[] {
   const existing = current.findIndex((run) => run.run_id === next.run_id)
   if (existing < 0) return [...current, next]
-  return current.map((run) => run.run_id === next.run_id ? { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) } : run)
+  return current.map((run) => {
+    if (run.run_id !== next.run_id || run.revision > next.revision) return run
+    return { ...next, ...((run.history_revision ?? 0) > (next.history_revision ?? 0) ? { history_state: run.history_state, history_revision: run.history_revision } : {}) }
+  })
 }
 
 function timestamp(value: unknown): string {

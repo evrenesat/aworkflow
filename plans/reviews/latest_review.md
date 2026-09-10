@@ -1,37 +1,31 @@
-# Integration CP1 v01 review — 2026-09-10
+# Checkpoint 1 review — responsive release CI readiness
 
-Checkpoint 1 is approved. Zero material findings remain after applying the material-code-review admission gate, exclusions and proportionate-fix discipline. No production edits were needed in this review.
+Zero admitted material findings. Checkpoint 1 approved as `cp1 v02` after the bounded `cp01-v01` follow-up.
 
 ## Reviewed scope
 
-Original plan: `plans/in-progress/integrate-reviewed-responsive-ui-20260910.md`.
-Active repair overlay: `plans/in-progress/integrate-reviewed-responsive-ui-20260910-cp01-v01.md` (retained at its owner-required stable filename).
-Branch: `aflow-integrate-reviewed-responsive-ui-20260910-20260910-161156`.
+Reviewed the six-file implementation and DEVLOG against the original readiness plan and active overlay. Used current-worktree fallback: no checkpoint commit for this plan existed at review start. Branch matches Git Tracking and the unchanged pre-handoff base `1153d35f3b2c5b43950c04d24447535b8d4df022` is reachable. Earlier responsive/clipboard checkpoint commits belong to preceding plans, not this repair. This review owns the first approval commit for this repair; no history rewrite or whole-plan squash.
 
-Review used the current-worktree fallback against original base `52597409b17c3e1050f1576bfe027580b5656d50`, covering the full combined integration and pending acceptance repairs. Recovery snapshot `5b52d3d37095014c92dfb6791685a3f0aaa2a9fc` is not an approval boundary; its parents preserve that base and approved responsive source `61d5988f98584ffa50ce0a6e02a0f5404a423276`. Branch/base and intentional MERGE_HEAD absence were verified; no unresolved index entries exist. The original six responsive approvals remain intact.
+## Evidence and finding gate
 
-Inspected the actual parent-relative integration and merge conflict resolutions, including App, RunDashboard, NewRunPage, styles, CI and documentation. App matches the approved responsive source. Resolutions retain both the header-slot presentation and accepted-main worktree preflight; live configuration/request semantics remain present. The reviewer-owned approval commit uses `cp1 v01 aflow-integrate-reviewed-responsive-ui-20260910-20260910-161156: Approve combined responsive acceptance` and preserves the recovery commit without rewriting history.
+The same-run lower-revision guard blocks the demonstrated old detail response after acknowledgement; equal revisions remain eligible for progress updates and distinct run IDs are not compared. The list refresh already retains the selected snapshot. Browser fixture acknowledgement now updates both its routed response and disposable server override/event sources. Exact first and second payloads, idempotency, rejected draft, restart/successor, responsive geometry and clipboard coverage remain intact.
 
-## Closed acceptance failures
+HISTORY: The retained reviewer [before/after source and output](responsive-readiness-cp01-ordering.txt) establishes list revision0 → held detail → mutation acknowledgement revision1 → held detail revision0 → second edit13. The old component submits revision0 plus repeated team; the corrected component submits exactly revision1/max_turns13.
 
-- Plan-list assertions now wait for the rendered fixture rows, including the final expected plan, instead of the independently rendered filename input. The existing count and geometry checks remain.
-- Team choices wait for exact native-option attachment and retain No team plus both colliding labels. The hosted journey submits raw `fast__team` and the exact worker selector with project/run/revision assertions.
-- Successor text is checked within its actual confirmation container, accounting for nested markup. The hosted action waits for enabled rendered confirmation. No sleeps, timeout inflation, skips or passing-retry dismissal were introduced.
-- Hosted browser coverage now exercises live settings save, rejection and draft retention, compact Back, navigation/resize, owner stop and inactive-source transition, dirty-preflight acknowledgement, unresolved successor state, and an unchanged exact successor retry body/key.
+Starter deferred-response coverage waits for implement/trunk before the unchanged action and draft assertions. The follow-up adds two existing observable readiness waits: the hosted Runs heading before logout, and base team/enabled selector before the colliding-role edit. Source confirms openAddedProject waits only for the project row/click, while the dashboard header is registered after loading; the selected-run effect initializes team and clears role selectors. These waits match the tested preconditions and preserve the exact existing assertions. The follow-up did not add separate deferred-response comparisons for these two unit-test boundaries; their supporting evidence is the loading/effect source and corrected full-suite receipt, not isolated green reruns.
 
-HISTORY: Earlier failures remain documented in the retained overlay and DEVLOG, including the initial native-option visible-state failure and earlier split-text confirmation failure. The attachment-state and markup-aware corrections address those failures; passing reruns alone are not the acceptance basis.
+## Verification
 
-## Verification and evidence
+HISTORY: Parsed completed command receipts directly from `/root/code/agent_flow/.aflow/runs/20260910t185404z-3b1d522d/turns/turn-003/transport.stdout`: `npm --prefix apps/aflow_app/web test -- --run src/App.test.tsx src/components/GuidedConfigForm.test.tsx src/components/RunDashboard.test.tsx` passed 163 tests; `npm --prefix apps/aflow_app/web test -- --run` passed 315 tests in 18 files; `npm --prefix apps/aflow_app/web run build` exited 0.
 
-- Current reviewer run: web suite **309 passed across 18 files**; production build passed. Logs: `/tmp/cp1-review-final-web.log`, `/tmp/cp1-review-final-build.log`.
-- HISTORY: Reused the worker's fresh post-correction unchanged-tree verification receipts: combined Chromium **16 passed**, responsive WebKit **11 passed**, full backend **2046 passed and 223 subtests passed**, Ruff passed. Confirmed receipts in `/root/code/agent_flow/.aflow/runs/20260910t175553z-e710e752/turns/turn-001/transport.stdout`; result.json identifies the completed worker attempt. The supplied relative artifact resides in the registered parent root and was read only.
-- HISTORY: Inspected saved post-correction captures under `/tmp/pytest-of-root/pytest-2332/`: dark desktop live controls, light phone live controls, dark landscape unresolved restart, light phone Skills editor, dark profile overview, light landscape Plans and dark landscape New Run. Loaded controls, retained exact team choices, usable editor space, document flow and successor recovery are visible. The very long profile capture supports overall document flow; fine detail relies on browser assertions and existing accepted evidence.
-- Current staged/unstaged diff checks passed; no unresolved index entries. No backend or browser rerun was warranted after the unchanged fresh evidence; the required web checks ran once in this review.
+HISTORY: Completed turn-001 receipts show `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py` and the WebKit variant each passed all 11 tests. Those receipts remain applicable because the follow-up changed only two unit-test waits and documentation. The prior 313/315 failure was followed by a correction before the passing full suite; isolated runs are not used to dismiss it.
 
-## Bookkeeping and delivery boundary
+Reviewer `git diff --check` passed. No unchanged suite rerun, unrelated backend suite, production edit, shared-tool repointing, service mutation or other-root change was needed in this review.
 
-Original CP1 acceptance and review state advances only for this checkpoint; the original pre-handoff base and six source approvals stay unchanged. The prior latest review was rotated byte-for-byte. No follow-up v02 plan is needed. No DEVLOG compaction or other-worktree, live-service, shared-installation or global-config mutation occurred.
+## Bookkeeping and delivery
 
-This is local checkpoint approval, not completed delivery. Coordinator-owned serialized reconciliation must preserve published clipboard history `c14f1f2`/`cd78d53` before origin/main publication, exact-SHA CI and actual live desktop/mobile proof. Those delivery gates remain pending; the original plan stays in progress until delivery. Physical keyboard and browser-toolbar behavior remain unverified. No GitHub posts, comments or messages were made.
+The prior latest review is archived byte-for-byte. Only original checkpoint 1 advances; its base stays unchanged and the plan stays in progress pending delivery. The active overlay is preserved unchanged as requested; no v02 fix overlay is needed. The retained ordering evidence is included in the approval commit. No GitHub posts, comments or messages were made.
+
+This is local checkpoint approval. Coordinator-owned serialized integration, origin/main publication, exact-SHA CI and live UI activation remain pending. Linux evidence does not establish macOS CI or physical mobile keyboard behavior.
 
 No material findings

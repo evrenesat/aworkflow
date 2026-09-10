@@ -1,5 +1,45 @@
 # DEVLOG
 
+## 2026-09-10 — Responsive release CI readiness repair, Checkpoint 1
+
+- Reproduced the starter ordering with a deferred pure-form response: the empty
+  form remains in its loading state until the response settles, then the React
+  default effect populates `implement` and `trunk`. The production component
+  remains correct; its test now waits for the settled defaults before preserving
+  the exact starter action and draft callbacks.
+- Controlled live-control ordering with list/detail revision 0, an acknowledged
+  revision 1 response, and a delayed old detail read settling afterward. The
+  exact first payload remains `expected_revision: 0`, `max_turns: 12`,
+  `team: fast__team`, and worker selector `reasonix.new`; the second remains
+  only `expected_revision: 1`, `max_turns: 13`. `RunDashboard` now ignores a
+  lower revision only for the same run identity; equal revisions still carry
+  progress/status updates, and different run IDs are never compared.
+- The responsive fixture now persists the acknowledged override and its
+  `control_changed` event, so list/detail/mutation and background event sources
+  no longer disagree about revision 0 after the first write.
+- The first exact full web command recorded 313/315. Its isolated green runs
+  were diagnostic only and did not establish unrelatedness or readiness. The
+  two demonstrated boundaries were readiness races: the logout case asserted
+  the hosted `Runs` heading before the workspace finished mounting, and the
+  colliding-role case saved before the existing control-admission wait observed
+  an enabled selector. The follow-up adds only those observable waits; exact
+  assertions and raw request keys remain unchanged.
+- Verification after the correction: `npm --prefix apps/aflow_app/web test --
+  --run src/App.test.tsx src/components/GuidedConfigForm.test.tsx
+  src/components/RunDashboard.test.tsx` passed 163 tests; the required
+  `npm --prefix apps/aflow_app/web test -- --run` passed 315 tests across 18
+  files; and `npm --prefix apps/aflow_app/web run build` plus `git diff --check`
+  passed. The already-valid Chromium and WebKit commands
+  (`uv run --project apps/aflow_app/server pytest -q
+  apps/aflow_app/server/tests/test_responsive_browser.py` and its
+  `AFLOW_TEST_BROWSER=webkit` variant) each passed 11 tests and were reused
+  because this follow-up changes only unit-test readiness fixtures. Durable
+  review evidence remains in `plans/reviews/latest_review.md`,
+  `plans/reviews/responsive-readiness-cp01-ordering.txt`, and
+  `/root/code/agent_flow/.aflow/runs/20260910t185404z-3b1d522d/turns/turn-001/transport.stdout`
+  with its adjacent `result.json`. No sleeps, retries, assertion weakening, UI
+  redesign, live configuration, publication, CI, or deployment was changed.
+
 ## 2026-09-10 — Approve issue38 checkpoint 1
 
 - Review reran the retained four-case comparison: all passed; both setups preserved

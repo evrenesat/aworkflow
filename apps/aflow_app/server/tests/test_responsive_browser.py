@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import pytest
 from playwright.sync_api import Page, sync_playwright
 
+from aflow.control_plane.persistence import append_run_event
 from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
 from test_control_plane_api import _add_live_control_targets, _prepared
 
@@ -791,6 +792,18 @@ def test_responsive_live_controls_and_restart(
                     })
                     if len(control_requests) == 1:
                         live_state.update({"revision": 1, "max_turns": 12, "team": "fast__team"})
+                        run_dir = root / ".aflow" / "runs" / run_id
+                        (run_dir / "overrides.toml").write_text(
+                            'revision = 1\nmax_turns = 12\nteam = "fast__team"\n\n'
+                            '[roles]\nworker = "reasonix.new"\n'
+                        )
+                        append_run_event(run_dir, "control_changed", {
+                            "revision": 1,
+                            "max_turns": 12,
+                            "team": "fast__team",
+                            "owner_stop": False,
+                            "roles": {"worker": "reasonix.new"},
+                        })
                         reply(route, {
                             "revision": 1,
                             "changed": True,

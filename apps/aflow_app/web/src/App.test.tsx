@@ -328,6 +328,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.logoutSession).mockRejectedValueOnce(new TypeError('fetch failed'))
     render(<App />)
     await openAddedProject(/Alpha Project/)
+    await screen.findByRole('heading', { name: 'Runs' })
     fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
     expect(await screen.findByText(/Logout could not be confirmed/)).toBeDefined()
     expect(screen.getByRole('button', { name: 'Retry logout' })).toBeDefined()
