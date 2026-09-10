@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-10 — Record completed-plan lifecycle ownership (Checkpoint 1)
+
+- Added a receipt-backed completed-plan lifecycle helper that verifies exact
+  source and Done bytes, preserves ignored Done storage, and records only the
+  owned source/destination Git paths in a narrow `chore/plans` commit.
+- Refuses unrelated staged changes and ambiguous ownership while preserving
+  unrelated unstaged data; recorded move and commit phases resume idempotently.
+- Exact pathspecs are now literal, and receipt-backed staging intent verifies
+  index identities after interruptions at either lifecycle staging boundary.
+- Destination identity follows Git's clean conversion (including autocrlf)
+  while raw on-disk plan bytes remain unchanged through move and retry.
+- Focused publication/lifecycle coverage passes, including unusual filenames,
+  pre-existing Done copies, conflicts, untracked plans, and interruption cases.
+
 ## 2026-09-10 — Responsive release CI readiness repair, Checkpoint 1
 
 - Reproduced the starter ordering with a deferred pure-form response: the empty
