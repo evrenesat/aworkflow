@@ -13,6 +13,8 @@ NON_CHECKPOINT_HEADING_RE = re.compile(r"^#{1,3}\s+")
 GIT_TRACKING_FIELD_RE = re.compile(
     r"^\s*(?:[-*]\s+)?(?:Plan Branch|Pre-Handoff Base HEAD|Last Reviewed HEAD|Review Log):"
 )
+MISSING_CHECKPOINT_SECTIONS = "missing_checkpoint_sections"
+AMBIGUOUS_GIT_TRACKING = "ambiguous_git_tracking"
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class PlanParseError(ValueError):
         checkpoint_index: int | None = None,
         total_checkpoint_count: int | None = None,
         error_kind: str | None = None,
+        admission_kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.checkpoint_name = checkpoint_name
@@ -78,6 +81,13 @@ class PlanParseError(ValueError):
         self.checkpoint_index = checkpoint_index
         self.total_checkpoint_count = total_checkpoint_count
         self.error_kind = error_kind
+        self.admission_kind = admission_kind
+
+
+class GitTrackingMetadataError(ValueError):
+    """A structurally ambiguous Git Tracking section."""
+
+    error_kind = AMBIGUOUS_GIT_TRACKING
 
 
 def _build_error(path: Path, message: str) -> PlanParseError:
@@ -176,7 +186,9 @@ def parse_git_tracking_metadata(text: str) -> GitTrackingMetadata | None:
     if not heading_line_numbers:
         return None
     if len(heading_line_numbers) > 1:
-        raise ValueError("AFLOW_STOP: git tracking metadata is ambiguous across multiple live sections")
+        raise GitTrackingMetadataError(
+            "AFLOW_STOP: git tracking metadata is ambiguous across multiple live sections"
+        )
 
     in_fence = False
     fence_char: str | None = None
@@ -513,7 +525,10 @@ def _collect_sections(text: str, *, source_path: Path) -> tuple[CheckpointSectio
         )
 
     if not sections:
-        raise _build_error(source_path, "no checkpoint sections were found")
+        raise PlanParseError(
+            f"{source_path}: no checkpoint sections were found",
+            admission_kind=MISSING_CHECKPOINT_SECTIONS,
+        )
 
     return tuple(sections)
 

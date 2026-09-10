@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -29,7 +30,15 @@ from aflow.api.models import (
     StartupRequest,
 )
 from aflow.api.runner import execute_workflow
-from aflow.api.startup import StartupError, prepare_startup, prepare_startup_with_answer
+from aflow.api.startup import (
+    PLAN_ADMISSION_ERROR_CODE,
+    PLAN_ADMISSION_CHECKPOINT_KIND,
+    PLAN_ADMISSION_TRACKING_KIND,
+    PlanAdmissionError,
+    StartupError,
+    prepare_startup,
+    prepare_startup_with_answer,
+)
 from aflow.control_plane.models import startup_failure
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.config import ConfigError, WorkflowUserConfig, load_workflow_config
@@ -73,6 +82,7 @@ _QUESTION_HISTORY_LIMIT = 64
 _MAX_EXTRA_INSTRUCTION_ITEMS = 8
 _MAX_EXTRA_INSTRUCTION_LENGTH = 512
 _MAX_EXTRA_INSTRUCTIONS_LENGTH = 4096
+_logger = logging.getLogger(__name__)
 
 
 class DaemonError(RuntimeError):
@@ -80,11 +90,18 @@ class DaemonError(RuntimeError):
 
 
 class DaemonStartupError(DaemonError):
-    """A reserved startup request failed with an already sanitized diagnostic."""
+    """A startup/admission request failed with an already safe diagnostic."""
 
-    def __init__(self, run_id: str, message: str) -> None:
+    def __init__(
+        self,
+        run_id: str | None,
+        message: str,
+        *,
+        code: str = "startup_failed",
+    ) -> None:
         super().__init__(message)
         self.run_id = run_id
+        self.code = code
 
 
 class DaemonNotReadyError(DaemonError):
@@ -466,6 +483,26 @@ class DaemonService:
                 prepared_or_question = prepare_startup_with_answer(
                     question, request, answer
                 )
+            except PlanAdmissionError as exc:
+                _logger.warning(
+                    "startup plan admission rejected for reserved run %s",
+                    run_id,
+                    exc_info=True,
+                )
+                updated = dict(record)
+                updated["state"] = "needs_attention"
+                updated["startup_failure"] = startup_failure(
+                    "preparation",
+                    exc.safe_message,
+                    code=exc.code,
+                    kind=exc.kind,
+                )
+                self._write_record(updated)
+                raise DaemonStartupError(
+                    run_id,
+                    exc.safe_message,
+                    code=exc.code,
+                ) from exc
             except StartupError as exc:
                 updated = dict(record)
                 updated["state"] = "needs_attention"
@@ -866,7 +903,13 @@ class DaemonService:
         workflow = self._workflow_config.workflows[workflow_name]
 
         from aflow.git_status import probe_repo_state
-        from aflow.plan import PlanParseError, load_plan, parse_git_tracking_metadata
+        from aflow.plan import (
+            GitTrackingMetadataError,
+            MISSING_CHECKPOINT_SECTIONS,
+            PlanParseError,
+            load_plan,
+            parse_git_tracking_metadata,
+        )
         from aflow.workflow import (
             WorkflowError,
             _backup_original_plan,
@@ -879,7 +922,16 @@ class DaemonService:
             return
         try:
             plan_text = request.plan_path.read_bytes().decode("utf-8")
-            if parse_git_tracking_metadata(plan_text) is not None:
+            metadata = parse_git_tracking_metadata(plan_text)
+            if metadata is not None:
+                if metadata.plan_branch is None or metadata.pre_handoff_base_head is None:
+                    raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND)
+                try:
+                    load_plan(request.plan_path)
+                except PlanParseError as exc:
+                    if exc.error_kind == "inconsistent_checkpoint_state":
+                        return
+                    raise
                 return
             repo_state = probe_repo_state(self._config.repo_root)
             needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
@@ -896,15 +948,64 @@ class DaemonService:
                 is_resume=request.resume_requested,
                 startup_retry=None,
             )
-        except (
-            OSError,
-            UnicodeError,
-            PlanParseError,
-            ValueError,
-            WorkflowError,
-        ) as exc:
-            summary = exc.summary if isinstance(exc, WorkflowError) else str(exc)
-            raise DaemonError(f"startup plan preflight failed: {summary}") from exc
+        except PlanAdmissionError as exc:
+            _logger.warning(
+                "startup plan admission rejected before run reservation",
+                exc_info=True,
+            )
+            raise DaemonStartupError(
+                None,
+                exc.safe_message,
+                code=exc.code,
+            ) from exc
+        except GitTrackingMetadataError as exc:
+            _logger.warning(
+                "startup plan admission rejected before run reservation",
+                exc_info=True,
+            )
+            raise DaemonStartupError(
+                None,
+                PlanAdmissionError.safe_message_for(PLAN_ADMISSION_TRACKING_KIND),
+                code=PLAN_ADMISSION_ERROR_CODE,
+            ) from exc
+        except PlanParseError as exc:
+            if exc.admission_kind == MISSING_CHECKPOINT_SECTIONS:
+                _logger.warning(
+                    "startup plan admission rejected before run reservation",
+                    exc_info=True,
+                )
+                raise DaemonStartupError(
+                    None,
+                    PlanAdmissionError.safe_message_for(PLAN_ADMISSION_CHECKPOINT_KIND),
+                    code=PLAN_ADMISSION_ERROR_CODE,
+                ) from exc
+            _logger.warning(
+                "startup plan preflight failed before run reservation",
+                exc_info=True,
+            )
+            raise DaemonError("startup plan preflight failed") from exc
+        except WorkflowError as exc:
+            if exc.failure_kind == "missing_git_tracking":
+                _logger.warning(
+                    "startup plan admission rejected before run reservation",
+                    exc_info=True,
+                )
+                raise DaemonStartupError(
+                    None,
+                    PlanAdmissionError.safe_message_for(PLAN_ADMISSION_TRACKING_KIND),
+                    code=PLAN_ADMISSION_ERROR_CODE,
+                ) from exc
+            _logger.warning(
+                "startup plan preflight failed before run reservation",
+                exc_info=True,
+            )
+            raise DaemonError("startup plan preflight failed") from exc
+        except (OSError, UnicodeError, ValueError) as exc:
+            _logger.warning(
+                "startup plan preflight failed before run reservation",
+                exc_info=True,
+            )
+            raise DaemonError("startup plan preflight failed") from exc
 
     def _new_start_record(
         self,
@@ -999,6 +1100,26 @@ class DaemonService:
         request = self._request_from_record(record)
         try:
             prepared_or_question = prepare_startup(request)
+        except PlanAdmissionError as exc:
+            _logger.warning(
+                "startup plan admission rejected for reserved run %s",
+                record["run_id"],
+                exc_info=True,
+            )
+            updated = dict(record)
+            updated["state"] = "needs_attention"
+            updated["startup_failure"] = startup_failure(
+                "preparation",
+                exc.safe_message,
+                code=exc.code,
+                kind=exc.kind,
+            )
+            self._write_record(updated)
+            raise DaemonStartupError(
+                str(record["run_id"]),
+                exc.safe_message,
+                code=exc.code,
+            ) from exc
         except StartupError as exc:
             updated = dict(record)
             updated["state"] = "needs_attention"
@@ -1814,6 +1935,17 @@ class DaemonService:
                 _question_generation(record),
             )
         if state in {"unit_started", "needs_attention"}:
+            failure = record.get("startup_failure")
+            if (
+                state == "needs_attention"
+                and isinstance(failure, Mapping)
+                and failure.get("code") == PLAN_ADMISSION_ERROR_CODE
+            ):
+                raise DaemonStartupError(
+                    run_id,
+                    PlanAdmissionError.safe_message_for(failure.get("kind")),
+                    code=PLAN_ADMISSION_ERROR_CODE,
+                )
             return self._existing_start_result(run_id)
         if state not in {"prepared", "launch_requested"}:
             raise DaemonError("persisted startup request has an unsupported state")

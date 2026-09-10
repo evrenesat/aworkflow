@@ -19,6 +19,9 @@ from .api import (
     ExecutionEventType,
     ExecutionObserver,
     PreparedRun,
+    PLAN_ADMISSION_ERROR_CODE,
+    PLAN_ADMISSION_SAFE_MESSAGE,
+    PlanAdmissionError,
     QuestionRequiredEvent,
     RunCompletedEvent,
     RunFailedEvent,
@@ -39,6 +42,9 @@ from .api import (
 
 __all__ = [
     "PreparedRun",
+    "PlanAdmissionError",
+    "PLAN_ADMISSION_ERROR_CODE",
+    "PLAN_ADMISSION_SAFE_MESSAGE",
     "StartupError",
     "StartupQuestion",
     "StartupQuestionKind",

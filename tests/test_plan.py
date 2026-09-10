@@ -28,8 +28,10 @@ class PlanParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             plan_path = Path(tmpdir) / 'plan.md'
             _write_plan(plan_path, '# No checkpoints\n- [ ] ignored\n')
-            with pytest.raises(PlanParseError):
+            with pytest.raises(PlanParseError) as exc_info:
                 load_plan(plan_path)
+            assert exc_info.value.error_kind is None
+            assert exc_info.value.admission_kind == 'missing_checkpoint_sections'
 
     def test_startup_tolerant_loader_builds_recovery_snapshot_from_inconsistent_checkpoint_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

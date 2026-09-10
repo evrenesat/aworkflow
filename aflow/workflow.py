@@ -4906,7 +4906,8 @@ def _prepare_required_git_tracking_before_allocation(
     if is_resume or startup_retry is not None:
         mode = "resume" if is_resume else "startup recovery"
         raise WorkflowError(
-            f"workflow requires a '## Git Tracking' section; refusing to modify the plan during {mode}"
+            f"workflow requires a '## Git Tracking' section; refusing to modify the plan during {mode}",
+            failure_kind="missing_git_tracking",
         )
     try:
         current_plan = parse_plan_text(plan_text, source_path=original_plan_path)
@@ -4918,7 +4919,8 @@ def _prepare_required_git_tracking_before_allocation(
         )
     if not is_plan_pristine_for_git_tracking_bootstrap(plan_text, current_plan.sections):
         raise WorkflowError(
-            "workflow requires a '## Git Tracking' section, but the plan is not pristine enough for insertion"
+            "workflow requires a '## Git Tracking' section, but the plan is not pristine enough for insertion",
+            failure_kind="missing_git_tracking",
         )
 
     deferred_base_head = False

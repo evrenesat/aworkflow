@@ -683,9 +683,13 @@ def _error_response(status_code: int, code: str, **extra: Any) -> JSONResponse:
 
 @app.exception_handler(DaemonStartupError)
 async def startup_failure_handler(_: Request, exception: DaemonStartupError) -> JSONResponse:
+    extra: dict[str, Any] = {"message": str(exception)}
+    if exception.run_id is not None:
+        extra["run_id"] = exception.run_id
     return _error_response(
-        status.HTTP_422_UNPROCESSABLE_CONTENT, "startup_failed",
-        message=str(exception), run_id=exception.run_id,
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        exception.code,
+        **extra,
     )
 
 

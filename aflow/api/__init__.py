@@ -34,7 +34,14 @@ from .models import (
 )
 from .analyze import analyze_runs
 from .runner import RunnerConfig, WorkflowRunner, execute_workflow
-from .startup import prepare_startup, prepare_startup_with_answer, StartupError
+from .startup import (
+    PLAN_ADMISSION_ERROR_CODE,
+    PLAN_ADMISSION_SAFE_MESSAGE,
+    PlanAdmissionError,
+    StartupError,
+    prepare_startup,
+    prepare_startup_with_answer,
+)
 
 __all__ = [
     "PreparedRun",
@@ -54,6 +61,9 @@ __all__ = [
     "prepare_startup",
     "prepare_startup_with_answer",
     "StartupError",
+    "PlanAdmissionError",
+    "PLAN_ADMISSION_ERROR_CODE",
+    "PLAN_ADMISSION_SAFE_MESSAGE",
     "execute_workflow",
     "WorkflowRunner",
     "RunnerConfig",

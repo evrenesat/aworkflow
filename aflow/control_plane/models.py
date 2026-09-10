@@ -33,7 +33,13 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def startup_failure(stage: str, message: str) -> dict[str, str]:
+def startup_failure(
+    stage: str,
+    message: str,
+    *,
+    code: str | None = None,
+    kind: str | None = None,
+) -> dict[str, str]:
     """Bound diagnostics after removing credential assignments and bearer text."""
     message = re.sub(
         r"""(?i)((?:token|secret|password|api[_-]?key)["']?\s*[:=]\s*)(["'])(.*?)\2""",
@@ -44,7 +50,12 @@ def startup_failure(stage: str, message: str) -> dict[str, str]:
         r"\1[redacted]", message,
     )
     safe = re.sub(r"(?i)\bbearer\s+[^\s,]+", "Bearer [redacted]", safe)
-    return bounded_redacted({"stage": stage, "message": safe, "timestamp": utc_now()})
+    payload = {"stage": stage, "message": safe, "timestamp": utc_now()}
+    if code is not None:
+        payload["code"] = code
+    if kind is not None:
+        payload["kind"] = kind
+    return bounded_redacted(payload)
 
 
 def bounded_redacted(value: Any, *, depth: int = 0) -> Any:

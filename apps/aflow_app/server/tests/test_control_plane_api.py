@@ -1578,6 +1578,162 @@ def test_real_dirty_startup_failure_survives_api_reload(control_client):
     assert status["plan_path"].endswith("plans/todo/test-plan.md")
 
 
+@pytest.mark.parametrize(
+    ("plan_text", "expected_message"),
+    [
+        (
+            "# Duplicate\n\n"
+            "## Git Tracking\n\n- Plan Branch: `one`\n"
+            "- Pre-Handoff Base HEAD: `abc`\n\n"
+            "## 2. Git Tracking\n\n- Plan Branch: `two`\n"
+            "- Pre-Handoff Base HEAD: `def`\n\n"
+            "### [ ] Checkpoint 1: Test\n- [ ] step\n",
+            "Plan validation failed. Add or correct exactly one Git Tracking section, then retry.",
+        ),
+        (
+            "# Malformed\n\nThis plan has no checkpoint section.\n",
+            "Plan validation failed. Add at least one valid Checkpoint section and checklist, then retry.",
+        ),
+        (
+            "# Tracking without checkpoint\n\n"
+            "## Git Tracking\n\n- Plan Branch: ``\n"
+            "- Pre-Handoff Base HEAD: ``\n",
+            "Plan validation failed. Add at least one valid Checkpoint section and checklist, then retry.",
+        ),
+    ],
+    ids=["duplicate-tracking", "malformed-plan", "tracking-without-checkpoint"],
+)
+def test_plan_admission_rejection_is_safe_and_preallocation_stays_empty(
+    control_client,
+    plan_text: str,
+    expected_message: str,
+) -> None:
+    from aflow.api.startup import PLAN_ADMISSION_ERROR_CODE
+
+    client, root, units, monkeypatch = control_client
+    (root / "plans" / "todo" / "test-plan.md").write_text(plan_text)
+    monkeypatch.setattr("aflow.workflow._workflow_requires_git_tracking", lambda *_: True)
+
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "plan-admission-before-reservation"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": {
+            "code": PLAN_ADMISSION_ERROR_CODE,
+            "message": expected_message,
+        }
+    }
+    assert str(root) not in response.text
+    assert "abc" not in response.text
+    assert "def" not in response.text
+    assert units.start_calls == []
+    assert not (root / ".aflow" / "launches").exists()
+    assert not (root / ".aflow" / "runs").exists()
+    assert not (root / ".aflow" / "last_run_id").exists()
+
+
+@pytest.mark.parametrize("failure", ["backup", "value"])
+def test_unclassified_preallocation_failure_is_generic_and_redacted(
+    control_client,
+    failure: str,
+) -> None:
+    client, root, units, monkeypatch = control_client
+    monkeypatch.setattr("aflow.workflow._workflow_requires_git_tracking", lambda *_: True)
+    sentinel = f"private-preflight-{failure}"
+    if failure == "backup":
+        def reject_backup(*args, **kwargs):
+            raise PermissionError(sentinel)
+
+        monkeypatch.setattr("aflow.workflow._backup_original_plan", reject_backup)
+    else:
+        monkeypatch.setattr("aflow.workflow._backup_original_plan", lambda *args, **kwargs: None)
+
+        def reject_value(*args, **kwargs):
+            raise ValueError(sentinel)
+
+        monkeypatch.setattr(
+            "aflow.workflow._prepare_required_git_tracking_before_allocation",
+            reject_value,
+        )
+
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": f"generic-preflight-{failure}"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": {"code": "operation_rejected"}}
+    assert sentinel not in response.text
+    assert units.start_calls == []
+    assert not (root / ".aflow" / "launches").exists()
+    assert not (root / ".aflow" / "runs").exists()
+
+
+def test_reserved_plan_admission_failure_keeps_idempotent_run_identity(control_client) -> None:
+    from aflow.api.startup import PLAN_ADMISSION_ERROR_CODE, PLAN_ADMISSION_SAFE_MESSAGE, PlanAdmissionError
+
+    client, root, units, monkeypatch = control_client
+
+    def reject(_request):
+        raise PlanAdmissionError
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", reject)
+    request = {
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+    }
+    headers = {"Idempotency-Key": "reserved-plan-admission"}
+    first = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers=headers,
+        json=request,
+    )
+
+    assert first.status_code == 422, first.text
+    first_detail = first.json()["detail"]
+    run_id = first_detail["run_id"]
+    assert first_detail == {
+        "code": PLAN_ADMISSION_ERROR_CODE,
+        "message": PLAN_ADMISSION_SAFE_MESSAGE,
+        "run_id": run_id,
+    }
+    assert units.start_calls == []
+
+    retry = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers=headers,
+        json=request,
+    )
+    assert retry.status_code == 422, retry.text
+    assert retry.json() == first.json()
+    assert units.start_calls == []
+    runs = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    )
+    assert runs.status_code == 200, runs.text
+    assert [item["run_id"] for item in runs.json()["runs"]] == [run_id]
+
+    status = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    )
+    assert status.status_code == 200, status.text
+    payload = status.json()
+    assert payload["status"] == "needs_attention"
+    assert payload["reason"] == PLAN_ADMISSION_SAFE_MESSAGE
+    assert payload["evidence"]["startup_failure"]["code"] == PLAN_ADMISSION_ERROR_CODE
+
+
 def test_history_api_filters_deleted_links_replays_and_auth(control_client):
     client, root, _, _ = control_client
     directory = root / '.aflow' / 'runs' / 'legacy-history'

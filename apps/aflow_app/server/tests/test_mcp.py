@@ -476,6 +476,56 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
     )
 
 
+def test_mcp_reserved_plan_admission_failure_preserves_safe_identity(mcp_client) -> None:
+    from aflow.api.startup import (
+        PLAN_ADMISSION_ERROR_CODE,
+        PLAN_ADMISSION_SAFE_MESSAGE,
+        PlanAdmissionError,
+    )
+
+    client, _, units, monkeypatch = mcp_client
+
+    def reject(_request):
+        raise PlanAdmissionError
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", reject)
+    arguments = {
+        "project_id": PROJECT_ID,
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+        "idempotency_key": "mcp-reserved-plan-admission",
+    }
+    first = _mcp_request(
+        client,
+        "tools/call",
+        {"name": "start_run", "arguments": arguments},
+    )
+    assert first["result"]["isError"] is True
+    first_detail = json.loads(first["result"]["content"][0]["text"])
+    run_id = first_detail["run_id"]
+    assert first_detail == {
+        "code": PLAN_ADMISSION_ERROR_CODE,
+        "message": PLAN_ADMISSION_SAFE_MESSAGE,
+        "run_id": run_id,
+    }
+
+    retry = _mcp_request(
+        client,
+        "tools/call",
+        {"name": "start_run", "arguments": arguments},
+    )
+    assert retry["result"]["isError"] is True
+    assert json.loads(retry["result"]["content"][0]["text"]) == first_detail
+    assert units.start_calls == []
+
+    status = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["status"] == "needs_attention"
+    assert status.json()["reason"] == PLAN_ADMISSION_SAFE_MESSAGE
+
+
 @pytest.mark.parametrize(
     ("extra_instructions", "expected"),
     (

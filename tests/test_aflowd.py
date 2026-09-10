@@ -167,12 +167,22 @@ def _prepared(request: StartupRequest) -> PreparedRun:
     )
 
 
-@pytest.mark.parametrize("invalid_state", ["started", "ambiguous", "no_head"])
+@pytest.mark.parametrize(
+    "invalid_state",
+    ["started", "ambiguous", "no_head", "tracking_no_checkpoint"],
+)
 def test_daemon_git_tracking_preflight_failure_does_not_allocate_run_artifacts(
     tmp_path: Path,
     monkeypatch,
     invalid_state: str,
 ) -> None:
+    from aflow.api.startup import (
+        PLAN_ADMISSION_CHECKPOINT_SAFE_MESSAGE,
+        PLAN_ADMISSION_ERROR_CODE,
+        PLAN_ADMISSION_TRACKING_SAFE_MESSAGE,
+    )
+    from aflow.daemon import DaemonStartupError
+
     units = InMemoryUnitManager()
     daemon, request = _daemon(tmp_path, monkeypatch, units)
     review_config = _review_workflow_config()
@@ -234,20 +244,280 @@ def test_daemon_git_tracking_preflight_failure_does_not_allocate_run_artifacts(
             "- Plan Branch: ``\n- Pre-Handoff Base HEAD: `def`\n\n"
             "### [ ] Checkpoint 1: First\n- [ ] step\n"
         )
+    elif invalid_state == "tracking_no_checkpoint":
+        plan_path.write_text(
+            "# Plan\n\n## Git Tracking\n\n"
+            "- Plan Branch: ``\n- Pre-Handoff Base HEAD: ``\n"
+        )
     original_bytes = plan_path.read_bytes()
 
-    with pytest.raises(DaemonError, match="startup plan preflight failed"):
+    expected_exception = DaemonError if invalid_state == "no_head" else DaemonStartupError
+    with pytest.raises(expected_exception) as caught:
         daemon.service.start(
             request,
             caller_scope="project:review",
             idempotency_key=f"invalid-{invalid_state}",
         )
 
+    if isinstance(caught.value, DaemonStartupError):
+        expected_message = (
+            PLAN_ADMISSION_CHECKPOINT_SAFE_MESSAGE
+            if invalid_state == "tracking_no_checkpoint"
+            else PLAN_ADMISSION_TRACKING_SAFE_MESSAGE
+        )
+        assert caught.value.run_id is None
+        assert caught.value.code == PLAN_ADMISSION_ERROR_CODE
+        assert str(caught.value) == expected_message
+    else:
+        assert str(caught.value) == "startup plan preflight failed"
+
     assert plan_path.read_bytes() == original_bytes
     assert units.start_calls == []
     assert not (request.repo_root / ".aflow" / "launches").exists()
     assert not (request.repo_root / ".aflow" / "runs").exists()
     assert not (request.repo_root / ".aflow" / "last_run_id").exists()
+
+
+@pytest.mark.parametrize(
+    "recorded_base",
+    [
+        "0000000000000000000000000000000000000000",
+        "",
+    ],
+    ids=["mismatch-started", "empty-base-started"],
+)
+def test_daemon_started_base_failure_preserves_reserved_typed_failure(
+    tmp_path: Path,
+    monkeypatch,
+    recorded_base: str,
+) -> None:
+    from aflow.api.startup import (
+        PLAN_ADMISSION_ERROR_CODE,
+        PLAN_ADMISSION_STARTED_HISTORY_KIND,
+        PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE,
+    )
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    review_config = _review_workflow_config()
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: review_config)
+    request = replace(request, workflow_config=review_config)
+
+    subprocess.run(
+        ("git", "init", "-b", "main"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.email", "test@test.com"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.name", "Test"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (request.repo_root / "README.md").write_text("ready\n")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "commit", "-m", "init"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    request.plan_path.write_text(
+        "# Plan\n\n"
+        "## 2. Git Tracking\n\n"
+        "- Plan Branch: ``\n"
+        f"- Pre-Handoff Base HEAD: `{recorded_base}`\n\n"
+        "### [ ] Checkpoint 1: First\n"
+        "- [x] started\n"
+        "- [ ] remaining\n"
+    )
+
+    with pytest.raises(DaemonStartupError) as first:
+        daemon.service.start(
+            request,
+            caller_scope="project:review",
+            idempotency_key="mismatch-started",
+        )
+
+    run_id = first.value.run_id
+    assert run_id is not None
+    assert first.value.code == PLAN_ADMISSION_ERROR_CODE
+    assert str(first.value) == PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE
+
+    with pytest.raises(DaemonStartupError) as retry:
+        daemon.service.start(
+            request,
+            caller_scope="project:review",
+            idempotency_key="mismatch-started",
+        )
+
+    assert retry.value.run_id == run_id
+    assert retry.value.code == PLAN_ADMISSION_ERROR_CODE
+    assert str(retry.value) == PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE
+    assert units.start_calls == []
+    assert [item.run_id for item in daemon.application.repository.list_runs(limit=100).runs] == [run_id]
+    status = daemon.service.run_status(run_id)
+    assert status.status == "needs_attention"
+    assert status.reason == PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE
+    assert status.evidence["startup_failure"]["code"] == PLAN_ADMISSION_ERROR_CODE
+    assert status.evidence["startup_failure"]["kind"] == PLAN_ADMISSION_STARTED_HISTORY_KIND
+
+
+@pytest.mark.parametrize("failure", ["backup", "value"])
+def test_unclassified_preallocation_failures_remain_generic_and_artifact_free(
+    tmp_path: Path,
+    monkeypatch,
+    failure: str,
+) -> None:
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    review_config = _review_workflow_config()
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: review_config)
+    request = replace(request, workflow_config=review_config)
+
+    subprocess.run(
+        ("git", "init", "-b", "main"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.email", "test@test.com"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.name", "Test"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (request.repo_root / "README.md").write_text("ready\n")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "commit", "-m", "init"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    sentinel = f"private-preflight-{failure}"
+    if failure == "backup":
+        def reject_backup(*args, **kwargs):
+            raise PermissionError(sentinel)
+
+        monkeypatch.setattr("aflow.workflow._backup_original_plan", reject_backup)
+    else:
+        monkeypatch.setattr("aflow.workflow._backup_original_plan", lambda *args, **kwargs: None)
+
+        def reject_value(*args, **kwargs):
+            raise ValueError(sentinel)
+
+        monkeypatch.setattr(
+            "aflow.workflow._prepare_required_git_tracking_before_allocation",
+            reject_value,
+        )
+
+    with pytest.raises(DaemonError) as caught:
+        daemon.service.start(
+            request,
+            caller_scope="project:review",
+            idempotency_key=f"generic-preflight-{failure}",
+        )
+
+    assert not isinstance(caught.value, DaemonStartupError)
+    assert str(caught.value) == "startup plan preflight failed"
+    assert sentinel not in str(caught.value)
+    assert units.start_calls == []
+    assert not (request.repo_root / ".aflow" / "launches").exists()
+    assert not (request.repo_root / ".aflow" / "runs").exists()
+
+
+def test_unclassified_reserved_startup_value_error_remains_generic(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    review_config = _review_workflow_config()
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: review_config)
+    request = replace(request, workflow_config=review_config)
+
+    subprocess.run(
+        ("git", "init", "-b", "main"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.email", "test@test.com"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.name", "Test"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (request.repo_root / "README.md").write_text("ready\n")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "commit", "-m", "init"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    sentinel = "private-startup-value-error"
+
+    def reject_preflight(*args, **kwargs):
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr(
+        "aflow.api.startup.preflight_pre_handoff_base_head_refresh",
+        reject_preflight,
+    )
+
+    with pytest.raises(DaemonStartupError) as caught:
+        daemon.service.start(
+            request,
+            caller_scope="project:review",
+            idempotency_key="generic-reserved-preflight",
+        )
+
+    assert caught.value.run_id is not None
+    assert caught.value.code == "startup_failed"
+    assert str(caught.value) == "Startup base/history validation could not be completed."
+    assert sentinel not in str(caught.value)
+    assert units.start_calls == []
 
 
 def test_daemon_persists_startup_question_then_launches_once_when_answered(

@@ -15,6 +15,8 @@ from aflow.git_status import (
     probe_repo_state,
 )
 from aflow.plan import (
+    GitTrackingMetadataError,
+    MISSING_CHECKPOINT_SECTIONS,
     PlanParseError,
     load_plan,
     load_plan_tolerant,
@@ -44,6 +46,52 @@ class StartupError(Exception):
     """Error during startup preparation."""
 
     pass
+
+
+PLAN_ADMISSION_ERROR_CODE = "plan_validation_failed"
+PLAN_ADMISSION_TRACKING_KIND = "git_tracking"
+PLAN_ADMISSION_CHECKPOINT_KIND = "checkpoint_format"
+PLAN_ADMISSION_STARTED_HISTORY_KIND = "started_history"
+PLAN_ADMISSION_TRACKING_SAFE_MESSAGE = (
+    "Plan validation failed. Add or correct exactly one Git Tracking section, then retry."
+)
+PLAN_ADMISSION_CHECKPOINT_SAFE_MESSAGE = (
+    "Plan validation failed. Add at least one valid Checkpoint section and checklist, then retry."
+)
+PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE = (
+    "Started plan history no longer matches its Git Tracking base. "
+    "Reconcile the base with current history before retrying; do not clear progress."
+)
+PLAN_ADMISSION_SAFE_MESSAGE = PLAN_ADMISSION_TRACKING_SAFE_MESSAGE
+_PLAN_ADMISSION_SAFE_MESSAGES = {
+    PLAN_ADMISSION_TRACKING_KIND: PLAN_ADMISSION_TRACKING_SAFE_MESSAGE,
+    PLAN_ADMISSION_CHECKPOINT_KIND: PLAN_ADMISSION_CHECKPOINT_SAFE_MESSAGE,
+    PLAN_ADMISSION_STARTED_HISTORY_KIND: PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE,
+}
+PLAN_RECOVERY_SAFE_MESSAGE = (
+    "Plan checkpoint state is inconsistent. Review the affected checkpoint and checklist before continuing."
+)
+
+
+class PlanAdmissionError(StartupError):
+    """Known plan/metadata rejection with a fixed transport-safe projection."""
+
+    code = PLAN_ADMISSION_ERROR_CODE
+    safe_message = PLAN_ADMISSION_SAFE_MESSAGE
+
+    def __init__(self, kind: str = PLAN_ADMISSION_TRACKING_KIND) -> None:
+        if kind not in _PLAN_ADMISSION_SAFE_MESSAGES:
+            raise ValueError("unknown plan admission classification")
+        self.kind = kind
+        self.safe_message = _PLAN_ADMISSION_SAFE_MESSAGES[kind]
+        super().__init__(self.safe_message)
+
+    @classmethod
+    def safe_message_for(cls, kind: object) -> str:
+        """Return a safe known message, falling back for legacy records."""
+        if isinstance(kind, str):
+            return _PLAN_ADMISSION_SAFE_MESSAGES.get(kind, cls.safe_message)
+        return cls.safe_message
 
 
 _DEFAULT_PROBE_WORKTREE = probe_worktree
@@ -133,10 +181,12 @@ def _load_plan_with_recovery(
         parsed_plan = load_plan(plan_path)
     except PlanParseError as exc:
         if exc.error_kind != "inconsistent_checkpoint_state":
-            raise StartupError(str(exc))
-        raise StartupError(f"inconsistent_checkpoint_state:{exc}")
-    except FileNotFoundError as exc:
-        raise StartupError(str(exc))
+            if exc.admission_kind == MISSING_CHECKPOINT_SECTIONS:
+                raise PlanAdmissionError(PLAN_ADMISSION_CHECKPOINT_KIND) from exc
+            raise StartupError("Startup plan could not be validated.") from exc
+        raise StartupError("inconsistent_checkpoint_state") from exc
+    except (OSError, UnicodeError) as exc:
+        raise StartupError("Startup plan could not be read.") from exc
     return parsed_plan, None
 
 
@@ -470,15 +520,17 @@ def _preflight_startup_base_head_refresh(
     request: StartupRequest,
     parsed_plan: object,
 ) -> object:
-    plan_text = request.plan_path.read_text(encoding="utf-8")
     try:
+        plan_text = request.plan_path.read_text(encoding="utf-8")
         return preflight_pre_handoff_base_head_refresh(
             request.repo_root,
             plan_text,
             parsed_plan,
         )
-    except ValueError as exc:
-        raise StartupError(str(exc)) from exc
+    except GitTrackingMetadataError as exc:
+        raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND) from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise StartupError("Startup base/history validation could not be completed.") from exc
 
 
 def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
@@ -510,10 +562,15 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
             parsed_plan, startup_retry_error = _load_plan_with_recovery(request.plan_path)
         except StartupError as exc:
             if str(exc).startswith("inconsistent_checkpoint_state:"):
-                recovery_msg = str(exc).replace("inconsistent_checkpoint_state:", "")
                 return StartupQuestion(
                     kind=StartupQuestionKind.CONFIRM_RECOVERY,
-                    message=recovery_msg,
+                    message=PLAN_RECOVERY_SAFE_MESSAGE,
+                    continuation_request=request,
+                )
+            if str(exc) == "inconsistent_checkpoint_state":
+                return StartupQuestion(
+                    kind=StartupQuestionKind.CONFIRM_RECOVERY,
+                    message=PLAN_RECOVERY_SAFE_MESSAGE,
                     continuation_request=request,
                 )
             raise
@@ -579,15 +636,13 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
             request,
             parsed_plan,
         )
+        if startup_base_head_refresh.status == StartupBaseHeadRefreshStatus.MALFORMED:
+            raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND)
         if startup_base_head_refresh.status in {
-            StartupBaseHeadRefreshStatus.MALFORMED,
             StartupBaseHeadRefreshStatus.EMPTY_BASE_STARTED,
             StartupBaseHeadRefreshStatus.MISMATCH_STARTED,
         }:
-            raise StartupError(
-                f"startup preflight rejected Pre-Handoff Base HEAD state: "
-                f"{startup_base_head_refresh.status.value}"
-            )
+            raise PlanAdmissionError(PLAN_ADMISSION_STARTED_HISTORY_KIND)
 
         effective_startup_base_head_refresh_sha = (
             request.startup_base_head_refresh_sha
@@ -705,8 +760,12 @@ def prepare_startup_with_answer(
 
         try:
             tolerant_result = load_plan_tolerant(effective_request.plan_path)
-        except FileNotFoundError as exc:
-            raise StartupError(str(exc))
+        except PlanParseError as exc:
+            if exc.admission_kind == MISSING_CHECKPOINT_SECTIONS:
+                raise PlanAdmissionError(PLAN_ADMISSION_CHECKPOINT_KIND) from exc
+            raise StartupError("Startup plan could not be validated.") from exc
+        except (OSError, UnicodeError) as exc:
+            raise StartupError("Startup plan could not be read.") from exc
 
         parsed_plan = tolerant_result.parsed_plan
         if tolerant_result.parse_error:

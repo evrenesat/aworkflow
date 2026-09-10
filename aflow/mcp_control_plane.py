@@ -8,6 +8,7 @@ MCP listener in this module.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from typing import Any, Literal, Mapping
@@ -27,7 +28,12 @@ from aflow.control_plane import (
     StartupQuestionRecord,
 )
 from aflow.control_plane.persistence import PersistenceError
-from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict
+from aflow.daemon import (
+    DaemonAuthorizationError,
+    DaemonError,
+    DaemonIdempotencyConflict,
+    DaemonStartupError,
+)
 
 
 ControlPlaneServiceGetter = Callable[[], Any]
@@ -60,6 +66,8 @@ def _public_error_code(
     for error_type, code in (extra_error_codes or {}).items():
         if isinstance(exc, error_type):
             return code
+    if isinstance(exc, DaemonStartupError) and exc.code != "startup_failed":
+        return exc.code
     if isinstance(exc, ControlValidationError):
         return exc.code
     if isinstance(exc, RepositoryNotFoundError):
@@ -77,6 +85,19 @@ def _public_error_code(
     return "internal_error"
 
 
+def _public_error_detail(
+    exc: Exception, *, extra_error_codes: Mapping[type[Exception], str] | None = None
+) -> str:
+    """Return a stable code, or the bounded structured detail for known startup errors."""
+    code = _public_error_code(exc, extra_error_codes=extra_error_codes)
+    if isinstance(exc, DaemonStartupError) and exc.code != "startup_failed":
+        detail: dict[str, str] = {"code": code, "message": str(exc)}
+        if exc.run_id is not None:
+            detail["run_id"] = exc.run_id
+        return json.dumps(detail, separators=(",", ":"), sort_keys=True)
+    return code
+
+
 def _tool_result(
     operation: Callable[[], dict[str, Any]],
     arguments: Mapping[str, object] | None = None,
@@ -88,7 +109,7 @@ def _tool_result(
         return operation()
     except Exception as exc:
         raise ToolError(
-            _public_error_code(exc, extra_error_codes=extra_error_codes)
+            _public_error_detail(exc, extra_error_codes=extra_error_codes)
         ) from None
 
 

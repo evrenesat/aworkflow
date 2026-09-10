@@ -9,6 +9,8 @@ Issue37 reproduces an unchecked plan with `## 3. Git Tracking` and blank reserve
 - Plan Branch: `aflow-issue-37-plan-heading-and-startup-errors-20260910-20260910-222325`
 - Pre-Handoff Base HEAD: `fdc9ff2c7ac7593383a0856f9d2c82cb09ad3f9c`
 - Review Log:
+  - 2026-09-10: Reviewer approved checkpoint 2 through `cp2 v01` after the cp03-v01 repair overlay, reviewing the uncommitted worktree against approved cp1 `c0afa1f`. Both prior findings resolved. Verification: 56 core/daemon, 67 HTTP/MCP/auth, 110 parser/retry/library tests plus 23 subtests; Ruff and diff check passed. Checkpoint 3 remains pending.
+  - 2026-09-10: Reviewer rejected checkpoint 2 v01 using the uncommitted worktree against `c0afa1f` (approved cp1 v01). Required suites passed (51 core/daemon and 64 API/MCP/auth), but blanket Git Tracking guidance misdirects malformed-plan correction and broad catches classify infrastructure errors as plan errors. Checkpoint 2 remains unapproved; repair overlay is `issue-37-plan-heading-and-startup-errors-20260910-cp03-v01.md` (filename supplied by controller, scope is checkpoint 2). No approval commit or history rewrite.
   - 2026-09-10: Reviewer approved checkpoint 1 through `cp1 v01` using the worktree against the pre-handoff base (no checkpoint commit existed). Required parser/runtime verification passed with process-local Git isolation; checkpoints 2 and 3 remain pending.
 
 ## Done Means
@@ -47,7 +49,7 @@ No global regex accepting arbitrary headings, silent history reset, new validati
 
 **Blockers:** Ambiguous sections remain rejected; do not choose one by order.
 
-### [ ] Checkpoint 2: Carry safe plan admission explanations to HTTP clients
+### [x] Checkpoint 2: Carry safe plan admission explanations to HTTP clients
 
 **Goal:** Known validation failures are actionable while arbitrary failures remain redacted.
 
@@ -57,9 +59,9 @@ No global regex accepting arbitrary headings, silent history reset, new validati
 
 **Steps:**
 
-- [ ] Give known plan-format/tracking admission failures a stable code and fixed safe corrective message using a narrow typed error (reuse an existing suitable type or extend the existing plan/startup error boundary). Annotate the source validation cases; do not infer categories by parsing arbitrary exception text. Include only safe requirement/correction text, bounded to300 characters, and preserve the detailed cause in private logs.
-- [ ] Preserve that typed failure through daemon/control-plane pre-allocation handling. Return HTTP422 with the existing structured detail code/message shape understood by ApiError. Keep all unrelated ValueError/DaemonError cases generic; do not echo path, branch value, submitted plan, tokens or arbitrary causes. If the validator already supplies several safe issues, retain that existing bounded list; do not build a new aggregator.
-- [ ] Test malformed/duplicate tracking rejection yields the specific safe correction, no launch/run allocation when validation precedes reservation, and no secrets/path sentinels in response. Cover already-reserved tracking/preflight failure separately: preserve its exact run ID and current failed-preparation state through existing HTTP/MCP error/result contracts, without another allocation on exact retry. Reuse the existing typed startup error boundary; no new storage or alternate lifecycle. Keep bearer authorization, idempotency, MCP mapping and generic-error redaction tests intact.
+- [x] Give known plan-format/tracking admission failures a stable code and fixed safe corrective message using a narrow typed error (reuse an existing suitable type or extend the existing plan/startup error boundary). Annotate the source validation cases; do not infer categories by parsing arbitrary exception text. Include only safe requirement/correction text, bounded to300 characters, and preserve the detailed cause in private logs.
+- [x] Preserve that typed failure through daemon/control-plane pre-allocation handling. Return HTTP422 with the existing structured detail code/message shape understood by ApiError. Keep all unrelated ValueError/DaemonError cases generic; do not echo path, branch value, submitted plan, tokens or arbitrary causes. If the validator already supplies several safe issues, retain that existing bounded list; do not build a new aggregator.
+- [x] Test malformed/duplicate tracking rejection yields the specific safe correction, no launch/run allocation when validation precedes reservation, and no secrets/path sentinels in response. Cover already-reserved tracking/preflight failure separately: preserve its exact run ID and current failed-preparation state through existing HTTP/MCP error/result contracts, without another allocation on exact retry. Reuse the existing typed startup error boundary; no new storage or alternate lifecycle. Keep bearer authorization, idempotency, MCP mapping and generic-error redaction tests intact.
 
 **Dependencies:** CP1.
 
