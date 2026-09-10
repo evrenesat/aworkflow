@@ -29,6 +29,7 @@ from aflow.control_plane import (
     RunStatus,
     StartRunResult,
     StartupQuestionRecord,
+    WorktreePreflightResult,
 )
 from aflow.control_plane.run_history import RunHistory
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
@@ -300,6 +301,49 @@ class ControlPlaneService:
             full_scope=full_scope,
         )
 
+    def preflight(
+        self,
+        project_id: str,
+        *,
+        plan_path: str,
+        workflow_name: str | None = None,
+        team: str | None = None,
+        start_step: str | None = None,
+        max_turns: int | None = None,
+        extra_instructions: tuple[str, ...] = (),
+        restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
+        offset: int = 0,
+        limit: int = 200,
+        caller_scope: str = "rest",
+    ) -> WorktreePreflightResult:
+        """Return a current, paged dirtiness inspection without a run."""
+        WorktreePreflightResult.validate_page(offset=offset, limit=limit)
+        with self.project_lock(project_id):
+            item = self._project(project_id)
+            request = StartupRequest(
+                repo_root=item.root,
+                plan_path=self._plan_path(item.root, plan_path),
+                config_path=item.config_path,
+                workflow_config=WorkflowUserConfig(),
+                workflow_name=workflow_name,
+                start_step=start_step,
+                max_turns=max_turns,
+                team=team,
+                extra_instructions=extra_instructions,
+                restarted_from_run_id=restarted_from_run_id,
+                dirty_worktree_confirmed=dirty_worktree_confirmed,
+            )
+            result = item.daemon.service.preflight(
+                request,
+                caller_scope=self._caller_scope(project_id, caller_scope),
+            )
+            return WorktreePreflightResult.from_domain(
+                result,
+                offset=offset,
+                limit=limit,
+            )
+
     def start_run(
         self,
         project_id: str,
@@ -311,6 +355,7 @@ class ControlPlaneService:
         max_turns: int | None,
         extra_instructions: tuple[str, ...] = (),
         restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
         idempotency_key: str | None = None,
         caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
@@ -327,6 +372,7 @@ class ControlPlaneService:
                 team=team,
                 extra_instructions=extra_instructions,
                 restarted_from_run_id=restarted_from_run_id,
+                dirty_worktree_confirmed=dirty_worktree_confirmed,
             )
             return item.daemon.service.start(
                 request,

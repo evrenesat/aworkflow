@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-10 — Expose dirty-worktree preflight (CP8 implementation)
+
+- Added authenticated REST and read-only MCP preflight over the shared CP7
+  status result, with bounded pages and repository-relative status items.
+- Fresh daemon launches now accept the explicit dirty-worktree choice across
+  transport, replay, and preparation boundaries while retaining the existing
+  structured startup question and conflict/in-progress-operation refusals.
+
 ## 2026-09-10 — Repair dirty-worktree lifecycle preflight (CP7 review)
 
 - Lifecycle startup now defers strict Git status inspection only for the

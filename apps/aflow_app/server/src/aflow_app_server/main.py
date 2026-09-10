@@ -67,6 +67,7 @@ from .models import (
     GlobalCapabilitiesResponse,
     GuidedStarterDefaults,
     OwnerStopPayload,
+    PreflightRunPayload,
     PlanListResponse,
     PlanResponse,
     ProjectConfigFormPayload,
@@ -86,6 +87,7 @@ from .models import (
     StartRunResponse,
     StartupAnswerPayload,
     StartupQuestionResponse,
+    WorktreePreflightResponse,
 )
 from .plan_service import (
     PlanProjectNotFound,
@@ -1126,6 +1128,34 @@ def run_context(
     )
 
 
+@app.post(
+    "/api/control-plane/projects/{project_id}/runs/preflight",
+    response_model=WorktreePreflightResponse,
+    tags=["control-plane"],
+)
+def preflight_run(
+    project_id: str,
+    payload: PreflightRunPayload,
+    _: str = Depends(verify_token),
+    service: ControlPlaneService = Depends(get_control_plane_service),
+) -> WorktreePreflightResponse:
+    return WorktreePreflightResponse.from_canonical(
+        service.preflight(
+            project_id,
+            plan_path=payload.plan_path,
+            workflow_name=payload.workflow_name,
+            team=payload.team,
+            start_step=payload.start_step,
+            max_turns=payload.max_turns,
+            extra_instructions=payload.extra_instructions,
+            restarted_from_run_id=payload.restarted_from_run_id,
+            dirty_worktree_confirmed=payload.dirty_worktree_confirmed,
+            offset=payload.offset,
+            limit=payload.limit,
+        )
+    )
+
+
 @app.get("/api/control-plane/projects/{project_id}/runs/{run_id}/restart-options", tags=["control-plane"])
 def control_plane_restart_options(
     project_id: str,
@@ -1172,6 +1202,7 @@ def start_run(
         max_turns=payload.max_turns,
         extra_instructions=payload.extra_instructions,
         restarted_from_run_id=payload.restarted_from_run_id,
+        dirty_worktree_confirmed=payload.dirty_worktree_confirmed,
         idempotency_key=idempotency_key,
     )
     adapted = _start_response(result)

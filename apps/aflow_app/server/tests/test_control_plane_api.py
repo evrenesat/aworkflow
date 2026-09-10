@@ -16,7 +16,13 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
-from aflow.control_plane import CapabilitySet, ContextBundle, RunControlRequest, RunStatus, StartRunResult
+from aflow.control_plane import (
+    CapabilitySet,
+    ContextBundle,
+    RunControlRequest,
+    RunStatus,
+    StartRunResult,
+)
 from aflow.control_plane.persistence import append_run_event
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import AflowDaemon
@@ -29,6 +35,7 @@ from aflow_app_server.models import (
     RunControlPayload,
     RunStatusResponse,
     StartRunResponse,
+    WorktreePreflightResponse,
     canonical_contract_payloads,
 )
 from aflow_app_server.project_registry import (
@@ -259,6 +266,181 @@ def _answer_pending(
     return response.json()
 
 
+def _commit_fixture_repository(root: Path) -> None:
+    subprocess.run(("git", "add", "-A"), cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture baseline",
+        ),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _preflight_request(
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    dirty_worktree_confirmed: bool = False,
+) -> dict[str, object]:
+    return {
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+        "limit": limit,
+        "offset": offset,
+        "dirty_worktree_confirmed": dirty_worktree_confirmed,
+    }
+
+
+def test_control_plane_preflight_is_paged_read_only_and_reports_relative_paths(
+    control_client,
+) -> None:
+    client, root, units, _ = control_client
+    _commit_fixture_repository(root)
+    for name in ("dirty-a.txt", "dirty-b.txt", "dirty-c.txt"):
+        (root / name).write_text(name, encoding="utf-8")
+    before_runs = sorted(
+        path.relative_to(root).as_posix()
+        for path in (root / ".aflow" / "runs").rglob("*")
+        if path.is_file()
+    ) if (root / ".aflow" / "runs").exists() else []
+
+    first = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json=_preflight_request(limit=2, dirty_worktree_confirmed=True),
+    )
+    assert first.status_code == 200, first.text
+    first_payload = first.json()
+    assert first_payload["checkout_path"] == str(root.resolve())
+    assert first_payload["dirty"] is True
+    assert first_payload["requires_confirmation"] is True
+    assert first_payload["total_items"] == 3
+    assert first_payload["offset"] == 0
+    assert first_payload["limit"] == 2
+    assert first_payload["next_offset"] == 2
+    assert [item["path"] for item in first_payload["items"]] == [
+        "dirty-a.txt",
+        "dirty-b.txt",
+    ]
+    assert all("content" not in item for item in first_payload["items"])
+    assert units.start_calls == []
+
+    second = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json=_preflight_request(limit=2, offset=2),
+    )
+    assert second.status_code == 200, second.text
+    second_payload = second.json()
+    assert second_payload["total_items"] == 3
+    assert second_payload["next_offset"] is None
+    assert [item["path"] for item in second_payload["items"]] == ["dirty-c.txt"]
+    after_runs = sorted(
+        path.relative_to(root).as_posix()
+        for path in (root / ".aflow" / "runs").rglob("*")
+        if path.is_file()
+    ) if (root / ".aflow" / "runs").exists() else []
+    assert after_runs == before_runs
+
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json=_preflight_request(limit=1_001),
+    )
+    assert rejected.status_code == 422
+
+    merge_head = root / ".git" / "MERGE_HEAD"
+    merge_head.write_text("synthetic-merge-marker\n", encoding="utf-8")
+    try:
+        conflict = client.post(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+            json=_preflight_request(),
+        )
+        assert conflict.status_code == 200, conflict.text
+        assert any(
+            blocker == "in-progress Git operation (MERGE_HEAD exists)"
+            for blocker in conflict.json()["blockers"]
+        )
+
+        refused = client.post(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs",
+            headers={"Idempotency-Key": "conflict-refusal"},
+            json={
+                "plan_path": "plans/todo/test-plan.md",
+                "workflow_name": "managed",
+                "dirty_worktree_confirmed": True,
+            },
+        )
+        assert refused.status_code == 422
+        assert units.start_calls == []
+    finally:
+        merge_head.unlink()
+
+
+def test_control_plane_start_rechecks_dirt_and_replays_acknowledgment_as_identity(
+    control_client,
+) -> None:
+    client, root, units, _ = control_client
+    _commit_fixture_repository(root)
+    clean = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json=_preflight_request(),
+    )
+    assert clean.status_code == 200, clean.text
+    assert clean.json()["dirty"] is False
+    (root / "appeared-after-selection.txt").write_text("dirty", encoding="utf-8")
+
+    unacknowledged = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "dirty-unacknowledged"},
+        json={"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"},
+    )
+    assert unacknowledged.status_code == 202, unacknowledged.text
+    question = unacknowledged.json()["startup_question"]
+    assert question["kind"] == "confirm_worktree_dirty"
+    assert units.start_calls == []
+
+    declined = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/startup-answers/{question['question_id']}",
+        headers={"Idempotency-Key": "dirty-declined"},
+        json={"answer": False},
+    )
+    assert declined.status_code == 422
+    assert units.start_calls == []
+
+    acknowledged = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "dirty-acknowledged"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "dirty_worktree_confirmed": True,
+        },
+    )
+    assert acknowledged.status_code == 201, acknowledged.text
+    assert acknowledged.json()["result"]["status"] == "running"
+    assert len(units.start_calls) == 1
+
+    changed_replay = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "dirty-acknowledged"},
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "dirty_worktree_confirmed": False,
+        },
+    )
+    assert changed_replay.status_code == 409
+    assert changed_replay.json() == {"detail": {"code": "idempotency_conflict"}}
+    assert len(units.start_calls) == 1
+
+
 def test_unregister_refuses_to_invalidate_daemon_with_active_unit(control_client) -> None:
     from aflow_app_server import main
 
@@ -399,6 +581,7 @@ def test_transport_models_match_canonical_control_plane_models() -> None:
     assert set(StartRunResponse.model_fields) == set(payloads["start"])
     assert set(RunControlPayload.model_fields) == set(payloads["control"])
     assert set(ContextResponse.model_fields) == set(payloads["context"])
+    assert set(WorktreePreflightResponse.model_fields) == set(payloads["preflight"])
 
 
 def test_openapi_documents_control_plane_operations_and_models() -> None:
@@ -414,6 +597,7 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
         "/api/control-plane/capabilities",
         "/api/control-plane/projects",
         "/api/control-plane/projects/{project_id}/runs",
+        "/api/control-plane/projects/{project_id}/runs/preflight",
         "/api/control-plane/projects/{project_id}/runs/{run_id}/events/stream",
         "/api/control-plane/projects/{project_id}/runs/{run_id}/control",
         "/api/control-plane/projects/{project_id}/runs/{run_id}/owner-stop",
@@ -426,6 +610,7 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
         "StartRunResponse",
         "RunControlPayload",
         "ContextResponse",
+        "WorktreePreflightResponse",
     }.issubset(schema["components"]["schemas"])
 
 
@@ -1236,10 +1421,19 @@ def test_real_dirty_startup_failure_survives_api_reload(control_client):
         headers={"Idempotency-Key": "dirty-failure"},
         json={"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"},
     )
-    assert response.status_code == 422, response.text
-    error = response.json()["detail"]
+    assert response.status_code == 202, response.text
+    question = response.json()["startup_question"]
+    assert question["kind"] == "confirm_worktree_dirty"
+    assert units.start_calls == []
+    declined = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/startup-answers/{question['question_id']}",
+        headers={"Idempotency-Key": "dirty-failure-answer"},
+        json={"answer": False},
+    )
+    assert declined.status_code == 422, declined.text
+    error = declined.json()["detail"]
     assert error["code"] == "startup_failed", error
-    assert "untracked-blocker.txt" in error["message"]
+    assert error["message"] == "Startup aborted due to dirty worktree"
     assert units.start_calls == []
     main._control_plane_service = ControlPlaneService(
         main._project_registry,

@@ -39,6 +39,7 @@ EXPECTED_TOOL_NAMES = {
     "get_run",
     "get_run_events",
     "get_run_context",
+    "preflight_run",
     "start_run",
     "answer_startup",
     "control_run",
@@ -142,6 +143,7 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     tool_by_name = {tool["name"]: tool for tool in tools}
     assert set(tool_by_name) == EXPECTED_TOOL_NAMES
     assert tool_by_name["list_projects"]["annotations"]["readOnlyHint"] is True
+    assert tool_by_name["preflight_run"]["annotations"]["readOnlyHint"] is True
     assert tool_by_name["start_run"]["annotations"]["readOnlyHint"] is False
     assert tool_by_name["owner_stop"]["annotations"]["destructiveHint"] is True
 
@@ -159,6 +161,22 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     ).json()
     assert _mcp_tool(client, "list_plans", {"project_id": PROJECT_ID}) == client.get(
         f"/api/control-plane/projects/{PROJECT_ID}/plans",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ).json()
+    preflight_arguments = {
+        "project_id": PROJECT_ID,
+        "plan_path": "plans/todo/test-plan.md",
+        "offset": 0,
+        "limit": 1,
+    }
+    assert _mcp_tool(client, "preflight_run", preflight_arguments) == client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": None,
+            "offset": 0,
+            "limit": 1,
+        },
         headers={"Authorization": f"Bearer {TOKEN}"},
     ).json()
 

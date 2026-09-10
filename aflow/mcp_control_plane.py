@@ -112,6 +112,12 @@ def _bounded_limit(limit: int) -> int:
     return limit
 
 
+def _bounded_offset(offset: int) -> int:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    return offset
+
+
 def _reject_credential_arguments(arguments: Mapping[str, object]) -> None:
     if any(_contains_credential(value) for value in arguments.values()):
         raise ValueError("credential-like MCP arguments are not allowed")
@@ -345,6 +351,57 @@ def create_control_plane_mcp(
         )
 
     @mcp.tool(
+        title="Preflight an AFlow run",
+        annotations=_READ_TOOL_ANNOTATIONS,
+        tags={"read"},
+    )
+    def preflight_run(
+        project_id: str,
+        plan_path: str,
+        offset: int = 0,
+        limit: int = 200,
+        workflow_name: str | None = None,
+        team: str | None = None,
+        start_step: str | None = None,
+        max_turns: int | None = None,
+        extra_instructions: list[str] | None = None,
+        restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        """Inspect current launch dirtiness without allocating a run."""
+        return tool_result(
+            lambda: get_service()
+            .preflight(
+                project_id,
+                plan_path=plan_path,
+                workflow_name=workflow_name,
+                team=team,
+                start_step=start_step,
+                max_turns=max_turns,
+                extra_instructions=tuple(extra_instructions or ()),
+                restarted_from_run_id=restarted_from_run_id,
+                dirty_worktree_confirmed=dirty_worktree_confirmed,
+                offset=_bounded_offset(offset),
+                limit=_bounded_limit(limit),
+                caller_scope="mcp",
+            )
+            .to_dict(),
+            {
+                "project_id": project_id,
+                "plan_path": plan_path,
+                "offset": offset,
+                "limit": limit,
+                "workflow_name": workflow_name,
+                "team": team,
+                "start_step": start_step,
+                "max_turns": max_turns,
+                "extra_instructions": extra_instructions,
+                "restarted_from_run_id": restarted_from_run_id,
+                "dirty_worktree_confirmed": dirty_worktree_confirmed,
+            },
+        )
+
+    @mcp.tool(
         title="Start an AFlow run",
         annotations=_WRITE_TOOL_ANNOTATIONS,
         tags={"write", "approval-required"},
@@ -359,6 +416,7 @@ def create_control_plane_mcp(
         max_turns: int | None = None,
         extra_instructions: list[str] | None = None,
         restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
     ) -> dict[str, Any]:
         """Reserve and start one daemon-owned workflow, or return its startup question."""
         return tool_result(
@@ -372,6 +430,7 @@ def create_control_plane_mcp(
                     max_turns=max_turns,
                     extra_instructions=tuple(extra_instructions or ()),
                     restarted_from_run_id=restarted_from_run_id,
+                    dirty_worktree_confirmed=dirty_worktree_confirmed,
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
                 )
@@ -386,6 +445,7 @@ def create_control_plane_mcp(
                 "max_turns": max_turns,
                 "extra_instructions": extra_instructions,
                 "restarted_from_run_id": restarted_from_run_id,
+                "dirty_worktree_confirmed": dirty_worktree_confirmed,
             },
         )
 

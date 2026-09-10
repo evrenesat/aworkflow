@@ -64,6 +64,7 @@ from aflow.control_plane.persistence import (
     normalized_request_digest,
 )
 from aflow.control_plane.units import UnitManager, UnitState
+from aflow.git_status import WorktreePreflight
 
 
 _START_RECORD_SCHEMA_VERSION = 1
@@ -390,6 +391,43 @@ class DaemonService:
                     self._read_record(run_id),
                     created=True,
                 )
+
+    def preflight(
+        self,
+        request: StartupRequest,
+        *,
+        caller_scope: str = "local",
+    ) -> WorktreePreflight:
+        """Inspect startup dirtiness without reserving or preparing a run.
+
+        The request is normalized against the current live configuration and
+        passed through the existing request-level selection validation.  The
+        manifest is built only in memory; no launch, startup record, snapshot,
+        or unit operation is performed here.
+        """
+        with self._lock:
+            self._refresh_workflow_config()
+            normalized = self._normalize_request(
+                request,
+                caller_scope=caller_scope,
+                idempotency_key=None,
+            )
+            candidate = self._initial_manifest_for(
+                run_id="preflight-preview",
+                request=normalized,
+                caller_scope=caller_scope,
+                idempotency_key="preflight-preview",
+            )
+            from aflow.api.startup import _check_worktree_dirtiness
+
+            try:
+                return _check_worktree_dirtiness(
+                    normalized,
+                    candidate.workflow_name,
+                    reject_blockers=False,
+                )
+            except StartupError as exc:
+                raise DaemonError(str(exc)) from exc
 
     def answer_startup(
         self,
@@ -1600,6 +1638,20 @@ class DaemonService:
                     raise DaemonIdempotencyConflict(
                         "start idempotency key was reused for a different request"
                     )
+                try:
+                    record = self._read_record(manifest.run_id)
+                except DaemonError:
+                    record = None
+                if isinstance(record, Mapping):
+                    stored_request = record.get("request")
+                    if isinstance(stored_request, Mapping):
+                        stored_confirmation = stored_request.get(
+                            "dirty_worktree_confirmed", False
+                        )
+                        if stored_confirmation != request.dirty_worktree_confirmed:
+                            raise DaemonIdempotencyConflict(
+                                "start idempotency key was reused for a different request"
+                            )
                 return manifest
             if page.next_cursor is None:
                 return None

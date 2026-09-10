@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Any
 
-from aflow.config import bootstrap_config, load_workflow_config
+from aflow.config import WorkflowUserConfig, bootstrap_config, load_workflow_config
 from aflow.control_plane import (
     ControlWriteResult,
     PlanRecord,
@@ -35,6 +35,7 @@ from aflow.control_plane import (
     RunStatus,
     StartRunResult,
     StartupQuestionRecord,
+    WorktreePreflightResult,
     validate_run_id,
 )
 from aflow.api.models import StartupRequest
@@ -200,6 +201,48 @@ class LocalControlPlaneService:
             full_scope=full_scope,
         )
 
+    def preflight(
+        self,
+        project_id: str,
+        *,
+        plan_path: str,
+        workflow_name: str | None = None,
+        team: str | None = None,
+        start_step: str | None = None,
+        max_turns: int | None = None,
+        extra_instructions: tuple[str, ...] = (),
+        restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
+        offset: int = 0,
+        limit: int = 200,
+        caller_scope: str = "mcp",
+    ) -> WorktreePreflightResult:
+        """Return a current, paged dirtiness inspection without a run."""
+        self._assert_project(project_id)
+        WorktreePreflightResult.validate_page(offset=offset, limit=limit)
+        request = StartupRequest(
+            repo_root=self._repo_root,
+            plan_path=self._plan_path(plan_path),
+            config_path=self._daemon_config_path(),
+            workflow_config=WorkflowUserConfig(),
+            workflow_name=workflow_name,
+            start_step=start_step,
+            max_turns=max_turns,
+            team=team,
+            extra_instructions=extra_instructions,
+            restarted_from_run_id=restarted_from_run_id,
+            dirty_worktree_confirmed=dirty_worktree_confirmed,
+        )
+        result = self._daemon.service.preflight(
+            request,
+            caller_scope=self._caller_scope(caller_scope),
+        )
+        return WorktreePreflightResult.from_domain(
+            result,
+            offset=offset,
+            limit=limit,
+        )
+
     def start_run(
         self,
         project_id: str,
@@ -211,6 +254,7 @@ class LocalControlPlaneService:
         max_turns: int | None,
         extra_instructions: tuple[str, ...] = (),
         restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
         idempotency_key: str | None = None,
         caller_scope: str = "mcp",
     ) -> StartRunResult | StartupQuestionRecord:
@@ -226,6 +270,7 @@ class LocalControlPlaneService:
             team=team,
             extra_instructions=extra_instructions,
             restarted_from_run_id=restarted_from_run_id,
+            dirty_worktree_confirmed=dirty_worktree_confirmed,
         )
         return self._daemon.service.start(
             request,

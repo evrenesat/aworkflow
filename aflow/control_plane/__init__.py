@@ -13,6 +13,8 @@ from .models import (
     RunStatus,
     StartupQuestionRecord,
     StartRunResult,
+    WorktreePreflightResult,
+    WorktreeStatusItem,
     WorkflowCapability,
 )
 from .application import ControlPlaneApplication, compose_control_plane
@@ -71,6 +73,8 @@ __all__ = [
     "RunStatus",
     "StartupQuestionRecord",
     "StartRunResult",
+    "WorktreePreflightResult",
+    "WorktreeStatusItem",
     "WorkflowCapability",
     "ControlPlaneApplication",
     "compose_control_plane",

@@ -816,6 +816,12 @@ Startup models (`models.py`):
 
 - REST and MCP adapt into one StartupRequest; transport models reject unknown
   fields and the daemon resolves numeric start steps before run reservation.
+- Authenticated REST `POST .../runs/preflight` and the read-only MCP
+  `preflight_run` tool share the daemon's CP7 worktree inspection. They return
+  the inspected checkout, repository-relative status items, blockers, and
+  bounded offset pages without creating run artifacts or units. Fresh starts
+  carry `dirty_worktree_confirmed` through the request record and preparation;
+  an omitted or false value preserves the structured startup question.
 - Immutable launch manifests carry canonical step, skipped-step, frozen-config,
   and optional restarted_from_run_id metadata. Extra-instruction text stays
   transient while its digest binds idempotency.

@@ -366,8 +366,15 @@ def _build_retry_context(
 def _check_worktree_dirtiness(
     request: StartupRequest,
     workflow_name: str,
+    *,
+    reject_blockers: bool = True,
 ) -> WorktreePreflight:
-    """Run the shared read-only startup worktree preflight."""
+    """Run the shared read-only startup worktree preflight.
+
+    Normal startup rejects blockers before asking the existing confirmation
+    question.  Remote read-only callers can set ``reject_blockers=False`` to
+    inspect that same typed result without changing the launch contract.
+    """
     workflow = request.workflow_config.workflows[workflow_name]
     execution_mode = (
         "new_worktree"
@@ -441,11 +448,11 @@ def _check_worktree_dirtiness(
             )
         raise StartupError(f"worktree preflight inspection failed: {exc}") from exc
 
-    if result.blockers:
+    if reject_blockers and result.blockers:
         raise StartupError(
             "worktree preflight blocked startup: " + "; ".join(result.blockers)
         )
-    if request.continue_from_current and result.requires_confirmation:
+    if reject_blockers and request.continue_from_current and result.requires_confirmation:
         _, non_plan_paths = classify_status_items_by_prefix(
             result.items,
             ignore_lifecycle_owned=True,

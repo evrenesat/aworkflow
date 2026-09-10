@@ -18,9 +18,11 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp7 v01` — approved.
+- Last Reviewed Checkpoint: `cp8 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp8 v01` from the immediately preceding worker worktree against approved CP7 `05d7d82`; worktree fallback used because no pending CP8 commit exists (zero intervening implementation commits). Reviewed authenticated read-only preflight, offset pagination, HTTP/MCP acknowledgment handoff, startup questions, conflict/race rechecks and replay identity. Verification: required CP8 suite plus server MCP tests, 86 passed; synthetic 1,001-item canonical/HTTP pagination passed; scoped Ruff and diff check passed. No material findings. CP9 remains unchecked; manager 40 KiB guard and compact 16 KiB summary retained.
 
 - 2026-09-10: Approved `cp7 v01` from the immediately preceding repaired worker worktree against approved CP6 `f77b5b1`; worktree fallback used because no pending CP7 commit exists (zero intervening implementation commits). Reviewed shared dirty preflight, acknowledgment handoffs and final lifecycle recheck. Both cp08-v01 overlay findings are resolved: supported non-Git bootstrap reaches preparation and operation markers remain local to the selected worktree. Verification: 467 passed, 168 subtests; library API 33 passed, 6 subtests; scoped Ruff and diff check passed. No material findings. CP8 remains unchecked; manager 40 KiB guard and compact 16 KiB summary retained.
 
@@ -258,7 +260,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** If an existing lifecycle action would overwrite dirty files despite acknowledgment, retain that specific refusal and report it; do not implement automatic cleanup.
 
-### [ ] Checkpoint 8: Expose read-only preflight and launch acknowledgment through the control plane
+### [x] Checkpoint 8: Expose read-only preflight and launch acknowledgment through the control plane
 
 **Goal:** Remote callers can inspect dirt before reserving a run and submit the same choice as CLI callers.
 
@@ -268,11 +270,11 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Add authenticated read-only `POST /api/control-plane/projects/{project_id}/runs/preflight` before any conflicting dynamic run route. Accept the same launch-selection fields as StartRunPayload; inspection ignores acknowledgment. Resolve project/plan/workflow through existing registry and path rules, delegate to checkpoint 7, and never call reservation/launch/startup-write functions. Report only repository-relative dirty paths plus the inspected checkout path, never file contents.
-- [ ] Bound response items with `offset` (default 0) and `limit` (default 200, maximum 1000) request fields and `next_offset` response field alongside `total_items`; all items remain inspectable through subsequent calls. No cursor database or content hashes. Each call describes the current read; no promise of an immutable inventory.
-- [ ] Add optional `dirty_worktree_confirmed` defaulting false to the existing start payload and shared service arguments; carry it through daemon request serialization, request digest/replay and preparation. Use the same boolean on restart-prefilled new launches. Preserve older clients: unacknowledged dirt yields the existing answerable startup-question response rather than direct failure. No worker launches before required confirmation.
-- [ ] Expose the same read-only preflight and boolean through the existing MCP tools, using the shared service; mirror canonical models and validation errors. Keep authentication, registry constraints, response bounds and idempotency behavior.
-- [ ] Add service/HTTP/MCP tests proving preflight creates no artifacts or units, paging covers all files, true/false launch behavior, conflict refusal, replay with a changed boolean rejected as a different request, and inspection/launch races rechecked correctly.
+- [x] Add authenticated read-only `POST /api/control-plane/projects/{project_id}/runs/preflight` before any conflicting dynamic run route. Accept the same launch-selection fields as StartRunPayload; inspection ignores acknowledgment. Resolve project/plan/workflow through existing registry and path rules, delegate to checkpoint 7, and never call reservation/launch/startup-write functions. Report only repository-relative dirty paths plus the inspected checkout path, never file contents.
+- [x] Bound response items with `offset` (default 0) and `limit` (default 200, maximum 1000) request fields and `next_offset` response field alongside `total_items`; all items remain inspectable through subsequent calls. No cursor database or content hashes. Each call describes the current read; no promise of an immutable inventory.
+- [x] Add optional `dirty_worktree_confirmed` defaulting false to the existing start payload and shared service arguments; carry it through daemon request serialization, request digest/replay and preparation. Use the same boolean on restart-prefilled new launches. Preserve older clients: unacknowledged dirt yields the existing answerable startup-question response rather than direct failure. No worker launches before required confirmation.
+- [x] Expose the same read-only preflight and boolean through the existing MCP tools, using the shared service; mirror canonical models and validation errors. Keep authentication, registry constraints, response bounds and idempotency behavior.
+- [x] Add service/HTTP/MCP tests proving preflight creates no artifacts or units, paging covers all files, true/false launch behavior, conflict refusal, replay with a changed boolean rejected as a different request, and inspection/launch races rechecked correctly.
 
 **Dependencies:** Checkpoint 7; coordinate existing control-service changes from checkpoint 5 without duplicating source resolution.
 

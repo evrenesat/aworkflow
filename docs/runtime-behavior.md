@@ -432,7 +432,7 @@ adapter and the local-daemon subprocess adapter is unchanged.
 ## Daemon control plane and direct CLI
 
 The lightweight local daemon starts with `aflow daemon start --foreground`.
-It owns one repository and exposes the shared 13-tool MCP registry over stdio;
+It owns one repository and exposes the shared 14-tool MCP registry over stdio;
 closing MCP input stops the daemon. Optional HTTP runs on `127.0.0.1` only and
 may be detached. `aflow daemon status` verifies the pidfile's process-birth
 identity and reports only direct `daemon-worker` children for the verified
@@ -699,6 +699,14 @@ Other early stop causes:
 ## Dirty Worktree
 
 `aflow run` checks git working tree state before starting.
+
+The authenticated control plane and MCP adapter expose the same inspection as
+the read-only `preflight_run` operation. It returns the inspected checkout,
+relative status paths, conflict blockers, and bounded `offset`/`limit` pages
+without reserving a run. A start request can set
+`dirty_worktree_confirmed = true`; otherwise the existing structured startup
+question is returned before a worker starts, and the final preparation check
+still rejects conflicts and in-progress Git operations.
 
 For worktree workflows, dirty files under `plans/` are allowed. Dirty files outside `plans/` require interactive confirmation, or fail in non-interactive mode.
 

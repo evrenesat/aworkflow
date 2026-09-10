@@ -172,9 +172,13 @@ Node; editable development installs build the web assets automatically.
 
 ## Run the lightweight local daemon
 
-`aflow daemon` exposes the same 13 control-plane MCP tools without the remote
+`aflow daemon` exposes the same 14 control-plane MCP tools without the remote
 web app, FastAPI, or systemd. Stdio is the default and must stay attached to its
 client; optional HTTP binds only to loopback.
+
+The read-only `preflight_run` tool reports bounded dirty-path pages before a
+launch. The `start_run` tool accepts `dirty_worktree_confirmed` and otherwise
+returns the existing startup question before any worker starts.
 
 ```bash
 aflow daemon start --foreground

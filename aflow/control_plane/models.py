@@ -13,6 +13,8 @@ from typing import Any, Literal, Mapping
 CONTROL_PLANE_SCHEMA_VERSION = 1
 MAX_SERIALIZED_TEXT = 4_096
 MAX_SERIALIZED_ITEMS = 128
+WORKTREE_PREFLIGHT_DEFAULT_LIMIT = 200
+WORKTREE_PREFLIGHT_MAX_LIMIT = 1_000
 _SECRET_FIELD_PARTS = (
     "authorization",
     "credential",
@@ -229,6 +231,99 @@ class RunPage:
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class WorktreeStatusItem:
+    """One repository-relative path from a working-tree preflight."""
+
+    path: str
+    index_status: str
+    worktree_status: str
+    original_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return bounded_redacted(asdict(self))
+
+
+@dataclass(frozen=True)
+class WorktreePreflightResult:
+    """Bounded, transport-neutral working-tree inspection output."""
+
+    checkout_path: str
+    execution_mode: Literal["same_checkout", "new_worktree"]
+    dirty: bool
+    requires_confirmation: bool
+    blockers: tuple[str, ...]
+    total_items: int
+    offset: int = 0
+    limit: int = WORKTREE_PREFLIGHT_DEFAULT_LIMIT
+    next_offset: int | None = None
+    items: tuple[WorktreeStatusItem, ...] = ()
+
+    @staticmethod
+    def validate_page(*, offset: int, limit: int) -> None:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= WORKTREE_PREFLIGHT_MAX_LIMIT
+        ):
+            raise ValueError(
+                "limit must be between 1 and "
+                f"{WORKTREE_PREFLIGHT_MAX_LIMIT}"
+            )
+
+    @classmethod
+    def from_domain(
+        cls,
+        result: Any,
+        *,
+        offset: int,
+        limit: int,
+    ) -> "WorktreePreflightResult":
+        """Project the CP7 domain result into one bounded response page."""
+        cls.validate_page(offset=offset, limit=limit)
+        domain_items = tuple(getattr(result, "items", ()))
+        items = tuple(
+            WorktreeStatusItem(
+                path=str(item.path),
+                original_path=(
+                    None
+                    if item.original_path is None
+                    else str(item.original_path)
+                ),
+                index_status=str(item.index_status),
+                worktree_status=str(item.worktree_status),
+            )
+            for item in domain_items
+        )
+        total_items = int(getattr(result, "total_items", len(items)))
+        if total_items < 0:
+            raise ValueError("worktree preflight total_items must be non-negative")
+        end = min(offset + limit, len(items))
+        next_offset = end if end < total_items and end > offset else None
+        return cls(
+            checkout_path=str(getattr(result, "checkout_path")),
+            execution_mode=getattr(result, "execution_mode"),
+            dirty=bool(getattr(result, "dirty")),
+            requires_confirmation=bool(getattr(result, "requires_confirmation")),
+            blockers=tuple(str(blocker) for blocker in getattr(result, "blockers", ())),
+            total_items=total_items,
+            offset=offset,
+            limit=limit,
+            next_offset=next_offset,
+            items=items[offset:end],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        # A preflight page may contain 1,000 items.  Keep the general
+        # control-plane serializer bound while preserving this endpoint's
+        # explicit page limit.
+        payload = bounded_redacted(asdict(self))
+        payload["items"] = [item.to_dict() for item in self.items]
+        return payload
 
 
 @dataclass(frozen=True)
