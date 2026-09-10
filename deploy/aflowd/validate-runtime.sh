@@ -51,7 +51,7 @@ managed_projects_root=$(realpath -e -- "$managed_projects_root")
 registry_parent=$(dirname -- "$project_registry_path")
 [[ -d "$registry_parent" && ! -L "$registry_parent" ]] || fail "project registry parent must be a real directory"
 
-for entrypoint in aflow aflowd aflow-app-server; do
+for entrypoint in aflow aflow-app-server; do
   path="$release/bin/$entrypoint"
   [[ -f "$path" && ! -L "$path" && -x "$path" ]] || fail "release entrypoint is not a regular executable: $entrypoint"
 done

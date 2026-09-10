@@ -7,7 +7,6 @@ terminal connection.  The workflow controller remains the authority for its
 
 from __future__ import annotations
 
-import argparse
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 import fcntl
@@ -17,7 +16,6 @@ import math
 import os
 from pathlib import Path
 import re
-import signal
 import sys
 import tempfile
 from threading import Event, RLock
@@ -2382,41 +2380,6 @@ def _validate_worker_selection(
         or prepared.max_turns < 1
     ):
         raise DaemonError("daemon worker max_turns must be a positive integer")
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Run the durable AFlow lifecycle daemon."
-    )
-    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--aflow-executable", type=Path)
-    parser.add_argument("--environment-file", type=Path, required=True)
-    parser.add_argument("--release-identity")
-    parser.add_argument("--once", action="store_true")
-    args = parser.parse_args(argv)
-    executable = args.aflow_executable or Path(sys.argv[0]).resolve().with_name("aflow")
-    release_identity = args.release_identity or str(Path(executable).resolve())
-    daemon = AflowDaemon(
-        DaemonConfig(
-            repo_root=args.repo_root,
-            config_path=args.config,
-            aflow_executable=executable,
-            environment_file=args.environment_file,
-            release_identity=release_identity,
-        )
-    )
-    try:
-        daemon.start()
-    except Exception as exc:
-        print(f"aflowd: readiness failed: {exc}", file=sys.stderr)
-        return 1
-    if args.once:
-        return 0
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda _signum, _frame: daemon.request_shutdown())
-    daemon.serve_forever()
-    return 0
 
 
 def _resolve_configured_start_step(

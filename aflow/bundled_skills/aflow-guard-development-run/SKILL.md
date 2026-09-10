@@ -58,10 +58,11 @@ For this version, do not launch through MCP. Preserve the selected run's
 existing ownership:
 
 - `legacy`: direct `aflow run` controller, optionally attached to tmux;
-- `local-daemon`: lightweight `aflow daemon` worker owned by that daemon; or
+- `ui-server`: run owned by `aflow ui`/`aflow ui --daemon` persistent units
+  and observed through its advertised authenticated MCP endpoint; or
 - `aflowd`: production control-plane run owned by its exact systemd unit.
 
-Never add a tmux or CLI controller to either daemon-owned mode.
+Never add a tmux or CLI controller to either server-owned mode.
 
 ## Establish the guard
 
@@ -101,14 +102,15 @@ For a `legacy` run, run the snapshot:
 python3 <skill-dir>/scripts/aflow_guard_snapshot.py   --repo <guarded-repo>   --run-id <run-id>   --tmux-session <optional-session>   --thread-id <initiating-task-id>
 ```
 
-For a `local-daemon` run:
+For a `ui-server` run:
 
-1. Use `aflow daemon status --repo-root <guarded-repo>` to corroborate the
-   existing daemon and its directly owned worker.
-2. Use the daemon's already configured MCP transport for one `get_run`.
-   Never create a disposable stdio connection: closing stdin stops that daemon
-   and drains its workers.
-3. Do not report a web UI URL. The lightweight daemon has no REST or web UI.
+1. Use one authenticated `get_run` through the advertised `/mcp` or `/mcp/`
+   endpoint, and corroborate the UI ownership record or exact persistent unit
+   when host access is available.
+2. Never use browser cookies or create a disposable transport; MCP is
+   header-only and UI shutdown does not signal workflow workers.
+3. Report only the endpoint and run identity advertised by the selected UI
+   server; never guess a host, scheme, or port.
 
 For an `aflowd` run:
 

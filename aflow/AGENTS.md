@@ -15,6 +15,10 @@
   workflow process group and writes receipts under the run's durable
   `units/` directory; its `shutdown` contract with `PersistentUnitManager`
   is a no-op by design, so UI shutdown never signals workflow subprocesses.
+- `aflow/mcp_control_plane.py` owns the single transport-neutral registry of
+  14 MCP tools and three resource templates. The UI server mounts it at `/mcp`
+  and `/mcp/` with bearer-header authentication; no standalone MCP listener or
+  duplicate registry is maintained.
 - Run configuration is loaded from the current selected source at reservation,
   startup preparation, worker boot, and resume. Persist the source path and
   whether team, max-turn, and start-step choices were explicit. A

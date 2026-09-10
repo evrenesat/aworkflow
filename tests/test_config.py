@@ -9,54 +9,10 @@ from aflow.config import (
 )
 
 
-def test_daemon_config_defaults_and_valid_overrides(tmp_path: Path) -> None:
-    default_path = _write_config(tmp_path / "default", "")
-    defaults = load_workflow_config(default_path).daemon
-    assert defaults.mcp_transport == "stdio"
-    assert defaults.mcp_port == 8765
-    assert defaults.poll_interval_seconds == 1.0
-    assert defaults.stop_timeout_seconds == 30.0
-
-    configured_path = _write_config(
-        tmp_path / "configured",
-        '[daemon]\nmcp_transport = "http"\nmcp_port = 4321\n'
-        "poll_interval_seconds = 0.25\nstop_timeout_seconds = 0\n",
-    )
-    configured = load_workflow_config(configured_path).daemon
-    assert configured.mcp_transport == "http"
-    assert configured.mcp_port == 4321
-    assert configured.poll_interval_seconds == 0.25
-    assert configured.stop_timeout_seconds == 0.0
-
-
-@pytest.mark.parametrize(
-    "source",
-    (
-        '[daemon]\nmcp_transport = "socket"\n',
-        "[daemon]\nmcp_port = 0\n",
-        "[daemon]\nmcp_port = 65536\n",
-        "[daemon]\nmcp_port = true\n",
-        "[daemon]\npoll_interval_seconds = 0\n",
-        "[daemon]\npoll_interval_seconds = -1\n",
-        "[daemon]\npoll_interval_seconds = true\n",
-        "[daemon]\npoll_interval_seconds = nan\n",
-        "[daemon]\npoll_interval_seconds = inf\n",
-        "[daemon]\nstop_timeout_seconds = -0.1\n",
-        "[daemon]\nstop_timeout_seconds = true\n",
-        "[daemon]\nstop_timeout_seconds = nan\n",
-        "[daemon]\nstop_timeout_seconds = inf\n",
-        "[daemon]\nunknown = 1\n",
-    ),
-)
-def test_daemon_config_rejects_invalid_values(tmp_path: Path, source: str) -> None:
-    with pytest.raises(ConfigError):
-        load_workflow_config(_write_config(tmp_path, source))
-
-
-def test_daemon_config_survives_split_workflow_merge(tmp_path: Path) -> None:
+def test_normal_config_loading_preserves_defaults_and_split_workflows(tmp_path: Path) -> None:
     config_path = _write_config(
         tmp_path,
-        '[daemon]\nmcp_transport = "http"\nmcp_port = 9123\n\n'
+        '[aflow]\nkeep_runs = 7\n\n'
         '[harness.opencode.profiles.default]\nmodel = "test"\n\n'
         '[roles]\nworker = "opencode.default"\n\n'
         '[prompts]\nimplementation_prompt = "Implement."\n',
@@ -67,9 +23,29 @@ def test_daemon_config_survives_split_workflow_merge(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     merged = load_workflow_config(config_path)
-    assert merged.daemon.mcp_transport == "http"
-    assert merged.daemon.mcp_port == 9123
+    assert merged.aflow.keep_runs == 7
     assert "simple" in merged.workflows
+    assert not hasattr(merged, "daemon")
+
+
+def test_daemon_section_is_rejected_from_single_file(tmp_path: Path) -> None:
+    config_path = tmp_path / "aflow.toml"
+    config_path.write_text('[daemon]\nmcp_port = 9123\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unsupported top-level keys"):
+        load_workflow_config(config_path)
+
+
+def test_daemon_section_is_rejected_from_split_files(tmp_path: Path) -> None:
+    config_path, _workflows_path = _write_split_config(
+        tmp_path,
+        '[daemon]\nmcp_transport = "http"\n',
+        '[workflow.simple.steps.implement]\nrole = "worker"\n'
+        'prompts = ["implementation_prompt"]\ngo = [{ to = "END" }]\n',
+    )
+
+    with pytest.raises(ConfigError, match="unsupported top-level keys"):
+        load_workflow_config(config_path)
 
 
 @pytest.mark.parametrize(

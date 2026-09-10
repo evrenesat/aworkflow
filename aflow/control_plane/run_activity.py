@@ -5,12 +5,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from aflow.process_identity import process_birth_identity
 from .models import RunStatus
 
 
 def preparation_owner() -> dict:
-    from aflow.daemon_cli import _process_birth_identity
-    return {"schema_version": 1, "pid": os.getpid(), "birth": _process_birth_identity(os.getpid()), "host_boot": _host_boot()}
+    return {"schema_version": 1, "pid": os.getpid(), "birth": process_birth_identity(os.getpid()), "host_boot": _host_boot()}
 
 
 def _host_boot():
@@ -30,7 +30,6 @@ def _host_boot():
 
 
 def preparation_active(owner: object) -> bool | None:
-    from aflow.daemon_cli import _process_birth_identity
     if not isinstance(owner, dict) or owner.get("schema_version") != 1:
         return None
     if not owner.get("host_boot") or owner["host_boot"] != _host_boot():
@@ -38,7 +37,7 @@ def preparation_active(owner: object) -> bool | None:
     pid = owner.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1 or not owner.get("birth"):
         return None
-    birth = _process_birth_identity(pid)
+    birth = process_birth_identity(pid)
     return birth == owner["birth"] if birth is not None else None
 
 

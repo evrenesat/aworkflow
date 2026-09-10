@@ -217,7 +217,10 @@ runs across all registered projects. N defaults to 10 and is saved only under
 input-waiting runs count as ongoing. Visible views refresh every ten seconds,
 with partial/stale results labelled and each row linking to its exact run.
 
-The `/mcp` streamable HTTP endpoint exposes the same canonical operations and bearer policy. The lightweight `aflow daemon` exposes the shared MCP contract without the web app.
+The `/mcp` and `/mcp/` streamable HTTP endpoints expose the same canonical
+operations and bearer policy through the UI server. They share the REST
+control-plane service, and HTTP disconnects do not stop independently owned
+workflow workers.
 
 ## Development checks
 

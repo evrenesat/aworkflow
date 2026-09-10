@@ -99,9 +99,10 @@ def _mcp_request(
     params: dict[str, Any] | None = None,
     *,
     headers: dict[str, str] | None = None,
+    path: str = "/mcp",
 ) -> dict[str, Any]:
     response = client.post(
-        "/mcp",
+        path,
         headers=headers or MCP_HEADERS,
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
     )
@@ -243,6 +244,40 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     assert token_resource.status_code == 400
     assert token_resource.json() == {"detail": {"code": "token_payload_rejected"}}
     assert "super-secret-token" not in token_resource.text
+
+
+def test_mcp_trailing_slash_mount_supports_discovery_resource_read_and_header_auth(
+    mcp_client,
+) -> None:
+    client, _, _, _ = mcp_client
+    tools = _mcp_request(client, "tools/list", path="/mcp/")["result"]["tools"]
+    assert {tool["name"] for tool in tools} == EXPECTED_TOOL_NAMES
+
+    resources = _mcp_request(
+        client,
+        "resources/templates/list",
+        path="/mcp/",
+    )["result"]["resourceTemplates"]
+    assert len(resources) == 3
+
+    resource_uri = "aflow://projects/test-project/capabilities"
+    resource_read = _mcp_request(
+        client,
+        "resources/read",
+        {"uri": resource_uri},
+        path="/mcp/",
+    )
+    content = resource_read["result"]["contents"][0]
+    assert content["uri"] == resource_uri
+    assert content["text"]
+
+    unauthorized = client.post(
+        "/mcp/",
+        headers={**MCP_HEADERS, "Authorization": ""},
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    )
+    assert unauthorized.status_code == 401
+    assert unauthorized.json() == {"detail": {"code": "unauthorized"}}
 
 
 def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client) -> None:

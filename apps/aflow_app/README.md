@@ -4,6 +4,21 @@ A mobile-friendly workflow control interface for registered AFlow projects. It s
 
 The server sources also ship inside the published `aworkflow` wheel, where `aflow ui` serves them with bundled web assets and the shared global configuration. This subproject remains the development/test entry point. Full behavior and API details are in [Remote workflow control app](../../docs/remote-app.md).
 
+## MCP through the UI server
+
+The FastAPI application mounts the shared, authenticated MCP registry at both
+`/mcp` and `/mcp/`. Run `aflow ui` or `aflow ui --daemon`, then connect to the
+configured server URL plus one of those paths with an
+`Authorization: Bearer <token>` header. MCP does not accept the browser
+session cookie, URL credentials, or credentials in tool arguments. The
+[secret-free client template](server/aflow-control-plane.mcp.example.toml)
+uses an environment-backed token.
+
+The registry retains all 14 control-plane tools and three resource templates;
+the root [MCP documentation](../../README.md#use-mcp-through-the-ui-server)
+lists their purposes and write/idempotency rules. HTTP disconnects and UI
+shutdown do not signal independently owned workflow workers.
+
 ## Run history and settings
 
 All runs and project Runs offer Visible, Archived, and All history filters.

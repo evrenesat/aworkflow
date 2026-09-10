@@ -39,6 +39,8 @@ import time
 import uuid
 from typing import Mapping
 
+from aflow.process_identity import process_birth_identity
+
 from .units import UnitState, _ENVIRONMENT_NAME_RE, _environment_file_entries
 
 _UNIT_NAME_RE = re.compile(
@@ -118,9 +120,7 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _birth_identity(pid: int) -> str | None:
-    from aflow.daemon_cli import _process_birth_identity
-
-    return _process_birth_identity(pid)
+    return process_birth_identity(pid)
 
 
 def _process_alive(pid: int, birth: str) -> bool:

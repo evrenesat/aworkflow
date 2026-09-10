@@ -242,14 +242,13 @@ ENTRYPOINT
     chmod 0755 -- "$stage/bin/$name"
   }
   write_entrypoint aflow aflow.cli main
-  write_entrypoint aflowd aflow.daemon main
   write_entrypoint aflow-app-server aflow_app_server.main run_server
   render_template "$script_dir/aflow-app.toml" "$stage/config/config.toml"
   {
     printf 'source_commit=%s\n' "$commit"
     (
       cd "$stage"
-      sha256sum bin/aflow bin/aflowd bin/aflow-app-server config/config.toml src/apps/aflow_app/web/dist/index.html
+      sha256sum bin/aflow bin/aflow-app-server config/config.toml src/apps/aflow_app/web/dist/index.html
     )
   } >"$stage/release-manifest.sha256"
   mv -- "$stage" "$release_dir"

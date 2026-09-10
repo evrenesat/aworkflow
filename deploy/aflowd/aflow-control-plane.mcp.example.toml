@@ -1,3 +1,5 @@
+# The retained `aflowd.service` runs the UI/server application and exposes this
+# authenticated HTTP MCP mount through the private Tailscale Serve URL.
 # Copy only the configuration shape into ~/.codex/config.toml on the Mac.
 # Export AFLOW_CONTROL_PLANE_TOKEN through the OS secret store or launch
 # environment. Literal bearer tokens, query parameters, fragments, and userinfo

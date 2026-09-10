@@ -1,34 +1,21 @@
-# Checkpoint 1 review: lifecycle backup preflight
+# Checkpoint 4 review — cp4 v01
 
-Reviewed checkpoint/version: `cp1 v01` on
-`aflow-fix-lifecycle-backup-preflight-ci-20260910-20260910-124847`.
+Original and active plan: `plans/in-progress/remove-standalone-daemons-keep-ui-mcp-20260908.md`.
+Branch: `aflow-remove-standalone-daemons-keep-ui-mcp-20260908-20260910-131652`.
 
-The original and active plan are both
-`plans/in-progress/fix-lifecycle-backup-preflight-ci-20260910.md`.
-The review uses the current-worktree fallback: this plan has no checkpoint
-commit yet. The target is the immediately preceding worker's six-file diff
-against `0eda48f2bd03a0a9550a96b549680a09c8339fc6`, not older approved commits.
+Reviewed the immediately preceding worker turn-009's uncommitted checkpoint 4 slice against `7c9fa534fae05ce03fa1ca70d8485c6ca338cd72` (`cp3 v01`). Used the worktree fallback because no checkpoint 4 commit existed; earlier approved commits are not the review target. Branch matches the plan and the pre-handoff base remains reachable. Worker evidence was found under `/root/code/agent_flow/.aflow/runs/20260910t131651z-d1e1ee36/turns/turn-009/result.json`; displayed historical artifact lines were prefixed HISTORY:. Worker checkbox changes are authorized progress bookkeeping, not prior review approval.
 
-Scope: untracked lifecycle backup confirmation classification, consistent
-startup/lifecycle callers and merge boundary reuse, focused protection tests,
-branch-only startup/resume regression, and DEVLOG. Raw status/dirty evidence,
-tracked changes, rename endpoints, conflicts, Git operation blockers and
-inspection failures retain their existing handling. Responsive UI work is
-outside this review and was untouched.
+Scope: UI-server MCP documentation and explanatory module text, client-template comments, active guard guidance, trailing-slash MCP tests and actual background UI-server discovery. The broader documentation edits remove active recommendations for deleted commands and remain within checkpoint 4's audit requirement. No production executable behavior changes occur in this slice. All 14 tools including preflight_run, three resources, schemas, authentication, live configuration, UI controls and internal worker lifetimes remain intact. Reviewed adapter/main/UI composition and existing lifecycle, mutation, auth and ownership coverage. No UI layout changes are included.
 
-Verification performed independently in this review:
+Verification performed in this review:
 
-- Clean Git configuration and disposable HOME/config: 97 focused tests and
-  21 subtests passed.
-- Same isolation for the full suite: 1,779 tests and 219 subtests passed.
-- `uv run ruff check aflow apps/aflow_app/server/src` passed.
-- `git diff --check` passed.
+- Isolated HOME/config/cache server command from checkpoint 4: 60 tests passed.
+- Isolated HOME/config/cache root command from checkpoint 4 plus tests/test_docs.py and tests/test_guard_daemon_ownership.py: 436 tests and 136 subtests passed.
+- Required scoped Ruff command and git diff --check passed.
+- Scoped active-documentation search contains only removed-feature explanations and retained systemd/internal references. Accumulated diff scope was audited without reopening earlier approved checkpoints.
 
-Findings: none admitted by the material-code-review gate.
-Checkpoint 1 is approved; this review creates the `cp1 v01` approval commit
-and advances the original plan's review log. No fix overlay is required.
-Normal publication follows the approval commit under the standing grant.
-Exact-SHA CI and live deployment verification belong to the coordinator;
-local approval is not deployment evidence.
+Findings: none admitted by the material finding gate. No production code was edited by the reviewer. Rotated the previous review byte-for-byte and recorded original checkpoint 4 approval. Corrected the original plan's stale 13-tool acceptance count to its explicit 14-tool contract; no checkpoint scope changed.
+
+Checkpoint 4 approved through cp4 v01; the reviewer creates its approval commit in this turn. No fix plan is needed. The original plan stays in plans/in-progress for workflow-owned delivery bookkeeping. Publication, exact-SHA CI and live activation remain unverified and coordinator-owned; this is local checkpoint approval only.
 
 No material findings

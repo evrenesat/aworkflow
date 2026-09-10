@@ -26,6 +26,7 @@ import threading
 import time
 
 from aflow.installation import detect_installation
+from aflow.process_identity import process_birth_identity as _process_birth_identity
 from aflow.ui_assets import AssetBuildError, ensure_launch_assets
 
 UI_LOG_MAX_BYTES = 1_000_000
@@ -65,8 +66,6 @@ def _log_path() -> Path:
 
 def process_birth_identity(pid: int) -> str | None:
     """Stable process-birth identity, portable across Linux and macOS."""
-    from aflow.daemon_cli import _process_birth_identity
-
     return _process_birth_identity(pid)
 
 
