@@ -1,5 +1,49 @@
 # DEVLOG
 
+## 2026-09-10 — Stabilize hosted browser ordering and Dashboard CI Python (Checkpoint 1)
+
+- HISTORY: A controlled browser probe held the Restore fetch after the server
+  response and before the client acknowledgement. `RunDashboard.tsx` left
+  Delete enabled, allowed its confirmation to open, then unconditionally cleared
+  it when Restore settled; the output was Delete enabled and Confirm delete
+  visible/disabled before release, then hidden after release. This established a
+  reachable busy/confirmation ownership race.
+- History actions now remain unavailable during a history mutation, and Restore
+  cannot supersede an open confirmation. The browser journey retains the exact
+  archive disappearance, restore identity, explicit delete, deleted-record
+  reload, navigation, geometry, and revision/idempotency contracts while waiting
+  on observable settled state instead of fixed delays in the touched flow.
+- Live-control admission now uses retrying enabled/value predicates. Dashboard
+  CI retains root 3.11/3.12, runs the server on 3.12/3.13 with `UV_PYTHON`
+  pinned from the matrix, and fails before server tests if the executed minor
+  differs from the declared job.
+- Verification corrections were retained: the first hosted probe required a
+  fresh web build because `dist` was absent; the first browser pair exposed the
+  positional `wait_for_function` argument and then a stale bundle, both fixed
+  before rerunning. The component regression used the repository's native
+  `.disabled` assertion style after its unsupported matcher failed, and the
+  labeled YAML check corrected an initial shell-quoting-only validator failure;
+  the final shell-safe pass also used the workflow's actual `Build web app`
+  step name before passing.
+- HISTORY: The later Ubuntu WebKit evidence from CI `34523507986` (changelog
+  source `main884b899`) failed when workflow selection was followed immediately
+  by the Advanced options click and the extra-instructions control was absent.
+  The route matrix now waits for the exact selected workflow and the disclosure
+  `aria-expanded`/textarea visibility predicates. Chromium and WebKit each
+  passed all seven route-matrix cases, so the controlled evidence did not
+  justify a production disclosure change.
+- HISTORY: The original restore-ordering source and output remain in
+  `/root/code/evidence/aflow-dogfood-20260909/STATUS.md` and
+  `ci-be19c4f-failed.log`. The earlier 13-test WebKit invocation was mixed
+  engine coverage because both navigation tests hard-coded Chromium; both now
+  use the existing `AFLOW_TEST_BROWSER` selector and its Chromium-only
+  `--no-sandbox` behavior.
+- Final evidence: the rebuilt web assets passed; the explicit Chromium and
+  WebKit commands each ran all 13 selected tests with no skips, including both
+  navigation tests and the held restore/delete/reload path. Focused RunDashboard
+  85 tests, full web 316 tests, YAML matrix/interpreter checks, and
+  `git diff --check` also pass. `actionlint` was unavailable in the environment.
+
 ## 2026-09-10 — Complete receipt-backed plan delivery (Checkpoint 2)
 
 - Routed approved publication, CP1 lifecycle finalization, and any resulting

@@ -1,51 +1,30 @@
-# Checkpoint 2 review — approved
+# Checkpoint 1 review — 2026-09-10
 
-Reviewed checkpoint 2 repair and approved through `cp2 v01` on branch
-`aflow-automated-changelog-and-delivery-20260909-20260910-184255`.
-Current-worktree fallback after approved `cp1 v01` (`e7253ac`) was used because
-no checkpoint 2 commit boundary existed. Pre-Handoff Base HEAD `1153d35` remains
-reachable and the branch matches the original plan.
+Target: `cp1 v02` approval of “Make hosted actions and CI interpreter selection deterministic,” branch `aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923`.
 
-Original plan: `plans/in-progress/automated-changelog-and-delivery-20260909.md`.
-Active repair: `plans/in-progress/automated-changelog-and-delivery-20260909-cp01-v02.md`.
-Scope: read-only Settings Changelog, grouping/paging, draft retention, responsive
-header integration, tests and documentation. CP1 generator/cache evidence is
-reused. The supplied turn-009 result.json is absent at its worktree-relative path;
-review instead uses inspected current source and fresh independent verification.
+Reviewed the original plan and its stable `stabilize-hosted-browser-loading-and-ci-python-20260910-cp01-v01.md` overlay. Used current-worktree fallback: no implementation checkpoint commit exists; HEAD equals reachable Pre-Handoff Base HEAD `be19c4ffffef80b4a53c8644a6908f8807557315`. The six dirty implementation files and reviewer bookkeeping form the reviewed slice. No unrelated changes were included.
 
 ## Findings
 
-Zero material findings. The previous Save-action defect is corrected in hosted
-header slots and the fallback. Save/reload/install are absent on Changelog;
-General and Skills drafts and their single save owner survive navigation.
-Advanced TOML retains editing actions even with a retained Changelog tab.
-No production code was edited during review.
+Zero material findings. The prior engine-selection finding is resolved: both navigation launches now reuse the existing validated Chromium/WebKit selector. Exact assertions remain intact. Reviewed admission predicates, workflow selection/disclosure readiness, scroll/refresh settlement, archive/restore/delete/reload semantics, the minimal history busy/confirmation guard, component regression, and CI interpreter selection. No further production correction or broader test redesign is warranted by the evidence.
 
-## Verification
+## Evidence
 
-- Web suite: 19 suites / 322 tests passed. Production build passed.
-- Chromium and WebKit each collected and passed one real Changelog journey,
-  covering all seven required viewports in both themes; zero skipped journeys.
-- Inspected fresh Chromium light 320×568 and WebKit dark 1280×720 screenshots.
-  Browser assertions verify read-only actions, restored enabled Save and exact
-  General draft, paging, keyboard activation, document movement and chrome budgets.
-- Fresh sdist-built wheel and installed login smoke passed in isolated paths.
-  Wheel changelog JSON and compiled JS/CSS bytes match the reviewed build.
-  Artifact: `/tmp/changelog-review-package-wUIrxg/wheel/aworkflow-0.1.12-py3-none-any.whl`,
-  SHA256 prefix `1414ac167a8403aa`; build.log and smoke.log are in its parent directory.
-- Browser logs: `/tmp/changelog-review-chromium.log`, `/tmp/changelog-review-webkit.log`.
-  Screenshots: `/tmp/changelog-review-current-chromium/` and
-  `/tmp/changelog-review-current-webkit/`.
-- `git diff --check` passed. Physical keyboard remains unverified.
+Reviewer executed:
+- Web build: passed.
+- `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py apps/aflow_app/server/tests/test_run_navigation_browser.py`: 13 passed, no skips, 119.64 seconds.
+- Same command with `AFLOW_TEST_BROWSER=webkit`: 13 passed, no skips, 132.78 seconds.
+- YAML validation: root 3.11/3.12, Dashboard 3.12/3.13, both OSes, explicit UV_PYTHON, executed version assertion before server tests, build ordering and designated WebKit artifacts preserved. `actionlint` unavailable; actual GitHub execution remains separate evidence.
+- `git diff --check`: passed.
 
-## Decision and bookkeeping
+Reused unchanged frontend evidence: focused RunDashboard 85 passed and full web 316 passed. Browser runs emitted existing dependency deprecation warnings. No test failure or passing retry occurred in this reviewer pass.
 
-Checkpoint 2 approved through the reviewer-created `cp2 v01` commit. Original
-plan checkpoint 2 review state advances; Pre-Handoff Base HEAD stays unchanged.
-Original plan and all repair overlays retain their current filenames and existing
-ignored status for durable references. The previous latest review is archived
-byte-for-byte. No fix plan is needed. No squash or history rewrite occurs.
-Publication, exact-SHA CI, live activation and lifecycle bookkeeping remain
-coordinator-owned and pending; this approval does not claim delivery.
+The supplied worker result resolves beneath `/root/code/agent_flow/.aflow/runs/20260910t194922z-d0da40bf/turns/turn-003/result.json`, not this worktree. Causal probe source/output and frontend result summaries are retained in `plans/reviews/hosted-browser-cp1-ordering.txt`, with every historical line prefixed. Exact provenance is turn-001 `transport.stdout`, diagnostic source line 132, baseline output lines 141/146, observed ordering lines 142/147, frontend summaries lines 338/339. This is the precise probe provenance; DEVLOG's external STATUS/CI references provide incident context, not the full controlled probe source.
+
+## Disposition
+
+Checkpoint 1 approved through `cp1 v02`; reviewer creates its approval commit in this turn and advances only this checkpoint and its remaining verification step. Original base and stable overlay filename are preserved. Previous review rotated byte-for-byte. No new fix plan is required.
+
+Local checkpoint approval does not establish whole-plan delivery: coordinator integration, origin/main publication, exact-SHA CI and live desktop/mobile usability remain pending. No other worktree edits, services, shared tools, GitHub messages, squash or history rewrite.
 
 No material findings

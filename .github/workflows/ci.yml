@@ -56,6 +56,10 @@ jobs:
     name: Dashboard (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    # The dashboard server requires Python >=3.12; pin uv to the declared job
+    # interpreter so its environment cannot silently use another installed minor.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,8 +67,8 @@ jobs:
           - ubuntu-latest
           - macos-latest
         python-version:
-          - "3.11"
           - "3.12"
+          - "3.13"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -87,6 +91,11 @@ jobs:
       - name: Install server dependencies
         working-directory: apps/aflow_app/server
         run: uv sync --frozen --group dev
+
+      - name: Assert Dashboard Python matches matrix
+        working-directory: apps/aflow_app/server
+        run: |
+          uv run python -c 'import os, sys; expected = os.environ["UV_PYTHON"]; actual = f"{sys.version_info.major}.{sys.version_info.minor}"; assert actual == expected, f"Dashboard matrix {expected} selected Python {actual} ({sys.executable})"; print(f"Dashboard interpreter: Python {actual} ({sys.executable})")'
 
       - name: Install web dependencies
         working-directory: apps/aflow_app/web

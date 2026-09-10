@@ -1013,7 +1013,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     window.dispatchEvent(new Event('aflow-history-changed'))
   }
   async function mutateHistory(action: 'archive' | 'restore' | 'delete') {
-    if (!selectedRun) return
+    if (!selectedRun || busyAction === 'history') return
     const runId = selectedRun.run_id
     const identity = JSON.stringify([projectId, runId, action])
     const pending = historyIntents.current.get(identity) ?? { action, revision: selectedRun.history_revision ?? 0, key: requestKey('history'), acknowledged: acknowledgeActive }
@@ -2062,10 +2062,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   </div>
                   <span className="status-pill">{statusLabel(selectedRun)}</span>
                   {selectedRun.history_state === 'archived' && <span className="status-pill">Archived</span>}
-                  {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" onClick={() => void mutateHistory('restore')}>Restore</button>}
+                  {selectedRun.history_state === 'archived' && <button className="btn btn-secondary" disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => void mutateHistory('restore')}>Restore</button>}
                   <MoreMenu label="More run actions">
-                    {selectedRun.history_state !== 'archived' && <MenuItem onClick={() => { if (selectedRun.activity === 'active') { setHistoryConfirm('archive'); setAcknowledgeActive(false) } else void mutateHistory('archive') }}>Archive</MenuItem>}
-                    <MenuItem danger onClick={() => { setHistoryConfirm('delete'); setAcknowledgeActive(false) }}>Delete record…</MenuItem>
+                    {selectedRun.history_state !== 'archived' && <MenuItem disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => { if (selectedRun.activity === 'active') { setHistoryConfirm('archive'); setAcknowledgeActive(false) } else void mutateHistory('archive') }}>Archive</MenuItem>}
+                    <MenuItem danger disabled={busyAction === 'history' || historyConfirm !== null} onClick={() => { setHistoryConfirm('delete'); setAcknowledgeActive(false) }}>Delete record…</MenuItem>
                   </MoreMenu>
                 </div>
                 {historyConfirm && <div role="alertdialog" aria-label={`${historyConfirm} record ${selectedRun.run_id}`}>

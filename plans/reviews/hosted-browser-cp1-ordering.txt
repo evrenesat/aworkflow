@@ -1,0 +1,101 @@
+HISTORY: Historical restore probe evidence extracted by checkpoint reviewer.
+HISTORY: Source: /root/code/agent_flow/.aflow/runs/20260910t194922z-d0da40bf/turns/turn-001/transport.stdout
+HISTORY: The source diff below is the first diagnostic (Delete enabled while Restore is held).
+HISTORY: The subsequent probe completion and recorded observation establish confirmation clearing.
+HISTORY: The current committed browser/component regressions verify the repaired ordering.
+HISTORY: Transport line 132, item_67, command_execution
+HISTORY: /bin/bash -lc 'git diff -- apps/aflow_app/server/tests/test_run_navigation_browser.py'
+HISTORY: diff --git a/apps/aflow_app/server/tests/test_run_navigation_browser.py b/apps/aflow_app/server/tests/test_run_navigation_browser.py
+HISTORY: index 8e1310b..2287e1b 100644
+HISTORY: --- a/apps/aflow_app/server/tests/test_run_navigation_browser.py
+HISTORY: +++ b/apps/aflow_app/server/tests/test_run_navigation_browser.py
+HISTORY: @@ -31,6 +31,25 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
+HISTORY:          browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+HISTORY:          try:
+HISTORY:              page = browser.new_page(viewport={'width': 1365, 'height': 900})
+HISTORY: +            page.add_init_script("""
+HISTORY: +                (() => {
+HISTORY: +                    const nativeFetch = window.fetch.bind(window)
+HISTORY: +                    window.__restoreResponseHeld = false
+HISTORY: +                    window.__releaseRestoreResponse = null
+HISTORY: +                    window.fetch = async (input, init) => {
+HISTORY: +                        const response = await nativeFetch(input, init)
+HISTORY: +                        const requestUrl = typeof input === 'string' ? input : input.url
+HISTORY: +                        const method = init?.method ?? input?.method ?? 'GET'
+HISTORY: +                        if (method === 'POST' && new URL(requestUrl, window.location.href).pathname.endsWith('/restore')) {
+HISTORY: +                            window.__restoreResponseHeld = true
+HISTORY: +                            await new Promise(resolve => { window.__releaseRestoreResponse = resolve })
+HISTORY: +                            window.__restoreResponseHeld = false
+HISTORY: +                            window.__releaseRestoreResponse = null
+HISTORY: +                        }
+HISTORY: +                        return response
+HISTORY: +                    }
+HISTORY: +                })()
+HISTORY: +            """)
+HISTORY:              page.goto(url)
+HISTORY:              page.get_by_placeholder('Auth token').fill(TOKEN)
+HISTORY:              page.get_by_role('button', name='Login', exact=True).click()
+HISTORY: @@ -156,8 +175,14 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
+HISTORY:              page.get_by_role('button', name='Restore', exact=True).wait_for()
+HISTORY:              assert page.locator('.run-list-item').filter(has_text='history-069.md').count() == 0
+HISTORY:              page.get_by_role('button', name='Restore', exact=True).click()
+HISTORY: +            page.wait_for_function('window.__restoreResponseHeld === true')
+HISTORY:              page.get_by_role('button', name='More run actions').click()
+HISTORY: -            page.get_by_role('menuitem', name='Delete record…').click()
+HISTORY: +            delete_item = page.get_by_role('menuitem', name='Delete record…')
+HISTORY: +            assert delete_item.is_enabled()
+HISTORY: +            page.evaluate('window.__releaseRestoreResponse()')
+HISTORY: +            page.wait_for_function('window.__restoreResponseHeld === false')
+HISTORY: +            page.get_by_role('button', name='Restore', exact=True).wait_for(state='hidden')
+HISTORY: +            delete_item.click()
+HISTORY:              page.get_by_role('button', name='Confirm delete').click()
+HISTORY:              page.get_by_role('heading', name='Deleted record').wait_for()
+HISTORY:              page.reload()
+HISTORY: Transport line 141, item_72, command_execution
+HISTORY: /bin/bash -lc 'uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_run_navigation_browser.py::test_run_navigation_scroll_selection_and_history'
+HISTORY: .                                                                        [100%]
+HISTORY: =============================== warnings summary ===============================
+HISTORY: apps/aflow_app/server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+HISTORY:   /root/code/worktrees/aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923/apps/aflow_app/server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+HISTORY:     from starlette.testclient import TestClient as TestClient  # noqa
+HISTORY:
+HISTORY: tests/test_run_navigation_browser.py::test_run_navigation_scroll_selection_and_history
+HISTORY:   /root/code/worktrees/aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923/apps/aflow_app/server/.venv/lib/python3.12/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+HISTORY:     warnings.warn(  # deprecated in 14.0 - 2024-11-09
+HISTORY:
+HISTORY: tests/test_run_navigation_browser.py::test_run_navigation_scroll_selection_and_history
+HISTORY:   /root/code/worktrees/aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923/apps/aflow_app/server/.venv/lib/python3.12/site-packages/uvicorn/protocols/websockets/websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+HISTORY:     from websockets.server import WebSocketServerProtocol
+HISTORY:
+HISTORY: -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+HISTORY: 1 passed, 3 warnings in 13.25s
+HISTORY: Transport line 142, item_73, agent_message
+HISTORY: The held-response probe now reaches the intended boundary and passes its diagnostic assertion: while Restore’s response is held, the existing UI leaves “Delete record…” enabled. I’m tightening that probe to open the confirmation before releasing Restore, so the next result records the precise pre-fix behavior—Restore completion clearing an already-visible confirmation—rather than only showing that the menu was reachable.
+HISTORY: Transport line 146, item_75, command_execution
+HISTORY: /bin/bash -lc 'uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_run_navigation_browser.py::test_run_navigation_scroll_selection_and_history'
+HISTORY: .                                                                        [100%]
+HISTORY: =============================== warnings summary ===============================
+HISTORY: apps/aflow_app/server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+HISTORY:   /root/code/worktrees/aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923/apps/aflow_app/server/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+HISTORY:     from starlette.testclient import TestClient as TestClient  # noqa
+HISTORY:
+HISTORY: tests/test_run_navigation_browser.py::test_run_navigation_scroll_selection_and_history
+HISTORY:   /root/code/worktrees/aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923/apps/aflow_app/server/.venv/lib/python3.12/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+HISTORY:     warnings.warn(  # deprecated in 14.0 - 2024-11-09
+HISTORY:
+HISTORY: tests/test_run_navigation_browser.py::test_run_navigation_scroll_selection_and_history
+HISTORY:   /root/code/worktrees/aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923/apps/aflow_app/server/.venv/lib/python3.12/site-packages/uvicorn/protocols/websockets/websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+HISTORY:     from websockets.server import WebSocketServerProtocol
+HISTORY:
+HISTORY: -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+HISTORY: 1 passed, 3 warnings in 13.31s
+HISTORY: Transport line 147, item_76, agent_message
+HISTORY: The held-response diagnostic reproduced the real user-reachable race: the browser could open Delete while Restore was unresolved, the confirmation button was disabled by the shared busy state, and releasing Restore caused the existing completion handler to clear that confirmation. I’m now applying the scoped correction: history actions are unavailable during a history mutation, Restore cannot supersede an open confirmation, and the browser/component tests assert the settled boundary before exercising the unchanged explicit delete flow.
+HISTORY: Transport line 338, item_177, command_execution
+HISTORY: /bin/bash -lc 'npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx'
+HISTORY:  Test Files  1 passed (1)
+HISTORY:       Tests  85 passed (85)
+HISTORY: Transport line 339, item_178, command_execution
+HISTORY: /bin/bash -lc 'npm --prefix apps/aflow_app/web test -- --run'
+HISTORY:  Test Files  18 passed (18)
+HISTORY:       Tests  316 passed (316)

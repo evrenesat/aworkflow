@@ -448,6 +448,41 @@ describe('RunDashboard', () => {
     expect(api.changeRunHistory).toHaveBeenLastCalledWith('control-project', 'run-owned', 'restore', 1, expect.any(String), false)
   })
 
+  it('keeps destructive history unavailable while restore is pending', async () => {
+    const archived = { ...ownedRun, history_state: 'archived' as const, history_revision: 1 }
+    const restoreReady = deferred<{ state: 'visible'; revision: number }>()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [archived], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(archived)
+    vi.mocked(api.changeRunHistory).mockImplementation(async (_project, _run, action) => {
+      if (action === 'restore') return restoreReady.promise
+      return { state: 'deleted', revision: 3 }
+    })
+    renderDashboard()
+
+    const restore = await screen.findByRole('button', { name: 'Restore', exact: true })
+    fireEvent.click(restore)
+    await waitFor(() => expect(api.changeRunHistory).toHaveBeenCalledWith(
+      'control-project', 'run-owned', 'restore', 1, expect.any(String), false,
+    ))
+    expect((restore as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'More run actions' }))
+    const deleteItem = screen.getByRole('menuitem', { name: 'Delete record…' })
+    expect((deleteItem as HTMLButtonElement).disabled).toBe(true)
+
+    await act(async () => {
+      restoreReady.resolve({ state: 'visible', revision: 2 })
+      await restoreReady.promise
+    })
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Restore', exact: true })).toBeNull())
+    expect((deleteItem as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(deleteItem)
+    const confirm = screen.getByRole('button', { name: 'Confirm delete' })
+    expect((confirm as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(confirm)
+    await screen.findByRole('heading', { name: 'Deleted record' })
+  })
+
   it('renders the run overview with lineage, skipped steps, checkpoints, outcomes, and reconciliation evidence', async () => {
     const successorRun = { ...ownedRun, run_id: 'run-successor', restarted_from_run_id: 'run-owned', status: 'running' }
     const linkedSourceRun = { ...ownedRun, selected_start_step: 'implement', skipped_steps: ['plan'], restarted_from_run_id: 'run-source' }

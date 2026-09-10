@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page, expect, sync_playwright
 
 from aflow.control_plane.persistence import append_run_event
 from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
@@ -217,7 +217,16 @@ def _assert_document_moves(page: Page) -> None:
     page.evaluate("window.scrollTo(0, 0)")
     before = page.evaluate("() => document.scrollingElement.scrollTop")
     page.mouse.wheel(0, max(240, page.viewport_size["height"] // 2))
-    page.wait_for_timeout(50)
+    page.wait_for_function(
+        """({before, viewportHeight}) => {
+            const scrolling = document.scrollingElement
+            return Boolean(scrolling && (
+                scrolling.scrollTop > before
+                || scrolling.scrollHeight <= viewportHeight + 1
+            ))
+        }""",
+        arg={"before": before, "viewportHeight": page.viewport_size["height"]},
+    )
     after = page.evaluate("() => document.scrollingElement.scrollTop")
     height = page.evaluate("() => document.scrollingElement.scrollHeight")
     assert after > before or height <= page.viewport_size["height"] + 1, {
@@ -494,8 +503,13 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
             workflow.fill("managed")
             workflow.press("ArrowDown")
             workflow.press("Enter")
-            page.get_by_role("button", name="Advanced options", exact=True).click()
+            expect(workflow).to_have_value("Managed")
+            advanced = page.get_by_role("button", name="Advanced options", exact=True)
+            expect(advanced).to_be_visible()
+            advanced.click()
+            expect(advanced).to_have_attribute("aria-expanded", "true")
             extra = page.get_by_label("Run extra instructions", exact=True)
+            expect(extra).to_be_visible()
             extra.fill("Long launch instruction. " * 100)
             assert page.get_by_role("button", name="Start run", exact=True).is_visible()
             _assert_header_and_flow(page)
@@ -876,19 +890,20 @@ def test_responsive_live_controls_and_restart(
             control_max_turns = dashboard.get_by_label("Control max turns", exact=True)
             control_team = dashboard.get_by_label("Control team", exact=True)
             control_selector = dashboard.get_by_label("Selector for Worker", exact=True)
-            assert not control_max_turns.is_disabled()
-            assert not control_team.is_disabled()
-            assert not control_selector.is_disabled()
+            expect(control_max_turns).to_be_enabled()
+            expect(control_team).to_be_enabled()
+            expect(control_selector).to_be_enabled()
             control_team.locator("option[value='']").wait_for(state="attached")
             control_team.locator("option[value='fast_team']").wait_for(state="attached")
             control_team.locator("option[value='fast__team']").wait_for(state="attached")
-            assert control_team.locator("option[value='']").text_content() == "No team"
-            assert control_team.locator("option[value='fast_team']").text_content() == "Fast team (fast_team)"
-            assert control_team.locator("option[value='fast__team']").text_content() == "Fast team (fast__team)"
+            expect(control_team.locator("option[value='']")).to_have_text("No team")
+            expect(control_team.locator("option[value='fast_team']")).to_have_text("Fast team (fast_team)")
+            expect(control_team.locator("option[value='fast__team']")).to_have_text("Fast team (fast__team)")
             control_max_turns.fill("12")
             control_team.select_option("fast__team")
             control_selector.select_option("reasonix.new")
             save_controls = dashboard.get_by_role("button", name="Save run settings", exact=True)
+            expect(save_controls).to_be_enabled()
             _assert_action_hit_test(page, save_controls)
             save_controls.click()
             page.get_by_text("Safe controls recorded at revision 1", exact=False).wait_for()
@@ -901,6 +916,7 @@ def test_responsive_live_controls_and_restart(
             assert control_requests[0]["key"]
 
             control_max_turns.fill("13")
+            expect(save_controls).to_be_enabled()
             save_controls.click()
             page.get_by_role("alert").filter(has_text="responsive fixture rejected this control draft").wait_for()
             assert control_max_turns.input_value() == "13"
@@ -968,14 +984,7 @@ def test_responsive_live_controls_and_restart(
             assert dirty_ack.is_checked()
             confirm = dashboard.get_by_role("button", name="Confirm stop and start successor", exact=True)
             confirm.wait_for(state="visible")
-            page.wait_for_function(
-                """() => {
-                    const button = document.querySelector('.confirmation button')
-                    return Boolean(button && !button.disabled && (
-                        button.offsetWidth || button.offsetHeight || button.getClientRects().length
-                    ))
-                }""",
-            )
+            expect(confirm).to_be_enabled()
             assert not confirm.is_disabled()
             confirm.click()
             page.get_by_role("button", name="Retry exact successor request", exact=True).wait_for()

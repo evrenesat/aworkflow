@@ -1,8 +1,9 @@
 """Real run navigation uses disposable history records, never workflow launches."""
 import json
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
+from test_responsive_browser import _browser
 from test_settings_browser import document_metrics
 
 
@@ -19,6 +20,24 @@ def refresh_from_header(page) -> None:
     page.get_by_role('menuitem', name='Refresh', exact=True).click()
 
 
+def wait_for_refresh_settled(page) -> None:
+    page.get_by_role('button', name='More', exact=True).click()
+    expect(page.get_by_role('menuitem', name='Refresh', exact=True)).to_be_enabled()
+    page.get_by_role('button', name='More', exact=True).click()
+
+
+def wait_for_restored_document_scroll(page, top: float) -> None:
+    page.wait_for_function(
+        """(top) => {
+            const scrolling = document.scrollingElement
+            if (!scrolling) return false
+            const target = Math.min(top, Math.max(0, scrolling.scrollHeight - innerHeight))
+            return Math.abs(scrolling.scrollTop - target) <= 2
+        }""",
+        arg=top,
+    )
+
+
 def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch):
     _, root, _, _ = control_client
     for index in range(130):
@@ -28,9 +47,28 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
     dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
     monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
     with live_server() as url, sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+        browser = _browser(playwright)
         try:
             page = browser.new_page(viewport={'width': 1365, 'height': 900})
+            page.add_init_script("""
+                (() => {
+                    const nativeFetch = window.fetch.bind(window)
+                    window.__restoreResponseHeld = false
+                    window.__releaseRestoreResponse = null
+                    window.fetch = async (input, init) => {
+                        const response = await nativeFetch(input, init)
+                        const requestUrl = typeof input === 'string' ? input : input.url
+                        const method = init?.method ?? input?.method ?? 'GET'
+                        if (method === 'POST' && new URL(requestUrl, window.location.href).pathname.endsWith('/restore')) {
+                            window.__restoreResponseHeld = true
+                            await new Promise(resolve => { window.__releaseRestoreResponse = resolve })
+                            window.__restoreResponseHeld = false
+                            window.__releaseRestoreResponse = null
+                        }
+                        return response
+                    }
+                })()
+            """)
             page.goto(url)
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
@@ -75,7 +113,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == item_id
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
             nav.wait_for(state='visible')
-            page.wait_for_timeout(50)
+            wait_for_restored_document_scroll(page, before_list_scroll)
             restored_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
             assert abs(restored_scroll - min(before_list_scroll, page.evaluate('(top) => Math.min(top, Math.max(0, document.scrollingElement.scrollHeight - innerHeight))', before_list_scroll))) <= 2
             assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
@@ -122,7 +160,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                     # first scroll its off-screen trigger into view on compact
                     # stacked layouts.
                     refresh_from_header(page)
-                    page.wait_for_timeout(250)
+                    wait_for_refresh_settled(page)
                     assert page.locator('.run-list-item').count() == 130
                     refreshed = document_metrics(page)
                     if width >= 960 and height >= 600:
@@ -132,7 +170,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         if compact:
                             page.get_by_role('button', name='← Back to Run history', exact=True).click()
                             nav.wait_for(state='visible')
-                            page.wait_for_timeout(50)
+                            wait_for_restored_document_scroll(page, before_list_scroll)
                             after_back_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                         restored_target = page.evaluate(
                             '(top) => Math.min(top, Math.max(0, document.scrollingElement.scrollHeight - innerHeight))',
@@ -156,9 +194,18 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             page.get_by_role('button', name='Restore', exact=True).wait_for()
             assert page.locator('.run-list-item').filter(has_text='history-069.md').count() == 0
             page.get_by_role('button', name='Restore', exact=True).click()
+            page.wait_for_function('window.__restoreResponseHeld === true')
             page.get_by_role('button', name='More run actions').click()
-            page.get_by_role('menuitem', name='Delete record…').click()
-            page.get_by_role('button', name='Confirm delete').click()
+            delete_item = page.get_by_role('menuitem', name='Delete record…')
+            expect(delete_item).to_be_disabled()
+            page.evaluate('window.__releaseRestoreResponse()')
+            page.wait_for_function('window.__restoreResponseHeld === false')
+            expect(page.get_by_role('button', name='Restore', exact=True)).to_be_hidden()
+            expect(delete_item).to_be_enabled()
+            delete_item.click()
+            confirm_delete = page.get_by_role('button', name='Confirm delete')
+            expect(confirm_delete).to_be_enabled()
+            confirm_delete.click()
             page.get_by_role('heading', name='Deleted record').wait_for()
             page.reload()
             page.get_by_role('heading', name='Deleted record').wait_for()
@@ -228,7 +275,7 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
         ), layouts
 
     with live_server() as url, sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=['--no-sandbox'])
+        browser = _browser(playwright)
         try:
             page = browser.new_page(viewport={'width': 320, 'height': 844})
             page.goto(url)
