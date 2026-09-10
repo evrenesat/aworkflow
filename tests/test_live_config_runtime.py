@@ -9,8 +9,10 @@ from pathlib import Path
 import pytest
 
 from aflow.config import load_workflow_config
+from aflow.hotplug import HANDOVER_HEADINGS
 from aflow.harnesses.base import HarnessInvocation
 from aflow.harnesses.codex import CodexAdapter
+from aflow.harnesses.session import SessionCapabilities, SessionResult
 from aflow.run_state import ControllerConfig, resolve_resume_override
 from aflow.workflow import WorkflowError, run_workflow
 from tests._support import _BROKEN_PLAN, _COMPLETE_PLAN, _VALID_PLAN, _write_plan, _write_split_config
@@ -52,11 +54,46 @@ class RecordingAdapter:
         )
 
 
+class RecordingSessionDriver:
+    capabilities = SessionCapabilities(
+        session_identity=True,
+        followup_turn=True,
+        resume_with_model=True,
+    )
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    def build_invocation(self, request):
+        self.requests.append(request)
+        return HarnessInvocation(
+            label="synthetic-session",
+            argv=("synthetic-session", str(len(self.requests))),
+            env={},
+            prompt_mode="synthetic-session",
+            system_prompt=request.system_prompt,
+            user_prompt=request.user_prompt,
+            effective_prompt=f"{request.system_prompt}\n\n{request.user_prompt}",
+        )
+
+    def parse_result(self, request, stdout, *, returncode=0):
+        del stdout, returncode
+        return SessionResult(
+            session_id=request.session_id or "session-1",
+            selector=request.selector,
+            model=request.model,
+            effort=request.effort,
+            final_output="DONE" if len(self.requests) > 1 else "continue",
+            capabilities=self.capabilities,
+        )
+
+
 def _live_config(
     *,
     max_turns: int = 3,
     team: str = "base",
     model: str = "model-base",
+    effort: str | None = None,
     prompt: str = "old prompt {ACTIVE_PLAN_PATH}",
     future_prompt: str | None = None,
     retry_limit: int = 0,
@@ -69,6 +106,7 @@ def _live_config(
         if include_new_profile
         else ""
     )
+    effort_line = f'effort = "{effort}"\n' if effort is not None else ""
     return f'''\
 [aflow]
 default_workflow = "live"
@@ -77,7 +115,7 @@ retry_inconsistent_checkpoint_state = {retry_limit}
 
 [harness.codex.profiles.base]
 model = "{model}"
-{new_profile}
+{effort_line}{new_profile}
 [harness.codex.profiles.updated]
 model = "model-updated"
 
@@ -129,6 +167,92 @@ go = [{{ to = "END", when = "DONE" }}, {{ to = "{next_target}" }}]
 {future}
 {added}
 '''
+
+
+def _managed_live_config(
+    *,
+    manager_model: str = "manager-old",
+    full_after_stalled_turns: int = 99,
+) -> str:
+    return f'''\
+[aflow]
+default_workflow = "live"
+max_turns = 3
+
+[harness.codex.profiles.worker]
+model = "worker"
+
+[harness.codex.profiles.manager_lite]
+model = "{manager_model}"
+
+[harness.codex.profiles.manager_full]
+model = "manager-full"
+
+[roles]
+worker = "codex.worker"
+manager_lite = "codex.manager_lite"
+manager_full = "codex.manager_full"
+
+[teams.base]
+worker = "codex.worker"
+
+[manager]
+lite_role = "manager_lite"
+full_role = "manager_full"
+full_after_stalled_turns = {full_after_stalled_turns}
+
+[prompts]
+p = "Work from {{ACTIVE_PLAN_PATH}}."
+'''
+
+
+_MANAGED_LIVE_WORKFLOWS = '''\
+[workflow.live]
+team = "base"
+manager_enabled = true
+
+[workflow.live.steps.work]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "END", when = "DONE" }, { to = "work" }]
+'''
+
+
+def _cross_harness_live_config(*, target: bool, retry_limit: int = 0) -> str:
+    if target:
+        harnesses = (
+            '[harness.reasonix.profiles.new]\n'
+            'model = "reasonix-new"\n'
+            'effort = "high"\n'
+        )
+        selector = "reasonix.new"
+    else:
+        harnesses = '[harness.codex.profiles.base]\nmodel = "codex-base"\n'
+        selector = "codex.base"
+    return f'''\
+[aflow]
+default_workflow = "live"
+max_turns = 2
+retry_inconsistent_checkpoint_state = {retry_limit}
+
+{harnesses}
+[roles]
+worker = "{selector}"
+
+[teams.base]
+worker = "{selector}"
+
+[prompts]
+p = "Live worker prompt {{ACTIVE_PLAN_PATH}}."
+future = "Live follow-up prompt {{ACTIVE_PLAN_PATH}}."
+'''
+
+
+def _live_handover() -> str:
+    return "\n".join(
+        f"## {heading}\n- bounded operational evidence"
+        for heading in HANDOVER_HEADINGS
+    )
 
 
 def _make_live_source(
@@ -248,6 +372,223 @@ def test_live_defaults_and_turn_inputs_refresh_at_the_loop_edge(tmp_path: Path) 
     ]
     assert "old prompt" in str(adapter.invocations[0]["user_prompt"])
     assert "new prompt" in str(adapter.invocations[1]["user_prompt"])
+
+
+def test_live_profile_edit_updates_model_effort_prompt_and_reuses_session(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    config_path, _ = _make_live_source(tmp_path, max_turns=2)
+    adapter = RecordingAdapter()
+    driver = RecordingSessionDriver()
+    calls = 0
+
+    def runner(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            config_path.write_text(
+                _live_config(
+                    max_turns=2,
+                    model="model-edited",
+                    effort="high",
+                    prompt="edited prompt {ACTIVE_PLAN_PATH}",
+                ),
+                encoding="utf-8",
+            )
+        else:
+            _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    result = _run_live(
+        config_path,
+        plan_path,
+        adapter,
+        runner,
+        max_turns=2,
+        session_driver=driver,
+    )
+
+    assert result.final_snapshot.is_complete
+    assert len(driver.requests) == 2
+    assert driver.requests[0].session_id is None
+    assert driver.requests[1].session_id == "session-1"
+    assert driver.requests[1].model == "model-edited"
+    assert driver.requests[1].effort == "high"
+    assert "edited prompt" in driver.requests[1].user_prompt
+    assert "old prompt" not in driver.requests[1].user_prompt
+
+
+@pytest.mark.parametrize("retry", [False, True], ids=("normal", "pending-retry"))
+def test_live_mapping_change_hands_over_from_captured_source_session(
+    tmp_path: Path,
+    retry: bool,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    config_path, _ = _write_split_config(
+        tmp_path / "config",
+        _cross_harness_live_config(target=False, retry_limit=int(retry)),
+        _live_workflows(),
+    )
+
+    class SourceDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True,
+            followup_turn=True,
+            read_only_teardown=True,
+        )
+
+        def __init__(self) -> None:
+            self.handovers = 0
+
+        def handover(self, request, prompt):
+            del request, prompt
+            self.handovers += 1
+            return _live_handover()
+
+    class TargetDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True,
+            followup_turn=True,
+            resume_with_model=True,
+            idempotent_turn_start=True,
+        )
+
+        def __init__(self) -> None:
+            self.requests = []
+            self.turns = 0
+
+        def build_invocation(self, request):
+            self.requests.append(request)
+            return HarnessInvocation(
+                label="synthetic-target",
+                argv=("synthetic-target", str(len(self.requests))),
+                env={},
+                prompt_mode="synthetic-session",
+                system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt,
+                effective_prompt=request.user_prompt,
+            )
+
+        def parse_result(self, request, stdout, *, returncode=0):
+            del stdout, returncode
+            self.turns += 1
+            return SessionResult(
+                session_id=f"target-{self.turns}",
+                selector=request.selector,
+                model=request.model,
+                effort=request.effort,
+                final_output="continue" if self.turns == 1 else "DONE",
+                idempotency_key=request.idempotency_key,
+                capabilities=self.capabilities,
+            )
+
+    source_driver = SourceDriver()
+    target_driver = TargetDriver()
+    calls = 0
+
+    def runner(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            config_path.write_text(
+                _cross_harness_live_config(target=True, retry_limit=int(retry)),
+                encoding="utf-8",
+            )
+            if retry:
+                _write_plan(plan_path, _BROKEN_PLAN)
+        else:
+            _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    result = run_workflow(
+        _run_config(config_path, plan_path, max_turns=2),
+        load_workflow_config(config_path),
+        "live",
+        config_dir=config_path,
+        snapshot_config=False,
+        adapter=CodexAdapter(),
+        runner=runner,
+        session_driver=target_driver,
+        source_session_driver=source_driver,
+    )
+
+    assert result.final_snapshot.is_complete
+    assert calls == 2
+    assert source_driver.handovers == 1
+    assert len(target_driver.requests) == 3  # initial turn, target preflight, target turn
+    assert target_driver.requests[0].selector == "codex.base"
+    assert target_driver.requests[1].selector == "reasonix.new"
+    assert target_driver.requests[2].selector == "reasonix.new"
+    assert target_driver.requests[2].model == "reasonix-new"
+    assert target_driver.requests[2].effort == "high"
+    assert "Source worker handover:" in target_driver.requests[2].user_prompt
+    payload = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert len(payload["hotplug_history"]) == 1
+    transaction = payload["hotplug_history"][0]
+    assert transaction["stage"] == "applied"
+    assert transaction["source_selector"] == "codex.base"
+    assert transaction["source_harness"] == "codex"
+    assert transaction["target_selector"] == "reasonix.new"
+    assert transaction["target_harness"] == "reasonix"
+    assert transaction["target_model_display"] == "reasonix / reasonix-new / high"
+
+
+def test_live_manager_profile_refresh_preserves_decision_history(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    config_path, _ = _write_split_config(
+        tmp_path / "config",
+        _managed_live_config(),
+        _MANAGED_LIVE_WORKFLOWS,
+    )
+    manager_models: list[str] = []
+    worker_calls = 0
+
+    manager_decision = json.dumps({
+        "schema_version": 1,
+        "action": "continue",
+        "reason": "Synthetic manager continuation.",
+        "next_step_notes": [],
+        "stop_report": None,
+    })
+
+    def runner(argv, **kwargs):
+        nonlocal worker_calls
+        model = argv[argv.index("--model") + 1]
+        if model.startswith("manager"):
+            manager_models.append(model)
+            if len(manager_models) == 1:
+                config_path.write_text(
+                    _managed_live_config(manager_model="manager-new"),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(argv, 0, manager_decision, "")
+
+        worker_calls += 1
+        if worker_calls == 2:
+            _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "worker output", "")
+
+    result = run_workflow(
+        _run_config(config_path, plan_path, max_turns=3),
+        load_workflow_config(config_path),
+        "live",
+        config_dir=config_path,
+        snapshot_config=False,
+        adapter=CodexAdapter(),
+        runner=runner,
+    )
+
+    assert result.final_snapshot.is_complete
+    assert manager_models == ["manager-old", "manager-new"]
+    payload = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert payload["manager_decision_number"] == 2
+    assert [item["decision_number"] for item in payload["manager_history"]] == [1, 2]
 
 
 def test_partial_overrides_retain_choices_and_consume_notes_once(
@@ -724,6 +1065,53 @@ def test_new_profile_in_current_config_can_be_selected_by_boundary_override(
     )
 
     assert any("model-new" in argument for argument in invocations[1])
+
+
+def test_effectively_unchanged_selector_alias_reuses_session_without_hotplug(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    config_path, _ = _make_live_source(tmp_path, max_turns=2)
+    adapter = RecordingAdapter()
+    driver = RecordingSessionDriver()
+    calls = 0
+
+    def runner(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            config_path.write_text(
+                _live_config(max_turns=2)
+                + '\n[harness.codex.profiles.alias]\nmodel = "model-base"\n',
+                encoding="utf-8",
+            )
+            run_dir = max(
+                (config_path.parents[3] / ".aflow" / "runs").iterdir(),
+                key=lambda path: path.stat().st_mtime_ns,
+            )
+            (run_dir / "overrides.toml").write_text(
+                '[roles]\nworker = "codex.alias"\n',
+                encoding="utf-8",
+            )
+        else:
+            _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
+
+    result = _run_live(
+        config_path,
+        plan_path,
+        adapter,
+        runner,
+        max_turns=2,
+        session_driver=driver,
+    )
+
+    assert result.final_snapshot.is_complete
+    assert driver.requests[1].selector == "codex.alias"
+    assert driver.requests[1].session_id == "session-1"
+    payload = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert payload["hotplug_history"] == []
 
 
 def test_invalid_new_override_is_nonfatal_and_preserves_last_accepted_choice(

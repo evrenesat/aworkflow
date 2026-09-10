@@ -949,6 +949,121 @@ def test_cross_harness_run_handles_success_and_hotplug_observer_failure(
     ]
 
 
+def test_resume_handover_ready_reuses_captured_source_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predecessor = tmp_path / ".aflow" / "runs" / "predecessor"
+    predecessor.mkdir(parents=True)
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n", encoding="utf-8")
+    transaction = make_transaction("handover_ready")
+    source_session = HarnessSessionRefV1(
+        session_id="reasonix-source",
+        role="worker",
+        selector=transaction.source_selector,
+        harness=transaction.source_harness,
+        profile=transaction.source_profile,
+        model_display=transaction.source_model_display,
+    )
+    refs, hashes = write_handover_artifacts(
+        predecessor,
+        transaction.transaction_number,
+        build_handover_context_v1(transaction, {"plan_state": {"checkpoint": 1}}),
+        _valid_handover(),
+        {"plan_state": {"checkpoint": 1}},
+    )
+    transaction = replace(
+        transaction,
+        source_session=source_session,
+        artifact_paths=refs,
+        artifact_hashes=hashes,
+    )
+    resume = ResumeContext(
+        resumed_from_run_id="predecessor",
+        feature_branch=None,
+        worktree_path=None,
+        main_branch=None,
+        setup=(),
+        teardown=(),
+        interrupted_step_name="implement",
+        role_selectors={"worker": transaction.target_selector},
+        current_hotplug_transaction=transaction,
+        pending_hotplug_transaction=transaction,
+        active_role_sessions=(source_session,),
+        hotplug_transaction_number=transaction.transaction_number,
+    )
+
+    class SourceDriver:
+        # A ready transaction must not need the source driver again.
+        capabilities = SessionCapabilities()
+
+    class TargetDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True,
+            idempotent_turn_start=True,
+        )
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def build_invocation(self, request):
+            self.prompts.append(request.user_prompt)
+            return HarnessInvocation(
+                label="synthetic-target",
+                argv=("synthetic-target",),
+                env={},
+                prompt_mode="synthetic",
+                system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt,
+                effective_prompt=request.user_prompt,
+            )
+
+        def parse_result(self, request, stdout, *, returncode=0):
+            del stdout, returncode
+            return SessionResult(
+                session_id="codex-target",
+                selector=request.selector,
+                model=request.model,
+                effort=request.effort,
+                final_output="DONE",
+                capabilities=self.capabilities,
+            )
+
+    source_driver = SourceDriver()
+    target_driver = TargetDriver()
+
+    def fake_run_process(invocation, *args, **kwargs):
+        del args, kwargs
+        plan.write_text(
+            "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(invocation.argv, 0, "wire", "")
+
+    monkeypatch.setattr("aflow.workflow._run_process", fake_run_process)
+
+    result = run_workflow(
+        ControllerConfig(repo_root=tmp_path, plan_path=plan, max_turns=1),
+        _controller_config(),
+        "live",
+        config_dir=tmp_path,
+        snapshot_config=False,
+        adapter=CodexAdapter(),
+        session_driver=target_driver,
+        source_session_driver=source_driver,
+        resume=resume,
+        preflight_probe=NoOpHarnessPreflightProbe(),
+    )
+
+    assert result.final_snapshot.is_complete
+    assert len(target_driver.prompts) == 2  # target preflight plus the turn
+    assert "Source worker handover:" in target_driver.prompts[-1]
+    assert (result.run_dir / refs[0]).read_text(encoding="utf-8").rstrip() == _valid_handover()
+    state = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert state["hotplug_history"][-1]["stage"] == "applied"
+
+
 def test_cross_harness_target_failure_restores_source_session_active(tmp_path: Path) -> None:
     transaction = make_transaction("accepted")
     source = HarnessSessionRefV1(

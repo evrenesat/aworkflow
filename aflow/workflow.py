@@ -109,6 +109,7 @@ from .hotplug import (
     build_handover_context_v1, render_handover_prompt, validate_handover_output,
     workspace_fingerprint, write_handover_artifacts, hotplug_transaction_id,
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
+    safe_hotplug_artifact_path, validate_hotplug_resume_artifacts,
 )
 from .harnesses.session import SessionDriver, SessionRequest, SessionResult
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, RunPaths, write_turn_artifacts_start
@@ -351,7 +352,7 @@ def _manager_repo_fingerprint(
     return head.strip(), status, tuple(plan_hashes)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ManagerCallExecutor:
     workflow_config: WorkflowUserConfig
     workflow_name: str
@@ -365,6 +366,16 @@ class _ManagerCallExecutor:
     banner: BannerRenderer
     adapter: HarnessAdapter | None
     preflight_or_fail: Callable[..., None]
+
+    def refresh_configuration(
+        self,
+        workflow_config: WorkflowUserConfig,
+        *,
+        max_turns: int,
+    ) -> None:
+        """Replace live configuration without resetting manager state."""
+        self.workflow_config = workflow_config
+        self.max_turns = max_turns
 
     def run(
         self,
@@ -893,7 +904,7 @@ class _ManagerCallExecutor:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RepartitionCycleExecutor:
     workflow_config: WorkflowUserConfig
     state: ControllerState
@@ -903,6 +914,10 @@ class _RepartitionCycleExecutor:
     persist_repartition: Callable[[PendingRepartitionV1], None]
     prepare_repartition_invocation: Callable[..., HarnessInvocation]
     invoke_repartition_full: Callable[..., tuple[str, str, str | None]]
+
+    def refresh_configuration(self, workflow_config: WorkflowUserConfig) -> None:
+        """Use the current manager/repartition settings for the next call."""
+        self.workflow_config = workflow_config
 
     def run(
         self,
@@ -1421,7 +1436,7 @@ def _persist_pending_repartition(
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RepartitionApplicationCoordinator:
     workflow_config: WorkflowUserConfig
     workflow: WorkflowConfig
@@ -1431,6 +1446,15 @@ class _RepartitionApplicationCoordinator:
     execution_context: ExecutionContext | None
     observer: ExecutionObserver | None
     run_metadata: RunMetadataWriter
+
+    def refresh_configuration(
+        self,
+        workflow_config: WorkflowUserConfig,
+        workflow: WorkflowConfig,
+    ) -> None:
+        """Refresh routing validation while retaining pending transaction state."""
+        self.workflow_config = workflow_config
+        self.workflow = workflow
 
     def run(
         self,
@@ -1745,7 +1769,7 @@ def _manager_level_for_boundary(
         return "full"
     return "lite"
 
-@dataclass(frozen=True)
+@dataclass
 class _ManagerGateCoordinator:
     workflow_config: WorkflowUserConfig
     workflow: WorkflowConfig
@@ -1758,6 +1782,18 @@ class _ManagerGateCoordinator:
     fail_manager_gate: Callable[..., NoReturn]
     run_repartition_cycle: Callable[..., None]
     apply_pending_repartition: Callable[[], None]
+
+    def refresh_configuration(
+        self,
+        workflow_config: WorkflowUserConfig,
+        workflow: WorkflowConfig,
+        *,
+        max_turns: int,
+    ) -> None:
+        """Refresh manager policy and graph without touching controller history."""
+        self.workflow_config = workflow_config
+        self.workflow = workflow
+        self.max_turns = max_turns
 
     def run(
         self,
@@ -6192,10 +6228,6 @@ def run_workflow(
             transaction = transactions[0]
             if runner is None:
                 try:
-                    source_profile = resolve_profile(
-                        transaction.source_selector, workflow_config,
-                        step_path="resume.hotplug.source",
-                    )
                     target_profile = resolve_profile(
                         transaction.target_selector, workflow_config,
                         step_path="resume.hotplug.target",
@@ -6204,11 +6236,35 @@ def run_workflow(
                     raise WorkflowError(
                         f"resume hotplug configuration drift: {exc}"
                     ) from exc
+                source_profile = None
+                try:
+                    source_profile = resolve_profile(
+                        transaction.source_selector, workflow_config,
+                        step_path="resume.hotplug.source",
+                    )
+                except WorkflowError as exc:
+                    # The source session and its harness/profile identity are
+                    # durable execution facts.  A deleted source catalog
+                    # entry must not discard the source needed to complete a
+                    # handover; the target still has to resolve live below.
+                    message = str(exc)
+                    if (
+                        "references unknown harness" not in message
+                        and "references unknown profile" not in message
+                    ):
+                        raise WorkflowError(
+                            f"resume hotplug configuration drift: {exc}"
+                        ) from exc
                 if (
-                    source_profile.harness_name != transaction.source_harness
-                    or source_profile.profile_name != transaction.source_profile
-                    or target_profile.harness_name != transaction.target_harness
+                    target_profile.harness_name != transaction.target_harness
                     or target_profile.profile_name != transaction.target_profile
+                    or (
+                        source_profile is not None
+                        and (
+                            source_profile.harness_name != transaction.source_harness
+                            or source_profile.profile_name != transaction.source_profile
+                        )
+                    )
                 ):
                     raise WorkflowError(
                         "resume hotplug configuration drift: transaction selector "
@@ -8452,6 +8508,24 @@ def run_workflow(
         apply_pending_repartition=_apply_pending_repartition,
     )
 
+    def _refresh_live_supervision_consumers() -> None:
+        """Point cached supervisors at the current boundary configuration."""
+        manager_max_turns = state.effective_max_turns or config.max_turns
+        manager_call_executor.refresh_configuration(
+            workflow_config,
+            max_turns=manager_max_turns,
+        )
+        repartition_cycle_executor.refresh_configuration(workflow_config)
+        repartition_application_coordinator.refresh_configuration(
+            workflow_config,
+            wf,
+        )
+        manager_gate_coordinator.refresh_configuration(
+            workflow_config,
+            wf,
+            max_turns=manager_max_turns,
+        )
+
     def _manager_terminal_incident(
         *,
         trigger: str,
@@ -9047,6 +9121,118 @@ def run_workflow(
             new_plan_path=new_plan_path,
         )
 
+    def _build_worker_hotplug_transaction(
+        *,
+        source_selector: str,
+        source_harness: str,
+        source_profile: str,
+        source_model_display: str,
+        target_selector: str,
+        target_profile: ResolvedProfile,
+        accepted_override_digest: str,
+    ) -> HotplugTransactionV1:
+        """Create one durable worker transition from captured source facts."""
+        transaction_number = state.hotplug_transaction_number + 1
+        transaction = HotplugTransactionV1(
+            transaction_id=hotplug_transaction_id(
+                state.run_id or run_paths.run_dir.name,
+                accepted_override_digest,
+                transaction_number,
+            ),
+            run_id=state.run_id or run_paths.run_dir.name,
+            accepted_override_digest=accepted_override_digest,
+            transaction_number=transaction_number,
+            source_role="worker",
+            target_role="worker",
+            source_selector=source_selector,
+            target_selector=target_selector,
+            source_harness=source_harness,
+            target_harness=target_profile.harness_name,
+            source_profile=source_profile,
+            target_profile=target_profile.profile_name,
+            source_model_display=source_model_display,
+            target_model_display=format_harness_model_display(
+                target_profile.harness_name, target_profile.model, target_profile.effort
+            ),
+            # The source is the last completed worker turn.  This remains a
+            # durable boundary for both a saved mapping change and a control.
+            source_turn_number=max(1, state.turns_completed),
+            capability_path=(
+                "native_resume"
+                if source_harness == target_profile.harness_name
+                else "handover_required"
+            ),
+            stage="accepted",
+        )
+        state.hotplug_transaction_number = transaction_number
+        return transaction
+
+    def _live_worker_handover_digest(
+        source_session: HarnessSessionRefV1,
+        *,
+        target_selector: str,
+        target_profile: ResolvedProfile,
+    ) -> str:
+        """Bind an automatic mapping transition to one boundary's facts."""
+        payload = {
+            "kind": "live-worker-handover",
+            "source_turn_number": state.turns_completed,
+            "source_session": source_session.to_dict(),
+            "target": {
+                "selector": target_selector,
+                "harness": target_profile.harness_name,
+                "profile": target_profile.profile_name,
+                "model": target_profile.model,
+                "effort": target_profile.effort,
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _reconcile_live_worker_target(
+        *,
+        selector: str,
+        resolved: ResolvedProfile,
+        step_role: str,
+    ) -> None:
+        """Route live cross-harness mapping changes through hotplug once."""
+        if step_role != "worker":
+            return
+        for transaction in (
+            state.current_hotplug_transaction,
+            state.pending_hotplug_transaction,
+        ):
+            if transaction is not None and transaction.stage not in {"applied", "failed"}:
+                return
+        source_session = next(
+            (
+                item for item in state.active_role_sessions
+                if item.role == "worker" and item.status == "active"
+            ),
+            None,
+        )
+        if source_session is None or source_session.harness == resolved.harness_name:
+            return
+        digest = _live_worker_handover_digest(
+            source_session,
+            target_selector=selector,
+            target_profile=resolved,
+        )
+        transaction = _build_worker_hotplug_transaction(
+            source_selector=source_session.selector,
+            source_harness=source_session.harness,
+            source_profile=source_session.profile,
+            source_model_display=source_session.model_display,
+            target_selector=selector,
+            target_profile=resolved,
+            accepted_override_digest=digest,
+        )
+        state.current_hotplug_transaction = transaction
+        state.pending_hotplug_transaction = transaction
+        _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_REQUESTED, transaction)
+        _write_override_boundary(status="running")
+
     def _last_accepted_boundary_override() -> OverrideResult | None:
         accepted = state.last_accepted_override
         if accepted is None and (
@@ -9146,6 +9332,7 @@ def run_workflow(
             state.effective_max_turns = config.max_turns
         else:
             state.effective_max_turns = workflow_config.aflow.max_turns
+        _refresh_live_supervision_consumers()
 
     def _finish_owner_stop(
         *,
@@ -9280,6 +9467,7 @@ def run_workflow(
             if transaction is not None and transaction.stage == "accepted":
                 state.role_selectors[transaction.target_role] = transaction.target_selector
             state.override_source_run_dir = None
+            _refresh_live_supervision_consumers()
             _write_override_boundary(status="running")
             if preserve_resume_override_source:
                 prune_old_runs(run_paths.runs_root, config.keep_runs)
@@ -9463,55 +9651,62 @@ def run_workflow(
         worker_target_selector = request.role_selectors.get("worker")
         worker_transaction: HotplugTransactionV1 | None = None
         if worker_target_selector is not None:
-            source_selector = resolve_role_selector(
-                "worker",
-                state.current_team,
-                workflow_config,
-                run_local_role_selectors=state.role_selectors,
+            target_profile = resolve_profile(
+                worker_target_selector, workflow_config, step_path="hotplug target"
             )
-            if source_selector != worker_target_selector:
+            source_session = next(
+                (
+                    item for item in state.active_role_sessions
+                    if item.role == "worker" and item.status == "active"
+                ),
+                None,
+            )
+            if source_session is not None:
+                source_selector = source_session.selector
+                source_harness = source_session.harness
+                source_profile_name = source_session.profile
+                source_model_display = source_session.model_display
+                target_model_display = format_harness_model_display(
+                    target_profile.harness_name, target_profile.model, target_profile.effort
+                )
+                execution_changed = (
+                    source_harness != target_profile.harness_name
+                    or source_model_display != target_model_display
+                )
+            else:
+                source_selector = resolve_role_selector(
+                    "worker",
+                    state.current_team,
+                    workflow_config,
+                    run_local_role_selectors=state.role_selectors,
+                )
                 source_profile = resolve_profile(
                     source_selector, workflow_config, step_path="hotplug source"
                 )
-                target_profile = resolve_profile(
-                    worker_target_selector, workflow_config, step_path="hotplug target"
+                source_harness = source_profile.harness_name
+                source_profile_name = source_profile.profile_name
+                source_model_display = format_harness_model_display(
+                    source_profile.harness_name, source_profile.model, source_profile.effort
                 )
-                transaction_number = state.hotplug_transaction_number + 1
-                worker_transaction = HotplugTransactionV1(
-                    transaction_id=hotplug_transaction_id(
-                        state.run_id or run_paths.run_dir.name,
-                        request.digest,
-                        transaction_number,
-                    ),
-                    run_id=state.run_id or run_paths.run_dir.name,
-                    accepted_override_digest=request.digest,
-                    transaction_number=transaction_number,
-                    source_role="worker",
-                    target_role="worker",
+                execution_changed = (
+                    source_harness,
+                    source_profile.model,
+                    source_profile.effort,
+                ) != (
+                    target_profile.harness_name,
+                    target_profile.model,
+                    target_profile.effort,
+                )
+            if execution_changed:
+                worker_transaction = _build_worker_hotplug_transaction(
                     source_selector=source_selector,
+                    source_harness=source_harness,
+                    source_profile=source_profile_name,
+                    source_model_display=source_model_display,
                     target_selector=worker_target_selector,
-                    source_harness=source_profile.harness_name,
-                    target_harness=target_profile.harness_name,
-                    source_profile=source_profile.profile_name,
-                    target_profile=target_profile.profile_name,
-                    source_model_display=format_harness_model_display(
-                        source_profile.harness_name, source_profile.model, source_profile.effort
-                    ),
-                    target_model_display=format_harness_model_display(
-                        target_profile.harness_name, target_profile.model, target_profile.effort
-                    ),
-                    # The request is consumed at the boundary after the
-                    # source turn finalized; bind the transaction to that
-                    # completed source turn, not the target turn.
-                    source_turn_number=max(1, state.turns_completed),
-                    capability_path=(
-                        "native_resume"
-                        if source_profile.harness_name == target_profile.harness_name
-                        else "handover_required"
-                    ),
-                    stage="accepted",
+                    target_profile=target_profile,
+                    accepted_override_digest=request.digest,
                 )
-                state.hotplug_transaction_number = transaction_number
                 state.current_hotplug_transaction = worker_transaction
         _write_override_boundary(status="running")
 
@@ -9523,6 +9718,7 @@ def run_workflow(
             baseline_team_name = request.team
         if request.max_turns is not None:
             state.effective_max_turns = request.max_turns
+        _refresh_live_supervision_consumers()
         # This boundary is reached only after the source turn has finalized;
         # make the accepted target authoritative for the next worker turn.
         state.role_selectors.update(request.role_selectors)
@@ -9586,7 +9782,7 @@ def run_workflow(
 
     def _prepare_cross_harness_handover(
         transaction: HotplugTransactionV1,
-        source_driver: SessionDriver,
+        source_driver: SessionDriver | None,
         target_driver: SessionDriver,
         *,
         selector: str,
@@ -9595,6 +9791,46 @@ def run_workflow(
         target_preflight: Callable[[], None],
     ) -> str:
         """Collect one bounded read-only source brief before a cross-harness target."""
+        def _render_handover_suffix(
+            normalized: str,
+            artifact_refs: tuple[str, ...],
+            artifact_hashes: tuple[str, ...],
+        ) -> str:
+            handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
+            projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
+            full_context_path = str((run_paths.run_dir / artifact_refs[2]).resolve())
+            return (
+                "\n\nSource worker handover:\n" + normalized
+                + "\nSource worker handover artifact: " + handover_path
+                + " (sha256=" + artifact_hashes[0] + ")"
+                + "\n\nController continuity context:\n"
+                + "Projection artifact: " + projection_path
+                + " (sha256=" + artifact_hashes[1] + ")"
+                + "\nFull context artifact: " + full_context_path
+                + " (sha256=" + artifact_hashes[2] + ")"
+            )
+
+        if transaction.stage == "handover_ready":
+            # A completed source handover is immutable evidence.  Reuse it
+            # after resume/retry while still preflighting the current target
+            # invocation so live model/effort settings apply at launch.
+            target_preflight()
+            try:
+                validate_hotplug_resume_artifacts(run_paths.run_dir, transaction)
+                handover_path = safe_hotplug_artifact_path(
+                    run_paths.run_dir, transaction.artifact_paths[0]
+                )
+                normalized = validate_handover_output(
+                    handover_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"cannot reuse completed cross-harness handover: {exc}"
+                ) from exc
+            return _render_handover_suffix(
+                normalized, transaction.artifact_paths, transaction.artifact_hashes
+            )
+
         if source_driver is target_driver:
             raise RuntimeError("cross-harness hotplug requires distinct source and target drivers")
         capabilities = getattr(source_driver, "capabilities", None)
@@ -9670,18 +9906,8 @@ def run_workflow(
         state.pending_hotplug_transaction = ready
         _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_STAGE_CHANGED, ready)
         _write_override_boundary(status="running")
-        handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
-        projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
-        full_context_path = str((run_paths.run_dir / artifact_refs[2]).resolve())
-        return (
-            "\n\nSource worker handover:\n" + normalized
-            + "\nSource worker handover artifact: " + handover_path
-            + " (sha256=" + artifact_hashes[0] + ")"
-            + "\n\nController continuity context:\n"
-            + "Projection artifact: " + projection_path
-            + " (sha256=" + artifact_hashes[1] + ")"
-            + "\nFull context artifact: " + full_context_path
-            + " (sha256=" + artifact_hashes[2] + ")"
+        return _render_handover_suffix(
+            normalized, artifact_refs, artifact_hashes
         )
 
     def _finish_normal_terminal(
@@ -9812,6 +10038,48 @@ def run_workflow(
         ))
 
         return result
+
+    def _find_previous_worker_session(
+        *,
+        selector: str,
+        resolved: ResolvedProfile,
+        transaction: HotplugTransactionV1 | None,
+    ) -> HarnessSessionRefV1 | None:
+        """Find continuity by effective harness, with hotplug source binding."""
+        if transaction is not None:
+            if (
+                transaction.target_selector != selector
+                or transaction.source_harness != resolved.harness_name
+                or transaction.target_harness != resolved.harness_name
+            ):
+                return None
+            source_selector = transaction.source_selector
+            source_harness = transaction.source_harness
+            return next(
+                (
+                    item for item in state.active_role_sessions
+                    if item.role == "worker"
+                    and item.status == "active"
+                    and item.selector == source_selector
+                    and item.harness == source_harness
+                ),
+                None,
+            )
+
+        # Selector aliases can point at the same effective execution target.
+        # Match the active session by its resolved harness so a catalog rename
+        # does not force a needless new session.  The current model/effort are
+        # still carried by SessionRequest and the driver's capability decides
+        # whether an edited target may resume that session.
+        return next(
+            (
+                item for item in state.active_role_sessions
+                if item.role == "worker"
+                and item.status == "active"
+                and item.harness == resolved.harness_name
+            ),
+            None,
+        )
 
     turn_number = 1
     while True:
@@ -9960,6 +10228,11 @@ def run_workflow(
                     state.pending_step_team_override if consume_team_override else None
                 ),
             )
+            _reconcile_live_worker_target(
+                selector=selector,
+                resolved=resolved,
+                step_role=step.role,
+            )
             system_prompt = resolve_role_prompt(
                 step.role,
                 active_team_name,
@@ -10061,34 +10334,10 @@ def run_workflow(
                     )
                 if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
                     transaction = state.current_hotplug_transaction
-                    source_selector = (
-                        transaction.source_selector
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else selector
-                    )
-                    source_harness = (
-                        transaction.source_harness
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else resolved.harness_name
-                    )
-                    previous_session = next(
-                        (
-                            item for item in state.active_role_sessions
-                            if item.role == "worker" and item.status == "active"
-                            and item.selector == source_selector
-                            and item.harness == source_harness
-                            and (
-                                transaction is None
-                                or (
-                                    transaction.target_selector == selector
-                                    and transaction.source_harness == resolved.harness_name
-                                    and transaction.target_harness == resolved.harness_name
-                                )
-                            )
-                        ),
-                        None,
+                    previous_session = _find_previous_worker_session(
+                        selector=selector,
+                        resolved=resolved,
+                        transaction=transaction,
                     )
                     turn_session_request = SessionRequest(
                         repo_root=execution_repo_root,
@@ -10276,6 +10525,11 @@ def run_workflow(
                     state.pending_step_team_override if consume_team_override else None
                 ),
             )
+            _reconcile_live_worker_target(
+                selector=selector,
+                resolved=resolved,
+                step_role=step.role,
+            )
             system_prompt = resolve_role_prompt(
                 step.role,
                 active_team_name,
@@ -10382,34 +10636,10 @@ def run_workflow(
                     )
                 if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
                     transaction = state.current_hotplug_transaction
-                    source_selector = (
-                        transaction.source_selector
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else selector
-                    )
-                    source_harness = (
-                        transaction.source_harness
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else resolved.harness_name
-                    )
-                    previous_session = next(
-                        (
-                            item for item in state.active_role_sessions
-                            if item.role == "worker" and item.status == "active"
-                            and item.selector == source_selector
-                            and item.harness == source_harness
-                            and (
-                                transaction is None
-                                or (
-                                    transaction.target_selector == selector
-                                    and transaction.source_harness == resolved.harness_name
-                                    and transaction.target_harness == resolved.harness_name
-                                )
-                            )
-                        ),
-                        None,
+                    previous_session = _find_previous_worker_session(
+                        selector=selector,
+                        resolved=resolved,
+                        transaction=transaction,
                     )
                     turn_session_request = SessionRequest(
                         repo_root=execution_repo_root,

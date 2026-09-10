@@ -18,9 +18,13 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp3 v01` — approved.
+- Last Reviewed Checkpoint: `cp4 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp4 v01` from the immediately preceding worker’s repaired worktree against approved CP3 `4ea9810`; worktree fallback used because no pending CP4 commit exists (zero intervening implementation commits). The cp05-v01 non-checkpoint repair overlay is resolved. Live cross-harness mappings use captured source facts and existing hotplug transactions in ordinary and retry turns; completed handovers are reused. Scoped verification: 226 passed; diff check passed. No material findings. CP5 remains unchecked; manager 40 KiB hard guard and 16 KiB compact summary retained.
+
+- 2026-09-10: Rejected pending CP4 worker worktree against approved CP3 `4ea9810`; worktree fallback used because no pending CP4 commit exists. Implementation markers are not approval. Scoped verification: 224 passed; diff check passed. Synthetic live worker mapping change codex.base → reasonix.new launched without source handover or hotplug transaction (P2). CP4 approval unchecked; compatible implementation retained; CP5 untouched. Non-checkpoint repair overlay: `live-configuration-without-snapshot-gates-20260909-cp05-v01.md` targets original CP4 despite filename. Manager 40 KiB hard guard and 16 KiB compact summary unchanged.
 
 - 2026-09-10: Approved `cp3 v01` from the immediately preceding worker's repaired worktree against approved CP2 `1bd1e2a`; no pending CP3 commit existed, so worktree fallback was used. The cp03-v03 non-checkpoint overlay is resolved: incomplete independent END fails, while actual limit-driven END and boundary exhaustion terminate normally. Persistent partial controls, live defaults/graph and retry refresh are retained. Runtime/state/runlog: 341 passed, 43 subtests; focused CLI resume: 2 passed, 8 subtests; diff check passed. No material findings. CP4 remains unchecked; manager 40 KiB hard guard and 16 KiB compact target unchanged.
 
@@ -152,7 +156,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** A persisted retry shape cannot reconstruct required template inputs: report the exact missing field rather than silently freezing retry prompts.
 
-### [ ] Checkpoint 4: Refresh sessions and supervision without losing continuity
+### [x] Checkpoint 4: Refresh sessions and supervision without losing continuity
 
 **Goal:** Live configuration reaches actual model calls, including same-name profile edits and cached supervisory components.
 
@@ -162,10 +166,10 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Refresh config-dependent invokers and closures from the boundary object, including enabled flags, manager role/skill selections, retry policy and prompt resolution. Preserve existing manager history, budgets and pending state; follow existing timing/routing semantics.
-- [ ] Detect effective execution changes using resolved harness/model/effort values, not selector-name equality alone. An edited profile with the same name must change the next invocation's actual arguments. Retain an unchanged session; use existing supported model-switch or handover/new-session behavior for a changed execution target. Never mutate the in-flight call on save.
-- [ ] Reuse existing session/hotplug continuity handling for cross-harness changes and pending transactions. Already-started handovers finish or recover under their captured invocation facts; subsequent target execution must reconcile current settings before launch. Do not duplicate the transaction machinery for configuration reloads. Keep current source session data long enough to hand over even when its profile was deleted from the catalog.
-- [ ] Add fake-driver tests for newly added profile/harness selection, same-selector model/effort edit, changed prompt, unchanged session reuse, manager settings refresh without budget reset, and resume/retry during an existing handover.
+- [x] Refresh config-dependent invokers and closures from the boundary object, including enabled flags, manager role/skill selections, retry policy and prompt resolution. Preserve existing manager history, budgets and pending state; follow existing timing/routing semantics.
+- [x] Detect effective execution changes using resolved harness/model/effort values, not selector-name equality alone. An edited profile with the same name must change the next invocation's actual arguments. Retain an unchanged session; use existing supported model-switch or handover/new-session behavior for a changed execution target. Never mutate the in-flight call on save.
+- [x] Reuse existing session/hotplug continuity handling for cross-harness changes and pending transactions. Already-started handovers finish or recover under their captured invocation facts; subsequent target execution must reconcile current settings before launch. Do not duplicate the transaction machinery for configuration reloads. Keep current source session data long enough to hand over even when its profile was deleted from the catalog.
+- [x] Add fake-driver tests for newly added profile/harness selection, same-selector model/effort edit, changed prompt, unchanged session reuse, manager settings refresh without budget reset, and resume/retry during an existing handover.
 
 **Dependencies:** Checkpoint 3.
 
