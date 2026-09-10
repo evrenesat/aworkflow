@@ -189,6 +189,7 @@ describe('App workspace shell', () => {
     vi.mocked(api.getRestartOptions).mockResolvedValue({ eligible: false, reason: null, requires_stop: false, run_id: '', extra_instructions_unavailable: false, options: { plan_path: '' } })
     vi.mocked(api.validateGlobalConfig).mockResolvedValue(configPayload('ready').validation)
     vi.mocked(api.listProjects).mockResolvedValue([])
+    vi.mocked(api.listProjectPlans).mockResolvedValue([])
     vi.mocked(api.getProjectDiscovery).mockResolvedValue(discoveryBase)
     vi.mocked(api.getGlobalConfig).mockResolvedValue(configPayload())
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(guidedFormResponse())

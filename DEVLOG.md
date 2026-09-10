@@ -10,6 +10,8 @@
   its slave, handle protected macOS executables in the no-Node packaging smoke,
   use the macOS boot-session identity, and confirm listener conflicts while
   preserving address reuse for clean restarts. Filesystem identity tests now exercise aliases on case-insensitive disks.
+- Probe live loopback listeners before wildcard binding on BSD, and give the
+  workspace-shell plan-list mock a valid empty response after project creation.
 
 ## 2026-09-10 — Release approved work through main
 

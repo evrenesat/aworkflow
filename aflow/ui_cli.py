@@ -245,13 +245,17 @@ def _local_url(host: str, port: int) -> str:
 
 
 def _port_bound(port: int) -> bool:
+    # BSD can permit wildcard bind/listen beside a specific-address listener.
+    # Check a live loopback listener first without confusing TIME_WAIT with one.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return True
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("0.0.0.0", port))
-        # BSD may allow the wildcard bind beside a specific-address listener.
-        # listen detects that conflict while reuse still permits clean restarts
-        # after the old service leaves connections in TIME_WAIT.
+        # Reuse permits clean restarts after connections enter TIME_WAIT.
         sock.listen(1)
         return False
     except OSError as exc:
