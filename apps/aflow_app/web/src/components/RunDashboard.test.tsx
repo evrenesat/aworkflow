@@ -222,7 +222,7 @@ describe('RunDashboard', () => {
     vi.mocked(api.startControlPlaneRun).mockResolvedValue({ result: { run_id: 'successor', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: failed.run_id }, startup_question: null })
     renderDashboard()
     fireEvent.click(await screen.findByRole('button', { name: 'Restart with changes' }))
-    expect((await screen.findByLabelText('Run workflow') as HTMLInputElement).value).toBe('managed')
+    expect((await screen.findByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
     openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '12' } })
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
@@ -375,7 +375,7 @@ describe('RunDashboard', () => {
     expect(screen.getByText('legacy-step')).toBeDefined()
     await waitFor(() => expect(screen.getByText('Build (2 of 2)')).toBeDefined())
     await waitFor(() => expect(screen.getByText('Decision #4: transition — implementation finished')).toBeDefined())
-    expect(screen.getByText('Last finished turn: turn 3 · implement · completed · exit 0')).toBeDefined()
+    expect(screen.getByText('Last finished turn: turn 3 · Implement · completed · exit 0')).toBeDefined()
     expect(screen.getByText('implemented the feature')).toBeDefined()
     expect(screen.getByText(/aflow-run-run-owned\.service · running · not reconciled/)).toBeDefined()
     expect(screen.getByText(/plans\/in-progress\/demo-2\.md/)).toBeDefined()
@@ -455,14 +455,14 @@ describe('RunDashboard', () => {
     expect((screen.getByLabelText('Run start step') as HTMLSelectElement).disabled).toBe(true)
     choose('Run workflow', 'managed')
 
-    expect(screen.getByRole('option', { name: '1 · plan' })).toBeDefined()
-    expect(screen.getByRole('option', { name: '2 · implement' })).toBeDefined()
-    expect(screen.getByRole('option', { name: '3 · review' })).toBeDefined()
+    expect(screen.getByRole('option', { name: '1 · Plan' })).toBeDefined()
+    expect(screen.getByRole('option', { name: '2 · Implement' })).toBeDefined()
+    expect(screen.getByRole('option', { name: '3 · Review' })).toBeDefined()
     // The capability default team is inherited without an explicit selection.
-    expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('base — workflow default (base)')
+    expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('Base — workflow default (Base)')
     fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
     const skipNotice = screen.getByText(/skips the earlier executable steps:/)
-    expect(skipNotice.textContent).toContain('plan')
+    expect(skipNotice.textContent).toContain('Plan')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
@@ -564,15 +564,15 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByLabelText('Selector for worker')).toBeDefined())
-    expect((screen.getByLabelText('Selector for worker') as HTMLSelectElement).tagName).toBe('SELECT')
+    await waitFor(() => expect(screen.getByLabelText('Selector for Worker')).toBeDefined())
+    expect((screen.getByLabelText('Selector for Worker') as HTMLSelectElement).tagName).toBe('SELECT')
     expect(screen.getByRole('option', { name: 'harness/impl-a' })).toBeDefined()
     expect(screen.getByRole('option', { name: 'harness/impl-b' })).toBeDefined()
     expect(screen.getByText(/Changes are saved now and applied between turns/)).toBeDefined()
 
     await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('base'))
     fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
-    fireEvent.change(screen.getByLabelText('Selector for worker'), { target: { value: 'harness/impl-b' } })
+    fireEvent.change(screen.getByLabelText('Selector for Worker'), { target: { value: 'harness/impl-b' } })
     await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('full'))
     fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
@@ -582,6 +582,39 @@ describe('RunDashboard', () => {
       expect.stringMatching(/^control-/),
     ))
     await waitFor(() => expect(screen.getByText(/revision 2\. The engine applies them at the next safe boundary/)).toBeDefined())
+  })
+
+  it('disambiguates colliding live role controls and sends the exact raw role key', async () => {
+    const collidingCapabilities = {
+      ...capabilities,
+      roles: ['code_review', 'code__review', 'unique_role'],
+      admitted_role_selectors: {
+        code_review: ['harness/impl-a', 'harness/impl-b'],
+        code__review: ['harness/impl-a', 'harness/impl-b'],
+        unique_role: ['harness/impl-a'],
+      },
+    }
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue(collidingCapabilities)
+    vi.mocked(api.controlControlPlaneRun).mockResolvedValue({
+      revision: 2,
+      changed: true,
+      owner_stop: false,
+      run: { ...ownedRun, revision: 2 },
+    })
+    renderDashboard()
+
+    await screen.findByLabelText('Selector for Code review (code_review)')
+    expect(screen.getByLabelText('Selector for Code review (code__review)')).toBeTruthy()
+    expect(screen.getByLabelText('Selector for Unique role')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Selector for Code review (code__review)'), { target: { value: 'harness/impl-b' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
+
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      'run-owned',
+      expect.objectContaining({ role_selectors: { code__review: 'harness/impl-b' } }),
+      expect.stringMatching(/^control-/),
+    ))
   })
 
   it('restarts a workflow change through owner stop, exact inactive proof, and a lineage-linked successor', async () => {
@@ -748,7 +781,7 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(screen.getByText(/Restart stopped without a confirmed successor: stop rejected by server/)).toBeDefined())
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
     expect(screen.getByText(/source state may have changed/)).toBeDefined()
-    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('managed')
+    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
@@ -800,7 +833,7 @@ describe('RunDashboard', () => {
       return () => {}
     })
     renderDashboard()
-    await screen.findByText('implement · 2')
+    await screen.findByText('Implement · 2')
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalled())
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({
       ...ownedRun, status: 'completed', current_step: 'review', turns_completed: 3,
@@ -813,7 +846,7 @@ describe('RunDashboard', () => {
     })
     if (!onEventsHook) throw new Error('subscription hook was not registered')
     onEventsHook!([{ sequence: 2, event_type: 'run_completed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
-    await screen.findByText('review · 3')
+    await screen.findByText('Review · 3')
     await screen.findByText('Decision #1: continue — checkpoint complete')
     await screen.findByText('All 1 checkpoints complete')
     expect(screen.getAllByText('Completed').length).toBeGreaterThan(0)
@@ -827,7 +860,7 @@ describe('RunDashboard', () => {
       return () => {}
     })
     renderDashboard()
-    await screen.findByText('implement · 2')
+    await screen.findByText('Implement · 2')
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalled())
     let finishRefresh: ((run: Awaited<ReturnType<typeof api.getControlPlaneRun>>) => void) | undefined
     vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve }))
@@ -843,13 +876,13 @@ describe('RunDashboard', () => {
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight)
     vi.mocked(api.getControlPlaneRun).mockResolvedValue({ ...ownedRun, current_step: 'review', turns_completed: 4 })
     finishRefresh!({ ...ownedRun, turns_completed: 3 })
-    await screen.findByText('review · 4')
+    await screen.findByText('Review · 4')
     expect(vi.mocked(api.getControlPlaneRun).mock.calls.length).toBe(callsInFlight + 1)
     expect(vi.mocked(api.listRunEvents).mock.calls.length).toBeGreaterThanOrEqual(1)
     vi.mocked(api.getControlPlaneRun).mockRejectedValue(new Error('summary temporarily unavailable'))
     emit(5)
     await screen.findByText('summary temporarily unavailable')
-    expect(screen.getByText('review · 4')).toBeDefined()
+    expect(screen.getByText('Review · 4')).toBeDefined()
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
@@ -878,7 +911,7 @@ describe('RunDashboard', () => {
     // A stream error never changes the displayed run status or timeline.
     onStateHook!('reconnecting')
     onEventsHook!([{ sequence: 2, event_type: 'step_started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
-    expect(await screen.findByText(/step started/)).toBeDefined()
+    expect(await screen.findByText(/Step started/)).toBeDefined()
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
@@ -1048,7 +1081,7 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
-    expect(screen.getByText(/exact role preview is unavailable/).textContent).toContain('plan, implement, review')
+    expect(screen.getByText(/exact role preview is unavailable/).textContent).toContain('Plan, Implement, Review')
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
@@ -1076,7 +1109,7 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
-    expect(screen.getByText(/exact role preview is unavailable/).textContent).toContain('review')
+    expect(screen.getByText(/exact role preview is unavailable/).textContent).toContain('Review')
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
   })
@@ -1181,19 +1214,19 @@ describe('RunDashboard', () => {
 
     // Without overrides, the committed defaults resolve and are labeled as defaults.
     const preview = screen.getByLabelText('Effective choices for this launch').textContent ?? ''
-    expect(preview).toContain('managed — global default')
+    expect(preview).toContain('Managed — global default')
     expect(preview).toContain('12 — global default')
-    expect(preview).toContain('base — workflow default (base)')
+    expect(preview).toContain('Base — workflow default (Base)')
 
     // Each executable step resolves exactly its own declared role — the other
     // configured roles are never repeated under a step.
-    const implementRow = screen.getByRole('row', { name: /^implement/ })
-    expect(implementRow.textContent).toContain('worker → codex.fast')
+    const implementRow = screen.getByRole('row', { name: /^Implement/ })
+    expect(implementRow.textContent).toContain('Worker → codex.fast')
     expect(implementRow.textContent).toContain('glm-4.6 · effort high')
     expect(implementRow.textContent).toContain('— team override')
     expect(implementRow.textContent).not.toContain('zcode.main')
-    const planRow = screen.getByRole('row', { name: /^plan/ })
-    expect(planRow.textContent).toContain('reviewer → zcode.main')
+    const planRow = screen.getByRole('row', { name: /^Plan/ })
+    expect(planRow.textContent).toContain('Reviewer → zcode.main')
     expect(planRow.textContent).toContain('model and effort configured in ZCode — global')
     expect(planRow.textContent).not.toContain('codex.fast')
 
@@ -1212,12 +1245,12 @@ describe('RunDashboard', () => {
     if (!screen.queryByLabelText('Run max turns')) openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '7' } })
     const overridden = screen.getByLabelText('Effective choices for this launch').textContent ?? ''
-    expect(overridden).toContain('other — your selection')
+    expect(overridden).toContain('Other — your selection')
     expect(overridden).toContain('7 — your override')
-    expect(overridden).toContain('full — your selection')
+    expect(overridden).toContain('Full — your selection')
     // Team full has no role overrides and worker has no global assignment, so
     // the research step's exact role is missing with the settings action named.
-    expect(overridden).toContain('worker — missing')
+    expect(overridden).toContain('Worker — missing')
     expect(overridden).toContain('Settings → Roles')
 
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
@@ -1265,7 +1298,7 @@ describe('RunDashboard', () => {
     openAdvanced()
     choose('Run workflow', 'managed')
     fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
-    expect(screen.getByText(/skips the earlier executable steps:/).textContent).toContain('plan')
+    expect(screen.getByText(/skips the earlier executable steps:/).textContent).toContain('Plan')
 
     choose('Run workflow', 'other')
     expect((screen.getByLabelText('Run start step') as HTMLSelectElement).selectedIndex).toBe(0)
@@ -1456,7 +1489,7 @@ describe('RunDashboard', () => {
     expect(newRun.compareDocumentPosition(runList!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(newRun.compareDocumentPosition(progressHeader!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     // The progress header carries the run's current step and turns.
-    expect(screen.getByText('implement · 2')).toBeDefined()
+    expect(screen.getByText('Implement · 2')).toBeDefined()
     expect(screen.queryByText(/stream connected|stream stopped/)).toBeNull()
   })
 
@@ -1618,6 +1651,20 @@ describe('RunDashboard', () => {
     expect(screen.queryByText(/running for/)).toBeNull()
   })
 
+  it('disambiguates colliding live-run team choices without changing the submitted value', async () => {
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
+      ...capabilities,
+      teams: ['fast_team', 'fast__team', 'slow_team'],
+    })
+    renderDashboard()
+    const controlTeam = await screen.findByLabelText('Control team') as HTMLSelectElement
+    expect(screen.getByRole('option', { name: 'Fast team (fast_team)', exact: true })).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'Fast team (fast__team)', exact: true })).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'Slow team', exact: true })).toBeTruthy()
+    fireEvent.change(controlTeam, { target: { value: 'fast__team' } })
+    expect(controlTeam.value).toBe('fast__team')
+  })
+
   it('keeps a failed preparation inactive as time advances and links its durable reason', async () => {
     const failed = { ...ownedRun, status: 'needs_attention', started_at: null,
       current_step: null, turns_completed: null,
@@ -1670,17 +1717,17 @@ describe('RunDashboard', () => {
     renderDashboard()
     await openNewRun()
     // Before any focus the resolved names are visible with Default indicators.
-    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('managed')
-    expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('base')
+    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
+    expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('Base')
     expect(screen.getAllByText('Default').length).toBe(2)
     // The open list offers a real-text default row, never an empty entry.
     const workflowInput = screen.getByLabelText('Run workflow')
     fireEvent.focus(workflowInput)
-    expect(screen.getByRole('option', { name: /Use default \(managed\)/ })).toBeDefined()
+    expect(screen.getByRole('option', { name: /Use default \(Managed\)/ })).toBeDefined()
     // Escape restores the resolved label instead of leaving a search query.
     fireEvent.change(workflowInput, { target: { value: 'man' } })
     fireEvent.keyDown(workflowInput, { key: 'Escape' })
-    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('managed')
+    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
   })
 
   it('submits explicit selections, omits defaults, and follows the new workflow default team', async () => {
@@ -1732,12 +1779,12 @@ describe('RunDashboard', () => {
     choose('Run plan', 'plans/in-progress/demo.md')
     const workflowInput = screen.getByLabelText('Run workflow')
     fireEvent.focus(workflowInput)
-    fireEvent.click(screen.getByRole('option', { name: /Use default \(managed\)/ }))
+    fireEvent.click(screen.getByRole('option', { name: /Use default \(Managed\)/ }))
     const teamInput = screen.getByLabelText('Run team')
     fireEvent.focus(teamInput)
     // Clearing the search query reveals the default row again.
     fireEvent.change(teamInput, { target: { value: '' } })
-    fireEvent.click(screen.getByRole('option', { name: /Use default \(base\)/ }))
+    fireEvent.click(screen.getByRole('option', { name: /Use default \(Base\)/ }))
     // Changing the workflow to one without a default team updates the resolved team.
     choose('Run workflow', 'other')
     expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('No team — global roles')
@@ -1759,11 +1806,11 @@ describe('RunDashboard', () => {
     // with override/fallback sources, and the full multi-stage chain.
     choose('Run workflow', 'managed')
     const resolved = screen.getByLabelText('Effective choices for this launch').textContent ?? ''
-    expect(resolved).toContain('base — workflow default (base)')
+    expect(resolved).toContain('Base — workflow default (Base)')
     // The unassigned roles stay honest; the chain keeps its full stage order.
     expect(resolved).toContain('missing — assign it in Settings')
-    expect(resolved).toContain('base — worker not assigned')
-    expect(resolved).toContain('full — worker not assigned — no further upgrade configured')
+    expect(resolved).toContain('Base — Worker not assigned')
+    expect(resolved).toContain('Full — Worker not assigned — no further upgrade configured')
     expect(resolved).toContain('no further upgrade configured')
     expect(resolved).toContain('configured escalation path')
   })

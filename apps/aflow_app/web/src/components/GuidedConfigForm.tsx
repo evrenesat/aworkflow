@@ -7,6 +7,7 @@ import type {
   GuidedProfileSummary,
   ProjectConfigFormResponse,
 } from '../types'
+import { formatMachineChoice, formatMachineLabel } from '../label'
 import { Combobox } from './Combobox'
 
 interface GuidedConfigFormProps {
@@ -193,6 +194,15 @@ export function GuidedConfigForm({
   const projection = form?.form ?? null
   const choices = form?.choices
   const suggestions = form?.suggestions
+  const workflowOptionNames = [...new Set([...(choices?.workflows ?? []), ...(projection?.default_workflow ? [projection.default_workflow] : [])])]
+  const teamOptionNames = choices?.teams ?? []
+  const roleOptionNames = choices?.roles ?? []
+  const workflowDisplayNames = projection ? Object.keys(projection.workflows).sort() : []
+  const teamDisplayNames = projection ? Object.keys(projection.teams).sort() : []
+  const roleDisplayNames = projection ? [...new Set([
+    ...Object.keys(projection.roles),
+    ...Object.values(projection.teams).flatMap((team) => Object.keys(team.roles)),
+  ])].sort() : []
   const profileIsConfigured = Boolean(projection?.harnesses[profileDraft.harness]?.[profileDraft.profile])
   const profileIsSuggested = !profileIsConfigured && (suggestions?.profiles.some(
     (item) => item.harness === profileDraft.harness && item.profile === profileDraft.profile,
@@ -537,11 +547,11 @@ export function GuidedConfigForm({
                 >
                   <option value="">Not set</option>
                   {(choices?.workflows ?? []).map((workflow) => (
-                    <option key={workflow} value={workflow}>{workflow}</option>
+                    <option key={workflow} value={workflow}>{formatMachineChoice(workflow, workflowOptionNames)}</option>
                   ))}
                   {projection.default_workflow
                     && !(choices?.workflows ?? []).includes(projection.default_workflow) && (
-                    <option value={projection.default_workflow}>{projection.default_workflow} (configured)</option>
+                    <option value={projection.default_workflow}>{formatMachineChoice(projection.default_workflow, workflowOptionNames)} (configured)</option>
                   )}
                 </select>
                 <span className="text-xs text-dim">
@@ -616,6 +626,7 @@ export function GuidedConfigForm({
                   onChange={(profile) => changeProfileIdentity({ profile })}
                   options={profileNameOptions(profileDraft.harness)}
                   optionBadges={profileNameBadges(profileDraft.harness)}
+                  optionLabel={formatMachineLabel}
                   allowCustom
                   placeholder="for example default"
                 />
@@ -703,7 +714,7 @@ export function GuidedConfigForm({
                 <tbody>
                   {Object.entries(projection.roles).map(([role, selector]) => (
                     <tr key={role}>
-                      <td className="mono">{role}</td>
+                      <td className="mono">{formatMachineChoice(role, roleDisplayNames)}</td>
                       <td className="mono">{selector}</td>
                       <td>{selectorModelEffort(selector, projection.harnesses) || <span className="text-dim">unknown profile</span>}</td>
                     </tr>
@@ -718,6 +729,7 @@ export function GuidedConfigForm({
                 onChange={(role) => setRoleDraft({ ...roleDraft, role })}
                 options={choices?.roles ?? []}
                 optionBadges={Object.fromEntries((choices?.roles ?? []).map((role) => [role, 'configured']))}
+                optionLabel={(role) => formatMachineChoice(role, roleOptionNames)}
                 allowCustom
                 placeholder="for example worker"
               />
@@ -747,8 +759,8 @@ export function GuidedConfigForm({
               <p className="text-sm text-dim">No teams are configured in this draft yet.</p>
             ) : (
               Object.entries(projection.teams).map(([team, summary]) => (
-                <div key={team} className="guided-team card" aria-label={`Team ${team}`}>
-                  <strong className="mono text-sm">{team}</strong>
+                <div key={team} className="guided-team card" aria-label={`Team ${formatMachineChoice(team, teamDisplayNames)}`}>
+                  <strong className="mono text-sm">{formatMachineChoice(team, teamDisplayNames)}</strong>
                   {Object.keys(summary.roles).length === 0 ? (
                     <p className="text-xs text-dim">No role overrides — this team inherits the global defaults.</p>
                   ) : (
@@ -758,7 +770,7 @@ export function GuidedConfigForm({
                       <tbody>
                         {Object.entries(summary.roles).map(([role, selector]) => (
                           <tr key={role}>
-                            <td className="mono">{role}</td>
+                            <td className="mono">{formatMachineChoice(role, roleDisplayNames)}</td>
                             <td className="mono">{selector}</td>
                             <td>{selectorModelEffort(selector, projection.harnesses) || <span className="text-dim">unknown profile</span>}</td>
                           </tr>
@@ -794,7 +806,7 @@ export function GuidedConfigForm({
                     onChange={(event) => setTeamDraft({ ...teamDraft, team: event.target.value })}
                   >
                     <option value="">Choose a team…</option>
-                    {(choices?.teams ?? []).map((team) => <option key={team} value={team}>{team}</option>)}
+                    {(choices?.teams ?? []).map((team) => <option key={team} value={team}>{formatMachineChoice(team, teamOptionNames)}</option>)}
                   </select>
                 </div>
                 <div className="dashboard-field">
@@ -806,7 +818,7 @@ export function GuidedConfigForm({
                     onChange={(event) => setTeamDraft({ ...teamDraft, role: event.target.value })}
                   >
                     <option value="">Choose a role…</option>
-                    {(choices?.roles ?? []).map((role) => <option key={role} value={role}>{role}</option>)}
+                    {(choices?.roles ?? []).map((role) => <option key={role} value={role}>{formatMachineChoice(role, roleOptionNames)}</option>)}
                   </select>
                 </div>
                 <Combobox
@@ -840,30 +852,30 @@ export function GuidedConfigForm({
                 const defaultTeam = projection.workflow_default_teams[workflow] ?? null
                 const teamRoles = defaultTeam ? projection.teams[defaultTeam]?.roles ?? {} : {}
                 return (
-                  <div key={workflow} className="guided-team card" aria-label={`Workflow ${workflow}`}>
+                  <div key={workflow} className="guided-team card" aria-label={`Workflow ${formatMachineChoice(workflow, workflowDisplayNames)}`}>
                     <div className="section-heading">
-                      <strong className="mono text-sm">{workflow}</strong>
+                      <strong className="mono text-sm">{formatMachineChoice(workflow, workflowDisplayNames)}</strong>
                       <div className="dashboard-field" style={{ minWidth: '200px' }}>
                         <label className="text-xs text-dim" htmlFor={`workflow-team-${workflow}`}>Default team</label>
                         <select
                           id={`workflow-team-${workflow}`}
                           className="input"
-                          aria-label={`Default team for ${workflow}`}
+                          aria-label={`Default team for ${formatMachineChoice(workflow, workflowDisplayNames)}`}
                           value={defaultTeam ?? ''}
                           disabled={actionBusy}
                           onChange={(event) => applyWorkflowTeam(workflow, event.target.value)}
                         >
                           <option value="">No default team</option>
-                          {(choices?.teams ?? []).map((team) => <option key={team} value={team}>{team}</option>)}
+                          {(choices?.teams ?? []).map((team) => <option key={team} value={team}>{formatMachineChoice(team, defaultTeam && !teamOptionNames.includes(defaultTeam) ? [...teamOptionNames, defaultTeam] : teamOptionNames)}</option>)}
                           {defaultTeam && !(choices?.teams ?? []).includes(defaultTeam) && (
-                            <option value={defaultTeam}>{defaultTeam} (configured)</option>
+                            <option value={defaultTeam}>{formatMachineChoice(defaultTeam, [...teamOptionNames, defaultTeam])} (configured)</option>
                           )}
                         </select>
                       </div>
                     </div>
                     <ol className="guided-steps">
                       {(summary.executable_steps ?? summary.declared_steps).map((step) => (
-                        <li key={step} className="text-sm mono">{step}</li>
+                        <li key={step} className="text-sm mono">{formatMachineLabel(step)}</li>
                       ))}
                     </ol>
                     {summary.executable_steps === null && (
@@ -873,7 +885,7 @@ export function GuidedConfigForm({
                     )}
                     <table className="guided-table">
                       <caption className="text-xs text-dim">
-                        Role assignments ({defaultTeam ? `team ${defaultTeam} overrides → global` : 'global'})
+                        Role assignments ({defaultTeam ? `team ${formatMachineChoice(defaultTeam, teamDisplayNames)} overrides → global` : 'global'})
                       </caption>
                       <thead><tr><th scope="col">Role</th><th scope="col">Profile</th><th scope="col">Model / effort</th><th scope="col">Source</th></tr></thead>
                       <tbody>
@@ -884,17 +896,17 @@ export function GuidedConfigForm({
                           if (!selector) {
                             return (
                               <tr key={role}>
-                                <td className="mono">{role}</td>
+                                <td className="mono">{formatMachineChoice(role, roleDisplayNames)}</td>
                                 <td colSpan={3}><span className="text-dim">missing — assign it in Roles</span></td>
                               </tr>
                             )
                           }
                           return (
                             <tr key={role}>
-                              <td className="mono">{role}</td>
+                              <td className="mono">{formatMachineChoice(role, roleDisplayNames)}</td>
                               <td className="mono">{selector}</td>
                               <td>{selectorModelEffort(selector, projection.harnesses) || <span className="text-dim">unknown profile</span>}</td>
-                              <td>{override ? `team ${defaultTeam}` : 'global'}</td>
+                              <td>{override ? `team ${formatMachineChoice(defaultTeam ?? '', teamDisplayNames)}` : 'global'}</td>
                             </tr>
                           )
                         })}

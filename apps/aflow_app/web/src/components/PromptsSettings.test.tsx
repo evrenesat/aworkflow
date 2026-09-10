@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { PromptsSettings } from './PromptsSettings'
 import type { GuidedFormProjection } from '../types'
@@ -45,18 +45,18 @@ const baseDraft = (): GuidedFormProjection => ({
 describe('PromptsSettings', () => {
   it('offers no deletion for referenced prompts and discloses their usages', () => {
     render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
-    expect(screen.queryByRole('button', { name: 'Delete implementation_plans' })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'More actions for prompt implementation_plans' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Delete Implementation plans' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'More actions for prompt Implementation plans' })).toBeNull()
     fireEvent.click(screen.getByText('Used by 1 configured reference'))
     expect(screen.getByText('workflow.demo.steps.implement.prompts')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Review plans', exact: true }))
     expect(screen.getByText('No configured references')).toBeTruthy()
   })
 
   it('labels the secondary action as a prompt, never as plan deletion', () => {
     render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
-    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
-    const trigger = screen.getByRole('button', { name: 'More actions for prompt review_plans' })
+    fireEvent.click(screen.getByRole('button', { name: 'Review plans', exact: true }))
+    const trigger = screen.getByRole('button', { name: 'More actions for prompt Review plans' })
     fireEvent.click(trigger)
     expect(screen.getByRole('menuitem', { name: 'Delete prompt…' })).toBeTruthy()
     expect(screen.queryByRole('menuitem', { name: /Delete plans/i })).toBeNull()
@@ -73,7 +73,7 @@ describe('PromptsSettings', () => {
   it('explains that role overrides are literal while retaining the shared reference', () => {
     const draft = { ...baseDraft(), roles: { worker: 'codex.worker' }, role_prompts: { worker: 'literal role text' } }
     render(<PromptsSettings draft={draft} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Global / worker', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Global / Worker', exact: true }))
     expect(screen.getByText(/Role and team prompt overrides are literal text/)).toBeTruthy()
     expect(screen.getByText('{MAIN_BRANCH}')).toBeTruthy()
   })
@@ -81,14 +81,14 @@ describe('PromptsSettings', () => {
   it('keeps prompt editing available when the help catalog is unavailable', () => {
     const draft = { ...baseDraft(), template_variables: undefined }
     render(<PromptsSettings draft={draft} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
-    expect((screen.getByRole('textbox', { name: 'Prompt text implementation_plans' }) as HTMLTextAreaElement).value).toBe('Read the plan.')
+    expect((screen.getByRole('textbox', { name: 'Prompt text' }) as HTMLTextAreaElement).value).toBe('Read the plan.')
     expect(screen.getByText(/reference is temporarily unavailable/)).toBeTruthy()
   })
 
   it('opens and closes the More menu with the keyboard', () => {
     render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
-    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
-    const trigger = screen.getByRole('button', { name: 'More actions for prompt review_plans' })
+    fireEvent.click(screen.getByRole('button', { name: 'Review plans', exact: true }))
+    const trigger = screen.getByRole('button', { name: 'More actions for prompt Review plans' })
     trigger.focus()
     expect(trigger.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(trigger)
@@ -101,14 +101,49 @@ describe('PromptsSettings', () => {
   it('requires confirmation and delegates deletion and undo to its draft owner', () => {
     const onDelete = vi.fn(), onUndo = vi.fn()
     const view = render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={onDelete} onUndo={onUndo} />)
-    fireEvent.click(screen.getByRole('button', { name: 'review_plans', exact: true }))
-    fireEvent.click(screen.getByRole('button', { name: 'More actions for prompt review_plans' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Review plans', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for prompt Review plans' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete prompt…' }))
     expect(onDelete).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Delete prompt' }))
     expect(onDelete).toHaveBeenCalledWith('review_plans', 'Review it.')
     view.rerender(<PromptsSettings draft={baseDraft()} change={() => {}} rename={() => {}} names={{}} deleted={[{ name: 'review_plans', text: 'Review it.' }]} onDelete={onDelete} onUndo={onUndo} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Undo deletion of review_plans' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Undo deletion of Review plans' }))
     expect(onUndo).toHaveBeenCalledWith('review_plans', 'review_plans')
+  })
+
+  it('keeps the prompt key literal while the navigation and heading are readable', () => {
+    const rename = vi.fn()
+    render(<PromptsSettings draft={baseDraft()} change={() => {}} rename={rename} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Review plans', exact: true }))
+    const key = screen.getByRole('textbox', { name: 'Prompt key' }) as HTMLInputElement
+    expect(key.value).toBe('review_plans')
+    fireEvent.change(key, { target: { value: 'implementation_plans' } })
+    expect(rename).toHaveBeenCalledWith('review_plans', 'implementation_plans')
+    expect(screen.getByRole('heading', { name: 'Review plans', exact: true })).toBeTruthy()
+  })
+
+  it('disambiguates colliding prompt override destinations while retaining raw values', () => {
+    const draft = {
+      ...baseDraft(),
+      roles: { fast_role: 'codex.worker', fast__role: 'codex.worker' },
+      teams: {
+        fast_team: { roles: {}, prompts: {} },
+        fast__team: { roles: {}, prompts: {} },
+      },
+      role_prompts: { fast_role: 'Fast role text', fast__role: 'Other role text' },
+    }
+    render(<PromptsSettings draft={draft} change={() => {}} rename={() => {}} names={{}} deleted={[]} onDelete={() => {}} onUndo={() => {}} />)
+    fireEvent.click(screen.getAllByRole('button', { name: /Global \/ Fast role/ })[0])
+    fireEvent.click(screen.getByText('Move override'))
+
+    const targetRole = screen.getByLabelText('Target role') as HTMLSelectElement
+    expect(within(targetRole).getByRole('option', { name: 'Fast role (fast_role)', exact: true })).toBeTruthy()
+    expect(within(targetRole).getByRole('option', { name: 'Fast role (fast__role)', exact: true })).toBeTruthy()
+    const targetTeam = screen.getByLabelText('Target team') as HTMLSelectElement
+    expect(within(targetTeam).getByRole('option', { name: 'Fast team (fast_team)', exact: true })).toBeTruthy()
+    expect(within(targetTeam).getByRole('option', { name: 'Fast team (fast__team)', exact: true })).toBeTruthy()
+    fireEvent.change(targetTeam, { target: { value: 'fast__team' } })
+    expect(targetTeam.value).toBe('fast__team')
   })
 })

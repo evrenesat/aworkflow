@@ -1,6 +1,6 @@
 # aflow manager context budget and failure evidence
 
-Status: Checkpoint 5 reviewed and approved through `cp5 v01`; Checkpoint 6 remains pending. Compatible implementation and prior CP1–CP4 approvals are retained.
+Status: All six checkpoints reviewed and approved; CP6 approved through `cp6 v02`. Compatible implementation and CP1–CP5 approvals are retained. This is checkpoint approval, not a whole-plan final review.
 
 Execution amendment (2026-09-09): retain the owner-approved 40 KiB hard guard already in the current baseline. The later readable-output plan adds the separate 16 KiB current-summary target. Historical incident sizes below remain historical evidence.
 
@@ -16,6 +16,12 @@ The handoff also adds prompt-variable help beneath editors and readable sentence
 - Pre-Handoff Base HEAD: `93a54774d8f4a92e05d04f99b936f43c88ccf673`
 
 ### Review Log
+
+- 2026-09-10: Approved CP6 through `cp6 v02` after the cp06-v01 repair overlay. Worker turn 11 of run `20260909t224505z-752d79ec` and its active-plan/result evidence identify the attempt. Used current-worktree fallback after CP5 approval `754331b`; no CP6 worker commit exists. Reviewed readable labels, collision disambiguation, raw identifier preservation and affected tests/documentation. Global/team/live role controls now distinguish colliding role keys; prior team/workflow/prompt repairs retained. Reviewer verification: 279 web tests, production build, four disposable Chromium checks and diff check passed. No material findings. Only CP6 approval advanced; prior approvals and original base retained. All checkpoints are now approved; whole-plan final review remains separate.
+
+- 2026-09-10: Reviewed CP6 repair worker turn 9 of run `20260909t224505z-752d79ec` against the cp01-v01 active overlay using current-worktree fallback after `754331b`; no CP6 worker commit exists. Team/workflow/native-option repairs are retained. One remaining P2: global/team role-assignment labels and live role controls collapse distinct supported role keys. Disposable component reproduction confirmed indistinguishable global and team controls for `code_review` and `code__review`. Reopened only the collision step; CP6 remains unapproved. Verification: 277 web tests, build, four disposable Chromium checks and diff check passed. Focused replacement overlay: `aflow-manager-context-budget-followup-20260908-cp06-v01.md`. No approval commit or history rewrite.
+
+- 2026-09-10: Reviewed CP6 worker turn 7 of run `20260909t224505z-752d79ec` using current-worktree fallback after `754331b`; no CP6 worker commit exists. The worker handoff and CP6 scope envelope identify this attempt despite all execution boxes being checked. One P2 finding: team/workflow settings and native selectors format colliding keys without disambiguation; a disposable component reproduction confirms indistinguishable team sidebar entries and upgrade destinations. Reopened CP6 and its collision step; retained compatible implementation, earlier approvals and lineage. Fix overlay: `aflow-manager-context-budget-followup-20260908-cp01-v01.md` (CP6 scope). Web tests (270), build and diff check passed. Full review evidence is in `plans/reviews/latest_review.md`. No approval commit or history rewrite.
 
 - 2026-09-09: Approved CP5 through `cp5 v01` using current-worktree fallback after `986300d`; no CP5 worker commit exists. Run `20260909t224505z-752d79ec`, worker turn 5 and its CP5 scope envelope identify the reviewed checkpoint despite CP6 being next unchecked. Covered ten-variable renderer/catalog coverage, named and literal role/team editor help, missing-help editing and metadata-free saves. Reviewer verification: 65 guided-config tests, 7 renderer regressions, all 256 web tests, production build and diff check passed; Python checks used disposable HOME/configuration. Bounded worker evidence records Chromium placement at desktop 1280px and mobile 390px with no project selected; reviewer did not rerun Chromium. No material findings. CP6 remains pending and prior approvals/lineage are retained.
 
@@ -232,7 +238,7 @@ Failure-artifact contract: store `rejected-context.json` and `rejected-user-prom
 
 **Blockers:** Report an unresolved renderer/editor scope contradiction if it cannot be settled from code and tests; do not invent variable meanings or expand the substitution language.
 
-### [ ] Checkpoint 6: Render readable labels without changing identifiers
+### [x] Checkpoint 6: Render readable labels without changing identifiers
 
 **Goal:** User-facing button labels, navigation options, section headings and similar UI labels display snake_case names as sentence-style text: `snake_case` → “Snake case”, `implementation_plans` → “Implementation plans”.
 
@@ -242,10 +248,10 @@ Failure-artifact contract: store `rejected-context.json` and `rejected-user-prom
 
 **Steps:**
 
-- [ ] Add one shared label formatter for snake_case machine names: replace underscore runs with spaces, trim, capitalize the initial letter, and retain existing case in the remaining tokens. Lowercase identifiers therefore produce sentence case, not Every Word Capitalized. Empty input stays empty; non-snake-case display names remain unchanged. Preserve acronyms explicitly supplied as uppercase rather than blindly lowercasing all text.
-- [ ] Use it at display boundaries for prompt selectors/headings, workflow/role/step and event labels, generated settings headings and buttons. Audit the remaining web screens for the same pattern. Keep the Prompt key input literal (`implementation_plans`), while the selected item/button and heading read “Implementation plans”. Exact paths and configuration reference strings in technical disclosure remain literal.
-- [ ] Keep search and selection operating on raw identifiers while accepting readable labels for discovery. Two identifiers with the same readable label must remain separately selectable; show the raw identifier as secondary text only when needed to disambiguate. Accessible names should match visible wording, without changing action identity.
-- [ ] Add tests proving rendered labels are readable and selecting/saving/renaming still sends exact original keys. Cover empty strings, repeated underscores, acronyms, already-readable custom names, colliding display labels and variable tokens that must not be reformatted. Verify actual prompt/sidebar and run/settings labels rather than only testing the helper.
+- [x] Add one shared label formatter for snake_case machine names: replace underscore runs with spaces, trim, capitalize the initial letter, and retain existing case in the remaining tokens. Lowercase identifiers therefore produce sentence case, not Every Word Capitalized. Empty input stays empty; non-snake-case display names remain unchanged. Preserve acronyms explicitly supplied as uppercase rather than blindly lowercasing all text.
+- [x] Use it at display boundaries for prompt selectors/headings, workflow/role/step and event labels, generated settings headings and buttons. Audit the remaining web screens for the same pattern. Keep the Prompt key input literal (`implementation_plans`), while the selected item/button and heading read “Implementation plans”. Exact paths and configuration reference strings in technical disclosure remain literal.
+- [x] Keep search and selection operating on raw identifiers while accepting readable labels for discovery. Two identifiers with the same readable label must remain separately selectable; show the raw identifier as secondary text only when needed to disambiguate. Accessible names should match visible wording, without changing action identity.
+- [x] Add tests proving rendered labels are readable and selecting/saving/renaming still sends exact original keys. Cover empty strings, repeated underscores, acronyms, already-readable custom names, colliding display labels and variable tokens that must not be reformatted. Verify actual prompt/sidebar and run/settings labels rather than only testing the helper.
 
 **Dependencies:** Independent of Checkpoints 1–4; coordinate shared prompt-editor changes with Checkpoint 5.
 

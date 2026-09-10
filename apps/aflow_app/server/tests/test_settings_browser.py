@@ -81,10 +81,22 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                     assert box and 0 <= box['y'] < height
                     save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                     assert save and 0 <= save['y'] < height
-                    for tab, name in [('Teams', 'team_39'), ('Workflows', 'workflow_39'), ('Prompts', 'scroll_test_39')]:
+                    for tab, display_name in [('Teams', 'Team 39'), ('Workflows', 'Workflow 39'), ('Prompts', 'Scroll test 39')]:
                         page.get_by_role('tab', name=tab, exact=True).click()
                         nav = page.locator('.sidebar-editor-navigation')
-                        nav.get_by_role('button', name=name, exact=True).click()
+                        if tab == 'Workflows':
+                            nav.get_by_role('button', name='Defaults', exact=True).click()
+                            default_workflow = page.get_by_role('combobox', name='Default workflow', exact=True)
+                            default_workflow.focus()
+                            default_workflow.fill('Workflow 00')
+                            default_workflow.press('ArrowDown')
+                            default_workflow.press('Enter')
+                            assert default_workflow.input_value() == 'Workflow 00'
+                            default_workflow.fill('Managed')
+                            default_workflow.press('ArrowDown')
+                            default_workflow.press('Enter')
+                            assert default_workflow.input_value() == 'Managed'
+                        nav.get_by_role('button', name=display_name, exact=True).click()
                         metrics = pane_metrics(page)
                         assert metrics['navContent'] > metrics['navHeight'], metrics
                         assert metrics['navScroll'] > 0, metrics
@@ -98,7 +110,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                         after = pane_metrics(page)
                         assert after['detailScroll'] >= 499
                         assert after['navScroll'] == metrics['navScroll']
-                        nav.get_by_role('button', name=name.replace('39', '38'), exact=True).click()
+                        nav.get_by_role('button', name=display_name.replace('39', '38'), exact=True).click()
                         assert pane_metrics(page)['detailScroll'] == 0
             page.get_by_role('button', name='Advanced TOML', exact=True).click()
             assert page.get_by_role('tab').count() == 0

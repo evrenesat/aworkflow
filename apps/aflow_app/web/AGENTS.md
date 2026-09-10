@@ -22,6 +22,10 @@
   streams. Hidden dashboards preserve drafts but suspend subscriptions and clocks.
 - Preserve exact project/run identities and unresolved mutation keys across
   navigation. Restart source identity is independent of the selected history row.
+- Format snake_case machine identifiers only at user-facing label boundaries with
+  the shared label helper. Keep raw keys in values, callbacks, API requests,
+  URLs, DOM identity and technical/raw details; retain custom display names and
+  explicitly supplied acronym casing.
 - Verify changes with `npm --prefix apps/aflow_app/web test -- --run` and
   `npm --prefix apps/aflow_app/web run build` from the repository root.
 

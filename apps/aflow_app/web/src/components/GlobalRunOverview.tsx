@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { fetchGlobalRuns, selectGlobalRuns, useRecentRunsLimit } from '../globalRuns'
 import type { ProjectInfo, RunStatus } from '../types'
 import { executionDuration, statusLabel } from '../runPresentation'
+import { formatMachineLabel } from '../label'
 
 export function RecentRunsLimit() {
   const [limit, setLimit] = useRecentRunsLimit()
@@ -62,7 +63,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           <button className="card global-run-row" onClick={() => onOpen(projectId, run.run_id)}>
             <strong>{projects.find(p => p.id === projectId)?.display_name ?? projectId} · {statusLabel(run)}{run.history_state === 'archived' ? ' · Archived' : ''}</strong>
             <span>{run.plan_path ?? run.run_id}</span>
-            <span className="text-sm text-dim">{[run.workflow_name, run.team, run.current_step, executionDuration(run, Date.now())].filter(Boolean).join(' · ')}</span>
+            <span className="text-sm text-dim">{[run.workflow_name ? formatMachineLabel(run.workflow_name) : null, run.team ? formatMachineLabel(run.team) : null, run.current_step ? formatMachineLabel(run.current_step) : null, executionDuration(run, Date.now())].filter(Boolean).join(' · ')}</span>
           </button>
         </li>)}
       </ul>}

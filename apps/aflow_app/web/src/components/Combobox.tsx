@@ -15,6 +15,8 @@ interface ComboboxProps {
   emptyOption?: string
   /** Visible source label per option (for example configured vs suggested). */
   optionBadges?: Record<string, string>
+  /** Presentation label for a raw option; selection and callbacks keep the raw option. */
+  optionLabel?: (option: string) => string
   /**
    * Resolved value shown while the control is unfocused and nothing is typed,
    * even when the stored value is empty ("follow default"). Focusing always
@@ -43,6 +45,7 @@ export function Combobox({
   disabled = false,
   emptyOption,
   optionBadges,
+  optionLabel,
   resolvedDisplay = null,
   resolvedBadge,
   defaultOption,
@@ -54,10 +57,14 @@ export function Combobox({
   const [text, setText] = useState<string | null>(null)
   const [activeIndex, setActiveIndex] = useState(-1)
 
+  const labelForOption = optionLabel ?? ((option: string) => option)
+  const visibleLabels = options.map(labelForOption)
+  const labelCounts = visibleLabels.reduce((counts, label) => counts.set(label, (counts.get(label) ?? 0) + 1), new Map<string, number>())
   const showResolved = text === null && Boolean(resolvedDisplay) && !value
   const query = text ?? (showResolved ? '' : value)
+  const normalizedQuery = query.toLowerCase()
   const filtered = query
-    ? options.filter((option) => option.toLowerCase().includes(query.toLowerCase()))
+    ? options.filter((option) => option.toLowerCase().includes(normalizedQuery) || labelForOption(option).toLowerCase().includes(normalizedQuery))
     : options
   const showDefaultRow = Boolean(defaultOption) && (!query || (defaultOption!.label.toLowerCase().includes(query.toLowerCase())))
 
@@ -70,7 +77,6 @@ export function Combobox({
     onChange(next)
     setText(null)
     setOpen(false)
-    inputRef.current?.focus()
   }
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
@@ -126,7 +132,7 @@ export function Combobox({
           spellCheck={false}
           disabled={disabled}
           placeholder={placeholder}
-          value={showResolved ? resolvedDisplay! : query}
+          value={showResolved ? resolvedDisplay! : !open && text === null && optionLabel ? labelForOption(value) : query}
           onFocus={() => {
             setOpen(true)
             setActiveIndex(-1)
@@ -178,7 +184,10 @@ export function Combobox({
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => commit(option)}
             >
-                <span className="mono text-sm">{option}</span>
+                <span className="text-sm">{labelForOption(option)}</span>
+                {optionLabel && labelCounts.get(labelForOption(option))! > 1 && labelForOption(option) !== option && (
+                  <span className="mono text-xs text-dim">{option}</span>
+                )}
                 {optionBadges?.[option] && (
                   <span className="text-xs text-dim">{optionBadges[option]}</span>
                 )}

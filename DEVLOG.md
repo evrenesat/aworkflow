@@ -1173,3 +1173,36 @@ Final verification: web tests (213), all server tests including Chromium layout 
 
 - Recovery also recognizes a durable manager context-budget prelaunch failure after a completed worker turn. Resume replays its validated manager boundary rather than rejecting the completed plan or skipping pending review; unrelated completed-run and consumed-boundary gates remain intact.
 - Preserve original configuration identity during direct CLI resume from a validated predecessor snapshot; retain fingerprint checks and reject unrelated paths.
+
+## 2026-09-09 — Readable machine labels
+
+- Added one shared sentence-style formatter for snake_case identifiers, including
+  repeated-underscore collapsing, empty values, custom names and explicit acronym
+  casing.
+- Applied it at prompt, workflow, role, step, event and generated-settings label
+  boundaries while keeping prompt keys, selector values, API payloads, URLs,
+  DOM identity and technical details exact. Search accepts both raw identifiers
+  and readable labels; colliding readable labels retain raw secondary text.
+- Verification: 270 web tests, the production build, and four disposable
+  Chromium checks across desktop/mobile settings and run layouts passed. The
+  browser check covered keyboard selection of a readable workflow label and
+  restored the original draft value; no live configuration was changed.
+
+## 2026-09-10 — CP6 collision disambiguation repair
+
+- Added sibling-aware presentation labels so colliding team, workflow and role
+  names remain separately identifiable in settings navigation, native selects,
+  prompt override destinations, guided configuration and live-run controls.
+  Raw option values, keys, callbacks and save actions remain unchanged; custom
+  display names remain intact.
+- Added regression coverage for colliding and unique labels, including the
+  exact `fast__team` upgrade action and native selector values.
+- Verification: 277 web tests, the production build, and four disposable
+  Chromium/browser checks passed; `git diff --check` passed and no live
+  configuration was changed.
+
+- Follow-up repair disambiguates colliding `code_review`/`code__review` role
+  controls in global settings, team settings and live-run controls, while
+  retaining raw keys in exact save and control payloads. Verification: 279 web
+  tests, production build and four disposable Chromium checks passed; no live
+  configuration was changed.

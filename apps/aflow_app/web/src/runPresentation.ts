@@ -1,4 +1,5 @@
 import type { RunStatus } from './types'
+import { formatMachineLabel } from './label'
 
 export const terminalStatuses = new Set(['completed', 'done', 'failed', 'owner_stopped', 'interrupted'])
 
@@ -14,8 +15,7 @@ export function statusLabel(run: RunStatus): string {
   if (['manifest_only', 'launch_requested', 'unit_started', 'launch_started'].includes(run.status)) return run.activity === 'active' || run.evidence.unit_active === true ? 'Starting' : 'Needs attention'
   if (run.status === 'owner_stopped') return 'Stopped'
   if (run.status === 'done') return 'Completed'
-  const label = run.status.replace(/_/g, ' ')
-  return label.charAt(0).toUpperCase() + label.slice(1)
+  return formatMachineLabel(run.status)
 }
 
 export function executionDuration(run: RunStatus, now: number): string | null {

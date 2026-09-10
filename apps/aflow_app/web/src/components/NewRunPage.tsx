@@ -1,4 +1,5 @@
 import { useId, type ReactNode, type Dispatch, type SetStateAction } from 'react'
+import { formatMachineChoice, formatMachineLabel } from '../label'
 import { Combobox } from './Combobox'
 
 interface LaunchSelectorPresentation {
@@ -78,6 +79,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                     onChange={changeStartWorkflow}
                     options={workflowOptions}
                     optionBadges={workflowBadges}
+                    optionLabel={(workflow) => formatMachineChoice(workflow, workflowOptions)}
                     disabled={restartDraftFrozen}
                     placeholder="Search workflows"
                     resolvedDisplay={workflowPresentation.resolvedDisplay}
@@ -92,6 +94,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                     onChange={setStartTeam}
                     options={teamOptions}
                     optionBadges={teamBadges}
+                    optionLabel={(team) => formatMachineChoice(team, teamOptions)}
                     disabled={restartDraftFrozen}
                     placeholder="Search teams"
                     resolvedDisplay={teamPresentation.resolvedDisplay}
@@ -127,14 +130,14 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                       <select className="input" aria-label="Run start step" value={startStep} onChange={(event) => setStartStep(event.target.value)} disabled={!effectiveWorkflow || restartDraftFrozen}>
                         <option value="">{effectiveWorkflow ? 'Workflow first step (default)' : 'Select a workflow first'}</option>
                         {runSteps.map((step, index) => (
-                          <option key={step} value={step}>{index + 1} · {step}</option>
+                          <option key={step} value={step}>{index + 1} · {formatMachineLabel(step)}</option>
                         ))}
                       </select>
                     </label>
                     {skippedByDraft.length > 0 && (
                       <div className="notice">
-                        Starting at <strong>{startStep}</strong> skips the earlier executable steps:{' '}
-                        <span className="mono">{skippedByDraft.join(', ')}</span>. They are recorded as skipped, not executed.
+                        Starting at <strong>{formatMachineLabel(startStep)}</strong> skips the earlier executable steps:{' '}
+                        <span className="mono">{skippedByDraft.map(formatMachineLabel).join(', ')}</span>. They are recorded as skipped, not executed.
                       </div>
                     )}
                     <label className="dashboard-field"><span>Extra instructions (optional — one instruction per line)</span>

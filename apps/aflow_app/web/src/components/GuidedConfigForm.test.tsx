@@ -169,11 +169,11 @@ describe('GuidedConfigForm', () => {
     // The selector appears beside role and workflow assignments with its model.
     expect(screen.getAllByText('codex.default').length).toBeGreaterThanOrEqual(2)
     expect(screen.getAllByText('gpt-5.1').length).toBeGreaterThanOrEqual(2)
-    expect(screen.getByText(/team core overrides/)).toBeDefined()
+    expect(screen.getByText(/team Core overrides/)).toBeDefined()
     // Suggestions are labeled wherever they are offered.
     expect(screen.getAllByText(/suggestions/i).length).toBeGreaterThanOrEqual(2)
     // Workflow steps appear in executable order with resolved role sources.
-    expect(screen.getByText('prepare')).toBeDefined()
+    expect(screen.getByText('Prepare')).toBeDefined()
     expect(screen.getByText('global')).toBeDefined()
   })
 
@@ -184,12 +184,12 @@ describe('GuidedConfigForm', () => {
     const nameBox = screen.getByRole('combobox', { name: 'Profile name' }) as HTMLInputElement
     // Configured and suggested names are offered and visibly distinguished.
     fireEvent.focus(nameBox)
-    const tunedOption = screen.getAllByRole('option', { name: /tuned/ }).find(
+    const tunedOption = screen.getAllByRole('option', { name: /tuned/i }).find(
       (node) => node.closest('.combobox-listbox') !== null,
     ) as HTMLElement
     expect(within(tunedOption).getByText('configured')).toBeDefined()
     fireEvent.click(tunedOption)
-    expect(nameBox.value).toBe('tuned')
+    expect(nameBox.value).toBe('Tuned')
     // The configured model and effort hydrate the visible fields.
     expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLInputElement).value).toBe('deploy-custom')
     expect((screen.getByLabelText('Effort') as HTMLSelectElement).value).toBe('high')
@@ -213,7 +213,7 @@ describe('GuidedConfigForm', () => {
     setup()
     await screen.findByText('Agents and models')
     fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'claude' } })
-    pickOption(screen.getByRole('combobox', { name: 'Profile name' }), /tuned/)
+    pickOption(screen.getByRole('combobox', { name: 'Profile name' }), /tuned/i)
     fireEvent.click(screen.getByRole('button', { name: 'Clear model' }))
     expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLInputElement).value).toBe('')
     fireEvent.change(screen.getByLabelText('Effort'), { target: { value: '' } })
@@ -229,12 +229,12 @@ describe('GuidedConfigForm', () => {
     fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'claude' } })
     const nameBox = screen.getByRole('combobox', { name: 'Profile name' }) as HTMLInputElement
     fireEvent.focus(nameBox)
-    const deepOption = screen.getAllByRole('option', { name: /deep/ }).find(
+    const deepOption = screen.getAllByRole('option', { name: /deep/i }).find(
       (node) => node.closest('.combobox-listbox') !== null,
     ) as HTMLElement
     expect(within(deepOption).getByText('suggested')).toBeDefined()
     fireEvent.click(deepOption)
-    expect(nameBox.value).toBe('deep')
+    expect(nameBox.value).toBe('Deep')
     expect((screen.getByLabelText('Effort') as HTMLSelectElement).value).toBe('high')
     expect(screen.getByText(/not verified as available/)).toBeDefined()
 
@@ -249,13 +249,13 @@ describe('GuidedConfigForm', () => {
     await screen.findByText('Agents and models')
     fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'claude' } })
     const nameBox = screen.getByRole('combobox', { name: 'Profile name' }) as HTMLInputElement
-    pickOption(nameBox, /tuned/)
+    pickOption(nameBox, /tuned/i)
     expect((screen.getByRole('combobox', { name: 'Model' }) as HTMLInputElement).value).toBe('deploy-custom')
     // The user clears the committed value to browse the full suggestion list,
     // then picks another profile; the tuned values must not leak into it.
     fireEvent.focus(nameBox)
     fireEvent.change(nameBox, { target: { value: '' } })
-    const deepOption = screen.getAllByRole('option', { name: /deep/ }).find(
+    const deepOption = screen.getAllByRole('option', { name: /deep/i }).find(
       (node) => node.closest('.combobox-listbox') !== null,
     ) as HTMLElement
     fireEvent.click(deepOption)
@@ -365,7 +365,7 @@ describe('GuidedConfigForm', () => {
     await screen.findByText(/Choose one of the configured profiles/)
     expect(api.postGlobalConfigForm).toHaveBeenCalledTimes(callsBefore)
     // The typed role survives the rejected action.
-    expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('worker')
+    expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('Worker')
   })
 
   it('adds a team and applies a team role override', async () => {
@@ -389,12 +389,52 @@ describe('GuidedConfigForm', () => {
 
   it('sets a workflow default team, treating empty as no team', async () => {
     setup()
-    const select = await screen.findByLabelText('Default team for implement')
+    const select = await screen.findByLabelText('Default team for Implement')
     expect((select as HTMLSelectElement).value).toBe('core')
     fireEvent.change(select, { target: { value: '' } })
     await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenCalledWith( expect.objectContaining({
       action: { type: 'set_workflow_default_team', workflow: 'implement', team: null },
     }), expect.anything()))
+  })
+
+  it('disambiguates colliding guided choices without changing their raw values', async () => {
+    const collisionResponse = formResponse({
+      form: {
+        ...configuredForm,
+        default_workflow: 'implementation_plans',
+        teams: { fast_team: { roles: {} }, fast__team: { roles: {} }, slow_team: { roles: {} } },
+        workflow_default_teams: { implementation_plans: 'fast_team', 'implementation__plans': 'fast__team' },
+        workflows: {
+          implementation_plans: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work' },
+          implementation__plans: { declared_steps: ['work'], first_step: 'work', executable_steps: ['work'], first_executable_step: 'work' },
+        },
+      },
+      choices: {
+        ...configuredChoices,
+        teams: ['fast_team', 'fast__team', 'slow_team'],
+        workflows: ['implementation_plans', 'implementation__plans'],
+      },
+    })
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(collisionResponse)
+    setup()
+
+    const workflow = await screen.findByLabelText('Default workflow') as HTMLSelectElement
+    expect(within(workflow).getByRole('option', { name: 'Implementation plans (implementation_plans)', exact: true })).toBeTruthy()
+    expect(within(workflow).getByRole('option', { name: 'Implementation plans (implementation__plans)', exact: true })).toBeTruthy()
+    fireEvent.change(workflow, { target: { value: 'implementation__plans' } })
+    await waitFor(() => expect(api.postGlobalConfigForm).toHaveBeenLastCalledWith(expect.objectContaining({
+      action: { type: 'set_default_workflow', value: 'implementation__plans' },
+    }), expect.anything()))
+
+    const team = screen.getByLabelText('Team') as HTMLSelectElement
+    expect(within(team).getByRole('option', { name: 'Fast team (fast_team)', exact: true })).toBeTruthy()
+    expect(within(team).getByRole('option', { name: 'Fast team (fast__team)', exact: true })).toBeTruthy()
+    expect(within(team).getByRole('option', { name: 'Slow team', exact: true })).toBeTruthy()
+    fireEvent.change(team, { target: { value: 'fast__team' } })
+    expect(team.value).toBe('fast__team')
+
+    expect(screen.getByLabelText('Default team for Implementation plans (implementation_plans)')).toBeTruthy()
+    expect(screen.getByLabelText('Default team for Implementation plans (implementation__plans)')).toBeTruthy()
   })
 
   it('keeps both texts and points to Advanced TOML on a syntax error', async () => {
@@ -449,7 +489,7 @@ describe('GuidedConfigForm', () => {
     fireEvent.focus(roleBox)
     fireEvent.change(roleBox, { target: { value: 'worker' } })
     fireEvent.blur(roleBox)
-    expect(roleBox.value).toBe('worker')
+    expect(roleBox.value).toBe('Worker')
 
     vi.mocked(api.postGlobalConfigForm).mockRejectedValueOnce(new Error('reprojection failed'))
     view.rerender(<GuidedConfigForm {...props} aflowText={'# next\n'} />)
@@ -462,7 +502,7 @@ describe('GuidedConfigForm', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(await screen.findByText('Defaults')).toBeDefined()
     // The draft texts and the typed entry survive the failure and retry.
-    expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('worker')
+    expect((screen.getByRole('combobox', { name: 'Role' }) as HTMLInputElement).value).toBe('Worker')
   })
 
 

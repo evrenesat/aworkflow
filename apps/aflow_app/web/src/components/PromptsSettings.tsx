@@ -3,6 +3,7 @@ import type { GuidedFormProjection } from '../types'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { TemplateVariablesHelp } from './TemplateVariablesHelp'
+import { formatMachineChoice, formatMachineLabel } from '../label'
 
 type ChangeFn = (update: (value: GuidedFormProjection) => void) => void
 
@@ -18,17 +19,18 @@ function NamedPromptCard({ name, text, displayName, usages, templateVariables, r
 }) {
   const [confirming, setConfirming] = useState(false)
   const referenced = usages.length > 0
+  const label = formatMachineLabel(displayName)
   return <div className="card settings-fields prompt-card">
     <div className="prompt-card-header">
-      <strong className="mono truncate" title={displayName}>{displayName}</strong>
-      {!referenced && !confirming && <MoreMenu label={`More actions for prompt ${name}`}>
+      <strong className="mono truncate" title={displayName}>{label}</strong>
+      {!referenced && !confirming && <MoreMenu label={`More actions for prompt ${label}`}>
         <MenuItem onClick={() => setConfirming(true)}>Delete prompt…</MenuItem>
       </MoreMenu>}
     </div>
     {confirming ? (
-      <div className="confirmation" role="alertdialog" aria-label={`Delete prompt ${name}`}>
+      <div className="confirmation" role="alertdialog" aria-label={`Delete prompt ${label}`}>
         <span>
-          Delete the prompt <strong className="mono">{name}</strong> from the unsaved draft?
+          Delete the prompt <strong className="mono">{label}</strong> from the unsaved draft?
           The removal takes effect when you Save all; Undo is available until then.
         </span>
         <div className="dashboard-actions">
@@ -38,8 +40,8 @@ function NamedPromptCard({ name, text, displayName, usages, templateVariables, r
       </div>
     ) : (
       <>
-        <label>Prompt key <input className="input" value={displayName} aria-label={`Prompt key ${name}`} onChange={e => rename(name, e.target.value)} /></label>
-        <label>Prompt text <textarea className="input" rows={7} aria-label={`Prompt text ${name}`} value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></label>
+        <label>Prompt key <input className="input" value={displayName} aria-label="Prompt key" onChange={e => rename(name, e.target.value)} /></label>
+        <label>Prompt text <textarea className="input" rows={7} aria-label="Prompt text" value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></label>
         <TemplateVariablesHelp variables={templateVariables} context="named" />
         {referenced
           ? <details className="prompt-usages">
@@ -68,10 +70,13 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
   const [localSelected, setLocalSelected] = useState('')
   const [navigationVersion, setNavigationVersion] = useState(0)
   const entries = [
-    ...Object.keys(draft.prompts ?? {}).sort().map(name => ({ id: `named:${name}`, label: names[name] ?? name })),
-    ...Object.keys(draft.roles).sort().map(role => ({ id: JSON.stringify(['role', '', role]), label: `Global / ${role}` })),
-    ...Object.keys(draft.teams).sort().flatMap(team => [...new Set([...Object.keys(draft.roles), ...Object.keys(draft.teams[team].roles), ...Object.keys(draft.teams[team].prompts ?? {})])].sort().map(role => ({ id: JSON.stringify(['role', team, role]), label: `${team} / ${role}` }))),
+    ...Object.keys(draft.prompts ?? {}).sort().map(name => ({ id: `named:${name}`, rawLabel: names[name] ?? name, label: formatMachineLabel(names[name] ?? name) })),
+    ...Object.keys(draft.roles).sort().map(role => ({ id: JSON.stringify(['role', '', role]), rawLabel: `Global / ${role}`, label: `Global / ${formatMachineLabel(role)}` })),
+    ...Object.keys(draft.teams).sort().flatMap(team => [...new Set([...Object.keys(draft.roles), ...Object.keys(draft.teams[team].roles), ...Object.keys(draft.teams[team].prompts ?? {})])].sort().map(role => ({ id: JSON.stringify(['role', team, role]), rawLabel: `${team} / ${role}`, label: `${formatMachineLabel(team)} / ${formatMachineLabel(role)}` }))),
   ]
+  const roleNames = Object.keys(draft.roles).sort()
+  const teamNames = Object.keys(draft.teams).sort()
+  const entryLabelCounts = entries.reduce((counts, entry) => counts.set(entry.label, (counts.get(entry.label) ?? 0) + 1), new Map<string, number>())
   const requested = suppliedSelected ?? localSelected
   const selected = entries.some(entry => entry.id === requested) ? requested : entries[0]?.id ?? ''
   function select(id: string) { setLocalSelected(id); onSelect?.(id); setNavigationVersion(value => value + 1) }
@@ -95,12 +100,12 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
       prompts[key] = ''; select(`named:${key}`)
     })}>New prompt</button>
     {deleted.map(item => <div className="notice" role="status" key={item.name}>
-      Prompt <strong className="mono">{item.name}</strong> was removed from the unsaved draft; the deletion happens when you Save all.
-      <label>Restore under key <input className="input" aria-label={`Restore key ${item.name}`} value={restoreKeys[item.name] ?? item.name} onChange={event => setRestoreKeys(keys => ({ ...keys, [item.name]: event.target.value }))} /></label>
-      <button type="button" className="btn btn-secondary btn-sm" aria-label={`Undo deletion of ${item.name}`} onClick={() => onUndo(item.name, restoreKeys[item.name] ?? item.name)}>Undo</button>
+      Prompt <strong className="mono">{formatMachineLabel(item.name)}</strong> was removed from the unsaved draft; the deletion happens when you Save all.
+      <label>Restore under key <input className="input" aria-label="Restore key" value={restoreKeys[item.name] ?? item.name} onChange={event => setRestoreKeys(keys => ({ ...keys, [item.name]: event.target.value }))} /></label>
+      <button type="button" className="btn btn-secondary btn-sm" aria-label={`Undo deletion of ${formatMachineLabel(item.name)}`} onClick={() => onUndo(item.name, restoreKeys[item.name] ?? item.name)}>Undo</button>
     </div>)}
-    <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} navigation={<div><h3>Prompts</h3>{entries.map(entry => <button className={`btn sidebar-entry ${selected === entry.id ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === entry.id} key={entry.id} onClick={() => select(entry.id)}>{entry.label}</button>)}</div>}>
-    <h3>{entries.find(entry => entry.id === selected)?.label ?? 'No prompts'}</h3>
+    <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} navigation={<div><h3>Prompts</h3>{entries.map(entry => <button className={`btn sidebar-entry ${selected === entry.id ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === entry.id} key={entry.id} onClick={() => select(entry.id)}><span>{entry.label}</span>{entryLabelCounts.get(entry.label)! > 1 && entry.rawLabel !== entry.label && <span className="mono text-xs text-dim">{entry.rawLabel}</span>}</button>)}</div>}>
+    <h3>{entries.find(entry => entry.id === selected)?.label ?? 'No prompts'}{(() => { const entry = entries.find(item => item.id === selected); return entry && entryLabelCounts.get(entry.label)! > 1 && entry.rawLabel !== entry.label ? <span className="mono text-xs text-dim"> {entry.rawLabel}</span> : null })()}</h3>
     {Object.entries(draft.prompts ?? {}).filter(([name]) => selected === `named:${name}`).map(([name, text]) => <NamedPromptCard
       key={name}
       name={name}
@@ -119,8 +124,8 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
         <TemplateVariablesHelp variables={draft.template_variables} context="role" />
         {role in map && <button className="btn btn-secondary" onClick={() => setRoleText(null)}>Remove override</button>}
         {role in map && <details><summary>Move override</summary>
-          <label>Target role<select className="input" value={targetRole} onChange={e => setTargetRole(e.target.value)}><option value="">Choose role</option>{Object.keys(draft.roles).map(key => <option key={key}>{key}</option>)}</select></label>
-          <label>Target team<select className="input" value={targetTeam} onChange={e => setTargetTeam(e.target.value)}><option value="">Global roles</option>{Object.keys(draft.teams).map(key => <option key={key}>{key}</option>)}</select></label>
+          <label>Target role<select className="input" value={targetRole} onChange={e => setTargetRole(e.target.value)}><option value="">Choose role</option>{roleNames.map(key => <option key={key} value={key}>{formatMachineChoice(key, roleNames)}</option>)}</select></label>
+          <label>Target team<select className="input" value={targetTeam} onChange={e => setTargetTeam(e.target.value)}><option value="">Global roles</option>{teamNames.map(key => <option key={key} value={key}>{formatMachineChoice(key, teamNames)}</option>)}</select></label>
           {moveError && <p role="alert">{moveError}</p>}
           <button className="btn btn-secondary" onClick={() => {
             const destination = targetTeam ? draft.teams[targetTeam]?.prompts ?? {} : draft.role_prompts ?? {}

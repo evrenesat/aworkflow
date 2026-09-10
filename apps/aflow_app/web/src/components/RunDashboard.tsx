@@ -20,6 +20,7 @@ import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage } from './NewRunPage'
 import { statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
+import { formatMachineChoice, formatMachineLabel } from '../label'
 
 const MAX_TIMELINE_EVENTS = 100
 /** Bounded wait for exact source inactivity before a successor start. */
@@ -329,7 +330,7 @@ function managerOutcome(context: RunContext | null): ManagerOutcome | null {
   if (finished) {
     const parts: string[] = []
     if (typeof finished.turn_number === 'number') parts.push(`turn ${finished.turn_number}`)
-    if (typeof finished.step_name === 'string') parts.push(finished.step_name)
+    if (typeof finished.step_name === 'string') parts.push(formatMachineLabel(finished.step_name))
     if (typeof finished.status === 'string') parts.push(finished.status)
     if (typeof finished.returncode === 'number') parts.push(`exit ${finished.returncode}`)
     finishedTurn = parts.length ? parts.join(' · ') : null
@@ -1417,7 +1418,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const effectiveTeamSource = startTeam.trim()
     ? 'your selection'
     : workflowDefaultTeam
-      ? `workflow default (${workflowDefaultTeam})`
+      ? `workflow default (${formatMachineLabel(workflowDefaultTeam)})`
       : 'no team — global role assignments apply'
   const effectiveTeamRoles = effectiveTeam ? committedForm?.teams?.[effectiveTeam]?.roles ?? {} : {}
   const effectiveSteps = configuredWorkflowSteps(committedForm, capabilities, effectiveWorkflow)
@@ -1454,18 +1455,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   // name with a Default indicator; the open list offers an explicit default row.
   const workflowResolvedDisplay = startWorkflow.trim()
     ? null
-    : committedForm?.default_workflow || 'No default workflow configured'
+    : committedForm?.default_workflow ? formatMachineChoice(committedForm.default_workflow, workflowOptions) : 'No default workflow configured'
   const workflowResolvedBadge = !startWorkflow.trim() && committedForm?.default_workflow ? 'Default' : undefined
   const workflowDefaultOption = {
     value: '',
-    label: committedForm?.default_workflow ? `Use default (${committedForm.default_workflow})` : 'Use default',
+    label: committedForm?.default_workflow ? `Use default (${formatMachineChoice(committedForm.default_workflow, workflowOptions)})` : 'Use default',
     hint: committedForm?.default_workflow ? 'the global default workflow applies' : 'no global default workflow is configured',
   }
-  const teamResolvedDisplay = startTeam.trim() ? null : (workflowDefaultTeam || 'No team — global roles')
+  const teamResolvedDisplay = startTeam.trim() ? null : (workflowDefaultTeam ? formatMachineChoice(workflowDefaultTeam, teamOptions) : 'No team — global roles')
   const teamResolvedBadge = !startTeam.trim() && workflowDefaultTeam ? 'Default' : undefined
   const teamDefaultOption = {
     value: '',
-    label: workflowDefaultTeam ? `Use default (${workflowDefaultTeam})` : 'Use default (no team)',
+    label: workflowDefaultTeam ? `Use default (${formatMachineChoice(workflowDefaultTeam, teamOptions)})` : 'Use default (no team)',
     hint: workflowDefaultTeam ? 'the workflow default team applies' : 'global role assignments apply',
   }
   // Launch admission offers only saved Ready (in progress) plans: Draft and
@@ -1493,7 +1494,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (!effectiveWorkflow || !workflowOptions.includes(effectiveWorkflow)) return 'No default workflow configured — choose an available workflow, or set a global default in Settings.'
     if (effectiveTeam && !teamOptions.includes(effectiveTeam)) return 'Choose an available team, or clear the override to use the workflow default.'
     if (effectiveSteps.length === 0) return 'The workflow has no available executable steps to preview. Check it in Settings.'
-    if (unmappedSteps.length > 0) return `The exact role preview is unavailable for ${effectiveWorkflow} step${unmappedSteps.length > 1 ? 's' : ''} ${unmappedSteps.join(', ')} — the committed configuration does not map those executable steps to roles. Refresh, or check the workflow in Settings, before starting a run.`
+    if (unmappedSteps.length > 0) return `The exact role preview is unavailable for ${formatMachineLabel(effectiveWorkflow)} step${unmappedSteps.length > 1 ? 's' : ''} ${unmappedSteps.map(formatMachineLabel).join(', ')} — the committed configuration does not map those executable steps to roles. Refresh, or check the workflow in Settings, before starting a run.`
     return null
   })()
   const startDisabled = !projectAvailable
@@ -1550,7 +1551,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const modelEffort = resolution.selector ? selectorModelEffortText(resolution.selector, committedForm) : ''
     return (
       <tr key={`${teamName ?? 'workspace'}-${role}`}>
-        <td>{role}</td>
+        <td>{formatMachineLabel(role)}</td>
         <td className="mono">{resolution.selector ?? <span className="text-dim">not assigned</span>}</td>
         <td>{modelEffort || '—'}</td>
         <td className="text-sm">
@@ -1573,7 +1574,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 <dl className="run-preview-list">
                   <div><dt>Plan</dt><dd className="mono">{startPlanPath.trim() || <span className="text-dim">Not chosen</span>}</dd></div>
                   <div><dt>Workflow</dt><dd>{effectiveWorkflow
-                    ? <><span className="mono">{effectiveWorkflow}</span> — {effectiveWorkflowSource}</>
+                    ? <><span className="mono">{formatMachineLabel(effectiveWorkflow)}</span> — {effectiveWorkflowSource}</>
                     : <span className="text-dim">No default workflow configured — choose a workflow or set a global default in Settings</span>}</dd></div>
                   <div><dt>Max turns</dt><dd>{startMaxTurnsProblem !== null
                     ? <><span className="mono">{startMaxTurns.trim()}</span> — invalid override: correct the Max turns field</>
@@ -1581,7 +1582,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       ? <><span className="mono">{effectiveMaxTurns}</span> — {effectiveMaxTurnsSource}</>
                       : <span className="text-dim">{effectiveMaxTurnsSource}</span>}</dd></div>
                   <div><dt>Team</dt><dd>{effectiveTeam
-                    ? <><span className="mono">{effectiveTeam}</span> — {effectiveTeamSource}</>
+                    ? <><span className="mono">{formatMachineLabel(effectiveTeam)}</span> — {effectiveTeamSource}</>
                     : <span className="text-dim">{effectiveTeamSource}</span>}</dd></div>
                 </dl>
                 {workflowRoleList.length > 0 && (
@@ -1589,7 +1590,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     <h4>Team members</h4>
                     <table className="guided-table">
                       <caption className="text-xs text-dim">
-                        Effective role assignments for this workflow{effectiveTeam ? ` with team ${effectiveTeam}` : ''} (team override → global fallback)
+                        Effective role assignments for this workflow{effectiveTeam ? ` with team ${formatMachineLabel(effectiveTeam)}` : ''} (team override → global fallback)
                       </caption>
                       <thead><tr><th scope="col">Role</th><th scope="col">Selector</th><th scope="col">Model / effort</th><th scope="col">Source</th></tr></thead>
                       <tbody>
@@ -1611,7 +1612,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {effectiveWorkflow && (effectiveSteps.length ? (
                   <table className="guided-table">
                     <caption className="text-xs text-dim">
-                      Executable steps with their exact role ({effectiveTeam ? `team ${effectiveTeam} override → global` : 'global selector'})
+                      Executable steps with their exact role ({effectiveTeam ? `team ${formatMachineLabel(effectiveTeam)} override → global` : 'global selector'})
                     </caption>
                     <thead><tr><th scope="col">Step</th><th scope="col">Role → selector</th></tr></thead>
                     <tbody>
@@ -1622,18 +1623,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                           : null
                         return (
                           <tr key={step}>
-                            <td className="mono">{step}</td>
+                            <td className="mono">{formatMachineLabel(step)}</td>
                             <td>
                               {!resolution
                                 ? <span className="text-dim text-sm">Exact role preview unavailable for this step.</span>
                                 : resolution.selector
                                   ? <div className="text-sm">
-                                      <span className="mono">{resolution.role} → {resolution.selector}</span>
+                                      <span className="mono">{formatMachineLabel(resolution.role)} → {resolution.selector}</span>
                                       {selectorModelEffortText(resolution.selector, committedForm) && <> · {selectorModelEffortText(resolution.selector, committedForm)}</>}
                                       {resolution.source === 'team' && <> — team override</>}
                                       {resolution.source === 'global' && <> — global</>}
                                     </div>
-                                  : <div className="text-sm"><span className="mono">{resolution.role}</span> — <span className="text-dim">missing — assign it in Settings → Roles or a team override</span></div>}
+                                  : <div className="text-sm"><span className="mono">{formatMachineLabel(resolution.role)}</span> — <span className="text-dim">missing — assign it in Settings → Roles or a team override</span></div>}
                             </td>
                           </tr>
                         )
@@ -1642,7 +1643,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   </table>
                 ) : (
                   <p className="text-sm text-dim">
-                    Executable steps for <span className="mono">{effectiveWorkflow}</span> are not available from the
+                    Executable steps for <span className="mono">{formatMachineLabel(effectiveWorkflow)}</span> are not available from the
                     committed configuration — check the workflow declaration in Settings.
                   </p>
                 ))}
@@ -1652,7 +1653,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     {!capabilities ? (
                       <p className="text-sm text-dim">The upgrade chain cannot be read because project capabilities failed to load. Refresh to retry.</p>
                     ) : !upgradeChain ? (
-                      <p className="text-sm text-dim">Team <span className="mono">{effectiveTeam}</span> is not part of the configured upgrade graph. Refresh, or check the team links in Settings.</p>
+                    <p className="text-sm text-dim">Team <span className="mono">{formatMachineLabel(effectiveTeam)}</span> is not part of the configured upgrade graph. Refresh, or check the team links in Settings.</p>
                     ) : (
                       <>
                         <ol className="upgrade-chain">
@@ -1664,8 +1665,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                             const stageRoles = [...new Set([...Object.keys(teamRoles), ...Object.keys(committedForm?.roles ?? {})])].sort()
                             return (
                               <li key={team}>
-                                <span className="mono">{team}</span>
-                                <span className="text-sm"> — worker {worker.selector
+                                <span className="mono">{formatMachineLabel(team)}</span>
+                                <span className="text-sm"> — {formatMachineLabel('worker')} {worker.selector
                                   ? <span className="mono">{worker.selector}</span>
                                   : <span className="text-dim">not assigned</span>}{modelEffort ? <> · {modelEffort}</> : null}</span>
                                 {isLast && <span className="text-xs text-dim"> — no further upgrade configured</span>}
@@ -1710,8 +1711,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     <div className="confirmation">
                       <span>
                         Confirm source <span className="mono">{restartSource.run_id}</span> (revision {restartSource.revision}) and start
-                        successor workflow <strong>{restartDraftWorkflow}</strong>
-                        {startStep.trim() ? <> at step <strong>{startStep.trim()}</strong></> : null}
+                        successor workflow <strong>{formatMachineLabel(restartDraftWorkflow)}</strong>
+                        {startStep.trim() ? <> at step <strong>{formatMachineLabel(startStep.trim())}</strong></> : null}
                         {startPlanPath ? <> with plan <span className="mono">{startPlanPath.trim()}</span></> : null}? The successor records this run as its restart source.
                       </span>
                       <button className="btn btn-danger" disabled={busyAction !== null || restartInProgress} onClick={() => void handleConfirmedRestart()}>Confirm stop and start successor</button>
@@ -1812,7 +1813,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 <span className="status-pill">{statusLabel(run)}</span>
                 <span className="text-xs text-dim">
                   {run.restarted_from_run_id ? '↻ successor · ' : ''}
-                  {run.workflow_name}{run.current_step ? ` · ${run.current_step}` : ''}
+                  {formatMachineLabel(run.workflow_name ?? '')}{run.current_step ? ` · ${formatMachineLabel(run.current_step)}` : ''}
                   {run.skipped_steps.length > 0 ? ` · ${run.skipped_steps.length} skipped` : ''}
                 </span>
               </button>
@@ -1843,9 +1844,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <button className="btn btn-secondary" onClick={() => setHistoryConfirm(null)}>Cancel</button>
                 </div>}
                 <dl className="run-progress-strip">
-                  {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{selectedRun.current_step} · {selectedRun.turns_completed ?? 0}</dd></div>}
-                  {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{selectedRun.workflow_name}</dd></div>}
-                  <div><dt>Team</dt><dd>{selectedRun.team ?? 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
+                  {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
+                  {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
+                  <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
                   {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
                     : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
                   {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
@@ -1869,8 +1870,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {savedOverrides && <div>
                   <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}</p>
                   {savedOverrides.max_turns && <p>Max turns: {savedOverrides.max_turns}</p>}
-                  {savedOverrides.team && <p>Team: {savedOverrides.team}</p>}
-                  {Object.entries(savedOverrides.role_selectors ?? {}).map(([role, selector]) => <p key={role}>{role}: {selector}</p>)}
+                  {savedOverrides.team && <p>Team: {formatMachineLabel(savedOverrides.team)}</p>}
+                  {Object.entries(savedOverrides.role_selectors ?? {}).map(([role, selector]) => <p key={role}>{formatMachineLabel(role)}: {selector}</p>)}
                 </div>}
               </details>}
 
@@ -1882,16 +1883,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </div>
                 <div className="dashboard-form-grid">
                   <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>
-                  <label className="dashboard-field"><span>Team</span><select className="input" aria-label="Control team" value={controlTeam} disabled={!canMutate || !hasSafeControl('team')} onChange={(event) => setControlTeam(event.target.value)}><option value="">No team</option>{capabilities?.teams.map((team) => <option key={team} value={team}>{team}</option>)}</select></label>
+                  <label className="dashboard-field"><span>Team</span><select className="input" aria-label="Control team" value={controlTeam} disabled={!canMutate || !hasSafeControl('team')} onChange={(event) => setControlTeam(event.target.value)}><option value="">No team</option>{(capabilities?.teams ?? []).map((team) => <option key={team} value={team}>{formatMachineChoice(team, capabilities?.teams ?? [])}</option>)}</select></label>
                 </div>
                 {roleChoices.map((role) => {
                   const admitted = capabilities?.admitted_role_selectors?.[role] ?? []
                   return (
                     <label className="dashboard-field" key={role}>
-                      <span>Selector for {role}{overrideRoles(controlOverride)[role] ? ` (current override: ${overrideRoles(controlOverride)[role]})` : ''}</span>
+                      <span>Selector for {formatMachineChoice(role, roleChoices)}{overrideRoles(controlOverride)[role] ? ` (current override: ${overrideRoles(controlOverride)[role]})` : ''}</span>
                       <select
                         className="input"
-                        aria-label={`Selector for ${role}`}
+                        aria-label={`Selector for ${formatMachineChoice(role, roleChoices)}`}
                         value={roleSelectors[role] ?? ''}
                         disabled={!canMutate || !hasSafeControl('role_selectors') || admitted.length === 0}
                         onChange={(event) => setRoleSelectors((current) => ({ ...current, [role]: event.target.value }))}
@@ -1936,7 +1937,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               <section className="dashboard-section">
                 <div className="section-heading"><div><h4>Activity timeline</h4><span className="text-xs text-dim">{events.length} recent events</span></div></div>
                 {streamNotice && <div className="notice">{streamNotice}</div>}
-                {events.length === 0 ? <p className="text-sm text-dim">No activity has been reported yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{event.event_type.replace(/_/g, ' ')}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
+                {events.length === 0 ? <p className="text-sm text-dim">No activity has been reported yet.</p> : <div className="run-timeline">{events.map((event) => <article className="timeline-event" key={event.sequence}><div><strong>{formatMachineLabel(event.event_type)}</strong><span className="text-xs text-dim">#{event.sequence} · {timestamp(event.timestamp)}</span></div></article>)}</div>}
               </section>
 
 <p>Backend state: {selectedRun.status} · {streamLabel}</p>
@@ -1973,8 +1974,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                         {selectedRun.worker_exit.diagnostic_unavailable && <p>Original worker error was not retained.</p>}
                       </>}
                       {!selectedRun.worker_exit && selectedRun.reason && <p>{selectedRun.reason}</p>}
-                      <p>{[selectedRun.plan_path, selectedRun.workflow_name, selectedRun.team, selectedRun.current_step].filter(Boolean).join(' · ')}</p>
-                      {events.length > 0 && <p>Last event: {events[events.length - 1].event_type.replace(/_/g, ' ')} · {timestamp(events[events.length - 1].timestamp)}</p>}
+                      <p>{[selectedRun.plan_path, selectedRun.workflow_name ? formatMachineLabel(selectedRun.workflow_name) : null, selectedRun.team ? formatMachineLabel(selectedRun.team) : null, selectedRun.current_step ? formatMachineLabel(selectedRun.current_step) : null].filter(Boolean).join(' · ')}</p>
+                      {events.length > 0 && <p>Last event: {formatMachineLabel(events[events.length - 1].event_type)} · {timestamp(events[events.length - 1].timestamp)}</p>}
                       <p>{selectedRun.evidence.can_resume === true ? 'Saved continuation is available.' : 'Resume is unavailable: no admitted saved continuation.'} {selectedRun.status === 'failed' ? 'Restart with options checks eligibility before creating a fresh run.' : ''}</p>
                       <details open={rawOpen}>
                         <summary onClick={event => { event.preventDefault(); setRawOpen(open => !open) }}>Raw details</summary>
