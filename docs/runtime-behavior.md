@@ -223,7 +223,10 @@ All keys are optional, but the file must contain at least one. `next_step` must
 name an executable step in the current workflow. `team` must be configured and
 able to resolve the target step's role. `max_turns` must be positive and cannot
 be below the number of completed turns. `notes` is an array of non-empty
-strings and is appended only to the next worker prompt.
+strings. With `next_step`, they are appended only to that selected step's
+prompt; without `next_step`, they retain the legacy behavior of reaching the
+next worker prompt. They are one-turn recovery guidance, consumed when the
+matching turn is durably started, and retained through a prelaunch failure.
 `roles` maps role names to fully qualified `harness.profile` selectors and is
 the run-local role-selector hotplug surface: it overrides the current role
 routing for the next worker turn (validated against the current config) and
@@ -278,8 +281,10 @@ released. Later boundaries read only the successor's
 `.aflow/runs/<successor-run-id>/overrides.toml`. The accepted digest/result stays
 durable to prevent replay across further resume generations. `team` becomes the
 successor's effective baseline, `max_turns` remains the effective limit,
-`next_step` affects only the applying boundary, and `notes` reach only the next
-worker prompt.
+`next_step` affects only the applying boundary, and `notes` reach only the
+selected one-turn prompt (or the next worker when `next_step` is omitted).
+Text supplied after the CLI `--` remains run-wide guidance and is independent
+of these notes; do not put checkpoint-specific recovery directions there.
 
 Protected state has no override syntax. For example, this is rejected because
 `active_turn` is not a supported key:

@@ -135,6 +135,10 @@ Positional arguments:
 
 Extra instructions:
   Append -- followed by free-form text to pass extra instructions to each step prompt.
+  This text is run-wide guidance. For one-turn recovery directions, write
+  notes = ["..."] to the run-owned overrides.toml; pair it with
+  next_step = "review_checkpoint" to target one review, or omit next_step for
+  the next worker.
 
 Examples:
   aflow run path/to/plan.md
@@ -359,6 +363,16 @@ def _validate_current_resume_metadata(
         value = prev_run.get(field)
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise _resume_metadata_error(run_id, field, "expected a list of strings")
+    pending_override_target_step = prev_run.get("pending_override_target_step")
+    if pending_override_target_step is not None and (
+        not isinstance(pending_override_target_step, str)
+        or not pending_override_target_step.strip()
+    ):
+        raise _resume_metadata_error(
+            run_id,
+            "pending_override_target_step",
+            "expected a non-empty string or null",
+        )
 
     for field in ("manager_history", "review_rejection_history", "repartition_history"):
         value = prev_run.get(field)
@@ -2146,6 +2160,12 @@ def _reconstruct_resume_context(
         isinstance(note, str) for note in pending_override_notes
     ):
         pending_override_notes = []
+    pending_override_target_step = prev_run.get("pending_override_target_step")
+    if pending_override_target_step is not None and (
+        not isinstance(pending_override_target_step, str)
+        or not pending_override_target_step.strip()
+    ):
+        pending_override_target_step = None
     resolved_max_turns = effective_max_turns
     if resolved_max_turns is None:
         resolved_max_turns = prev_run.get("effective_max_turns")
@@ -2254,6 +2274,7 @@ def _reconstruct_resume_context(
         last_accepted_override=override_resolution.last_accepted_override,
         effective_max_turns=resolved_max_turns,
         pending_override_notes=tuple(pending_override_notes),
+        pending_override_target_step=pending_override_target_step,
         override_source_run_dir=override_resolution.source_run_dir,
         override_file_present=override_resolution.file_present,
         terminal_integration_only=terminal_integration_only,

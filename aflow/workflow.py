@@ -6772,6 +6772,7 @@ def run_workflow(
         state.hotplug_transaction_number = resume.hotplug_transaction_number
         state.hotplug_history = list(resume.hotplug_history)
         state.pending_override_notes = resume.pending_override_notes
+        state.pending_override_target_step = resume.pending_override_target_step
         state.override_source_run_dir = resume.override_source_run_dir
         state.override_file_present = resume.override_file_present
         transactions = [
@@ -10155,6 +10156,9 @@ def run_workflow(
             )
 
         state.pending_override_notes = request.notes
+        state.pending_override_target_step = (
+            request.next_step if request.notes else None
+        )
         state.override_result = OverrideResult(
             status="accepted",
             digest=request.digest,
@@ -10805,7 +10809,14 @@ def run_workflow(
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
                         f"- {note}" for note in manager_notes
                     )
-                if step.role == "worker" and state.pending_override_notes:
+                override_notes_match = bool(state.pending_override_notes) and (
+                    state.pending_override_target_step == current_step_name
+                    or (
+                        state.pending_override_target_step is None
+                        and step.role == "worker"
+                    )
+                )
+                if override_notes_match:
                     user_prompt += (
                         "\n\n## User override notes for this turn\n"
                         + "\n".join(
@@ -11126,7 +11137,14 @@ def run_workflow(
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
                         f"- {note}" for note in manager_notes
                     )
-                if step.role == "worker" and state.pending_override_notes:
+                override_notes_match = bool(state.pending_override_notes) and (
+                    state.pending_override_target_step == current_step_name
+                    or (
+                        state.pending_override_target_step is None
+                        and step.role == "worker"
+                    )
+                )
+                if override_notes_match:
                     user_prompt += (
                         "\n\n## User override notes for this turn\n"
                         + "\n".join(
@@ -11270,17 +11288,6 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
 
-        if step.role == "worker":
-            state.pending_override_notes = ()
-        if step.role == "worker":
-            run_metadata.write(
-                status="running",
-                last_snapshot=state.last_snapshot,
-                original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-            )
-
         turn_dir, turn_started_at = _start_turn(
             turn_number=turn_number,
             step_name=current_step_name,
@@ -11299,6 +11306,17 @@ def run_workflow(
         selected_transition: GoTransition | None = None
         transition_target: str | None = None
         try:
+            if override_notes_match:
+                state.pending_override_notes = ()
+                state.pending_override_target_step = None
+                run_metadata.write(
+                    status="running",
+                    last_snapshot=state.last_snapshot,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                )
             if consume_manager_notes:
                 state.pending_manager_notes = None
             if consume_team_override:

@@ -18,9 +18,11 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp10 v02` — approved.
+- Last Reviewed Checkpoint: `cp11 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp11 v01` from the immediately preceding worker worktree against approved CP10 `89ea22c`; worktree fallback, zero intervening implementation commits. Reviewed selected-step and legacy worker note delivery, both prompt paths, prelaunch retention, durable target reconstruction and consumption, successor non-replay and independent run-wide guidance. Required suite: 305 passed, 43 subtests; focused CLI resume: 4 passed, 10 subtests; source Ruff and diff check passed. No material findings. CP12 remains unchecked; manager 40 KiB hard guard and compact 16 KiB summary retained.
 
 - 2026-09-10: Approved `cp10 v02` from the immediately preceding repaired worker worktree against approved CP9 `ff7f388`; worktree fallback, zero intervening implementation commits. Reviewed active-scope targeting, finalized-worker recovery independent of manager-boundary replay, original approval evidence, overlay context, both prompt call sites and bundled reviewer rules. Required suite: 323 passed, 43 subtests; focused pending-finalized CLI: 1 passed; source Ruff and diff check passed. No material findings. CP10-v02 repair overlay resolved; CP11 remains unchecked. Manager 40 KiB hard guard, compact 16 KiB summary and CP13 amendment retained.
 
@@ -342,7 +344,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** No unambiguous pending target in a legacy fixture: expose that actual ambiguity rather than invent a numeric fallback or new approval ledger.
 
-### [ ] Checkpoint 11: Deliver one-turn recovery notes to the selected step
+### [x] Checkpoint 11: Deliver one-turn recovery notes to the selected step
 
 **Goal:** A one-turn recovery note can target a reviewer without leaking into later turns.
 
@@ -352,9 +354,9 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Extend existing `notes` + `next_step` processing so reviewer-targeted recovery notes appear in that review invocation and are consumed with it. Without `next_step`, keep next-worker delivery. Reuse existing durable request/result and pending-note fields, adding only a small target-step field if needed for resume; legacy absent target means next worker. Avoid replay after a completed targeted turn, including a successor resume; retain notes after a prelaunch failure so recovery is not lost.
-- [ ] Test reviewer notes delivered once; unrelated step does not consume them; preflight failure does not consume; completed review plus resume does not replay; actual successor prompt preserves global text independently. Preserve existing worker-note tests and predecessor evidence.
-- [ ] Document run-wide versus one-turn lifetimes in `docs/runtime-behavior.md`, the assistant engine reference and existing CLI help examples. Use `next_step = "review_checkpoint"` plus `notes` for one review's recovery directions; do not suggest putting a fixed checkpoint recovery instruction into global text.
+- [x] Extend existing `notes` + `next_step` processing so reviewer-targeted recovery notes appear in that review invocation and are consumed with it. Without `next_step`, keep next-worker delivery. Reuse existing durable request/result and pending-note fields, adding only a small target-step field if needed for resume; legacy absent target means next worker. Avoid replay after a completed targeted turn, including a successor resume; retain notes after a prelaunch failure so recovery is not lost.
+- [x] Test reviewer notes delivered once; unrelated step does not consume them; preflight failure does not consume; completed review plus resume does not replay; actual successor prompt preserves global text independently. Preserve existing worker-note tests and predecessor evidence.
+- [x] Document run-wide versus one-turn lifetimes in `docs/runtime-behavior.md`, the assistant engine reference and existing CLI help examples. Use `next_step = "review_checkpoint"` plus `notes` for one review's recovery directions; do not suggest putting a fixed checkpoint recovery instruction into global text.
 
 **Dependencies:** Checkpoint 3 boundary overrides. Compatible with checkpoint 10 but does not depend on its target inference.
 

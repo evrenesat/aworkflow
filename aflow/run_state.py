@@ -753,6 +753,9 @@ class ResumeContext:
     hotplug_history: tuple[HotplugTransactionV1, ...] = ()
     effective_max_turns: int | None = None
     pending_override_notes: tuple[str, ...] = ()
+    # Explicit override notes target this step; ``None`` preserves the legacy
+    # meaning of delivering them to the next worker turn.
+    pending_override_target_step: str | None = None
     override_source_run_dir: Path | None = None
     override_file_present: bool = False
     terminal_integration_only: bool = False
@@ -878,6 +881,9 @@ class ControllerState:
     hotplug_history: list[HotplugTransactionV1] = field(default_factory=list)
     effective_max_turns: int | None = None
     pending_override_notes: tuple[str, ...] = ()
+    # Explicit override notes target this step; ``None`` preserves the legacy
+    # meaning of delivering them to the next worker turn.
+    pending_override_target_step: str | None = None
     override_source_run_dir: Path | None = None
     override_file_present: bool = False
 

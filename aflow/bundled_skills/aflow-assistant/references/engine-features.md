@@ -344,8 +344,13 @@ notes = ["Re-run the focused regression before broader tests."]
 - `roles` maps role names to fully qualified `harness.profile` selectors. It
   becomes authoritative for the next worker turn and drives hotplug
   transactions (below). Selectors are validated against the frozen config.
-- `notes` is an array of non-empty strings appended only to the next worker
-  prompt.
+- `notes` is an array of non-empty strings. When `next_step` is present, the
+  notes are appended once to that selected step's prompt; when it is omitted,
+  they retain the legacy next-worker behavior. They are one-turn recovery
+  guidance, retained through a prelaunch failure and consumed when the target
+  turn durably starts. CLI text after `--` is run-wide guidance and has a
+  separate lifetime; use `next_step = "review_checkpoint"` plus `notes` for
+  recovery directions intended for one review.
 
 The file is read once per pre-turn boundary, never while a harness runs; the
 accepted digest is durable and never applied twice. Invalid content leaves

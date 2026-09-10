@@ -1445,6 +1445,10 @@ class RunMetadataWriter:
                 payload["last_accepted_override"] = previous["last_accepted_override"]
             if self.state.pending_override_notes:
                 payload["pending_override_notes"] = list(self.state.pending_override_notes)
+                if self.state.pending_override_target_step is not None:
+                    payload["pending_override_target_step"] = (
+                        self.state.pending_override_target_step
+                    )
             if self.state.override_source_run_dir is not None:
                 payload["override_source_run_dir"] = str(self.state.override_source_run_dir)
             if end_reason is None:

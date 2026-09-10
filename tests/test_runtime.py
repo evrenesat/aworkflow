@@ -171,6 +171,7 @@ def _resume_override_context(
     predecessor_dir: Path,
     persisted_result: Mapping[str, object] | None = None,
     pending_notes: tuple[str, ...] = (),
+    pending_target_step: str | None = None,
 ) -> ResumeContext:
     resolution = resolve_resume_override(
         predecessor_dir,
@@ -185,8 +186,52 @@ def _resume_override_context(
         teardown=(),
         override_result=resolution.override_result,
         pending_override_notes=pending_notes,
+        pending_override_target_step=pending_target_step,
         override_source_run_dir=resolution.source_run_dir,
         override_file_present=resolution.file_present,
+    )
+
+
+def _review_note_workflow_config() -> WorkflowUserConfig:
+    workflow = WorkflowConfig(
+        steps={
+            "implement": WorkflowStepConfig(
+                role="worker",
+                prompts=("implement",),
+                go=(
+                    GoTransition(to="END", when="DONE"),
+                    GoTransition(to="review"),
+                ),
+            ),
+            "review": WorkflowStepConfig(
+                role="reviewer",
+                prompts=("review",),
+                go=(
+                    GoTransition(to="implement", when="!DONE"),
+                    GoTransition(to="END", when="DONE"),
+                ),
+            ),
+        },
+        first_step="implement",
+    )
+    return WorkflowUserConfig(
+        roles={
+            "worker": "codex.worker",
+            "reviewer": "codex.reviewer",
+        },
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                }
+            )
+        },
+        workflows={"review_notes": workflow},
+        prompts={
+            "implement": "Implement {ACTIVE_PLAN_PATH}.",
+            "review": "Review {ACTIVE_PLAN_PATH}.",
+        },
     )
 
 
@@ -821,6 +866,280 @@ class WorkflowRuntimeTests(unittest.TestCase):
             assert changed.status == "valid"
             assert changed.request is not None
             assert changed.request.digest != loaded.request.digest
+
+    def test_override_notes_target_reviewer_once_and_global_text_reaches_successor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _review_note_workflow_config()
+            note = "Review only the recovery evidence for this turn."
+            global_text = "RUN-WIDE-GUIDANCE"
+            actual_create = create_run_paths
+            created_paths = []
+
+            def create_with_override(controller_config: ControllerConfig):
+                paths = actual_create(controller_config)
+                created_paths.append(paths)
+                (paths.run_dir / "overrides.toml").write_text(
+                    'next_step = "review"\n'
+                    f"notes = [{note!r}]\n",
+                    encoding="utf-8",
+                )
+                return paths
+
+            prompts: list[str] = []
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                prompt = _runner_prompt(argv, kwargs)
+                prompts.append(prompt)
+                if calls == 2:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ):
+                result = run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                        extra_instructions=(global_text,),
+                    ),
+                    workflow_config,
+                    "review_notes",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert result.final_snapshot.is_complete
+            assert calls == 2
+            assert len(prompts) == 2
+            assert note in prompts[0]
+            assert note not in prompts[1]
+            assert prompts[0].count(note) == 1
+            assert all(global_text in prompt for prompt in prompts)
+            payload = json.loads(
+                created_paths[0].run_json.read_text(encoding="utf-8")
+            )
+            assert "pending_override_notes" not in payload
+            assert "pending_override_target_step" not in payload
+
+    def test_targeted_override_notes_wait_for_the_matching_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            worktree_path = root / "worktree"
+            repo_root.mkdir()
+            worktree_path.mkdir()
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            predecessor_dir = repo_root / ".aflow" / "runs" / "predecessor"
+            predecessor_dir.mkdir(parents=True)
+            note = "Deliver this only to the reviewer."
+            resume = _resume_override_context(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                predecessor_dir=predecessor_dir,
+                pending_notes=(note,),
+                pending_target_step="review",
+            )
+            prompts: list[str] = []
+            calls = 0
+
+            def runner(argv, **kwargs):
+                nonlocal calls
+                calls += 1
+                prompts.append(_runner_prompt(argv, kwargs))
+                if calls == 1:
+                    successors = [
+                        path
+                        for path in (repo_root / ".aflow" / "runs").iterdir()
+                        if path != predecessor_dir
+                    ]
+                    assert len(successors) == 1
+                    payload = json.loads(
+                        (successors[0] / "run.json").read_text(encoding="utf-8")
+                    )
+                    assert payload["pending_override_notes"] == [note]
+                    assert payload["pending_override_target_step"] == "review"
+                else:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=2,
+                ),
+                _review_note_workflow_config(),
+                "review_notes",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=resume,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert calls == 2
+            assert note not in prompts[0]
+            assert prompts[1].count(note) == 1
+
+    def test_targeted_override_notes_survive_a_preflight_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            predecessor_dir = repo_root / ".aflow" / "runs" / "predecessor"
+            predecessor_dir.mkdir(parents=True)
+            note = "Keep this recovery direction for the reviewer."
+            resume = ResumeContext(
+                resumed_from_run_id=predecessor_dir.name,
+                feature_branch=None,
+                worktree_path=None,
+                main_branch=None,
+                setup=(),
+                teardown=(),
+                interrupted_step_name="review",
+                pending_override_notes=(note,),
+                pending_override_target_step="review",
+            )
+            runner_calls: list[str] = []
+
+            class BlockingProbe(NoOpHarnessPreflightProbe):
+                def resolve_executable(self, command: str, *, env):
+                    return None
+
+            with pytest.raises(WorkflowError, match="environment preflight") as error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                    ),
+                    _review_note_workflow_config(),
+                    "review_notes",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=lambda argv, **kwargs: runner_calls.append(
+                        _runner_prompt(argv, kwargs)
+                    ),
+                    preflight_probe=BlockingProbe(),
+                    resume=resume,
+                )
+
+            assert runner_calls == []
+            assert error.value.run_dir is not None
+            payload = json.loads(
+                (error.value.run_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert payload["pending_override_notes"] == [note]
+            assert payload["pending_override_target_step"] == "review"
+
+    def test_targeted_override_note_is_not_replayed_after_review_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _review_note_workflow_config()
+            note = "This must not replay after the review turn."
+            actual_create = create_run_paths
+
+            def create_with_override(controller_config: ControllerConfig):
+                paths = actual_create(controller_config)
+                (paths.run_dir / "overrides.toml").write_text(
+                    'next_step = "review"\n'
+                    f"notes = [{note!r}]\n",
+                    encoding="utf-8",
+                )
+                return paths
+
+            first_calls = 0
+            first_prompts: list[str] = []
+
+            def failing_runner(argv, **kwargs):
+                nonlocal first_calls
+                first_calls += 1
+                first_prompts.append(_runner_prompt(argv, kwargs))
+                return subprocess.CompletedProcess(argv, 0 if first_calls == 1 else 1, "ok", "")
+
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_override,
+            ), pytest.raises(WorkflowError) as first_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=2,
+                    ),
+                    workflow_config,
+                    "review_notes",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=failing_runner,
+                )
+
+            failed_dir = first_error.value.run_dir
+            assert failed_dir is not None
+            failed_payload = json.loads(
+                (failed_dir / "run.json").read_text(encoding="utf-8")
+            )
+            assert note in first_prompts[0]
+            assert "pending_override_notes" not in failed_payload
+            assert "pending_override_target_step" not in failed_payload
+            resolution = resolve_resume_override(
+                failed_dir,
+                failed_payload["override_result"],
+            )
+            resumed_prompts: list[str] = []
+
+            def resumed_runner(argv, **kwargs):
+                resumed_prompts.append(_runner_prompt(argv, kwargs))
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=1,
+                ),
+                workflow_config,
+                "review_notes",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=resumed_runner,
+                resume=ResumeContext(
+                    resumed_from_run_id=failed_dir.name,
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                    interrupted_step_name="implement",
+                    override_result=resolution.override_result,
+                    last_accepted_override=resolution.last_accepted_override,
+                ),
+            )
+
+            assert result.final_snapshot.is_complete
+            assert len(resumed_prompts) == 1
+            assert note not in resumed_prompts[0]
 
     def test_resume_override_applies_post_stop_before_launch_and_does_not_replay(
         self,
