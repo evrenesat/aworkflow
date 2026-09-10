@@ -1652,3 +1652,18 @@ Final verification: web tests (213), all server tests including Chromium layout 
   shows the loaded preflight result rather than a loading state. Physical mobile
   keyboard/browser-toolbar behavior remains unverified. Publication, exact CI
   and live activation remain downstream delivery checks.
+
+## HISTORY: 2026-09-10 — Combined responsive integration repair
+
+- HISTORY: Added a rendered-plan-row readiness wait and hosted-shell browser coverage for live max-turn, team and role-selector controls, rejected drafts, list/detail navigation, resize retention, owner stop, dirty preflight and exact unresolved-successor retry.
+- HISTORY: Responsive Chromium and WebKit each passed 11 tests; the combined Settings, run-navigation and responsive Chromium command passed 16 tests. Fresh light/dark live-control and restart-state captures, plus existing Skills, profile, Plans and New Run captures, were inspected. Physical keyboard/browser-toolbar behavior remains unverified.
+- HISTORY: Web build and full backend verification passed (`2046` tests, `223` subtests); Ruff passed. The first parallel Vitest suite invocation had one existing RunDashboard worker-order failure at 308/309, while the exact rerun, focused file, and serial diagnostic all passed 309/309. No skip, timeout inflation, retry-only dismissal, production change or external mutation was used.
+- HISTORY: This repair remains uncommitted; the earlier pending-merge state is superseded by the authorized recovery snapshot and the current verification record below. No publication, CI receipt or live activation is claimed.
+
+## HISTORY: 2026-09-10 — Recovery snapshot acceptance follow-up
+
+HISTORY: The authorized snapshot `5b52d3d` preserves accepted base `5259740` and responsive source `61d5988`; `.git/MERGE_HEAD` is intentionally absent and no history rewrite, checkpoint commit or second merge was performed.
+HISTORY: The focused acceptance repair now waits for the hosted capabilities to expose `No team`, both colliding labels and raw `fast__team` before selecting it, and asserts successor confirmation through its rendered container and enabled action.
+HISTORY: The first post-edit full backend invocation recorded a real readiness gap: native `<option>` locators were awaited as visible and all three new live-control viewports timed out, with `2043 passed`, `3 failed`, `223 subtests`. The waits were corrected to exact attachment state without delay, timeout, skip or assertion weakening.
+HISTORY: The corrected combined Chromium browser command passed 16 tests, responsive WebKit passed 11 tests, the full backend command passed `2046`, `223 subtests`, the web suite passed `309`, the production build passed and Ruff passed. Physical keyboard and browser-toolbar behavior remain unverified.
+HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and must be preserved by coordinator-owned delivery; no publication, CI receipt or live activation is claimed.

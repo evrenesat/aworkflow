@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.sync_api import Page, sync_playwright
 
 from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
+from test_control_plane_api import _add_live_control_targets, _prepared
 
 
 VIEWPORTS = (
@@ -281,6 +283,105 @@ def _clear_test_text_zoom(page: Page) -> None:
     }""")
 
 
+def _wait_for_loaded_plan_rows(page: Page) -> None:
+    """Wait for the fixture's plan list, not only the independent filename form."""
+    page.wait_for_function("""() => {
+        const rows = [...document.querySelectorAll('.plan-list .content-button')]
+        return rows.length >= 40
+            && rows.some(row => row.textContent?.includes('long-plan-39.md'))
+    }""")
+
+
+def _visible_dashboard(page: Page):
+    dashboard = page.locator(".dashboard-host:not([hidden])").first
+    dashboard.wait_for()
+    return dashboard
+
+
+def _open_live_controls(page: Page):
+    dashboard = _visible_dashboard(page)
+    details = dashboard.locator("details.dashboard-section").filter(has_text="Adjust run").first
+    details.wait_for()
+    max_turns = dashboard.get_by_label("Control max turns", exact=True)
+    if details.get_attribute("open") is None:
+        details.locator("summary").click()
+    max_turns.wait_for(state="visible")
+    return dashboard
+
+
+def _choose_combobox(dashboard, label: str, query: str, option_text: str) -> None:
+    field = dashboard.get_by_label(label, exact=True)
+    field.click()
+    field.fill(query)
+    option = dashboard.get_by_role("option").filter(has_text=option_text).first
+    option.wait_for()
+    option.click()
+
+
+def _assert_action_hit_test(page: Page, action) -> None:
+    action.scroll_into_view_if_needed()
+    box = action.bounding_box()
+    assert box and 0 <= box["y"] < page.viewport_size["height"], box
+    assert box["x"] >= 0 and box["x"] + box["width"] <= page.viewport_size["width"], box
+    hit = page.evaluate("""({x, y}) => {
+        const target = document.elementFromPoint(x, y)
+        return Boolean(target && (target.closest('button') || target.closest('[role="button"]')))
+    }""", {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2})
+    assert hit, box
+
+
+def _create_live_control_fixture(control_client, root: Path, monkeypatch) -> tuple[str, dict[str, object]]:
+    """Create one real control-plane run while keeping later browser writes intercepted."""
+    client, _, units, _ = control_client
+    _add_live_control_targets(root.parent / "global" / "aflow.toml")
+    with (root.parent / "global" / "aflow.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[teams.fast_team.roles]\n"
+            'worker = "reasonix.new"\n'
+            "\n[teams.fast__team.roles]\n"
+            'worker = "reasonix.new"\n'
+        )
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "responsive-live-start"},
+        json={
+            "plan_path": "plans/in-progress/ready-launch-plan.md",
+            "workflow_name": "managed",
+            "team": "team_00",
+            "max_turns": 8,
+            "dirty_worktree_confirmed": True,
+        },
+    )
+    assert response.status_code == 201, response.text
+    result = response.json()["result"]
+    run_id = result["run_id"]
+    assert len(units.start_calls) == 1
+    # The disposable unit manager proves the launch without running a controller.
+    # Advertise the admitted controller state in the same durable run metadata
+    # used by the repository, so the browser exercises live controls rather than
+    # a synthetic launch-pending response.
+    (root / ".aflow" / "runs" / run_id / "run.json").write_text(
+        json.dumps({
+            "status": "running",
+            "active_plan_path": "plans/in-progress/ready-launch-plan.md",
+            "workflow_name": "managed",
+            "team": "team_00",
+            "current_step_name": "implement",
+            "turns_completed": 2,
+            "max_turns": 8,
+            "run_started_at": "2026-09-10T00:00:00Z",
+        })
+    )
+    status = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}")
+    assert status.status_code == 200, status.text
+    state = status.json()
+    assert state["ownership"] == "control_plane"
+    assert state["status"] == "running"
+    assert state["revision"] == 0
+    return run_id, state
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_route_matrix(control_client, monkeypatch, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""
@@ -319,6 +420,7 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
 
             _open_destination(page, "Plans")
             page.get_by_label("New plan filename", exact=True).wait_for()
+            _wait_for_loaded_plan_rows(page)
             assert page.locator(".plan-list .content-button").count() >= 40
             _assert_header_and_flow(page)
             _assert_document_moves(page)
@@ -473,6 +575,7 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
             page.set_viewport_size({"width": 390, "height": 844})
             _open_destination(page, "Plans")
             page.get_by_label("New plan filename", exact=True).wait_for()
+            _wait_for_loaded_plan_rows(page)
             page.get_by_role("button", name="long-plan-39.md", exact=False).first.click()
             editor = page.get_by_label("Plan content", exact=True)
             editor.wait_for()
@@ -572,11 +675,340 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
                 page.goto(f"{url}/?project={PROJECT_ID}&view=plans")
                 _assert_theme(page, theme)
                 page.get_by_label("New plan filename", exact=True).wait_for()
+                _wait_for_loaded_plan_rows(page)
                 page.get_by_role("button", name="long-plan-39.md", exact=False).first.click()
                 page.get_by_label("Plan content", exact=True).wait_for()
                 image = tmp_path / f"responsive-{theme}-plans-landscape.png"
                 page.screenshot(path=str(image), full_page=True)
                 print("RESPONSIVE_SCREENSHOT", image)
                 page.set_viewport_size({"width": 390, "height": 844})
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    (
+        pytest.param(1280, 720, id="desktop-live-controls"),
+        pytest.param(390, 844, id="phone-live-controls"),
+        pytest.param(844, 390, id="landscape-live-controls"),
+    ),
+)
+def test_responsive_live_controls_and_restart(
+    control_client,
+    monkeypatch,
+    tmp_path,
+    width: int,
+    height: int,
+):
+    """Exercise live control and successor recovery through the hosted shell."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    run_id, initial_state = _create_live_control_fixture(control_client, root, monkeypatch)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": width, "height": height})
+            _login(page, url)
+            _ensure_project(page)
+
+            live_state = dict(initial_state)
+            successor_state: dict[str, object] | None = None
+            control_requests: list[dict[str, object]] = []
+            owner_stop_requests: list[dict[str, object]] = []
+            successor_requests: list[dict[str, object]] = []
+            successor_id = "responsive-successor"
+            base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+            run_path = f"{base_path}/{run_id}"
+
+            def reply(route, payload: object, status: int = 200) -> None:
+                route.fulfill(
+                    status=status,
+                    content_type="application/json",
+                    body=json.dumps(payload),
+                )
+
+            def runs_payload() -> dict[str, object]:
+                runs = [live_state]
+                if successor_state is not None:
+                    runs.append(successor_state)
+                return {"runs": runs, "next_cursor": None, "schema_version": 1}
+
+            def route_control_plane(route) -> None:
+                nonlocal successor_state
+                request = route.request
+                path = urlsplit(request.url).path
+                method = request.method
+
+                if method == "GET" and path == base_path:
+                    reply(route, runs_payload())
+                    return
+                if method == "GET" and path in {run_path, f"{base_path}/{successor_id}"}:
+                    reply(route, successor_state if path.endswith(successor_id) and successor_state else live_state)
+                    return
+                if method == "GET" and path == f"{run_path}/restart-options":
+                    reply(route, {
+                        "eligible": True,
+                        "reason": None,
+                        "requires_stop": live_state["status"] == "running",
+                        "run_id": run_id,
+                        "extra_instructions_unavailable": False,
+                        "options": {
+                            "plan_path": "plans/in-progress/ready-launch-plan.md",
+                            "workflow_name": "managed",
+                            "team": "fast__team",
+                            "max_turns": 8,
+                        },
+                    })
+                    return
+                if method == "POST" and path == f"{base_path}/preflight":
+                    reply(route, {
+                        "checkout_path": str(root),
+                        "execution_mode": "same_checkout",
+                        "dirty": True,
+                        "requires_confirmation": True,
+                        "blockers": [],
+                        "total_items": 1,
+                        "offset": 0,
+                        "limit": 200,
+                        "next_offset": None,
+                        "items": [{
+                            "path": "plans/in-progress/ready-launch-plan.md",
+                            "index_status": "?",
+                            "worktree_status": "?",
+                            "original_path": None,
+                        }],
+                    })
+                    return
+                if method == "PATCH" and path == f"{run_path}/control":
+                    payload = request.post_data_json
+                    control_requests.append({
+                        "payload": payload,
+                        "key": request.headers.get("idempotency-key"),
+                    })
+                    if len(control_requests) == 1:
+                        live_state.update({"revision": 1, "max_turns": 12, "team": "fast__team"})
+                        reply(route, {
+                            "revision": 1,
+                            "changed": True,
+                            "owner_stop": False,
+                            "run": live_state,
+                        })
+                    else:
+                        reply(route, {
+                            "detail": {
+                                "code": "validation_error",
+                                "message": "responsive fixture rejected this control draft",
+                            },
+                        }, status=422)
+                    return
+                if method == "POST" and path == f"{run_path}/owner-stop":
+                    owner_stop_requests.append({
+                        "payload": request.post_data_json,
+                        "key": request.headers.get("idempotency-key"),
+                    })
+                    live_state.update({
+                        "status": "owner_stopped",
+                        "activity": "inactive",
+                        "status_reason_code": "owner_stopped",
+                        "launch_phase": "owner_stopped",
+                    })
+                    reply(route, live_state)
+                    return
+                if method == "POST" and path == base_path:
+                    successor_requests.append({
+                        "payload": request.post_data_json,
+                        "key": request.headers.get("idempotency-key"),
+                    })
+                    if len(successor_requests) == 1:
+                        route.abort(error_code="failed")
+                    else:
+                        successor_state = dict(live_state)
+                        successor_state.update({
+                            "run_id": successor_id,
+                            "status": "running",
+                            "activity": "active",
+                            "status_reason_code": "active",
+                            "revision": 0,
+                            "launch_phase": "running",
+                            "team": "fast__team",
+                            "max_turns": 10,
+                            "restarted_from_run_id": run_id,
+                        })
+                        reply(route, {
+                            "result": {
+                                "run_id": successor_id,
+                                "created": True,
+                                "status": "running",
+                                "schema_version": 1,
+                                "manifest_path": None,
+                                "reason": None,
+                                "restarted_from_run_id": run_id,
+                            },
+                            "startup_question": None,
+                        }, status=201)
+                    return
+                route.continue_()
+
+            page.route(f"**/api/control-plane/projects/{PROJECT_ID}/runs**", route_control_plane)
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
+            dashboard = _open_live_controls(page)
+            dashboard.locator(".run-detail h3").wait_for()
+            page.get_by_text("Adjust run", exact=True).wait_for()
+            _assert_header_and_flow(page)
+
+            control_max_turns = dashboard.get_by_label("Control max turns", exact=True)
+            control_team = dashboard.get_by_label("Control team", exact=True)
+            control_selector = dashboard.get_by_label("Selector for Worker", exact=True)
+            assert not control_max_turns.is_disabled()
+            assert not control_team.is_disabled()
+            assert not control_selector.is_disabled()
+            control_team.locator("option[value='']").wait_for(state="attached")
+            control_team.locator("option[value='fast_team']").wait_for(state="attached")
+            control_team.locator("option[value='fast__team']").wait_for(state="attached")
+            assert control_team.locator("option[value='']").text_content() == "No team"
+            assert control_team.locator("option[value='fast_team']").text_content() == "Fast team (fast_team)"
+            assert control_team.locator("option[value='fast__team']").text_content() == "Fast team (fast__team)"
+            control_max_turns.fill("12")
+            control_team.select_option("fast__team")
+            control_selector.select_option("reasonix.new")
+            save_controls = dashboard.get_by_role("button", name="Save run settings", exact=True)
+            _assert_action_hit_test(page, save_controls)
+            save_controls.click()
+            page.get_by_text("Safe controls recorded at revision 1", exact=False).wait_for()
+            assert control_requests[0]["payload"] == {
+                "expected_revision": 0,
+                "max_turns": 12,
+                "team": "fast__team",
+                "role_selectors": {"worker": "reasonix.new"},
+            }
+            assert control_requests[0]["key"]
+
+            control_max_turns.fill("13")
+            save_controls.click()
+            page.get_by_role("alert").filter(has_text="responsive fixture rejected this control draft").wait_for()
+            assert control_max_turns.input_value() == "13"
+            assert control_requests[1]["payload"] == {"expected_revision": 1, "max_turns": 13}
+
+            if _compact(page):
+                page.get_by_role("button", name="← Back to Run history", exact=True).click()
+                dashboard = _visible_dashboard(page)
+                dashboard.locator(".sidebar-editor-navigation").wait_for(state="visible")
+                run_row = dashboard.locator(f"[data-sidebar-editor-item='{run_id}']")
+                run_row.wait_for(state="visible")
+                run_row.click()
+                dashboard = _open_live_controls(page)
+            else:
+                _open_destination(page, "Settings")
+                page.get_by_role("heading", name="Settings", exact=True).wait_for()
+                _open_destination(page, "Runs")
+                dashboard = _open_live_controls(page)
+            assert dashboard.get_by_label("Control max turns", exact=True).input_value() == "13"
+            assert dashboard.get_by_label("Control team", exact=True).input_value() == "fast__team"
+
+            page.set_viewport_size({"width": 390, "height": 844})
+            if width >= 960 and height >= 600:
+                dashboard = _visible_dashboard(page)
+                dashboard.locator(".sidebar-editor-navigation").wait_for(state="visible")
+                run_row = dashboard.locator(f"[data-sidebar-editor-item='{run_id}']")
+                run_row.wait_for(state="visible")
+                run_row.click()
+            dashboard = _open_live_controls(page)
+            assert dashboard.get_by_label("Control max turns", exact=True).input_value() == "13"
+            page.set_viewport_size({"width": width, "height": height})
+            dashboard = _open_live_controls(page)
+            assert dashboard.get_by_label("Control max turns", exact=True).input_value() == "13"
+            _assert_action_hit_test(page, dashboard.get_by_role("button", name="Save run settings", exact=True))
+
+            for theme in ("light", "dark"):
+                _set_theme_preference(page, theme)
+                page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
+                _assert_theme(page, theme)
+                dashboard = _open_live_controls(page)
+                dashboard.get_by_label("Control max turns", exact=True).wait_for()
+                image = tmp_path / f"responsive-{width}x{height}-{theme}-live-controls.png"
+                page.screenshot(path=str(image), full_page=True)
+                print("RESPONSIVE_LIVE_SCREENSHOT", image)
+
+            _set_theme_preference(page, "light")
+            page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
+            dashboard = _visible_dashboard(page)
+            dashboard.locator(".run-detail h3").wait_for()
+            page.get_by_role("button", name="Restart with changes", exact=True).click()
+            dashboard = _visible_dashboard(page)
+            dashboard.get_by_label("Run plan", exact=True).wait_for()
+            _choose_combobox(dashboard, "Run team", "fast__team", "Fast team (fast__team)")
+            if not dashboard.get_by_label("Run max turns", exact=True).is_visible():
+                dashboard.get_by_role("button", name="Advanced options", exact=True).click()
+            dashboard.get_by_label("Run max turns", exact=True).fill("10")
+            preflight = dashboard.locator('section[aria-label="Working tree preflight"]')
+            preflight.get_by_role("button", name="Refresh worktree inspection", exact=True).wait_for()
+            dirty_ack = preflight.get_by_role(
+                "checkbox", name="Continue despite uncommitted changes", exact=True
+            )
+            dirty_ack.wait_for(state="visible")
+            assert not dirty_ack.is_checked()
+            dirty_ack.check()
+            assert dirty_ack.is_checked()
+            confirm = dashboard.get_by_role("button", name="Confirm stop and start successor", exact=True)
+            confirm.wait_for(state="visible")
+            page.wait_for_function(
+                """() => {
+                    const button = document.querySelector('.confirmation button')
+                    return Boolean(button && !button.disabled && (
+                        button.offsetWidth || button.offsetHeight || button.getClientRects().length
+                    ))
+                }""",
+            )
+            assert not confirm.is_disabled()
+            confirm.click()
+            page.get_by_role("button", name="Retry exact successor request", exact=True).wait_for()
+            assert dashboard.get_by_label("Run workflow", exact=True).is_disabled()
+            assert page.get_by_role("button", name="Start run", exact=True).is_disabled()
+            image = tmp_path / f"responsive-{width}x{height}-light-restart-unknown.png"
+            page.screenshot(path=str(image), full_page=True)
+            print("RESPONSIVE_RESTART_SCREENSHOT", image)
+
+            _open_destination(page, "Settings")
+            page.get_by_role("heading", name="Settings", exact=True).wait_for()
+            page.locator("#settings-domain-panel").wait_for()
+            _select_settings_section(page, "General")
+            page.locator("#settings-domain-panel").wait_for()
+            theme = page.locator("label").filter(has_text="Color theme").locator("select").first
+            theme.wait_for()
+            theme.select_option("dark")
+            _assert_theme(page, "dark")
+            page.get_by_role("button", name="Resolve pending successor", exact=True).click()
+            page.get_by_role("button", name="Retry exact successor request", exact=True).wait_for()
+            image = tmp_path / f"responsive-{width}x{height}-dark-restart-unknown.png"
+            page.screenshot(path=str(image), full_page=True)
+            print("RESPONSIVE_RESTART_SCREENSHOT", image)
+
+            retry = page.get_by_role("button", name="Retry exact successor request", exact=True)
+            retry.click()
+            page.get_by_text("Successor retry created run responsive-successor", exact=False).wait_for()
+            assert len(owner_stop_requests) == 1
+            assert owner_stop_requests[0]["payload"] == {"expected_revision": 1}
+            assert owner_stop_requests[0]["key"]
+            assert control_requests[0]["payload"] == {
+                "expected_revision": 0,
+                "max_turns": 12,
+                "team": "fast__team",
+                "role_selectors": {"worker": "reasonix.new"},
+            }
+            assert len(successor_requests) == 2
+            assert successor_requests[0]["payload"] == {
+                "plan_path": "plans/in-progress/ready-launch-plan.md",
+                "workflow_name": "managed",
+                "team": "fast__team",
+                "start_step": "implement",
+                "max_turns": 10,
+                "restarted_from_run_id": run_id,
+                "dirty_worktree_confirmed": True,
+            }
+            assert successor_requests[1] == successor_requests[0]
         finally:
             browser.close()

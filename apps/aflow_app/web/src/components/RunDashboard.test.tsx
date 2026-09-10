@@ -896,26 +896,33 @@ describe('RunDashboard', () => {
   })
 
   it('keeps a rejected control draft and run status while showing the server error', async () => {
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
+      ...capabilities,
+      teams: ['base', 'fast_team', 'fast__team'],
+    })
     vi.mocked(api.controlControlPlaneRun).mockRejectedValueOnce(
-      new ApiError(422, 'saved-team is not admitted for this run', 'invalid_control'),
+      new ApiError(422, 'fast__team is not admitted for this run', 'invalid_control'),
     )
     renderDashboard()
 
     await waitForControlAdmission()
     const team = screen.getByLabelText('Control team') as HTMLSelectElement
-    fireEvent.change(team, { target: { value: 'full' } })
-    await waitFor(() => expect(team.value).toBe('full'))
+    expect(screen.getByRole('option', { name: 'No team', exact: true })).toBeDefined()
+    expect(screen.getByRole('option', { name: 'Fast team (fast_team)', exact: true })).toBeDefined()
+    expect(screen.getByRole('option', { name: 'Fast team (fast__team)', exact: true })).toBeDefined()
+    fireEvent.change(team, { target: { value: 'fast__team' } })
+    await waitFor(() => expect(team.value).toBe('fast__team'))
     const save = screen.getByRole('button', { name: 'Save run settings' })
     await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
     fireEvent.click(save)
     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
       'run-owned',
-      { expected_revision: 1, team: 'full' },
+      { expected_revision: 1, team: 'fast__team' },
       expect.stringMatching(/^control-/),
     ))
-    await waitFor(() => expect(screen.getByText('saved-team is not admitted for this run')).toBeDefined())
-    expect(team.value).toBe('full')
+    await waitFor(() => expect(screen.getByText('fast__team is not admitted for this run')).toBeDefined())
+    expect(team.value).toBe('fast__team')
     expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
@@ -1007,7 +1014,11 @@ describe('RunDashboard', () => {
       workflow_name: 'other',
       restarted_from_run_id: 'run-owned',
     })
-    expect(screen.getByText(/and start successor workflow/)).toBeDefined()
+    const confirmation = screen
+      .getByRole('button', { name: 'Confirm stop and start successor', exact: true })
+      .closest('.confirmation')
+    expect(confirmation?.textContent).toContain('and start')
+    expect(confirmation?.textContent).toContain('successor workflow')
     expect(screen.getAllByText('run-owned').length).toBeGreaterThanOrEqual(2)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
