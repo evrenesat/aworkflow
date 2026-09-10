@@ -1,5 +1,21 @@
 # DEVLOG
 
+## 2026-09-10 — Exempt untracked lifecycle backups from confirmation (Checkpoint 1)
+
+- Phase-B branch-only preflight was classifying AFlow's newly created
+  `plans/backups/` copy as ordinary plan dirtiness, so clean Git environments
+  stopped before the first turn. Confirmation classification now ignores only
+  untracked records wholly under that exact boundary while retaining raw status
+  items, dirty facts, conflicts and tracked/rename protection.
+- Added synthetic preflight coverage for backup admission, source and plan
+  dirtiness, sibling-path boundaries, tracked/renamed backups and conflicts;
+  strengthened branch-only resume coverage to verify the original source bytes
+  and backup survive the failed first turn and successful resume.
+- Verification passed: 97 focused tests plus 21 subtests, 1,779 full-suite
+  tests plus 219 subtests, Ruff and the diff check. Exact-SHA CI and live
+  deployment remain post-review coordinator gates; local verification makes no
+  deployment claim.
+
 ## 2026-09-10 — Prefer parallel development with owned integration
 
 - Persist coordinator guidance to run independent plans in isolated worktrees,

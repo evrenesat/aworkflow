@@ -456,6 +456,7 @@ def _check_worktree_dirtiness(
         _, non_plan_paths = classify_status_items_by_prefix(
             result.items,
             ignore_lifecycle_owned=True,
+            ignore_untracked_lifecycle_backups=True,
         )
         raise StartupError(
             "current-branch continuation has non-plan dirtiness; "

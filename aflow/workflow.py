@@ -60,6 +60,7 @@ from .publication import PublicationError, publish_completed_run
 from .git_status import (
     classify_status_items_by_prefix,
     is_lifecycle_owned_path,
+    LIFECYCLE_BACKUP_PATH_ROOT,
     porcelain_status_paths,
     RepoState,
     WorktreeInspectionError,
@@ -4883,6 +4884,7 @@ def _lifecycle_preflight_git(
                 worktree_preflight.items,
                 ignore_lifecycle_owned=True,
                 ignore_untracked=allow_untracked,
+                ignore_untracked_lifecycle_backups=True,
             )
             raise WorkflowError(
                 f"lifecycle preflight: primary checkout at '{primary_root}' has non-plan dirtiness: "
@@ -5957,7 +5959,7 @@ def _is_ignored_merge_status_line(
         return False
     if xy == "??" and len(paths) == 1 and is_lifecycle_owned_path(
         paths[0],
-        additional_roots=("plans/backups",),
+        additional_roots=(LIFECYCLE_BACKUP_PATH_ROOT,),
     ):
         return True
     if original_plan_path is None:

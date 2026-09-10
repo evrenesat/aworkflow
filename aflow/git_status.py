@@ -119,6 +119,7 @@ class WorktreeInspectionError(RuntimeError):
 
 
 AFLOW_OWNED_PATH_ROOTS = (".aflow",)
+LIFECYCLE_BACKUP_PATH_ROOT = "plans/backups"
 
 
 _GIT_C_STYLE_ESCAPE_BYTES = {
@@ -319,6 +320,11 @@ def porcelain_status_path(line: str) -> str | None:
     return paths[-1] if paths else None
 
 
+def _path_is_under_root(path: str, root: str) -> bool:
+    normalized_root = root.rstrip("/")
+    return path == normalized_root or path.startswith(f"{normalized_root}/")
+
+
 def is_lifecycle_owned_path(
     path: str,
     *,
@@ -326,10 +332,19 @@ def is_lifecycle_owned_path(
 ) -> bool:
     """Return whether a repo-relative POSIX path belongs to aflow lifecycle state."""
     for root in (*AFLOW_OWNED_PATH_ROOTS, *additional_roots):
-        normalized_root = root.rstrip("/")
-        if path == normalized_root or path.startswith(f"{normalized_root}/"):
+        if _path_is_under_root(path, root):
             return True
     return False
+
+
+def _is_untracked_lifecycle_backup(item: WorktreeStatusItem) -> bool:
+    """Return whether one status record is only AFlow's untracked plan backup."""
+    return (
+        item.original_path is None
+        and item.index_status == "?"
+        and item.worktree_status == "?"
+        and _path_is_under_root(item.path, LIFECYCLE_BACKUP_PATH_ROOT)
+    )
 
 
 def classify_status_items_by_prefix(
@@ -338,12 +353,23 @@ def classify_status_items_by_prefix(
     *,
     ignore_lifecycle_owned: bool = False,
     ignore_untracked: bool = False,
+    ignore_untracked_lifecycle_backups: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Classify decoded status records without losing rename source paths."""
+    """Classify decoded status records without losing rename source paths.
+
+    When requested, untracked records wholly under ``plans/backups`` are
+    omitted from confirmation classification only; callers retain the raw
+    status records for reporting and blocker checks.
+    """
     plan_paths: list[str] = []
     non_plan_paths: list[str] = []
 
     for item in items:
+        if (
+            ignore_untracked_lifecycle_backups
+            and _is_untracked_lifecycle_backup(item)
+        ):
+            continue
         if ignore_untracked and item.index_status == "?" and item.worktree_status == "?":
             continue
         paths = (item.original_path, item.path) if item.original_path else (item.path,)
@@ -481,6 +507,7 @@ def preflight_worktree(
         items,
         ignore_lifecycle_owned=True,
         ignore_untracked=allow_untracked,
+        ignore_untracked_lifecycle_backups=True,
     )
     effective_items = tuple(
         item

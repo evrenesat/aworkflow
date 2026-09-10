@@ -162,6 +162,8 @@ def test_new_worktree_preflight_does_not_confirm_plan_or_lifecycle_dirt(tmp_path
     repo = _make_repo(tmp_path)
     (repo / "plans" / "in-progress").mkdir(parents=True)
     (repo / "plans" / "in-progress" / "plan.md").write_text("plan\n", encoding="utf-8")
+    (repo / "plans" / "backups").mkdir(parents=True)
+    (repo / "plans" / "backups" / "plan.md").write_text("backup\n", encoding="utf-8")
     (repo / ".aflow" / "runs").mkdir(parents=True)
     (repo / ".aflow" / "runs" / "run.json").write_text("{}\n", encoding="utf-8")
 
@@ -181,6 +183,108 @@ def test_new_worktree_preflight_does_not_confirm_plan_or_lifecycle_dirt(tmp_path
     assert clean.total_items == 0
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "requires_confirmation"),
+    [
+        ("plans/backups/plan.md", False),
+        ("plans/backups-other/plan.md", True),
+    ],
+)
+def test_untracked_lifecycle_backup_boundary_controls_confirmation(
+    tmp_path: Path,
+    relative_path: str,
+    requires_confirmation: bool,
+) -> None:
+    repo = _make_repo(tmp_path)
+    backup = repo / relative_path
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_text("backup\n", encoding="utf-8")
+    (repo / ".aflow" / "runs").mkdir(parents=True)
+    (repo / ".aflow" / "runs" / "run.json").write_text("{}\n", encoding="utf-8")
+
+    result = preflight_worktree(repo, execution_mode="same_checkout")
+
+    assert result.dirty is True
+    assert result.requires_confirmation is requires_confirmation
+    assert {item.path for item in result.items} >= {
+        relative_path,
+        ".aflow/runs/run.json",
+    }
+    plan_paths, non_plan_paths = classify_status_items_by_prefix(
+        result.items,
+        ignore_lifecycle_owned=True,
+        ignore_untracked_lifecycle_backups=True,
+    )
+    if requires_confirmation:
+        assert plan_paths == [relative_path]
+        assert non_plan_paths == []
+    else:
+        assert plan_paths == []
+        assert non_plan_paths == []
+
+
+def test_untracked_lifecycle_backup_does_not_hide_source_dirtiness(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    backup = repo / "plans" / "backups" / "plan.md"
+    backup.parent.mkdir(parents=True)
+    backup.write_text("backup\n", encoding="utf-8")
+    source = repo / "notes.txt"
+    source.write_text("owner change\n", encoding="utf-8")
+
+    for execution_mode in ("same_checkout", "new_worktree"):
+        result = preflight_worktree(repo, execution_mode=execution_mode)
+
+        assert result.dirty is True
+        assert result.requires_confirmation is True
+        _, non_plan_paths = classify_status_items_by_prefix(
+            result.items,
+            ignore_lifecycle_owned=True,
+            ignore_untracked_lifecycle_backups=True,
+        )
+        assert non_plan_paths == ["notes.txt"]
+
+
+@pytest.mark.parametrize("mutation", ["modified", "renamed_out", "renamed_in"])
+def test_tracked_or_renamed_lifecycle_backup_is_not_exempt(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    repo = _make_repo(tmp_path)
+    backup = repo / "plans" / "backups" / "plan.md"
+    backup.parent.mkdir(parents=True)
+    if mutation == "renamed_in":
+        (repo / "notes.txt").write_text("source\n", encoding="utf-8")
+        _git(repo, "add", "notes.txt")
+    else:
+        backup.write_text("backup\n", encoding="utf-8")
+        _git(repo, "add", "plans/backups/plan.md")
+    _git(repo, "commit", "-m", "track backup")
+
+    if mutation == "modified":
+        backup.write_text("changed backup\n", encoding="utf-8")
+    elif mutation == "renamed_out":
+        _git(repo, "mv", "plans/backups/plan.md", "renamed-plan.md")
+    else:
+        _git(repo, "mv", "notes.txt", "plans/backups/plan.md")
+
+    result = preflight_worktree(repo, execution_mode="same_checkout")
+
+    assert result.dirty is True
+    assert result.requires_confirmation is True
+    assert len(result.items) == 1
+    if mutation == "modified":
+        assert result.items[0].path == "plans/backups/plan.md"
+        assert result.items[0].original_path is None
+    elif mutation == "renamed_out":
+        assert result.items[0].path == "renamed-plan.md"
+        assert result.items[0].original_path == "plans/backups/plan.md"
+    else:
+        assert result.items[0].path == "plans/backups/plan.md"
+        assert result.items[0].original_path == "notes.txt"
+
+
 def test_preflight_reports_inspection_failure_instead_of_clean(tmp_path: Path) -> None:
     with pytest.raises(WorktreeInspectionError, match="git status inspection failed"):
         preflight_worktree(tmp_path / "not-a-repository")
@@ -198,22 +302,27 @@ def test_preflight_reports_conflicts_and_in_progress_operations(tmp_path: Path) 
     finally:
         (marker / "MERGE_HEAD").unlink()
 
-    (repo / "conflict.txt").write_text("base\n", encoding="utf-8")
-    _git(repo, "add", "conflict.txt")
+    conflict_path = repo / "plans" / "backups" / "conflict.txt"
+    conflict_path.parent.mkdir(parents=True)
+    conflict_path.write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "plans/backups/conflict.txt")
     _git(repo, "commit", "-m", "conflict base")
     _git(repo, "checkout", "-b", "other")
-    (repo / "conflict.txt").write_text("other\n", encoding="utf-8")
-    _git(repo, "add", "conflict.txt")
+    conflict_path.write_text("other\n", encoding="utf-8")
+    _git(repo, "add", "plans/backups/conflict.txt")
     _git(repo, "commit", "-m", "other change")
     _git(repo, "checkout", "main")
-    (repo / "conflict.txt").write_text("main\n", encoding="utf-8")
-    _git(repo, "add", "conflict.txt")
+    conflict_path.write_text("main\n", encoding="utf-8")
+    _git(repo, "add", "plans/backups/conflict.txt")
     _git(repo, "commit", "-m", "main change")
     merge = _git(repo, "merge", "other", check=False)
     assert merge.returncode != 0
     try:
         result = preflight_worktree(repo)
-        assert any("unresolved conflict: conflict.txt" in blocker for blocker in result.blockers)
+        assert any(
+            "unresolved conflict: plans/backups/conflict.txt" in blocker
+            for blocker in result.blockers
+        )
     finally:
         _git(repo, "merge", "--abort", check=False)
 

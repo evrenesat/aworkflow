@@ -8703,12 +8703,18 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             _make_lifecycle_git_repo(repo_root, branch='main')
+            assert _run_git_in_test(
+                ['config', 'core.excludesFile', os.devnull], cwd=repo_root
+            )[0] == 0
             plan_path = repo_root / 'plan.md'
             _write_plan(plan_path, _VALID_PLAN)
             _git_commit_file(repo_root, plan_path)
             wf_config = _make_branch_only_wf_config(main_branch='main')
+            original_plan_bytes = plan_path.read_bytes()
+            first_calls: list[Path] = []
 
             def first_runner(argv, **kwargs):
+                first_calls.append(Path(kwargs['cwd']))
                 return subprocess.CompletedProcess(argv, 1, '', 'blocked preflight')
 
             with pytest.raises(WorkflowError) as first_error:
@@ -8726,6 +8732,11 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                     runner=first_runner,
                 )
 
+            assert first_calls
+            assert all(call == repo_root for call in first_calls)
+            assert plan_path.read_bytes() == original_plan_bytes
+            backup_path = repo_root / 'plans' / 'backups' / 'plan.md'
+            assert backup_path.read_bytes() == original_plan_bytes
             first_run = json.loads(
                 (first_error.value.run_dir / 'run.json').read_text(encoding='utf-8')
             )
@@ -8780,6 +8791,7 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 cwd=repo_root,
             )
             assert rc == 0
+            assert backup_path.read_bytes() == original_plan_bytes
 
     def test_no_lifecycle_resume_uses_primary_repo_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
