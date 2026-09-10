@@ -67,6 +67,21 @@
   with its adjacent `result.json`. No sleeps, retries, assertion weakening, UI
   redesign, live configuration, publication, CI, or deployment was changed.
 
+## 2026-09-10 — Show release changes in Settings
+
+- Added a read-only Settings → Changelog tab backed by the generated release
+  artifact, with date groups, escaped titles, and 20-entry paging.
+- Preserved the shared settings/skills draft owner across Changelog navigation
+  and covered the responsive desktop/mobile journeys in both browser engines.
+
+## 2026-09-10 — Keep Changelog actions read-only
+
+- Hide the shared Save, reload, and skill-install actions while Changelog is
+  displayed, while retaining the truthful unsaved indicator and Advanced TOML
+  navigation.
+- Preserve General and Skills drafts without writes, then restore their shared
+  Save owner when returning to an editable settings section.
+
 ## 2026-09-10 — Generate compact release changelog from DEVLOG
 
 - Added deterministic build-time JSON and Markdown changelog generation from

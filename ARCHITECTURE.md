@@ -1044,6 +1044,12 @@ only authored changelog source. The asset fingerprint includes DEVLOG and the
 generator inputs while excluding generated output, which makes a DEVLOG-only
 edit rebuild once and then cache normally. Wheels bundle the generated assets,
 and sdist builds carry the DEVLOG and generator source needed to reproduce them.
+`GlobalSettings` consumes the packaged JSON through a normal read-only Changelog
+tab. The tab groups the generated newest-first entries by date, pages them in
+batches of 20, and owns no settings or skill draft state, so a dirty editor can
+leave and return without a save or reset. Its presentation stays in document
+flow and uses the same responsive Settings header and section-selection
+conventions as the editing tabs.
 
 REST plus SSE is the canonical remote interface, and authenticated MCP is an
 HTTP adapter mounted by the same UI server at `/mcp` and `/mcp/`. Both use the

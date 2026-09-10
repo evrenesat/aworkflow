@@ -13,9 +13,10 @@ import { formatMachineChoice, formatMachineLabel } from '../label'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { useHeaderSlots } from './HeaderSlots'
 import { TextEditor } from './TextEditor'
+import { ChangelogSettings } from './ChangelogSettings'
 
-const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General'] as const
-// Header fit is deliberately wider than the list/detail breakpoint: the six
+const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General', 'Changelog'] as const
+// Header fit is deliberately wider than the list/detail breakpoint: the seven
 // labelled tabs plus dirty-state actions do not fit reliably at 960–1024px.
 // Keep this presentation query independent so the SidebarEditorLayout
 // list/detail ownership boundary remains unchanged.
@@ -535,6 +536,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   }
   const headerCompact = useSettingsHeaderCompact()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const changelogReadOnly = !advanced && tab === 'Changelog'
   const sectionNavigation = advanced ? <span className="header-local-label">Advanced TOML</span> : headerCompact ? <label className="header-section-select">
     <span>Section</span>
     <select aria-label="Settings section" value={tab} onChange={event => setTab(event.target.value as typeof tabs[number])}>
@@ -548,31 +550,31 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     context: <h2 className="header-context-title">Settings</h2>,
     local: sectionNavigation,
     primary: <>
-      <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
+      {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
       {dirty && <span className="text-xs text-dim header-dirty-state">Unsaved changes</span>}
     </>,
     more: <MoreMenu label="More settings actions" triggerLabel="More">
-      <MenuItem disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</MenuItem>
+      {!changelogReadOnly && <MenuItem disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</MenuItem>}
       <MenuItem disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</MenuItem>
-      <MenuItem disabled={busy} onClick={() => void openSkillsInstallation()}>Install skills</MenuItem>
+      {!changelogReadOnly && <MenuItem disabled={busy} onClick={() => void openSkillsInstallation()}>Install skills</MenuItem>}
     </MoreMenu>,
   }
   const hosted = useHeaderSlots('global-settings', settingsSlots)
   return <div className="workspace-content global-settings">
     {!hosted && <>
       <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
-      <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>
+      {!changelogReadOnly && <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>}
       <div className="settings-toolbar">
         {sectionNavigation}
         {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
-        <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
+        {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
       </div>
     </>}
     {error && <p className="error-message" role="alert">{error}</p>}
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : tab === 'Skills' ? <SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : tab === 'Changelog' ? <ChangelogSettings /> : tab === 'Skills' ? <SkillsSettings
       skills={skills}
       loadError={skillsError}
       selected={effectiveSkill}
@@ -662,7 +664,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         }} />}
       </fieldset>
     </div> : <p>Loading configuration, or the saved documents contain invalid TOML or mistyped values. Use Advanced TOML to inspect and repair them.</p>}
-    {snapshot?.aflow_toml === '' && snapshot.workflows_toml === '' && <div className="card settings-fields"><h3>Starter setup</h3>{(['workflow', 'main_branch'] as const).map(key => <label key={key}>{formatMachineLabel(key)}<input className="input" value={starter[key]} onChange={e => setStarter({ ...starter, [key]: e.target.value })} /></label>)}<button className="btn btn-secondary" onClick={async () => {
+    {!advanced && tab !== 'Changelog' && snapshot?.aflow_toml === '' && snapshot.workflows_toml === '' && <div className="card settings-fields"><h3>Starter setup</h3>{(['workflow', 'main_branch'] as const).map(key => <label key={key}>{formatMachineLabel(key)}<input className="input" value={starter[key]} onChange={e => setStarter({ ...starter, [key]: e.target.value })} /></label>)}<button className="btn btn-secondary" onClick={async () => {
       try { const form = await api.postGlobalConfigForm({ aflow_toml: '', workflows_toml: '', action: { type: 'build_starter', ...starter } }); setTexts([form.aflow_toml, form.workflows_toml]); setDraft(form.form); setProjection(form); setRawEdited(true); setAdvanced(true) } catch (reason) { setError(reason instanceof Error ? reason.message : 'Starter setup failed') }
     }}>Build starter draft</button></div>}
     </fieldset>

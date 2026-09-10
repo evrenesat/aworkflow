@@ -1,6 +1,7 @@
-"""Real Chromium assertions for document scrolling and reachable settings."""
+"""Real browser assertions for document scrolling and reachable settings."""
 import json
 import os
+import pytest
 import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -56,6 +57,157 @@ def select_settings_section(page, name):
 
 def open_settings_more(page):
     page.get_by_role('button', name='More', exact=True).click()
+
+
+def wait_for_changelog_read_only(page):
+    page.wait_for_function("""() => ![...document.querySelectorAll('button')]
+        .some(button => button.textContent?.trim() === 'Save all changes')""")
+
+
+def launch_test_browser(playwright):
+    browser_name = os.environ.get('AFLOW_TEST_BROWSER', 'chromium').strip().lower()
+    if browser_name not in {'chromium', 'webkit'}:
+        raise pytest.UsageError('AFLOW_TEST_BROWSER must be chromium or webkit')
+    browser_type = getattr(playwright, browser_name)
+    launch = {'headless': True}
+    if browser_name == 'chromium':
+        launch['args'] = ['--no-sandbox']
+    return browser_type.launch(**launch)
+
+
+def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeypatch):
+    """Exercise the release view and draft ownership in real browsers."""
+    _, root, _, _ = control_client
+    from aflow_app_server import config as config_module, main
+
+    config_dir = root.parent / 'global'
+    monkeypatch.setattr(main, 'global_config_dir', lambda: config_dir)
+    monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+    generated = json.loads((dist.parent / 'src' / 'generated' / 'changelog.json').read_text())
+    entries = generated['entries']
+    assert len(entries) > 20
+    viewports = ((320, 568), (390, 844), (768, 1024), (844, 390), (1280, 720), (1440, 900), (390, 420))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = launch_test_browser(playwright)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 720})
+            page.goto(url)
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
+            page.get_by_role('button', name='Settings', exact=True).click()
+            draft_value = 'unsaved-changelog-round-trip.example'
+
+            select_settings_section(page, 'Changelog')
+            open_settings_more(page)
+            assert page.get_by_role('menuitem', name='Reload server settings', exact=True).count() == 0
+            assert page.get_by_role('menuitem', name='Install skills', exact=True).count() == 0
+            assert page.get_by_role('menuitem', name='Advanced TOML', exact=True).count() == 1
+            page.get_by_role('menuitem', name='Advanced TOML', exact=True).click()
+            page.get_by_label('aflow.toml contents').wait_for()
+            assert page.get_by_role('button', name='Save all changes', exact=True).count() == 1
+            open_settings_more(page)
+            page.get_by_role('menuitem', name='Guided settings', exact=True).click()
+            page.get_by_role('heading', name='Changelog', exact=True).wait_for()
+            wait_for_changelog_read_only(page)
+            assert page.get_by_role('button', name='Save all changes', exact=True).count() == 0
+
+            for theme in ('light', 'dark'):
+                for width, height in viewports:
+                    page.set_viewport_size({'width': width, 'height': height})
+                    page.wait_for_timeout(75)
+                    select_settings_section(page, 'General')
+                    page.get_by_label('Color theme').select_option(theme)
+                    if theme == 'light' and (width, height) == viewports[0]:
+                        page.get_by_label('Bind host').fill(draft_value)
+                    select_settings_section(page, 'Changelog')
+                    page.get_by_role('heading', name='Changelog', exact=True).wait_for()
+                    page.get_by_text('Changes included in this version', exact=True).wait_for()
+                    wait_for_changelog_read_only(page)
+                    if width < 1200 or height < 600:
+                        assert page.get_by_role('combobox', name='Settings section', exact=True).input_value() == 'Changelog'
+                    else:
+                        assert page.get_by_role('tab', name='Changelog', exact=True).get_attribute('aria-selected') == 'true'
+                    assert page.get_by_role('button', name='Save all changes', exact=True).count() == 0
+                    assert page.get_by_role('button', name='Reload server settings', exact=True).count() == 0
+                    open_settings_more(page)
+                    assert page.get_by_role('menuitem', name='Reload server settings', exact=True).count() == 0
+                    assert page.get_by_role('menuitem', name='Install skills', exact=True).count() == 0
+                    assert page.get_by_role('menuitem', name='Advanced TOML', exact=True).count() == 1
+                    page.keyboard.press('Escape')
+
+                    titles = page.locator('[data-changelog-title]')
+                    assert titles.count() == 20
+                    assert titles.first.inner_text() == entries[0]['title']
+                    assert titles.nth(19).inner_text() == entries[19]['title']
+                    assert titles.nth(20).count() == 0
+                    show_more = page.get_by_role('button', name='Show more', exact=True)
+                    show_more.focus()
+                    assert page.evaluate('() => document.activeElement?.getAttribute("aria-controls") === "changelog-entries"')
+                    page.keyboard.press('Enter')
+                    assert titles.count() == 40
+                    assert titles.nth(39).inner_text() == entries[39]['title']
+
+                    metrics = page.evaluate('''() => {
+                        const root = document.scrollingElement;
+                        const rowTwo = document.querySelector('.app-header-row-two');
+                        const main = document.querySelector('.workspace-main');
+                        const scrollers = [...document.querySelectorAll('*')]
+                          .filter(element => {
+                            if (element === root) return false;
+                            const style = getComputedStyle(element);
+                            return /(auto|scroll)/.test(style.overflowY)
+                              && element.scrollHeight > element.clientHeight + 1;
+                          })
+                          .filter(element => !['TEXTAREA', 'SELECT'].includes(element.tagName)
+                            && element.getAttribute('role') !== 'menu')
+                          .map(element => String(element.className || ''));
+                        return {
+                            documentHeight: root?.scrollHeight ?? 0,
+                            viewportHeight: innerHeight,
+                            documentWidth: document.documentElement.scrollWidth,
+                            viewportWidth: innerWidth,
+                            headerBottom: rowTwo?.getBoundingClientRect().bottom ?? null,
+                            contentTop: main?.getBoundingClientRect().top ?? null,
+                            scrollers,
+                        };
+                    }''')
+                    assert metrics['documentHeight'] > metrics['viewportHeight'], metrics
+                    assert metrics['documentWidth'] <= metrics['viewportWidth'] + 1, metrics
+                    assert not metrics['scrollers'], metrics
+                    if width >= 960 and height >= 600:
+                        assert metrics['headerBottom'] <= 112, metrics
+                        assert metrics['contentTop'] <= 128, metrics
+                    else:
+                        page.get_by_role('button', name='Menu', exact=True).wait_for()
+                        assert page.evaluate('''() => [...document.styleSheets].some(sheet => {
+                            try { return [...sheet.cssRules].some(rule => rule.cssText.includes('safe-area-inset-top')) }
+                            catch { return false }
+                        })''')
+
+                    page.evaluate('window.scrollTo(0, 0)')
+                    before_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                    page.mouse.move(width // 2, min(250, height - 1))
+                    page.mouse.wheel(0, max(240, height // 2))
+                    page.wait_for_timeout(50)
+                    after_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                    assert after_scroll > before_scroll, {'before': before_scroll, 'after': after_scroll, **metrics}
+                    assert page.locator('[data-changelog-title]').evaluate_all('''elements => elements.every(element => {
+                        const style = getComputedStyle(element);
+                        return style.overflowWrap === 'anywhere' || style.overflowWrap === 'break-word';
+                    })''')
+
+                    page.screenshot(path=str(tmp_path / f'changelog-{theme}-{width}x{height}.png'))
+                    select_settings_section(page, 'General')
+                    assert page.get_by_label('Bind host').input_value() == draft_value
+                    save = page.get_by_role('button', name='Save all changes', exact=True)
+                    save.wait_for()
+                    assert save.count() == 1
+                    assert save.is_enabled()
+        finally:
+            browser.close()
 
 
 def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monkeypatch):

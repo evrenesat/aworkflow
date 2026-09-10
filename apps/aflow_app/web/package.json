@@ -9,6 +9,7 @@
     "predev": "npm run changelog",
     "build": "tsc && vite build",
     "prebuild": "npm run changelog",
+    "pretest": "npm run changelog",
     "preview": "vite preview",
     "test": "vitest",
     "lint": "eslint src --ext ts,tsx"

@@ -11,7 +11,9 @@ The remote app opens on All runs: every ongoing run across registered projects
 a separate Needs attention group for unconfirmed outcomes, and the latest 10
 terminal runs (the count is a browser preference). Projects
 have separate Runs, Plans, and New run pages. Global Settings offers Agents &
-Roles, Teams, Workflows, Prompts, and General tabs with one changed-only save.
+Roles, Teams, Workflows, Prompts, General, and a read-only Changelog tab with
+one changed-only save coordinator. Changelog shows concise date-grouped release
+titles from the built artifact, initially 20 entries at a time.
 Appearance follows the system by default; Light and Dark overrides
 persist in the browser. Startup failures retain their safe explanation after
 reload, and runtime starts only from execution evidence. Starting requires a
@@ -189,7 +191,9 @@ as part of every web build; run `npm --prefix apps/aflow_app/web run changelog`
 to regenerate the ignored JSON and Markdown artifacts in a checkout. DEVLOG is
 the only authored changelog source. Built wheels carry the same release data as
 `aflow/ui_web/changelog.json`, so installed clients do not need Node or a
-repository checkout to read it.
+repository checkout to read it. Settings renders that packaged data without a
+runtime repository or configuration request; switching to Changelog does not
+discard dirty settings or skill drafts.
 
 ## Use MCP through the UI server
 
