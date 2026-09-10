@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-10 — Release approved work through main
+
+- Publish the completed Skills/settings, manager-context, and readable CLI work
+  to main. Remove the invalid empty CI matrix exclusion so CI can run and the
+  existing exact-SHA deployment gate can advance the live UI.
+- The active live-configuration plan remains in its execution worktree until
+  complete. Local plan approval alone is not evidence of publication or deployment.
+
 ## 2026-09-10 — Store manager history outside the live context (Checkpoint 4)
 
 - Added an additive content-addressed JSON evidence kind for complete manager
