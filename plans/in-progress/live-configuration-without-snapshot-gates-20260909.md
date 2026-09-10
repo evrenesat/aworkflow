@@ -18,9 +18,17 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp2 v01` — approved.
+- Last Reviewed Checkpoint: `cp3 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp3 v01` from the immediately preceding worker's repaired worktree against approved CP2 `1bd1e2a`; no pending CP3 commit existed, so worktree fallback was used. The cp03-v03 non-checkpoint overlay is resolved: incomplete independent END fails, while actual limit-driven END and boundary exhaustion terminate normally. Persistent partial controls, live defaults/graph and retry refresh are retained. Runtime/state/runlog: 341 passed, 43 subtests; focused CLI resume: 2 passed, 8 subtests; diff check passed. No material findings. CP4 remains unchecked; manager 40 KiB hard guard and 16 KiB compact target unchanged.
+
+- 2026-09-10: Re-reviewed latest CP3 repair using worktree fallback against approved CP2 `1bd1e2a`. Prior normal-limit failure is fixed. CP3 remains unapproved: an unconditional END at the cap succeeds as transition_end with an incomplete plan; synthetic reproduction confirmed it. Required suite: 339 passed, 43 subtests; focused CLI: 2 passed, 8 subtests; diff check passed. New non-checkpoint cp03-v03 overlay supersedes CP3 cp03-v02. Compatible work retained, CP4 untouched, manager 40 KiB guard and 16 KiB summary unchanged.
+
+- 2026-09-10: Re-reviewed repaired CP3 using worktree fallback against approved CP2 `1bd1e2a`. Persistent partial choices are fixed and MAX_TURNS_REACHED graph evidence is restored. CP3 remains unapproved: lowered live limits and capped END still record failed status instead of the required normal termination; current synthetic tests assert that wrong result. Verification: 338 passed, 43 subtests; focused CLI resume: 2 passed, 8 subtests; diff check passed. New non-checkpoint CP3 overlay `live-configuration-without-snapshot-gates-20260909-cp03-v02.md` supersedes cp04-v01. Compatible implementation retained; CP4 untouched; 40 KiB manager guard and 16 KiB target preserved.
+
+- 2026-09-10: Rejected pending CP3 worker worktree against approved CP2 `1bd1e2a`; no pending checkpoint commit exists, so worktree fallback was used. Two reproduced P2 defects: partial accepted controls discard earlier team/limit choices, and live-source turns suppress MAX_TURNS_REACHED transitions. Scoped suite: 295 passed, 43 subtests; two additional synthetic reproductions confirmed failures; `git diff --check` passed. CP3 approval remains unchecked; implementation markers retained. Repair overlay `live-configuration-without-snapshot-gates-20260909-cp04-v01.md` targets CP3 despite its filename. Review original CP3 after repair; CP4 remains out of scope. Manager 40 KiB guard and 16 KiB summary retained.
 
 - 2026-09-10: Approved `cp2 v01` from the immediately preceding worker's repaired worktree against CP1 `7454db7`; no pending CP2 commit existed, so worktree fallback was used. Both prior P2 findings are resolved. Required CP2 plus library/API suites: 288 passed, 131 subtests; metadata regressions: 2 passed; unfinished-step and finalized reviewer/worker replay: 3 passed; `git diff --check` passed. No material findings. The `cp03-v01` CP2 repair overlay is resolved; CP3 remains unchecked. Manager 40 KiB guard and 16 KiB compact target retained.
 
@@ -120,7 +128,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** Unrelated in-flight process ownership changes; do not test by resuming production runs.
 
-### [ ] Checkpoint 3: Reload configuration and resolve overrides at each turn boundary
+### [x] Checkpoint 3: Reload configuration and resolve overrides at each turn boundary
 
 **Goal:** The controller's next turn executes current saved settings with deterministic defaults and override precedence.
 
@@ -130,11 +138,11 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Move boundary control flow so owner stop is honored, current configuration loads, pending controls resolve, then limits and next-step execution are evaluated. Use one current object for the complete turn; update `wf` and derived controller settings while preserving actual execution context.
-- [ ] Implement invariant 4 default/explicit provenance and runtime resolution. Add/remove future steps and change role/prompt definitions without full-config mismatch checks. Missing targets cause the stated actionable pre-turn failure; valid pending target corrections take precedence over checking replaced saved targets.
-- [ ] Remove frozen-catalog validation from team/role overrides. Reject a newly invalid request once per digest, preserve the last accepted choices separately from last request result, and continue usable work. Test rejected direct TOML and accepted-then-deleted target cases. Keep one-shot notes/next-step and existing owner-stop semantics.
-- [ ] For a pending retry, preserve saved valid plan context, paths, error appendix and attempt accounting, but resolve current role/model/effort and render current configured prompt templates using that saved context. Do not require reparsing the broken plan to pick up a config edit. Retain the context fields needed for template rendering rather than treating `base_user_prompt` as current configuration. Existing captured failure evidence remains unchanged.
-- [ ] Test live limit increase/decrease at the loop edge, default team changes versus explicit choices, graph edits, selected-target deletion, malformed current config, correction/resume, and owner stop with broken config.
+- [x] Move boundary control flow so owner stop is honored, current configuration loads, pending controls resolve, then limits and next-step execution are evaluated. Use one current object for the complete turn; update `wf` and derived controller settings while preserving actual execution context.
+- [x] Implement invariant 4 default/explicit provenance and runtime resolution. Add/remove future steps and change role/prompt definitions without full-config mismatch checks. Missing targets cause the stated actionable pre-turn failure; valid pending target corrections take precedence over checking replaced saved targets.
+- [x] Remove frozen-catalog validation from team/role overrides. Reject a newly invalid request once per digest, preserve the last accepted choices separately from last request result, and continue usable work. Test rejected direct TOML and accepted-then-deleted target cases. Keep one-shot notes/next-step and existing owner-stop semantics.
+- [x] For a pending retry, preserve saved valid plan context, paths, error appendix and attempt accounting, but resolve current role/model/effort and render current configured prompt templates using that saved context. Do not require reparsing the broken plan to pick up a config edit. Retain the context fields needed for template rendering rather than treating `base_user_prompt` as current configuration. Existing captured failure evidence remains unchanged.
+- [x] Test live limit increase/decrease at the loop edge, default team changes versus explicit choices, graph edits, selected-target deletion, malformed current config, correction/resume, and owner stop with broken config.
 
 **Dependencies:** Checkpoints 1–2.
 

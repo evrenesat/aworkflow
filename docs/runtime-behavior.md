@@ -167,8 +167,10 @@ In normal checkouts, ignore `.aflow/`, `.aflow/runs/`, and `plans/backups/` in g
 A scheduled retry:
 
 - skips the pre-turn plan reload
-- reuses the last valid snapshot and saved prompt context
-- reuses the same `ACTIVE_PLAN_PATH`, `NEW_PLAN_PATH`, and resolved selector
+- preserves the last valid snapshot, saved plan paths, failure evidence, and
+  attempt accounting
+- resolves the current step's role/profile and renders its current prompt
+  templates at the retry boundary
 - appends the exact parse error to the retry prompt
 - counts toward `max_turns`
 
@@ -236,6 +238,12 @@ records acceptance or rejection atomically before routing or launch, and never
 deletes or rewrites the file. Broad status and analysis output redact the source
 and note contents. An unchanged
 accepted digest is not applied twice; editing the file creates a new request.
+Accepted partial requests retain the latest persistent `team` and `max_turns`
+choices when either field is omitted. `next_step` and `notes` remain scoped to
+the request that supplied them and are not replayed from an older request.
+For a live source, reaching the effective `max_turns` is a normal terminal
+outcome with `end_reason = "max_turns_reached"`; the completed turn and its
+incomplete plan snapshot are preserved, and no additional harness is launched.
 Invalid TOML, unknown keys, incompatible routing, and invalid limits leave the
 run in `waiting_for_valid_override` without launching another harness. Correct
 the same file and resume the recorded run id.
@@ -376,7 +384,8 @@ the current/pending transactions, normalized history, capability paths, and
 active session count.
 ## Live run configuration and diagnostic snapshots
 
-Each launch and resume boundary selects a current configuration source. A
+Each launch, resume, and subsequent turn boundary selects a current
+configuration source. A
 direct CLI invocation uses its explicit `--config` path when supplied, or the
 current default source otherwise. Daemon, UI, and MCP requests use the
 configured daemon source. Reservation records that source and the provenance
@@ -393,6 +402,11 @@ controller-inactivity checks remain required. An explicit resume correction
 for team or step is checked against the current configuration; an omitted
 choice may follow the current default when its saved provenance says it was
 not explicit. Configuration is not reloaded in the middle of a harness turn.
+A completed turn keeps the object it started with; the next boundary reloads
+the current workflow graph, defaults, role/profile resolution, prompts, retry
+policy, and limits. An invalid newly submitted override is recorded once per
+digest and does not discard the last accepted run-local choices when usable
+work can continue. Owner-stop is checked before this reload.
 
 ## UI process lifecycle and persistent units
 
@@ -494,9 +508,11 @@ On the last allowed turn:
 - `MAX_TURNS_REACHED` evaluates true.
 - The selected transition is still recorded, including an `END` selected by
   `MAX_TURNS_REACHED`.
-- If the original plan remains incomplete, the run fails with a max-turns
-  error whether or not the transition selected `END`.
-- A max-turn `END` is successful only when the post-turn original-plan
+- For a static configuration, if the original plan remains incomplete, the run
+  fails with a max-turns error whether or not the transition selected `END`.
+- For a live source, a cap-selected `END` is a normal terminal outcome with
+  `end_reason = "max_turns_reached"`; the incomplete plan remains unchanged.
+- A non-limit `END` is successful only when the post-turn original-plan
   snapshot is complete.
 
 `max_same_step_turns` limits consecutive selection of the same step in multi-step workflows. The streak resets only after a different step actually executes. Single-step workflows are not affected.

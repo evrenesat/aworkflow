@@ -22,12 +22,14 @@ if TYPE_CHECKING:
 
 from .config import (
     AflowSection,
+    ConfigError,
     GoTransition,
     VALID_CONDITION_SYMBOLS,
     WorkflowConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
 )
+from .live_config import load_live_config
 from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
@@ -101,7 +103,7 @@ from .recovery import (
     TeamLeadRecoveryDecision,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
     build_handover_context_v1, render_handover_prompt, validate_handover_output,
@@ -5823,6 +5825,20 @@ def run_workflow(
     allow_existing_launch_manifest: bool = False,
     snapshot_config: bool = True,
 ) -> ControllerRunResult:
+    config_dir = Path(config_dir)
+    live_config_source_path: Path | None = None
+    if config_dir.is_file() or config_dir.suffix == ".toml":
+        live_config_source_path = config_dir.resolve()
+    elif (
+        (config_dir / "aflow.toml").is_file()
+        and (config_dir / "workflows.toml").is_file()
+    ):
+        live_config_source_path = (config_dir / "aflow.toml").resolve()
+    prompt_config_dir = (
+        live_config_source_path.parent
+        if live_config_source_path is not None
+        else config_dir
+    )
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
 
@@ -6122,7 +6138,9 @@ def run_workflow(
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
     state.frozen_run_identity = current_frozen_identity
-    state.live_config_path = str(config_dir.resolve())
+    state.live_config_path = str(
+        live_config_source_path if live_config_source_path is not None else config_dir.resolve()
+    )
     state.team_explicit = (
         config.team_explicit
         if config.team_explicit is not None
@@ -6145,6 +6163,16 @@ def run_workflow(
     )
     if resume is not None:
         state.override_result = resume.override_result
+        state.last_accepted_override = resume.last_accepted_override
+        if (
+            state.last_accepted_override is None
+            and state.override_result is not None
+            and state.override_result.status == "accepted"
+        ):
+            state.last_accepted_override = merge_accepted_override_choices(
+                None,
+                state.override_result,
+            )
         state.role_selectors = dict(resume.role_selectors)
         state.current_hotplug_transaction = resume.current_hotplug_transaction
         state.pending_hotplug_transaction = resume.pending_hotplug_transaction
@@ -9019,6 +9047,106 @@ def run_workflow(
             new_plan_path=new_plan_path,
         )
 
+    def _last_accepted_boundary_override() -> OverrideResult | None:
+        accepted = state.last_accepted_override
+        if accepted is None and (
+            state.override_result is not None
+            and state.override_result.status == "accepted"
+        ):
+            accepted = merge_accepted_override_choices(
+                None,
+                state.override_result,
+            )
+            state.last_accepted_override = accepted
+        return accepted
+
+    def _honor_owner_stop_before_live_reload() -> None:
+        """Honor a stop request without requiring the current config to parse."""
+        source_run_dir = state.override_source_run_dir or run_paths.run_dir
+        override_path = source_run_dir / "overrides.toml"
+        prior = state.override_result
+        if (
+            prior is not None
+            and prior.status == "accepted"
+            and not prior.applied
+            and prior.owner_stop
+        ):
+            state.override_result = replace(prior, applied=True)
+            _write_override_boundary(status="owner_stop_requested")
+            raise OwnerStopRequested()
+
+        consumed_digest = (
+            prior.digest
+            if prior is not None
+            and prior.status == "accepted"
+            and prior.applied
+            else None
+        )
+        loaded = load_override_request(
+            override_path,
+            consumed_digest=consumed_digest,
+        )
+        state.override_file_present = loaded.status != "absent"
+        if loaded.status == "valid" and loaded.request is not None:
+            request = loaded.request
+            if request.owner_stop:
+                state.override_result = OverrideResult(
+                    status="accepted",
+                    digest=request.digest,
+                    message="owner stop accepted at pre-turn boundary",
+                    source_text=request.source_text,
+                    owner_stop=True,
+                    applied=True,
+                )
+                _write_override_boundary(status="owner_stop_requested")
+                raise OwnerStopRequested()
+
+    def _reload_live_configuration_at_boundary() -> None:
+        """Refresh all configuration-derived turn inputs exactly once."""
+        nonlocal workflow_config, wf, retry_limit, baseline_team_name
+        if live_config_source_path is None:
+            return
+        try:
+            loaded = load_live_config(live_config_source_path)
+        except ConfigError as exc:
+            raise WorkflowError(
+                "current live workflow configuration is unusable: "
+                f"{exc}"
+            ) from exc
+        refreshed_config = loaded.workflow_config
+        refreshed_workflow = refreshed_config.workflows.get(workflow_name)
+        if refreshed_workflow is None:
+            raise WorkflowError(
+                f"current live configuration removed workflow '{workflow_name}'"
+            )
+        if refreshed_workflow.first_step is None:
+            raise WorkflowError(
+                f"current live configuration gives workflow '{workflow_name}' no steps"
+            )
+
+        workflow_config = refreshed_config
+        wf = refreshed_workflow
+        retry_limit = _effective_retry_limit(wf, workflow_config.aflow)
+        state.live_config_path = str(loaded.source.config_path)
+
+        accepted = _last_accepted_boundary_override()
+        if accepted is not None and accepted.team is not None:
+            refreshed_team = accepted.team
+        elif state.team_explicit:
+            refreshed_team = config.team if config.team is not None else state.current_team
+        else:
+            refreshed_team = wf.team
+        if state.current_team_override is None:
+            state.current_team = refreshed_team
+        baseline_team_name = refreshed_team
+
+        if accepted is not None and accepted.max_turns is not None:
+            state.effective_max_turns = accepted.max_turns
+        elif state.max_turns_explicit:
+            state.effective_max_turns = config.max_turns
+        else:
+            state.effective_max_turns = workflow_config.aflow.max_turns
+
     def _finish_owner_stop(
         *,
         invocation: HarnessInvocation | None = None,
@@ -9120,6 +9248,7 @@ def run_workflow(
         source_run_dir = state.override_source_run_dir or run_paths.run_dir
         override_path = source_run_dir / "overrides.toml"
         prior = state.override_result
+        accepted = _last_accepted_boundary_override()
         required_predecessor_override = (
             state.override_source_run_dir is not None
             and source_run_dir.resolve() != run_paths.run_dir.resolve()
@@ -9129,17 +9258,23 @@ def run_workflow(
             and prior.status == "accepted"
             and not prior.applied
         ):
+            applied_override = replace(prior, applied=True)
+            accepted = merge_accepted_override_choices(
+                state.last_accepted_override,
+                applied_override,
+            )
             if prior.owner_stop:
                 raise OwnerStopRequested()
             if prior.next_step is not None:
                 current_step_name = prior.next_step
-            if prior.team is not None:
-                state.current_team = prior.team
+            if accepted.team is not None:
+                state.current_team = accepted.team
                 state.current_team_override = None
-                baseline_team_name = prior.team
-            if prior.max_turns is not None:
-                state.effective_max_turns = prior.max_turns
-            state.override_result = replace(prior, applied=True)
+                baseline_team_name = accepted.team
+            if accepted.max_turns is not None:
+                state.effective_max_turns = accepted.max_turns
+            state.override_result = applied_override
+            state.last_accepted_override = accepted
             state.role_selectors.update(prior.role_selectors)
             transaction = state.current_hotplug_transaction
             if transaction is not None and transaction.stage == "accepted":
@@ -9166,6 +9301,14 @@ def run_workflow(
             and prior is not None
             and prior.status == "accepted"
             and prior.applied
+        ):
+            return current_step_name, baseline_team_name
+        if (
+            not required_predecessor_override
+            and prior is not None
+            and prior.status == "rejected"
+            and loaded.digest == prior.digest
+            and (state.turns_completed > 0 or accepted is not None)
         ):
             return current_step_name, baseline_team_name
         request = loaded.request
@@ -9244,7 +9387,7 @@ def run_workflow(
                     )
                 elif unknown_selectors:
                     validation_error = (
-                        "roles contains selectors outside frozen config: "
+                        "roles contains selectors not configured in current configuration: "
                         + ", ".join(unknown_selectors)
                     )
                 elif request.role_selectors:
@@ -9277,11 +9420,22 @@ def run_workflow(
                 message=validation_error or "invalid override request",
                 source_text=loaded.source_text,
             )
+            state.override_source_run_dir = source_run_dir
+            can_continue_with_rejected_override = (
+                not required_predecessor_override
+                and (state.turns_completed > 0 or accepted is not None)
+            )
+            if can_continue_with_rejected_override:
+                state.status_message = (
+                    "invalid_override_ignored: "
+                    f"{state.override_result.message}"
+                )
+                _write_override_boundary(status="running")
+                return current_step_name, baseline_team_name
             state.status_message = (
                 "waiting_for_valid_override: "
                 f"{state.override_result.message}"
             )
-            state.override_source_run_dir = source_run_dir
             _write_override_boundary(status="waiting_for_valid_override")
             if preserve_resume_override_source:
                 prune_old_runs(run_paths.runs_root, config.keep_runs)
@@ -9391,6 +9545,10 @@ def run_workflow(
                     replace(worker_transaction, stage="applied"),
                 )
         state.override_result = replace(state.override_result, applied=True)
+        state.last_accepted_override = merge_accepted_override_choices(
+            state.last_accepted_override,
+            state.override_result,
+        )
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
         if preserve_resume_override_source:
@@ -9526,16 +9684,188 @@ def run_workflow(
             + " (sha256=" + artifact_hashes[2] + ")"
         )
 
+    def _finish_normal_terminal(
+        *,
+        final_snapshot: PlanSnapshot,
+        end_reason: WorkflowEndReason,
+        terminal_step_name: str,
+        terminal_step_role: str | None,
+        terminal_selector: str | None,
+        active_team: str | None,
+    ) -> ControllerRunResult:
+        """Finalize a normal terminal boundary, including an incomplete cap."""
+        nonlocal original_plan_path, active_plan_path
+
+        state.end_reason = end_reason
+        recovered_turn = state.current_team_override is not None
+        if recovered_turn:
+            state.current_team_override = None
+        merge_team_name = baseline_team_name if recovered_turn else active_team
+
+        merge_status: str | None = None
+        merge_failure_reason: str | None = None
+
+        if exec_ctx is not None and "merge" in exec_ctx.teardown:
+            try:
+                merge_status, merge_failure_reason = _perform_merge_teardown(
+                    exec_ctx,
+                    wf,
+                    workflow_config,
+                    preflight_probe=resolved_preflight_probe,
+                    repo_root=config.repo_root,
+                    team_name=merge_team_name,
+                    adapter=adapter,
+                    runner=runner,
+                    config_dir=config_dir,
+                    working_dir=working_dir,
+                    original_plan_path=original_plan_path,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    banner=banner,
+                    state=state,
+                )
+            except HarnessEnvironmentPreflightError as exc:
+                _handle_environment_preflight_failure(exc)
+
+        if merge_status == "failed":
+            state.status_message = "failed"
+            report = _manager_terminal_incident(
+                trigger="merge_failure",
+                reason=merge_failure_reason or "merge teardown failed",
+                current_step=terminal_step_name,
+                current_role=terminal_step_role,
+                active_team=merge_team_name,
+                active_selector=terminal_selector,
+            )
+            summary = report or _format_failure(
+                reason=merge_failure_reason or "merge teardown failed",
+                run_dir=run_paths.run_dir,
+                snapshot=final_snapshot,
+            )
+            run_metadata.write(
+                status="failed",
+                merge_status=merge_status,
+                merge_failure_reason=merge_failure_reason,
+                execution_context=exec_ctx,
+                last_snapshot=final_snapshot,
+                turns_completed=state.turns_completed,
+                original_plan_path=original_plan_path,
+                current_step_name=terminal_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+            )
+            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            banner.stop(state)
+            raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+        if final_snapshot.is_complete:
+            prior_original_plan_path = original_plan_path
+            finalized_original_plan_path = _finalize_original_plan_if_complete(
+                config.repo_root,
+                original_plan_path,
+                snapshot=final_snapshot,
+            )
+            if finalized_original_plan_path != prior_original_plan_path:
+                original_plan_path = finalized_original_plan_path
+                if active_plan_path == prior_original_plan_path:
+                    active_plan_path = original_plan_path
+
+        state.status_message = "completed"
+        _emit_event(observer, StatusChangedEvent.create(
+            status_message="completed",
+            turns_completed=state.turns_completed,
+            active_turn=None,
+            current_step_name=terminal_step_name,
+        ))
+        result = ControllerRunResult(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=final_snapshot,
+            issues_accumulated=state.issues_accumulated,
+            end_reason=end_reason,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        )
+        run_metadata.write(
+            status="completed",
+            merge_status=merge_status,
+            execution_context=exec_ctx,
+            last_snapshot=final_snapshot,
+            turns_completed=state.turns_completed,
+            end_reason=end_reason,
+            original_plan_path=original_plan_path,
+            current_step_name=terminal_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+        prune_old_runs(run_paths.runs_root, config.keep_runs)
+        banner.stop(state)
+
+        _emit_event(observer, RunCompletedEvent.create(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=final_snapshot,
+            end_reason=end_reason,
+            issues_accumulated=state.issues_accumulated,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        ))
+
+        return result
+
     turn_number = 1
-    while turn_number <= (state.effective_max_turns or config.max_turns):
+    while True:
+        try:
+            _honor_owner_stop_before_live_reload()
+        except OwnerStopRequested:
+            return _finish_owner_stop()
+        try:
+            _reload_live_configuration_at_boundary()
+        except WorkflowError as exc:
+            _raise_pre_turn_failure(
+                reason=exc.summary,
+                snapshot=state.last_snapshot,
+                active_path=active_plan_path,
+                new_path=new_plan_path,
+            )
         try:
             current_step_name, baseline_team_name = _apply_boundary_override()
         except OwnerStopRequested:
             return _finish_owner_stop()
         effective_max_turns = state.effective_max_turns or config.max_turns
         if turn_number > effective_max_turns:
+            if live_config_source_path is not None:
+                return _finish_normal_terminal(
+                    final_snapshot=state.last_snapshot,
+                    end_reason="max_turns_reached",
+                    terminal_step_name=current_step_name,
+                    terminal_step_role=None,
+                    terminal_selector=None,
+                    active_team=state.current_team,
+                )
             break
         retry_ctx = state.pending_retry
+        boundary_active_path = (
+            retry_ctx.active_plan_path if retry_ctx is not None else active_plan_path
+        )
+        boundary_new_path = (
+            retry_ctx.new_plan_path if retry_ctx is not None else new_plan_path
+        )
+        if current_step_name not in wf.steps:
+            _raise_pre_turn_failure(
+                reason=(
+                    f"current step '{current_step_name}' is not an executable step "
+                    f"in current workflow '{workflow_name}'; correct the live "
+                    "configuration or submit a valid next_step override"
+                ),
+                snapshot=(
+                    retry_ctx.snapshot_before
+                    if retry_ctx is not None
+                    else state.last_snapshot
+                ),
+                active_path=boundary_active_path,
+                new_path=boundary_new_path,
+            )
         active_team_name = (
             state.current_team_override
             if state.current_team_override is not None
@@ -9649,7 +9979,19 @@ def run_workflow(
                 active_team=active_team_name,
             )
             try:
-                user_prompt = retry_ctx.base_user_prompt + "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
+                user_prompt = render_step_prompts(
+                    step,
+                    workflow_config,
+                    config_dir=prompt_config_dir,
+                    working_dir=working_dir,
+                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                    new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
+                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                )
+                if config.extra_instructions:
+                    extra_text = " ".join(config.extra_instructions).strip()
+                    user_prompt = "\n\n".join((user_prompt, extra_text))
+                user_prompt += "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
                 if manager_notes:
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
                         f"- {note}" for note in manager_notes
@@ -9963,7 +10305,7 @@ def run_workflow(
                 user_prompt = render_step_prompts(
                     step,
                     workflow_config,
-                    config_dir=config_dir,
+                    config_dir=prompt_config_dir,
                     working_dir=working_dir,
                     original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
                     new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
@@ -10625,6 +10967,10 @@ def run_workflow(
             if new_plan_exists:
                 active_plan_path = new_plan_path
 
+            # A source-backed run must reach the next boundary before deciding
+            # that the limit is terminal. The saved turn still uses the
+            # current limit for accounting, but a boundary edit may increase
+            # it before the next synthetic/provider launch.
             max_turns_reached = turn_number >= effective_max_turns
 
             conditions = {
@@ -10696,6 +11042,19 @@ def run_workflow(
                     conditions=conditions,
                 )
 
+            limit_terminal = (
+                transition_target == "END"
+                and live_config_source_path is not None
+                and max_turns_reached
+                and selected_transition is not None
+                and selected_transition.when is not None
+                and not evaluate_condition(
+                    selected_transition.when,
+                    done=done,
+                    new_plan_exists=new_plan_exists,
+                    max_turns_reached=False,
+                )
+            )
             review_rejection: ReviewRejectionRecord | None = None
             scope_before_finalize = state.active_implementation_scope
             controller_next_step = (
@@ -10751,7 +11110,7 @@ def run_workflow(
                 )
 
             _finalize_turn_record(
-                status="completed" if done else "running",
+                status="completed" if done or limit_terminal else "running",
                 started_at=turn_started_at,
                 snapshot_before=snapshot_before,
                 snapshot_after=post_snapshot,
@@ -10777,7 +11136,7 @@ def run_workflow(
                     if (
                         transition_target == "END"
                         and selected_transition is not None
-                        and post_snapshot.is_complete
+                        and (post_snapshot.is_complete or limit_terminal)
                     )
                     else None
                 ),
@@ -10868,10 +11227,12 @@ def run_workflow(
         ):
             _close_implementation_scope(state)
 
-        # Exhaustion is a finalized terminal boundary regardless of whether
-        # manager supervision is enabled. Full enriches the incident when it
-        # is available, but cannot turn an incomplete plan into success.
-        if max_turns_reached and not done:
+        # A live source may change the effective limit at the next boundary;
+        # let the completed turn reach that reload before deciding whether
+        # another provider launch is allowed. Static runs retain their
+        # existing terminal manager gate, while live END transitions flow
+        # through normal END finalization so their edge is recorded.
+        if max_turns_reached and not done and live_config_source_path is None:
             reason = f"reached max turns limit of {effective_max_turns} without completing the active plan"
             report = _manager_terminal_incident(
                 trigger="max_turns", reason=reason, current_step=current_step_name,
@@ -10993,11 +11354,15 @@ def run_workflow(
         )
 
         if transition_target == "END":
-            if not post_snapshot.is_complete:
+            if not post_snapshot.is_complete and not limit_terminal:
+                terminal_reason = (
+                    f"reached max turns limit of {effective_max_turns} without "
+                    "completing the active plan"
+                    if max_turns_reached
+                    else "workflow selected END while the active plan remains incomplete"
+                )
                 _raise_incomplete_terminal_failure(
-                    reason=(
-                        "workflow selected END while the active plan remains incomplete"
-                    ),
+                    reason=terminal_reason,
                     post_snapshot=post_snapshot,
                     turn_dir=turn_dir,
                 )
@@ -11006,115 +11371,14 @@ def run_workflow(
                 done=done,
                 max_turns_reached=max_turns_reached,
             )
-            state.end_reason = end_reason
-            recovered_turn = state.current_team_override is not None
-            if recovered_turn:
-                state.current_team_override = None
-            merge_team_name = baseline_team_name if recovered_turn else active_team_name
-
-            merge_status: str | None = None
-            merge_failure_reason: str | None = None
-
-            if exec_ctx is not None and "merge" in exec_ctx.teardown:
-                try:
-                    merge_status, merge_failure_reason = _perform_merge_teardown(
-                        exec_ctx,
-                        wf,
-                        workflow_config,
-                        preflight_probe=resolved_preflight_probe,
-                        repo_root=config.repo_root,
-                        team_name=merge_team_name,
-                        adapter=adapter,
-                        runner=runner,
-                        config_dir=config_dir,
-                        working_dir=working_dir,
-                        original_plan_path=original_plan_path,
-                        active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path,
-                        banner=banner,
-                        state=state,
-                    )
-                except HarnessEnvironmentPreflightError as exc:
-                    _handle_environment_preflight_failure(exc)
-
-            if merge_status == "failed":
-                state.status_message = "failed"
-                report = _manager_terminal_incident(
-                    trigger="merge_failure", reason=merge_failure_reason or "merge teardown failed",
-                    current_step=current_step_name, current_role=step.role,
-                    active_team=merge_team_name, active_selector=selector,
-                )
-                summary = report or _format_failure(
-                    reason=merge_failure_reason or "merge teardown failed",
-                    run_dir=run_paths.run_dir, snapshot=post_snapshot,
-                )
-                run_metadata.write(
-                    status="failed",
-                    merge_status=merge_status,
-                    merge_failure_reason=merge_failure_reason,
-                    execution_context=exec_ctx,
-                    last_snapshot=post_snapshot,
-                    turns_completed=state.turns_completed,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                )
-                prune_old_runs(run_paths.runs_root, config.keep_runs)
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
-
-            prior_original_plan_path = original_plan_path
-            finalized_original_plan_path = _finalize_original_plan_if_complete(
-                config.repo_root,
-                original_plan_path,
-                snapshot=post_snapshot,
-            )
-            if finalized_original_plan_path != prior_original_plan_path:
-                original_plan_path = finalized_original_plan_path
-                if active_plan_path == prior_original_plan_path:
-                    active_plan_path = original_plan_path
-
-            state.status_message = "completed"
-            _emit_event(observer, StatusChangedEvent.create(
-                status_message="completed",
-                turns_completed=state.turns_completed,
-                active_turn=None,
-                current_step_name=current_step_name,
-            ))
-            result = ControllerRunResult(
-                run_dir=run_paths.run_dir,
-                turns_completed=state.turns_completed,
-                final_snapshot=post_snapshot,
-                issues_accumulated=state.issues_accumulated,
-                end_reason=end_reason,
-                recovery_summary=state.current_harness_recovery,
-                recovery_history=tuple(state.harness_recovery_history),
-            )
-            run_metadata.write(
-                status="completed",
-                merge_status=merge_status,
-                execution_context=exec_ctx,
-                last_snapshot=post_snapshot,
-                turns_completed=state.turns_completed,
-                end_reason=end_reason,
-                 original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-            )
-            prune_old_runs(run_paths.runs_root, config.keep_runs)
-            banner.stop(state)
-
-            _emit_event(observer, RunCompletedEvent.create(
-                run_dir=run_paths.run_dir,
-                turns_completed=state.turns_completed,
+            return _finish_normal_terminal(
                 final_snapshot=post_snapshot,
                 end_reason=end_reason,
-                issues_accumulated=state.issues_accumulated,
-                recovery_summary=state.current_harness_recovery,
-                recovery_history=tuple(state.harness_recovery_history),
-            ))
-
-            return result
+                terminal_step_name=current_step_name,
+                terminal_step_role=step.role,
+                terminal_selector=selector,
+                active_team=active_team_name,
+            )
 
         if len(wf.steps) > 1:
             max_cap = workflow_config.aflow.max_same_step_turns

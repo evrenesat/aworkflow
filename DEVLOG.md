@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-09-10 — Approve live turn configuration (Checkpoint 3)
+
+- Each source-backed turn reloads configuration before controls and limits; persistent partial choices and retry context survive refresh and resume.
+- Limit-driven termination preserves incomplete plan progress; independent incomplete END still fails. Owner stop precedes configuration parsing.
+- CP3 approved after 341 runtime/state/runlog tests and 43 subtests, plus 2 focused CLI tests and 8 subtests. Session and supervision refresh remains CP4.
+
 ## 2026-09-10 — Approve live launch and resume configuration (Checkpoint 2)
 
 - CLI and daemon startup/resume use the current source; snapshots are optional diagnostics. Explicit choices retain provenance, while execution identity and resume progress remain authoritative.

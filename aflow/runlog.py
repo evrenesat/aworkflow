@@ -1437,6 +1437,12 @@ class RunMetadataWriter:
                 payload["frozen_config"] = asdict(self.state.frozen_run_identity)
             if self.state.override_result is not None:
                 payload["override_result"] = asdict(self.state.override_result)
+            if self.state.last_accepted_override is not None:
+                payload["last_accepted_override"] = asdict(
+                    self.state.last_accepted_override
+                )
+            elif isinstance(previous.get("last_accepted_override"), Mapping):
+                payload["last_accepted_override"] = previous["last_accepted_override"]
             if self.state.pending_override_notes:
                 payload["pending_override_notes"] = list(self.state.pending_override_notes)
             if self.state.override_source_run_dir is not None:

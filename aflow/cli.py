@@ -2120,9 +2120,15 @@ def _reconstruct_resume_context(
         recovered_active_plan = str(pending_finalized_turn.new_plan_path)
 
     override_value = prev_run.get("override_result")
+    accepted_override_value = prev_run.get("last_accepted_override")
     override_resolution = resolve_resume_override(
         run_dir,
         override_value if isinstance(override_value, Mapping) else None,
+        persisted_accepted_result=(
+            accepted_override_value
+            if isinstance(accepted_override_value, Mapping)
+            else None
+        ),
     )
     pending_override_notes = prev_run.get("pending_override_notes")
     if not isinstance(pending_override_notes, list) or not all(
@@ -2234,6 +2240,7 @@ def _reconstruct_resume_context(
             else True
         ),
         override_result=override_resolution.override_result,
+        last_accepted_override=override_resolution.last_accepted_override,
         effective_max_turns=resolved_max_turns,
         pending_override_notes=tuple(pending_override_notes),
         override_source_run_dir=override_resolution.source_run_dir,

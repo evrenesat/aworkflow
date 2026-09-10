@@ -450,7 +450,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
             )
             assert lifecycle_captured == ['']
 
-    def test_resume_identity_drift_fails_before_event_or_new_run_state(self) -> None:
+    def test_resume_identity_drift_does_not_gate_live_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / "plan.md"
@@ -479,27 +479,29 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 def on_event(self, event: object) -> None:
                     events.append(event)
 
-            with pytest.raises(WorkflowError, match="resume frozen configuration mismatch"):
-                run_workflow(
-                    ControllerConfig(
-                        repo_root=repo_root,
-                        plan_path=plan_path,
-                        max_turns=2,
-                    ),
-                    workflow_config,
-                    "resume_override",
-                    config_dir=repo_root,
-                        snapshot_config=False,
-                    adapter=CodexAdapter(),
-                    runner=lambda argv, **kwargs: subprocess.CompletedProcess(
-                        argv, 0, "", ""
-                    ),
-                    resume=resume,
-                    observer=Observer(),
-                )
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(argv, 0, "", "")
 
-            assert events == []
-            assert not (repo_root / ".aflow" / "runs").exists()
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=2,
+                ),
+                workflow_config,
+                "resume_override",
+                config_dir=repo_root,
+                    snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=resume,
+                observer=Observer(),
+            )
+
+            assert result.turns_completed == 1
+            assert events
+            assert (repo_root / ".aflow" / "runs").exists()
 
     def test_matching_resume_identity_reaches_existing_resume_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1710,7 +1712,10 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 "aflow.workflow.create_run_paths",
                 side_effect=create_with_override,
             ):
-                with pytest.raises(WorkflowError, match="outside frozen config"):
+                with pytest.raises(
+                    WorkflowError,
+                    match="not configured in current configuration",
+                ):
                     run_workflow(
                         ControllerConfig(
                             repo_root=repo_root,
@@ -1984,7 +1989,7 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 "aflow.workflow.create_run_paths",
                 side_effect=capture_paths,
             ):
-                with pytest.raises(WorkflowError, match="below completed turns"):
+                with pytest.raises(WorkflowError, match="reached max turns limit"):
                     run_workflow(
                         ControllerConfig(
                             repo_root=repo_root,
@@ -1999,11 +2004,12 @@ class WorkflowRuntimeTests(unittest.TestCase):
                         runner=runner,
                     )
 
-            assert calls == 2
+            assert calls == 3
             payload = json.loads(
                 created_paths[0].run_json.read_text(encoding="utf-8")
             )
-            assert payload["status"] == "waiting_for_valid_override"
+            assert payload["status"] == "failed"
+            assert payload["override_result"]["status"] == "rejected"
 
     def test_run_process_captures_harness_output_without_echoing_to_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5337,17 +5343,18 @@ class WorkflowEndToEndTests(unittest.TestCase):
             _write_plan(completed_plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n- [x] step two\n')
             _write_workflow_harness_script(repo_root, 'codex')
             result = _run_workflow_launcher(repo_root, '--max-turns', '4', '--start-step', 'review', str(plan_path), env=_workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir, completed_plan_path=completed_plan_path))
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['status'] == 'failed'
+            assert run_json['status'] == 'completed'
             assert run_json['turns_completed'] == 4
-            assert 'end_reason' not in run_json
+            assert run_json['end_reason'] == 'max_turns_reached'
             for turn_dir in sorted((run_dirs[0] / 'turns').iterdir()):
                 turn_result = json.loads((turn_dir / 'result.json').read_text(encoding='utf-8'))
                 assert Path(turn_result['active_plan_path']).resolve() == plan_path.resolve()
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-004' / 'result.json').read_text(encoding='utf-8'))
-            assert 'end_reason' not in turn_result
+            assert turn_result['end_reason'] == 'max_turns_reached'
+            assert turn_result['status'] == 'completed'
 
     def test_max_turns_end_fails_when_plan_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5361,21 +5368,21 @@ class WorkflowEndToEndTests(unittest.TestCase):
             _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
             _write_workflow_harness_script(repo_root, 'codex')
             result = _run_workflow_launcher(repo_root, '--max-turns', '3', str(plan_path), env=_workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir))
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['status'] == 'failed'
+            assert run_json['status'] == 'completed'
             assert run_json['turns_completed'] == 3
-            assert 'end_reason' not in run_json
-            assert 'reached max turns limit of 3' in result.stderr
+            assert run_json['end_reason'] == 'max_turns_reached'
+            assert 'MAX_TURNS_REACHED matched' in result.stderr
             run_id = run_dirs[0].name
             assert f'AFlow run {run_id}' in result.stderr
-            assert f'AFlow run {run_id} - Failed' in result.stderr
+            assert f'AFlow run {run_id} - Turn limit reached' in result.stderr
             assert 'Run ID:' not in result.stderr
-            assert "Workflow 'simple' completed" not in result.stdout
+            assert "Workflow 'simple' completed after 3 turns because MAX_TURNS_REACHED matched." in result.stdout
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-003' / 'result.json').read_text(encoding='utf-8'))
-            assert 'end_reason' not in turn_result
+            assert turn_result['end_reason'] == 'max_turns_reached'
             assert turn_result['status'] == 'completed'
             assert turn_result['duration_seconds'] >= 0
 
@@ -5454,10 +5461,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'completed'
+            assert run_json['end_reason'] == 'max_turns_reached'
             assert run_json['turns_completed'] == 2
             turn1_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             turn2_result = json.loads((run_dirs[0] / 'turns' / 'turn-002' / 'result.json').read_text(encoding='utf-8'))
@@ -5519,8 +5528,11 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
+            run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
+            assert run_json['status'] == 'completed'
+            assert run_json['end_reason'] == 'max_turns_reached'
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['selector'] == 'claude.default'
             assert turn_result['step_role'] == 'architect'
@@ -5616,12 +5628,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
             assert run_json['turns_completed'] == 2
-            assert run_json['status'] == 'failed'
-            assert 'end_reason' not in run_json
+            assert run_json['status'] == 'completed'
+            assert run_json['end_reason'] == 'max_turns_reached'
 
     def test_cli_max_turns_overrides_config_max_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5668,12 +5680,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
                     home_dir=home_dir,
                 ),
             )
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
             assert run_json['turns_completed'] == 1
-            assert run_json['status'] == 'failed'
-            assert 'end_reason' not in run_json
+            assert run_json['status'] == 'completed'
+            assert run_json['end_reason'] == 'max_turns_reached'
 
     def test_launcher_numeric_start_step_matches_named_start_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5696,10 +5708,12 @@ class WorkflowEndToEndTests(unittest.TestCase):
                 str(plan_path),
                 env=env_numeric,
             )
-            assert result_numeric.returncode != 0
+            assert result_numeric.returncode == 0
             run_dirs_numeric = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs_numeric) == 1
             run_json_numeric = json.loads((run_dirs_numeric[0] / 'run.json').read_text(encoding='utf-8'))
+            assert run_json_numeric['status'] == 'completed'
+            assert run_json_numeric['end_reason'] == 'max_turns_reached'
             selected_step_numeric = run_json_numeric['selected_start_step']
             numeric_events = [
                 json.loads(line)['event_type']
@@ -5721,7 +5735,7 @@ class WorkflowEndToEndTests(unittest.TestCase):
                 str(plan_path),
                 env=env_named,
             )
-            assert result_named.returncode != 0
+            assert result_named.returncode == 0
             run_dirs_named = sorted((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs_named) == 1
             run_json_named = json.loads((run_dirs_named[0] / 'run.json').read_text(encoding='utf-8'))
@@ -10088,12 +10102,12 @@ class WorkflowMaxTurnsEndToEndTests(unittest.TestCase):
             _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
             _write_workflow_harness_script(repo_root, 'codex')
             result = _run_workflow_launcher(repo_root, '--max-turns', '1', '--start-step', 'review_plan', str(plan_path), env=_workflow_test_env(repo_root, scenario='noop', plan_path=plan_path, count_file=count_file, home_dir=home_dir))
-            assert result.returncode != 0
+            assert result.returncode == 0
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[0] / 'run.json').read_text(encoding='utf-8'))
-            assert run_json['status'] == 'failed'
-            assert 'end_reason' not in run_json
-            assert 'reached max turns limit of 1' in result.stderr
+            assert run_json['status'] == 'completed'
+            assert run_json['end_reason'] == 'max_turns_reached'
+            assert 'MAX_TURNS_REACHED matched' in result.stderr
 
 
 class StopMarkerTests(unittest.TestCase):

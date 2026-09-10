@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -90,11 +90,92 @@ class ResumeOverrideResolution:
     override_result: OverrideResult | None
     source_run_dir: Path | None
     file_present: bool
+    last_accepted_override: OverrideResult | None = None
+
+
+def _decode_override_result(value: Mapping[str, Any] | None) -> OverrideResult | None:
+    """Decode one persisted override result without inventing missing state."""
+    if value is None:
+        return None
+    override_status = value.get("status")
+    digest = value.get("digest")
+    message = value.get("message")
+    if (
+        override_status not in {"accepted", "rejected"}
+        or not isinstance(digest, str)
+        or not isinstance(message, str)
+    ):
+        return None
+    return OverrideResult(
+        status=override_status,
+        digest=digest,
+        message=message,
+        source_text=(
+            str(value["source_text"])
+            if isinstance(value.get("source_text"), str)
+            else None
+        ),
+        next_step=(
+            str(value["next_step"])
+            if value.get("next_step") is not None
+            else None
+        ),
+        team=(
+            str(value["team"])
+            if value.get("team") is not None
+            else None
+        ),
+        max_turns=(
+            int(value["max_turns"])
+            if isinstance(value.get("max_turns"), int)
+            and not isinstance(value.get("max_turns"), bool)
+            else None
+        ),
+        owner_stop=bool(value.get("owner_stop", False)),
+        role_selectors={
+            str(key): str(selector)
+            for key, selector in (
+                value.get("role_selectors", {})
+                if isinstance(value.get("role_selectors", {}), Mapping)
+                else {}
+            ).items()
+        },
+        has_notes=bool(value.get("has_notes", False)),
+        applied=bool(value.get("applied", False)),
+        recorded_at=str(value.get("recorded_at", "")),
+    )
+
+
+def merge_accepted_override_choices(
+    previous: OverrideResult | None,
+    current: OverrideResult,
+) -> OverrideResult:
+    """Retain persistent choices while keeping the latest request one-shot."""
+    prior = previous if previous is not None and previous.status == "accepted" else None
+    return replace(
+        current,
+        next_step=None,
+        owner_stop=False,
+        role_selectors={},
+        has_notes=False,
+        team=(
+            current.team
+            if current.team is not None
+            else prior.team if prior is not None else None
+        ),
+        max_turns=(
+            current.max_turns
+            if current.max_turns is not None
+            else prior.max_turns if prior is not None else None
+        ),
+    )
 
 
 def resolve_resume_override(
     run_dir: Path,
     persisted_result: Mapping[str, Any] | None,
+    *,
+    persisted_accepted_result: Mapping[str, Any] | None = None,
 ) -> ResumeOverrideResolution:
     """Resolve only the selected predecessor's override source.
 
@@ -103,54 +184,14 @@ def resolve_resume_override(
     predecessor file decides whether a new or corrected request owns the first
     resumed boundary.
     """
-    prior = None
-    if persisted_result is not None:
-        override_status = persisted_result.get("status")
-        digest = persisted_result.get("digest")
-        message = persisted_result.get("message")
-        if (
-            override_status in {"accepted", "rejected"}
-            and isinstance(digest, str)
-            and isinstance(message, str)
-        ):
-            prior = OverrideResult(
-                status=override_status,
-                digest=digest,
-                message=message,
-                source_text=(
-                    str(persisted_result["source_text"])
-                    if isinstance(persisted_result.get("source_text"), str)
-                    else None
-                ),
-                next_step=(
-                    str(persisted_result["next_step"])
-                    if persisted_result.get("next_step") is not None
-                    else None
-                ),
-                team=(
-                    str(persisted_result["team"])
-                    if persisted_result.get("team") is not None
-                    else None
-                ),
-                max_turns=(
-                    int(persisted_result["max_turns"])
-                    if isinstance(persisted_result.get("max_turns"), int)
-                    and not isinstance(persisted_result.get("max_turns"), bool)
-                    else None
-                ),
-                owner_stop=bool(persisted_result.get("owner_stop", False)),
-                role_selectors={
-                    str(key): str(value)
-                    for key, value in (
-                        persisted_result.get("role_selectors", {})
-                        if isinstance(persisted_result.get("role_selectors", {}), Mapping)
-                        else {}
-                    ).items()
-                },
-                has_notes=bool(persisted_result.get("has_notes", False)),
-                applied=bool(persisted_result.get("applied", False)),
-                recorded_at=str(persisted_result.get("recorded_at", "")),
-            )
+    prior = _decode_override_result(persisted_result)
+    last_accepted = _decode_override_result(persisted_accepted_result)
+    if last_accepted is not None and last_accepted.status == "accepted":
+        last_accepted = merge_accepted_override_choices(None, last_accepted)
+    if prior is not None and prior.status == "accepted":
+        last_accepted = merge_accepted_override_choices(last_accepted, prior)
+    elif last_accepted is not None and last_accepted.status != "accepted":
+        last_accepted = None
 
     consumed_digest = (
         prior.digest
@@ -184,6 +225,7 @@ def resolve_resume_override(
         override_result=prior,
         source_run_dir=source_run_dir,
         file_present=file_present,
+        last_accepted_override=last_accepted,
     )
 
 
@@ -698,6 +740,7 @@ class ResumeContext:
     max_turns_explicit: bool | None = None
     start_step_explicit: bool | None = None
     override_result: OverrideResult | None = None
+    last_accepted_override: OverrideResult | None = None
     role_selectors: Mapping[str, str] = field(default_factory=dict)
     current_hotplug_transaction: HotplugTransactionV1 | None = None
     pending_hotplug_transaction: HotplugTransactionV1 | None = None
@@ -822,6 +865,7 @@ class ControllerState:
     max_turns_explicit: bool | None = None
     start_step_explicit: bool | None = None
     override_result: OverrideResult | None = None
+    last_accepted_override: OverrideResult | None = None
     role_selectors: dict[str, str] = field(default_factory=dict)
     current_hotplug_transaction: HotplugTransactionV1 | None = None
     pending_hotplug_transaction: HotplugTransactionV1 | None = None
