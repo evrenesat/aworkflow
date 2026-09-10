@@ -60,3 +60,10 @@
   integration policy. Keep execution worktrees and test resources isolated;
   serialize shared-main integration and publication. Checkpoint workers retain
   their assigned scope and do not take over queue management.
+- Completed-plan delivery is controller-owned: publish approved code first,
+  record the receipt-backed `plans/done` lifecycle move, and publish only a
+  resulting bookkeeping commit. A failed delivery follows the validated
+  `resumed_from_run_id` lineage to its one receipt owner, retaining every
+  required predecessor through pruning and resuming from the recorded phase
+  without replaying checkpoints or a removed worktree; the coordinator owns
+  remote publication, exact-SHA CI, and live validation.

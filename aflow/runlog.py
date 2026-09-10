@@ -1253,6 +1253,7 @@ class RunMetadataWriter:
         end_reason: WorkflowEndReason | None = None,
         failure_reason: str | None = None,
         failure_kind: str | None = None,
+        completion_phase: str | None = None,
         environment_preflight: Mapping[str, object] | None = None,
         merge_status: str | None = None,
         merge_failure_reason: str | None = None,
@@ -1535,11 +1536,25 @@ class RunMetadataWriter:
             payload["recovery_matched_terms"] = list(recovery.matched_terms)
             payload["recovery_delay_seconds"] = recovery.delay_seconds
         if failure_kind is not None:
-            if failure_kind != "environment_preflight":
-                raise ValueError("invalid environment preflight failure kind")
+            if failure_kind not in {"environment_preflight", "completion_publication"}:
+                raise ValueError("invalid run failure kind")
+            if failure_kind == "completion_publication" and completion_phase not in {
+                "approved",
+                "lifecycle",
+            }:
+                raise ValueError("completion publication failures require a valid phase")
             payload["failure_kind"] = failure_kind
         elif isinstance(previous.get("failure_kind"), str):
             payload["failure_kind"] = previous["failure_kind"]
+        if completion_phase is not None:
+            if failure_kind != "completion_publication" or completion_phase not in {
+                "approved",
+                "lifecycle",
+            }:
+                raise ValueError("invalid completion publication phase")
+            payload["completion_phase"] = completion_phase
+        elif isinstance(previous.get("completion_phase"), str):
+            payload["completion_phase"] = previous["completion_phase"]
         if environment_preflight is not None:
             payload["environment_preflight"] = _validated_environment_preflight_payload(
                 environment_preflight

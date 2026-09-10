@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-10 — Complete receipt-backed plan delivery (Checkpoint 2)
+
+- Routed approved publication, CP1 lifecycle finalization, and any resulting
+  bookkeeping publication through one terminal delivery boundary; a missing
+  bookkeeping commit does not trigger a redundant push.
+- Recorded the completion phase on delivery failure so resume can retry the
+  exact receipt-backed terminal work without replaying checkpoints or a removed
+  worktree. Repeated resumes follow the complete predecessor lineage to the one
+  receipt owner and retain every required run under low run-history limits. The
+  local bare-remote regression covers the original final-push failure plus
+  three rejected terminal retries, clean Done storage, remote receipt identity,
+  and preserved failure status.
+
 ## 2026-09-10 — Record completed-plan lifecycle ownership (Checkpoint 1)
 
 - Added a receipt-backed completed-plan lifecycle helper that verifies exact

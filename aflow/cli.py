@@ -36,7 +36,7 @@ from .config import (
 from .manager_context import scoped_reviewer_rejection_count
 from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
-from .plan import PlanSnapshot
+from .plan import PlanParseError, PlanSnapshot, load_plan
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
@@ -170,6 +170,7 @@ class ResumeBootstrap:
     team_explicit: bool
     max_turns_explicit: bool
     start_step_override: bool = False
+    parsed_plan: object | None = None
 
 
 INSTALL_SKILLS_HELP = """\
@@ -246,6 +247,34 @@ def _is_terminal_integration_resume(
         and isinstance(lifecycle_teardown, list)
         and "merge" in lifecycle_teardown
     )
+
+
+def _completion_resume_phase(prev_run: Mapping[str, object]) -> str | None:
+    """Return the durable terminal-delivery phase that still needs work."""
+    last_snapshot = prev_run.get("last_snapshot")
+    phase = prev_run.get("completion_phase")
+    if (
+        prev_run.get("status") == "failed"
+        and isinstance(last_snapshot, Mapping)
+        and last_snapshot.get("is_complete") is True
+        and prev_run.get("failure_kind") == "completion_publication"
+        and phase in {"approved", "lifecycle"}
+    ):
+        return phase
+    return None
+
+
+def _is_terminal_completion_resume(prev_run: Mapping[str, object]) -> bool:
+    return _completion_resume_phase(prev_run) is not None
+
+
+def _resume_done_plan_path(repo_root: Path, plan_path: Path) -> Path | None:
+    plans_root = (repo_root / "plans").resolve()
+    try:
+        relative = plan_path.resolve().relative_to(plans_root / "in-progress")
+    except ValueError:
+        return None
+    return plans_root / "done" / relative
 
 
 def _resume_plan_path(
@@ -1251,11 +1280,20 @@ def _bootstrap_resume_invocation(
             plan_field,
             "expected a non-empty string",
         )
+    completion_phase = _completion_resume_phase(prev_run)
+    parsed_plan_for_startup = None
+    plan_to_validate = plan_path
+    if not plan_path.is_file() and completion_phase == "lifecycle":
+        done_plan_path = _resume_done_plan_path(repo_root, plan_path)
+        if done_plan_path is not None and done_plan_path.is_file():
+            plan_to_validate = done_plan_path
     try:
-        if not plan_path.is_file():
+        if not plan_to_validate.is_file():
             raise OSError("file does not exist")
-        plan_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
+        plan_to_validate.read_text(encoding="utf-8")
+        if plan_to_validate != plan_path:
+            parsed_plan_for_startup = load_plan(plan_to_validate)
+    except (OSError, UnicodeError, PlanParseError) as exc:
         raise _resume_metadata_error(
             resolved_run_id,
             plan_field,
@@ -1496,6 +1534,7 @@ def _bootstrap_resume_invocation(
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
         start_step_override=start_step_override,
+        parsed_plan=parsed_plan_for_startup,
     )
 
 
@@ -1542,12 +1581,13 @@ def _resume_candidate_mismatch_reason(
     feature_branch = prev_run.get("feature_branch")
     worktree_path = prev_run.get("worktree_path")
     main_branch = prev_run.get("main_branch")
-    if "branch" in lifecycle_setup:
+    terminal_completion_only = _is_terminal_completion_resume(prev_run)
+    if "branch" in lifecycle_setup or (terminal_completion_only and lifecycle_setup):
         if not isinstance(feature_branch, str) or not feature_branch:
             return "it has no recorded feature branch"
         if not isinstance(main_branch, str) or not main_branch:
             return "it has no recorded main branch"
-    if "worktree" in lifecycle_setup:
+    if "worktree" in lifecycle_setup and not terminal_completion_only:
         if not isinstance(worktree_path, str) or not worktree_path:
             return "it has no recorded worktree path"
 
@@ -1564,11 +1604,16 @@ def _resume_candidate_mismatch_reason(
         isinstance(last_snapshot, dict)
         and last_snapshot.get("is_complete") is True
         and not terminal_integration_only
+        and not terminal_completion_only
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
     ):
         return "its last saved plan snapshot was already complete"
 
-    if "merge_status" in prev_run and not terminal_integration_only:
+    if (
+        "merge_status" in prev_run
+        and not terminal_integration_only
+        and not terminal_completion_only
+    ):
         return "it already entered merge teardown"
 
     prev_repo_root = prev_run.get("repo_root")
@@ -1620,10 +1665,10 @@ def _resume_candidate_mismatch_reason(
     ):
         return "its extra instructions do not match this invocation"
 
-    if terminal_integration_only:
+    if terminal_integration_only or terminal_completion_only:
         # Teardown belongs to the saved execution context.  A live workflow
         # edit must not migrate or repeat lifecycle ownership during resume.
-        if not lifecycle_teardown:
+        if terminal_integration_only and not lifecycle_teardown:
             return "it has no recorded lifecycle teardown"
 
     return None
@@ -1986,6 +2031,15 @@ def _reconstruct_resume_context(
     raw_main_branch = prev_run.get("main_branch")
     lifecycle_setup = prev_run.get("lifecycle_setup", [])
     lifecycle_teardown = prev_run.get("lifecycle_teardown", [])
+    completion_phase = _completion_resume_phase(prev_run)
+    terminal_completion_only = completion_phase is not None
+    raw_completion_end_reason = prev_run.get("end_reason")
+    completion_end_reason = (
+        raw_completion_end_reason
+        if raw_completion_end_reason
+        in {"already_complete", "done", "max_turns_reached", "transition_end", "owner_stopped"}
+        else None
+    )
     continuation_from_branch = prev_run.get("continuation_from_branch")
     continuation_from_head = prev_run.get("continuation_from_head")
     continuation_mode = prev_run.get("continuation_mode")
@@ -2031,7 +2085,7 @@ def _reconstruct_resume_context(
         if isinstance(raw_main_branch, str) and raw_main_branch
         else None
     )
-    if "branch" in lifecycle_setup and (
+    if ("branch" in lifecycle_setup or (terminal_completion_only and lifecycle_setup)) and (
         feature_branch is None or main_branch is None
     ):
         if require_resume:
@@ -2039,7 +2093,7 @@ def _reconstruct_resume_context(
                 f"error: run '{run_id}' is missing branch resume metadata."
             )
         return None
-    if "worktree" in lifecycle_setup and worktree_path is None:
+    if "worktree" in lifecycle_setup and worktree_path is None and not terminal_completion_only:
         if require_resume:
             raise ValueError(
                 f"error: run '{run_id}' is missing worktree resume metadata."
@@ -2051,7 +2105,7 @@ def _reconstruct_resume_context(
 
     pending_finalized_turn = (
         None
-        if reset_scope
+        if reset_scope or terminal_completion_only
         else _pending_finalized_resume_turn(run_dir, prev_run)
     )
     if relocation is not None and pending_finalized_turn is not None:
@@ -2134,7 +2188,7 @@ def _reconstruct_resume_context(
 
     recovered_active_plan = (
         str(plan_path)
-        if terminal_integration_only
+        if terminal_integration_only or terminal_completion_only
         else active_plan_path
     )
     if (
@@ -2225,8 +2279,10 @@ def _reconstruct_resume_context(
             if start_step_override
             else (
                 str(prev_run["current_step_name"])
-                if terminal_integration_only
-                and isinstance(prev_run.get("current_step_name"), str)
+                if (
+                    (terminal_integration_only or terminal_completion_only)
+                    and isinstance(prev_run.get("current_step_name"), str)
+                )
                 else _interrupted_resume_step(run_dir, prev_run)
             )
         ),
@@ -2277,6 +2333,9 @@ def _reconstruct_resume_context(
         override_source_run_dir=override_resolution.source_run_dir,
         override_file_present=override_resolution.file_present,
         terminal_integration_only=terminal_integration_only,
+        terminal_completion_only=terminal_completion_only,
+        completion_phase=completion_phase,
+        completion_end_reason=completion_end_reason,
         scope_envelope_bytes=scope_envelope_bytes,
         scope_envelope_source_path=scope_envelope_source_path,
         scope_evidence_artifact_bytes=scope_evidence_artifact_bytes,
@@ -3482,6 +3541,11 @@ def main(argv: list[str] | None = None) -> int:
             else args.max_turns is not None
         ),
         extra_instructions=extra_instructions,
+        pre_recovered_plan=(
+            resume_bootstrap.parsed_plan
+            if resume_bootstrap is not None
+            else None
+        ),
         resume_requested=require_resume,
         continue_from_current=args.continue_from_current,
         reserved_run_id=args.run_id,

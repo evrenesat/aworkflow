@@ -7282,6 +7282,503 @@ class WorkflowPreflightTests(unittest.TestCase):
 
 class WorkflowLifecycleRuntimeTests(unittest.TestCase):
 
+    def test_two_tracked_plan_runs_publish_ignored_done_lifecycle_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            from aflow.publication import publish_completed_run as real_publish_completed_run
+
+            publication_patch = patch(
+                'aflow.workflow.publish_completed_run',
+                real_publish_completed_run,
+            )
+            publication_patch.start()
+            self.addCleanup(publication_patch.stop)
+            remote = root / 'remote.git'
+            subprocess.run(
+                ['git', 'init', '--bare', '--initial-branch=main', str(remote)],
+                check=True,
+                capture_output=True,
+            )
+
+            def clone(name: str) -> Path:
+                repo = root / name
+                subprocess.run(
+                    ['git', 'clone', '-q', str(remote), str(repo)],
+                    check=True,
+                    capture_output=True,
+                )
+                _run_git_in_test(['config', 'user.email', 'test@test.com'], cwd=repo)
+                _run_git_in_test(['config', 'user.name', 'Test'], cwd=repo)
+                exclude = repo / '.git' / 'info' / 'exclude'
+                exclude.write_text(
+                    exclude.read_text(encoding='utf-8')
+                    + '\n.aflow/\nplans/backups/\nplans/done/\n',
+                    encoding='utf-8',
+                )
+                _run_git_in_test(['config', 'aflow.publishRemote', 'origin'], cwd=repo)
+                _run_git_in_test(['config', 'aflow.publishBranch', 'main'], cwd=repo)
+                return repo
+
+            first_repo = root / 'first'
+            subprocess.run(
+                ['git', 'clone', '-q', str(remote), str(first_repo)],
+                check=True,
+                capture_output=True,
+            )
+            _run_git_in_test(['config', 'user.email', 'test@test.com'], cwd=first_repo)
+            _run_git_in_test(['config', 'user.name', 'Test'], cwd=first_repo)
+            exclude = first_repo / '.git' / 'info' / 'exclude'
+            exclude.write_text(
+                exclude.read_text(encoding='utf-8')
+                + '\n.aflow/\nplans/backups/\nplans/done/\n',
+                encoding='utf-8',
+            )
+            first_plan = first_repo / 'plans' / 'in-progress' / 'first.md'
+            first_plan.parent.mkdir(parents=True)
+            _write_plan(first_plan, _VALID_PLAN)
+            (first_repo / 'unrelated.txt').write_text(
+                'must stay outside lifecycle commits\n',
+                encoding='utf-8',
+            )
+            _run_git_in_test(['add', '.'], cwd=first_repo)
+            rc, _, err = _run_git_in_test(
+                ['commit', '-m', 'seed first plan'], cwd=first_repo
+            )
+            assert rc == 0, err
+            _run_git_in_test(['push', '-q', 'origin', 'main'], cwd=first_repo)
+            _run_git_in_test(['config', 'aflow.publishRemote', 'origin'], cwd=first_repo)
+            _run_git_in_test(['config', 'aflow.publishBranch', 'main'], cwd=first_repo)
+            assert _run_git_in_test(
+                ['config', '--local', '--get', 'aflow.publishRemote'], cwd=first_repo
+            )[1] == 'origin'
+            assert _run_git_in_test(
+                ['config', '--local', '--get', 'aflow.publishBranch'], cwd=first_repo
+            )[1] == 'main'
+
+            def complete_plan(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                plan = cwd / 'plans' / 'in-progress' / 'first.md'
+                _write_plan(plan, _COMPLETE_PLAN)
+                rc, _, err = _run_git_in_test(
+                    ['add', 'plans/in-progress/first.md'], cwd=cwd
+                )
+                assert rc == 0, err
+                rc, _, err = _run_git_in_test(
+                    ['commit', '-m', 'reviewed first plan'], cwd=cwd
+                )
+                assert rc == 0, err
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            first_result = run_workflow(
+                ControllerConfig(
+                    repo_root=first_repo,
+                    plan_path=first_plan,
+                    max_turns=1,
+                ),
+                _make_branch_only_wf_config(main_branch='main'),
+                'branch_wf',
+                config_dir=first_repo,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=complete_plan,
+            )
+
+            first_receipt = json.loads(
+                (first_result.run_dir / 'publication.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            remote_head = subprocess.check_output(
+                ['git', '--git-dir', str(remote), 'rev-parse', 'refs/heads/main'],
+                text=True,
+            ).strip()
+            assert first_receipt.get('status') == 'published', first_receipt
+            assert first_receipt['commit'] == remote_head
+            assert first_receipt['plan_lifecycle']['phase'] == 'committed'
+            assert not first_plan.exists()
+            assert (first_repo / 'plans' / 'done' / 'first.md').read_bytes() == _COMPLETE_PLAN.encode()
+            assert _run_git_in_test(
+                ['status', '--porcelain', '--untracked-files=all'], cwd=first_repo
+            )[1] == ''
+            lifecycle_commit = first_receipt['plan_lifecycle']['commit']
+            lifecycle_paths = subprocess.check_output(
+                [
+                    'git', '-C', str(first_repo), 'diff-tree', '--no-commit-id',
+                    '--no-renames', '--name-only', '-r', lifecycle_commit + '^',
+                    lifecycle_commit,
+                ],
+                text=True,
+            ).splitlines()
+            assert lifecycle_paths == ['plans/in-progress/first.md']
+
+            second_repo = clone('second')
+            second_plan = second_repo / 'plans' / 'in-progress' / 'second.md'
+            second_plan.parent.mkdir(parents=True)
+            _write_plan(second_plan, _VALID_PLAN)
+            _run_git_in_test(['add', 'plans/in-progress/second.md'], cwd=second_repo)
+            rc, _, err = _run_git_in_test(
+                ['commit', '-m', 'seed second plan'], cwd=second_repo
+            )
+            assert rc == 0, err
+
+            def complete_second_plan(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                plan = cwd / 'plans' / 'in-progress' / 'second.md'
+                _write_plan(plan, _COMPLETE_PLAN)
+                rc, _, err = _run_git_in_test(
+                    ['add', 'plans/in-progress/second.md'], cwd=cwd
+                )
+                assert rc == 0, err
+                rc, _, err = _run_git_in_test(
+                    ['commit', '-m', 'reviewed second plan'], cwd=cwd
+                )
+                assert rc == 0, err
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            second_result = run_workflow(
+                ControllerConfig(
+                    repo_root=second_repo,
+                    plan_path=second_plan,
+                    max_turns=1,
+                ),
+                _make_branch_only_wf_config(main_branch='main'),
+                'branch_wf',
+                config_dir=second_repo,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=complete_second_plan,
+            )
+
+            second_receipt = json.loads(
+                (second_result.run_dir / 'publication.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            remote_head_after_second = subprocess.check_output(
+                ['git', '--git-dir', str(remote), 'rev-parse', 'refs/heads/main'],
+                text=True,
+            ).strip()
+            assert second_receipt['status'] == 'published'
+            assert second_receipt['commit'] == remote_head_after_second
+            assert not second_plan.exists()
+            assert (second_repo / 'plans' / 'done' / 'second.md').is_file()
+            assert _run_git_in_test(
+                ['status', '--porcelain', '--untracked-files=all'], cwd=second_repo
+            )[1] == ''
+
+    def test_rejected_final_lifecycle_push_resumes_without_replaying_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            remote = root / 'remote.git'
+            repo_root = root / 'repo'
+            subprocess.run(
+                ['git', 'init', '--bare', '--initial-branch=main', str(remote)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ['git', 'clone', '-q', str(remote), str(repo_root)],
+                check=True,
+                capture_output=True,
+            )
+            _run_git_in_test(['config', 'user.email', 'test@test.com'], cwd=repo_root)
+            _run_git_in_test(['config', 'user.name', 'Test'], cwd=repo_root)
+            exclude = repo_root / '.git' / 'info' / 'exclude'
+            exclude.write_text(
+                exclude.read_text(encoding='utf-8')
+                + '\n.aflow/\nplans/backups/\nplans/done/\n',
+                encoding='utf-8',
+            )
+            plan_path = repo_root / 'plans' / 'in-progress' / 'resume.md'
+            plan_path.parent.mkdir(parents=True)
+            _write_plan(plan_path, _VALID_PLAN)
+            (repo_root / 'unrelated.txt').write_text(
+                'never swept into lifecycle delivery\n',
+                encoding='utf-8',
+            )
+            _run_git_in_test(['add', '.'], cwd=repo_root)
+            rc, _, err = _run_git_in_test(
+                ['commit', '-m', 'seed resumable plan'], cwd=repo_root
+            )
+            assert rc == 0, err
+            _run_git_in_test(['push', '-q', 'origin', 'main'], cwd=repo_root)
+            _run_git_in_test(['config', 'aflow.publishRemote', 'origin'], cwd=repo_root)
+            _run_git_in_test(['config', 'aflow.publishBranch', 'main'], cwd=repo_root)
+
+            from aflow.publication import (
+                PublicationError,
+                publish_completed_run as real_publish_completed_run,
+            )
+
+            publication_patch = patch(
+                'aflow.workflow.publish_completed_run',
+                real_publish_completed_run,
+            )
+            publication_patch.start()
+            self.addCleanup(publication_patch.stop)
+            real_git = __import__('aflow.publication', fromlist=['_git'])._git
+            push_calls = [0]
+
+            def reject_final_push(git_root, *args, **kwargs):
+                if args and args[0] == 'push':
+                    push_calls[0] += 1
+                    if push_calls[0] in {2, 3, 4, 5}:
+                        raise PublicationError('synthetic final push rejection')
+                return real_git(git_root, *args, **kwargs)
+
+            def complete_plan(argv, **kwargs):
+                cwd = Path(kwargs['cwd'])
+                _write_plan(cwd / 'plans' / 'in-progress' / 'resume.md', _COMPLETE_PLAN)
+                rc, _, err = _run_git_in_test(
+                    ['add', 'plans/in-progress/resume.md'], cwd=cwd
+                )
+                assert rc == 0, err
+                rc, _, err = _run_git_in_test(
+                    ['commit', '-m', 'reviewed resumable plan'], cwd=cwd
+                )
+                assert rc == 0, err
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            workflow_config = _make_branch_only_wf_config(main_branch='main')
+            git_patch = patch(
+                'aflow.publication._git',
+                side_effect=reject_final_push,
+            )
+            git_patch.start()
+            self.addCleanup(git_patch.stop)
+            with pytest.raises(
+                WorkflowError, match='publication to origin/main did not finish'
+            ) as first_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    'branch_wf',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=complete_plan,
+                )
+
+            failed_dir = first_error.value.run_dir
+            assert failed_dir is not None
+            failed_payload = json.loads(
+                (failed_dir / 'run.json').read_text(encoding='utf-8')
+            )
+            receipt = json.loads(
+                (failed_dir / 'publication.json').read_text(encoding='utf-8')
+            )
+            assert failed_payload['status'] == 'failed'
+            assert failed_payload['failure_kind'] == 'completion_publication'
+            assert failed_payload['completion_phase'] == 'lifecycle'
+            assert receipt['status'] == 'failed'
+            lifecycle_commit = receipt['plan_lifecycle']['commit']
+            assert (repo_root / 'plans' / 'done' / 'resume.md').is_file()
+            assert not plan_path.exists()
+
+            resume_calls = [0]
+
+            def must_not_replay_worker(argv, **kwargs):
+                resume_calls[0] += 1
+                raise AssertionError('terminal completion resume replayed a worker')
+
+            from aflow.cli import (
+                _decode_frozen_run_identity,
+                _reconstruct_resume_context,
+                _resume_plan_path,
+            )
+
+            def reconstruct_resume(
+                run_dir: Path,
+            ) -> tuple[ResumeContext, dict[str, object]]:
+                payload = json.loads(
+                    (run_dir / 'run.json').read_text(encoding='utf-8')
+                )
+                resolved_run_id = Path(run_dir.name)
+                frozen_identity = _decode_frozen_run_identity(
+                    payload,
+                    resolved_run_id,
+                )
+                saved_plan_path = _resume_plan_path(payload, repo_root)
+                assert saved_plan_path is not None
+                context = _reconstruct_resume_context(
+                    resolved_run_id=resolved_run_id,
+                    run_dir=run_dir,
+                    prev_run=payload,
+                    plan_path=saved_plan_path,
+                    frozen_run_identity=frozen_identity,
+                    reset_scope=False,
+                    require_resume=True,
+                    workflow_steps=workflow_config.workflows['branch_wf'].steps,
+                )
+                assert context is not None
+                assert context.terminal_completion_only is True
+                assert context.completion_phase == 'lifecycle'
+                return context, payload
+
+            first_resume, first_resume_payload = reconstruct_resume(failed_dir)
+            assert first_resume.resumed_from_run_id == failed_dir.name
+            assert 'resumed_from_run_id' not in first_resume_payload
+            assert failed_dir.is_dir()
+            with pytest.raises(
+                WorkflowError, match='publication to origin/main did not finish'
+            ) as second_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    'branch_wf',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=must_not_replay_worker,
+                    resume=first_resume,
+                )
+
+            second_failed_dir = second_error.value.run_dir
+            assert second_failed_dir is not None
+            assert second_failed_dir != failed_dir
+            assert failed_dir.is_dir()
+            assert not (second_failed_dir / 'publication.json').exists()
+            second_resume, second_resume_payload = reconstruct_resume(
+                second_failed_dir
+            )
+            assert second_resume.resumed_from_run_id == second_failed_dir.name
+            assert second_resume_payload['resumed_from_run_id'] == failed_dir.name
+            assert failed_dir.is_dir()
+            assert second_failed_dir.is_dir()
+
+            with pytest.raises(
+                WorkflowError, match='publication to origin/main did not finish'
+            ) as third_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    'branch_wf',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=must_not_replay_worker,
+                    resume=second_resume,
+                )
+
+            third_failed_dir = third_error.value.run_dir
+            assert third_failed_dir is not None
+            assert third_failed_dir not in {failed_dir, second_failed_dir}
+            assert failed_dir.is_dir()
+            assert second_failed_dir.is_dir()
+            assert not (third_failed_dir / 'publication.json').exists()
+            third_resume, third_resume_payload = reconstruct_resume(
+                third_failed_dir
+            )
+            assert third_resume.resumed_from_run_id == third_failed_dir.name
+            assert third_resume_payload['resumed_from_run_id'] == second_failed_dir.name
+            assert failed_dir.is_dir()
+            assert second_failed_dir.is_dir()
+            assert third_failed_dir.is_dir()
+
+            with pytest.raises(
+                WorkflowError, match='publication to origin/main did not finish'
+            ) as fourth_error:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root,
+                        plan_path=plan_path,
+                        max_turns=1,
+                        keep_runs=1,
+                    ),
+                    workflow_config,
+                    'branch_wf',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=must_not_replay_worker,
+                    resume=third_resume,
+                )
+
+            fourth_failed_dir = fourth_error.value.run_dir
+            assert fourth_failed_dir is not None
+            assert fourth_failed_dir not in {
+                failed_dir,
+                second_failed_dir,
+                third_failed_dir,
+            }
+            assert failed_dir.is_dir()
+            assert second_failed_dir.is_dir()
+            assert third_failed_dir.is_dir()
+            assert not (fourth_failed_dir / 'publication.json').exists()
+            fourth_resume, fourth_resume_payload = reconstruct_resume(
+                fourth_failed_dir
+            )
+            assert fourth_resume.resumed_from_run_id == fourth_failed_dir.name
+            assert fourth_resume_payload['resumed_from_run_id'] == third_failed_dir.name
+            assert failed_dir.is_dir()
+            assert second_failed_dir.is_dir()
+            assert third_failed_dir.is_dir()
+            assert fourth_failed_dir.is_dir()
+
+            resumed_result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=1,
+                    keep_runs=1,
+                ),
+                workflow_config,
+                'branch_wf',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=must_not_replay_worker,
+                resume=fourth_resume,
+            )
+
+            assert resume_calls == [0]
+            assert push_calls == [6]
+            assert resumed_result.end_reason == 'transition_end'
+            assert failed_dir.is_dir()
+            assert second_failed_dir.is_dir()
+            assert third_failed_dir.is_dir()
+            assert fourth_failed_dir.is_dir()
+            assert not (resumed_result.run_dir / 'publication.json').exists()
+            assert sum(
+                (run_dir / 'publication.json').exists()
+                for run_dir in (
+                    failed_dir,
+                    second_failed_dir,
+                    third_failed_dir,
+                    fourth_failed_dir,
+                    resumed_result.run_dir,
+                )
+            ) == 1
+            resumed_receipt = json.loads(
+                (failed_dir / 'publication.json').read_text(encoding='utf-8')
+            )
+            remote_head = subprocess.check_output(
+                ['git', '--git-dir', str(remote), 'rev-parse', 'refs/heads/main'],
+                text=True,
+            ).strip()
+            assert resumed_receipt['status'] == 'published'
+            assert resumed_receipt['commit'] == remote_head
+            assert resumed_receipt['plan_lifecycle']['commit'] == lifecycle_commit
+            assert (repo_root / 'plans' / 'done' / 'resume.md').read_bytes() == _COMPLETE_PLAN.encode()
+            assert _run_git_in_test(
+                ['status', '--porcelain', '--untracked-files=all'], cwd=repo_root
+            )[1] == ''
+
     def test_incomplete_end_preserves_unmerged_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

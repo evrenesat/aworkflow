@@ -56,7 +56,11 @@ from .manager_context import (
     summarize_review_rejection,
 )
 from .skill_store import SkillStoreError
-from .publication import PublicationError, publish_completed_run
+from .publication import (
+    PublicationError,
+    finalize_completed_plan,
+    publish_completed_run,
+)
 from .git_status import (
     classify_status_items_by_prefix,
     is_lifecycle_owned_path,
@@ -2972,6 +2976,15 @@ class WorkflowError(RuntimeError):
         self.failure_kind = failure_kind
 
 
+class _CompletedPlanDeliveryError(PublicationError):
+    """A terminal delivery phase failed after the plan was complete."""
+
+    def __init__(self, phase: str, cause: PublicationError) -> None:
+        super().__init__(str(cause))
+        self.phase = phase
+        self.cause = cause
+
+
 @dataclass(frozen=True)
 class _WorkflowFailureFinalizer:
     run_metadata: RunMetadataWriter
@@ -2989,10 +3002,16 @@ class _WorkflowFailureFinalizer:
         new_plan_path: Path | None,
         last_snapshot: PlanSnapshot | None = None,
         cause: BaseException | None = None,
+        failure_kind: str | None = None,
+        completion_phase: str | None = None,
     ) -> NoReturn:
+        if failure_kind == "completion_publication":
+            self.state.status_message = "failed"
         self.run_metadata.write(
             status="failed",
             failure_reason=summary,
+            failure_kind=failure_kind,
+            completion_phase=completion_phase,
             turns_completed=self.state.turns_completed,
             last_snapshot=last_snapshot,
             execution_context=self.execution_context,
@@ -3002,7 +3021,11 @@ class _WorkflowFailureFinalizer:
             new_plan_path=new_plan_path,
         )
         self.banner.stop(self.state)
-        error = WorkflowError(summary, run_dir=self.run_metadata.paths.run_dir)
+        error = WorkflowError(
+            summary,
+            run_dir=self.run_metadata.paths.run_dir,
+            failure_kind=failure_kind,
+        )
         if cause is None:
             raise error
         raise error from cause
@@ -4234,6 +4257,224 @@ def _finalize_original_plan_if_complete(
     return move_completed_plan_to_done(repo_root, original_plan_path)
 
 
+def _terminal_resume_run_dir(repo_root: Path, run_id: object) -> Path | None:
+    """Resolve one safe, existing run directory for terminal delivery recovery."""
+    if not isinstance(run_id, str) or not run_id:
+        return None
+    try:
+        run_id_path = Path(run_id)
+        if run_id in {".", ".."} or run_id_path.name != run_id:
+            return None
+        runs_root = (repo_root / ".aflow" / "runs").resolve()
+        run_dir = runs_root / run_id
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            return None
+        resolved_run_dir = run_dir.resolve()
+        resolved_run_dir.relative_to(runs_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return run_dir
+
+
+def _read_terminal_publication_receipt(run_dir: Path) -> Mapping[str, object] | None:
+    """Read one direct publication receipt without following run-directory links."""
+    receipt_path = run_dir / "publication.json"
+    if receipt_path.is_symlink():
+        raise WorkflowError(
+            f"terminal completion receipt is not a regular file in run '{run_dir.name}'"
+        )
+    if not receipt_path.exists():
+        return None
+    if not receipt_path.is_file():
+        raise WorkflowError(
+            f"terminal completion receipt is not a regular file in run '{run_dir.name}'"
+        )
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(
+            f"terminal completion receipt is unreadable in run '{run_dir.name}'"
+        ) from exc
+    if not isinstance(receipt, Mapping):
+        raise WorkflowError(
+            f"terminal completion receipt is not an object in run '{run_dir.name}'"
+        )
+    return receipt
+
+
+def _terminal_receipt_matches(
+    receipt: Mapping[str, object],
+    *,
+    phase: str,
+    source_relative: str,
+    destination_relative: str,
+) -> bool:
+    """Prove that a receipt owns this exact terminal delivery phase."""
+    if phase == "approved":
+        status = receipt.get("status")
+        return isinstance(status, str) and status in {
+            "pending",
+            "failed",
+            "published",
+        }
+
+    lifecycle = receipt.get("plan_lifecycle")
+    if not isinstance(lifecycle, Mapping):
+        return False
+    lifecycle_phase = lifecycle.get("phase")
+    return (
+        lifecycle.get("source") == source_relative
+        and lifecycle.get("destination") == destination_relative
+        and lifecycle.get("complete") is True
+        and isinstance(lifecycle_phase, str)
+        and lifecycle_phase in {"prepared", "moved", "commit_pending", "committed"}
+    )
+
+
+def _resolve_terminal_delivery_lineage(
+    repo_root: Path,
+    resume: ResumeContext,
+    *,
+    original_plan_path: Path,
+    phase: str,
+) -> tuple[Path, tuple[str, ...]]:
+    """Find the receipt owner and every required predecessor run."""
+    done_plan_path = _done_plan_path(repo_root, original_plan_path)
+    try:
+        source_relative = original_plan_path.resolve().relative_to(
+            repo_root.resolve()
+        ).as_posix()
+        destination_relative = (
+            done_plan_path.resolve().relative_to(repo_root.resolve()).as_posix()
+            if done_plan_path is not None
+            else ""
+        )
+    except (OSError, ValueError) as exc:
+        raise WorkflowError(
+            "terminal completion resume cannot establish exact plan paths"
+        ) from exc
+    if phase == "lifecycle" and not destination_relative:
+        raise WorkflowError(
+            "terminal completion resume cannot establish the Done plan path"
+        )
+
+    run_id: object = resume.resumed_from_run_id
+    visited: set[str] = set()
+    lineage: list[str] = []
+    while True:
+        if not isinstance(run_id, str) or run_id in visited:
+            raise WorkflowError(
+                "terminal completion resume has an invalid or cyclic receipt lineage"
+            )
+        visited.add(run_id)
+        lineage.append(run_id)
+        run_dir = _terminal_resume_run_dir(repo_root, run_id)
+        if run_dir is None:
+            raise WorkflowError(
+                "terminal completion resume cannot access receipt owner "
+                f"'{run_id}'"
+            )
+        receipt = _read_terminal_publication_receipt(run_dir)
+        if receipt is not None and _terminal_receipt_matches(
+            receipt,
+            phase=phase,
+            source_relative=source_relative,
+            destination_relative=destination_relative,
+        ):
+            return run_dir, tuple(lineage)
+        if receipt is not None:
+            raise WorkflowError(
+                "terminal completion resume found a receipt with mismatched plan "
+                f"identity in run '{run_id}'"
+            )
+        metadata = load_run_json(run_dir)
+        if not isinstance(metadata, Mapping):
+            raise WorkflowError(
+                "terminal completion resume cannot read receipt lineage metadata "
+                f"for run '{run_id}'"
+            )
+        run_id = metadata.get("resumed_from_run_id")
+        if run_id is None:
+            raise WorkflowError(
+                "terminal completion resume cannot prove receipt ownership from "
+                f"run '{run_dir.name}'"
+            )
+
+
+def _resolve_terminal_delivery_run_dir(
+    repo_root: Path,
+    resume: ResumeContext,
+    *,
+    original_plan_path: Path,
+    phase: str,
+) -> Path:
+    """Find the receipt owner through the durable resume lineage."""
+    run_dir, _ = _resolve_terminal_delivery_lineage(
+        repo_root,
+        resume,
+        original_plan_path=original_plan_path,
+        phase=phase,
+    )
+    return run_dir
+
+
+def _deliver_completed_plan(
+    *,
+    repo_root: Path,
+    working_dir: Path,
+    run_dir: Path,
+    original_plan_path: Path,
+    snapshot: PlanSnapshot,
+    execution_context: ExecutionContext | None,
+    publish_approved: bool = True,
+) -> Path:
+    """Publish approved code, then recoverably finalize and publish lifecycle."""
+    merging = (
+        execution_context is not None
+        and "merge" in execution_context.teardown
+    )
+    publication_root = (
+        repo_root
+        if merging or execution_context is None
+        else working_dir
+    )
+    publication_ref = (
+        execution_context.main_branch if merging else "HEAD"
+    )
+    approved_commit: str | None = None
+    if publish_approved:
+        try:
+            approved_commit = publish_completed_run(
+                publication_root,
+                run_dir,
+                source_ref=publication_ref,
+            )
+        except PublicationError as exc:
+            raise _CompletedPlanDeliveryError("approved", exc) from exc
+
+    if _done_plan_path(repo_root, original_plan_path) is None:
+        return original_plan_path
+
+    try:
+        lifecycle = finalize_completed_plan(
+            repo_root,
+            original_plan_path,
+            run_dir,
+            is_complete=snapshot.is_complete,
+        )
+    except PublicationError as exc:
+        raise _CompletedPlanDeliveryError("lifecycle", exc) from exc
+
+    if lifecycle.commit is not None and (
+        not publish_approved or approved_commit is not None
+    ):
+        try:
+            publish_completed_run(repo_root, run_dir, source_ref="HEAD")
+        except PublicationError as exc:
+            raise _CompletedPlanDeliveryError("lifecycle", exc) from exc
+    return lifecycle.destination
+
+
 def _resolve_post_turn_original_plan_path(
     repo_root: Path,
     original_plan_path: Path,
@@ -4622,8 +4863,11 @@ def _prepare_required_git_tracking_before_allocation(
     needs_bootstrap: bool,
     is_resume: bool,
     startup_retry: RetryContext | None,
+    terminal_completion_resume: bool = False,
 ) -> tuple[ParsedPlan, bool]:
     """Insert required Git Tracking metadata before durable run allocation."""
+    if terminal_completion_resume:
+        return parsed_plan, False
     if not _workflow_requires_git_tracking(wf, workflow_config):
         return parsed_plan, False
 
@@ -6180,6 +6424,78 @@ def _validate_branch_resume_context(
             )
 
 
+def _validate_terminal_completion_resume_context(
+    primary_root: Path,
+    resume_ctx: ResumeContext,
+) -> None:
+    """Validate merged branch identity without reopening a removed worktree."""
+    if not resume_ctx.setup:
+        return
+    if (
+        resume_ctx.feature_branch is None
+        or resume_ctx.main_branch is None
+        or "merge" not in resume_ctx.teardown
+    ):
+        raise WorkflowError(
+            "terminal completion resume requires recorded merge branch identity"
+        )
+
+    for branch, label in (
+        (resume_ctx.feature_branch, "feature"),
+        (resume_ctx.main_branch, "main"),
+    ):
+        rc, _, _ = _run_git(
+            ["show-ref", "--verify", f"refs/heads/{branch}"],
+            cwd=primary_root,
+        )
+        if rc != 0:
+            raise WorkflowError(
+                f"resume validation: {label} branch '{branch}' does not exist locally"
+            )
+
+    rc, current_branch, err = _run_git(
+        ["symbolic-ref", "--short", "HEAD"],
+        cwd=primary_root,
+    )
+    if rc != 0 or current_branch.strip() != resume_ctx.main_branch:
+        raise WorkflowError(
+            "terminal completion resume requires the primary checkout on "
+            f"'{resume_ctx.main_branch}' (got '{current_branch.strip() or err}')"
+        )
+
+    rc, git_dir, _ = _run_git(["rev-parse", "--git-dir"], cwd=primary_root)
+    if rc == 0:
+        operation_root = Path(git_dir)
+        if not operation_root.is_absolute():
+            operation_root = primary_root / operation_root
+        if (operation_root / "MERGE_HEAD").exists():
+            raise WorkflowError(
+                f"resume validation: primary checkout '{primary_root}' has an in-progress merge"
+            )
+        if (
+            (operation_root / "REBASE_HEAD").exists()
+            or (operation_root / "rebase-merge").exists()
+        ):
+            raise WorkflowError(
+                f"resume validation: primary checkout '{primary_root}' has an in-progress rebase"
+            )
+
+    rc, _, _ = _run_git(
+        [
+            "merge-base",
+            "--is-ancestor",
+            resume_ctx.feature_branch,
+            resume_ctx.main_branch,
+        ],
+        cwd=primary_root,
+    )
+    if rc != 0:
+        raise WorkflowError(
+            "terminal completion resume requires the recorded feature branch "
+            f"'{resume_ctx.feature_branch}' to be merged into '{resume_ctx.main_branch}'"
+        )
+
+
 def _execute_merge_handoff(
     exec_ctx: ExecutionContext,
     wf: WorkflowConfig,
@@ -6491,6 +6807,46 @@ def run_workflow(
         )
 
     original_plan_path = config.plan_path
+    terminal_completion_resume = bool(
+        resume is not None and resume.terminal_completion_only
+    )
+    terminal_completion_phase = (
+        resume.completion_phase if terminal_completion_resume and resume is not None else None
+    )
+    if terminal_completion_resume and terminal_completion_phase not in {
+        "approved",
+        "lifecycle",
+    }:
+        raise WorkflowError(
+            "terminal completion resume has no valid recorded delivery phase"
+        )
+    terminal_completion_plan_path = (
+        _done_plan_path(config.repo_root, original_plan_path)
+        if terminal_completion_resume
+        and terminal_completion_phase == "lifecycle"
+        and not original_plan_path.is_file()
+        else original_plan_path
+    )
+    terminal_delivery_run_id: str | None = None
+    terminal_delivery_lineage: tuple[str, ...] = ()
+    if terminal_completion_resume and resume is not None:
+        assert terminal_completion_phase is not None
+        (
+            terminal_delivery_run_dir,
+            terminal_delivery_lineage,
+        ) = _resolve_terminal_delivery_lineage(
+            config.repo_root,
+            resume,
+            original_plan_path=original_plan_path,
+            phase=terminal_completion_phase,
+        )
+        terminal_delivery_run_id = terminal_delivery_run_dir.name
+    terminal_completion_after_move = (
+        terminal_completion_resume
+        and terminal_completion_plan_path != original_plan_path
+        and terminal_completion_plan_path is not None
+        and terminal_completion_plan_path.is_file()
+    )
     repo_state = probe_repo_state(config.repo_root)
     needs_bootstrap = _lifecycle_is_bootstrap_eligible(wf, repo_state)
     lifecycle_plan = None
@@ -6511,9 +6867,14 @@ def run_workflow(
         )
 
     try:
-        _backup_original_plan(config.repo_root, original_plan_path)
+        if not terminal_completion_after_move:
+            _backup_original_plan(config.repo_root, original_plan_path)
         if parsed_plan is None:
-            parsed_plan = load_plan(original_plan_path)
+            if terminal_completion_plan_path is None:
+                raise WorkflowError(
+                    "terminal completion resume cannot resolve the Done plan path"
+                )
+            parsed_plan = load_plan(terminal_completion_plan_path)
         parsed_plan, deferred_git_tracking_base_head = (
             _prepare_required_git_tracking_before_allocation(
                 repo_root=config.repo_root,
@@ -6525,6 +6886,7 @@ def run_workflow(
                 needs_bootstrap=needs_bootstrap,
                 is_resume=resume is not None,
                 startup_retry=startup_retry,
+                terminal_completion_resume=terminal_completion_resume,
             )
         )
     except WorkflowError as exc:
@@ -6633,7 +6995,11 @@ def run_workflow(
     # Resume discovery carries already validated bytes so pruning the source
     # run cannot turn a checked authority record into a late file read.
     resumed_envelope_bytes = resume.scope_envelope_bytes if resume is not None else None
-    if resume is not None and resume.active_implementation_scope is not None:
+    if (
+        resume is not None
+        and not terminal_completion_resume
+        and resume.active_implementation_scope is not None
+    ):
         reference = _scope_envelope_reference(resume.active_implementation_scope)
         if reference is None:
             raise WorkflowError(
@@ -6660,6 +7026,8 @@ def run_workflow(
         or resume.resume_team_override is not None
     ):
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if terminal_completion_resume and resume is not None:
+        preserved_resume_run_ids.update(terminal_delivery_lineage)
     if (
         resume is not None
         and resume.active_implementation_scope is None
@@ -6681,6 +7049,16 @@ def run_workflow(
             if preserved_resume_run_ids
             else {}
         ),
+    )
+    terminal_delivery_run_dir = (
+        run_paths.runs_root / terminal_delivery_run_id
+        if terminal_delivery_run_id is not None
+        else run_paths.run_dir
+    )
+    terminal_delivery_preserved_run_ids = (
+        frozenset(terminal_delivery_lineage)
+        if terminal_delivery_run_id is not None
+        else frozenset()
     )
     journal = EventJournal(run_paths.run_dir)
     if launch_result.created:
@@ -6784,7 +7162,7 @@ def run_workflow(
         if resume is not None and resume.effective_max_turns is not None
         else config.max_turns
     )
-    if resume is not None:
+    if resume is not None and not terminal_completion_resume:
         state.override_result = resume.override_result
         state.last_accepted_override = resume.last_accepted_override
         if (
@@ -6984,7 +7362,7 @@ def run_workflow(
     # Defensive invariant: external mutation after pre-allocation normalization
     # must still fail closed instead of reaching a review worker without metadata.
     if _workflow_requires_git_tracking(wf, workflow_config):
-        plan_text = original_plan_path.read_text(encoding="utf-8")
+        plan_text = terminal_completion_plan_path.read_text(encoding="utf-8")
         if not plan_has_git_tracking(plan_text):
             state.status_message = "failed"
             banner.stop(state)
@@ -7087,7 +7465,7 @@ def run_workflow(
     try:
         startup_base_head_refresh_check = preflight_pre_handoff_base_head_refresh(
             config.repo_root,
-            original_plan_path.read_text(encoding="utf-8"),
+            terminal_completion_plan_path.read_text(encoding="utf-8"),
             parsed_plan,
         )
     except ValueError as exc:
@@ -7150,15 +7528,50 @@ def run_workflow(
     terminal_integration_only = bool(
         resume is not None and resume.terminal_integration_only
     )
-    if done and not terminal_integration_only and not (
+    if done and not terminal_integration_only and not terminal_completion_resume and not (
         resume is not None and resume.pending_finalized_turn is not None
     ):
         prior_original_plan_path = original_plan_path
-        finalized_original_plan_path = _finalize_original_plan_if_complete(
-            config.repo_root,
-            original_plan_path,
-            snapshot=original_snapshot,
-        )
+        try:
+            finalized_original_plan_path = _deliver_completed_plan(
+                repo_root=config.repo_root,
+                working_dir=working_dir,
+                run_dir=run_paths.run_dir,
+                original_plan_path=original_plan_path,
+                snapshot=original_snapshot,
+                execution_context=None,
+            )
+        except _CompletedPlanDeliveryError as exc:
+            state.status_message = "failed"
+            summary = _format_failure(
+                reason=str(exc),
+                run_dir=run_paths.run_dir,
+                snapshot=original_snapshot,
+            )
+            run_metadata.write(
+                status="failed",
+                failure_reason=summary,
+                failure_kind="completion_publication",
+                completion_phase=exc.phase,
+                last_snapshot=original_snapshot,
+                original_plan_path=original_plan_path,
+                active_plan_path=active_plan_path,
+            )
+            banner.stop(state)
+            _emit_event(observer, RunFailedEvent.create(
+                run_dir=run_paths.run_dir,
+                turns_completed=0,
+                failure_reason=summary,
+                final_snapshot=original_snapshot,
+                issues_accumulated=state.issues_accumulated,
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            ))
+            raise WorkflowError(
+                summary,
+                run_dir=run_paths.run_dir,
+                failure_kind="completion_publication",
+            ) from exc.cause
         if finalized_original_plan_path != prior_original_plan_path:
             original_plan_path = finalized_original_plan_path
             if active_plan_path == prior_original_plan_path:
@@ -7336,7 +7749,21 @@ def run_workflow(
 
             _validate_scope_envelope_bytes(scope, envelope_path.read_bytes())
         try:
-            if "worktree" in resume.setup:
+            if terminal_completion_resume:
+                _validate_terminal_completion_resume_context(config.repo_root, resume)
+                if resume.main_branch is not None and resume.feature_branch is not None:
+                    exec_ctx = ExecutionContext(
+                        primary_repo_root=config.repo_root,
+                        execution_repo_root=config.repo_root,
+                        main_branch=resume.main_branch,
+                        feature_branch=resume.feature_branch,
+                        worktree_path=None,
+                        setup=resume.setup,
+                        teardown=resume.teardown,
+                    )
+                else:
+                    exec_ctx = None
+            elif "worktree" in resume.setup:
                 _validate_worktree_resume_context(config.repo_root, resume)
                 assert resume.worktree_path is not None
                 assert resume.main_branch is not None
@@ -7365,14 +7792,15 @@ def run_workflow(
                 )
             else:
                 exec_ctx = None
-            _sync_startup_plan_metadata_for_execution(
-                original_plan_path,
-                exec_ctx,
-                startup_base_head_refresh_sha=(
-                    effective_startup_base_head_refresh_sha if should_refresh_pre_handoff_base_head else None
-                ),
-            )
-            if resume.active_plan_path is not None:
+            if not terminal_completion_resume:
+                _sync_startup_plan_metadata_for_execution(
+                    original_plan_path,
+                    exec_ctx,
+                    startup_base_head_refresh_sha=(
+                        effective_startup_base_head_refresh_sha if should_refresh_pre_handoff_base_head else None
+                    ),
+                )
+            if resume.active_plan_path is not None and not terminal_completion_resume:
                 active_plan_path = resume.active_plan_path
                 active_execution_path = _exec_plan_path(active_plan_path, exec_ctx)
                 if not active_execution_path.is_file():
@@ -7558,7 +7986,7 @@ def run_workflow(
             )
             raise WorkflowError(summary, run_dir=run_paths.run_dir) from exc
 
-    if exec_ctx is None:
+    if exec_ctx is None and not terminal_completion_resume:
         _sync_startup_plan_metadata_for_execution(
             original_plan_path,
             None,
@@ -7568,7 +7996,11 @@ def run_workflow(
         )
 
     pending_boundary = state.pending_boundary_decision
-    if pending_boundary is not None and not pending_boundary.consumed:
+    if (
+        pending_boundary is not None
+        and not pending_boundary.consumed
+        and not terminal_completion_resume
+    ):
         if pending_boundary.resolved_next_step is not None:
             current_step_name = pending_boundary.resolved_next_step
         if pending_boundary.post_transition_active_plan_path is not None:
@@ -7592,6 +8024,96 @@ def run_workflow(
         banner=banner,
         execution_context=exec_ctx,
     )
+
+    if terminal_completion_resume:
+        if not done:
+            raise WorkflowError(
+                "terminal completion resume requires a complete saved plan",
+                run_dir=run_paths.run_dir,
+            )
+        prior_original_plan_path = original_plan_path
+        try:
+            finalized_original_plan_path = _deliver_completed_plan(
+                repo_root=config.repo_root,
+                working_dir=config.repo_root,
+                run_dir=terminal_delivery_run_dir,
+                original_plan_path=original_plan_path,
+                snapshot=original_snapshot,
+                execution_context=exec_ctx,
+                publish_approved=terminal_completion_phase == "approved",
+            )
+        except _CompletedPlanDeliveryError as exc:
+            failure_finalizer.raise_failure(
+                str(exc),
+                original_plan_path=original_plan_path,
+                current_step_name=current_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=None,
+                last_snapshot=original_snapshot,
+                cause=exc.cause,
+                failure_kind="completion_publication",
+                completion_phase=exc.phase,
+            )
+        if finalized_original_plan_path != prior_original_plan_path:
+            original_plan_path = finalized_original_plan_path
+            if active_plan_path == prior_original_plan_path:
+                active_plan_path = original_plan_path
+
+        end_reason: WorkflowEndReason = (
+            resume.completion_end_reason
+            if resume is not None and resume.completion_end_reason is not None
+            else "transition_end"
+        )
+        state.end_reason = end_reason
+        state.status_message = "completed"
+        _emit_event(
+            observer,
+            StatusChangedEvent.create(
+                status_message="completed",
+                turns_completed=state.turns_completed,
+                active_turn=None,
+                current_step_name=current_step_name,
+            ),
+        )
+        result = ControllerRunResult(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=original_snapshot,
+            issues_accumulated=state.issues_accumulated,
+            end_reason=end_reason,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        )
+        run_metadata.write(
+            status="completed",
+            execution_context=exec_ctx,
+            last_snapshot=original_snapshot,
+            turns_completed=state.turns_completed,
+            end_reason=end_reason,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=None,
+        )
+        prune_old_runs(
+            run_paths.runs_root,
+            config.keep_runs,
+            preserved_run_ids=terminal_delivery_preserved_run_ids,
+        )
+        banner.stop(state)
+        _emit_event(
+            observer,
+            RunCompletedEvent.create(
+                run_dir=run_paths.run_dir,
+                turns_completed=state.turns_completed,
+                final_snapshot=original_snapshot,
+                end_reason=end_reason,
+                issues_accumulated=state.issues_accumulated,
+                recovery_summary=state.current_harness_recovery,
+                recovery_history=tuple(state.harness_recovery_history),
+            ),
+        )
+        return result
 
     def _record_issue(
         kind: str,
@@ -9381,19 +9903,29 @@ def run_workflow(
         except HarnessEnvironmentPreflightError as exc:
             _handle_environment_preflight_failure(exc)
         if merge_status != "failed":
+            prior_original_plan_path = original_plan_path
             try:
-                merging = exec_ctx is not None and "merge" in exec_ctx.teardown
-                publish_completed_run(
-                    config.repo_root if merging else working_dir,
-                    run_paths.run_dir,
-                    source_ref=exec_ctx.main_branch if merging else "HEAD",
+                finalized_original_plan_path = _deliver_completed_plan(
+                    repo_root=config.repo_root,
+                    working_dir=working_dir,
+                    run_dir=run_paths.run_dir,
+                    original_plan_path=original_plan_path,
+                    snapshot=original_snapshot,
+                    execution_context=exec_ctx,
                 )
-            except PublicationError as exc:
+            except _CompletedPlanDeliveryError as exc:
                 failure_finalizer.raise_failure(
                     str(exc), original_plan_path=original_plan_path,
                     current_step_name=current_step_name, active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                    new_plan_path=new_plan_path, last_snapshot=state.last_snapshot,
+                    cause=exc.cause,
+                    failure_kind="completion_publication",
+                    completion_phase=exc.phase,
                 )
+            if finalized_original_plan_path != prior_original_plan_path:
+                original_plan_path = finalized_original_plan_path
+                if active_plan_path == prior_original_plan_path:
+                    active_plan_path = original_plan_path
 
         if merge_status == "failed":
             state.status_message = "failed"
@@ -9426,17 +9958,6 @@ def run_workflow(
             prune_old_runs(run_paths.runs_root, config.keep_runs)
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
-
-        prior_original_plan_path = original_plan_path
-        finalized_original_plan_path = _finalize_original_plan_if_complete(
-            config.repo_root,
-            original_plan_path,
-            snapshot=original_snapshot,
-        )
-        if finalized_original_plan_path != prior_original_plan_path:
-            original_plan_path = finalized_original_plan_path
-            if active_plan_path == prior_original_plan_path:
-                active_plan_path = original_plan_path
 
         end_reason: WorkflowEndReason = "transition_end"
         state.end_reason = end_reason
@@ -9610,19 +10131,29 @@ def run_workflow(
                 except HarnessEnvironmentPreflightError as exc:
                     _handle_environment_preflight_failure(exc)
             if merge_status != "failed":
+                prior_original_plan_path = original_plan_path
                 try:
-                    merging = exec_ctx is not None and "merge" in exec_ctx.teardown
-                    publish_completed_run(
-                        config.repo_root if merging else working_dir,
-                        run_paths.run_dir,
-                        source_ref=exec_ctx.main_branch if merging else "HEAD",
+                    finalized_original_plan_path = _deliver_completed_plan(
+                        repo_root=config.repo_root,
+                        working_dir=working_dir,
+                        run_dir=run_paths.run_dir,
+                        original_plan_path=original_plan_path,
+                        snapshot=state.last_snapshot,
+                        execution_context=exec_ctx,
                     )
-                except PublicationError as exc:
+                except _CompletedPlanDeliveryError as exc:
                     failure_finalizer.raise_failure(
                         str(exc), original_plan_path=original_plan_path,
                         current_step_name=current_step_name, active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                        new_plan_path=new_plan_path, last_snapshot=state.last_snapshot,
+                        cause=exc.cause,
+                        failure_kind="completion_publication",
+                        completion_phase=exc.phase,
                     )
+                if finalized_original_plan_path != prior_original_plan_path:
+                    original_plan_path = finalized_original_plan_path
+                    if active_plan_path == prior_original_plan_path:
+                        active_plan_path = original_plan_path
 
             if merge_status == "failed":
                 state.status_message = "failed"
@@ -9654,16 +10185,6 @@ def run_workflow(
                 banner.stop(state)
                 raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
-            prior_original_plan_path = original_plan_path
-            finalized_original_plan_path = _finalize_original_plan_if_complete(
-                config.repo_root,
-                original_plan_path,
-                snapshot=state.last_snapshot,
-            )
-            if finalized_original_plan_path != prior_original_plan_path:
-                original_plan_path = finalized_original_plan_path
-                if active_plan_path == prior_original_plan_path:
-                    active_plan_path = original_plan_path
             state.status_message = "completed"
             result = ControllerRunResult(
                 run_dir=run_paths.run_dir,
@@ -10540,14 +11061,17 @@ def run_workflow(
                 _handle_environment_preflight_failure(exc)
 
         if final_snapshot.is_complete and merge_status != "failed":
+            prior_original_plan_path = original_plan_path
             try:
-                merging = exec_ctx is not None and "merge" in exec_ctx.teardown
-                publish_completed_run(
-                    config.repo_root if merging else working_dir,
-                    run_paths.run_dir,
-                    source_ref=exec_ctx.main_branch if merging else "HEAD",
+                finalized_original_plan_path = _deliver_completed_plan(
+                    repo_root=config.repo_root,
+                    working_dir=working_dir,
+                    run_dir=run_paths.run_dir,
+                    original_plan_path=original_plan_path,
+                    snapshot=final_snapshot,
+                    execution_context=exec_ctx,
                 )
-            except PublicationError as exc:
+            except _CompletedPlanDeliveryError as exc:
                 failure_finalizer.raise_failure(
                     str(exc),
                     original_plan_path=original_plan_path,
@@ -10555,8 +11079,14 @@ def run_workflow(
                     active_plan_path=active_plan_path,
                     new_plan_path=new_plan_path,
                     last_snapshot=final_snapshot,
-                    cause=exc,
+                    cause=exc.cause,
+                    failure_kind="completion_publication",
+                    completion_phase=exc.phase,
                 )
+            if finalized_original_plan_path != prior_original_plan_path:
+                original_plan_path = finalized_original_plan_path
+                if active_plan_path == prior_original_plan_path:
+                    active_plan_path = original_plan_path
 
         if merge_status == "failed":
             state.status_message = "failed"
@@ -10588,18 +11118,6 @@ def run_workflow(
             prune_old_runs(run_paths.runs_root, config.keep_runs)
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
-
-        if final_snapshot.is_complete:
-            prior_original_plan_path = original_plan_path
-            finalized_original_plan_path = _finalize_original_plan_if_complete(
-                config.repo_root,
-                original_plan_path,
-                snapshot=final_snapshot,
-            )
-            if finalized_original_plan_path != prior_original_plan_path:
-                original_plan_path = finalized_original_plan_path
-                if active_plan_path == prior_original_plan_path:
-                    active_plan_path = original_plan_path
 
         state.status_message = "completed"
         _emit_event(observer, StatusChangedEvent.create(

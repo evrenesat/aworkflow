@@ -740,6 +740,55 @@ class WorkflowCliTests(unittest.TestCase):
         assert result.extra_instructions == ("keep the patch focused",)
         assert result.frozen_run_identity is not None
 
+    def test_terminal_completion_resume_loads_plan_from_receipt_backed_done_path(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, previous_run = (
+            self._resume_bootstrap_fixture(tmp_path)
+        )
+        source_path = Path(previous_run["original_plan_path"])
+        done_path = repo_root / "plans" / "done" / source_path.name
+        done_path.parent.mkdir(parents=True)
+        done_path.write_text(_COMPLETE_PLAN, encoding="utf-8")
+        source_path.unlink()
+
+        failed_run = dict(previous_run)
+        failed_run.update(
+            {
+                "last_snapshot": {"is_complete": True},
+                "failure_kind": "completion_publication",
+                "completion_phase": "lifecycle",
+                "end_reason": "transition_end",
+                "current_step_name": "implement_plan",
+            }
+        )
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=failed_run):
+            result = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg=None,
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
+        assert result.plan_path == source_path
+        assert result.parsed_plan is not None
+        assert result.parsed_plan.snapshot.is_complete
+        assert result.resume_context.terminal_completion_only is True
+        assert result.resume_context.completion_phase == "lifecycle"
+        assert result.resume_context.worktree_path == Path(previous_run["worktree_path"])
+
     def test_resume_explicit_start_step_correction_replaces_interrupted_step(
         self,
     ) -> None:

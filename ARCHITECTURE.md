@@ -1222,9 +1222,18 @@ The dashboard coordinates manual, timer and stream refreshes, preserves selected
 
 ### Repository-authorized publication
 
-`aflow/publication.py` runs at successful normal and resumed terminal boundaries,
-after optional local merge and before plan finalization. Local Git configuration
-selects an existing remote/branch. Publication preserves the execution checkout,
-merges concurrent accepted history in an isolated checkout, never force-pushes,
-and writes a bounded run-local receipt. An error prevents normal completion.
-CI and deployment remain downstream of the remote main update.
+`aflow/publication.py` runs at successful normal and resumed terminal boundaries.
+The controller first publishes the approved execution ref, then uses the
+receipt-backed lifecycle helper to move a complete tracked plan to `plans/done`.
+If that move creates a bookkeeping commit, it publishes that commit through the
+same receipt; no redundant push is issued for an untracked or ignored-only move.
+Local Git configuration selects an existing remote/branch. Publication preserves
+the execution checkout, merges concurrent accepted history in an isolated
+checkout, never force-pushes, and writes a bounded run-local receipt. A failed
+approved or lifecycle phase records its phase in `run.json`; a terminal resume
+validates the recorded branch identities and receipt. Repeated terminal resumes
+follow the validated `resumed_from_run_id` lineage to the exact receipt owner
+and retain every predecessor needed to resolve that lineage through allocation
+and final pruning, then retry only the unfinished delivery without reopening a
+removed worktree or replaying a checkpoint. CI and deployment remain downstream
+of the remote main update.

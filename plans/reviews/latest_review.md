@@ -1,20 +1,22 @@
-# Checkpoint 1 review — approved
+# Checkpoint 2 review — approved
 
-Reviewed checkpoint 1, “Record exact tracked lifecycle moves deterministically,” and active repair overlay `plans/in-progress/complete-plan-bookkeeping-with-delivery-20260910-cp01-v01.md` against original plan `plans/in-progress/complete-plan-bookkeeping-with-delivery-20260910.md`.
+Reviewed checkpoint 2 against the original `complete-plan-bookkeeping-with-delivery-20260910.md` and active repair overlay `complete-plan-bookkeeping-with-delivery-20260910-cp02-v02.md`.
 
-Target: current-worktree fallback against `cd78d536edf1743541367fde8dc7a859487db1a9`; no checkpoint commit existed for this run. Approval label: `cp1 v01 aflow-complete-plan-bookkeeping-with-delivery-20260910-20260910-165127`. Reviewed `aflow/publication.py`, `tests/test_publication.py`, and DEVLOG.
+No CP2 commit boundary existed. Review used the current-worktree fallback after `cp1 v01` (`4cb8c70`), covering terminal publication/finalization, CLI resume reconstruction, receipt identity, predecessor retention, regressions, and related documentation. The reviewer approves this slice as `cp2 v01`; CP1 remains approved. The supplied worker artifact was absent from this worktree, so verification used actual code and independently run tests.
 
-Coverage: literal staging, ignored and normally tracked Done storage, raw byte preservation with Git destination clean conversion, receipt identity, staged-change refusals, unrelated unstaged preservation, idempotent move/staging/commit recovery, and preservation of publication receipt fields. Workflow integration belongs to checkpoint 2.
+## Findings
 
-Verification:
+None met the material-code-review admission gate. The repeated-retry regression exercises the original final-push rejection and three failed successors with `keep_runs=1`, then successful delivery. It verifies retained predecessor directories, one authoritative receipt, an unchanged lifecycle commit, exact remote receipt SHA, identical ignored Done bytes, clean checkout, and zero worker replay.
 
-- Focused publication/runtime lifecycle pytest command specified in the plan: 34 passed, 287 deselected.
-- `uv run ruff check aflow`: passed.
+## Verification
+
+- `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 uv run pytest -q tests/test_publication.py tests/test_runtime.py tests/test_dirty_worktree_preflight.py tests/test_control_plane_resume.py tests/test_cli.py --tb=short`: 513 passed, 172 subtests passed.
+- `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 uv run pytest -q --tb=short`: 1775 passed, 223 subtests passed.
+- `uv run ruff check aflow apps/aflow_app/server/src`: passed.
 - `git diff --check`: passed.
-- Independent disposable repositories: destination-specific attributes with CRLF bytes, uninterrupted and interrupted after commit creation before receipt persistence. Repeat finalization preserved bytes, clean status and exactly one lifecycle commit.
 
-Findings: none passed the material-code-review admission gate.
+## Bookkeeping and delivery
 
-Checkpoint 1 approved; checkpoint 2 remains unchecked. Both repair overlays retained. Publication, CI and live verification remain coordinator-owned and pending.
+Only checkpoint 2 approval state advanced. The original plan remains in-progress for controller-owned finalization. All repair overlays remain intact, including those referenced by durable active-plan state. The previous review was rotated byte-for-byte to a timestamped local archive under the existing ignored storage policy. No implementation fixes or new repair plan were needed. Reviewer owns the checkpoint approval commit; coordinator owns serialized origin/main publication, exact-SHA CI and live validation. Those delivery gates are not claimed here.
 
 No material findings

@@ -759,6 +759,12 @@ class ResumeContext:
     override_source_run_dir: Path | None = None
     override_file_present: bool = False
     terminal_integration_only: bool = False
+    # A completed run whose final publication/finalization failed resumes only
+    # the unfinished terminal delivery work.  The phase distinguishes the
+    # reviewed-code publication from the receipt-backed lifecycle publication.
+    terminal_completion_only: bool = False
+    completion_phase: str | None = None
+    completion_end_reason: WorkflowEndReason | None = None
     # Exact source artifact bytes, fully parsed and bound before pruning so a
     # keep_runs resume never needs to reopen the source run.
     scope_envelope_bytes: bytes | None = None
