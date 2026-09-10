@@ -71,7 +71,7 @@ No global regex accepting arbitrary headings, silent history reset, new validati
 
 **Blockers:** Missing safe classification must fall back to the current generic error, not raw exception disclosure.
 
-### [ ] Checkpoint 3: Show truthful plan state and actionable startup feedback
+### [x] Checkpoint 3: Show truthful plan state and actionable startup feedback
 
 **Goal:** Browser users understand Ready and can correct a rejected start.
 
@@ -81,11 +81,11 @@ No global regex accepting arbitrary headings, silent history reset, new validati
 
 **Steps:**
 
-- [ ] Replace folder-derived `Ready — runnable` with accurate Ready wording and brief contextual guidance that startup checks occur when starting; do not imply a preflight was performed. Preserve Draft/Done action gating and existing state transitions.
-- [ ] Display the safe structured startup message in the existing form error surface, preserving the draft and selections. If a run was already reserved, offer its exact existing detail link and make the failed attempt clear; do not imply nothing was created or auto-submit a replacement. Existing generic fallback stays for unclassified errors. Do not parse server logs or recreate Git Tracking parsing in React.
-- [ ] Document the exact recommended reserved heading `## Git Tracking` without numbering in the maintained bundled aflow-plan skill and relevant template. Show canonical fields; note supported numbered input only where useful. No automatic changes to real installed/canonical skills.
-- [ ] Add component/API parsing tests and a real Chromium isolated-server journey: numbered pristine plan starts through validated recognition; duplicate or malformed metadata is rejected before allocation with visible correction; user can edit and retry through normal revision-aware controls. Verify Ready wording does not promise prior validation. Retain exact history/field bytes.
-- [ ] Update DEVLOG and relevant concise format/API/usage documentation in the same pass. Root AGENTS unchanged.
+- [x] Replace folder-derived `Ready — runnable` with accurate Ready wording and brief contextual guidance that startup checks occur when starting; do not imply a preflight was performed. Preserve Draft/Done action gating and existing state transitions.
+- [x] Display the safe structured startup message in the existing form error surface, preserving the draft and selections. If a run was already reserved, offer its exact existing detail link and make the failed attempt clear; do not imply nothing was created or auto-submit a replacement. Existing generic fallback stays for unclassified errors. Do not parse server logs or recreate Git Tracking parsing in React.
+- [x] Document the exact recommended reserved heading `## Git Tracking` without numbering in the maintained bundled aflow-plan skill and relevant template. Show canonical fields; note supported numbered input only where useful. No automatic changes to real installed/canonical skills.
+- [x] Add component/API parsing tests and a real Chromium isolated-server journey: numbered pristine plan starts through validated recognition; duplicate or malformed metadata is rejected before allocation with visible correction; user can edit and retry through normal revision-aware controls. Verify Ready wording does not promise prior validation. Retain exact history/field bytes.
+- [x] Update DEVLOG and relevant concise format/API/usage documentation in the same pass. Root AGENTS unchanged.
 
 **Dependencies:** CP2; reconcile accepted responsive presentation before integration if it completed concurrently.
 

@@ -1173,6 +1173,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       setBusyAction('start')
       setError(null)
       setFeedback(null)
+      // A new admission attempt owns its own failure link. A prior reserved
+      // request must not remain attached to a later rejection without a run ID.
+      setFailedRequestId(null)
       const response = await api.startControlPlaneRun(projectId, startRequest, getPendingWriteKey('start', intent))
       clearPendingWriteKey('start', intent)
       await handleStartResponse(response, 'Start request')

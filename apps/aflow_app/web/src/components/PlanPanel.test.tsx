@@ -74,6 +74,8 @@ describe('PlanPanel', () => {
 
     // A saved Ready plan offers the exact relative path handoff.
     await openPlan(inProgressPlan, '# Ready plan\n')
+    expect(screen.getByText(/startup checks run when you start the plan/)).toBeDefined()
+    expect(screen.queryByText('Ready — runnable')).toBeNull()
     const run = screen.getByRole('button', { name: 'Run this plan' })
     expect(run.getAttribute('disabled')).toBeNull()
     fireEvent.click(run)

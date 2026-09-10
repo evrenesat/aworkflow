@@ -16,6 +16,16 @@
 - HISTORY: Source inspection established both as render-order boundaries: `GlobalSettings` conditionally renders the named combobox or tabs, while `useHeaderSlots` registers the hosted header actions in an effect that can settle after the editor itself is visible. No local reproduction is claimed.
 - The browser helper now waits for the visible union of the requested combobox and tab before selecting the actual rendered control. The Advanced TOML journey waits for the visible Save action in the hosted header before retaining its exact count assertion; paging, draft bytes, geometry, and read-only assertions are unchanged.
 - Verification passed with `cd apps/aflow_app/web && npm ci && npm run build`, `cd apps/aflow_app/server && uv sync --frozen --group dev`, and the complete `tests/test_settings_browser.py` file under both `AFLOW_TEST_BROWSER=chromium` (5 passed) and `AFLOW_TEST_BROWSER=webkit` (5 passed). Only the Changelog and dirty mobile Skills journeys use the selected engine; the toolbar, draft-template, and skill-save/install tests in this same file remain hard-coded Chromium. `git diff --check` also passed.
+## 2026-09-10 — Make Ready state and startup corrections truthful (Checkpoint 3)
+
+- Ready remains a lifecycle state: the hosted plan editor now explains that startup
+  checks run when the user starts the plan, without claiming an earlier validation.
+- Start failures keep the existing plan/workflow draft and show the bounded structured
+  server message; a reserved run remains linkable, while a new attempt clears any stale
+  failure link when no new run identity is returned.
+- Bundled `aflow-plan` guidance and the draft template recommend the exact unnumbered
+  `## Git Tracking` heading and its two controller-owned fields, while documenting the
+  supported single numbered form for existing plans.
 
 ## 2026-09-10 — Stabilize hosted browser ordering and Dashboard CI Python (Checkpoint 1)
 

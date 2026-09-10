@@ -31,7 +31,7 @@ const LIFECYCLE_SECTIONS: Array<{ status: PlanDocument['status']; title: string;
   {
     status: 'in_progress',
     title: 'Ready (in progress)',
-    hint: 'Runnable plans. Open one and use “Run this plan” to start a run from it.',
+    hint: 'Runnable plans. Startup checks run when you start one. Open one and use “Run this plan” to start a run from it.',
   },
   {
     status: 'done',
@@ -39,6 +39,8 @@ const LIFECYCLE_SECTIONS: Array<{ status: PlanDocument['status']; title: string;
     hint: 'Finished plans, kept for the record. A done plan is no longer runnable.',
   },
 ]
+
+const READY_START_GUIDANCE = 'Ready is a plan lifecycle state; startup checks run when you start the plan.'
 
 /**
  * Plan list/reader/editor against the revisioned plan routes.  Local text is
@@ -245,7 +247,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
         ? 'Done plans are kept for the record and cannot run. Create a new plan and move it through Draft → Ready to run this work again.'
         : dirty
           ? 'Save this draft before running the plan.'
-          : null
+          : READY_START_GUIDANCE
 
     return (
       <div className="plan-editor">
@@ -253,7 +255,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
           <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>
-            {selected.status === 'todo' ? 'Draft — not runnable yet' : selected.status === 'in_progress' ? 'Ready — runnable' : 'Done — not runnable'}
+            {selected.status === 'todo' ? 'Draft — not runnable yet' : selected.status === 'in_progress' ? 'Ready' : 'Done — not runnable'}
           </span>
           <span className="text-xs text-dim mono" title={selected.revision}>
             Revision {shortRevision(selected.revision)}

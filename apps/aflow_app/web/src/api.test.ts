@@ -244,6 +244,28 @@ describe('workflow control API client', () => {
       .rejects.toMatchObject({ status: 409, code: 'revision_conflict' })
   })
 
+  it('preserves a safe startup message and reserved run identity', async () => {
+    const message = 'Plan validation failed. Add or correct exactly one Git Tracking section, then retry.'
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      text: async () => JSON.stringify({ detail: {
+        code: 'plan_validation_failed', message, run_id: 'run-reserved',
+      } }),
+    } as Response)
+
+    await expect(api.startControlPlaneRun(
+      'project-1',
+      { plan_path: 'plans/in-progress/demo.md' },
+      'start-key',
+    )).rejects.toMatchObject({
+      status: 422,
+      code: 'plan_validation_failed',
+      message,
+      detail: expect.objectContaining({ code: 'plan_validation_failed', message, run_id: 'run-reserved' }),
+    })
+  })
+
   it('creates and unregisters projects through the registry-scoped contract', async () => {
     api.setAuthToken('test-token')
     mockOkJson({

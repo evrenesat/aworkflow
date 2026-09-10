@@ -487,7 +487,9 @@ Parses a Markdown plan file into structured checkpoint data. Expects `### [x] Ch
 - `is_complete` (all checkpoints checked)
 - `total_checkpoint_count`
 
-Also detects `## Git Tracking` sections required by review skills.
+Also detects the canonical `## Git Tracking` sections required by review skills and
+the single integer-dot-prefixed form accepted for existing plans without rewriting
+their bytes.
 
 ### `workflow.py`
 The core engine. `run_workflow()` executes the turn loop:

@@ -71,6 +71,11 @@ Keep the content concise. Omit repetition, background already captured elsewhere
 - Keep progress durable: checkboxes must represent verified work rather than activity.
 - Include only the minimal `Git Tracking` fields shown below; the runtime populates them.
 
+For new plans, use the exact unnumbered level-two heading `## Git Tracking` with the
+controller-owned `Plan Branch` and `Pre-Handoff Base HEAD` fields below. Existing plans
+with one narrow integer-dot prefix, such as `## 3. Git Tracking`, remain supported so
+their bytes do not need to be rewritten; never add a duplicate tracking section.
+
 ```markdown
 ## Git Tracking
 

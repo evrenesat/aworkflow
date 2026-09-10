@@ -268,6 +268,19 @@ Ready repositories record the current commit; an empty-repository lifecycle
 records the verified bootstrap commit before the first ordinary turn. Started,
 resumed, recovery, malformed, or ambiguous plans are not silently repaired.
 
+New plans should keep the canonical unnumbered heading and controller-owned fields:
+
+```markdown
+## Git Tracking
+
+- Plan Branch: ``
+- Pre-Handoff Base HEAD: ``
+```
+
+One integer-dot-prefixed heading such as `## 3. Git Tracking` remains supported for
+existing plans without rewriting their history; duplicate tracking sections remain
+invalid.
+
 ## Included workflows
 
 - `ralph`: repeat one implementation step without a review phase.

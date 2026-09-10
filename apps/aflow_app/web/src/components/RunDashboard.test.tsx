@@ -945,6 +945,32 @@ describe('RunDashboard', () => {
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][1]).toEqual({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', max_turns: 9, dirty_worktree_confirmed: false })
   })
 
+  it('keeps launch selections after a safe rejection and clears an old reserved link on retry', async () => {
+    const message = 'Plan validation failed. Add or correct exactly one Git Tracking section, then retry.'
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.startControlPlaneRun)
+      .mockRejectedValueOnce(new ApiError(422, message, 'plan_validation_failed', {
+        code: 'plan_validation_failed', message, run_id: 'run-reserved',
+      }))
+      .mockRejectedValueOnce(new ApiError(422, 'operation_rejected', 'operation_rejected'))
+    renderDashboard()
+
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await waitForPreflightReady()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+
+    await screen.findByText(message)
+    expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md')
+    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
+    expect(screen.getByRole('button', { name: 'View failed request' })).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await screen.findByText('operation_rejected')
+    expect(screen.queryByRole('button', { name: 'View failed request' })).toBeNull()
+  })
+
   it('refreshes a CAS conflict, keeps local control edits, and reports restart-required changes', async () => {
     vi.mocked(api.controlControlPlaneRun)
       .mockRejectedValueOnce(Object.assign(new Error('revision conflict'), { code: 'revision_conflict' }))
