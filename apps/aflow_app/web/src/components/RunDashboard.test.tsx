@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
 import type { WorktreePreflight } from '../types'
@@ -206,10 +206,42 @@ function openAdvanced() {
   fireEvent.click(screen.getByRole('button', { name: 'Advanced options' }))
 }
 
-describe('RunDashboard', () => {
-  beforeEach(() => {
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
+type ResumeComparisonSetup = 'accepted-baseline' | 'pending'
+type ResumeComparisonTiming = 'before-detail-settlement' | 'after-detail-settlement'
+
+function installResumeComparisonSetup(setup: ResumeComparisonSetup) {
+  const locationBefore = window.location.href
+  const clipboardBefore = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+  const writeText = vi.fn()
+  window.history.replaceState(null, '', `${window.location.pathname}?project=wrong&view=settings&extra=query-sentinel#fragment-sentinel`)
+  if (setup === 'accepted-baseline') {
     window.location.search = ''
     window.location.hash = ''
+  } else {
+    window.history.replaceState(null, '', window.location.pathname)
+  }
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+  return () => {
+    window.history.replaceState(null, '', locationBefore)
+    if (clipboardBefore) Object.defineProperty(navigator, 'clipboard', clipboardBefore)
+    else Reflect.deleteProperty(navigator, 'clipboard')
+  }
+}
+
+describe('RunDashboard', () => {
+  let locationBeforeTest = ''
+  let clipboardDescriptorBeforeTest: PropertyDescriptor | undefined
+
+  beforeEach(() => {
+    locationBeforeTest = window.location.href
+    clipboardDescriptorBeforeTest = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    window.history.replaceState(null, '', window.location.pathname)
     vi.resetAllMocks()
     vi.mocked(api.getRestartOptions).mockResolvedValue(null as never)
     vi.mocked(api.checkSession).mockResolvedValue({ authenticated: true })
@@ -229,6 +261,12 @@ describe('RunDashboard', () => {
     vi.mocked(api.listRunEvents).mockResolvedValue([{ sequence: 1, event_type: 'run_started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:00Z' }])
     vi.mocked(api.getRunContext).mockResolvedValue({ run_id: 'run-owned', level: 'lite', data: { status: 'running' }, schema_version: 1 })
     vi.mocked(api.subscribeToRunEvents).mockReturnValue(() => {})
+  })
+
+  afterEach(() => {
+    window.history.replaceState(null, '', locationBeforeTest)
+    if (clipboardDescriptorBeforeTest) Object.defineProperty(navigator, 'clipboard', clipboardDescriptorBeforeTest)
+    else Reflect.deleteProperty(navigator, 'clipboard')
   })
 
   it('suspends hidden streams and refreshes on visibility restoration', async () => {
@@ -1284,14 +1322,29 @@ describe('RunDashboard', () => {
 
   it('reuses a resume key after an uncertain failure', async () => {
     const attentionRun = { ...ownedRun, run_id: 'run-needs-attention', status: 'needs_attention', revision: 3, evidence: { ...ownedRun.evidence, can_resume: true } }
-    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [attentionRun], next_cursor: null, schema_version: 1 })
-    vi.mocked(api.getControlPlaneRun).mockResolvedValue(attentionRun)
+    const listReady = deferred<{ runs: (typeof attentionRun)[]; next_cursor: null; schema_version: number }>()
+    const detailReady = deferred<typeof attentionRun>()
+    const confirmedRun = { ...attentionRun, current_step: 'review' }
+    vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(() => listReady.promise)
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => detailReady.promise)
     vi.mocked(api.resumeControlPlaneRun).mockRejectedValue(new Error('connection lost'))
     renderDashboard()
 
+    await act(async () => {
+      listReady.resolve({ runs: [attentionRun], next_cursor: null, schema_version: 1 })
+      await listReady.promise
+    })
     await waitFor(() => expect(screen.getByRole('button', { name: /Resume as new run/ })).toBeDefined())
-    fireEvent.click(screen.getByRole('button', { name: /Resume as new run/ }))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Confirm resume' })).toBeDefined())
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      detailReady.resolve(confirmedRun)
+      await detailReady.promise
+    })
+    await screen.findByText('Review · 2')
+    const resumeButton = screen.getByRole('button', { name: /Resume as new run/ }) as HTMLButtonElement
+    expect(resumeButton.disabled).toBe(false)
+    fireEvent.click(resumeButton)
+    expect(await screen.findByRole('button', { name: 'Confirm resume' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm resume' }))
     await waitFor(() => expect(screen.getByText('connection lost')).toBeDefined())
 
@@ -1300,6 +1353,57 @@ describe('RunDashboard', () => {
     expect(vi.mocked(api.resumeControlPlaneRun).mock.calls[1][2]).toBe(
       vi.mocked(api.resumeControlPlaneRun).mock.calls[0][2],
     )
+  })
+
+  it.each([
+    ['accepted-baseline', 'before-detail-settlement'],
+    ['accepted-baseline', 'after-detail-settlement'],
+    ['pending', 'before-detail-settlement'],
+    ['pending', 'after-detail-settlement'],
+  ] as const)('retains confirmed resume readiness for %s setup with %s interaction', async (setup, timing) => {
+    const restoreSetup = installResumeComparisonSetup(setup)
+    const attentionRun = { ...ownedRun, run_id: 'run-needs-attention', status: 'needs_attention', revision: 3, evidence: { ...ownedRun.evidence, can_resume: true } }
+    const listReady = deferred<{ runs: (typeof attentionRun)[]; next_cursor: null; schema_version: number }>()
+    const detailReady = deferred<typeof attentionRun>()
+    const confirmedRun = { ...attentionRun, current_step: 'review' }
+    vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(() => listReady.promise)
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => detailReady.promise)
+    const rendered = renderDashboard()
+
+    try {
+      await act(async () => {
+        listReady.resolve({ runs: [attentionRun], next_cursor: null, schema_version: 1 })
+        await listReady.promise
+      })
+      const listResumeButton = await screen.findByRole('button', { name: /Resume as new run/ }) as HTMLButtonElement
+      expect(listResumeButton.disabled).toBe(false)
+      expect(screen.queryByText('Review · 2')).toBeNull()
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
+
+      if (timing === 'before-detail-settlement') {
+        fireEvent.click(listResumeButton)
+        expect(await screen.findByRole('button', { name: 'Confirm resume' })).toBeDefined()
+        await act(async () => {
+          detailReady.resolve(confirmedRun)
+          await detailReady.promise
+        })
+        await screen.findByText('Review · 2')
+        expect(screen.getByRole('button', { name: 'Confirm resume' })).toBeDefined()
+      } else {
+        await act(async () => {
+          detailReady.resolve(confirmedRun)
+          await detailReady.promise
+        })
+        await screen.findByText('Review · 2')
+        const settledResumeButton = screen.getByRole('button', { name: /Resume as new run/ }) as HTMLButtonElement
+        expect(settledResumeButton.disabled).toBe(false)
+        fireEvent.click(settledResumeButton)
+        expect(await screen.findByRole('button', { name: 'Confirm resume' })).toBeDefined()
+      }
+    } finally {
+      rendered.unmount()
+      restoreSetup()
+    }
   })
 
   it('classifies stale legacy runs as interrupted read-only records', async () => {
@@ -1844,13 +1948,39 @@ describe('RunDashboard', () => {
   it('copies the sanitized dashboard link and reports clipboard failure without hidden data', async () => {
     window.location.search = '?project=wrong&view=settings&extra=query-sentinel'
     window.location.hash = '#fragment-sentinel'
+    const listReady = deferred<{ runs: (typeof ownedRun)[]; next_cursor: null; schema_version: number }>()
+    const detailReady = deferred<typeof ownedRun>()
+    const confirmedRun = { ...ownedRun, current_step: 'review' }
+    vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(() => listReady.promise)
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => detailReady.promise)
+    const onRunSelectionChange = vi.fn()
     const writeText = vi.fn()
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
-    renderDashboard()
-    await screen.findByRole('button', { name: 'run-owned' })
+    renderDashboard({ onRunSelectionChange })
 
-    writeText.mockResolvedValueOnce(undefined)
+    await act(async () => {
+      listReady.resolve({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
+      await listReady.promise
+    })
+    await screen.findByRole('button', { name: /run-owned Running/ })
+    expect(screen.queryByText('Review · 2')).toBeNull()
+    await waitFor(() => expect(onRunSelectionChange).toHaveBeenCalledWith({ runId: 'run-owned', userInitiated: false }))
+    await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      detailReady.resolve(confirmedRun)
+      await detailReady.promise
+    })
+    await screen.findByText('Review · 2')
+
+    const copyReady = deferred<void>()
+    writeText.mockImplementationOnce(() => copyReady.promise)
     fireEvent.click(screen.getByRole('button', { name: 'Copy link' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText('Link copied to the clipboard.')).toBeNull()
+    await act(async () => {
+      copyReady.resolve()
+      await copyReady.promise
+    })
     expect(await screen.findByText('Link copied to the clipboard.')).toBeDefined()
     expect(writeText).toHaveBeenCalledTimes(1)
     expect(writeText).toHaveBeenCalledWith(window.location.origin + window.location.pathname + '?project=control-project&view=runs&run=run-owned')
@@ -1860,6 +1990,39 @@ describe('RunDashboard', () => {
     const failure = await screen.findByText(/Clipboard access failed/)
     expect(failure.textContent).not.toContain('http')
     expect(failure.textContent).not.toContain('token')
+  })
+
+  it('does not report an older copy after the selected run changes', async () => {
+    const otherRun = {
+      ...ownedRun,
+      run_id: 'run-other',
+      status: 'completed',
+      plan_path: 'plans/in-progress/other.md',
+      current_step: 'review',
+      evidence: { ...ownedRun.evidence, manifest_created_at: '2023-12-31T00:00:00Z' },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun, otherRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === otherRun.run_id ? otherRun : ownedRun)
+    const copyReady = deferred<void>()
+    const writeText = vi.fn().mockImplementation(() => copyReady.promise)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    renderDashboard()
+    await screen.findByRole('button', { name: 'run-owned' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy link' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: /other\.md/ }))
+    await screen.findByRole('button', { name: 'run-other' })
+    expect(screen.queryByText('Link copied to the clipboard.')).toBeNull()
+
+    await act(async () => {
+      copyReady.resolve()
+      await copyReady.promise
+    })
+    expect(screen.queryByText('Link copied to the clipboard.')).toBeNull()
+    expect(screen.queryByText(/Clipboard access failed/)).toBeNull()
+    expect(writeText).toHaveBeenCalledTimes(1)
+    expect(writeText).toHaveBeenCalledWith(window.location.origin + window.location.pathname + '?project=control-project&view=runs&run=run-owned')
   })
 
   it('keeps detailed context under one owner while Refresh updates list, status and events', async () => {

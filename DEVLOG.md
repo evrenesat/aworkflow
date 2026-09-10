@@ -1,5 +1,79 @@
 # DEVLOG
 
+## 2026-09-10 — Approve issue38 checkpoint 1
+
+- Review reran the retained four-case comparison: all passed; both setups preserved
+  confirmation before/after detail settlement. No setup-specific failure reproduced.
+- Retained complete command output, verified baseline setup provenance, and passed
+  diff check. Reused documented post-comparison focused83/full296/build results.
+- Zero material findings; checkpoint approved locally. Publication, exact-SHA CI
+  and live verification remain coordinator-owned.
+
+## 2026-09-10 — Retain issue38 baseline/pending readiness comparison
+
+- Added four controlled comparison cases to `RunDashboard.test.tsx`: accepted
+  baseline versus pending location/clipboard setup, each exercised before and after
+  direct-detail settlement. Every case observes list settlement, selected-detail
+  settlement, visible/enabled Resume, and Confirm visibility after clicking.
+- The comparison source/provenance is recorded in
+  `plans/notes/issue-38-stable-dashboard-clipboard-cp01-v03-comparison-source.md`,
+  with exact verbose output in the paired `-output.txt` artifact. Both setups behaved
+  identically; the setup-specific failure did not reproduce, so no clipboard causal
+  link or new production correction is claimed.
+- Location and clipboard state are restored per case. Existing URL/privacy, source
+  and continuation identity, resume-key, API-call, and confirmation assertions remain
+  intact. The pending clipboard implementation and responsive work are unchanged.
+- Verification after the added comparison coverage passed once: focused RunDashboard
+  tests (83), full web tests (296 across 16 files), web production build, and
+  `git diff --check`.
+
+## 2026-09-10 — Resolve issue38 confirmed-selection readiness
+
+- The uncertain-resume test now controls list and direct-detail promises, waits for
+  the settled selected-run output (`Review · 2`), verifies that Resume is enabled,
+  and enters confirmation only after confirmed selection readiness.
+- Existing source/continuation identities, confirmation requirements, uncertain-error
+  assertion, API call count, and reused idempotency key remain intact. The correction
+  is test-only; the production diff remains limited to clipboard request generations.
+- `HISTORY:` The earlier review's 291-pass/one-failure result was the missing Confirm
+  resume transition. The corrected controlled journey now passes without retries,
+  sleeps, timeout changes, or weakened assertions.
+- Verification: focused RunDashboard tests passed (79); full web tests passed (292
+  across 16 files); web production build passed; `git diff --check` passed. Responsive
+  work, exact sanitized URLs, error/privacy assertions, and cleanup ownership remain
+  preserved.
+
+## 2026-09-10 — Isolate issue38 full-suite resume verification gap
+
+- HISTORY: The current-worktree review reported 291 full-web tests passing and
+  one failure in `reuses a resume key after an uncertain failure` at the
+  missing `Confirm resume` assertion; the focused RunDashboard file passed 79.
+- A temporary controlled experiment deferred the list and direct-detail
+  promises, waited for the visible Resume action, clicked it, and verified the
+  visible Confirm action survived direct-detail settlement. It passed 1 test
+  with 79 skipped, so the reported failure was not reproduced by the relevant
+  readiness ordering.
+- The failing resume journey precedes the modified clipboard test in the file;
+  the production diff only guards clipboard completion identity, and the test
+  cleanup restores location and clipboard descriptors. No causal clipboard
+  fixture defect was demonstrated, so no restart/control repair was made.
+  Approval remains withheld pending the required full-suite verification.
+
+## 2026-09-10 — Bind dashboard clipboard feedback to the selected run (Issue 38, Checkpoint 1)
+
+- The focused clipboard journey now releases list, direct-detail, and
+  clipboard promises in order, waits for the observed selected-run callback
+  and settled detail output, and restores location and clipboard ownership in
+  test cleanup. It still asserts the exact success text, one exact sanitized
+  project/run URL, call count, rejection text, and secret/URL exclusions.
+- A controlled pending-copy selection change reproduced stale success from the
+  old run. `RunDashboard` now invalidates copy request generations on selection
+  changes and ignores late success or failure from an older request. No URL
+  contract, responsive work, or control/restart behavior changed.
+- Verification: focused RunDashboard tests passed (79); full web tests passed
+  (292 across 16 files); web build passed; `git diff --check` passed. The
+  pre-fix stale-feedback reproduction is retained by the regression test.
+
 ## 2026-09-10 — Wait for admitted dashboard controls before interaction (Checkpoint 2)
 
 - The rejected-control and capability-admitted selector tests now wait for the

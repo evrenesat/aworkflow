@@ -542,6 +542,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [technicalOpen, setTechnicalOpen] = useState(false)
   const technicalId = useId()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copyRequestRef = useRef(0)
   const [refreshNonce, setRefreshNonce] = useState(0)
   const selectedRunRef = useRef<string | null>(selectedRunId)
   const requestedRunRef = useRef<string | null>(requestedRunId)
@@ -657,13 +658,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (requestedRunId === requestedRunRef.current) return
     requestedRunRef.current = requestedRunId
     if (requestedRunId !== null) {
+      copyRequestRef.current += 1
       setMissingRunId(null)
       setSelectedRunId(requestedRunId)
     }
   }, [requestedRunId])
 
-  // Clipboard feedback describes one link; a new selection starts a new one.
+  // Clipboard feedback describes one link; a new selection starts a new one
+  // and invalidates completions from older writes.
   useEffect(() => {
+    copyRequestRef.current += 1
     setCopyState('idle')
   }, [projectId, selectedRunId])
 
@@ -1026,22 +1030,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
   useEffect(() => { if (projectAvailable) void loadDashboard(projectId) }, [historyFilter]) // eslint-disable-line react-hooks/exhaustive-deps
   const listedRuns = runs.filter(run => !deletedIds.has(run.run_id) && (run.history_state ?? 'visible') !== 'deleted' && (historyFilter === 'all' || (run.history_state ?? 'visible') === historyFilter))
+  function invalidateCopyFeedback() {
+    copyRequestRef.current += 1
+  }
+
   function selectRun(runId: string) {
     setNavigationVersion(value => value + 1)
     setHistoryConfirm(null)
     setMissingRunId(null)
+    invalidateCopyFeedback()
     setSelectedRunId(runId)
     onRunSelectionChangeRef.current?.({ runId, userInitiated: true })
   }
 
   /** Copy only project/run identities confirmed by the server, never ambient URL data. */
   async function handleCopyLink() {
+    const copyRequest = ++copyRequestRef.current
     try {
       const href = workspaceHref({ project: projectId, view: 'runs', run: selectedRun?.run_id ?? null })
       const url = new URL(window.location.pathname + href, window.location.origin)
       await navigator.clipboard.writeText(url.href)
+      if (copyRequest !== copyRequestRef.current) return
       setCopyState('copied')
     } catch {
+      if (copyRequest !== copyRequestRef.current) return
       setCopyState('failed')
     }
   }

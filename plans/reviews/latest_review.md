@@ -1,21 +1,31 @@
-# Checkpoint 2 review — 2026-09-10
+# Issue38 checkpoint 1 approval review
 
-Reviewed `cp2 v01` on `aflow-stabilize-lifecycle-and-control-tests-20260910-20260910-152132` using the current-worktree fallback against `5620137`, the approved checkpoint-1 boundary. No checkpoint-2 commit existed; the supplied turn-003 result artifact was absent at its specified path. Original and active plan: `plans/in-progress/stabilize-lifecycle-and-control-tests-20260910.md`.
+Reviewed checkpoint 1 through cp1 v01 using current-worktree fallback against
+`52597409b17c3e1050f1576bfe027580b5656d50`. The branch matches the original plan,
+the base is reachable, and no issue38 checkpoint commit existed before review.
+Original plan, active v01 and retained v03 evidence overlay govern this slice.
 
-Scope: immediately preceding worker's RunDashboard tests and DEVLOG entry, with intended checkpoint bookkeeping. Older approved commits were excluded. Original base is reachable, branch matches, and accepted merge-context commit `2b04d12` is preserved. No production changes.
+Scope: pending clipboard request ownership, deterministic selection readiness,
+resume fixture readiness, retained baseline/pending setup comparison and DEVLOG.
+No material code findings survive the admission gate. Existing exact URL/privacy,
+source/continuation identity, resume key, API-call and confirmation assertions
+are preserved. No production or test edits were made by this reviewer.
 
-The rejection test waits for baseline team and enabled admission, verifies selected draft and enabled Save, and asserts exact run/revision/request, error, retained draft and running status. The equivalent selector test retains request identity assertions. Preflight readiness requires the clean result and enabled action; the successor case also checks the latest request's plan, workflow and source. Dashboard loading supplies plan and capability choices together with the source run before restart interaction. Stop and lineage assertions are preserved. No sleeps, retries, timeout increases or weakened assertions were introduced.
+The retained comparison source in RunDashboard.test.tsx matches the baseline
+location/clipboard operations recovered from the base. All four cases passed in
+review under identical deferred list/detail ordering, with Resume clicks before
+and after detail settlement. Both setups preserve confirmation; the earlier
+setup-specific failure did not reproduce. This establishes the tested outcomes,
+not the cause of the earlier failure or independence under every possible order.
 
-Findings: none admitted by the material-code-review gate.
+Complete fresh comparison output and exact command are retained in
+`plans/notes/issue-38-stable-dashboard-clipboard-cp01-v03-comparison-output.txt`;
+provenance is in the paired `-source.md` artifact. Diff check passed. Reused the
+documented post-comparison focused83/full296/build results; no suite retries.
 
-Verification:
-- Full web suite: 291 passed (16 files).
-- Web build: passed.
-- Full Python suite with clean user Git configuration: 1,748 passed and 223 subtests passed.
-- Focused RunDashboard suite: 77 passed, 1 failed in the unchanged clipboard test at line 1854 (missing success message). Changed tests passed. The clipboard test does not use the changed helpers; no patch-introduced cause was established. Tracked independently at https://github.com/evrenesat/aworkflow/issues/38, without a rerun to dismiss the failure.
-- `git diff --check`: passed.
-- Evidence: `/tmp/aflow-cp2-review-{web,build,python,focused}.log` on p100.
-
-Checkpoint 2 is approved through `cp2 v01`. Plan stays in progress for coordinator-owned delivery. This is not an all-green verification or whole-plan completion claim. Resolve the clipboard verification failure before declaring delivery green. Publication, exact-SHA CI and live activation remain unverified and coordinator-owned.
+Checkpoint 1 approved; reviewer creates the cp1 v01 approval commit and advances
+only checkpoint 1. Preserved original base and v01/v02/v03 overlay paths. No v04
+fix plan needed. Publication, exact-SHA CI and live verification remain pending
+with the coordinator; this review performs no delivery or service operations.
 
 No material findings

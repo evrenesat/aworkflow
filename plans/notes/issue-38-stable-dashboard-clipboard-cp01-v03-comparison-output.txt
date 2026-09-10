@@ -1,0 +1,21 @@
+Command: npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx -t "retains confirmed resume readiness" --reporter verbose
+
+
+> aflow-app-web@0.1.0 test
+> vitest --run src/components/RunDashboard.test.tsx -t retains confirmed resume readiness --reporter verbose
+
+
+ RUN  v1.6.1 /root/code/worktrees/aflow-issue-38-stable-dashboard-clipboard-20260910-20260910-155213/apps/aflow_app/web
+
+ ✓ src/components/RunDashboard.test.tsx > RunDashboard > retains confirmed resume readiness for accepted-baseline setup with before-detail-settlement interaction
+ ✓ src/components/RunDashboard.test.tsx > RunDashboard > retains confirmed resume readiness for accepted-baseline setup with after-detail-settlement interaction
+ ✓ src/components/RunDashboard.test.tsx > RunDashboard > retains confirmed resume readiness for pending setup with before-detail-settlement interaction
+ ✓ src/components/RunDashboard.test.tsx > RunDashboard > retains confirmed resume readiness for pending setup with after-detail-settlement interaction
+
+ Test Files  1 passed (1)
+      Tests  4 passed | 79 skipped (83)
+   Start at  16:48:22
+   Duration  1.64s (transform 649ms, setup 29ms, collect 877ms, tests 189ms, environment 150ms, prepare 115ms)
+
+
+Exit code: 0
