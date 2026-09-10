@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 import textwrap
@@ -26,6 +27,8 @@ _WORKFLOW_TERMINAL_TARGET = "END"
 _DEFAULT_VALUE_LIMIT = 200
 _DEFAULT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _DISPLAY_WRAP_WIDTH = 78
+_SGR_BOLD = "\x1b[1m"
+_SGR_RESET = "\x1b[0m"
 
 
 @dataclass(frozen=True)
@@ -581,6 +584,8 @@ class BannerRenderer:
         self._last_emitted_final_turn_number: int | None = None
         self._output_disabled = False
         self._has_output = False
+        self._style_stream: object | None = None
+        self._style_enabled: bool | None = None
 
     def set_context(
         self,
@@ -1629,16 +1634,49 @@ class BannerRenderer:
         if projection.generated_plan_path is not None:
             lines.append(f"    generated: {projection.generated_plan_path}")
 
+    @staticmethod
+    def _stream_supports_bold(stream: object) -> bool:
+        try:
+            isatty = getattr(stream, "isatty")
+            if not callable(isatty) or not isatty():
+                return False
+        except Exception:
+            return False
+        term = os.environ.get("TERM")
+        return bool(term) and term != "dumb" and "NO_COLOR" not in os.environ
+
+    def _style_block(self, block: str) -> str:
+        if not self._style_enabled:
+            return block
+        heading_end = block.find("\n")
+        if heading_end < 0:
+            heading_end = len(block)
+        if heading_end == 0:
+            return block
+        return (
+            _SGR_BOLD
+            + block[:heading_end]
+            + _SGR_RESET
+            + block[heading_end:]
+        )
+
     def _write_blocks(self, blocks: list[str]) -> None:
-        cleaned_blocks = [block.strip("\n") for block in blocks if block.strip("\n")]
-        if not cleaned_blocks:
-            return
-        text = "\n\n".join(cleaned_blocks)
         with self._lock:
             if self._output_disabled:
                 return
             stream = self._stream if self._stream is not None else sys.stderr
             try:
+                if self._style_stream is not stream:
+                    self._style_stream = stream
+                    self._style_enabled = self._stream_supports_bold(stream)
+                cleaned_blocks = [
+                    self._style_block(block.strip("\n"))
+                    for block in blocks
+                    if block.strip("\n")
+                ]
+                if not cleaned_blocks:
+                    return
+                text = "\n\n".join(cleaned_blocks)
                 prefix = "\n" if self._has_output else ""
                 stream.write(prefix + text + "\n")
                 stream.flush()

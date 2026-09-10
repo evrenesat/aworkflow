@@ -34,6 +34,7 @@ from aflow.status import (
 )
 
 _FIXED_NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+_OWNED_SGR = ("\x1b[1m", "\x1b[0m")
 
 
 def _renderer(stream: object, **kwargs: object) -> BannerRenderer:
@@ -47,6 +48,40 @@ def _renderer(stream: object, **kwargs: object) -> BannerRenderer:
         clock=lambda: _FIXED_NOW,
         **defaults,  # type: ignore[arg-type]
     )
+
+
+class _CapabilityStream(io.StringIO):
+    def __init__(self, is_tty: bool, error: Exception | None = None) -> None:
+        super().__init__()
+        self._is_tty = is_tty
+        self._error = error
+        self.isatty_calls = 0
+
+    def isatty(self) -> bool:
+        self.isatty_calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._is_tty
+
+
+class _MissingIsattyStream:
+    def __init__(self) -> None:
+        self._buffer = io.StringIO()
+
+    def write(self, value: str) -> int:
+        return self._buffer.write(value)
+
+    def flush(self) -> None:
+        self._buffer.flush()
+
+    def getvalue(self) -> str:
+        return self._buffer.getvalue()
+
+
+def _strip_owned_sgr(value: str) -> str:
+    for sequence in _OWNED_SGR:
+        value = value.replace(sequence, "")
+    return value
 
 
 def _records(stream: io.StringIO) -> list[str]:
@@ -621,6 +656,105 @@ def test_control_bytes_flattened_and_unicode_content_remains_readable() -> None:
     assert "running 中文 ✓ next [31mred [0m line  end" in output
 
 
+def test_bold_policy_requires_capable_tty_and_environment(monkeypatch) -> None:
+    cases = (
+        ("capable tty", _CapabilityStream(True), "xterm", None, True),
+        ("term dumb", _CapabilityStream(True), "dumb", None, False),
+        ("term missing", _CapabilityStream(True), None, None, False),
+        ("term empty", _CapabilityStream(True), "", None, False),
+        ("no color empty", _CapabilityStream(True), "xterm", "", False),
+        ("no color value", _CapabilityStream(True), "xterm", "1", False),
+        ("non tty", _CapabilityStream(False), "xterm", None, False),
+        ("isatty missing", _MissingIsattyStream(), "xterm", None, False),
+        (
+            "isatty raises",
+            _CapabilityStream(True, RuntimeError("isatty unavailable")),
+            "xterm",
+            None,
+            False,
+        ),
+    )
+    for name, stream, term, no_color, expected in cases:
+        if term is None:
+            monkeypatch.delenv("TERM", raising=False)
+        else:
+            monkeypatch.setenv("TERM", term)
+        if no_color is None:
+            monkeypatch.delenv("NO_COLOR", raising=False)
+        else:
+            monkeypatch.setenv("NO_COLOR", no_color)
+
+        renderer = _renderer(stream)
+        renderer.start(_basic_state())
+        output = stream.getvalue()
+        assert (_OWNED_SGR[0] in output) is expected, name
+        if not expected:
+            assert "\x1b" not in output, name
+
+
+def test_force_color_variables_do_not_enable_pipe_styling(monkeypatch) -> None:
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("CLICOLOR_FORCE", "1")
+
+    stream = _CapabilityStream(False)
+    _renderer(stream).start(_basic_state())
+
+    assert "\x1b" not in stream.getvalue()
+
+
+def test_styling_is_cached_per_stream_and_environment_changes_do_not_redraw_policy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    stream = _CapabilityStream(True)
+    renderer = _renderer(stream)
+    state = _basic_state()
+    state.run_started_at = _FIXED_NOW
+    renderer.start(state)
+    assert stream.isatty_calls == 1
+
+    monkeypatch.setenv("NO_COLOR", "")
+    state.status_message = "preparation changed"
+    renderer.update(state)
+
+    assert stream.isatty_calls == 1
+    assert _OWNED_SGR[0] in stream.getvalue().split("\n\n")[-1]
+
+
+def test_styled_output_strips_to_plain_output_and_styles_only_headings(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    def _drive(renderer: BannerRenderer) -> None:
+        state = _basic_state()
+        state.run_started_at = _FIXED_NOW
+        state.run_id = "run-\x1b[2J"
+        renderer.start(state)
+        state.status_message = "running 中文 ✓\nnext\x1b[31mred\x1b[0m line\r\nend"
+        renderer.update(state)
+        renderer.stop(state)
+
+    styled = _CapabilityStream(True)
+    plain = io.StringIO()
+    _drive(_renderer(styled))
+    _drive(_renderer(plain))
+
+    styled_output = styled.getvalue()
+    assert _strip_owned_sgr(styled_output) == plain.getvalue()
+    assert styled_output.count(_OWNED_SGR[0]) == styled_output.count(_OWNED_SGR[1])
+    assert "\x1b" not in _strip_owned_sgr(styled_output)
+    for block in styled_output.strip().split("\n\n"):
+        lines = block.splitlines()
+        assert lines[0].startswith(_OWNED_SGR[0])
+        assert lines[0].endswith(_OWNED_SGR[1])
+        assert "\x1b" not in "\n".join(lines[1:])
+
+
 def test_display_values_bounded_but_artifact_paths_never_truncated() -> None:
     state = _basic_state()
     state.status_message = "preparing"
@@ -645,9 +779,13 @@ def test_display_values_bounded_but_artifact_paths_never_truncated() -> None:
     assert deep_artifact_path in output
 
 
-def test_tty_and_non_tty_streams_receive_identical_ordered_output() -> None:
+def test_tty_and_non_tty_streams_receive_identical_ordered_output(monkeypatch) -> None:
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
     def _drive(renderer: BannerRenderer) -> None:
         state = _basic_state()
+        state.run_started_at = _FIXED_NOW
         renderer.start(state)
         state.status_message = "turn 3 finished"
         renderer.update(state)
@@ -662,21 +800,24 @@ def test_tty_and_non_tty_streams_receive_identical_ordered_output() -> None:
         with os.fdopen(slave, "w", encoding="utf-8") as tty_stream:
             _drive(_renderer(tty_stream))
             tty_stream.flush()
-            tty_output = b""
-            while tty_output.count(b"\n") < 3:
-                readable, _, _ = select.select((master,), (), (), 1.0)
-                assert readable, "PTY did not expose the renderer output"
+        tty_output = b""
+        while True:
+            readable, _, _ = select.select((master,), (), (), 1.0)
+            if not readable:
+                break
+            try:
                 chunk = os.read(master, 65536)
-                assert chunk, "PTY reached EOF before all renderer records"
-                tty_output += chunk
+            except OSError:
+                break
+            if not chunk:
+                break
+            tty_output += chunk
     finally:
         os.close(master)
-    tty_text = tty_output.decode("utf-8")
-
-    tty_records = [
-        block for block in tty_text.replace("\r\n", "\n").strip().split("\n\n") if block
-    ]
-    assert tty_records == _records(plain)
+    tty_text = tty_output.decode("utf-8").replace("\r\n", "\n")
+    assert _strip_owned_sgr(tty_text) == plain.getvalue()
+    assert "\x1b" not in _strip_owned_sgr(tty_text)
+    assert "\r" not in tty_text
 
 
 def test_broken_stream_disables_output_without_raising() -> None:
