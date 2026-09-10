@@ -1,21 +1,34 @@
-# Checkpoint 1 review — cp1 v01
+# Checkpoint 1 review — 2026-09-10
 
-Original and active plan: `plans/in-progress/always-supply-merge-handoff-context-20260910.md`.
-Branch: `aflow-always-supply-merge-handoff-context-20260910-20260910-145043`.
+Approved `cp1 v01` for branch
+`aflow-stabilize-lifecycle-and-control-tests-20260910-20260910-152132`.
 
-Reviewed the immediately preceding worker turn-001's uncommitted checkpoint 1 changes against `a4977dc4a8613862f6205f59c68ddf6f56a34041`, using the current-worktree fallback because no checkpoint 1 commit existed. The branch matches the original plan and the base is reachable. Worker evidence resides at `/root/code/agent_flow/.aflow/runs/20260910t145042z-a886d375/turns/turn-001/result.json`. Historical evidence was displayed with HISTORY: prefixes. The worker's checked implementation steps are progress bookkeeping; this review records approval separately.
+Reviewed the immediately preceding worker's uncommitted changes against
+`24ab54eb707e487254c18c35b0b42c939757b43c` using the current-worktree fallback:
+no checkpoint commit boundary exists for this plan. The supplied worker result
+artifact was unavailable at its specified worktree-relative path. Older approved
+merge-context work at `2b04d12` is outside this slice and remains untouched.
 
-Scope: mandatory JSON merge context in the existing prompt builder, custom-template retention and ordering, ordinary and terminal integration-only captured invocations, unusual-value serialization, and associated architecture, DEVLOG, and bundled merge-skill documentation. All eight facts come from supplied execution identity and plan arguments; absent worktree is JSON null. Reviewed both lifecycle call paths and existing template validation. No lifecycle selection, Git behavior, provider chain, or live configuration changes are introduced.
+Scope: `tests/_support.py` and its DEVLOG entry. All three shared synthetic Git
+builders disable maintenance repository-locally immediately after initialization.
+Normal Git operations, production behavior and existing assertions are preserved.
+The original plan's checked implementation steps were reviewed only for checkpoint 1.
 
-Verification performed in this review:
+Verification under `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1`:
 
-- `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 uv run pytest -q tests/test_runtime.py tests/test_config.py tests/test_docs.py --tb=short`: 445 passed, 50 subtests passed.
-- `uv run ruff check aflow`: passed.
+- `uv run pytest -q tests/test_runtime.py --tb=short`: 289 passed, 43 subtests passed.
+- `uv run pytest -q tests/test_harnesses.py --tb=short`: 78 passed, 9 subtests passed.
+- Targeted `WorkflowArtifactTests::test_terminal_backup_recovery_uses_original_team_for_merge_teardown`
+  under `strace -f -e trace=process`: 1 passed; zero maintenance/auto-GC invocation
+  attempts and two `/usr/bin/git` local fixture-config invocations. Trace:
+  `/tmp/aflow-cp1-review-git-process.trace`.
 - `git diff --check`: passed.
-- No separate prompt-test module exists. Synthetic lifecycle tests use disposable repositories and injected runners; repository publication is disabled by the test fixture.
 
-Findings: none admitted by the material finding gate. No production code was edited by the reviewer. The previous review was rotated byte-for-byte and the original plan's review log was advanced only for checkpoint 1. No fix plan is needed.
+Findings: none passed the material finding admission gate.
 
-Checkpoint 1 approved through cp1 v01; the reviewer creates its approval commit in this turn. The original plan remains in progress for workflow-owned delivery. Target main and primary `/root/code/agent_flow` remain the authorized integration context, using this run's feature branch and execution root. Publication, exact-SHA CI, and live activation remain unverified and coordinator-owned. Responsive work and live services were not touched.
+Checkpoint 1 is approved. Checkpoint 2 remains unchecked in the in-progress
+original plan. This review creates the checkpoint approval commit; it does not
+claim publication, CI success or live activation. Those delivery checks remain
+with the coordinator after the remaining checkpoint work.
 
 No material findings

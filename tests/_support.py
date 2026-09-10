@@ -179,9 +179,20 @@ def _run_workflow_launcher(
     )
 
 
+def _disable_git_maintenance(path: Path) -> None:
+    """Keep automatic Git maintenance owned by the synthetic repo fixture."""
+    for key, value in (('maintenance.auto', 'false'), ('gc.auto', '0')):
+        subprocess.run(
+            ['git', '-C', str(path), 'config', '--local', key, value],
+            check=True,
+            capture_output=True,
+        )
+
+
 def _make_git_repo(path: Path) -> None:
     """Initialize a git repo with an initial commit in path."""
     subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    _disable_git_maintenance(path)
     subprocess.run(
         ["git", "-C", str(path), "config", "user.email", "test@test.com"],
         check=True,
@@ -297,6 +308,7 @@ def _make_lifecycle_git_repo(path: Path, branch: str = "main") -> Path:
     subprocess.run(
         ["git", "init", "-b", branch], cwd=str(path), check=True, capture_output=True
     )
+    _disable_git_maintenance(path)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
         cwd=str(path),
@@ -491,6 +503,7 @@ def _make_unborn_git_repo(path: Path, branch: str = "main") -> None:
     subprocess.run(
         ["git", "init", "-b", branch], cwd=str(path), check=True, capture_output=True
     )
+    _disable_git_maintenance(path)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
         cwd=str(path),

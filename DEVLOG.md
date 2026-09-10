@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-10 — Keep synthetic Git maintenance inside fixture ownership (Checkpoint 1)
+
+- CI34493456633 at `24ab54e` failed
+  `WorkflowArtifactTests.test_terminal_backup_recovery_uses_original_team_for_merge_teardown`
+  during temporary-repository cleanup because `.git/objects` remained nonempty.
+  The recorded process trace showed `git maintenance run --auto --no-quiet`
+  children; the targeted test itself passed, so this was isolated as a fixture
+  lifetime race rather than a production failure.
+- Shared synthetic repository builders now set `maintenance.auto=false` and
+  `gc.auto=0` with repository-local Git configuration immediately after init.
+  Existing user identity, normal Git operations, and workflow/recovery/merge
+  assertions remain unchanged; no production architecture change is claimed.
+- Verification: clean-Git-config targeted test passed; the process trace showed
+  zero automatic-maintenance children and 20 local fixture-config commands.
+  The full runtime suite passed with 289 tests and 43 subtests, followed by a
+  clean diff check.
+
 ## 2026-09-10 — Supply engine-owned merge handoff context (Checkpoint 1)
 
 - Merge teardown now always gives the `aflow-merge` worker exact branch, root,
