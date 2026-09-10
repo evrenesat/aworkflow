@@ -797,6 +797,49 @@ class TestAuthenticatedApi:
         response = client.delete("/api/projects/alpha")
         assert response.status_code == 404
 
+    def test_project_reads_expose_verified_parent_without_changing_identity(
+        self, client: TestClient, tmp_path: Path
+    ) -> None:
+        managed = tmp_path / "managed"
+        primary = _committed_repo(managed, "primary")
+        child = managed / "child"
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(primary),
+                "worktree",
+                "add",
+                "-q",
+                str(child),
+                "-b",
+                "child",
+            ),
+            check=True,
+        )
+        registry = main_module._project_registry
+        assert registry is not None
+        registry.register("primary", "Primary", "primary")
+        registry.register("child", "Child", "child")
+        registry_bytes = registry.path.read_bytes()
+
+        listing = client.get("/api/projects")
+
+        assert listing.status_code == 200, listing.text
+        entries = {entry["id"]: entry for entry in listing.json()}
+        assert set(entries) == {"primary", "child"}
+        assert entries["primary"]["current_path"] == str(primary.resolve())
+        assert entries["primary"]["parent_project_id"] is None
+        assert entries["child"]["current_path"] == str(child.resolve())
+        assert entries["child"]["parent_project_id"] == "primary"
+        detail = client.get("/api/projects/child")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["id"] == "child"
+        assert detail.json()["parent_project_id"] == "primary"
+        assert registry.path.read_bytes() == registry_bytes
+        assert not (primary / ".aflow" / "runs").exists()
+        assert not (child / ".aflow" / "runs").exists()
+
     def test_unauthenticated_requests_are_rejected(self, client: TestClient) -> None:
         anon = TestClient(main_module.app)
         assert anon.get("/api/projects").status_code == 401

@@ -104,7 +104,11 @@ from .project_config_service import (
     ProjectConfigSnapshot,
 )
 from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
-from .project_registry import ProjectRegistry, ProjectRegistryError
+from .project_registry import (
+    ProjectReadProjection,
+    ProjectRegistry,
+    ProjectRegistryError,
+)
 from .project_service import (
     ProjectRequest,
     ProjectService,
@@ -1326,23 +1330,30 @@ class ProjectCreateRequest(BaseModel):
     initialize_git: bool = False
 
 
-def _project_payload(registry: ProjectRegistry, project_id: str) -> dict[str, Any] | None:
+def _project_payload(
+    registry: ProjectRegistry,
+    project_id: str,
+    *,
+    read_projection: ProjectReadProjection | None = None,
+) -> dict[str, Any] | None:
     record = registry.get(project_id)
     if record is None:
         return None
-    try:
-        _, root = registry.resolve(project_id)
-        is_git_root = True
-    except ProjectRegistryError:
-        root = registry.declared_root(project_id)
-        is_git_root = False
+    if read_projection is None:
+        read_projection = registry.read_project_projection().get(project_id)
+    if read_projection is None:
+        return None
     return {
         "id": record.id,
         "display_name": record.display_name,
-        "current_path": str(root),
-        "is_git_root": is_git_root,
+        "current_path": str(read_projection.root),
+        "is_git_root": read_projection.is_git_root,
         "registered_at": record.created_at.isoformat(),
-        "readiness": project_readiness(root, is_git_root=is_git_root),
+        "readiness": project_readiness(
+            read_projection.root,
+            is_git_root=read_projection.is_git_root,
+        ),
+        "parent_project_id": read_projection.parent_project_id,
     }
 
 
@@ -1352,7 +1363,18 @@ def list_projects(
     registry: ProjectRegistry = Depends(get_project_registry),
 ) -> list[dict[str, Any]]:
     """List only explicitly registered projects."""
-    return [payload for record in registry.list_records() if (payload := _project_payload(registry, record.id))]
+    read_projection = registry.read_project_projection()
+    return [
+        payload
+        for record in registry.list_records()
+        if (
+            payload := _project_payload(
+                registry,
+                record.id,
+                read_projection=read_projection.get(record.id),
+            )
+        )
+    ]
 
 
 @app.get(

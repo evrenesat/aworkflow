@@ -16,6 +16,7 @@ from typing import Any
 
 
 PROJECT_REGISTRY_SCHEMA_VERSION = 1
+_GIT_READ_TIMEOUT_SECONDS = 5.0
 _PROJECT_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _STORE_LOCKS_GUARD = RLock()
 _STORE_LOCKS: dict[str, RLock] = {}
@@ -45,6 +46,86 @@ class ProjectRegistryRecord:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
+
+
+@dataclass(frozen=True)
+class GitProjectIdentity:
+    """Verified Git identity for one exact registered checkout."""
+
+    root: Path
+    git_dir: Path
+    common_dir: Path
+
+    @property
+    def is_primary_checkout(self) -> bool:
+        """Whether Git identifies this checkout as the repository primary."""
+        return os.path.normcase(str(self.git_dir)) == os.path.normcase(
+            str(self.common_dir)
+        )
+
+
+@dataclass(frozen=True)
+class ProjectReadProjection:
+    """Read-only presentation metadata for one registered project."""
+
+    root: Path
+    is_git_root: bool
+    parent_project_id: str | None = None
+
+
+def _git_path(raw: str, *, root: Path) -> Path:
+    """Resolve one Git path output relative to the exact checkout root."""
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return candidate.resolve(strict=True)
+
+
+def _read_git_identity(root: Path) -> GitProjectIdentity | None:
+    """Read bounded, read-only Git identity metadata for one exact root."""
+    try:
+        completed = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(root),
+                "--no-optional-locks",
+                "rev-parse",
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--git-common-dir",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_READ_TIMEOUT_SECONDS,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    output = completed.stdout.splitlines()
+    if len(output) != 3 or any(not value for value in output):
+        return None
+    try:
+        resolved_root = root.resolve(strict=True)
+        observed_root = _git_path(output[0], root=root)
+        git_dir = _git_path(output[1], root=root)
+        common_dir = _git_path(output[2], root=root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        os.path.normcase(str(observed_root))
+        != os.path.normcase(str(resolved_root))
+        or not git_dir.is_dir()
+        or not common_dir.is_dir()
+    ):
+        return None
+    return GitProjectIdentity(
+        root=resolved_root,
+        git_dir=git_dir,
+        common_dir=common_dir,
+    )
 
 
 def _canonical_managed_root(path: Path) -> Path:
@@ -109,6 +190,56 @@ class ProjectRegistry:
             return self._managed_root.joinpath(
                 *PurePosixPath(record.relative_root).parts
             )
+
+    def read_project_projection(self) -> dict[str, ProjectReadProjection]:
+        """Return safe presentation metadata without changing registry state.
+
+        Only exact registered roots are probed.  A registered linked worktree
+        receives a parent when exactly one other registered checkout is
+        verified as the primary checkout for the same Git common directory.
+        Unavailable or ambiguous identities remain independent.
+        """
+        with self._lock:
+            records = self._read_records()
+            projections: dict[str, ProjectReadProjection] = {}
+            identities: dict[str, GitProjectIdentity] = {}
+            for record in records.values():
+                declared = self._managed_root.joinpath(
+                    *PurePosixPath(record.relative_root).parts
+                )
+                try:
+                    root, identity = self._resolve_record_with_identity(record)
+                except ProjectRegistryError:
+                    projections[record.id] = ProjectReadProjection(
+                        root=declared,
+                        is_git_root=False,
+                    )
+                else:
+                    projections[record.id] = ProjectReadProjection(
+                        root=root,
+                        is_git_root=True,
+                    )
+                    identities[record.id] = identity
+
+            primary_ids_by_common_dir: dict[str, list[str]] = {}
+            for project_id, identity in identities.items():
+                if identity.is_primary_checkout:
+                    common_key = os.path.normcase(str(identity.common_dir))
+                    primary_ids_by_common_dir.setdefault(common_key, []).append(
+                        project_id
+                    )
+
+            for project_id, identity in identities.items():
+                if identity.is_primary_checkout:
+                    continue
+                common_key = os.path.normcase(str(identity.common_dir))
+                primary_ids = primary_ids_by_common_dir.get(common_key, [])
+                if len(primary_ids) == 1 and primary_ids[0] != project_id:
+                    projections[project_id] = replace(
+                        projections[project_id],
+                        parent_project_id=primary_ids[0],
+                    )
+            return projections
 
     def register(
         self,
@@ -251,6 +382,11 @@ class ProjectRegistry:
             raise ProjectRegistryError("project timestamps are inconsistent")
 
     def _resolve_record(self, record: ProjectRegistryRecord) -> Path:
+        return self._resolve_record_with_identity(record)[0]
+
+    def _resolve_record_with_identity(
+        self, record: ProjectRegistryRecord
+    ) -> tuple[Path, GitProjectIdentity]:
         self._validate_record_shape(record)
         candidate = self._managed_root
         for part in PurePosixPath(record.relative_root).parts:
@@ -267,25 +403,12 @@ class ProjectRegistry:
         git_entry = resolved / ".git"
         if git_entry.is_symlink() or not git_entry.exists():
             raise ProjectRegistryError("project root must be a Git repository root")
-        try:
-            completed = subprocess.run(
-                ("git", "-C", str(resolved), "rev-parse", "--show-toplevel"),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ProjectRegistryError("project Git identity could not be verified") from exc
-        if completed.returncode != 0:
+        identity = _read_git_identity(resolved)
+        if identity is None:
             raise ProjectRegistryError("project root must be a Git repository root")
-        try:
-            observed_root = Path(completed.stdout.strip()).resolve(strict=True)
-        except OSError as exc:
-            raise ProjectRegistryError("project Git identity could not be verified") from exc
-        if os.path.normcase(str(observed_root)) != os.path.normcase(str(resolved)):
+        if os.path.normcase(str(identity.root)) != os.path.normcase(str(resolved)):
             raise ProjectRegistryError("project path must name the exact Git repository root")
-        return resolved
+        return resolved, identity
 
     def _reject_root_conflicts(
         self,

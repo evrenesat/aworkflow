@@ -18,6 +18,7 @@ from aflow_app_server.control_plane_service import (
     ProjectNotAllowedError,
 )
 from aflow_app_server.project_registry import (
+    GitProjectIdentity,
     ProjectRegistry,
     ProjectRegistryError,
 )
@@ -48,6 +49,29 @@ def _git_project(root: Path, name: str, *, valid_config: bool = True) -> Path:
             '[workflow.managed.steps.implement]\nrole = "worker"\n'
             'prompts = ["p"]\ngo = [{ to = "END", when = "DONE" }]\n'
         )
+    return project
+
+
+def _committed_git_project(root: Path, name: str) -> Path:
+    project = _git_project(root, name)
+    (project / "keep.txt").write_text("history")
+    subprocess.run(("git", "-C", str(project), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "prior",
+        ),
+        check=True,
+    )
     return project
 
 
@@ -170,6 +194,142 @@ def test_registry_rejects_symlinked_managed_root_and_corrupt_store(tmp_path: Pat
     with pytest.raises(ProjectRegistryError, match="corrupt"):
         ProjectRegistry(managed, path)
     assert path.read_text() == '{"schema_version": 1, "projects": ['
+
+
+def test_read_project_projection_groups_only_registered_git_worktrees(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    primary = _committed_git_project(managed, "primary")
+    first_child = managed / "first-child"
+    second_child = managed / "second-child"
+    subprocess.run(
+        ("git", "-C", str(primary), "worktree", "add", "-q", str(first_child), "-b", "first-child"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(primary), "worktree", "add", "-q", str(second_child), "-b", "second-child"),
+        check=True,
+    )
+    unrelated_clone = managed / "unrelated-clone"
+    subprocess.run(("git", "clone", "-q", str(primary), str(unrelated_clone)), check=True)
+
+    unregistered_primary = _committed_git_project(managed, "unregistered-primary")
+    unregistered_child = managed / "unregistered-child"
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(unregistered_primary),
+            "worktree",
+            "add",
+            "-q",
+            str(unregistered_child),
+            "-b",
+            "unregistered-child",
+        ),
+        check=True,
+    )
+    unavailable = _committed_git_project(managed, "unavailable")
+
+    registry = ProjectRegistry(managed, tmp_path / "projects.json")
+    registry.register("primary", "Primary", "primary")
+    registry.register("first-child", "First child", "first-child")
+    registry.register("second-child", "Second child", "second-child")
+    registry.register("unrelated-clone", "Unrelated clone", "unrelated-clone")
+    registry.register("unregistered-child", "Unregistered child", "unregistered-child")
+    registry.register("unavailable", "Unavailable", "unavailable")
+    registry_bytes = registry.path.read_bytes()
+    shutil.rmtree(unavailable)
+
+    projection = registry.read_project_projection()
+
+    assert projection["primary"].parent_project_id is None
+    assert projection["first-child"].parent_project_id == "primary"
+    assert projection["second-child"].parent_project_id == "primary"
+    assert projection["unrelated-clone"].parent_project_id is None
+    assert projection["unregistered-child"].parent_project_id is None
+    assert projection["unavailable"].parent_project_id is None
+    assert projection["unavailable"].is_git_root is False
+    assert projection["first-child"].root == first_child.resolve()
+    assert projection["second-child"].root == second_child.resolve()
+    assert registry.path.read_bytes() == registry_bytes
+    assert not any(
+        path.name == "runs"
+        for path in managed.rglob("runs")
+        if path.is_dir()
+    )
+
+
+def test_read_project_projection_does_not_guess_ambiguous_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    first = _committed_git_project(managed, "first")
+    second = _committed_git_project(managed, "second")
+    linked = _committed_git_project(managed, "linked")
+    registry = ProjectRegistry(managed, tmp_path / "projects.json")
+    registry.register("first", "First", "first")
+    registry.register("second", "Second", "second")
+    registry.register("linked", "Linked", "linked")
+
+    common_dir = tmp_path / "shared-common"
+    (common_dir / "worktrees").mkdir(parents=True)
+
+    def ambiguous_identity(root: Path) -> GitProjectIdentity:
+        resolved = root.resolve()
+        if resolved in {first.resolve(), second.resolve()}:
+            return GitProjectIdentity(resolved, common_dir, common_dir)
+        assert resolved == linked.resolve()
+        return GitProjectIdentity(
+            resolved,
+            common_dir / "worktrees" / "linked",
+            common_dir,
+        )
+
+    monkeypatch.setattr(
+        "aflow_app_server.project_registry._read_git_identity",
+        ambiguous_identity,
+    )
+
+    projection = registry.read_project_projection()
+
+    assert projection["first"].parent_project_id is None
+    assert projection["second"].parent_project_id is None
+    assert projection["linked"].parent_project_id is None
+
+
+def test_read_project_projection_probes_each_registered_root_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    first = _committed_git_project(managed, "first")
+    second = _committed_git_project(managed, "second")
+    registry = ProjectRegistry(managed, tmp_path / "projects.json")
+    registry.register("first", "First", "first")
+    registry.register("second", "Second", "second")
+
+    from aflow_app_server import project_registry as project_registry_module
+
+    original = project_registry_module._read_git_identity
+    calls: list[Path] = []
+
+    def counted_identity(root: Path):
+        calls.append(root)
+        return original(root)
+
+    monkeypatch.setattr(
+        project_registry_module,
+        "_read_git_identity",
+        counted_identity,
+    )
+
+    registry.read_project_projection()
+
+    assert calls == [first.resolve(), second.resolve()]
 
 
 def test_external_valid_record_is_immediately_addressable_and_daemon_is_cached(
