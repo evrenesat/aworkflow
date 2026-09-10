@@ -18,9 +18,15 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp8 v01` — approved.
+- Last Reviewed Checkpoint: `cp9 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp9 v01` from the immediately preceding repaired worker worktree against approved CP8 `c0e5220`; worktree fallback, zero intervening implementation commits. Reopened dirty startup answers are restored; reviewed preflight display/paging, acknowledgment/reset, launch race and shared restart wiring. Full web suite: 291 passed; production build and diff check passed. Cached Chromium keyboard smoke with fake backend and temporary repository passed after correcting a harness-only option locator. CP10 remains unchecked; manager 40 KiB hard guard and compact 16 KiB summary retained. The cp10-v01 non-checkpoint CP9 repair overlay is resolved.
+
+- 2026-09-10: Bounded CP9 repair restores the existing dirty-worktree startup question on Runs for an exact pending run and adds regression coverage for the existing answer/idempotency path without a second start request. Focused web coverage: 99 passed; full web suite: 291 passed; production build and diff check passed. No Chromium executable or browser harness is available, so the browser-specific CP9 step remains unchecked; CP9 approval and CP10 remain unchecked.
+
+- 2026-09-10: Rejected pending CP9 worker worktree against approved CP8 `c0e5220`; worktree fallback used (zero intervening implementation commits). Reproduced P2: reopened dirty startup questions have no answer UI on Runs. Web suite: 289 passed, one clipboard test failed and passed focused retry; build and diff check passed. Chromium verification remains outstanding. CP9 approval unchecked, compatible implementation retained, CP10 untouched. Non-checkpoint overlay `live-configuration-without-snapshot-gates-20260909-cp10-v01.md` targets original CP9 despite filename. Manager 40 KiB guard and compact 16 KiB summary retained.
 
 - 2026-09-10: Approved `cp8 v01` from the immediately preceding worker worktree against approved CP7 `05d7d82`; worktree fallback used because no pending CP8 commit exists (zero intervening implementation commits). Reviewed authenticated read-only preflight, offset pagination, HTTP/MCP acknowledgment handoff, startup questions, conflict/race rechecks and replay identity. Verification: required CP8 suite plus server MCP tests, 86 passed; synthetic 1,001-item canonical/HTTP pagination passed; scoped Ruff and diff check passed. No material findings. CP9 remains unchecked; manager 40 KiB guard and compact 16 KiB summary retained.
 
@@ -284,7 +290,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** An existing startup endpoint cannot return its structured question through a transport: fix that mapping in scope rather than return a generic failed run.
 
-### [ ] Checkpoint 9: Add dirty-worktree list and continuation checkbox to New Run
+### [x] Checkpoint 9: Add dirty-worktree list and continuation checkbox to New Run
 
 **Goal:** New Run makes the dirt and its launch effect visible before the user chooses to continue.
 
@@ -294,10 +300,10 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Fetch read-only preflight when project/plan/workflow selection becomes valid and through a visible Refresh action. Discard late results for a different selection. Render dirty items as status plus literal filename, include rename source, and provide “Show more” using `next_offset`. Never claim a clean tree on loading/inspection error.
-- [ ] When acknowledgment is required, show an unchecked checkbox labeled “Continue despite uncommitted changes”. Place the checkout/execution-mode explanation beside the list: existing-checkout work sees the dirt; a new worktree starts from the selected commit and leaves those changes here. No generic danger modal or extra confirmation button.
-- [ ] Disable Start while preflight is loading/failed/blocked or required acknowledgment is unchecked. Submit `dirty_worktree_confirmed` with Start; reset it for changed project/plan/workflow/restart source, not on unrelated draft edits. Retain existing mutation-key handling. Recheck server response: if previously clean dirt appears at launch, render the returned dirty question/list/checkbox inline and use the existing startup-answer mechanism to continue without allocating another run.
-- [ ] Test clean launch, each dirty category display, paging, unchecked/checked behavior, selection changes during loading, source-dirt-new-worktree explanation, server-side inspection failure, and the clean-preflight/dirty-launch race. Verify keyboard checkbox/Start behavior in Chromium with a fake backend and temporary repositories.
+- [x] Fetch read-only preflight when project/plan/workflow selection becomes valid and through a visible Refresh action. Discard late results for a different selection. Render dirty items as status plus literal filename, include rename source, and provide “Show more” using `next_offset`. Never claim a clean tree on loading/inspection error.
+- [x] When acknowledgment is required, show an unchecked checkbox labeled “Continue despite uncommitted changes”. Place the checkout/execution-mode explanation beside the list: existing-checkout work sees the dirt; a new worktree starts from the selected commit and leaves those changes here. No generic danger modal or extra confirmation button.
+- [x] Disable Start while preflight is loading/failed/blocked or required acknowledgment is unchecked. Submit `dirty_worktree_confirmed` with Start; reset it for changed project/plan/workflow/restart source, not on unrelated draft edits. Retain existing mutation-key handling. Recheck server response: if previously clean dirt appears at launch, render the returned dirty question/list/checkbox inline and use the existing startup-answer mechanism to continue without allocating another run.
+- [x] Test clean launch, each dirty category display, paging, unchecked/checked behavior, selection changes during loading, source-dirt-new-worktree explanation, server-side inspection failure, and the clean-preflight/dirty-launch race. Verify keyboard checkbox/Start behavior in Chromium with a fake backend and temporary repositories.
 
 **Dependencies:** Checkpoints 6 and 8.
 
@@ -305,7 +311,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Done When:** The user sees the dirty list in New Run and can explicitly continue through one checkbox; real source files remain untouched by preflight and submission. Every completed step is verified and scope checks pass.
 
-**Blockers:** Missing browser test environment must be recorded; do not claim screenshots/interactive checks were performed.
+**Blockers:** None. Reviewer used cached Chromium and project Python Playwright with a temporary frontend harness, fake backend and disposable Git repository. Keyboard Space enabled Start; Enter submitted one acknowledged request; source content/status remained unchanged. Temporary harness removed.
 
 ### [ ] Checkpoint 10: Give checkpoint reviewers the pending implementation target
 

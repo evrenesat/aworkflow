@@ -12,12 +12,13 @@ import type {
   StartRunRequest,
   StartRunResponse,
   StartupQuestion,
+  WorktreePreflight,
 } from '../types'
 import { ApiError } from '../api'
 import * as api from '../api'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MoreMenu, MenuItem } from './MoreMenu'
-import { NewRunPage } from './NewRunPage'
+import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
 import { statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
@@ -75,6 +76,13 @@ interface CommittedProjection {
   validationState: 'ready' | 'configuration_required' | 'invalid'
   form: GuidedFormProjection | null
   syntaxIssues: ConfigValidationIssue[]
+}
+
+interface WorktreePreflightState {
+  status: WorktreePreflightLoadState
+  result: WorktreePreflight | null
+  error: string | null
+  identity: string
 }
 
 interface RoleResolution {
@@ -494,6 +502,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [feedback, setFeedback] = useState<string | null>(null)
   const [handoffError, setHandoffError] = useState<string | null>(null)
   const [startupQuestion, setStartupQuestion] = useState<StartupQuestion | null>(null)
+  const [dirtyWorktreeConfirmed, setDirtyWorktreeConfirmed] = useState(false)
+  const [worktreePreflight, setWorktreePreflight] = useState<WorktreePreflightState>({
+    status: 'idle',
+    result: null,
+    error: null,
+    identity: '',
+  })
   const [startPlanPath, setStartPlanPath] = useState('')
   const [startWorkflow, setStartWorkflow] = useState('')
   const [startTeam, setStartTeam] = useState('')
@@ -535,12 +550,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const contextRequestRef = useRef(0)
   const requestAbortRef = useRef(new AbortController())
   const contextAbortRef = useRef(new AbortController())
+  const preflightRequestRef = useRef(0)
+  const preflightAbortRef = useRef(new AbortController())
   const desiredContextLevelRef = useRef<'lite' | 'full'>('lite')
   desiredContextLevelRef.current = technicalOpen && rawOpen && capabilities?.context_levels.includes('full') ? 'full' : 'lite'
   useEffect(() => {
     requestAbortRef.current = new AbortController()
     return () => { requestAbortRef.current.abort(); contextAbortRef.current.abort() }
   }, [projectId, selectedRunId, visible])
+  useEffect(() => () => {
+    preflightRequestRef.current += 1
+    preflightAbortRef.current.abort()
+  }, [projectId, visible])
   const diagnosticsLoadedForRef = useRef<string | null>(null)
   const controlsForRunRef = useRef<string | null>(null)
   const previousStreamStateRef = useRef<api.StreamState>('stopped')
@@ -958,6 +979,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       await Promise.all([
         selectedRunId ? loadSelectedRun(projectId, selectedRunId, active) : Promise.resolve(),
         loadContext(desiredContextLevelRef.current),
+        newRunPage ? refreshPreflight() : Promise.resolve(),
       ])
     })().finally(() => { if (active()) { pageRefreshRef.current = null; setRefreshing(false) } })
     pageRefreshRef.current = task
@@ -1090,7 +1112,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
    * then the committed default (workflow, max turns, workflow default team),
    * and only a value with no configured source is omitted from the request.
    */
-  function startRequestFromDraft(restartedFromRunId?: string): StartRunRequest {
+  function startRequestFromDraft(restartedFromRunId?: string, dirtyConfirmed = dirtyWorktreeConfirmed): StartRunRequest {
     // One validation result for preview and request alike: empty keeps the
     // configured/default value, a valid override wins, and an invalid
     // nonempty override never reaches a request because the launch is
@@ -1113,10 +1135,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         : {}),
       ...(extraInstructions.length ? { extra_instructions: extraInstructions } : {}),
       ...(restartedFromRunId ? { restarted_from_run_id: restartedFromRunId } : {}),
+      dirty_worktree_confirmed: dirtyConfirmed,
     }
   }
 
   async function handleStart() {
+    if (startupQuestion?.kind === 'confirm_worktree_dirty') {
+      if (startDisabled || !dirtyWorktreeConfirmed) return
+      await handleStartupAnswer(true)
+      return
+    }
     const selectedPlan = plans.find((plan) => plan.path === startPlanPath.trim())
     // Launch admission is lifecycle-checked again at submit time: only a
     // saved Ready (in progress) plan path is ever submitted.
@@ -1144,6 +1172,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   async function handleStartResponse(response: StartRunResponse, action: string) {
     if (response.startup_question) {
       setStartupQuestion(response.startup_question)
+      if (response.startup_question.kind === 'confirm_worktree_dirty') {
+        setDirtyWorktreeConfirmed(false)
+        await refreshPreflight()
+      }
       setFeedback(`${action} is awaiting a startup answer. No workflow has been started.`)
       return
     }
@@ -1344,7 +1376,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   async function handleConfirmedRestart() {
     if (!restartDraftReady || !projectId || !restartSource || pendingSuccessorStart) return
     const sourceRunId = restartSource.run_id
-    const startRequest = startRequestFromDraft(sourceRunId)
+    const startRequest = startRequestFromDraft(sourceRunId, dirtyWorktreeConfirmed)
     const stopIntent = {
       project_id: projectId,
       run_id: sourceRunId,
@@ -1551,6 +1583,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (unmappedSteps.length > 0) return `The exact role preview is unavailable for ${formatMachineLabel(effectiveWorkflow)} step${unmappedSteps.length > 1 ? 's' : ''} ${unmappedSteps.map(formatMachineLabel).join(', ')} — the committed configuration does not map those executable steps to roles. Refresh, or check the workflow in Settings, before starting a run.`
     return null
   })()
+  const dirtyStartupQuestion = startupQuestion?.kind === 'confirm_worktree_dirty'
+  const preflightEligible = projectAvailable === true
+    && newRunPage
+    && !restartInProgress
+    && launchBlocker === null
+    && startMaxTurnsProblem === null
+    && extraInstructionProblem === null
+  const preflightRequest = preflightEligible
+    ? startRequestFromDraft(restartSource?.run_id, false)
+    : null
+  const preflightSelectionIdentity = JSON.stringify([
+    projectId,
+    startPlanPath.trim(),
+    startWorkflow.trim(),
+    restartSource?.run_id ?? null,
+  ])
+  const preflightRequestIdentity = JSON.stringify([projectId, preflightRequest])
+  const worktreeLaunchBlocked = preflightEligible && (
+    worktreePreflight.status !== 'ready'
+    || worktreePreflight.result === null
+    || worktreePreflight.error !== null
+    || worktreePreflight.result.blockers.length > 0
+    || ((worktreePreflight.result.requires_confirmation || dirtyStartupQuestion) && !dirtyWorktreeConfirmed)
+  )
   const startDisabled = !projectAvailable
     || !startPlanPath
     || busyAction === 'start'
@@ -1559,15 +1615,87 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     || Boolean(extraInstructionProblem)
     || startMaxTurnsProblem !== null
     || launchBlocker !== null
-  const restartDraftReady = Boolean(restartDraftWorkflow && startPlanPath && planOptions.includes(startPlanPath))
+    || worktreeLaunchBlocked
+    || (startupQuestion !== null && !dirtyStartupQuestion)
+  const restartDraftChoicesReady = Boolean(restartDraftWorkflow && startPlanPath && planOptions.includes(startPlanPath))
     && (!missingRestartInstructions || Boolean(startExtraInstructions.trim()))
     && launchBlocker === null && startMaxTurnsProblem === null && !extraInstructionProblem
+  const restartDraftReady = restartDraftChoicesReady && !worktreeLaunchBlocked
   const restartDraftHint = canRestart && !restartDraftReady
-    ? 'Choose an available workflow and a Ready plan. Original choices that are no longer available must be corrected.'
+    ? restartDraftChoicesReady
+      ? 'Working-tree inspection must finish before the successor can start.'
+      : 'Choose an available workflow and a Ready plan. Original choices that are no longer available must be corrected.'
     : null
   const runSteps = effectiveSteps
   const startStepIndex = runSteps.indexOf(startStep.trim())
   const skippedByDraft = startStepIndex > 0 ? runSteps.slice(0, startStepIndex) : []
+
+  async function requestWorktreePreflight(
+    request: StartRunRequest,
+    identity: string,
+    offset: number,
+    append: boolean,
+  ): Promise<void> {
+    const requestNumber = ++preflightRequestRef.current
+    preflightAbortRef.current.abort()
+    const controller = new AbortController()
+    preflightAbortRef.current = controller
+    setWorktreePreflight((current) => ({
+      status: 'loading',
+      identity,
+      result: append || current.identity === identity ? current.result : null,
+      error: null,
+    }))
+    try {
+      const result = await api.preflightControlPlaneRun(projectId, request, { offset, limit: 200, signal: controller.signal })
+      if (requestNumber !== preflightRequestRef.current) return
+      setWorktreePreflight((current) => {
+        if (current.identity !== identity) return current
+        const items = append && current.result
+          ? [...current.result.items, ...result.items]
+          : result.items
+        return { status: 'ready', identity, result: { ...result, items }, error: null }
+      })
+    } catch (preflightError) {
+      if (requestNumber !== preflightRequestRef.current) return
+      if (preflightError instanceof DOMException && preflightError.name === 'AbortError') return
+      setWorktreePreflight((current) => current.identity === identity
+        ? { ...current, status: 'error', error: errorMessage(preflightError, 'Could not inspect the working tree') }
+        : current)
+    }
+  }
+
+  async function refreshPreflight(): Promise<void> {
+    if (!preflightEligible || !preflightRequest) return
+    await requestWorktreePreflight(preflightRequest, preflightRequestIdentity, 0, false)
+  }
+
+  async function loadMorePreflight(): Promise<void> {
+    const nextOffset = worktreePreflight.result?.next_offset
+    if (!preflightEligible || !preflightRequest || nextOffset === null || nextOffset === undefined || worktreePreflight.status === 'loading') return
+    await requestWorktreePreflight(preflightRequest, preflightRequestIdentity, nextOffset, true)
+  }
+
+  useEffect(() => {
+    setDirtyWorktreeConfirmed(false)
+    if (startupQuestion?.kind === 'confirm_worktree_dirty') setStartupQuestion(null)
+    // The acknowledgement follows only the launch identity, not unrelated
+    // draft controls such as max turns, team, or extra instructions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preflightSelectionIdentity])
+
+  useEffect(() => {
+    preflightRequestRef.current += 1
+    preflightAbortRef.current.abort()
+    if (!visible || !preflightEligible || !preflightRequest) {
+      setWorktreePreflight({ status: 'idle', result: null, error: null, identity: preflightRequestIdentity })
+      return
+    }
+    void requestWorktreePreflight(preflightRequest, preflightRequestIdentity, 0, false)
+    // The serialized request is the complete preflight identity; changing a
+    // draft field cannot let a late response update the next launch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, preflightEligible, preflightRequestIdentity])
 
   const readinessLabel = readiness === null
     ? 'Readiness unavailable'
@@ -1747,6 +1875,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               </section>
 
   )
+  const worktreePreflightPanel = (
+    <WorktreePreflightPanel
+      status={worktreePreflight.status}
+      result={worktreePreflight.result}
+      error={worktreePreflight.error}
+      dirtyWorktreeConfirmed={dirtyWorktreeConfirmed}
+      onDirtyWorktreeConfirmedChange={setDirtyWorktreeConfirmed}
+      onRefresh={() => void refreshPreflight()}
+      onLoadMore={() => void loadMorePreflight()}
+      dirtyQuestionMessage={dirtyStartupQuestion ? startupQuestion?.message ?? 'The working tree changed while starting. Review it before continuing.' : null}
+    />
+  )
   const restartActions = restartSource && restartPhase ? (
                 <section className="dashboard-section">
                   <div className="section-heading"><h4>Restart with changes</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
@@ -1837,7 +1977,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         </div>
       )}
 
-      {projectAvailable && startupQuestion && (newRunPage || selectedRun?.run_id === startupQuestion.run_id) && (
+      {projectAvailable && startupQuestion && (!dirtyStartupQuestion || !newRunPage) && (newRunPage || selectedRun?.run_id === startupQuestion.run_id) && (
         <section className="card startup-question" aria-label="Startup question">
           <div className="status-pill status-awaiting">Input needed</div>
           <h3>{startupQuestion.message}</h3>
@@ -2089,6 +2229,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         startMaxTurnsProblem={startMaxTurnsProblem}
         configuredMaxTurns={configuredMaxTurns}
         preview={launchPreview}
+        worktreePreflight={worktreePreflightPanel}
         restartActions={restartActions}
         onCancel={() => { if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }; setLocalPage('runs'); onCancelNewRun?.() }}
         advancedOpen={advancedOpen}

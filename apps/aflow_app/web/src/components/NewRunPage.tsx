@@ -1,6 +1,109 @@
 import { useId, type ReactNode, type Dispatch, type SetStateAction } from 'react'
+import type { WorktreePreflight, WorktreeStatusItem } from '../types'
 import { formatMachineChoice, formatMachineLabel } from '../label'
 import { Combobox } from './Combobox'
+
+export type WorktreePreflightLoadState = 'idle' | 'loading' | 'ready' | 'error'
+
+interface WorktreePreflightPanelProps {
+  status: WorktreePreflightLoadState
+  result: WorktreePreflight | null
+  error: string | null
+  dirtyWorktreeConfirmed: boolean
+  onDirtyWorktreeConfirmedChange: (confirmed: boolean) => void
+  onRefresh: () => void
+  onLoadMore: () => void
+  dirtyQuestionMessage: string | null
+}
+
+function worktreeStatusName(status: string): string {
+  return {
+    A: 'added',
+    C: 'copied',
+    D: 'deleted',
+    M: 'modified',
+    R: 'renamed',
+    T: 'type changed',
+    U: 'unmerged',
+  }[status] ?? 'changed'
+}
+
+function worktreeItemDescription(item: WorktreeStatusItem): string {
+  const code = `${item.index_status}${item.worktree_status}`
+  if (code === '??' || (item.index_status === '?' && item.worktree_status === '?')) return 'untracked'
+  const descriptions: string[] = []
+  if (item.index_status.trim() && item.index_status !== '?') descriptions.push(`staged ${worktreeStatusName(item.index_status)}`)
+  if (item.worktree_status.trim() && item.worktree_status !== '?') descriptions.push(`unstaged ${worktreeStatusName(item.worktree_status)}`)
+  return descriptions.join(' + ') || 'changed'
+}
+
+export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeConfirmed, onDirtyWorktreeConfirmedChange, onRefresh, onLoadMore, dirtyQuestionMessage }: WorktreePreflightPanelProps) {
+  const acknowledgmentRequired = Boolean(result?.requires_confirmation || dirtyQuestionMessage)
+  const canShowResult = result !== null && status !== 'idle'
+  return (
+    <section className="dashboard-section worktree-preflight" aria-label="Working tree preflight">
+      <div className="section-heading">
+        <h4>Working tree before start</h4>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={onRefresh} disabled={status === 'loading'}>
+          {status === 'loading' ? 'Inspecting…' : 'Refresh worktree inspection'}
+        </button>
+      </div>
+      {status === 'idle' && <p className="text-sm text-dim">Choose a Ready plan and valid workflow to inspect the working tree.</p>}
+      {status === 'loading' && <p className="text-sm text-dim" role="status">Inspecting the selected checkout…</p>}
+      {status === 'error' && <div className="error-message" role="alert">Working tree inspection failed: {error ?? 'Refresh to retry.'}</div>}
+      {canShowResult && result && (
+        <>
+          <p className="text-sm text-dim">
+            Checkout: <span className="mono">{result.checkout_path}</span>
+          </p>
+          <p className="text-sm text-dim">
+            {result.execution_mode === 'new_worktree'
+              ? 'A new worktree starts from the selected commit and leaves these changes in the current checkout.'
+              : 'This run uses the existing checkout, so it sees the uncommitted changes listed here.'}
+          </p>
+          {result.blockers.length > 0 && (
+            <div className="error-message" role="alert">
+              <strong>Preflight blocks this start:</strong>
+              <ul>{result.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul>
+            </div>
+          )}
+          {status === 'ready' && !result.dirty && <p>No uncommitted changes detected.</p>}
+          {result.dirty && result.items.length === 0 && (
+            <p className="notice">The checkout has uncommitted changes, but no individual paths were returned.</p>
+          )}
+          {result.items.length > 0 && (
+            <ul className="worktree-preflight-list">
+              {result.items.map((item) => (
+                <li key={`${item.path}:${item.original_path ?? ''}`}>
+                  <span className="status-pill">{worktreeItemDescription(item)}</span>{' '}
+                  <span className="mono">{item.path}</span>
+                  <span className="text-xs text-dim"> ({item.index_status}{item.worktree_status})</span>
+                  {item.original_path && <span className="text-sm text-dim"> — renamed from <span className="mono">{item.original_path}</span></span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {result.next_offset !== null && (
+            <button type="button" className="btn btn-secondary btn-sm" onClick={onLoadMore} disabled={status === 'loading'}>
+              {status === 'loading' ? 'Loading more…' : `Show more (${Math.max(result.total_items - result.next_offset, 0)} remaining)`}
+            </button>
+          )}
+        </>
+      )}
+      {dirtyQuestionMessage && <div className="notice" role="alert">{dirtyQuestionMessage}</div>}
+      {acknowledgmentRequired && (
+        <label className="worktree-confirmation">
+          <input
+            type="checkbox"
+            checked={dirtyWorktreeConfirmed}
+            onChange={(event) => onDirtyWorktreeConfirmedChange(event.target.checked)}
+          />
+          Continue despite uncommitted changes
+        </label>
+      )}
+    </section>
+  )
+}
 
 interface LaunchSelectorPresentation {
   /** Resolved value shown before focus when the stored value is empty. */
@@ -33,6 +136,7 @@ interface NewRunPageProps {
   startMaxTurnsProblem: string | null
   configuredMaxTurns: number | null
   preview: ReactNode
+  worktreePreflight: ReactNode
   restartActions: ReactNode
   onCancel: () => void
   advancedOpen: boolean
@@ -53,7 +157,7 @@ interface NewRunPageProps {
 }
 
 /** Presentation only; the workspace retains request and answer identity across navigation. */
-export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeam, setStartTeam, teamOptions, teamBadges, teamPresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction }: NewRunPageProps) {
+export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeam, setStartTeam, teamOptions, teamBadges, teamPresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, worktreePreflight, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction }: NewRunPageProps) {
   const advancedId = useId()
   return (
         <section className="card start-run-form">
@@ -105,6 +209,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
 
               </div>
               {preview}
+              {worktreePreflight}
               <section className="dashboard-section">
                 <h4>
                   <button

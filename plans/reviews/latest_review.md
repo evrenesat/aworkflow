@@ -1,18 +1,16 @@
-# CP8 checkpoint review
+# CP9 v01 review — 2026-09-10
 
-Reviewed `cp8 v01` on `codex/aflow-dogfood-20260909`: immediately preceding worker changes against approved CP7 `05d7d82`. Worktree fallback used because no pending CP8 implementation commit exists; zero intervening implementation commits. The older approved CP7 commit is the base, not the review target.
+Target: immediately preceding repaired CP9 worker worktree against approved CP8 `c0e5220`, branch `codex/aflow-dogfood-20260909`. Worktree fallback used because no pending CP9 commit exists; zero intervening implementation commits. Original scope: `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`. Active non-checkpoint overlay: `live-configuration-without-snapshot-gates-20260909-cp10-v01.md`, targeting original CP9 despite its filename.
 
-Original and active plan: `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`. Scope: CP8 read-only preflight and launch acknowledgment through the control plane. The worker's CP8 completion markers were verified; CP9 remains unchecked.
-
-Reviewed shared daemon inspection, canonical and HTTP models, authenticated HTTP/MCP service wiring, pagination, acknowledgment serialization and replay, structured startup questions, conflict refusal and inspection/launch races. Retained compatible CP7 behavior and the unchanged manager 40 KiB hard guard and compact 16 KiB summary. No production code was edited by the reviewer.
+Scope: New Run preflight API/types, dirty statuses and literal paths, pagination, acknowledgment/reset, ordinary/restart request wiring, launch-time dirty question continuation, and reopened pending startup answers. Applied material finding admission gate, exclusions and proportionate-fix discipline. No surviving material findings. The earlier reopened-question finding is resolved by retaining the legacy answer card on Runs with its selected-run identity guard and existing answer/idempotency handlers.
 
 Verification:
 
-- `uv run pytest tests/test_dirty_worktree_preflight.py tests/test_control_plane_services.py tests/test_daemon_cli.py apps/aflow_app/server/tests/test_control_plane_api.py apps/aflow_app/server/tests/test_mcp.py -q`: 86 passed; one dependency deprecation warning.
-- `uv run ruff check aflow/api/startup.py aflow/control_plane aflow/daemon.py aflow/daemon_cli.py aflow/mcp_control_plane.py apps/aflow_app/server/src`: passed.
-- Synthetic canonical/HTTP transport check: all 1,001 items survive two pages with correct next offsets. The initial scratch invocation omitted a required fixture constructor argument; corrected invocation passed.
-- `git diff --check`: passed. Original base remains reachable and branch matches Git Tracking.
+- `npm --prefix apps/aflow_app/web test -- --run`: 291 tests passed in 16 files.
+- `npm --prefix apps/aflow_app/web run build`: passed.
+- `git diff --check`: passed.
+- Cached Chromium via project Python Playwright: temporary New Run harness with fake backend and disposable Git repository. Start disabled while unchecked; keyboard Space checks acknowledgment; keyboard Enter submits exactly one fake start with `dirty_worktree_confirmed=true`. Temporary repository status and content unchanged. Initial smoke locator timed out because the option includes a badge; keyboard selection corrected the harness and the smoke passed. No product correction was needed. Temporary harness removed.
 
-No findings survived the material-code-review admission gate. CP8 approved; approval commit created by the reviewer with the `cp8 v01` label. Original plan review state advances only through CP8. No fix overlay required. Verification used synthetic providers and temporary fixtures; no real global configuration, skills, services, deployments or public pushes were changed.
+Disposition: approve `cp9 v01`; reviewer creates the checkpoint approval commit and advances only CP9. CP10 remains unchecked. Preserve manager 40 KiB hard guard and compact 16 KiB summary. Separate concurrent CP13 plan amendment remains outside the approval commit. No production implementation edits during review, real provider calls, deployment, public push, global config/skills or service edits.
 
 No material findings

@@ -431,6 +431,20 @@ input::placeholder, textarea::placeholder {
   font-size: 0.875rem;
 }
 
+.worktree-preflight-list {
+  display: grid;
+  gap: var(--spacing-xs);
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.worktree-confirmation {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+  font-weight: 600;
+}
+
 .run-metadata {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

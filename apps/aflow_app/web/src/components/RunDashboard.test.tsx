@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
+import type { WorktreePreflight } from '../types'
 import { RunDashboard, type RunSelectionChange } from './RunDashboard'
 import { App } from '../App'
 
@@ -13,7 +14,7 @@ vi.mock('../api', async () => {
     getGlobalConfig: vi.fn(), postGlobalConfigForm: vi.fn(), getRestartOptions: vi.fn().mockResolvedValue(null),
     listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
     listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
-    startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), controlControlPlaneRun: vi.fn(),
+    startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), preflightControlPlaneRun: vi.fn(), controlControlPlaneRun: vi.fn(),
     changeRunHistory: vi.fn(), ownerStopControlPlaneRun: vi.fn(), resumeControlPlaneRun: vi.fn(), subscribeToRunEvents: vi.fn(),
   }
 })
@@ -46,6 +47,22 @@ const capabilities = {
   team_upgrade_chains: { base: ['base', 'full'], full: ['full'] },
   control_safety: { max_turns: 'safe' as const, team: 'safe' as const, role_selectors: 'safe' as const, owner_stop: 'safe' as const, workflow: 'restart_required' as const },
   service_features: ['controls'],
+}
+
+function preflightResult(overrides: Partial<WorktreePreflight> = {}): WorktreePreflight {
+  return {
+    checkout_path: '/workspace/alpha',
+    execution_mode: 'same_checkout',
+    dirty: false,
+    requires_confirmation: false,
+    blockers: [],
+    total_items: 0,
+    offset: 0,
+    limit: 200,
+    next_offset: null,
+    items: [],
+    ...overrides,
+  }
 }
 
 const ownedRun = {
@@ -154,6 +171,10 @@ async function openNewRun() {
   fireEvent.click(await screen.findByRole('button', { name: 'New run' }))
 }
 
+async function waitForPreflightReady() {
+  await waitFor(() => expect(screen.getByText('No uncommitted changes detected.')).toBeDefined())
+}
+
 function openTechnicalDetails() {
   fireEvent.click(screen.getByRole('button', { name: 'Diagnostics' }))
 }
@@ -175,6 +196,11 @@ describe('RunDashboard', () => {
     vi.mocked(api.getGlobalConfig).mockResolvedValue(committedConfig)
     vi.mocked(api.postGlobalConfigForm).mockResolvedValue(emptyProjection)
     vi.mocked(api.listControlPlanePlans).mockResolvedValue([{ path: 'plans/in-progress/demo.md', status: 'in_progress', modified_at: '2024-01-01T00:00:00Z', schema_version: 1 }])
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue({
+      checkout_path: '/workspace/alpha', execution_mode: 'same_checkout', dirty: false,
+      requires_confirmation: false, blockers: [], total_items: 0, offset: 0, limit: 200,
+      next_offset: null, items: [],
+    })
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownedRun)
     vi.mocked(api.listRunEvents).mockResolvedValue([{ sequence: 1, event_type: 'run_started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:00Z' }])
@@ -246,6 +272,7 @@ describe('RunDashboard', () => {
     expect((await screen.findByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
     openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '12' } })
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(project.project_id, expect.objectContaining({ workflow_name: 'managed', max_turns: 12, restarted_from_run_id: failed.run_id }), expect.any(String)))
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
@@ -451,14 +478,241 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await screen.findByText('Worktree is dirty. Start anyway?')
 
+    expect(screen.queryByRole('button', { name: 'Confirm and continue' })).toBeNull()
+    const confirmation = screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement
+    expect(confirmation.checked).toBe(false)
+    fireEvent.click(confirmation)
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.answerStartupQuestion).toHaveBeenCalledWith(
+      'control-project', 'question-2', true, expect.stringMatching(/^startup-answer-/),
+    ))
+  })
+
+  it('restores a pending dirty question on Runs and answers it without a new start', async () => {
+    const pendingRun = {
+      ...ownedRun,
+      run_id: 'run-dirty-question',
+      status: 'awaiting_startup_answer',
+      launch_phase: 'awaiting_startup_answer',
+      evidence: {
+        ...ownedRun.evidence,
+        startup_question: {
+          question_id: 'question-reopened',
+          kind: 'confirm_worktree_dirty',
+          message: 'The reopened checkout is dirty. Continue?',
+          options: {},
+          choices: [],
+          run_id: 'run-dirty-question',
+          schema_version: 1,
+        },
+      },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [pendingRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === pendingRun.run_id ? pendingRun : ownedRun)
+    vi.mocked(api.answerStartupQuestion).mockResolvedValue({ result: null, startup_question: null })
+    renderDashboard({ requestedRunId: pendingRun.run_id })
+
+    await screen.findByText('The reopened checkout is dirty. Continue?')
     expect(screen.getByRole('button', { name: 'Confirm and continue' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Decline and stop' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Decline and stop' }))
     await waitFor(() => expect(api.answerStartupQuestion).toHaveBeenCalledWith(
-      'control-project', 'question-2', false, expect.stringMatching(/^startup-answer-/),
+      'control-project', 'question-reopened', false, expect.stringMatching(/^startup-answer-/),
     ))
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('shows every dirty status and requires the explicit continuation checkbox', async () => {
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({
+      dirty: true,
+      requires_confirmation: true,
+      total_items: 4,
+      items: [
+        { path: 'src/staged.ts', index_status: 'M', worktree_status: ' ', original_path: null },
+        { path: 'src/changed.ts', index_status: ' ', worktree_status: 'M', original_path: null },
+        { path: 'notes.txt', index_status: '?', worktree_status: '?', original_path: null },
+        { path: 'src/new.ts', index_status: 'R', worktree_status: ' ', original_path: 'src/old.ts' },
+      ],
+    }))
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+
+    await screen.findByText('src/staged.ts')
+    expect(screen.getByText('staged modified')).toBeDefined()
+    expect(screen.getByText('unstaged modified')).toBeDefined()
+    expect(screen.getByText('untracked')).toBeDefined()
+    expect(screen.getByText('staged renamed')).toBeDefined()
+    expect(screen.getByText('src/old.ts')).toBeDefined()
+    const checkbox = screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement
+    expect(checkbox.checked).toBe(false)
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+
+    fireEvent.click(checkbox)
+    expect(checkbox.checked).toBe(true)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      expect.objectContaining({ dirty_worktree_confirmed: true }),
+      expect.any(String),
+    ))
+  })
+
+  it('appends the next preflight page only through Show more', async () => {
+    vi.mocked(api.preflightControlPlaneRun)
+      .mockResolvedValueOnce(preflightResult({
+        dirty: true,
+        total_items: 2,
+        next_offset: 1,
+        items: [{ path: 'first.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+      }))
+      .mockResolvedValueOnce(preflightResult({
+        dirty: true,
+        offset: 1,
+        total_items: 2,
+        items: [{ path: 'second.ts', index_status: ' ', worktree_status: 'D', original_path: null }],
+      }))
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+
+    await screen.findByText('first.ts')
+    const showMore = screen.getByRole('button', { name: 'Show more (1 remaining)' })
+    fireEvent.click(showMore)
+    await screen.findByText('second.ts')
+    expect(screen.getByText('first.ts')).toBeDefined()
+    expect(screen.queryByRole('button', { name: /Show more/ })).toBeNull()
+    expect(api.preflightControlPlaneRun).toHaveBeenNthCalledWith(
+      2,
+      'control-project',
+      expect.objectContaining({ plan_path: 'plans/in-progress/demo.md', dirty_worktree_confirmed: false }),
+      expect.objectContaining({ offset: 1, limit: 200, signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('explains new-worktree dirt without asking for an unnecessary confirmation', async () => {
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({
+      execution_mode: 'new_worktree',
+      dirty: true,
+      requires_confirmation: false,
+      total_items: 1,
+      items: [{ path: 'plans/in-progress/demo.md', index_status: ' ', worktree_status: 'M', original_path: null }],
+    }))
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+
+    await screen.findByText('plans/in-progress/demo.md')
+    expect(screen.getByText(/A new worktree starts from the selected commit/)).toBeDefined()
+    expect(screen.getByText(/leaves these changes in the current checkout/)).toBeDefined()
+    expect(screen.queryByRole('checkbox', { name: 'Continue despite uncommitted changes' })).toBeNull()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull())
+  })
+
+  it('keeps inspection failure distinct from a clean checkout and blocks Start', async () => {
+    vi.mocked(api.preflightControlPlaneRun).mockRejectedValue(new Error('git status unavailable'))
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+
+    await screen.findByText(/Working tree inspection failed: git status unavailable/)
+    expect(screen.queryByText('No uncommitted changes detected.')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    expect(api.startControlPlaneRun).not.toHaveBeenCalled()
+  })
+
+  it('discards a late preflight response after the workflow selection changes', async () => {
+    let releaseManaged!: (result: WorktreePreflight) => void
+    const managedResult = new Promise<WorktreePreflight>((resolve) => { releaseManaged = resolve })
+    vi.mocked(api.preflightControlPlaneRun).mockImplementation((_projectId, request) => request.workflow_name === 'managed'
+      ? managedResult
+      : Promise.resolve(preflightResult({ dirty: true, total_items: 1, items: [{ path: 'other.ts', index_status: ' ', worktree_status: 'M', original_path: null }] })))
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await waitFor(() => expect(api.preflightControlPlaneRun).toHaveBeenCalledTimes(1))
+    choose('Run workflow', 'other')
+    await screen.findByText('other.ts')
+    releaseManaged(preflightResult({ dirty: true, total_items: 1, items: [{ path: 'stale.ts', index_status: ' ', worktree_status: 'M', original_path: null }] }))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByText('stale.ts')).toBeNull()
+    expect(screen.getByText('other.ts')).toBeDefined()
+  })
+
+  it('preserves acknowledgment through unrelated edits but resets it for a new launch selection', async () => {
+    vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({
+      dirty: true,
+      requires_confirmation: true,
+      total_items: 1,
+      items: [{ path: 'draft.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+    }))
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await screen.findByText('draft.ts')
+    const checkbox = screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement
+    fireEvent.click(checkbox)
+    openAdvanced()
+    fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '7' } })
+    await waitFor(() => expect(api.preflightControlPlaneRun).toHaveBeenCalledTimes(2))
+    expect(checkbox.checked).toBe(true)
+
+    choose('Run workflow', 'other')
+    await waitFor(() => expect((screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement).checked).toBe(false))
+  })
+
+  it('rechecks dirt at launch and answers the returned question without starting another run', async () => {
+    vi.mocked(api.preflightControlPlaneRun)
+      .mockResolvedValueOnce(preflightResult())
+      .mockResolvedValueOnce(preflightResult({
+        dirty: true,
+        requires_confirmation: true,
+        total_items: 1,
+        items: [{ path: 'appeared-at-launch.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+      }))
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: null,
+      startup_question: { question_id: 'question-race', kind: 'confirm_worktree_dirty', message: 'Worktree became dirty at launch.', options: {}, choices: [], run_id: 'pending-run', schema_version: 1 },
+    })
+    vi.mocked(api.answerStartupQuestion).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    choose('Run workflow', 'managed')
+    await waitForPreflightReady()
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+
+    await screen.findByText('appeared-at-launch.ts')
+    expect(screen.getByText('Worktree became dirty at launch.')).toBeDefined()
+    expect(screen.queryByRole('button', { name: 'Confirm and continue' })).toBeNull()
+    const checkbox = screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement
+    expect(checkbox.checked).toBe(false)
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    fireEvent.click(checkbox)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.answerStartupQuestion).toHaveBeenCalledWith(
+      'control-project', 'question-race', true, expect.stringMatching(/^startup-answer-/),
+    ))
+    expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1)
   })
 
   it('offers capability-admitted start steps, explains skips, and sends the canonical step name', async () => {
@@ -482,6 +736,7 @@ describe('RunDashboard', () => {
     // The capability default team is inherited without an explicit selection.
     expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('Base — workflow default (Base)')
     fireEvent.change(screen.getByLabelText('Run start step'), { target: { value: 'implement' } })
+    await waitForPreflightReady()
     const skipNotice = screen.getByText(/skips the earlier executable steps:/)
     expect(skipNotice.textContent).toContain('Plan')
 
@@ -510,6 +765,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'managed')
     openAdvanced()
     fireEvent.change(screen.getByLabelText('Run extra instructions'), { target: { value: '  Focus on tests.  \n\nKeep runs short. ' } })
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
@@ -537,6 +793,7 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(screen.getByText('connection lost')).toBeDefined())
 
@@ -547,10 +804,11 @@ describe('RunDashboard', () => {
 
     if (!screen.queryByLabelText('Run max turns')) openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '9' } })
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(3))
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][2]).not.toBe(unchangedRetryKey)
-    expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][1]).toEqual({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', max_turns: 9 })
+    expect(vi.mocked(api.startControlPlaneRun).mock.calls[2][1]).toEqual({ plan_path: 'plans/in-progress/demo.md', workflow_name: 'managed', max_turns: 9, dirty_worktree_confirmed: false })
   })
 
   it('refreshes a CAS conflict, keeps local control edits, and reports restart-required changes', async () => {
@@ -669,6 +927,7 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
+    await waitForPreflightReady()
     expect(screen.getByText(/and start successor workflow/)).toBeDefined()
     expect(screen.getAllByText('run-owned').length).toBeGreaterThanOrEqual(2)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
@@ -724,6 +983,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
     await screen.findByText(/Successor outcome is unknown/)
@@ -772,6 +1032,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
     await screen.findByRole('button', { name: 'Retry exact successor request' })
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
@@ -812,6 +1073,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
     await waitFor(() => expect(screen.getByText(/Restart stopped without a confirmed successor: stop rejected by server/)).toBeDefined())
@@ -835,6 +1097,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
     await waitFor(() => expect(screen.getByText(/Source inactivity could not be confirmed/)).toBeDefined())
@@ -855,6 +1118,7 @@ describe('RunDashboard', () => {
     choose('Run workflow', 'other')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     fireEvent.click(screen.getByRole('button', { name: 'Restart with changes' }))
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
 
     await waitFor(() => expect(screen.getByText(/Source inactivity could not be confirmed/)).toBeDefined())
@@ -1090,6 +1354,7 @@ describe('RunDashboard', () => {
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
     choose('Run workflow', 'other')
+    await waitForPreflightReady()
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull()
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull()
   })
@@ -1186,6 +1451,7 @@ describe('RunDashboard', () => {
     if (!screen.queryByLabelText('Run max turns')) openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '7' } })
     await waitFor(() => expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('7 — your override'))
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
@@ -1198,11 +1464,12 @@ describe('RunDashboard', () => {
     if (!screen.queryByLabelText('Run max turns')) openAdvanced()
     fireEvent.change(screen.getByLabelText('Run max turns'), { target: { value: '' } })
     expect(screen.getByLabelText('Effective choices for this launch').textContent).toContain('12 — global default')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
     // An empty field stays an omission: the server applies the defaults.
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][1]).toEqual({
-      plan_path: 'plans/in-progress/demo.md', max_turns: 12,
+      plan_path: 'plans/in-progress/demo.md', max_turns: 12, dirty_worktree_confirmed: false,
     })
   })
 
@@ -1266,11 +1533,12 @@ describe('RunDashboard', () => {
     expect(planRow.textContent).toContain('model and effort configured in ZCode — global')
     expect(planRow.textContent).not.toContain('codex.fast')
 
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
       // Following the defaults keeps the request an omission.
-      { plan_path: 'plans/in-progress/demo.md', max_turns: 12 },
+      { plan_path: 'plans/in-progress/demo.md', max_turns: 12, dirty_worktree_confirmed: false },
       expect.stringMatching(/^start-/),
     ))
 
@@ -1289,11 +1557,12 @@ describe('RunDashboard', () => {
     expect(overridden).toContain('Worker — missing')
     expect(overridden).toContain('Settings → Roles')
 
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
     expect(api.startControlPlaneRun).toHaveBeenLastCalledWith(
       'control-project',
-      { plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', team: 'full', max_turns: 7 },
+      { plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', team: 'full', max_turns: 7, dirty_worktree_confirmed: false },
       expect.stringMatching(/^start-/),
     )
   })
@@ -1340,6 +1609,7 @@ describe('RunDashboard', () => {
     expect((screen.getByLabelText('Run start step') as HTMLSelectElement).selectedIndex).toBe(0)
     expect(screen.queryByText(/skips the earlier executable steps/)).toBeNull()
 
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
@@ -1507,6 +1777,7 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
 
     await waitFor(() => expect(onRunSelectionChange).toHaveBeenCalledWith({ runId: 'run-started', userInitiated: false }))
@@ -1702,6 +1973,7 @@ describe('RunDashboard', () => {
     await openNewRun()
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await screen.findByText('response lost')
     const original = vi.mocked(api.startControlPlaneRun).mock.calls[0]
@@ -1709,6 +1981,7 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: /run-other Completed/ }))
     await screen.findByRole('button', { name: 'run-other', exact: true })
     await openNewRun()
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[1]).toEqual(original)
@@ -1842,10 +2115,11 @@ describe('RunDashboard', () => {
     choose('Run plan', 'plans/in-progress/demo.md')
     // An explicit team selection is submitted verbatim.
     choose('Run team', 'full')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1))
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[0][1]).toEqual({
-      plan_path: 'plans/in-progress/demo.md', team: 'full', max_turns: 12,
+      plan_path: 'plans/in-progress/demo.md', team: 'full', max_turns: 12, dirty_worktree_confirmed: false,
     })
 
     // Returning to the default row restores omission in the request.
@@ -1862,10 +2136,11 @@ describe('RunDashboard', () => {
     // Changing the workflow to one without a default team updates the resolved team.
     choose('Run workflow', 'other')
     expect((screen.getByLabelText('Run team') as HTMLInputElement).value).toBe('No team — global roles')
+    await waitForPreflightReady()
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
     expect(vi.mocked(api.startControlPlaneRun).mock.calls[1][1]).toEqual({
-      plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', max_turns: 12,
+      plan_path: 'plans/in-progress/demo.md', workflow_name: 'other', max_turns: 12, dirty_worktree_confirmed: false,
     })
   })
 
