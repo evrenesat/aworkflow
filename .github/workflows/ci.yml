@@ -90,7 +90,9 @@ jobs:
 
       - name: Run server tests
         working-directory: apps/aflow_app/server
-        run: uv run pytest -q
+        run: |
+          uv run playwright install --with-deps chromium
+          uv run pytest -q
 
       - name: Install web dependencies
         working-directory: apps/aflow_app/web

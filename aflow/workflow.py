@@ -54,6 +54,7 @@ from .manager_context import (
     summarize_review_rejection,
 )
 from .skill_store import SkillStoreError
+from .publication import PublicationError, publish_completed_run
 from .git_status import (
     classify_dirtiness_by_prefix,
     is_lifecycle_owned_path,
@@ -8704,6 +8705,21 @@ def run_workflow(
             )
         except HarnessEnvironmentPreflightError as exc:
             _handle_environment_preflight_failure(exc)
+        if merge_status != "failed":
+            try:
+                merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                publish_completed_run(
+                    config.repo_root if merging else working_dir,
+                    run_paths.run_dir,
+                    source_ref=exec_ctx.main_branch if merging else "HEAD",
+                )
+            except PublicationError as exc:
+                failure_finalizer.raise_failure(
+                    str(exc), original_plan_path=original_plan_path,
+                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                )
+
         if merge_status == "failed":
             state.status_message = "failed"
             current_step = wf.steps.get(current_step_name)
@@ -8918,6 +8934,21 @@ def run_workflow(
                     )
                 except HarnessEnvironmentPreflightError as exc:
                     _handle_environment_preflight_failure(exc)
+            if merge_status != "failed":
+                try:
+                    merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                    publish_completed_run(
+                        config.repo_root if merging else working_dir,
+                        run_paths.run_dir,
+                        source_ref=exec_ctx.main_branch if merging else "HEAD",
+                    )
+                except PublicationError as exc:
+                    failure_finalizer.raise_failure(
+                        str(exc), original_plan_path=original_plan_path,
+                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                    )
+
             if merge_status == "failed":
                 state.status_message = "failed"
                 report = _manager_terminal_incident(
@@ -11051,6 +11082,21 @@ def run_workflow(
                     )
                 except HarnessEnvironmentPreflightError as exc:
                     _handle_environment_preflight_failure(exc)
+
+            if merge_status != "failed":
+                try:
+                    merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                    publish_completed_run(
+                        config.repo_root if merging else working_dir,
+                        run_paths.run_dir,
+                        source_ref=exec_ctx.main_branch if merging else "HEAD",
+                    )
+                except PublicationError as exc:
+                    failure_finalizer.raise_failure(
+                        str(exc), original_plan_path=original_plan_path,
+                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                    )
 
             if merge_status == "failed":
                 state.status_message = "failed"

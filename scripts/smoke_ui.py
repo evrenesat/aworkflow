@@ -173,7 +173,9 @@ class InstalledWheel:
                 if entry.name in self._NODE_TOOLS:
                     continue
                 link = shadow / entry.name
-                if not link.exists():
+                # Do not follow inaccessible system executables (macOS ships
+                # protected entries such as weakpass_edit), or broken links.
+                if not os.path.lexists(link):
                     try:
                         link.symlink_to(entry)
                     except OSError:

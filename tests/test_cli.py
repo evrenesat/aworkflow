@@ -3029,11 +3029,14 @@ p = "do it"
             plan_path = Path(tmpdir) / 'plan.md'
             _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
             original_home = os.environ.get('HOME')
+            original_cwd = Path.cwd()
             try:
                 os.environ['HOME'] = str(home_dir)
+                os.chdir(home_dir)
                 with patch('aflow.api.startup.probe_worktree', return_value=None):
                     result = main(['run', 'other', str(plan_path)])
             finally:
+                os.chdir(original_cwd)
                 if original_home is None:
                     os.environ.pop('HOME', None)
                 else:

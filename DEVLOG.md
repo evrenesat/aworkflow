@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-10 — Close the publication gap and exercise CI portability
+
+- Add explicitly repository-authorized publication before successful workflow
+  completion, including in-place and resumed boundaries. Preserve active trees
+  and remote history; record the delivered SHA or failed delivery in the run.
+- Install Chromium before server browser tests. Drain PTY output before closing
+  its slave, handle protected macOS executables in the no-Node packaging smoke,
+  use the macOS boot-session identity, and probe occupied ports without address
+  reuse. Filesystem identity tests now exercise aliases on case-insensitive disks.
+
 ## 2026-09-10 — Release approved work through main
 
 - Publish the completed Skills/settings, manager-context, and readable CLI work

@@ -358,3 +358,23 @@ installation, activation, verification, and rollback.
 - [Architecture](ARCHITECTURE.md)
 
 Worker failures before controller startup are now visible from validated detached-worker receipts. Diagnostics provides a readable summary and expandable raw details; the page Refresh updates run data together. The browser-local recent-run count is edited only in Settings → General.
+
+### Publish completed workflows
+
+An explicitly enabled repository publishes successful workflows to its existing
+remote branch before moving the plan to Done. This also covers in-place runs:
+
+```sh
+git config --local aflow.publishRemote origin
+git config --local aflow.publishBranch main
+```
+
+These local Git settings grant publication for this repository; neither setting
+is enabled by a clone. Configure both, or unset both to disable publication.
+The controller requires a clean completed checkout, fetches the target, and uses
+a normal push. Concurrent accepted remote changes merge in a separate temporary
+checkout; conflicts preserve that checkout and fail delivery rather than overwrite
+history. `publication.json` in the run directory records the source and published
+commit or a failed delivery. Existing CI/CD then validates and deploys main.
+Local approval, remote publication, passing CI, and live deployment are distinct
+outcomes; a successful push alone does not establish live availability.

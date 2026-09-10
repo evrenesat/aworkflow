@@ -588,6 +588,13 @@ class TestUnsafeFolderNames:
     def test_case_distinct_basenames_stay_distinct(self, tmp_path: Path) -> None:
         service, registry, managed = _service(tmp_path)
         _committed_repo(managed, "case")
+        if (managed / "Case").exists():
+            # A case-insensitive volume cannot contain both physical roots.
+            assert (managed / "Case").samefile(managed / "case")
+            lower = _create(service, "case", mode="register")
+            assert registry.resolve(lower["id"])[1].samefile(managed / "Case")
+            assert len(registry.list_records()) == 1
+            return
         _committed_repo(managed, "Case")
 
         lower = _create(service, "case", mode="register")

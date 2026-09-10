@@ -800,18 +800,17 @@ def test_tty_and_non_tty_streams_receive_identical_ordered_output(monkeypatch) -
         with os.fdopen(slave, "w", encoding="utf-8") as tty_stream:
             _drive(_renderer(tty_stream))
             tty_stream.flush()
-        tty_output = b""
-        while True:
-            readable, _, _ = select.select((master,), (), (), 1.0)
-            if not readable:
-                break
-            try:
+            # BSD PTYs can discard unread output when the last slave closes.
+            # Drain while the writer remains open on every supported platform.
+            tty_output = b""
+            while True:
+                readable, _, _ = select.select((master,), (), (), 1.0)
+                if not readable:
+                    break
                 chunk = os.read(master, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            tty_output += chunk
+                if not chunk:
+                    break
+                tty_output += chunk
     finally:
         os.close(master)
     tty_text = tty_output.decode("utf-8").replace("\r\n", "\n")

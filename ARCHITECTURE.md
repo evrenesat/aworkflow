@@ -1136,3 +1136,12 @@ exposure.
 The installed `ui-worker` wrapper drains both child pipes concurrently and atomically replaces `units/diagnostic.json` with redacted recent output (4,096 characters per stream, bounded line buffers; oversized lines omitted). It writes exit time/code even if diagnostic capture fails. `daemon-worker` writes a nonce-bound structured early exception with its stage. Context reads expose these bounded artifacts even without `run.json`.
 
 The dashboard coordinates manual, timer and stream refreshes, preserves selected-run state on partial failure and gives context a single loader with cancellation and stale-response guards. Summary fields are deterministic; raw artifacts are grouped under collapsed details. Settings owns outstanding prompt-deletion recovery across tabs and editor modes. Browser count edits commit only valid integers on blur/Enter.
+
+### Repository-authorized publication
+
+`aflow/publication.py` runs at successful normal and resumed terminal boundaries,
+after optional local merge and before plan finalization. Local Git configuration
+selects an existing remote/branch. Publication preserves the execution checkout,
+merges concurrent accepted history in an isolated checkout, never force-pushes,
+and writes a bounded run-local receipt. An error prevents normal completion.
+CI and deployment remain downstream of the remote main update.

@@ -246,7 +246,6 @@ def _local_url(host: str, port: int) -> str:
 
 def _port_bound(port: int) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("0.0.0.0", port))
         return False

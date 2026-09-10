@@ -3,6 +3,8 @@
 from dataclasses import replace
 import os
 from pathlib import Path
+import subprocess
+import sys
 from .models import RunStatus
 
 
@@ -12,6 +14,15 @@ def preparation_owner() -> dict:
 
 
 def _host_boot():
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            return result.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
     try:
         return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     except OSError:
