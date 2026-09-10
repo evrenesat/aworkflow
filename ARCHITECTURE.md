@@ -30,11 +30,20 @@ history mutations require authentication, revision and idempotency checks;
 external deleted reads return 410. No history action signals a process or removes
 workflow artifacts.
 
-The web `SidebarEditorLayout` bounds navigation and detail panes within Runs and
-Settings only. Selection resets detail scrolling; polling preserves scroll and
-focus. `GlobalSettings` owns drafts and selected editor IDs across guided/raw
-mode changes, while run dashboards retain pending history keys and deletion
-tombstones across navigation and late responses.
+The current web `SidebarEditorLayout` still bounds navigation and detail panes
+within Runs and Settings. This is a known layout limitation, superseded by the
+owner-approved [UI guidelines](UI_GUIDELINES.md); migration remains planned.
+The target uses document scrolling and shared shell slots: one desktop row for
+app/project/global navigation, one for page/section context and primary actions.
+Pages contribute actions to those slots instead of adding persistent toolbars.
+Mobile uses hamburger navigation and list → detail → Back; secondary maintenance
+and help remain available through menus/disclosures. See the guidelines for
+pixel budgets, allowed scroll exceptions, focus rules, and browser evidence.
+
+Presentation must not take over domain state: `GlobalSettings` owns drafts and
+selected editor IDs across guided/raw mode changes; run dashboards retain pending
+history keys and deletion tombstones across navigation and late responses.
+Polling preserves scroll/focus. Responsive transitions preserve those owners.
 
 ## High-Level Data Flow
 

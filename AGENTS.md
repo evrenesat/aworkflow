@@ -26,3 +26,11 @@
   publication, CI, and live activation separately; do not claim deployed usability
   from a local approval. Fix a failed delivery gate before accumulating more
   completed local plans. Preserve active execution worktrees and never force-push.
+
+## UI and interaction work
+
+- Read and follow [UI_GUIDELINES.md](UI_GUIDELINES.md) for every web UI change.
+  It defines the owner-approved two-row desktop header, mobile hamburger/list-detail
+  navigation, document scrolling, state preservation, and browser acceptance rules.
+- These requirements supersede older bounded-pane layout guidance. Implementing
+  them remains planned work; do not describe the current UI as already compliant.

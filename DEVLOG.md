@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-10 — Record compact UI acceptance requirements
+
+- Record the owner-approved two-row desktop header, mobile hamburger navigation,
+  document scrolling and full mobile editing in UI_GUIDELINES.md. Root/web agent
+  guidance now references this contract; architecture distinguishes the current
+  bounded-pane limitation from the planned replacement. No UI implementation is
+  claimed by this documentation update.
+
 ## 2026-09-10 — Close the publication gap and exercise CI portability
 
 - Add explicitly repository-authorized publication before successful workflow

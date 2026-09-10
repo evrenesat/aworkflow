@@ -32,18 +32,19 @@
 - Run context has one loader; status refresh must not overwrite detailed context with Lite. One page Refresh coordinates list/status/events/context and retains valid partial results. Diagnostics summary uses structured fields; Raw details stays collapsed until requested.
 - Prompt-deletion recovery belongs to GlobalSettings, survives tab/editor navigation, and clears only after acknowledged configuration save or explicit discard. Keep the recent-count editor only in General and commit its separate input draft on blur/Enter.
 
-- Runs and Settings own a bounded viewport through `SidebarEditorLayout`; other
-  pages retain normal scrolling. Keep page controls outside scrolling editors
-  and selection in the draft owner. Verify desktop/mobile pane geometry with
-  Chromium after building; DOM-only tests cannot establish independent scrolling.
+- Follow [UI_GUIDELINES.md](../../../UI_GUIDELINES.md): two compact desktop
+  header rows, mobile hamburger navigation and list → detail → Back, document
+  scrolling, and outcome-based browser checks. The previous bounded-pane design
+  is superseded; its replacement is planned, not yet implemented. Preserve the
+  existing draft owners while migrating presentation.
 
 - Keep history mutation keys by exact project/run/action until acknowledged or
   definitively rejected (including acknowledgement-required validation). Deletion tombstones suppress late rows and
   close streams; archive retains opened details while removing default-list rows.
 
-- Apply settings overflow only to owning panels. Profile cards inside the
-  Agents & Roles scroller keep their natural height and must not shrink into
-  individual scrollboxes; include that tab in Chromium layout coverage.
+- Profile forms and detail content belong in document flow; do not introduce
+  panel/card scrollers. Keep only the explicit local-scroll exceptions in the
+  UI guidelines, and include Agents & Roles in real-browser coverage.
 
 - Refresh the full loaded history page range, not just its first page. Keep
   the next cursor from the refreshed range and discard superseded responses.
