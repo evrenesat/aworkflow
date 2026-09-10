@@ -1835,3 +1835,23 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   normal internal-checkout launch path and legacy registration recovery.
 - Verification is recorded with the checkpoint handoff after web unit tests,
   production build, Chromium/WebKit responsive journeys, and `git diff --check`.
+
+## 2026-09-10 — Dashboard control-refresh readiness
+
+- The named `RunDashboard.test.tsx` saved-options regression now controls the
+  initial run list, capabilities, and selected-run detail independently. Its
+  observed sequence is exact: with list/capabilities pending the max-turns
+  control is absent; after the list settles but capabilities remain pending it
+  is still absent; after capabilities settle while detail remains pending the
+  selected `run-owned` control is enabled at baseline `8`; after detail settles
+  it remains `8`; the real change handler then sets draft `17`.
+- On visibility restoration the test waits for rendered `saved-team` and
+  `harness/saved` options before confirming exact draft `17` and `run-owned`
+  remain. The controlled ordering did not reproduce the historical `17` to `8`
+  failure, so it establishes safe preconditions and post-readiness preservation,
+  not a causal explanation of that historical incident. Production control
+  ownership is unchanged.
+- Verification passed for focused RunDashboard (85 tests), the normal parallel
+  web suite (331 tests), the production build, and `git diff --check`.
+  Backend/browser evidence is reused; CI, publication, activation, and
+  physical-device behavior remain downstream.

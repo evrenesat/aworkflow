@@ -287,8 +287,47 @@ describe('RunDashboard', () => {
   })
 
   it('refreshes saved configuration options without losing the selected run or control draft', async () => {
+    const initialRuns = deferred<{ runs: typeof ownedRun[]; next_cursor: null; schema_version: number }>()
+    const initialCapabilities = deferred<typeof capabilities>()
+    const initialRunDetail = deferred<typeof ownedRun>()
+    vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(() => initialRuns.promise)
+    vi.mocked(api.getControlPlaneCapabilities).mockImplementationOnce(() => initialCapabilities.promise)
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => initialRunDetail.promise)
     const view = renderDashboardNode(dashboardNode())
-    await waitFor(() => expect(screen.getByLabelText('Control max turns')).toBeDefined())
+
+    await waitFor(() => {
+      expect(api.listControlPlaneRuns).toHaveBeenCalled()
+      expect(api.getControlPlaneCapabilities).toHaveBeenCalled()
+    })
+    expect(screen.queryByLabelText('Control max turns')).toBeNull()
+
+    await act(async () => {
+      initialRuns.resolve({ runs: [ownedRun], next_cursor: null, schema_version: 1 })
+      await initialRuns.promise
+    })
+    expect(screen.queryByLabelText('Control max turns')).toBeNull()
+
+    await act(async () => {
+      initialCapabilities.resolve(capabilities)
+      await initialCapabilities.promise
+    })
+    await waitFor(() => {
+      expect(api.getControlPlaneRun).toHaveBeenCalledWith(
+        'control-project',
+        'run-owned',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+      const maxTurns = screen.getByLabelText('Control max turns') as HTMLInputElement
+      expect(maxTurns.disabled).toBe(false)
+      expect(maxTurns.value).toBe('8')
+      expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
+    })
+
+    await act(async () => {
+      initialRunDetail.resolve(ownedRun)
+      await initialRunDetail.promise
+    })
+    expect((screen.getByLabelText('Control max turns') as HTMLInputElement).value).toBe('8')
     fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '17' } })
     vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
       ...capabilities,
@@ -297,11 +336,9 @@ describe('RunDashboard', () => {
     })
 
     view.rerender(dashboardNode({ visible: false }))
-    const refreshCalls = vi.mocked(api.getControlPlaneCapabilities).mock.calls.length
     view.rerender(dashboardNode({ visible: true }))
-    await waitFor(() => expect(vi.mocked(api.getControlPlaneCapabilities).mock.calls.length).toBeGreaterThan(refreshCalls))
-    expect(screen.getByRole('option', { name: 'saved-team' })).toBeDefined()
-    expect(screen.getByRole('option', { name: 'harness/saved' })).toBeDefined()
+    await screen.findByRole('option', { name: 'saved-team' })
+    await screen.findByRole('option', { name: 'harness/saved' })
     expect((screen.getByLabelText('Control max turns') as HTMLInputElement).value).toBe('17')
     expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
   })
