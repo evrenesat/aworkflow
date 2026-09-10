@@ -3263,6 +3263,17 @@ p = "do it"
                 else:
                     os.environ['HOME'] = original_home
             assert result == 0
+            run_dirs = sorted((home_dir / '.aflow' / 'runs').iterdir())
+            assert len(run_dirs) == 1
+            run_dir = run_dirs[0]
+            run_json = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert run_dir.resolve().is_relative_to(home_dir.resolve())
+            assert run_json['repo_root'] == str(home_dir)
+            assert run_json['run_dir'] == str(run_dir)
+            assert run_json['workflow_name'] == 'other'
+            assert run_json['plan_path'] == str(plan_path)
+            assert run_json['original_plan_path'] == str(plan_path)
+            assert run_json['active_plan_path'] == str(plan_path)
 
     def test_cli_install_skills_runs_without_config_bootstrap(self) -> None:
         import aflow.cli as cli_module

@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-10 — Isolate real CLI test run artifacts (Checkpoint 1)
+
+- `test_cli_workflow_override` now inspects its durable `run.json` to verify
+  the run stays beneath the temporary root, records workflow `other`, and
+  references the test-owned plan; its existing cwd/HOME restoration remains
+  unchanged.
+- Verification passed: targeted and full CLI tests (157 tests, 129 subtests),
+  `git diff --check`, and a disposable outer-Git-checkout subprocess proof
+  (1 passed, with no caller `.aflow` created).
+
 ## 2026-09-10 — Await Settings navigation and header actions (Checkpoint 1)
 
 - HISTORY: CI failure evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-fdc9ff2-failed.log` showed the mobile Skills journey waiting for a desktop `tab` after the responsive combobox count was observed as zero, and the macOS Changelog journey observed zero Save buttons immediately after the Advanced TOML editor appeared.
