@@ -129,11 +129,12 @@ function renderDashboardNode(node: React.ReactElement) {
   return render(node)
 }
 
-function dashboardNode(options: { requestedRunId?: string | null } = {}) {
+function dashboardNode(options: { requestedRunId?: string | null; visible?: boolean } = {}) {
   return (
     <RunDashboard
       projectId="control-project"
       requestedRunId={options.requestedRunId ?? null}
+      visible={options.visible ?? true}
       initialPlanPath={null}
       onInitialPlanHandled={vi.fn()}
       onOpenSettings={vi.fn()}
@@ -195,6 +196,26 @@ describe('RunDashboard', () => {
     view.rerender(<RunDashboard {...props} visible />)
     await waitFor(() => expect(api.subscribeToRunEvents).toHaveBeenCalledTimes(2))
     expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(count + 1)
+  })
+
+  it('refreshes saved configuration options without losing the selected run or control draft', async () => {
+    const view = renderDashboardNode(dashboardNode())
+    await waitFor(() => expect(screen.getByLabelText('Control max turns')).toBeDefined())
+    fireEvent.change(screen.getByLabelText('Control max turns'), { target: { value: '17' } })
+    vi.mocked(api.getControlPlaneCapabilities).mockResolvedValue({
+      ...capabilities,
+      teams: [...capabilities.teams, 'saved-team'],
+      admitted_role_selectors: { worker: [...capabilities.admitted_role_selectors.worker, 'harness/saved'] },
+    })
+
+    view.rerender(dashboardNode({ visible: false }))
+    const refreshCalls = vi.mocked(api.getControlPlaneCapabilities).mock.calls.length
+    view.rerender(dashboardNode({ visible: true }))
+    await waitFor(() => expect(vi.mocked(api.getControlPlaneCapabilities).mock.calls.length).toBeGreaterThan(refreshCalls))
+    expect(screen.getByRole('option', { name: 'saved-team' })).toBeDefined()
+    expect(screen.getByRole('option', { name: 'harness/saved' })).toBeDefined()
+    expect((screen.getByLabelText('Control max turns') as HTMLInputElement).value).toBe('17')
+    expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
   })
 
   it('resolves a promoted-plan handoff against fresh plans and keeps it after a failed refresh', async () => {
@@ -555,6 +576,21 @@ describe('RunDashboard', () => {
     expect((screen.getByLabelText('Control max turns') as HTMLInputElement).value).toBe('10')
   })
 
+  it('keeps a rejected control draft and run status while showing the server error', async () => {
+    vi.mocked(api.controlControlPlaneRun).mockRejectedValueOnce(
+      new ApiError(422, 'saved-team is not admitted for this run', 'invalid_control'),
+    )
+    renderDashboard()
+
+    await waitFor(() => expect(screen.getByLabelText('Control team')).toBeDefined())
+    fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
+    await waitFor(() => expect(screen.getByText('saved-team is not admitted for this run')).toBeDefined())
+    expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('full')
+    expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
+    expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
+  })
+
   it('offers only capability-admitted selector values and explains the next safe boundary', async () => {
     vi.mocked(api.controlControlPlaneRun).mockResolvedValue({
       revision: 2,
@@ -568,7 +604,7 @@ describe('RunDashboard', () => {
     expect((screen.getByLabelText('Selector for Worker') as HTMLSelectElement).tagName).toBe('SELECT')
     expect(screen.getByRole('option', { name: 'harness/impl-a' })).toBeDefined()
     expect(screen.getByRole('option', { name: 'harness/impl-b' })).toBeDefined()
-    expect(screen.getByText(/Changes are saved now and applied between turns/)).toBeDefined()
+    expect(screen.getByText(/Changes are saved now and apply at the next safe turn/)).toBeDefined()
 
     await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('base'))
     fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
@@ -1545,6 +1581,44 @@ describe('RunDashboard', () => {
     expect(screen.getByText(/Worker: inactive/)).toBeTruthy()
     expect(screen.getByText('Raw details').parentElement?.hasAttribute('open')).toBe(false)
   })
+
+  it('separates pending control model details from the last executed turn evidence', async () => {
+    const pendingRun = {
+      ...ownedRun,
+      evidence: {
+        ...ownedRun.evidence,
+        overrides: { state: 'pending', revision: 2, role_selectors: { worker: 'codex.pending' } },
+      },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [pendingRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(pendingRun)
+    vi.mocked(api.listRunEvents).mockResolvedValue([{
+      sequence: 1,
+      event_type: 'turn_started',
+      data: {
+        turn_number: 4,
+        step_name: 'implement',
+        step_role: 'worker',
+        resolved_model_display: 'executed-model',
+      },
+      schema_version: 1,
+      timestamp: '2024-01-01T00:04:00Z',
+    }])
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: {
+        ...emptyProjection.form,
+        harnesses: { codex: { pending: { model: 'pending-model', effort: 'low' } } },
+      },
+    })
+
+    renderDashboard()
+    await waitFor(() => expect(screen.getByText(/Last executed/)).toBeDefined())
+    expect(screen.getByText(/executed-model/)).toBeDefined()
+    expect(screen.getByText(/codex\.pending · pending-model · effort low/)).toBeDefined()
+    expect(screen.getByText(/applies at the next turn or on resume/)).toBeDefined()
+  })
+
   it('loads full debugging context straight from Diagnostics without any acknowledgement', async () => {
     renderDashboard()
     await screen.findByRole('button', { name: 'run-owned' })

@@ -467,7 +467,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       else if (server) setServerText(server.advanced_toml)
       if (epochRef.current !== epoch) return
       const parts: string[] = []
-      if (configSaved) parts.push('Workflow settings saved; new runs use the saved configuration, existing runs keep their snapshot.')
+      if (configSaved) parts.push('Workflow settings saved; new runs use the saved configuration, and existing control-plane runs can select updated teams and profiles. Saved run controls apply at the next turn or when the run resumes.')
       if (savedSkills.length) parts.push(`Skill text saved for ${savedSkills.join(', ')}; the next manager invocation uses it.`)
       setNotice(parts.length ? parts.join(' ') : 'All changes saved.')
     } catch (reason) {

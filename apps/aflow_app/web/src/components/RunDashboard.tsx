@@ -288,6 +288,60 @@ function checkpointSummary(context: RunContext | null): CheckpointSummary | null
   return { name, index, count: checkpoints.length, complete: planState.is_complete === true }
 }
 
+interface LastExecutedEvidence {
+  turnNumber: number | null
+  stepName: string | null
+  role: string | null
+  selector: string | null
+  model: string | null
+}
+
+function lastExecutedEvidence(
+  events: RunEvent[],
+  context: RunContext | null,
+): LastExecutedEvidence | null {
+  const textValue = (record: Record<string, unknown>, ...keys: string[]): string | null => {
+    for (const key of keys) {
+      const value = record[key]
+      if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 240)
+    }
+    return null
+  }
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.event_type !== 'turn_started') continue
+    const data = event.data
+    const evidence = {
+      turnNumber: typeof data.turn_number === 'number' ? data.turn_number : null,
+      stepName: textValue(data, 'step_name'),
+      role: textValue(data, 'step_role', 'role'),
+      selector: textValue(data, 'resolved_selector', 'selector'),
+      model: textValue(data, 'resolved_model_display', 'model', 'resolved_model'),
+    }
+    if (evidence.turnNumber !== null || evidence.stepName || evidence.role || evidence.selector || evidence.model) {
+      return evidence
+    }
+  }
+
+  const managerContext = contextRecord(context, 'manager_context')
+  const finishedTurn = managerContext?.finished_turn
+  if (typeof finishedTurn !== 'object' || finishedTurn === null || Array.isArray(finishedTurn)) {
+    return null
+  }
+  const evidence = finishedTurn as Record<string, unknown>
+  const fallback = {
+    turnNumber: typeof evidence.turn_number === 'number' ? evidence.turn_number : null,
+    stepName: textValue(evidence, 'step_name'),
+    role: textValue(evidence, 'role', 'step_role'),
+    selector: textValue(evidence, 'selector', 'resolved_selector'),
+    model: textValue(evidence, 'resolved_model_display', 'model', 'resolved_model'),
+  }
+  return fallback.turnNumber !== null || fallback.stepName || fallback.role || fallback.selector || fallback.model
+    ? fallback
+    : null
+}
+
 interface ManagerOutcome {
   decision: string | null
   finishedTurn: string | null
@@ -1539,6 +1593,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     : 'Not reported'
   const roleChoices = capabilities?.roles ?? []
   const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string> } | null
+  const lastExecuted = lastExecutedEvidence(events, context)
 
   const workflowRoleList = stepRoleMap ? [...new Set(Object.values(stepRoleMap))].sort() : []
   const otherConfiguredRoles = committedForm
@@ -1697,7 +1752,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <div className="section-heading"><h4>Restart with changes</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
                   <div className="notice">
                     Create a new attempt from <span className="mono">{restartSource.run_id}</span> with these choices.
-                    Plan progress is retained. Active sources are stopped first. This attempt uses the current saved configuration; Resume uses the source snapshot.
+                    Plan progress is retained. Active sources are stopped first. This attempt and Resume use the current saved configuration.
                   </div>
                   {restartDraftHint
                     ? <div className="text-xs text-dim">{restartDraftHint}</div>
@@ -1847,6 +1902,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
                   {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
                   <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
+                  {lastExecuted && <div><dt>Last executed</dt><dd>
+                    {lastExecuted.role ? formatMachineLabel(lastExecuted.role) : 'Role not reported'}
+                    {lastExecuted.model ? <> · {lastExecuted.model}</> : null}
+                    {lastExecuted.turnNumber !== null ? <> · turn {lastExecuted.turnNumber}</> : null}
+                  </dd></div>}
                   {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
                     : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
                   {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
@@ -1868,18 +1928,21 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
               {savedOverrides && <details className="dashboard-section" open><summary>Run changes</summary>
                 {savedOverrides && <div>
-                  <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}</p>
+                  <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}{savedOverrides.state === 'pending' ? ' · applies at the next turn or on resume' : ''}</p>
                   {savedOverrides.max_turns && <p>Max turns: {savedOverrides.max_turns}</p>}
                   {savedOverrides.team && <p>Team: {formatMachineLabel(savedOverrides.team)}</p>}
-                  {Object.entries(savedOverrides.role_selectors ?? {}).map(([role, selector]) => <p key={role}>{formatMachineLabel(role)}: {selector}</p>)}
+                  {Object.entries(savedOverrides.role_selectors ?? {}).map(([role, selector]) => {
+                    const modelEffort = selectorModelEffortText(selector, committedForm)
+                    return <p key={role}>{formatMachineLabel(role)}: {selector}{modelEffort ? <> · {modelEffort}</> : null}</p>
+                  })}
+                  {savedOverrides.state === 'pending' && <p>Saved controls apply at the next turn or when the run resumes.</p>}
                 </div>}
               </details>}
 
               {selectedRunHasLiveControls && <details className="dashboard-section"><summary>Adjust run</summary>
                 {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
                 <div className="notice">
-                  Changes are saved now and applied between turns. They remain marked Pending until the run
-                  confirms them. To use a profile outside this run's available choices, restart the run.
+                  Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
                 </div>
                 <div className="dashboard-form-grid">
                   <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>

@@ -18,9 +18,11 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp5 v01` — approved.
+- Last Reviewed Checkpoint: `cp6 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp6 v01` from the immediately preceding worker worktree against approved CP5 `281bdeb`; worktree fallback used because no pending CP6 commit exists (zero intervening implementation commits). Reviewed live UI option refresh, draft/error preservation, pending versus executed role/model evidence and timing copy. Verification: 282 web tests passed, production build and diff check passed; Chromium with temporary config and in-memory units passed Settings team save → existing-run selection → accepted/rejected feedback with retained draft. No material findings. CP7 remains unchecked; manager 40 KiB hard guard and 16 KiB compact summary retained.
 
 - 2026-09-10: Approved `cp5 v01` from the immediately preceding worker's repaired worktree against approved CP4 `62d8ac9`; worktree fallback used because no pending CP5 commit exists (zero intervening implementation commits). The cp06-v01 non-checkpoint overlay is resolved: admission validates the preserved pending next_step before status fallbacks. Reviewed shared live admission, capabilities, HTTP/MCP errors and runtime boundary validation. Verification: 423 passed, 43 subtests; diff check passed. No material findings. CP6 remains unchecked; manager 40 KiB hard guard and 16 KiB compact summary retained.
 
@@ -206,7 +208,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** Conflicting live-source injection ownership; do not fall back to a hardcoded home or repository path.
 
-### [ ] Checkpoint 6: Make UI controls reflect live configuration
+### [x] Checkpoint 6: Make UI controls reflect live configuration
 
 **Goal:** The user can save a team/profile, select it for an existing run, and understand when the change takes effect.
 
@@ -216,10 +218,10 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Refresh committed options through the existing save/navigation/Refresh path; do not use snapshot catalogs. Preserve the user's draft and exact selected project/run identity. Ensure new saved teams/profiles appear without restarting the UI service.
-- [ ] Show concise text that saved settings apply at the next turn and on resume. Distinguish selected pending controls from the last executed role/model evidence; no fingerprint displayed as an execution restriction.
-- [ ] On rejected control submission, retain the draft, show the server's actionable error, leave previous selection/status intact and preserve established retry/idempotency behavior. No confirmation dialog for ordinary changes.
-- [ ] Test save-new-team then select-on-existing-run, settings refresh without lost draft, rejection without a fabricated stopped status, and pending versus last-executed model display.
+- [x] Refresh committed options through the existing save/navigation/Refresh path; do not use snapshot catalogs. Preserve the user's draft and exact selected project/run identity. Ensure new saved teams/profiles appear without restarting the UI service.
+- [x] Show concise text that saved settings apply at the next turn and on resume. Distinguish selected pending controls from the last executed role/model evidence; no fingerprint displayed as an execution restriction.
+- [x] On rejected control submission, retain the draft, show the server's actionable error, leave previous selection/status intact and preserve established retry/idempotency behavior. No confirmation dialog for ordinary changes.
+- [x] Test save-new-team then select-on-existing-run, settings refresh without lost draft, rejection without a fabricated stopped status, and pending versus last-executed model display.
 
 **Dependencies:** Checkpoint 5.
 
