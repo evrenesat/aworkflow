@@ -96,7 +96,7 @@ def _resolve_relative_settings(
     source: LiveConfigSource,
 ) -> WorkflowUserConfig:
     """Resolve configuration-defined filesystem paths from the live file."""
-    worktree_root = workflow_config.aflow.worktree_root
+    worktree_root = getattr(workflow_config.aflow, "worktree_root", None)
     if (
         worktree_root is None
         or worktree_root.startswith("~")
@@ -295,6 +295,7 @@ def load_live_config_for_run(
     saved_live_config_path: str | Path | None = None,
     run_metadata: Mapping[str, Any] | None = None,
     default_config_path: str | Path | None = None,
+    loader: Callable[[Path], WorkflowUserConfig] | None = None,
 ) -> LoadedLiveConfig:
     """Load current configuration for a run without trusting its snapshots.
 
@@ -321,6 +322,7 @@ def load_live_config_for_run(
         legacy_snapshot_origin=legacy_origin,
         legacy_origin_base_dir=legacy_base,
         default_config_path=default_config_path,
+        loader=loader,
     )
 
 

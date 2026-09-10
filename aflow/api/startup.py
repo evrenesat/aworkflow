@@ -586,6 +586,21 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         ),
         restarted_from_run_id=request.restarted_from_run_id,
         skipped_steps=skipped_steps,
+        team_explicit=(
+            request.team_explicit
+            if request.team_explicit is not None
+            else request.team is not None
+        ),
+        max_turns_explicit=(
+            request.max_turns_explicit
+            if request.max_turns_explicit is not None
+            else request.max_turns is not None
+        ),
+        start_step_explicit=(
+            request.start_step_explicit
+            if request.start_step_explicit is not None
+            else request.start_step is not None
+        ),
     )
 
 
@@ -654,6 +669,7 @@ def prepare_startup_with_answer(
         new_request = replace(
             effective_request,
             start_step=selected_step,
+            start_step_explicit=True,
         )
         result = prepare_startup(new_request)
         if isinstance(result, StartupQuestion):

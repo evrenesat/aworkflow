@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .api import (
     AnalyzeRequest,
@@ -35,6 +35,7 @@ from .config import (
     WorkflowStepConfig,
 )
 from .manager_context import scoped_reviewer_rejection_count
+from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
 from .plan import PlanSnapshot
 from .skill_installer import InstallerError, install_skills
@@ -100,8 +101,6 @@ _PENDING_REPARTITION_ARTIFACT_FIELDS = (
 )
 from .workflow import (
     WorkflowError,
-    _freeze_run_identity,
-    _frozen_identity_mismatch,
     _scope_envelope_reference,
     _validate_scope_envelope_bytes,
     load_scope_envelope_for_resume,
@@ -109,7 +108,6 @@ from .workflow import (
     move_completed_plan_to_done,
 )
 from .repartition import derive_generation_id
-from .run_config_snapshot import SnapshotError, load_run_config_snapshot
 from .runlog import load_run_json
 from .analyzer import resolve_run_id
 from .status import BannerRenderer, WorkflowGraphSource, build_workflow_show
@@ -118,6 +116,7 @@ RUN_HELP = """\
 Flags:
   --plan/-p PLAN_FILE       Path to the plan Markdown file.
   --workflow/-w WORKFLOW    Name of the workflow to run (default from config).
+  --config CONFIG_FILE      Current workflow configuration for launch/resume.
   --start-step/-ss STEP     Start from this step name or 1-based index (default: first).
   --team/-t TEAM_NAME       Override workflow team.
   --max-turns/-mt N         Maximum turns (default from config).
@@ -165,6 +164,9 @@ class ResumeBootstrap:
     frozen_run_identity: FrozenRunIdentity
     config_path: Path
     workflow_config: Any
+    team_explicit: bool
+    max_turns_explicit: bool
+    start_step_override: bool = False
 
 
 INSTALL_SKILLS_HELP = """\
@@ -309,7 +311,6 @@ def _validate_current_resume_metadata(
         "extra_instructions",
         "lifecycle_setup",
         "lifecycle_teardown",
-        "frozen_config",
         *_CURRENT_MANAGER_RESUME_FIELDS,
         "hotplug_schema_version",
         "role_selectors",
@@ -1099,7 +1100,13 @@ def _decode_frozen_run_identity(
     prev_run: Mapping[str, object],
     run_id: Path,
 ) -> FrozenRunIdentity:
-    """Admit only the exact current persisted schema and decode its identity."""
+    """Decode diagnostic identity while leaving configuration admission live.
+
+    Schema-v2 run metadata remains required for the controller-owned resume
+    envelope, but ``frozen_config`` itself is optional.  Older fields are
+    retained when present for diagnostics and continuation facts; none of them
+    are required to select or admit the current configuration.
+    """
     schema_version = prev_run.get("schema_version")
     if (
         not isinstance(schema_version, int)
@@ -1114,37 +1121,47 @@ def _decode_frozen_run_identity(
 
     frozen_value = prev_run.get("frozen_config")
     if not isinstance(frozen_value, Mapping):
+        frozen_value = None
+
+    def metadata_value(field_name: str) -> object:
+        value = prev_run.get(field_name)
+        if value is None and isinstance(frozen_value, Mapping):
+            value = frozen_value.get(field_name)
+        return value
+
+    workflow_name = metadata_value("workflow_name")
+    if not isinstance(workflow_name, str) or not workflow_name.strip():
         raise _resume_metadata_error(
             run_id,
-            "frozen_config",
-            "expected a mapping for schema-versioned metadata",
+            "workflow_name",
+            "expected a non-empty string",
         )
-
-    values: dict[str, object] = {}
-    for field_name in ("workflow_name", "config_path", "config_fingerprint"):
-        value = frozen_value.get(field_name)
-        if not isinstance(value, str) or not value.strip():
-            raise _resume_metadata_error(
-                run_id,
-                f"frozen_config.{field_name}",
-                "expected a non-empty string",
-            )
-        values[field_name] = value
+    values: dict[str, object] = {"workflow_name": workflow_name}
+    for field_name in (
+        "config_path",
+        "config_fingerprint",
+        "live_config_path",
+    ):
+        value = metadata_value(field_name)
+        values[field_name] = (
+            value
+            if isinstance(value, str) and value.strip()
+            else None
+        )
+    for field_name in ("team_explicit", "max_turns_explicit"):
+        value = metadata_value(field_name)
+        values[field_name] = value if isinstance(value, bool) else None
     for field_name in (
         "continuation_from_branch",
         "continuation_from_head",
         "continuation_mode",
     ):
-        value = frozen_value.get(field_name)
-        if value is not None and (
-            not isinstance(value, str) or not value.strip()
-        ):
-            raise _resume_metadata_error(
-                run_id,
-                f"frozen_config.{field_name}",
-                "expected a non-empty string or null",
-            )
-        values[field_name] = value
+        value = metadata_value(field_name)
+        values[field_name] = (
+            value
+            if isinstance(value, str) and value.strip()
+            else None
+        )
 
     return FrozenRunIdentity(**values)
 
@@ -1166,6 +1183,8 @@ def _bootstrap_resume_invocation(
     *,
     repo_root: Path,
     config_path: Path | None = None,
+    default_config_path: Path | None = None,
+    config_path_is_explicit: bool = False,
     workflow_config: Any,
     requested_run_id: str | None,
     workflow_arg: str | None,
@@ -1177,6 +1196,7 @@ def _bootstrap_resume_invocation(
     extra_instructions_provided: bool,
     reset_scope: bool = False,
     rehome_worktree: str | Path | None = None,
+    live_loader: Callable[[Path], Any] | None = None,
 ) -> ResumeBootstrap:
     """Resolve one durable run and reconstruct omitted resume identity read-only."""
     resolved_run_id, _source = resolve_run_id(requested_run_id, repo_root)
@@ -1210,17 +1230,6 @@ def _bootstrap_resume_invocation(
             replacement_worktree=rehome_worktree,
         )
         prev_run = relocation.payload(prev_run)
-        # Relocation changes only the in-memory identity path when the saved
-        # config was inside a recorded source root. Fingerprint/workflow stay
-        # byte-for-byte authoritative; external paths remain mismatched.
-        frozen_run_identity = replace(
-            frozen_run_identity,
-            config_path=str(
-                relocation.map_frozen_config_path(
-                    frozen_run_identity.config_path
-                )
-            ),
-        )
     plan_path = _resume_plan_path(prev_run, repo_root)
     plan_field = "original_plan_path"
     if plan_path is None:
@@ -1240,24 +1249,25 @@ def _bootstrap_resume_invocation(
             f"saved plan '{plan_path}' is not readable ({exc})",
         ) from exc
 
-    # A frozen snapshot is the run's saved configuration: resume always uses
-    # it, even when the global configuration has since changed or removed the
-    # workflow. Legacy runs without a snapshot keep comparing current config.
     try:
-        snapshot = load_run_config_snapshot(repo_root, run_id)
-    except SnapshotError as exc:
-        raise ValueError(f"error: run '{resolved_run_id.name}' {exc}") from None
-    effective_config_path = config_path or (repo_root / "aflow.toml")
-    if snapshot is not None:
-        try:
-            workflow_config = load_workflow_config(snapshot.config_path)
-        except ConfigError as exc:
-            raise ValueError(
-                f"error: run '{resolved_run_id.name}' has an unusable saved "
-                f"configuration snapshot ({exc}); resume from this run is "
-                "unavailable. Start a fresh run to use the current configuration."
-            ) from None
-        effective_config_path = snapshot.config_path
+        loaded_live = load_live_config_for_run(
+            repo_root,
+            run_id,
+            config_path=(config_path if config_path_is_explicit else None),
+            run_metadata=prev_run,
+            default_config_path=(
+                default_config_path
+                or config_path
+                or (repo_root / "aflow.toml")
+            ),
+            loader=live_loader or (lambda _path: workflow_config),
+        )
+    except ConfigError as exc:
+        raise ValueError(
+            f"error: run '{resolved_run_id.name}' current configuration is unusable: {exc}"
+        ) from None
+    workflow_config = loaded_live.workflow_config
+    effective_config_path = loaded_live.source.config_path
 
     workflow_name = prev_run.get("workflow_name")
     if not isinstance(workflow_name, str) or not workflow_name.strip():
@@ -1273,25 +1283,6 @@ def _bootstrap_resume_invocation(
         )
     workflow_spec = workflow_config.workflows[workflow_name]
 
-    current_identity = _freeze_run_identity(
-        workflow_name,
-        workflow_config,
-        config_dir=(
-            Path(frozen_run_identity.config_path)
-            if snapshot is not None
-            else effective_config_path
-        ),
-        continuation_from_branch=frozen_run_identity.continuation_from_branch,
-        continuation_from_head=frozen_run_identity.continuation_from_head,
-        continuation_mode=frozen_run_identity.continuation_mode,
-    )
-    mismatch = _frozen_identity_mismatch(frozen_run_identity, current_identity)
-    if mismatch is not None:
-        raise ValueError(
-            f"error: run '{resolved_run_id.name}' frozen configuration mismatch: "
-            f"{mismatch}."
-        )
-
     team_value = prev_run.get("team")
     if team_value is not None and (
         not isinstance(team_value, str) or not team_value.strip()
@@ -1302,6 +1293,9 @@ def _bootstrap_resume_invocation(
             "expected null or a non-empty string",
         )
     saved_team = team_value if isinstance(team_value, str) else None
+    saved_team_explicit = frozen_run_identity.team_explicit
+    if saved_team_explicit is None:
+        saved_team_explicit = saved_team is not None
 
     start_step_value = prev_run.get("selected_start_step")
     if start_step_value is not None and (
@@ -1315,20 +1309,16 @@ def _bootstrap_resume_invocation(
     saved_start_step = (
         start_step_value if isinstance(start_step_value, str) else None
     )
-    if saved_start_step is not None and saved_start_step not in workflow_spec.steps:
+    saved_max_turns = _resume_max_turns(prev_run)
+    if saved_max_turns is None:
         raise _resume_metadata_error(
             resolved_run_id,
-            "selected_start_step",
-            f"'{saved_start_step}' is not a configured step of workflow '{workflow_name}'",
-        )
-
-    max_turns = _resume_max_turns(prev_run)
-    if max_turns is None:
-        raise _resume_metadata_error(
-            resolved_run_id,
-            "max_turns",
+            "effective_max_turns",
             "expected a positive integer",
         )
+    saved_max_turns_explicit = frozen_run_identity.max_turns_explicit
+    if saved_max_turns_explicit is None:
+        saved_max_turns_explicit = True
     extra_value = prev_run.get("extra_instructions")
     if not isinstance(extra_value, list) or not all(
         isinstance(item, str) for item in extra_value
@@ -1355,10 +1345,15 @@ def _bootstrap_resume_invocation(
                 f"but run '{resolved_run_id.name}' saved '{plan_path}'."
             )
 
-    effective_saved_team = saved_team
+    effective_saved_team = (
+        saved_team
+        if saved_team_explicit
+        else workflow_spec.team
+    )
     resume_team_override: str | None = None
     resumed_from_team: str | None = None
-    if team_arg is not None and team_arg != effective_saved_team:
+    team_override_requested = team_arg is not None
+    if team_arg is not None:
         if requested_run_id is None:
             raise ValueError(
                 "error: resume team override requires explicit --resume RUN_ID"
@@ -1377,7 +1372,10 @@ def _bootstrap_resume_invocation(
         resumed_from_team = saved_team
         resume_team_override = team_arg
         effective_saved_team = team_arg
+        saved_team_explicit = True
 
+    effective_start_step = saved_start_step
+    start_step_override = False
     if start_step_arg is not None:
         resolved_start_step, start_step_error = _resolve_numeric_start_step(
             start_step_arg,
@@ -1385,17 +1383,43 @@ def _bootstrap_resume_invocation(
         )
         if start_step_error is not None:
             raise ValueError(start_step_error)
-        if saved_start_step is None or resolved_start_step != saved_start_step:
-            raise ValueError(
-                f"error: resume start-step mismatch: requested '{start_step_arg}', "
-                f"but run '{resolved_run_id.name}' saved '{saved_start_step}'."
-            )
-
-    if max_turns_arg is not None and max_turns_arg != max_turns:
-        raise ValueError(
-            f"error: resume max-turns mismatch: requested {max_turns_arg}, "
-            f"but run '{resolved_run_id.name}' saved {max_turns}."
+        effective_start_step = resolved_start_step
+        # Explicit resume intent must survive even when the requested step is
+        # equal to the saved starting step. The saved run may have failed
+        # before a different, now-removed step, and equality alone cannot
+        # distinguish that correction from an omitted argument.
+        start_step_override = True
+    elif saved_start_step is not None and saved_start_step not in workflow_spec.steps:
+        raise _resume_metadata_error(
+            resolved_run_id,
+            "selected_start_step",
+            f"'{saved_start_step}' is not a configured step of current workflow "
+            f"'{workflow_name}'; pass --start-step with a current step",
         )
+
+    effective_max_turns = saved_max_turns
+    max_turns_override = False
+    if max_turns_arg is not None:
+        effective_max_turns = max_turns_arg
+        max_turns_override = max_turns_arg != saved_max_turns
+        saved_max_turns_explicit = True
+    elif not saved_max_turns_explicit:
+        current_default_max_turns = getattr(
+            getattr(workflow_config, "aflow", None),
+            "max_turns",
+            None,
+        )
+        if (
+            not isinstance(current_default_max_turns, int)
+            or isinstance(current_default_max_turns, bool)
+            or current_default_max_turns < 1
+        ):
+            raise ValueError(
+                f"error: run '{resolved_run_id.name}' current configuration has "
+                "an invalid [aflow].max_turns default."
+            )
+        effective_max_turns = current_default_max_turns
+
     effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
     mismatch_reason = _resume_candidate_mismatch_reason(
@@ -1405,10 +1429,15 @@ def _bootstrap_resume_invocation(
         workflow_name,
         plan_path,
         effective_saved_team,
-        saved_start_step,
-        max_turns,
+        effective_start_step,
+        effective_max_turns,
         saved_extra,
-        allow_team_override=resume_team_override is not None,
+        allow_team_override=team_override_requested,
+        allow_start_step_override=start_step_override,
+        allow_max_turns_override=max_turns_override,
+        allow_extra_instructions_override=extra_instructions_provided,
+        team_explicit=saved_team_explicit,
+        max_turns_explicit=saved_max_turns_explicit,
     )
     if mismatch_reason is not None:
         raise ValueError(
@@ -1428,6 +1457,12 @@ def _bootstrap_resume_invocation(
         relocation=relocation,
         resumed_from_team=resumed_from_team,
         resume_team_override=resume_team_override,
+        effective_start_step=effective_start_step,
+        start_step_override=start_step_override,
+        team_explicit=saved_team_explicit,
+        max_turns_explicit=saved_max_turns_explicit,
+        start_step_explicit=True,
+        effective_max_turns=effective_max_turns,
     )
     assert resume_context is not None
 
@@ -1438,13 +1473,16 @@ def _bootstrap_resume_invocation(
         plan_path=plan_path,
         workflow_name=workflow_name,
         team=effective_saved_team,
-        start_step=saved_start_step,
-        max_turns=max_turns,
+        start_step=effective_start_step,
+        max_turns=effective_max_turns,
         extra_instructions=effective_extra,
         resume_context=resume_context,
         frozen_run_identity=frozen_run_identity,
         config_path=effective_config_path,
         workflow_config=workflow_config,
+        team_explicit=saved_team_explicit,
+        max_turns_explicit=saved_max_turns_explicit,
+        start_step_override=start_step_override,
     )
 
 
@@ -1461,6 +1499,10 @@ def _resume_candidate_mismatch_reason(
     *,
     allow_team_override: bool = False,
     allow_extra_instructions_override: bool = False,
+    allow_start_step_override: bool = False,
+    allow_max_turns_override: bool = False,
+    team_explicit: bool | None = None,
+    max_turns_explicit: bool | None = None,
 ) -> str | None:
     """Check if the previous run is a valid resume candidate for the current invocation.
 
@@ -1483,10 +1525,6 @@ def _resume_candidate_mismatch_reason(
         isinstance(item, str) for item in lifecycle_teardown
     ):
         return "it has invalid lifecycle resume metadata (teardown)"
-
-    current_setup = current_workflow_config.setup or ()
-    if tuple(lifecycle_setup) != current_setup:
-        return "its lifecycle setup does not match this invocation"
 
     feature_branch = prev_run.get("feature_branch")
     worktree_path = prev_run.get("worktree_path")
@@ -1533,20 +1571,33 @@ def _resume_candidate_mismatch_reason(
         return "its plan path does not match this invocation"
 
     prev_team = prev_run.get("team")
-    prev_team_none_or_absent = prev_team is None or (isinstance(prev_team, str) and not prev_team.strip())
-    current_team_none_or_absent = current_team is None or not current_team.strip()
-    if prev_team_none_or_absent != current_team_none_or_absent and not allow_team_override:
+    prev_team_explicit = (
+        team_explicit
+        if team_explicit is not None
+        else isinstance(prev_team, str) and bool(prev_team.strip())
+    )
+    if prev_team_explicit and not allow_team_override and prev_team != current_team:
         return "its effective team does not match this invocation"
-    if not prev_team_none_or_absent and not current_team_none_or_absent:
-        if prev_team != current_team and not allow_team_override:
-            return "its effective team does not match this invocation"
 
     prev_selected_start_step = prev_run.get("selected_start_step")
-    if prev_selected_start_step != current_selected_start_step:
+    if (
+        prev_selected_start_step != current_selected_start_step
+        and not allow_start_step_override
+    ):
         return "its selected start step does not match this invocation"
 
     prev_max_turns = _resume_max_turns(prev_run)
-    if prev_max_turns is None or prev_max_turns != current_max_turns:
+    prev_max_turns_explicit = (
+        max_turns_explicit if max_turns_explicit is not None else True
+    )
+    if (
+        prev_max_turns is None
+        or (
+            prev_max_turns_explicit
+            and prev_max_turns != current_max_turns
+            and not allow_max_turns_override
+        )
+    ):
         return "its max-turns value does not match this invocation"
 
     prev_extra_instructions = prev_run.get("extra_instructions")
@@ -1557,9 +1608,10 @@ def _resume_candidate_mismatch_reason(
         return "its extra instructions do not match this invocation"
 
     if terminal_integration_only:
-        current_teardown = getattr(current_workflow_config, "teardown", ()) or ()
-        if tuple(lifecycle_teardown) != current_teardown:
-            return "its lifecycle teardown does not match this invocation"
+        # Teardown belongs to the saved execution context.  A live workflow
+        # edit must not migrate or repeat lifecycle ownership during resume.
+        if not lifecycle_teardown:
+            return "it has no recorded lifecycle teardown"
 
     return None
 
@@ -1889,24 +1941,22 @@ def _reconstruct_resume_context(
     run_dir: Path,
     prev_run: Mapping[str, object],
     plan_path: Path,
-    frozen_run_identity: FrozenRunIdentity,
+    frozen_run_identity: FrozenRunIdentity | None,
     reset_scope: bool,
     require_resume: bool,
     workflow_steps: Mapping[str, object] | None = None,
     relocation: ResumeRelocation | None = None,
     resumed_from_team: str | None = None,
     resume_team_override: str | None = None,
+    effective_start_step: str | None = None,
+    start_step_override: bool = False,
+    team_explicit: bool | None = None,
+    max_turns_explicit: bool | None = None,
+    start_step_explicit: bool | None = None,
+    effective_max_turns: int | None = None,
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
-    if frozen_run_identity is None:
-        if require_resume:
-            raise _resume_metadata_error(
-                resolved_run_id,
-                "frozen_config",
-                "a current frozen run identity is required",
-            )
-        return None
     raw_feature_branch = prev_run.get("feature_branch")
     raw_worktree_path = prev_run.get("worktree_path")
     raw_main_branch = prev_run.get("main_branch")
@@ -2079,8 +2129,10 @@ def _reconstruct_resume_context(
         isinstance(note, str) for note in pending_override_notes
     ):
         pending_override_notes = []
-    effective_max_turns = prev_run.get("effective_max_turns")
-    if not isinstance(effective_max_turns, int) or isinstance(effective_max_turns, bool) or effective_max_turns < 1:
+    resolved_max_turns = effective_max_turns
+    if resolved_max_turns is None:
+        resolved_max_turns = prev_run.get("effective_max_turns")
+    if not isinstance(resolved_max_turns, int) or isinstance(resolved_max_turns, bool) or resolved_max_turns < 1:
         if require_resume:
             raise _resume_metadata_error(
                 resolved_run_id,
@@ -2133,6 +2185,8 @@ def _reconstruct_resume_context(
         interrupted_step_name=(
             None
             if reset_scope
+            else effective_start_step
+            if start_step_override
             else (
                 str(prev_run["current_step_name"])
                 if terminal_integration_only
@@ -2142,8 +2196,45 @@ def _reconstruct_resume_context(
         ),
         pending_finalized_turn=pending_finalized_turn,
         frozen_run_identity=frozen_run_identity,
+        live_config_path=(
+            frozen_run_identity.live_config_path
+            if frozen_run_identity is not None
+            else (
+                str(prev_run["live_config_path"])
+                if isinstance(prev_run.get("live_config_path"), str)
+                else None
+            )
+        ),
+        team_explicit=(
+            team_explicit
+            if team_explicit is not None
+            else (
+                frozen_run_identity.team_explicit
+                if frozen_run_identity is not None
+                and frozen_run_identity.team_explicit is not None
+                else (
+                    prev_run.get("team") is not None
+                    and bool(str(prev_run.get("team")).strip())
+                )
+            )
+        ),
+        max_turns_explicit=(
+            max_turns_explicit
+            if max_turns_explicit is not None
+            else (
+                frozen_run_identity.max_turns_explicit
+                if frozen_run_identity is not None
+                and frozen_run_identity.max_turns_explicit is not None
+                else True
+            )
+        ),
+        start_step_explicit=(
+            start_step_explicit
+            if start_step_explicit is not None
+            else True
+        ),
         override_result=override_resolution.override_result,
-        effective_max_turns=effective_max_turns,
+        effective_max_turns=resolved_max_turns,
         pending_override_notes=tuple(pending_override_notes),
         override_source_run_dir=override_resolution.source_run_dir,
         override_file_present=override_resolution.file_present,
@@ -2173,6 +2264,10 @@ def _detect_resume_candidate(
     require_resume: bool = False,
     reset_scope: bool = False,
     resume_bootstrap: ResumeBootstrap | None = None,
+    allow_start_step_override: bool = False,
+    allow_max_turns_override: bool = False,
+    team_explicit: bool | None = None,
+    max_turns_explicit: bool | None = None,
 ) -> ResumeContext | None:
     """Detect if there's a valid resume candidate and prompt the user.
 
@@ -2232,6 +2327,10 @@ def _detect_resume_candidate(
             and resume_bootstrap.resume_context.resume_team_override is not None
         ),
         allow_extra_instructions_override=resume_bootstrap is not None,
+        allow_start_step_override=allow_start_step_override,
+        allow_max_turns_override=allow_max_turns_override,
+        team_explicit=team_explicit,
+        max_turns_explicit=max_turns_explicit,
     )
     if reason is not None:
         if require_resume:
@@ -2365,6 +2464,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="WORKFLOW_NAME",
         help="Name of the workflow to run.",
+    )
+    run_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        metavar="CONFIG_FILE",
+        help="Use this current workflow configuration for the run or resume.",
     )
     run_parser.add_argument(
         "--max-turns", "-mt",
@@ -3213,8 +3319,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     config_path: Path | None = None
+    config_path_is_explicit = False
     if args.command in (None, "run", "show"):
-        config_path, created_paths = _bootstrap_config_files()
+        if args.command == "run" and args.config is not None:
+            config_path = Path(args.config).expanduser().resolve()
+            config_path_is_explicit = True
+            created_paths = ()
+        else:
+            config_path, created_paths = _bootstrap_config_files()
         if created_paths:
             _print_bootstrap_paths(config_path)
             return 0
@@ -3260,23 +3372,6 @@ def main(argv: list[str] | None = None) -> int:
     if config_path is None:
         config_path = bootstrap_config()
 
-    try:
-        workflow_config = load_workflow_config(config_path)
-    except ConfigError as exc:
-        print(exc, file=sys.stderr)
-        return 1
-
-    try:
-        workflow_arg, plan_file_arg, extra_instructions = _resolve_run_arguments(
-            args.plan, args.workflow, args.run_args, workflow_config
-        )
-        extra_instructions_provided = (
-            "--" in args.run_args or bool(extra_instructions)
-        )
-    except ValueError as exc:
-        print(exc, file=sys.stderr)
-        return 1
-
     requested_resume_run_id: str | None = None
     require_resume = False
     if args.resume is not None:
@@ -3284,34 +3379,80 @@ def main(argv: list[str] | None = None) -> int:
         if args.resume != "AUTO":
             requested_resume_run_id = args.resume
 
+    if not require_resume and args.plan is None and not args.run_args:
+        print("error: plan_file is required", file=sys.stderr)
+        return 1
+
+    if require_resume and not config_path_is_explicit:
+        # Do not read the ordinary default before the resume metadata can
+        # select its saved live source. Positional ambiguity is resolved after
+        # that source has been loaded below.
+        workflow_config = None
+        workflow_arg = args.workflow
+        plan_file_arg = args.plan
+        _, _, extra_instructions = _parse_run_args(args.run_args)
+        extra_instructions_provided = (
+            "--" in args.run_args or bool(extra_instructions)
+        )
+    else:
+        try:
+            if require_resume:
+                # Resume bootstrap resolves the saved live source before doing
+                # current-workflow admission. The object here only parses
+                # optional positional arguments and is replaced by the live
+                # result before startup.
+                workflow_config = load_workflow_config(config_path)
+            else:
+                workflow_config = load_live_config(
+                    config_path,
+                    loader=load_workflow_config,
+                ).workflow_config
+        except ConfigError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+
+        try:
+            workflow_arg, plan_file_arg, extra_instructions = _resolve_run_arguments(
+                args.plan, args.workflow, args.run_args, workflow_config
+            )
+            extra_instructions_provided = (
+                "--" in args.run_args or bool(extra_instructions)
+            )
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+
     if not require_resume and plan_file_arg is None:
         print("error: plan_file is required", file=sys.stderr)
         return 1
 
-    placeholders = find_placeholders(workflow_config)
-    if placeholders:
-        keys = "\n".join(f"  {k}" for k in placeholders)
-        print(
-            f"Config bootstrapped. Fill in the following model values before running:\n{keys}",
-            file=sys.stderr,
-        )
-        return 1
+    if not require_resume:
+        placeholders = find_placeholders(workflow_config)
+        if placeholders:
+            keys = "\n".join(f"  {k}" for k in placeholders)
+            print(
+                f"Config bootstrapped. Fill in the following model values before running:\n{keys}",
+                file=sys.stderr,
+            )
+            return 1
 
-    validation_errors = validate_workflow_config(workflow_config)
-    if validation_errors:
-        errors = "\n".join(f"  {e}" for e in validation_errors)
-        print(
-            f"Config validation errors:\n{errors}",
-            file=sys.stderr,
-        )
-        return 1
+        validation_errors = validate_workflow_config(workflow_config)
+        if validation_errors:
+            errors = "\n".join(f"  {e}" for e in validation_errors)
+            print(
+                f"Config validation errors:\n{errors}",
+                file=sys.stderr,
+            )
+            return 1
 
     resume_bootstrap: ResumeBootstrap | None = None
     if require_resume:
         try:
             resume_bootstrap = _bootstrap_resume_invocation(
                 repo_root=repo_root,
-                config_path=config_path,
+                config_path=(config_path if config_path_is_explicit else None),
+                default_config_path=config_path,
+                config_path_is_explicit=config_path_is_explicit,
                 workflow_config=workflow_config,
                 requested_run_id=requested_resume_run_id,
                 workflow_arg=workflow_arg,
@@ -3323,20 +3464,72 @@ def main(argv: list[str] | None = None) -> int:
                 extra_instructions_provided=extra_instructions_provided,
                 reset_scope=args.resume_reset_scope,
                 rehome_worktree=args.resume_rehome_worktree,
+                live_loader=load_workflow_config,
             )
         except ValueError as exc:
             print(exc, file=sys.stderr)
             return 1
+        if not config_path_is_explicit:
+            try:
+                parsed_workflow, parsed_plan, parsed_extra = _resolve_run_arguments(
+                    args.plan,
+                    args.workflow,
+                    args.run_args,
+                    resume_bootstrap.workflow_config,
+                )
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                return 1
+            if parsed_workflow is not None and parsed_workflow != resume_bootstrap.workflow_name:
+                print(
+                    f"error: resume workflow mismatch: requested '{parsed_workflow}', "
+                    f"but run '{resume_bootstrap.resolved_run_id.name}' saved "
+                    f"'{resume_bootstrap.workflow_name}'.",
+                    file=sys.stderr,
+                )
+                return 1
+            if parsed_plan is not None:
+                requested_plan = Path(parsed_plan).expanduser()
+                if not requested_plan.is_absolute():
+                    requested_plan = Path.cwd() / requested_plan
+                if requested_plan.resolve() != resume_bootstrap.plan_path:
+                    print(
+                        f"error: resume plan mismatch: requested '{requested_plan.resolve()}', "
+                        f"but run '{resume_bootstrap.resolved_run_id.name}' saved "
+                        f"'{resume_bootstrap.plan_path}'.",
+                        file=sys.stderr,
+                    )
+                    return 1
+            extra_instructions = parsed_extra
         workflow_arg = resume_bootstrap.workflow_name
         plan_file_arg = str(resume_bootstrap.plan_path)
         startup_start_step = resume_bootstrap.start_step
         startup_max_turns = resume_bootstrap.max_turns
         startup_team = resume_bootstrap.team
         extra_instructions = resume_bootstrap.extra_instructions
+        workflow_config = resume_bootstrap.workflow_config
     else:
         startup_start_step = args.start_step
         startup_max_turns = args.max_turns
         startup_team = args.team
+
+    if require_resume:
+        placeholders = find_placeholders(workflow_config)
+        if placeholders:
+            keys = "\n".join(f"  {k}" for k in placeholders)
+            print(
+                f"Config bootstrapped. Fill in the following model values before running:\n{keys}",
+                file=sys.stderr,
+            )
+            return 1
+        validation_errors = validate_workflow_config(workflow_config)
+        if validation_errors:
+            errors = "\n".join(f"  {e}" for e in validation_errors)
+            print(
+                f"Config validation errors:\n{errors}",
+                file=sys.stderr,
+            )
+            return 1
 
     if plan_file_arg is None:
         print("error: plan_file is required", file=sys.stderr)
@@ -3360,6 +3553,19 @@ def main(argv: list[str] | None = None) -> int:
         start_step=startup_start_step,
         max_turns=startup_max_turns,
         team=startup_team,
+        start_step_explicit=(
+            True if resume_bootstrap is not None else args.start_step is not None
+        ),
+        team_explicit=(
+            resume_bootstrap.team_explicit
+            if resume_bootstrap is not None
+            else args.team is not None
+        ),
+        max_turns_explicit=(
+            resume_bootstrap.max_turns_explicit
+            if resume_bootstrap is not None
+            else args.max_turns is not None
+        ),
         extra_instructions=extra_instructions,
         resume_requested=require_resume,
         continue_from_current=args.continue_from_current,
@@ -3376,7 +3582,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             resume_ctx = _detect_resume_candidate(
                 repo_root=prepared_run.repo_root,
-                workflow_config=workflow_config.workflows[prepared_run.workflow_name],
+                workflow_config=workflow_config,
                 workflow_name=prepared_run.workflow_name,
                 plan_path=prepared_run.plan_path,
                 team=prepared_run.team,
@@ -3387,6 +3593,16 @@ def main(argv: list[str] | None = None) -> int:
                 require_resume=require_resume,
                 reset_scope=args.resume_reset_scope,
                 resume_bootstrap=resume_bootstrap,
+                allow_start_step_override=(
+                    resume_bootstrap is not None
+                    and resume_bootstrap.start_step_override
+                ),
+                allow_max_turns_override=(
+                    resume_bootstrap is not None
+                    and args.max_turns is not None
+                ),
+                team_explicit=prepared_run.team_explicit,
+                max_turns_explicit=prepared_run.max_turns_explicit,
             )
         except ValueError as exc:
             print(exc, file=sys.stderr)

@@ -6,11 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from aflow.api.models import PreparedRun
-from aflow.config import GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
+from aflow.api.models import PreparedRun, StartupRequest
+from aflow.config import (
+    AflowSection,
+    GoTransition,
+    TeamConfig,
+    WorkflowConfig,
+    WorkflowStepConfig,
+    WorkflowUserConfig,
+)
 from aflow.control_plane import InMemoryUnitManager, LaunchManifest, create_launch_manifest, read_events, write_launch_phase
 from aflow.control_plane.repository import RunRepository
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError, _worker_prepared
+from aflow.run_config_snapshot import SnapshotError
 
 
 def _workflow_config() -> WorkflowUserConfig:
@@ -28,6 +36,50 @@ def _workflow_config() -> WorkflowUserConfig:
         roles={"worker": "codex.worker"},
         workflows={"managed": workflow},
         prompts={"p": "Work."},
+    )
+
+
+def _daemon_for_config(
+    tmp_path: Path,
+    monkeypatch,
+    units: InMemoryUnitManager,
+    workflow_config: WorkflowUserConfig,
+) -> tuple[AflowDaemon, StartupRequest]:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    plan_path.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n")
+    config_path = repo_root / "aflow.toml"
+    config_path.write_text("")
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n")
+    executable = repo_root / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda _path: workflow_config)
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            environment={"PATH": str(executable.parent)},
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+    return daemon, StartupRequest(
+        repo_root=repo_root,
+        plan_path=plan_path,
+        config_path=config_path,
+        workflow_config=workflow_config,
+        workflow_name="managed",
+        start_step=None,
+        max_turns=None,
+        team=None,
     )
 
 
@@ -216,3 +268,96 @@ def test_legacy_run_status_remains_read_only_and_historical(tmp_path: Path) -> N
     assert status.status == "needs_attention"
     assert status.reason == "legacy run has no control-plane launch manifest"
     assert run_json.read_bytes() == before
+
+
+def test_worker_reloads_edited_defaults_without_a_snapshot_or_stale_step(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    units = InMemoryUnitManager()
+    base = _workflow_config()
+    initial_workflow = replace(
+        base.workflows["managed"],
+        team="blue",
+    )
+    initial = replace(
+        base,
+        aflow=AflowSection(max_turns=2),
+        teams={"blue": TeamConfig(), "green": TeamConfig()},
+        workflows={"managed": initial_workflow},
+    )
+    replacement_step = WorkflowStepConfig(
+        role="worker",
+        prompts=("p",),
+        go=(GoTransition(to="END", when="DONE"),),
+    )
+    edited = replace(
+        initial,
+        aflow=AflowSection(max_turns=7),
+        workflows={
+            "managed": WorkflowConfig(
+                steps={"replacement": replacement_step},
+                first_step="replacement",
+                team="green",
+            )
+        },
+    )
+    live = [initial]
+    daemon, request = _daemon_for_config(tmp_path, monkeypatch, units, initial)
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda _path: live[0])
+    monkeypatch.setattr(
+        "aflow.daemon.create_run_config_snapshot",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            SnapshotError("diagnostic snapshot unavailable")
+        ),
+    )
+
+    def prepare(current_request: StartupRequest) -> PreparedRun:
+        workflow = current_request.workflow_config.workflows["managed"]
+        return PreparedRun(
+            workflow_name="managed",
+            repo_root=current_request.repo_root,
+            plan_path=current_request.plan_path,
+            config_path=current_request.config_path,
+            max_turns=current_request.workflow_config.aflow.max_turns,
+            team=workflow.team,
+            extra_instructions=(),
+            start_step=workflow.first_step or "implement",
+            team_explicit=False,
+            max_turns_explicit=False,
+            start_step_explicit=False,
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", prepare)
+    start_request = replace(
+        request,
+        workflow_config=initial,
+        max_turns=None,
+        team=None,
+    )
+    started = daemon.service.start(
+        start_request,
+        caller_scope="project:one",
+        idempotency_key="live-defaults",
+    )
+
+    live[0] = edited
+    record = daemon.service._read_record(started.run_id)
+    manifest = daemon.application.repository.get_launch_manifest(started.run_id)
+    assert manifest is not None
+    worker_prepared, resume_context = _worker_prepared(
+        record,
+        manifest,
+        request.repo_root,
+        request.config_path,
+        edited,
+    )
+
+    assert resume_context is None
+    assert worker_prepared.max_turns == 7
+    assert worker_prepared.team == "green"
+    assert worker_prepared.start_step == "replacement"
+    assert not (request.repo_root / ".aflow" / "runs" / started.run_id / "config").exists()
+    assert units.start_calls[0][1][
+        units.start_calls[0][1].index("--config") + 1
+    ] == str(request.config_path)

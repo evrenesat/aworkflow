@@ -2229,34 +2229,14 @@ def _resume_identity_config_dir(
     config: "ControllerConfig", config_dir: Path,
     saved_identity: FrozenRunIdentity | None = None,
 ) -> Path:
-    """Keep a validated snapshot's identity stable across resumed copies.
+    """Return the selected current source for diagnostic identity metadata.
 
-    When the controller loaded its configuration from the run's frozen
-    snapshot (worker/resume path), the fingerprint is identical but the
-    CLI runs may record the original location, while detached workers record
-    their snapshot location. Preserve either predecessor convention; the
-    caller still compares the loaded configuration's fingerprint.
+    Snapshot directories are compatibility artifacts only.  A resume may use
+    the source's saved live path, but once that source has been resolved the
+    identity must describe the path actually selected for this invocation.
     """
-    from .run_config_snapshot import SnapshotError, load_run_config_snapshot
-
-    snapshot_run_id = config.reserved_run_id
-    if not snapshot_run_id:
-        # Direct CLI resume loads the predecessor snapshot before reserving
-        # its successor. Recognize only the exact repository-owned path.
-        candidate = config_dir.resolve()
-        runs_root = (config.repo_root / ".aflow" / "runs").resolve()
-        if candidate.parent.name != "config" or candidate.parent.parent.parent != runs_root:
-            return config_dir
-        snapshot_run_id = candidate.parent.parent.name
-    try:
-        snapshot = load_run_config_snapshot(config.repo_root, snapshot_run_id)
-    except SnapshotError:
-        return config_dir
-    if snapshot is None:
-        return config_dir
-    if not config.reserved_run_id and snapshot.config_path.resolve() != config_dir.resolve():
-        return config_dir
-    return Path(saved_identity.config_path if saved_identity is not None else snapshot.origin_config_path)
+    del config, saved_identity
+    return config_dir
 
 
 def _freeze_run_identity(
@@ -2296,33 +2276,42 @@ def _freeze_run_identity(
     )
 
 
-def _daemon_manifest_matches_execution(existing: object, expected: object) -> bool:
+def _daemon_manifest_matches_execution(
+    existing: object,
+    expected: object,
+    *,
+    match_max_turns: bool = True,
+    match_team: bool = True,
+    match_start_step: bool = True,
+) -> bool:
     """Accept only a daemon's pre-preparation manifest for its exact worker.
 
     A daemon records request-level intent before startup questions are
     answered, so its immutable manifest may deliberately omit ``start_step``.
-    Every other execution identity field remains exact.  This narrow bridge is
-    never used by direct CLI execution.
+    Non-explicit configuration defaults can be re-resolved from the current
+    source; every identity field and every explicit choice remains exact. This
+    narrow bridge is never used by direct CLI execution.
     """
-    fields = (
+    fields = [
         "run_id",
         "project_root",
         "plan_path",
         "workflow_name",
-        "max_turns",
-        "team",
         "idempotency_key",
         "caller_scope",
-        "frozen_config_fingerprint",
         "restarted_from_run_id",
-    )
+    ]
+    if match_max_turns:
+        fields.append("max_turns")
+    if match_team:
+        fields.append("team")
     if any(getattr(existing, field, None) != getattr(expected, field, None) for field in fields):
         return False
     if getattr(existing, "intended_unit", None) != f"aflow-run-{getattr(expected, 'run_id', '')}.service":
         return False
     existing_start_step = getattr(existing, "start_step", None)
     expected_start_step = getattr(expected, "start_step", None)
-    if existing_start_step is None:
+    if existing_start_step is None or not match_start_step:
         return True
     return (
         existing_start_step == expected_start_step
@@ -2340,8 +2329,6 @@ def _frozen_identity_mismatch(
         f"{field} saved '{getattr(saved, field)}' but current '{getattr(current, field)}'"
         for field in (
             "workflow_name",
-            "config_path",
-            "config_fingerprint",
             "continuation_from_branch",
             "continuation_from_head",
             "continuation_mode",
@@ -5965,6 +5952,9 @@ def run_workflow(
         if existing_manifest is not None and _daemon_manifest_matches_execution(
             existing_manifest,
             launch_manifest,
+            match_max_turns=config.max_turns_explicit is not False,
+            match_team=config.team_explicit is not False,
+            match_start_step=config.start_step_explicit is not False,
         ):
             launch_result = StartRunResult(
                 run_id=reserved_run_id,
@@ -5983,17 +5973,11 @@ def run_workflow(
             f"launch intent already exists for run '{reserved_run_id}'; refusing duplicate controller"
         )
 
-    from .run_config_snapshot import (
-        SnapshotError,
-        create_run_config_snapshot,
-        load_run_config_snapshot,
-    )
+    from .run_config_snapshot import SnapshotError, create_run_config_snapshot
 
     if launch_result.created and snapshot_config:
-        # Freeze the effective workflow pair before any startup answer or
-        # worker launch. A failed snapshot must never launch a worker.
-        # Direct library callers with a synthetic in-memory config may opt
-        # out; every CLI, daemon, and UI launch path keeps the default.
+        # Keep the compatibility copy best-effort.  It is never the execution
+        # source and its failure must not block a valid current configuration.
         try:
             create_run_config_snapshot(
                 repo_root=config.repo_root,
@@ -6002,23 +5986,8 @@ def run_workflow(
                 workflow_name=workflow_name,
                 fingerprint=current_frozen_identity.config_fingerprint,
             )
-        except SnapshotError as exc:
-            raise WorkflowError(f"cannot freeze run configuration: {exc}") from exc
-    else:
-        # A daemon reserved this run earlier; its snapshot must exist and
-        # match the manifest fingerprint before a worker attaches.
-        try:
-            existing_snapshot = load_run_config_snapshot(config.repo_root, reserved_run_id)
-        except SnapshotError as exc:
-            raise WorkflowError(str(exc)) from None
-        if (
-            existing_snapshot is not None
-            and existing_snapshot.fingerprint != current_frozen_identity.config_fingerprint
-        ):
-            raise WorkflowError(
-                f"run '{reserved_run_id}' configuration snapshot does not match "
-                "the launch intent; refusing to attach"
-            )
+        except SnapshotError:
+            pass
 
     _emit_event(observer, RunStartedEvent.create(
         workflow_name=workflow_name,
@@ -6153,6 +6122,22 @@ def run_workflow(
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
     state.frozen_run_identity = current_frozen_identity
+    state.live_config_path = str(config_dir.resolve())
+    state.team_explicit = (
+        config.team_explicit
+        if config.team_explicit is not None
+        else config.team is not None
+    )
+    state.max_turns_explicit = (
+        config.max_turns_explicit
+        if config.max_turns_explicit is not None
+        else True
+    )
+    state.start_step_explicit = (
+        config.start_step_explicit
+        if config.start_step_explicit is not None
+        else True
+    )
     state.effective_max_turns = (
         resume.effective_max_turns
         if resume is not None and resume.effective_max_turns is not None

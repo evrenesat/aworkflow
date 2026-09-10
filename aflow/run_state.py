@@ -37,6 +37,7 @@ class FrozenRunIdentity:
     live_config_path: str | None = None
     team_explicit: bool | None = None
     max_turns_explicit: bool | None = None
+    start_step_explicit: bool | None = None
     continuation_from_branch: str | None = None
     continuation_from_head: str | None = None
     continuation_mode: str | None = None
@@ -360,6 +361,9 @@ class ControllerConfig:
     continuation_mode: str | None = None
     restarted_from_run_id: str | None = None
     skipped_steps: tuple[str, ...] = ()
+    team_explicit: bool | None = None
+    max_turns_explicit: bool | None = None
+    start_step_explicit: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -692,6 +696,7 @@ class ResumeContext:
     live_config_path: str | None = None
     team_explicit: bool | None = None
     max_turns_explicit: bool | None = None
+    start_step_explicit: bool | None = None
     override_result: OverrideResult | None = None
     role_selectors: Mapping[str, str] = field(default_factory=dict)
     current_hotplug_transaction: HotplugTransactionV1 | None = None
@@ -815,6 +820,7 @@ class ControllerState:
     live_config_path: str | None = None
     team_explicit: bool | None = None
     max_turns_explicit: bool | None = None
+    start_step_explicit: bool | None = None
     override_result: OverrideResult | None = None
     role_selectors: dict[str, str] = field(default_factory=dict)
     current_hotplug_transaction: HotplugTransactionV1 | None = None

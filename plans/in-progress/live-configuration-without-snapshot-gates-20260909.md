@@ -18,9 +18,13 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp1 v01` — approved.
+- Last Reviewed Checkpoint: `cp2 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp2 v01` from the immediately preceding worker's repaired worktree against CP1 `7454db7`; no pending CP2 commit existed, so worktree fallback was used. Both prior P2 findings are resolved. Required CP2 plus library/API suites: 288 passed, 131 subtests; metadata regressions: 2 passed; unfinished-step and finalized reviewer/worker replay: 3 passed; `git diff --check` passed. No material findings. The `cp03-v01` CP2 repair overlay is resolved; CP3 remains unchecked. Manager 40 KiB guard and 16 KiB compact target retained.
+
+- 2026-09-10: CP2 pending worker worktree reviewed against approved CP1 `7454db7`; rejected for two P2 defects: missing ControllerState start-step provenance breaks metadata writes, and explicit resume correction equal to the original start is ignored. Implementation step markers retained; approval unchecked. Repair overlay `live-configuration-without-snapshot-gates-20260909-cp03-v01.md` is CP2 scope despite filename. Required suite: 251 passed, 125 subtests. Expanded API/runtime: 309 passed, 49 subtests, two metadata regressions and one stale frozen-gate assertion. See `plans/reviews/latest_review.md`. Review CP2 after repair; do not advance to CP3.
 
 - 2026-09-10: Approved `cp1 v01` using the pending worker worktree against `576d91e`; preceding checkpoint commits belong to older plans. CP1 implementation markers were already checked; CP2 remains unchecked. No material findings. Verification: `uv run pytest tests/test_live_config.py tests/test_run_config_snapshot.py tests/test_config.py tests/test_run_state.py tests/test_runlog.py -q` — 211 passed, 7 subtests passed; `git diff --check` passed. Scope: current-source loader, snapshot compatibility, optional state/provenance serialization and focused tests. Launch/resume integration remains CP2.
 
@@ -92,7 +96,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** Ambiguous dirty-line ownership; do not remove concurrent unrelated resume fixes.
 
-### [ ] Checkpoint 2: Launch and resume from current configuration everywhere
+### [x] Checkpoint 2: Launch and resume from current configuration everywhere
 
 **Goal:** Direct CLI, detached workers and remote resume no longer depend on frozen configuration identity.
 
@@ -102,11 +106,11 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Route reservation, preparation, startup answers, worker boot and resume to checkpoint 1's current source. Worker argv uses the live source. Revalidate actual selected workflow/step against current settings at worker launch; a global edit after reservation is allowed without a fingerprint equality check. Prepared prompts/choices must not force execution of removed steps.
-- [ ] Remove config hash and config-path equality from `_frozen_identity_mismatch` callers and launch-manifest matching. Retain checks of exact run/project/plan/unit/idempotency/continuation facts. Do not relax those checks by returning unconditional success.
-- [ ] Stop copying predecessor snapshots as execution configuration. Legacy `frozen_config` is optional for configuration admission, not a prerequisite for reading valid saved progress. Preserve existing original-plan, execution-context, scope, lineage and controller inactivity checks and current resume budget fixes.
-- [ ] Persist live-source/choice provenance through CLI, daemon startup records and successor runs; explicit resume team/step corrections are validated against current settings before rejecting an obsolete saved selection. Keep existing remote API payload compatibility.
-- [ ] Update `docs/runtime-behavior.md` resume sections and applicable `aflow/AGENTS.md` snapshot instructions to match this implemented change.
+- [x] Route reservation, preparation, startup answers, worker boot and resume to checkpoint 1's current source. Worker argv uses the live source. Revalidate actual selected workflow/step against current settings at worker launch; a global edit after reservation is allowed without a fingerprint equality check. Prepared prompts/choices must not force execution of removed steps.
+- [x] Remove config hash and config-path equality from `_frozen_identity_mismatch` callers and launch-manifest matching. Retain checks of exact run/project/plan/unit/idempotency/continuation facts. Do not relax those checks by returning unconditional success.
+- [x] Stop copying predecessor snapshots as execution configuration. Legacy `frozen_config` is optional for configuration admission, not a prerequisite for reading valid saved progress. Preserve existing original-plan, execution-context, scope, lineage and controller inactivity checks and current resume budget fixes.
+- [x] Persist live-source/choice provenance through CLI, daemon startup records and successor runs; explicit resume team/step corrections are validated against current settings before rejecting an obsolete saved selection. Keep existing remote API payload compatibility.
+- [x] Update `docs/runtime-behavior.md` resume sections and applicable `aflow/AGENTS.md` snapshot instructions to match this implemented change.
 
 **Dependencies:** Checkpoint 1.
 

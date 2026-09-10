@@ -1,13 +1,18 @@
-# Checkpoint 1 review
+# CP2 v01 review — approved
 
-Approved `cp1 v01` for `codex/aflow-dogfood-20260909` under `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`, the original and active plan.
+Reviewed the immediately preceding worker's repaired CP2 worktree against approved CP1 `7454db7`. Used the current worktree fallback because no pending CP2 implementation commit existed; older checkpoint commits belong to preceding plans. The active `cp03-v01` non-checkpoint overlay repairs original CP2 and is resolved. Original plan: `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`.
 
-Reviewed pending worker worktree against base `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`. Worktree fallback applies because this plan's checkpoint 1 has no implementation commit boundary; preceding checkpoint approvals belong to older plans. Implementation boxes were already checked; this review records approval. Checkpoint 2 remains unchecked.
+Scope: current-source CLI/daemon launch and resume, compatibility diagnostics, worker selection, choice provenance, retained execution identity and focused tests. Both prior findings are resolved: ordinary ControllerState declares start-step provenance, and an explicit correction equal to the original starting step reaches execution. Omitted correction retains saved progress; finalized-turn reconstruction/replay is preserved. No material findings survived the admission gate.
 
-Scope: current-source selection and locked pair loading, strict missing-source behavior, legacy origin fallback, relative worktree paths, snapshot hash admission removal, optional compatibility/provenance fields and serialization, focused tests. Applied the material finding admission gate, exclusions and proportionate-fix discipline. No findings survived. Launch/resume and turn-boundary integration remain later checkpoint work.
+Verification with synthetic providers and temporary fixtures:
 
-Validation: `uv run pytest tests/test_live_config.py tests/test_run_config_snapshot.py tests/test_config.py tests/test_run_state.py tests/test_runlog.py -q` — 211 passed, 7 subtests passed. `git diff --check` passed. Branch, reachable base and changed scope verified. The approved 40 KiB manager guard and 16 KiB summary remain untouched. No production provider calls, service edits, global config/skill edits or public push.
+- Required CP2 suite plus `tests/test_library_api.py` and `tests/test_api.py`: 288 passed, 131 subtests passed.
+- Two metadata/failure-finalizer regressions: 2 passed.
+- Unfinished-step resume and completed reviewer/worker replay regressions: 3 passed.
+- `git diff --check` passed. Approved manager 40 KiB hard guard and 16 KiB compact target remain intact.
 
-Original plan remains in progress. No fix overlay required.
+The full runtime suite was not rerun. Its previously identified frozen-config-gate assertion remains deferred to the original plan's restriction-test cleanup; it is not an additional CP2 finding.
+
+Original CP2 is approved as `cp2 v01`, with its reviewer-owned approval commit created in this turn. CP3 remains unchecked and the original plan stays in progress. No new repair plan is required.
 
 No material findings

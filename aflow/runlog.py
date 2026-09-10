@@ -1307,7 +1307,11 @@ class RunMetadataWriter:
                 raise ValueError(
                     "live_config_path must be null or a non-empty string"
                 )
-            for field_name in ("team_explicit", "max_turns_explicit"):
+            for field_name in (
+                "team_explicit",
+                "max_turns_explicit",
+                "start_step_explicit",
+            ):
                 value = getattr(self.state, field_name)
                 if value is not None and not isinstance(value, bool):
                     raise ValueError(f"{field_name} must be null or a boolean")
@@ -1419,7 +1423,11 @@ class RunMetadataWriter:
                 payload["live_config_path"] = self.state.live_config_path
             elif isinstance(previous.get("live_config_path"), str):
                 payload["live_config_path"] = previous["live_config_path"]
-            for field_name in ("team_explicit", "max_turns_explicit"):
+            for field_name in (
+                "team_explicit",
+                "max_turns_explicit",
+                "start_step_explicit",
+            ):
                 value = getattr(self.state, field_name)
                 if value is not None:
                     payload[field_name] = value

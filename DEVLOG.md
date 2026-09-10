@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-09-10 — Approve live launch and resume configuration (Checkpoint 2)
+
+- CLI and daemon startup/resume use the current source; snapshots are optional diagnostics. Explicit choices retain provenance, while execution identity and resume progress remain authoritative.
+- Resolved the CP2 metadata writer regression and explicit start-step correction equal to the original start. Verified 293 tests and 131 subtests across CP2/API and focused metadata/replay checks.
+- CP2 approved; per-turn reload remains subsequent checkpoint work.
+
 ## 2026-09-10 — Store manager history outside the live context (Checkpoint 4)
 
 - Added an additive content-addressed JSON evidence kind for complete manager

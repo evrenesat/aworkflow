@@ -190,12 +190,15 @@ The run fails if recovery exceeds `max_consecutive_recoveries` or a backup-team 
 
 Every new `.aflow/runs/<run-id>/run.json` is a schema-version `2` controller
 snapshot. It records the selected workflow, authoritative original plan path,
-resolved configuration directory, frozen configuration fingerprint, complete
-lifecycle identity, manager authority, hotplug authority, and active-scope
-envelope references. AFlow writes this file through a flushed same-directory
-temporary file and atomic replacement, so an interrupted update cannot expose
-partial JSON. Older or malformed metadata remains readable for inspection but
-is never migrated or resumed.
+the current configuration source used for the boundary, explicit-choice
+provenance, complete lifecycle identity, manager authority, hotplug authority,
+and active-scope envelope references. A legacy `frozen_config` object and its
+fingerprint may remain as diagnostic metadata, but they are not the execution
+source or a resume gate. AFlow writes this file through a flushed
+same-directory temporary file and atomic replacement, so an interrupted update
+cannot expose partial JSON. Required controller, plan, lifecycle, and scope
+metadata remains fail-closed; an absent or damaged compatibility snapshot does
+not by itself invalidate otherwise valid saved progress.
 
 `run.json` is controller-owned output. To request a safe future-turn change,
 create or edit exactly:
@@ -215,13 +218,13 @@ notes = ["Re-run the focused regression before broader tests."]
 ```
 
 All keys are optional, but the file must contain at least one. `next_step` must
-name an executable step in the frozen workflow. `team` must be configured and
+name an executable step in the current workflow. `team` must be configured and
 able to resolve the target step's role. `max_turns` must be positive and cannot
 be below the number of completed turns. `notes` is an array of non-empty
 strings and is appended only to the next worker prompt.
 `roles` maps role names to fully qualified `harness.profile` selectors and is
-the run-local role-selector hotplug surface: it overrides the frozen role
-routing for the next worker turn (validated against the frozen config) and
+the run-local role-selector hotplug surface: it overrides the current role
+routing for the next worker turn (validated against the current config) and
 creates a durable hotplug transaction instead of a plain override. Same-harness
 switches resume the exact active source session (`native_resume`); cross-harness
 switches require a bounded read-only handover brief before the target starts
@@ -279,8 +282,9 @@ active_turn = 0
 
 Active/completed turn history, plan lineage, lifecycle/worktree ownership,
 manager decisions, the workflow graph, and configuration files cannot be
-changed through this surface. There is no live config reload, file watcher,
-daemon, database, or supported direct-edit workflow for `run.json`.
+changed through this surface. Global configuration is read again at each
+launch and resume boundary, but there is no turn-loop config reload, file
+watcher, daemon, database, or supported direct-edit workflow for `run.json`.
 
 ## Live Role-Selector Hotplug
 
@@ -370,22 +374,25 @@ include `status=... hotplug <stage>: <source_selector> -> <target_selector>
 `aflow analyze` reports
 the current/pending transactions, normalized history, capability paths, and
 active session count.
-## Frozen run configuration snapshots
+## Live run configuration and diagnostic snapshots
 
-Every durably reserved run captures the complete effective workflow pair under
-`.aflow/runs/<run_id>/config/` before startup questions or worker launch. The
-snapshot records its origin paths and the canonical fingerprint in a versioned
-`snapshot.json`; schema-defined relative paths (such as `[aflow] worktree_root`)
-are resolved against the original configuration location before serialization,
-while prompt strings and repository-relative plan paths are never rewritten.
-Startup answers, worker launch, retries, resume, and run inspection all read
-the snapshot, so later global configuration edits affect only new runs.
-Snapshot creation shares one configuration lock with global saves, so a launch
-sees either the old pair or the new pair, never a mixture; a failed or
-fingerprint-mismatched snapshot fails the launch before any worker starts.
-Legacy runs without a snapshot keep their recorded identity checks, and a
-missing or damaged snapshot makes resume unavailable with an explanation
-instead of silently substituting current configuration.
+Each launch and resume boundary selects a current configuration source. A
+direct CLI invocation uses its explicit `--config` path when supplied, or the
+current default source otherwise. Daemon, UI, and MCP requests use the
+configured daemon source. Reservation records that source and the provenance
+of explicit team, max-turn, and start-step choices; startup answers and worker
+boot re-read the current source and validate the selected workflow, team, and
+step before execution.
+
+`.aflow/runs/<run_id>/config/` and the historical `frozen_config` fingerprint
+are optional compatibility diagnostics. A failed, missing, or changed copy
+does not block valid saved progress, and a successor never copies a
+predecessor snapshot as its execution configuration. Exact run, project, plan,
+unit, idempotency, continuation, original-plan, execution-context, scope, and
+controller-inactivity checks remain required. An explicit resume correction
+for team or step is checked against the current configuration; an omitted
+choice may follow the current default when its saved provenance says it was
+not explicit. Configuration is not reloaded in the middle of a harness turn.
 
 ## UI process lifecycle and persistent units
 
@@ -457,8 +464,9 @@ as skipped in status and run events.
 A workflow change uses a fresh successor start with restarted_from_run_id.
 The daemon accepts that lineage only after the same-project, same-caller source
 has explicit owner-stop evidence and its exact unit is inactive. The successor
-gets a new run ID and normal frozen-config validation. Resume remains strict
-continuation of the saved invocation. Bounded extra instructions affect the
+gets a new run ID and validates the current workflow and lifecycle identity.
+Resume remains strict continuation of the saved invocation while resolving
+omitted configuration choices from the current source. Bounded extra instructions affect the
 request digest and worker prompt but their text is omitted from control-plane
 manifests, start records, events, and status.
 

@@ -35,11 +35,10 @@ from aflow.api.startup import StartupError, prepare_startup, prepare_startup_wit
 from aflow.control_plane.models import startup_failure
 from aflow.control_plane.worker_diagnostics import confirmed_inactive
 from aflow.config import ConfigError, WorkflowUserConfig, load_workflow_config
+from aflow.live_config import load_live_config
 from aflow.run_config_snapshot import (
     SnapshotError,
-    copy_run_config_snapshot,
     create_run_config_snapshot,
-    load_run_config_snapshot,
 )
 from aflow.control_plane import (
     ControlConflictError,
@@ -204,7 +203,10 @@ class AflowDaemon:
 
     def start(self, *, persist_reconciliation: bool = True) -> tuple[ReconciliationResult, ...]:
         """Load configuration and reconcile; this method never starts a workflow."""
-        workflow_config = load_workflow_config(self._config.config_path)
+        workflow_config = load_live_config(
+            self._config.config_path,
+            loader=load_workflow_config,
+        ).workflow_config
         application = compose_control_plane(
             self._config.repo_root,
             config_path=self._config.config_path,
@@ -241,13 +243,8 @@ class AflowDaemon:
 
 
 def _bootstrap_config_path(bootstrap: Any, config: "DaemonConfig") -> Path:
-    """Prefer the resume bootstrap's frozen configuration path when present.
-
-    Resume bootstrap doubles in older tests may not carry the snapshot fields;
-    falling back to the daemon configuration preserves that contract.
-    """
-    value = getattr(bootstrap, "config_path", None)
-    return Path(value) if value is not None else config.config_path
+    """Return the daemon's current execution source for a prepared resume."""
+    return config.config_path
 
 
 def _bootstrap_workflow_config(
@@ -275,11 +272,14 @@ class DaemonService:
     def _refresh_workflow_config(self) -> None:
         """Reload the workflow pair so global edits apply to new runs immediately.
 
-        Existing runs keep their frozen snapshots; only new-run selection and
-        reservation observe the refreshed configuration.
+        Existing runs keep their execution facts; current settings govern
+        reservation, startup answers, and worker preparation.
         """
         try:
-            self._workflow_config = load_workflow_config(self._config.config_path)
+            self._workflow_config = load_live_config(
+                self._config.config_path,
+                loader=load_workflow_config,
+            ).workflow_config
         except ConfigError as exc:
             raise DaemonError(f"workflow configuration is invalid: {exc}") from exc
 
@@ -322,7 +322,8 @@ class DaemonService:
             existing = self._find_existing_manifest(
                 caller_scope=caller_scope,
                 idempotency_key=idempotency_key,
-                request_digest=normalized_request_digest(candidate),
+                request=normalized,
+                candidate=candidate,
             )
             if existing is not None:
                 self._transient_extra_instructions[existing.run_id] = normalized.extra_instructions
@@ -349,7 +350,7 @@ class DaemonService:
                     manifest, normalized, request_digest
                 )
             try:
-                snapshot = create_run_config_snapshot(
+                create_run_config_snapshot(
                     repo_root=self._config.repo_root,
                     run_id=run_id,
                     config_path=self._config.config_path,
@@ -357,15 +358,16 @@ class DaemonService:
                     fingerprint=manifest.frozen_config_fingerprint,
                     loader=load_workflow_config,
                 )
-            except SnapshotError as exc:
-                write_launch_phase(self._config.repo_root, run_id, "failed")
-                raise DaemonError(f"cannot freeze run configuration: {exc}") from exc
+            except SnapshotError:
+                # The copy is diagnostic compatibility only.  The live source
+                # in the request remains the sole execution configuration.
+                pass
             record = self._new_start_record(
                 run_id=run_id,
                 request=replace(
                     normalized,
                     reserved_run_id=run_id,
-                    config_path=snapshot.config_path,
+                    config_path=self._config.config_path,
                 ),
                 request_digest=request_digest,
                 caller_scope=caller_scope,
@@ -611,6 +613,9 @@ class DaemonService:
                 reserved_run_id=run_id,
                 idempotency_key=idempotency_key or f"daemon-{run_id}",
                 caller_scope=caller_scope,
+                team_explicit=getattr(bootstrap, "team_explicit", None),
+                max_turns_explicit=getattr(bootstrap, "max_turns_explicit", None),
+                start_step_explicit=True,
             )
             manifest = self._manifest_for(
                 run_id=run_id,
@@ -628,7 +633,7 @@ class DaemonService:
                 caller_scope=caller_scope,
                 idempotency_key=idempotency_key,
                 state="prepared",
-                prepared=None,
+                prepared=prepared,
                 operation="resume",
                 mode="resume",
                 resumed_from_run_id=source_run_id,
@@ -637,40 +642,6 @@ class DaemonService:
             record["manifest_request_digest"] = normalized_request_digest(manifest)
             self._create_record(record)
             return self._recover_resume_record(record, prepared=prepared, created=True)
-
-    def _freeze_resume_snapshot(
-        self,
-        *,
-        source_run_id: str,
-        run_id: str,
-        workflow_name: str,
-        fingerprint: str,
-    ) -> None:
-        """Give a resumed successor its own snapshot copied from its source.
-
-        The successor's manifest origin stays the source run's original
-        configuration location, so identity comparisons remain stable. Legacy
-        sources without a snapshot keep their current-config launch behavior.
-        """
-        try:
-            source_snapshot = load_run_config_snapshot(
-                self._config.repo_root, source_run_id
-            )
-        except SnapshotError as exc:
-            raise DaemonError(str(exc)) from exc
-        if source_snapshot is None:
-            return
-        try:
-            copy_run_config_snapshot(
-                self._config.repo_root,
-                source=source_snapshot,
-                run_id=run_id,
-                workflow_name=workflow_name,
-                fingerprint=fingerprint,
-            )
-        except SnapshotError as exc:
-            write_launch_phase(self._config.repo_root, run_id, "failed")
-            raise DaemonError(f"cannot freeze continuation configuration: {exc}") from exc
 
     def run_status(self, run_id: str) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
@@ -897,8 +868,26 @@ class DaemonService:
         }
         if request is not None:
             record["request"] = _request_payload(request)
+            record["live_config_path"] = str(request.config_path)
+            for field_name in (
+                "team_explicit",
+                "max_turns_explicit",
+                "start_step_explicit",
+            ):
+                value = getattr(request, field_name)
+                if value is not None:
+                    record[field_name] = value
         if prepared is not None:
             record["prepared"] = _prepared_payload(prepared)
+            record["live_config_path"] = str(prepared.config_path)
+            for field_name in (
+                "team_explicit",
+                "max_turns_explicit",
+                "start_step_explicit",
+            ):
+                value = getattr(prepared, field_name)
+                if value is not None:
+                    record[field_name] = value
         if question is not None:
             record["question"] = _question_payload(question)
         if resumed_from_run_id is not None:
@@ -1160,6 +1149,9 @@ class DaemonService:
                 reserved_run_id=run_id,
                 idempotency_key=str(record["effective_idempotency_key"]),
                 caller_scope=str(record["caller_scope"]),
+                team_explicit=getattr(bootstrap, "team_explicit", None),
+                max_turns_explicit=getattr(bootstrap, "max_turns_explicit", None),
+                start_step_explicit=True,
             )
         else:
             bootstrap = self._resume_bootstrap(
@@ -1172,34 +1164,34 @@ class DaemonService:
             idempotency_key=str(record["effective_idempotency_key"]),
             workflow_config=_bootstrap_workflow_config(bootstrap, self),
         )
-        if record.get("manifest_request_digest") != normalized_request_digest(manifest):
-            raise DaemonError(
-                "resume record does not match its immutable continuation intent"
-            )
         persisted_manifest = self._application.repository.get_launch_manifest(run_id)
         if persisted_manifest is None:
             try:
-                result = create_launch_manifest(self._config.repo_root, manifest)
+                create_launch_manifest(self._config.repo_root, manifest)
             except (ValueError, RunIdentityConflict) as exc:
                 raise DaemonError(
                     f"cannot reserve continuation launch intent: {exc}"
                 ) from exc
-            if not result.created:
-                persisted_manifest = self._application.repository.get_launch_manifest(
-                    run_id
-                )
-                if persisted_manifest is None:
-                    raise DaemonError("continuation manifest disappeared during replay")
-            # The manifest exists now, so the successor's run directory may be
-            # created; freeze its configuration copy from the source snapshot.
-            self._freeze_resume_snapshot(
-                source_run_id=validate_run_id(str(record["resumed_from_run_id"])),
-                run_id=run_id,
-                workflow_name=manifest.workflow_name,
-                fingerprint=manifest.frozen_config_fingerprint,
+            persisted_manifest = self._application.repository.get_launch_manifest(run_id)
+            if persisted_manifest is None:
+                raise DaemonError("continuation manifest disappeared during replay")
+            # A crash can leave the successor record without its manifest. The
+            # current source is authoritative when rebuilding that optional
+            # launch artifact, so align the record with the newly published
+            # digest before replaying the worker.
+            mutable_record = dict(record)
+            mutable_record["manifest_request_digest"] = (
+                persisted_manifest.request_digest
+                or normalized_request_digest(manifest)
             )
+            self._write_record(mutable_record)
+            record = mutable_record
         else:
-            self._assert_manifest_accepts_prepared(persisted_manifest, record, prepared)
+            if record.get("manifest_request_digest") != persisted_manifest.request_digest:
+                raise DaemonError(
+                    "resume record does not match its immutable continuation intent"
+                )
+        self._assert_manifest_accepts_prepared(persisted_manifest, record, prepared)
         mutable = dict(record)
         if not mutable.get("source_audited"):
             source_run_id = validate_run_id(str(mutable["resumed_from_run_id"]))
@@ -1223,7 +1215,7 @@ class DaemonService:
         caller_scope: str,
         idempotency_key: str,
     ) -> LaunchManifest:
-        """Freeze only typed configuration defaults before plan-sensitive preparation.
+        """Build request-level launch intent before plan-sensitive preparation.
 
         ``start_step`` deliberately remains ``None`` when the caller has not
         selected one.  A later persisted startup answer may choose a step, but
@@ -1485,14 +1477,21 @@ class DaemonService:
             or manifest.project_root != str(self._config.repo_root)
             or manifest.plan_path != str(Path(prepared.plan_path).resolve())
             or manifest.workflow_name != prepared.workflow_name
-            or manifest.max_turns != prepared.max_turns
-            or manifest.team != prepared.team
+            or (
+                prepared.max_turns_explicit is not False
+                and manifest.max_turns != prepared.max_turns
+            )
+            or (
+                prepared.team_explicit is not False
+                and manifest.team != prepared.team
+            )
             or manifest.idempotency_key != record.get("effective_idempotency_key")
             or manifest.caller_scope != record.get("caller_scope")
             or manifest.intended_unit != _unit_name(manifest.run_id)
             or manifest.restarted_from_run_id != prepared.restarted_from_run_id
             or (
                 manifest.start_step is not None
+                and prepared.start_step_explicit is not False
                 and manifest.skipped_steps != prepared.skipped_steps
             )
         ):
@@ -1501,31 +1500,12 @@ class DaemonService:
             )
         if (
             manifest.start_step is not None
+            and prepared.start_step_explicit is not False
             and manifest.start_step != prepared.start_step
         ):
             raise DaemonError(
                 "prepared startup step does not match immutable launch intent"
             )
-        from aflow.workflow import _freeze_run_identity
-
-        try:
-            snapshot = load_run_config_snapshot(self._config.repo_root, manifest.run_id)
-        except SnapshotError as exc:
-            raise DaemonError(str(exc)) from exc
-        workflow_config = (
-            load_workflow_config(snapshot.config_path)
-            if snapshot is not None else self._workflow_config
-        )
-        frozen = _freeze_run_identity(
-            prepared.workflow_name,
-            workflow_config,
-            config_dir=Path(snapshot.origin_config_path) if snapshot is not None else self._config.config_path,
-        )
-        if manifest.frozen_config_fingerprint != frozen.config_fingerprint:
-            raise DaemonError(
-                "prepared startup state does not match frozen configuration"
-            )
-
     def _assert_record_runtime_identity(self, record: Mapping[str, object]) -> None:
         if (
             record.get("selected_executable") != str(self._config.aflow_executable)
@@ -1592,7 +1572,8 @@ class DaemonService:
         *,
         caller_scope: str,
         idempotency_key: str | None,
-        request_digest: str,
+        request: StartupRequest,
+        candidate: LaunchManifest,
     ) -> LaunchManifest | None:
         if idempotency_key is None:
             return None
@@ -1611,7 +1592,11 @@ class DaemonService:
                     or not _equivalent_caller_scope(manifest.caller_scope, caller_scope)
                 ):
                     continue
-                if manifest.request_digest != request_digest:
+                if not self._manifest_matches_start_request(
+                    manifest,
+                    request=request,
+                    candidate=candidate,
+                ):
                     raise DaemonIdempotencyConflict(
                         "start idempotency key was reused for a different request"
                     )
@@ -1619,6 +1604,74 @@ class DaemonService:
             if page.next_cursor is None:
                 return None
             cursor = page.next_cursor
+
+    def _manifest_matches_start_request(
+        self,
+        manifest: LaunchManifest,
+        *,
+        request: StartupRequest,
+        candidate: LaunchManifest,
+    ) -> bool:
+        """Match durable start intent without treating live defaults as identity."""
+        if (
+            manifest.project_root != candidate.project_root
+            or manifest.plan_path != candidate.plan_path
+            or manifest.workflow_name != candidate.workflow_name
+            or manifest.idempotency_key != candidate.idempotency_key
+            or manifest.caller_scope != candidate.caller_scope
+            or manifest.restarted_from_run_id != candidate.restarted_from_run_id
+            or manifest.intended_unit != _unit_name(manifest.run_id)
+        ):
+            return False
+
+        max_turns_explicit = (
+            request.max_turns_explicit
+            if request.max_turns_explicit is not None
+            else request.max_turns is not None
+        )
+        team_explicit = (
+            request.team_explicit
+            if request.team_explicit is not None
+            else request.team is not None
+        )
+        start_step_explicit = (
+            request.start_step_explicit
+            if request.start_step_explicit is not None
+            else request.start_step is not None
+        )
+        if max_turns_explicit and manifest.max_turns != candidate.max_turns:
+            return False
+        if team_explicit and manifest.team != candidate.team:
+            return False
+        if start_step_explicit:
+            if (
+                manifest.start_step != candidate.start_step
+                or manifest.skipped_steps != candidate.skipped_steps
+            ):
+                return False
+        elif manifest.start_step is not None:
+            # The request-level manifest deliberately leaves an omitted
+            # start-step unset; a populated value therefore represents a
+            # different explicit request.
+            return False
+
+        # The persisted digest still protects prompt-like request intent. Use
+        # the old values for omitted defaults and the old diagnostic
+        # fingerprint only to reproduce the historical digest; neither value
+        # authorizes loading the historical configuration.
+        digest_candidate = replace(
+            candidate,
+            max_turns=(candidate.max_turns if max_turns_explicit else manifest.max_turns),
+            team=candidate.team if team_explicit else manifest.team,
+            start_step=(candidate.start_step if start_step_explicit else manifest.start_step),
+            skipped_steps=(
+                candidate.skipped_steps
+                if start_step_explicit
+                else manifest.skipped_steps
+            ),
+            frozen_config_fingerprint=manifest.frozen_config_fingerprint,
+        )
+        return manifest.request_digest == normalized_request_digest(digest_candidate)
 
     def _pending_response(
         self, record: Mapping[str, object]
@@ -1743,20 +1796,13 @@ class DaemonService:
             for instruction in extra_instructions
             for argument in (f"--extra-instruction={instruction}",)
         )
-        try:
-            snapshot = load_run_config_snapshot(self._config.repo_root, run_id)
-        except SnapshotError as exc:
-            raise DaemonError(str(exc)) from exc
-        config_path = (
-            snapshot.config_path if snapshot is not None else self._config.config_path
-        )
         return (
             str(self._config.aflow_executable),
             "daemon-worker",
             "--repo-root",
             str(self._config.repo_root),
             "--config",
-            str(config_path),
+            str(self._config.config_path),
             "--run-id",
             run_id,
             *instruction_args,
@@ -1768,6 +1814,8 @@ class DaemonService:
         return _bootstrap_resume_invocation(
             repo_root=self._config.repo_root,
             config_path=self._config.config_path,
+            default_config_path=self._config.config_path,
+            config_path_is_explicit=True,
             workflow_config=self._workflow_config,
             requested_run_id=source_run_id,
             workflow_arg=None,
@@ -1777,6 +1825,7 @@ class DaemonService:
             max_turns_arg=None,
             extra_instructions_arg=(),
             extra_instructions_provided=False,
+            live_loader=load_workflow_config,
         )
 
     def _assert_record_caller(
@@ -1924,22 +1973,10 @@ class DaemonService:
         payload = record.get("request")
         if not isinstance(payload, Mapping):
             raise DaemonError("startup record does not contain a replayable request")
-        recorded_config = Path(str(payload["config_path"]))
-        workflow_config = self._workflow_config
-        if recorded_config.resolve() != self._config.config_path:
-            # The record was reserved against a frozen snapshot: a pending
-            # startup question belongs to that already-frozen intent, even
-            # across daemon restarts and later global configuration saves.
-            try:
-                workflow_config = load_workflow_config(recorded_config)
-            except ConfigError as exc:
-                raise DaemonError(
-                    "the run's frozen configuration snapshot is unusable: "
-                    f"{exc}"
-                ) from exc
-        return _request_from_payload(
+        self._refresh_workflow_config()
+        request = _request_from_payload(
             payload,
-            workflow_config=workflow_config,
+            workflow_config=self._workflow_config,
             extra_instructions=self._transient_extra_instructions.get(
                 validate_run_id(str(record["run_id"])), ()
             ),
@@ -1950,6 +1987,11 @@ class DaemonService:
                 if record.get("idempotency_key") is not None
                 else None
             ),
+        )
+        return replace(
+            request,
+            config_path=self._config.config_path,
+            workflow_config=self._workflow_config,
         )
 
 
@@ -1967,8 +2009,11 @@ def worker_main(
         config = Path(config_path).resolve()
         selected_run_id = validate_run_id(run_id)
         _validate_extra_instructions(extra_instructions)
-        workflow_config = load_workflow_config(config)
-        stage = "snapshot_manifest"
+        workflow_config = load_live_config(
+            config,
+            loader=load_workflow_config,
+        ).workflow_config
+        stage = "live_configuration_manifest"
         daemon_config = DaemonConfig(
             repo_root=root,
             config_path=config,
@@ -1999,16 +2044,7 @@ def worker_main(
             workflow_config,
             extra_instructions=extra_instructions,
         )
-        from aflow.workflow import _freeze_run_identity
-
-        stage = "snapshot_validation"
-        frozen = _freeze_run_identity(
-            prepared.workflow_name, workflow_config, config_dir=config
-        )
-        if manifest.frozen_config_fingerprint != frozen.config_fingerprint:
-            raise DaemonError(
-                "daemon worker frozen configuration does not match launch intent"
-            )
+        stage = "live_configuration_validation"
         stage = "controller_entry"
         execute_workflow(
             prepared,
@@ -2048,6 +2084,8 @@ def _worker_prepared(
         bootstrap = _bootstrap_resume_invocation(
             repo_root=repo_root,
             config_path=config_path,
+            default_config_path=config_path,
+            config_path_is_explicit=True,
             workflow_config=workflow_config,
             requested_run_id=source_run_id,
             workflow_arg=None,
@@ -2057,24 +2095,34 @@ def _worker_prepared(
             max_turns_arg=None,
             extra_instructions_arg=(),
             extra_instructions_provided=False,
+            live_loader=load_workflow_config,
         )
         prepared = PreparedRun(
             workflow_name=bootstrap.workflow_name,
             repo_root=repo_root,
             plan_path=bootstrap.plan_path,
-            config_path=config_path,
+            config_path=getattr(bootstrap, "config_path", config_path),
             max_turns=bootstrap.max_turns,
             team=bootstrap.team,
             extra_instructions=bootstrap.extra_instructions,
             start_step=(
                 bootstrap.start_step
-                or workflow_config.workflows[bootstrap.workflow_name].first_step
+                or getattr(
+                    bootstrap,
+                    "workflow_config",
+                    workflow_config,
+                ).workflows[bootstrap.workflow_name].first_step
                 or bootstrap.workflow_name
             ),
             reserved_run_id=run_id,
             idempotency_key=manifest.idempotency_key,
             caller_scope=manifest.caller_scope,
+            team_explicit=getattr(bootstrap, "team_explicit", None),
+            max_turns_explicit=getattr(bootstrap, "max_turns_explicit", None),
+            start_step_explicit=True,
         )
+        workflow_config = getattr(bootstrap, "workflow_config", workflow_config)
+        _validate_worker_selection(prepared, workflow_config)
         return prepared, bootstrap.resume_context
     payload = record.get("prepared")
     if not isinstance(payload, Mapping):
@@ -2087,17 +2135,103 @@ def _worker_prepared(
     )
     prepared = replace(
         prepared,
+        config_path=config_path,
         reserved_run_id=run_id,
         idempotency_key=manifest.idempotency_key,
         caller_scope=manifest.caller_scope,
     )
+    prepared = _apply_live_worker_defaults(prepared, workflow_config)
+    _validate_worker_selection(prepared, workflow_config)
     if prepared.skipped_steps != _skipped_steps_for(
-        workflow_config,
-        prepared.workflow_name,
-        prepared.start_step,
+        workflow_config, prepared.workflow_name, prepared.start_step
     ):
         raise DaemonError("daemon worker skipped-step state is invalid")
     return prepared, None
+
+
+def _apply_live_worker_defaults(
+    prepared: PreparedRun,
+    workflow_config: WorkflowUserConfig,
+) -> PreparedRun:
+    """Resolve non-explicit startup choices from the worker's current config."""
+    workflow = workflow_config.workflows.get(prepared.workflow_name)
+    if workflow is None:
+        raise DaemonError(
+            f"daemon worker workflow '{prepared.workflow_name}' is not configured"
+        )
+    team_explicit = (
+        prepared.team_explicit
+        if prepared.team_explicit is not None
+        else prepared.team is not None
+    )
+    max_turns_explicit = (
+        prepared.max_turns_explicit
+        if prepared.max_turns_explicit is not None
+        else True
+    )
+    start_step_explicit = (
+        prepared.start_step_explicit
+        if prepared.start_step_explicit is not None
+        else True
+    )
+    return replace(
+        prepared,
+        team=prepared.team if team_explicit else workflow.team,
+        max_turns=(
+            prepared.max_turns
+            if max_turns_explicit
+            else workflow_config.aflow.max_turns
+        ),
+        start_step=(
+            prepared.start_step
+            if start_step_explicit
+            else workflow.first_step
+        ),
+        skipped_steps=(
+            _skipped_steps_for(
+                workflow_config,
+                prepared.workflow_name,
+                prepared.start_step
+                if start_step_explicit
+                else workflow.first_step,
+            )
+        ),
+        team_explicit=team_explicit,
+        max_turns_explicit=max_turns_explicit,
+        start_step_explicit=start_step_explicit,
+    )
+
+
+def _validate_worker_selection(
+    prepared: PreparedRun,
+    workflow_config: WorkflowUserConfig,
+) -> None:
+    """Reject a stale worker selection before entering the controller."""
+    workflow = workflow_config.workflows.get(prepared.workflow_name)
+    if workflow is None:
+        raise DaemonError(
+            f"daemon worker workflow '{prepared.workflow_name}' is not configured"
+        )
+    if prepared.start_step in workflow.excluded_steps:
+        raise DaemonError(
+            f"daemon worker start step '{prepared.start_step}' is excluded "
+            f"from workflow '{prepared.workflow_name}'"
+        )
+    if prepared.start_step not in workflow.steps:
+        raise DaemonError(
+            f"daemon worker start step '{prepared.start_step}' is not configured "
+            f"for workflow '{prepared.workflow_name}'"
+        )
+    if prepared.team is not None and prepared.team not in workflow_config.teams:
+        raise DaemonError(
+            f"daemon worker team '{prepared.team}' is not configured"
+        )
+    if (
+        not isinstance(prepared.max_turns, int)
+        or isinstance(prepared.max_turns, bool)
+        or prepared.max_turns < 1
+    ):
+        raise DaemonError("daemon worker max_turns must be a positive integer")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2265,6 +2399,9 @@ def _request_payload(request: StartupRequest) -> dict[str, object]:
         "start_step": request.start_step,
         "max_turns": request.max_turns,
         "team": request.team,
+        "team_explicit": request.team_explicit,
+        "max_turns_explicit": request.max_turns_explicit,
+        "start_step_explicit": request.start_step_explicit,
         "resume_requested": request.resume_requested,
         "startup_base_head_refresh_sha": request.startup_base_head_refresh_sha,
         "dirty_worktree_confirmed": request.dirty_worktree_confirmed,
@@ -2299,6 +2436,16 @@ def _request_from_payload(
         not isinstance(max_turns, int) or isinstance(max_turns, bool)
     ):
         raise DaemonError("startup record request has invalid max_turns")
+    choice_values = {}
+    for field_name in (
+        "team_explicit",
+        "max_turns_explicit",
+        "start_step_explicit",
+    ):
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, bool):
+            raise DaemonError(f"startup record request has invalid {field_name}")
+        choice_values[field_name] = value
     return StartupRequest(
         repo_root=Path(str(payload["repo_root"])),
         plan_path=Path(str(payload["plan_path"])),
@@ -2308,6 +2455,9 @@ def _request_from_payload(
         start_step=_optional_string(payload.get("start_step")),
         max_turns=max_turns,
         team=_optional_string(payload.get("team")),
+        team_explicit=choice_values["team_explicit"],
+        max_turns_explicit=choice_values["max_turns_explicit"],
+        start_step_explicit=choice_values["start_step_explicit"],
         extra_instructions=extra_instructions,
         resume_requested=bool(payload.get("resume_requested", False)),
         startup_base_head_refresh_sha=_optional_string(
@@ -2332,6 +2482,9 @@ def _prepared_payload(prepared: PreparedRun) -> dict[str, object]:
         "config_path": str(prepared.config_path),
         "max_turns": prepared.max_turns,
         "team": prepared.team,
+        "team_explicit": prepared.team_explicit,
+        "max_turns_explicit": prepared.max_turns_explicit,
+        "start_step_explicit": prepared.start_step_explicit,
         "start_step": prepared.start_step,
         "startup_base_head_refresh_sha": prepared.startup_base_head_refresh_sha,
         "move_completed_plan_to_done": prepared.move_completed_plan_to_done,
@@ -2366,6 +2519,16 @@ def _prepared_from_payload(
     max_turns = payload.get("max_turns")
     if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
         raise DaemonError("prepared startup record has invalid max_turns")
+    choice_values = {}
+    for field_name in (
+        "team_explicit",
+        "max_turns_explicit",
+        "start_step_explicit",
+    ):
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, bool):
+            raise DaemonError(f"prepared startup record has invalid {field_name}")
+        choice_values[field_name] = value
     return PreparedRun(
         workflow_name=str(payload["workflow_name"]),
         repo_root=repo_root,
@@ -2373,6 +2536,9 @@ def _prepared_from_payload(
         config_path=config_path,
         max_turns=max_turns,
         team=_optional_string(payload.get("team")),
+        team_explicit=choice_values["team_explicit"],
+        max_turns_explicit=choice_values["max_turns_explicit"],
+        start_step_explicit=choice_values["start_step_explicit"],
         extra_instructions=extra_instructions,
         start_step=str(payload["start_step"]),
         startup_base_head_refresh_sha=_optional_string(payload.get("startup_base_head_refresh_sha")),
