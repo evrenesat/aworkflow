@@ -32,13 +32,19 @@ workflow artifacts.
 
 The web `SidebarEditorLayout` keeps detail and editor content in document flow.
 In wide/tall mode its navigation may be sticky with a bounded local scroll
-surface; in compact/short mode navigation and detail stack at natural height
-until the list → detail migration checkpoint. The shell and workspace no longer
-lock the root or create ordinary nested pane scrollers. Bounded option lists,
-native textareas, and explicitly expanded raw payloads remain named local
-exceptions. This implements the document-scroll portion of the owner-approved
-[UI guidelines](UI_GUIDELINES.md); shared shell slots, hamburger navigation and
-mobile Back behavior remain subsequent checkpoints.
+surface; in compact/short mode its local presentation state exposes one
+already-mounted list or detail surface at a time. Selection remains owned by
+the consumer, while `navigationVersion` marks a user opening and the Runs
+consumer marks URL/deep-link entry. Back restores the document position and
+focuses the same item when it still exists, or the labelled list surface when
+it does not. Hidden presentation uses actual `hidden` semantics so inactive
+controls are not keyboard-accessible, and resize transitions do not recreate
+draft/editor owners. The shell and workspace no longer lock the root or create
+ordinary nested pane scrollers. Bounded option lists, native textareas, and
+explicitly expanded raw payloads remain named local exceptions. This implements
+the document-scroll and list/detail portions of the owner-approved [UI
+guidelines](UI_GUIDELINES.md); shared shell slots and hamburger navigation
+remain subsequent checkpoints.
 
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
 selected editor IDs across guided/raw mode changes; run dashboards retain pending

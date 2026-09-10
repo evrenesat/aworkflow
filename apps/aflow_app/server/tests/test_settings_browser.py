@@ -71,6 +71,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                 page.get_by_label('Color theme').select_option(theme)
                 for width, height in ((1365, 900), (390, 844), (844, 390)):
                     page.set_viewport_size({'width': width, 'height': height})
+                    compact = width < 960 or height < 600
                     page.get_by_role('tab', name='Agents & Roles', exact=True).click()
                     page.get_by_label('Effort codex.profile_29', exact=True).wait_for()
                     metrics = document_metrics(page)
@@ -99,6 +100,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                     for tab, display_name in [('Teams', 'Team 39'), ('Workflows', 'Workflow 39'), ('Prompts', 'Scroll test 39')]:
                         page.get_by_role('tab', name=tab, exact=True).click()
                         nav = page.locator('.sidebar-editor-navigation')
+                        nav.wait_for(state='visible')
                         if tab == 'Workflows':
                             nav.get_by_role('button', name='Defaults', exact=True).click()
                             default_workflow = page.get_by_role('combobox', name='Default workflow', exact=True)
@@ -111,7 +113,15 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                             default_workflow.press('ArrowDown')
                             default_workflow.press('Enter')
                             assert default_workflow.input_value() == 'Managed'
-                        nav.get_by_role('button', name=display_name, exact=True).click()
+                            if compact:
+                                page.get_by_role('button', name='← Back to Workflows', exact=True).click()
+                                nav.wait_for(state='visible')
+                        row = nav.get_by_role('button', name=display_name, exact=True)
+                        row.scroll_into_view_if_needed()
+                        item_id = row.get_attribute('data-sidebar-editor-item')
+                        before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                        row.click()
+                        page.locator('.sidebar-editor-detail').wait_for(state='visible')
                         metrics = document_metrics(page)
                         assert metrics['detailHeight'] > 0, metrics
                         assert metrics['detailContent'] <= metrics['detailHeight'] + 1, metrics
@@ -120,12 +130,31 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                         if width >= 960 and height >= 600:
                             assert metrics['navContent'] > metrics['navHeight'], metrics
                         else:
+                            assert not nav.is_visible()
                             assert metrics['navScroll'] == 0, metrics
+                            assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
                         save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                         if height < 600:
                             page.get_by_role('button', name='Save all changes', exact=True).scroll_into_view_if_needed()
                             save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                         assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width
+                        if compact:
+                            page.get_by_role('button', name=f'← Back to {tab}', exact=True).click()
+                            nav.wait_for(state='visible')
+                            page.wait_for_timeout(50)
+                            after_back_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                            assert abs(after_back_scroll - before_list_scroll) <= 2, {
+                                'before': before_list_scroll, 'after': after_back_scroll, 'tab': tab,
+                            }
+                            assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
+                            # The same selected row is a valid re-entry point.
+                            row.click()
+                            page.locator('.sidebar-editor-detail').wait_for(state='visible')
+                        nav = page.locator('.sidebar-editor-navigation')
+                        if compact:
+                            page.get_by_role('button', name=f'← Back to {tab}', exact=True).click()
+                            nav.wait_for(state='visible')
+                            page.wait_for_timeout(50)
                         nav.get_by_role('button', name=display_name.replace('39', '38'), exact=True).click()
                         assert document_metrics(page)['detailScroll'] == 0
             page.get_by_role('button', name='Advanced TOML', exact=True).click()
@@ -274,6 +303,23 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                 page.get_by_role('tab', name='Skills', exact=True).click()
                 for width, height in ((1365, 900), (390, 844)):
                     page.set_viewport_size({'width': width, 'height': height})
+                    compact = width < 960 or height < 600
+                    if compact:
+                        nav = page.locator('.sidebar-editor-navigation')
+                        nav.wait_for(state='visible')
+                        row = nav.get_by_role('button', name='aflow-plan', exact=True)
+                        row.scroll_into_view_if_needed()
+                        before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                        row.click()
+                        page.locator('.sidebar-editor-detail').wait_for(state='visible')
+                        assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
+                        page.get_by_role('button', name='← Back to Skills', exact=True).click()
+                        nav.wait_for(state='visible')
+                        page.wait_for_timeout(50)
+                        assert abs(page.evaluate('() => document.scrollingElement.scrollTop') - before_list_scroll) <= 2
+                        assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == 'aflow-plan'
+                        row.click()
+                        page.locator('.sidebar-editor-detail').wait_for(state='visible')
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                     save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                     assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width

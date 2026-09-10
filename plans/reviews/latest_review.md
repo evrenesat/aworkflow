@@ -1,39 +1,41 @@
-# Responsive document scrolling: CP1 v01 review
+# CP2 approval review — 2026-09-10
 
-Original and active plan: `plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910.md`.
-Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`.
+Reviewed `cp2 v02`: active non-checkpoint repair overlay
+`plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910-cp02-v02.md`
+and accumulated CP2 implementation against original checkpoint 2 in
+`plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910.md`.
+No CP2 commit existed before this review (zero commits since approved cp1 v01,
+`4bf09ae8a1847d7ea29e3230e2a6d50a84a01b5c`); used current-worktree fallback.
+Branch matches original Git Tracking; original pre-handoff base remains
+reachable and unchanged. Prior reviewer bookkeeping is preserved.
 
-Reviewed the immediately preceding worker's nine-file uncommitted diff from
-`ee1757579b216afe9c02f3ca763038cae59a8498` through current worktree state.
-No checkpoint commit existed, so current-worktree fallback was used. There
-were zero implementation commits beyond the base before this review. The
-prechecked CP1 heading represented worker completion, not earlier approval.
-CP2 was not the review target.
+Scope: shared compact list/detail/Back presentation; Skills, Teams, Workflows,
+Prompts and Runs consumers; explicit App run-entry intent; related component
+and browser tests, CSS and documentation. CP3–6 are outside this review.
 
-Scope: document/root/workspace scrolling, wide navigation exception, natural
-compact stacking expressly allowed by CP1, PlanPanel sizing, removal of pane
-selection resets, corresponding browser checks and documentation. No material
-findings survived the admission gate, exclusions and proportionate-fix review.
+Zero findings passed the material-code-review admission gate. Fresh and repeated
+All runs selections now open the exact detail, and successful launch handoffs
+use the same explicit-entry callback. Passive default-run URL synchronization
+remains list-first. Reviewed mounted draft ownership, hidden semantics,
+matchMedia cleanup, resize behavior, repeated selection, removed-row fallback,
+and separation of presentation from domain requests and URL selection.
 
-Reviewer verification:
+Local verification: 178 targeted web tests passed; production build passed;
+both required disposable Chromium modules passed all four tests; diff check
+passed. Browser journeys exercise All runs fresh/repeat entry, ordinary compact
+Runs entry, deep links, list/detail/Back focus and document-position restoration,
+Settings navigation and real editing/save behavior. Test services use temporary
+records/configuration and ephemeral localhost ports. No shared tool target,
+live settings, controller or concurrent worktree was changed.
 
-- `npm --prefix apps/aflow_app/web test -- --run`: 279 passed.
-- `npm --prefix apps/aflow_app/web run build`: passed.
-- `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_settings_browser.py apps/aflow_app/server/tests/test_run_navigation_browser.py`: 4 passed.
-- `git diff --check`: passed.
+Disposition: approve CP2 as `cp2 v02` in a reviewer-created checkpoint commit;
+advance only original CP2 and Last Approved Checkpoint. CP3–6 remain unchecked.
+No production code was changed by review and no history was rewritten. Previous
+latest review was archived byte-for-byte. No new repair plan is needed.
 
-Checks covered document wheel movement, final-control reachability, long-plan
-text persistence and run-history behavior using disposable configuration,
-fixture projects and ephemeral localhost ports. React act warnings and Python
-dependency deprecation warnings did not fail verification. No live/global
-settings or shared uv tool were changed.
-
-Approve CP1 v01 with a reviewer-owned checkpoint commit; original plan remains
-in progress and CP2–6 stay unchecked. No fix plan is required. Full mobile
-list/detail, editor-space budgets, WebKit, inspected screenshots and physical
-keyboard proof remain later-checkpoint work and are not claimed here.
-
-Publication: pending workflow delivery. Exact-SHA CI: unverified.
-Live activation/usability: unverified.
+Publication: pending normal workflow delivery. Exact-SHA CI: not run.
+Live activation/usability: not verified. Full task-space budgets, WebKit and
+physical mobile keyboard evidence remain later-checkpoint work; this approval
+does not claim the completed responsive plan or deployed usability.
 
 No material findings

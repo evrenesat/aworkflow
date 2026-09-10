@@ -65,9 +65,9 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
     {loadError && <p role="alert" className="error-message">Skills could not be loaded: {loadError}</p>}
     {!skills && !loadError && <p>Loading skills…</p>}
     {skills && skills.length === 0 && <p>No bundled skills are registered.</p>}
-    {skills && skills.length > 0 && <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} navigation={<div>
+    {skills && skills.length > 0 && <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} listLabel="Skills" navigation={<div>
       <h3>Skills</h3>
-      {skills.map(skill => <button className={`btn sidebar-entry ${selected === skill.name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === skill.name} key={skill.name} onClick={() => select(skill.name)}>
+      {skills.map(skill => <button data-sidebar-editor-item={skill.name} className={`btn sidebar-entry ${selected === skill.name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === skill.name} key={skill.name} onClick={() => select(skill.name)}>
         {skill.name}{skill.default ? '' : ' (optional)'}{unsavedNames.includes(skill.name) ? ' · unsaved' : ''}
       </button>)}
     </div>}>

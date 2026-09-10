@@ -1289,3 +1289,42 @@ Final verification: web tests (213), all server tests including Chromium layout 
 - Verification: 279 web tests, production build, four disposable Chromium
   browser checks and `git diff --check` passed. No live configuration or
   production run was changed.
+
+## 2026-09-10 — Responsive list/detail checkpoint 2
+
+- Added compact list → detail → Back presentation to the shared
+  `SidebarEditorLayout` for Skills, Teams, Workflows, Prompts and Run history.
+  The compact helper follows the CSS media query through a cleaned-up
+  `matchMedia` listener; wide layouts retain both columns. Domain consumers
+  continue to own exact selections, drafts, saves, URL state and requests.
+- Compact selection captures document position and the clicked machine identity
+  before opening, focuses the detail heading once, and Back restores the row or
+  the labelled list surface if refresh removed it. Both surfaces stay mounted,
+  with the inactive one removed from keyboard/accessibility traversal. A run URL
+  opens detail explicitly; passive refresh does not reset focus or scroll, and
+  resize preserves an opened detail.
+- Added seven focused layout tests and extended disposable Chromium Settings and
+  run journeys for compact deep links, list/detail/Back, focus, position and
+  re-entry. Verification for this checkpoint: 174 targeted web tests, a
+  production build, four Chromium browser checks and `git diff --check` passed.
+  No live configuration, production run, publication or CI deployment was
+  changed.
+
+## 2026-09-10 — CP2 run-entry intent repair
+
+- Separated App-owned explicit run URL/browser-navigation intent from the
+  synchronized selected-run URL. Ordinary default selection therefore remains
+  list-first on compact screens while direct links and browser navigation still
+  open the exact run detail; existing selection, URL and request behavior is
+  unchanged.
+- All runs and successful launch handoffs now mark that existing explicit
+  intent before moving to their exact Runs URL, so compact detail opens even
+  when the dashboard was not visible or was locally backed out of.
+- Added compact App and disposable Chromium regressions for fresh and repeated
+  All runs selection, alongside passive default synchronization, explicit
+  initial links, later browser navigation, row Back, identity and focus
+  restoration.
+- Verification: the CP2 subset passed 178 web tests; the production build and
+  all four disposable Chromium browser checks passed; and `git diff --check`
+  passed. No live configuration, production run, publication, CI, or live
+  activation was changed.

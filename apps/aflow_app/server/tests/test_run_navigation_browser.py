@@ -21,15 +21,68 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             page.goto(url)
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
+            # All runs is an explicit cross-project entry. Its first compact
+            # selection, and a repeat after local Back, must expose that exact
+            # run detail while retaining the canonical URL identity.
+            page.set_viewport_size({'width': 390, 'height': 844})
+            page.goto(f'{url}/?view=all-runs')
+            for attempt in range(2):
+                page.get_by_role('button', name='Test project · Completed', exact=False).first.click()
+                page.wait_for_function("new URL(location.href).searchParams.get('project') === 'test-project' && new URL(location.href).searchParams.get('view') === 'runs'")
+                selected_id = page.evaluate("() => new URL(location.href).searchParams.get('run')")
+                assert selected_id
+                detail = page.locator('.sidebar-editor-detail')
+                detail.wait_for(state='visible')
+                assert not page.locator('.sidebar-editor-navigation').is_visible()
+                assert detail.locator('.run-detail h3').is_visible()
+                page.get_by_role('button', name='← Back to Run history', exact=True).click()
+                page.locator('.sidebar-editor-navigation').wait_for(state='visible')
+                assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == selected_id
+                if attempt == 0:
+                    page.get_by_role('button', name='All runs', exact=True).click()
+                    page.get_by_role('heading', name='All runs', exact=True).wait_for()
+            # An ordinary Runs URL has no explicit run entry. The dashboard
+            # still reports its default selection so the URL stays truthful,
+            # but that passive replacement must leave compact history open.
+            page.set_viewport_size({'width': 390, 'height': 844})
+            page.goto(f'{url}/?project={PROJECT_ID}&view=runs')
+            nav = page.locator('.sidebar-editor-navigation')
+            nav.wait_for(state='visible')
+            page.wait_for_function("new URL(location.href).searchParams.get('run') !== null")
+            detail = page.locator('.sidebar-editor-detail')
+            assert not detail.is_visible()
+            row = nav.get_by_role('button', name='history-069.md', exact=False)
+            row.scroll_into_view_if_needed()
+            before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+            item_id = row.get_attribute('data-sidebar-editor-item')
+            row.click()
+            detail.wait_for(state='visible')
+            assert not nav.is_visible()
+            assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
+            assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == item_id
+            page.get_by_role('button', name='← Back to Run history', exact=True).click()
+            nav.wait_for(state='visible')
+            page.wait_for_timeout(50)
+            restored_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+            assert abs(restored_scroll - min(before_list_scroll, page.evaluate('(top) => Math.min(top, Math.max(0, document.scrollingElement.scrollHeight - innerHeight))', before_list_scroll))) <= 2
+            assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
             for theme in ('light', 'dark'):
                 page.evaluate('(theme) => { document.documentElement.dataset.theme = theme }', theme)
                 for width, height in ((1365, 900), (390, 844)):
                     page.set_viewport_size({'width': width, 'height': height})
                     page.goto(f'{url}/?project={PROJECT_ID}&view=runs&run=history-000')
                     nav = page.locator('.sidebar-editor-navigation')
+                    compact = width < 960 or height < 600
+                    if compact:
+                        page.get_by_role('button', name='← Back to Run history', exact=True).click()
+                        nav.wait_for(state='visible')
                     page.get_by_role('button', name='Load more runs', exact=True).click()
                     page.wait_for_function("document.querySelectorAll('.run-list-item').length === 130")
-                    nav.get_by_role('button', name='history-069.md', exact=False).click()
+                    row = nav.get_by_role('button', name='history-069.md', exact=False)
+                    row.scroll_into_view_if_needed()
+                    before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                    item_id = row.get_attribute('data-sidebar-editor-item')
+                    row.click()
                     page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
                     metrics = document_metrics(page)
                     assert metrics['detailHeight'] > 0, metrics
@@ -40,9 +93,13 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         assert metrics['navContent'] > metrics['navHeight'], metrics
                         assert metrics['navScroll'] > 0, metrics
                     else:
-                        assert metrics['documentHeight'] > height, metrics
+                        assert not nav.is_visible()
                         assert metrics['navScroll'] == 0, metrics
-                        assert metrics['documentScroll'] > 0, metrics
+                        assert metrics['documentScroll'] == 0, metrics
+                        # The history list, rather than the detail surface,
+                        # proves ordinary document movement on compact screens.
+                        assert before_list_scroll > 0, metrics
+                        assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
                     actions = page.get_by_role('button', name='More run actions', exact=True)
                     actions.scroll_into_view_if_needed()
                     action_box = actions.bounding_box()
@@ -59,7 +116,22 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         assert refreshed['navScroll'] == metrics['navScroll'], refreshed
                     else:
                         assert refreshed['documentScroll'] >= metrics['documentScroll'] - 2, refreshed
+                        if compact:
+                            page.get_by_role('button', name='← Back to Run history', exact=True).click()
+                            nav.wait_for(state='visible')
+                            page.wait_for_timeout(50)
+                            after_back_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+                        restored_target = page.evaluate(
+                            '(top) => Math.min(top, Math.max(0, document.scrollingElement.scrollHeight - innerHeight))',
+                            before_list_scroll,
+                        )
+                        assert abs(after_back_scroll - restored_target) <= 2, {
+                            'before': before_list_scroll, 'after': after_back_scroll, 'target': restored_target,
+                        }
+                        assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
                     nav.get_by_role('button', name='history-068.md', exact=False).click()
+                    if compact:
+                        page.locator('.run-detail h3').filter(has_text='history-068.md').wait_for()
                     assert document_metrics(page)['detailScroll'] == 0
                     page.go_back()
                     page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()

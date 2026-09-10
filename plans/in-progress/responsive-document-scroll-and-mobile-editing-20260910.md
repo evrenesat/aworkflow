@@ -12,7 +12,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 - Plan Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`
 - Pre-Handoff Base HEAD: `ee1757579b216afe9c02f3ca763038cae59a8498`
-- Last Approved Checkpoint: `cp1 v01`
+- Last Approved Checkpoint: `cp2 v02`
 
 ### Review Log
 
@@ -24,6 +24,50 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
   Chromium modules (4 passed), and `git diff --check`. CP2–6 remain unchecked.
   Publication, exact-SHA CI and live proof remain pending workflow delivery.
 
+- 2026-09-10: Rejected CP2 attempt v01 using the current-worktree fallback
+  from approved `cp1 v01` (`4bf09ae`); no CP2 commit exists. The immediately
+  preceding worker diff is CP2, despite the supplied cp03 fix filename. P2:
+  passive default-run URL synchronization is treated as explicit detail entry,
+  hiding history on an ordinary compact Runs visit. Confirmed in disposable
+  Chromium at 390×844 without a run URL parameter. 174 targeted web tests,
+  production build, existing four browser checks and diff check passed; the
+  additional first-entry reproduction failed. CP2 remains unapproved, CP3–6
+  remain unchecked. Repair overlay: `responsive-document-scroll-and-mobile-editing-20260910-cp03-v01.md`.
+  No approval commit, publication, CI or live deployment proof in this review.
+
+- 2026-09-10: Rejected the subsequent uncommitted CP2 repair attempt against
+  original CP2, using current-worktree fallback from cp1 v01 (`4bf09ae`). The
+  passive-default entry defect is repaired, but explicit selection from All
+  runs now leaves compact detail hidden because that callback never supplies
+  the new App navigation intent. Confirmed in disposable Chromium at 390×844.
+  Build, four existing Chromium tests and diff check passed; targeted web suite
+  initially passed 176/177, with the existing restart test passing in a rerun
+  of all 67 RunDashboard tests. CP2 remains unapproved; CP3–6 remain unchecked.
+  Replacement non-checkpoint repair overlay:
+  `responsive-document-scroll-and-mobile-editing-20260910-cp02-v01.md`.
+  Superseded cp03 overlay removed. No approval commit or history rewrite;
+  publication, exact-SHA CI and live proof remain pending workflow delivery.
+
+- 2026-09-10: Rejected CP2 repair overlay cp02-v01 against original CP2 using
+  current-worktree fallback from cp1 v01 (`4bf09ae`); no CP2 commit exists.
+  The All runs callback still lacks explicit-entry intent and the requested
+  All runs regression tests are absent. Fresh disposable Chromium at 390×844
+  again reached the exact run URL with detail hidden. The 177 targeted web tests
+  and production build passed. CP2 stays unapproved; CP3–6 remain unchecked.
+  Superseded cp02-v01 with non-checkpoint repair overlay
+  `responsive-document-scroll-and-mobile-editing-20260910-cp02-v02.md`.
+  No approval commit, history rewrite, publication, CI or live proof.
+
+- 2026-09-10: Approved `cp2 v02`, reviewing active cp02-v02 repair and the
+  accumulated CP2 work against original CP2. No CP2 commit existed; used the
+  current-worktree fallback from approved cp1 v01 (`4bf09ae`). Explicit All
+  runs and launch entry now supply App navigation intent; passive default
+  selection remains list-first. No material findings. Reviewer verification:
+  178 targeted web tests, production build, four disposable Chromium tests
+  (including fresh/repeat All runs and Back focus/scroll), and diff check passed.
+  Reviewer owns the cp2 v02 approval commit. Only CP2 advances; CP3–6 remain
+  unchecked. Publication, exact-SHA CI and live proof remain pending normal
+  workflow delivery; broader task-space budgets and WebKit belong to later CPs.
 
 ## Done Means
 
@@ -81,7 +125,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Blockers:** Report genuinely ambiguous overlapping dirty-file ownership; unrelated dirty files outside scope do not justify stopping.
 
-### [ ] Checkpoint 2: Add narrow list/detail navigation without losing state
+### [x] Checkpoint 2: Add narrow list/detail navigation without losing state
 
 **Goal:** Use available phone space for one task while retaining the wide layout.
 
@@ -91,11 +135,11 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Steps:**
 
-- [ ] Extend the existing layout with an accessible list label, explicit user-open signal (reuse navigationVersion), and explicit-detail-entry flag for a run URL. Local presentation state controls list/detail; domain owners retain selection/drafts. Compact first entry shows list unless explicitly deep-linked; wide mode preserves existing selected detail behavior.
-- [ ] Selection from a compact list opens detail with “Back to Skills/Teams/Workflows/Prompts/Run history”. Back does not clear selection or drafts, issue a save, or change selected run. Keep the editor mounted/hidden when needed to preserve state, with actual hidden semantics and no focusable hidden controls.
-- [ ] Capture list document position and clicked-item identity before opening. On Back restore that position and focus the same row, or the list heading if removed. On explicit opening focus detail heading using preventScroll and move document to its start once. Passive refresh/polling never resets focus/scroll. Re-clicking the selected row still opens it.
-- [ ] Resizing an open detail to wide and back retains detail; resizing an untouched wide default selection to compact uses list. Changing Settings section resets presentation to its list while retaining per-section drafts/selection. Do not add URL parameters/history entries for local Settings selection. Existing browser Back/Forward behavior remains guarded by App.
-- [ ] Add focused component tests for first entry, repeat selection, Back, deep link, removed row, dirty resize, and inactive focusability. Extend real browser navigation checks to verify document position and focus after Back.
+- [x] Extend the existing layout with an accessible list label, explicit user-open signal (reuse navigationVersion), and explicit-detail-entry flag for a run URL. Local presentation state controls list/detail; domain owners retain selection/drafts. Compact first entry shows list unless explicitly deep-linked; wide mode preserves existing selected detail behavior.
+- [x] Selection from a compact list opens detail with “Back to Skills/Teams/Workflows/Prompts/Run history”. Back does not clear selection or drafts, issue a save, or change selected run. Keep the editor mounted/hidden when needed to preserve state, with actual hidden semantics and no focusable hidden controls.
+- [x] Capture list document position and clicked-item identity before opening. On Back restore that position and focus the same row, or the list heading if removed. On explicit opening focus detail heading using preventScroll and move document to its start once. Passive refresh/polling never resets focus/scroll. Re-clicking the selected row still opens it.
+- [x] Resizing an open detail to wide and back retains detail; resizing an untouched wide default selection to compact uses list. Changing Settings section resets presentation to its list while retaining per-section drafts/selection. Do not add URL parameters/history entries for local Settings selection. Existing browser Back/Forward behavior remains guarded by App.
+- [x] Add focused component tests for first entry, repeat selection, Back, deep link, removed row, dirty resize, and inactive focusability. Extend real browser navigation checks to verify document position and focus after Back.
 
 **Dependencies:** CP1.
 

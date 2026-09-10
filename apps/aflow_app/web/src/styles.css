@@ -1122,6 +1122,8 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-md);
   align-items: start;
   min-width: 0;
+  /* Back restores the document offset explicitly while a sibling is hidden. */
+  overflow-anchor: none;
 }
 .sidebar-editor-navigation {
   position: sticky;
@@ -1159,8 +1161,8 @@ input::placeholder, textarea::placeholder {
 .plan-editor-textarea { min-height: 360px; resize: vertical; width: 100%; }
 
 @media (max-width: 959px), (max-height: 599px) {
-  /* Compact/short screens stack natural-height blocks until list/detail
-     presentation is introduced by the next checkpoint. */
+  /* Compact/short screens expose one mounted list or detail surface at a time;
+     SidebarEditorLayout owns the hidden presentation state. */
   .sidebar-editor-layout {
     display: flex;
     flex-direction: column;

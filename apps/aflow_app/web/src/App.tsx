@@ -17,6 +17,17 @@ import {
 
 type View = WorkspaceQuery['view']
 
+interface RunNavigationIntent {
+  projectId: string
+  runId: string
+}
+
+/** Returns only URL entries that were capable of explicitly opening a run. */
+function runNavigationIntentFor(query: WorkspaceQuery): RunNavigationIntent | null {
+  if (query.view !== 'runs' || query.project === null || query.run === null) return null
+  return { projectId: query.project, runId: query.run }
+}
+
 /** Why the login gate is (or is not) shown. */
 type AuthGate = 'checking' | 'signedOut' | 'restoreFailed' | 'expired' | 'signedIn'
 
@@ -53,6 +64,9 @@ export function App() {
   const [projectsLoading, setProjectsLoading] = useState(true)
   const [projectsError, setProjectsError] = useState<string | null>(null)
   const [query, setQuery] = useState<WorkspaceQuery>(initialWorkspaceQuery)
+  const [runNavigationIntent, setRunNavigationIntent] = useState<RunNavigationIntent | null>(() => (
+    runNavigationIntentFor(initialWorkspaceQuery())
+  ))
   const [visitedProjects, setVisitedProjects] = useState<string[]>([])
   useEffect(() => {
     if (query.project) setVisitedProjects(ids => ids.includes(query.project!) ? ids : [...ids, query.project!])
@@ -70,6 +84,14 @@ export function App() {
   queryRef.current = query
   const dirtyRef = useRef(false)
   dirtyRef.current = configDirty || planDirty
+
+  // A passive selected-run URL replacement must not leave an old explicit
+  // entry marker armed for a later visit to the same run.
+  useEffect(() => {
+    if (!runNavigationIntent) return
+    if (query.view === 'runs' && query.project === runNavigationIntent.projectId && query.run === runNavigationIntent.runId) return
+    setRunNavigationIntent(null)
+  }, [query, runNavigationIntent])
 
   // On load, ask the server whether the browser session cookie is still
   // valid. Only a definitive 401 shows Login; a network/server failure
@@ -174,7 +196,10 @@ export function App() {
       const target = normalizeWorkspaceQuery(parseWorkspaceQuery(window.location.search))
       const current = queryRef.current
       if (sameWorkspaceQuery(target, current)) return
-      const apply = () => applyQuery(target, 'replace')
+      const apply = () => {
+        setRunNavigationIntent(runNavigationIntentFor(target))
+        applyQuery(target, 'replace')
+      }
       if (dirtyRef.current) {
         setPendingAction({
           description: 'follow the browser navigation',
@@ -381,6 +406,12 @@ export function App() {
     else applyQuery({ ...current, run: change.runId }, 'replace')
   }, [applyQuery])
 
+  /** Opens a run from outside its mounted history list as an explicit detail entry. */
+  const openExplicitRun = useCallback((project: string, run: string) => {
+    setRunNavigationIntent({ projectId: project, runId: run })
+    applyQuery({ project, view: 'runs', run }, 'push')
+  }, [applyQuery])
+
   if (authGate !== 'signedIn') {
     return (
       <div className="auth-gate">
@@ -491,7 +522,7 @@ export function App() {
       )}
 
       <main className="workspace-main">
-        {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={(project, run) => applyQuery({ project, view: 'runs', run }, 'push')} />}
+        {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={openExplicitRun} />}
         {view === 'settings' && (
             <GlobalSettings
               onDirtyChange={handleConfigDirty}
@@ -583,6 +614,9 @@ export function App() {
               visible={query.project === id && (view === 'runs' || view === 'new-run')}
               page={query.project === id && view === 'new-run' ? 'new-run' : 'runs'}
               requestedRunId={query.project === id ? query.run : null}
+              explicitRunNavigation={query.project === id
+                && runNavigationIntent?.projectId === id
+                && runNavigationIntent.runId === query.run}
               onRunSelectionChange={change => { if (queryRef.current.project === id) handleRunSelectionChange(change) }}
               initialPlanPath={query.project === id ? runDashboardPlanPath : null}
               onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
@@ -591,7 +625,9 @@ export function App() {
               onOpenSettings={() => switchView('settings')}
               onNewRun={() => applyQuery({ project: id, view: 'new-run', run: null }, 'push')}
               onCancelNewRun={() => applyQuery({ project: id, view: 'runs', run: null }, 'push')}
-              onRunStarted={runId => { if (queryRef.current.project === id && ['runs', 'new-run'].includes(queryRef.current.view)) applyQuery({ project: id, view: 'runs', run: runId }, 'push') }}
+              onRunStarted={runId => {
+                if (queryRef.current.project === id && ['runs', 'new-run'].includes(queryRef.current.view)) openExplicitRun(id, runId)
+              }}
             />
           </div>
         ))}

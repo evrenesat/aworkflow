@@ -55,6 +55,8 @@ interface RunDashboardProps {
    * missing request never selects a substitute.
    */
   requestedRunId?: string | null
+  /** True only for an explicit initial URL or browser navigation to a run. */
+  explicitRunNavigation?: boolean
   onRunSelectionChange?: (change: RunSelectionChange) => void
   initialPlanPath: string | null
   onInitialPlanHandled: () => void
@@ -402,7 +404,7 @@ function configuredWorkflowSteps(
   return []
 }
 
-export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
+export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, explicitRunNavigation, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
   const [projectAvailable, setProjectAvailable] = useState<boolean | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
@@ -1803,12 +1805,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       )}
 
       {projectAvailable && !newRunPage && (
-        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} navigation={
+        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} navigation={
           <section className="card run-list" aria-label="Project runs">
             <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
             <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>
             {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => (
-              <button className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
+              <button data-sidebar-editor-item={run.run_id} className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
                 <span>{run.plan_path?.split('/').pop() ?? run.run_id}</span>
                 <span className="status-pill">{statusLabel(run)}</span>
                 <span className="text-xs text-dim">

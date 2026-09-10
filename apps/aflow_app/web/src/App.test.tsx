@@ -170,6 +170,33 @@ function setUrl(search: string) {
   window.location.href = window.location.origin + search
 }
 
+function mockMatchMedia(initialMatches: boolean) {
+  const original = window.matchMedia
+  let matches = initialMatches
+  const listeners = new Set<(event: MediaQueryListEvent) => void>()
+  const media = {
+    media: '(max-width: 959px), (max-height: 599px)',
+    onchange: null,
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    addListener: (listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeListener: (listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    dispatchEvent: () => true,
+  } as unknown as MediaQueryList
+  Object.defineProperty(media, 'matches', { configurable: true, get: () => matches })
+  Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: vi.fn(() => media) })
+  return {
+    setMatches(next: boolean) {
+      matches = next
+      const event = { matches: next, media: media.media } as MediaQueryListEvent
+      listeners.forEach(listener => listener(event))
+    },
+    restore() {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: original })
+    },
+  }
+}
+
 /** Opens an added project from its compact row (the row itself is the open control). */
 async function openAddedProject(name: RegExp) {
   const list = await screen.findByRole('list', { name: 'Added projects' })
@@ -797,6 +824,105 @@ describe('App workspace shell', () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Runs' })
     await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-older'))
+  })
+
+  it('keeps an ordinary compact Runs entry on history after passive URL sync', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?project=alpha&view=runs')
+      const replace = vi.spyOn(window.history, 'replaceState')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard()
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Runs' })
+      await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+
+      const navigation = document.querySelector('.sidebar-editor-navigation') as HTMLElement
+      const detail = document.querySelector('.sidebar-editor-detail') as HTMLElement
+      expect(navigation.hidden).toBe(false)
+      expect(detail.hidden).toBe(true)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('keeps a wide default Runs entry on history when resized compact', async () => {
+    const media = mockMatchMedia(false)
+    try {
+      setUrl('/?project=alpha&view=runs')
+      const replace = vi.spyOn(window.history, 'replaceState')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard()
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Runs' })
+      await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+
+      media.setMatches(true)
+      await waitFor(() => expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(true))
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(false)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('opens explicit initial and later browser run URLs on compact screens', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?project=alpha&view=runs&run=run-9')
+      const other = { ...dashboardRun, run_id: 'run-other', plan_path: 'plans/in-progress/other.md' }
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard({ runs: [dashboardRun, other] })
+      vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-other' ? other : dashboardRun)
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Runs' })
+      await screen.findByRole('heading', { name: 'demo.md' })
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+
+      setUrl('/?project=alpha&view=runs&run=run-other')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-other', expect.objectContaining({ signal: expect.any(AbortSignal) })))
+      await screen.findByRole('heading', { name: 'other.md' })
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+
+      setUrl('/?project=alpha&view=runs&run=run-9')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenLastCalledWith('alpha', 'run-9', expect.objectContaining({ signal: expect.any(AbortSignal) })))
+      await screen.findByRole('heading', { name: 'demo.md' })
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('opens fresh and repeated compact All runs selections in the exact detail', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?view=all-runs')
+      const push = vi.spyOn(window.history, 'pushState')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard()
+      render(<App />)
+
+      const openFromAllRuns = async () => {
+        const row = await screen.findByRole('button', { name: /Alpha Project.*run-9/ })
+        fireEvent.click(row)
+        await waitFor(() => expect(push).toHaveBeenLastCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+        await screen.findByRole('heading', { name: 'demo.md' })
+        expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+        expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(false)
+      }
+
+      await openFromAllRuns()
+      fireEvent.click(screen.getByRole('button', { name: '← Back to Run history', exact: true }))
+      await waitFor(() => expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(false))
+      expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(true)
+
+      fireEvent.click(screen.getByRole('button', { name: 'All runs', exact: true }))
+      await screen.findByRole('heading', { name: 'All runs' })
+      await openFromAllRuns()
+    } finally {
+      media.restore()
+    }
   })
 
   it('clears a stale project link with guidance instead of a substitute', async () => {
