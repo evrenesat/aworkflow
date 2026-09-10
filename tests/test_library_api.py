@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 
 from aflow.api import (
@@ -1293,18 +1295,28 @@ class LibraryRunnerTests(unittest.TestCase):
                     effective_prompt=user_prompt,
                 )
 
-        execute_workflow(
-            result,
-            observer=observer,
-            adapter=FakeAdapter(),
-            runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "done\n", ""),
-        )
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            execute_workflow(
+                result,
+                observer=observer,
+                adapter=FakeAdapter(),
+                runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "done\n", ""),
+            )
 
         events = observer.events
         event_types = [type(e) for e in events if e]
 
         self.assertIn(RunStartedEvent, event_types)
         self.assertTrue(any(isinstance(e, RunCompletedEvent) for e in events))
+        self.assertIs(event_types[0], RunStartedEvent)
+        self.assertIs(event_types[-1], RunCompletedEvent)
+        completed = next(e for e in events if isinstance(e, RunCompletedEvent))
+        self.assertEqual(completed.turns_completed, 0)
+        self.assertTrue(completed.final_snapshot.is_complete)
+        self.assertIn("AFlow run ", stderr.getvalue())
+        self.assertIn("- Completed", stderr.getvalue())
+        self.assertNotIn("Run ID:", stderr.getvalue())
 
     def test_execute_workflow_forwards_explicit_preflight_probe(self) -> None:
         from aflow.api import execute_workflow

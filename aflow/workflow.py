@@ -6294,7 +6294,6 @@ def run_workflow(
     state.selected_start_step = config.start_step
     state.startup_recovery_used = startup_retry is not None
     state.startup_recovery_reason = startup_retry.parse_error_str if startup_retry is not None else None
-    print(f"Run ID: {run_paths.run_dir.name}", file=sys.stderr)
     if resumed_from_run_id is not None:
         print(f"Resuming from: {resumed_from_run_id}", file=sys.stderr)
     run_metadata.write(

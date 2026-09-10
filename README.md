@@ -80,12 +80,16 @@ aflow run path/to/plan.md -- keep changes limited to the requested scope
 If no workflow is named, AFlow uses `aflow.default_workflow` from the
 configuration.
 
-Status and progress are printed as plain, append-only `key=value` records on
-stderr. Interactive terminals, redirected logs, and `TERM=dumb` environments
-receive the same ordered, copyable lines with no cursor movement, ANSI styling,
-or keyboard capture, and one final summary record per run. `aflow show` prints
-plain ASCII workflow graphs, roles, and teams. The CLI is a portable launcher
-and log stream; the remote web application is the interactive dashboard.
+Status and progress are printed as readable, append-only blocks on stderr. A
+run emits one identity and plan header, preparation and turn updates, and a
+final summary. On a capable TTY, only each block's heading is bold; redirected
+streams, `TERM=dumb` or missing/empty `TERM`, and any `NO_COLOR` setting remain
+plain. The renderer never refreshes the screen, captures keyboard input, or
+emits cursor, alternate-screen, polling, or heartbeat output. Full paths to
+saved turn logs remain visible. Structured observer events and `.aflow/runs`
+artifacts are the machine-facing alternatives. `aflow show` prints plain ASCII
+workflow graphs, roles, and teams. The CLI is a portable launcher and log
+stream; the remote web application is the interactive dashboard.
 
 ## Reusable NO-OP smoke plan
 

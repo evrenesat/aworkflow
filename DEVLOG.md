@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-10 — Integrate readable CLI status output
+
+- Wired the readable status renderer into the real runner lifecycle and
+  removed only the duplicate pre-banner run-ID line; existing resume and error
+  reporting paths remain unchanged.
+- Added synthetic runner coverage for normal and two-checkpoint progress,
+  stderr-only harness failure, pre-turn failure, waiting, owner stop, turn
+  limits, observer ordering, and durable run metadata.
+- Documented the block layout, TTY-only heading emphasis, plain fallback,
+  artifact paths, machine interfaces, no-refresh behavior, and fixture-based
+  before/after examples.
+
 ## 2026-09-09 — Document prompt template variables (Checkpoint 5)
 
 - Added read-only template-variable metadata to the guided configuration

@@ -401,8 +401,9 @@ def test_manager_report_remains_visible_once_after_real_banner_and_cli(
     assert "## Evidence" in stderr
     assert "## Next actions" in stderr
     assert "## Artifact references" in stderr
-    assert "manager_report=manager-report.md" in stderr
-    assert stderr.index("manager_report=manager-report.md") < stderr.index(report)
+    manager_report_path = "  Manager report:\n    manager-report.md"
+    assert manager_report_path in stderr
+    assert stderr.index(manager_report_path) < stderr.index(report)
     assert stderr.index(report) < stderr.index("Aflow exited with status 1.")
     assert run_json["failure_reason"] == report
     assert run_json["last_manager_report_path"] == "manager-report.md"

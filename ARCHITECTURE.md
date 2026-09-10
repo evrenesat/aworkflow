@@ -69,7 +69,7 @@ flowchart TD
     Transition["workflow.py — evaluate_condition() + proposed transition"]
     Manager["workflow.py — optional manager gate"]
     RunLog["runlog.py — write run metadata & turn artifacts"]
-    Banner["status.py — plain append-only status records on stderr"]
+    Banner["status.py — readable append-only status blocks on stderr"]
 
     User --> CLI
     CLI --> Config
@@ -676,21 +676,23 @@ Git snapshot helpers used by the banner and CLI. Provides three public data clas
 All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
 
 ### `status.py`
-Plain append-only status output rendered to stderr during a run. Meaningful
-state transitions, turn finalizations, and the final summary each emit one
-deterministic `key=value` record line prefixed with `aflow time=` and
-`event=start|update|final`. Identical consecutive snapshots are deduplicated,
-display values are bounded (durable artifact references are never truncated),
-control bytes are flattened, and dynamic Unicode content remains readable.
-Output is identical for interactive and redirected streams: no terminal-size or
-input dependence, no ANSI styling, and no cursor or alternate-screen sequences.
-Records carry run identity and lineage, status and end reason (including live
-hotplug stage, selector transition, and capability), workflow, step, checkpoint
-index/count/name, turn/max, team, role selector, harness/model, chosen
-transition and outcome, skipped start-step names, safe override diagnostics,
-manager and review-rejection pointers, repartition summaries, git summary since
-start with a bounded changed-file list, and artifact links (stdout, issues,
-manager report, review evidence).
+Readable append-only status blocks rendered to stderr during a run. The
+renderer emits one identity/plan header, preparation and meaningful status
+updates, finalized-turn blocks, and a final summary; identical consecutive
+snapshots are deduplicated. Indented labels expose run lineage, workflow and
+step, checkpoint progress, turn outcome and transition, resolved harness/model,
+plan identities, manager/review/repartition diagnostics, git changes since the
+start baseline, and full artifact paths. Display prose is bounded and control
+bytes are flattened, while Unicode and durable artifact references remain
+intact.
+
+The first line of each block is bold only when the actual stream is a capable
+TTY with a non-empty, non-`dumb` `TERM` and no `NO_COLOR`; all other streams
+receive identical unstyled content. Styling is presentation-only and does not
+change wrapping, deduplication, ordering, or machine data. The renderer owns
+no refresh loop, heartbeat, terminal input, cursor movement, or alternate
+screen. Observer events and `.aflow/runs/` JSON are the stable structured
+interfaces; human stderr is not a machine serialization.
 
 `BannerRenderer` is the single renderer. It keeps the historical name because
 the workflow call sites and the `banner_files_limit` configuration option are
@@ -868,7 +870,7 @@ aflow/
   run_state.py         # runtime data classes
   repartition.py       # immutable envelopes, strict split protocol, validation
   runlog.py            # run/turn artifact persistence
-  status.py            # plain append-only status records on stderr
+  status.py            # readable append-only status blocks on stderr
   git_status.py        # git snapshot helpers (probe, baseline, summary)
   skill_catalog.py     # bundled skill registry and package-resource lookup
   skill_installer.py   # bundled skill installer

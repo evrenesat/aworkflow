@@ -1601,15 +1601,68 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return paths
 
             runner = unittest.mock.Mock()
+            stderr = io.StringIO()
             with patch(
                 "aflow.workflow.create_run_paths",
                 side_effect=create_with_override,
             ):
-                with pytest.raises(
-                    WorkflowError,
-                    match="waiting_for_valid_override",
-                ):
-                    run_workflow(
+                with redirect_stderr(stderr):
+                    with pytest.raises(
+                        WorkflowError,
+                        match="waiting_for_valid_override",
+                    ):
+                        run_workflow(
+                            ControllerConfig(
+                                repo_root=repo_root,
+                                plan_path=plan_path,
+                                max_turns=2,
+                            ),
+                            workflow_config,
+                            "simple",
+                            config_dir=repo_root,
+                                snapshot_config=False,
+                            adapter=CodexAdapter(),
+                            runner=runner,
+                        )
+
+            runner.assert_not_called()
+            payload = json.loads(
+                created_paths[0].run_json.read_text(encoding="utf-8")
+            )
+            assert payload["status"] == "waiting_for_valid_override"
+            assert payload["override_result"]["status"] == "rejected"
+            assert "not an executable step" in payload["status_message"]
+            output = stderr.getvalue()
+            assert f"AFlow run {created_paths[0].run_dir.name}" in output
+            assert f"AFlow run {created_paths[0].run_dir.name} - Waiting" in output
+            assert "Run ID:" not in output
+
+    def test_owner_stop_emits_readable_terminal_summary_without_launching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            workflow_config = _make_simple_wf_config()
+            actual_create = create_run_paths
+            created_paths = []
+
+            def create_with_owner_stop(config):
+                paths = actual_create(config)
+                created_paths.append(paths)
+                (paths.run_dir / "overrides.toml").write_text(
+                    "owner_stop = true\n",
+                    encoding="utf-8",
+                )
+                return paths
+
+            runner = unittest.mock.Mock()
+            stderr = io.StringIO()
+            with patch(
+                "aflow.workflow.create_run_paths",
+                side_effect=create_with_owner_stop,
+            ):
+                with redirect_stderr(stderr):
+                    result = run_workflow(
                         ControllerConfig(
                             repo_root=repo_root,
                             plan_path=plan_path,
@@ -1624,12 +1677,12 @@ class WorkflowRuntimeTests(unittest.TestCase):
                     )
 
             runner.assert_not_called()
-            payload = json.loads(
-                created_paths[0].run_json.read_text(encoding="utf-8")
-            )
-            assert payload["status"] == "waiting_for_valid_override"
-            assert payload["override_result"]["status"] == "rejected"
-            assert "not an executable step" in payload["status_message"]
+            assert result.status == "owner_stopped"
+            assert result.end_reason == "owner_stopped"
+            output = stderr.getvalue()
+            assert f"AFlow run {created_paths[0].run_dir.name}" in output
+            assert f"AFlow run {created_paths[0].run_dir.name} - Stopped by owner" in output
+            assert "Run ID:" not in output
 
     def test_boundary_override_rejects_invalid_role_atomically_without_launching(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2925,19 +2978,54 @@ class WorkflowRuntimeTests(unittest.TestCase):
             repo_root = Path(tmpdir)
             config_dir = repo_root
             plan_path = repo_root / 'plan.md'
-            _write_plan(plan_path, '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n')
+            _write_plan(
+                plan_path,
+                '# Plan\n\n'
+                '### [ ] Checkpoint 1: CP4 worker\n'
+                '- [ ] step one\n\n'
+                '### [ ] Checkpoint 2: CP5 worker\n'
+                '- [ ] step two\n',
+            )
             call_order: list[str] = []
 
             def capturing_runner(argv, **kwargs):
                 call_order.append(argv[0])
-                _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
+                if len(call_order) == 1:
+                    _write_plan(
+                        plan_path,
+                        '# Plan\n\n'
+                        '### [x] Checkpoint 1: CP4 worker\n'
+                        '- [x] step one\n\n'
+                        '### [ ] Checkpoint 2: CP5 worker\n'
+                        '- [ ] step two\n',
+                    )
+                else:
+                    _write_plan(
+                        plan_path,
+                        '# Plan\n\n'
+                        '### [x] Checkpoint 1: CP4 worker\n'
+                        '- [x] step one\n\n'
+                        '### [x] Checkpoint 2: CP5 worker\n'
+                        '- [x] step two\n',
+                    )
                 return subprocess.CompletedProcess(argv, 0, stdout='ok', stderr='')
             wf_config = WorkflowUserConfig(roles={'reviewer': 'claude.opus', 'worker': 'opencode.turbo'}, harnesses={'claude': WorkflowHarnessConfig(profiles={'opus': HarnessProfileConfig(model='claude-opus-4')}), 'opencode': WorkflowHarnessConfig(profiles={'turbo': HarnessProfileConfig(model='glm-5-turbo')})}, workflows={'review_loop': WorkflowConfig(steps={'review_plan': WorkflowStepConfig(role='reviewer', prompts=('review_prompt',), go=(GoTransition(to='implement_plan'),)), 'implement_plan': WorkflowStepConfig(role='worker', prompts=('impl_prompt',), go=(GoTransition(to='END', when='DONE || MAX_TURNS_REACHED'), GoTransition(to='review_plan')))}, first_step='review_plan')}, prompts={'review_prompt': 'Review the plan.', 'impl_prompt': 'Implement from {ACTIVE_PLAN_PATH}.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5)
-            result = run_workflow(controller_config, wf_config, 'review_loop', config_dir=config_dir, snapshot_config=False, runner=capturing_runner)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = run_workflow(controller_config, wf_config, 'review_loop', config_dir=config_dir, snapshot_config=False, runner=capturing_runner)
             assert result.turns_completed == 2
             assert result.final_snapshot.is_complete
             assert call_order == ['claude', 'opencode']
+            output = stderr.getvalue()
+            assert output.count(f'AFlow run {result.run_dir.name}') == 2
+            assert 'Run ID:' not in output
+            blocks = [block for block in output.strip().split('\n\n') if block]
+            turn_one = next(block for block in blocks if 'Turn 1 of 5 - Finished' in block)
+            turn_two = next(block for block in blocks if 'Turn 2 of 5 - Finished' in block)
+            assert 'CP4 worker' in turn_one
+            assert 'CP5 worker' in turn_two
+            assert f'AFlow run {result.run_dir.name} - Completed' in output
 
     def test_workflow_max_turns_end_fails_when_plan_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3139,9 +3227,16 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1, stdout='bad', stderr='err')
             wf_config = WorkflowUserConfig(roles={'architect': 'codex.default'}, harnesses={'codex': WorkflowHarnessConfig(profiles={'default': HarnessProfileConfig(model='gpt-5.4')})}, workflows={'simple': WorkflowConfig(steps={'implement_plan': WorkflowStepConfig(role='architect', prompts=('p',), go=(GoTransition(to='END', when='DONE'), GoTransition(to='implement_plan')))}, first_step='implement_plan')}, prompts={'p': 'Work.'})
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
-            with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                with pytest.raises(WorkflowError) as ctx:
+                    run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
             assert 'exited with code 1' in str(ctx.value)
+            output = stderr.getvalue()
+            assert f'AFlow run {ctx.value.run_dir.name}' in output
+            assert f'AFlow run {ctx.value.run_dir.name} - Failed' in output
+            assert 'stderr:' in output
+            assert 'Run ID:' not in output
 
     def test_workflow_prompt_render_failure_marks_run_failed_without_turn_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3163,9 +3258,14 @@ class WorkflowRuntimeTests(unittest.TestCase):
                 prompts={'p': 'file://./missing-prompt.txt'},
             )
             controller_config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3)
-            with pytest.raises(WorkflowError) as ctx:
-                run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                with pytest.raises(WorkflowError) as ctx:
+                    run_workflow(controller_config, wf_config, 'simple', config_dir=config_dir, snapshot_config=False, adapter=CodexAdapter(), runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '', ''))
             assert 'prompt file not found' in str(ctx.value)
+            assert ctx.value.run_dir is not None
+            assert f"AFlow run {ctx.value.run_dir.name}" in stderr.getvalue()
+            assert f"Run ID: {ctx.value.run_dir.name}" not in stderr.getvalue()
             run_dirs = sorted((repo_root / '.aflow' / 'runs').iterdir())
             run_json = json.loads((run_dirs[-1] / 'run.json').read_text(encoding='utf-8'))
             assert run_json['status'] == 'failed'
@@ -5151,6 +5251,11 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert run_json['workflow_name'] == 'simple'
             assert run_json['turns_completed'] == 1
             assert run_json['end_reason'] == 'done'
+            run_id = run_dirs[0].name
+            assert f'AFlow run {run_id}' in result.stderr
+            assert f'AFlow run {run_id} - Completed' in result.stderr
+            assert 'Turn 1 of 1 - Finished' in result.stderr
+            assert 'Run ID:' not in result.stderr
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'result.json').read_text(encoding='utf-8'))
             assert turn_result['end_reason'] == 'done'
             argv_json = json.loads((run_dirs[0] / 'turns' / 'turn-001' / 'argv.json').read_text(encoding='utf-8'))
@@ -5264,6 +5369,10 @@ class WorkflowEndToEndTests(unittest.TestCase):
             assert run_json['turns_completed'] == 3
             assert 'end_reason' not in run_json
             assert 'reached max turns limit of 3' in result.stderr
+            run_id = run_dirs[0].name
+            assert f'AFlow run {run_id}' in result.stderr
+            assert f'AFlow run {run_id} - Failed' in result.stderr
+            assert 'Run ID:' not in result.stderr
             assert "Workflow 'simple' completed" not in result.stdout
             turn_result = json.loads((run_dirs[0] / 'turns' / 'turn-003' / 'result.json').read_text(encoding='utf-8'))
             assert 'end_reason' not in turn_result

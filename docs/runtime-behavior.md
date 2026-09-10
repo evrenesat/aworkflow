@@ -682,45 +682,98 @@ The interactive prompt accepts `y` or `yes`; any other input exits with code `1`
 
 ## Status Output
 
-While a workflow runs, `aflow` writes plain, append-only status records to
-stderr. Every meaningful state transition, turn finalization, and the final
-summary emits one deterministic `key=value` record line prefixed with
-`aflow time=` and `event=start|update|final`. Identical consecutive snapshots
-are deduplicated, so no poll-tick or repeated snapshot produces duplicate
-records. Output never depends on terminal size, terminal type, or keyboard
-input: interactive TTYs, redirected logs, `TERM=dumb`, narrow `COLUMNS`, and
-`NO_COLOR` environments all receive the same ordered, copyable lines, with no
-ANSI styling and no cursor or alternate-screen sequences. Interactive startup
-questions remain interactive when stdin and stdout are TTYs.
+While a workflow runs, `aflow` writes readable, append-only status blocks to
+stderr. The sequence is deterministic: one run identity and plan header,
+preparation, meaningful status changes, finalized-turn blocks, and one final
+summary. Identical consecutive snapshots are deduplicated. There is no
+background refresh, poll tick, heartbeat, cursor movement, alternate screen,
+or keyboard capture; interactive startup questions remain interactive when
+stdin and stdout are TTYs.
 
-Fields include, when available:
+Each block uses a heading followed by indented labels and values. Depending on
+the available state, the blocks show:
 
-- timestamp, event kind, run id, and resumed-from run id
-- status with end reason, including live hotplug stage, selector transition,
-  capability path, and active selector
-- workflow name and current step
-- checkpoint index/count and name
-- turn count and effective max turns
-- team, step role, resolved selector, harness, and model
-- selected start step and the skipped executable step names it implies
-- chosen transition with its condition and the finalized turn outcome
-- frozen-config fingerprint and safe override diagnostics
-- manager decision, pending notes/upgrades, and manager report path
-- review-rejection ordinal and its review artifact path
-- repartition stage, latest split summary, and candidate artifact path
-- original/active/generated plan paths
-- git summary since workflow start with a bounded changed-file list
-- artifact links: turn stdout, issues summary, and manager report paths
+- run identity, workflow, team, original plan, and resume lineage
+- preparation state, current step, checkpoint title and progress
+- turn number, role, selector, harness/model, outcome, transition, and duration
+- active/generated plan changes, manager/review/repartition diagnostics, and
+  git changes since the workflow-start baseline
+- full paths to turn stdout/stderr, issue, manager, review, and repartition
+  artifacts
 
-Display values are bounded; durable artifact references are never truncated.
-Control bytes are flattened so pasted provider output stays copy-safe, while
-non-ASCII content remains readable. Controller-owned values are rendered
-literally; there is no markup engine to interpret.
+Display prose is bounded and control bytes are flattened, while dynamic
+Unicode remains readable. Durable artifact references are never truncated. If
+git is unavailable, git fields are omitted and the workflow still runs. A
+failed or closed stderr disables further status output instead of failing the
+run.
 
-The git summary is based on a baseline captured at workflow start, so
-pre-existing dirty state is excluded. If git is unavailable, git fields are
-omitted and the workflow still runs. A failed or closed stderr disables further
-status output instead of failing the run.
+Only the first line of each block uses terminal emphasis. Bold is enabled when
+the actual output stream reports `isatty()`, `TERM` is present and not
+`dumb`, and `NO_COLOR` is absent. Otherwise the same content is emitted with
+no escape bytes; `FORCE_COLOR` does not override this fallback. Styling does
+not affect wrapping, deduplication, ordering, or the structured machine
+interfaces. Consumers that need stable machine data should use observer events
+or the durable JSON under `.aflow/runs/`, not parse the human stream.
+
+The following synthetic fixtures show the before/after shape without provider
+transcript content. The CP4 fixture first has no checkpoint metadata:
+
+```text
+AFlow run 20260909t003427z-ea0bff22
+  Workflow: cumulative_delivery
+  Team:     MusparkGLM
+  Plan:
+    /full/path/skills-manager-workflow-settings-cp4-restart-20260909.md
+
+Preparing run
+  Waiting for checkpoint metadata
+```
+
+After the same fixture identifies CP4, the running block is:
+
+```text
+12:00:00 UTC - Turn 1 of 40 - Running
+  Checkpoint 4 of 10
+  Manager instructions come from live skill Markdown
+  Team:     MusparkGLM
+  Worker: muse / muse-spark-1.3-contributor / high
+  Step:     implement_plan
+```
+
+After CP4 finalizes and before CP5 starts, the cached completed-turn label and
+the next running label remain separate:
+
+```text
+12:00:00 UTC - Turn 1 of 40 - Finished
+  Checkpoint 4 of 10
+  CP4 worker
+
+12:00:00 UTC - Turn 2 of 40 - Running
+  Checkpoint 5 of 10
+  CP5 worker
+```
+
+The failure fixture keeps its bounded reason and complete stderr path while
+omitting a stdout reference that was not supplied:
+
+```text
+AFlow run failure-run - Failed
+  Status:   failed
+  Turns:    0 of 5
+  Checkpoint: Checkpoint 4 of 10
+  Last turn: 4 (implement_plan, harness-failed)
+  Reason: DSH ACP request failed: Usage limit reached for 5 hour.
+  Elapsed:  0s
+  Plans:
+    original: plans/demo.md
+  Logs:
+    stderr: /full/path/to/turn/stderr.txt
+```
+
+Successful CLI explanations remain on stdout, while the human narrative is
+on stderr. A pre-turn failure still writes the run header and terminal failure
+summary before raising; provider exceptions and renderer/output failures keep
+their existing finalization and persistence paths.
 
 `aflow show` renders plain ASCII workflow inspection output: shared or
 workflow-applicable roles and teams, then each declared step labeled
