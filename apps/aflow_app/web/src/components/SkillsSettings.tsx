@@ -17,7 +17,7 @@ function skillStatusLine(skill: SkillSummary, dirty: boolean): string {
  * Saving Markdown updates every installed link; installation itself runs
  * through the shared installer action owned by GlobalSettings.
  */
-export function SkillsSettings({ skills, loadError, selected, onSelect, content, contentLoading, contentError, draft, unsavedNames, onEdit, hasUnsavedEdits, onInstall, installing, installResult, installError, installOpen = false, onCloseInstall, hosted = false }: {
+export function SkillsSettings({ skills, loadError, selected, onSelect, content, contentLoading, contentError, draft, unsavedNames, onEdit, hasUnsavedEdits, onInstall, installing, installResult, installError, installOpen = false, onCloseInstall, hosted = false, visible = true }: {
   skills: SkillSummary[] | null
   loadError: string | null
   selected: string
@@ -38,6 +38,8 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
   onCloseInstall?: () => void
   /** Standalone renders retain a local fallback for focused component tests. */
   hosted?: boolean
+  /** The retained Settings surface is visible to users and may manage focus. */
+  visible?: boolean
 }) {
   const [navigationVersion, setNavigationVersion] = useState(0)
   const editorId = `${useId()}-skill-editor`
@@ -78,25 +80,24 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
     {loadError && <p role="alert" className="error-message">Skills could not be loaded: {loadError}</p>}
     {!skills && !loadError && <p>Loading skills…</p>}
     {skills && skills.length === 0 && <p>No bundled skills are registered.</p>}
-    {skills && skills.length > 0 && <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} listLabel="Skills" navigation={<div>
+    {skills && skills.length > 0 && <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} listLabel="Skills" active={visible} navigation={<div>
       <h3>Skills</h3>
       {skills.map(skill => <button data-sidebar-editor-item={skill.name} className={`btn sidebar-entry ${selected === skill.name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === skill.name} key={skill.name} onClick={() => select(skill.name)}>
         {skill.name}{skill.default ? '' : ' (optional)'}{unsavedNames.includes(skill.name) ? ' · unsaved' : ''}
       </button>)}
-    </div>}>
-      <div className="skill-editor-header">
-        <div className="skill-editor-title">
-          <h3>{active ? <>{active.name}{active.default ? '' : ' (optional)'}</> : 'No skill selected'}</h3>
-          {active && <p className="text-xs text-dim" role="status">
-            {skillStatusLine(active, dirty)}{active.source === 'saved' && !active.installed ? ' — saved but not installed; run Install/reinstall all or the CLI to link it.' : ''}
-            {!active.default ? ' An optional skill: the default install excludes it; use existing CLI options to install it.' : ''}
-          </p>}
-        </div>
-        {active && <div className="skill-editor-control">
-          <span className="text-editor-label">SKILL.md</span>
-          <TextEditorToolbar editorId={editorId} wrapLines={wrapLines} onWrapLinesChange={setWrapLines} />
-        </div>}
+    </div>} detailHeading={<div className="skill-editor-header">
+      <div className="skill-editor-title">
+        <h3>{active ? <>{active.name}{active.default ? '' : ' (optional)'}</> : 'No skill selected'}</h3>
+        {active && <p className="text-xs text-dim" role="status">
+          {skillStatusLine(active, dirty)}{active.source === 'saved' && !active.installed ? ' — saved but not installed; run Install/reinstall all or the CLI to link it.' : ''}
+          {!active.default ? ' An optional skill: the default install excludes it; use existing CLI options to install it.' : ''}
+        </p>}
       </div>
+      {active && <div className="skill-editor-control">
+        <span className="text-editor-label">SKILL.md</span>
+        <TextEditorToolbar editorId={editorId} wrapLines={wrapLines} onWrapLinesChange={setWrapLines} />
+      </div>}
+    </div>}>
       {contentLoading && <p>Loading skill content…</p>}
       {contentError && <p role="alert" className="error-message">{contentError}</p>}
       {!contentLoading && !contentError && content !== null && active && <TextEditor

@@ -61,9 +61,12 @@ the generated screenshot artifacts. These emulated checks do not stand in for
 physical mobile keyboard or browser-toolbar verification.
 
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
-selected editor IDs across guided/raw mode changes; run dashboards retain pending
-history keys and deletion tombstones across navigation and late responses.
-Polling preserves scroll/focus. Responsive transitions preserve those owners.
+selected editor IDs across guided/raw mode changes, and retains the single
+Skills presentation instance behind native `hidden` semantics across Settings
+sections. The shared layout suppresses hidden-surface focus and scroll effects;
+run dashboards retain pending history keys and deletion tombstones across
+navigation and late responses. Polling preserves scroll/focus. Responsive
+transitions preserve those owners.
 
 ## Development coordination policy
 

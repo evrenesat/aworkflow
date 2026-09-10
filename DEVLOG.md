@@ -1806,3 +1806,19 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - The CI failure was a cross-surface ordering mistake: after `Resolve pending successor`, the preserved retry control can render before the destination's effect-registered `Start run` header. The recovery test now waits for that destination button, then asserts its disabled state without changing exact request, body, key, retry, owner-stop, or existing-run assertions.
 - `openNewRun` now performs one navigation action and awaits the New-run form. Removed 18 conditional second-navigation fallbacks in RunDashboard tests; App New-run handoffs already wait for their destination heading and selected-plan field, so no App or production changes were needed.
 - Verification: focused App/RunDashboard tests passed (136), the normal parallel web suite passed (324), production build passed, and `git diff --check` passed. Browser/server/CI jobs were not rerun because the change is test-only; no publication or live activation occurred.
+
+## 2026-09-10 — Preserve live mobile Skills editor
+
+- Retained the single Skills presentation instance across Settings sections
+  under native hidden semantics, preserving its open/list state and wrap choice
+  without moving draft or save ownership out of `GlobalSettings`.
+- Shared compact Back with the Skills title/status heading. The full Back name
+  and 44px touch target remain, while Chromium and WebKit both keep a dirty
+  390×844 editor at or above the required geometry with no horizontal overflow.
+- Added disposable dirty `aflow-plan` Changelog round-trip coverage, including
+  hidden-focus/scroll rejection, Back/list retention, light/dark screenshots,
+  all required viewports, enlarged text, and read-only Changelog paging.
+- Verification: web suite (325), production build, Chromium browser journeys
+  (16), WebKit browser journeys (16), and `git diff --check` passed. Physical
+  mobile keyboard behavior, live CI, activation, and the coordinator's live
+  unsaved-draft smoke remain downstream checks.

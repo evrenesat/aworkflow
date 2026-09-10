@@ -26,8 +26,10 @@ HARNESS_EXECUTABLES = (
 def document_metrics(page):
     return page.evaluate('''() => {
         const root = document.scrollingElement;
-        const nav = document.querySelector('.sidebar-editor-navigation');
-        const detail = document.querySelector('.sidebar-editor-detail')
+        const nav = [...document.querySelectorAll('.sidebar-editor-navigation')]
+            .find(element => !element.closest('[hidden]') && !element.hasAttribute('hidden'));
+        const detail = [...document.querySelectorAll('.sidebar-editor-detail')]
+            .find(element => !element.closest('[hidden]') && !element.hasAttribute('hidden'))
             ?? document.querySelector('.settings-guided-content > .settings-body');
         const rowTwo = document.querySelector('.app-header-row-two');
         const mainChild = document.querySelector('.workspace-main')?.firstElementChild;
@@ -289,7 +291,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                     assert save and 0 <= save['y'] < height
                     for tab, display_name in [('Teams', 'Team 39'), ('Workflows', 'Workflow 39'), ('Prompts', 'Scroll test 39')]:
                         select_settings_section(page, tab)
-                        nav = page.locator('.sidebar-editor-navigation')
+                        nav = page.get_by_role('navigation', name=tab, exact=True)
                         nav.wait_for(state='visible')
                         if tab == 'Workflows':
                             nav.get_by_role('button', name='Defaults', exact=True).click()
@@ -311,7 +313,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                         item_id = row.get_attribute('data-sidebar-editor-item')
                         before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                         row.click()
-                        page.locator('.sidebar-editor-detail').wait_for(state='visible')
+                        page.locator(f'[data-sidebar-editor-list="{tab}"] .sidebar-editor-detail').wait_for(state='visible')
                         metrics = document_metrics(page)
                         assert metrics['detailHeight'] > 0, metrics
                         assert metrics['detailContent'] <= metrics['detailHeight'] + 1, metrics
@@ -339,8 +341,8 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                             assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
                             # The same selected row is a valid re-entry point.
                             row.click()
-                            page.locator('.sidebar-editor-detail').wait_for(state='visible')
-                        nav = page.locator('.sidebar-editor-navigation')
+                            page.locator(f'[data-sidebar-editor-list="{tab}"] .sidebar-editor-detail').wait_for(state='visible')
+                        nav = page.get_by_role('navigation', name=tab, exact=True)
                         if compact:
                             page.get_by_role('button', name=f'← Back to {tab}', exact=True).click()
                             nav.wait_for(state='visible')
@@ -510,7 +512,7 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
             page.get_by_role('button', name='Login', exact=True).click()
             page.get_by_role('button', name='Settings', exact=True).click()
             select_settings_section(page, 'Skills')
-            nav = page.locator('.sidebar-editor-navigation')
+            nav = page.get_by_role('navigation', name='Skills', exact=True)
             nav.get_by_role('button', name='aflow-plan', exact=True).click()
             area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
             area.wait_for()
@@ -526,13 +528,15 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                     compact = width < 960 or height < 600
                     assert page.get_by_role('heading', name='Install skills', exact=True).count() == 0
                     if compact:
-                        nav = page.locator('.sidebar-editor-navigation')
+                        nav = page.get_by_role('navigation', name='Skills', exact=True)
+                        if nav.is_hidden():
+                            page.get_by_role('button', name='← Back to Skills', exact=True).click()
                         nav.wait_for(state='visible')
                         row = nav.get_by_role('button', name='aflow-plan', exact=True)
                         row.scroll_into_view_if_needed()
                         before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                         row.click()
-                        page.locator('.sidebar-editor-detail').wait_for(state='visible')
+                        page.locator('[data-sidebar-editor-list="Skills"] .sidebar-editor-detail').wait_for(state='visible')
                         assert page.evaluate("() => document.activeElement?.closest('.sidebar-editor-detail') !== null")
                         page.get_by_role('button', name='← Back to Skills', exact=True).click()
                         nav.wait_for(state='visible')
@@ -540,7 +544,7 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                         assert abs(page.evaluate('() => document.scrollingElement.scrollTop') - before_list_scroll) <= 2
                         assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == 'aflow-plan'
                         row.click()
-                        page.locator('.sidebar-editor-detail').wait_for(state='visible')
+                        page.locator('[data-sidebar-editor-list="Skills"] .sidebar-editor-detail').wait_for(state='visible')
                     area_box = page.get_by_label('SKILL.md for aflow-plan', exact=True).bounding_box()
                     assert area_box and area_box['y'] <= (280 if compact else 208), area_box
                     assert area_box['height'] >= 280, area_box
@@ -635,7 +639,7 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
 
             page.route('**/api/skills/aflow-plan', fail_plan_save)
             page.get_by_role('button', name='← Back to Skills', exact=True).click()
-            nav = page.locator('.sidebar-editor-navigation')
+            nav = page.get_by_role('navigation', name='Skills', exact=True)
             nav.wait_for(state='visible')
             assistant_row = nav.get_by_role('button', name='aflow-assistant (optional)', exact=True)
             assistant_row.click()
@@ -663,5 +667,99 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
             page.get_by_role('button', name='Save all changes', exact=True).click()
             page.get_by_text('the next manager invocation uses it').wait_for()
             assert (home / '.claude' / 'skills' / 'aflow-plan' / 'SKILL.md').read_text() == partial_plan
+        finally:
+            browser.close()
+
+
+def test_dirty_mobile_skills_presentation_survives_changelog(control_client, tmp_path, monkeypatch):
+    """Retain one unsaved bundled editor through Settings sections without writes."""
+    from aflow_app_server import main, config as config_module
+
+    _, root, _, _ = control_client
+    home = tmp_path / 'skills-home'
+    home.mkdir()
+    cache = Path.home() / 'Library' / 'Caches' if sys.platform == 'darwin' else Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache')))
+    monkeypatch.setenv('PLAYWRIGHT_BROWSERS_PATH', os.environ.get('PLAYWRIGHT_BROWSERS_PATH', str(cache / 'ms-playwright')))
+    monkeypatch.setenv('HOME', str(home))
+    config_dir = root.parent / 'global'
+    monkeypatch.setattr(main, 'global_config_dir', lambda: config_dir)
+    monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = launch_test_browser(playwright)
+        try:
+            page = browser.new_page(viewport={'width': 390, 'height': 844})
+            page.goto(url)
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
+            page.get_by_role('button', name='Menu', exact=True).click()
+            page.get_by_role('menuitem', name='Settings', exact=True).click()
+            select_settings_section(page, 'Skills')
+
+            nav = page.get_by_role('navigation', name='Skills', exact=True)
+            row = nav.get_by_role('button', name='aflow-plan', exact=True)
+            row.wait_for()
+            row.click()
+            area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
+            area.wait_for()
+            original = area.input_value()
+            dirty = original + '\n' + ('Long retained mobile Markdown. ' * 600) + '\n'
+            area.fill(dirty)
+            wrap = page.get_by_role('checkbox', name='Wrap lines', exact=True)
+            wrap.uncheck()
+            assert area.input_value() == dirty
+            assert area.get_attribute('wrap') == 'off'
+            editor_box = area.bounding_box()
+            geometry = page.evaluate('''() => Object.fromEntries([
+                ['heading', '.sidebar-editor-detail-heading'],
+                ['back', '.sidebar-editor-back'],
+                ['title', '.skill-editor-title'],
+                ['control', '.skill-editor-control'],
+                ['editor', 'textarea[aria-label="SKILL.md for aflow-plan"]'],
+            ].map(([name, selector]) => {
+                const box = document.querySelector(selector)?.getBoundingClientRect();
+                return [name, box && { y: box.y, height: box.height, width: box.width }];
+            }))''')
+            assert editor_box and editor_box['y'] <= 280 and editor_box['height'] >= 280, geometry
+            assert page.locator('.skill-editor-title [role="status"]').is_visible()
+            assert page.locator('.skill-editor-control').is_visible()
+            page.get_by_role('button', name='← Back to Skills', exact=True).wait_for()
+
+            for theme in ('light', 'dark'):
+                select_settings_section(page, 'General')
+                page.get_by_label('Color theme').select_option(theme)
+                select_settings_section(page, 'Skills')
+                area.wait_for()
+                assert area.input_value() == dirty
+                assert area.get_attribute('wrap') == 'off'
+                page.screenshot(path=str(tmp_path / f'dirty-skills-{theme}-390x844.png'), full_page=True)
+
+            select_settings_section(page, 'Changelog')
+            page.get_by_role('heading', name='Changelog', exact=True).wait_for()
+            page.get_by_role('button', name='Show more', exact=True).click()
+            assert page.locator('[data-changelog-title]').count() == 40
+            before = page.evaluate('() => document.scrollingElement.scrollTop')
+            page.evaluate('''() => document.querySelector('textarea[aria-label="SKILL.md for aflow-plan"]')?.focus()''')
+            assert page.evaluate('() => document.activeElement?.getAttribute("aria-label")') != 'SKILL.md for aflow-plan'
+            assert page.evaluate('() => document.scrollingElement.scrollTop') == before
+
+            select_settings_section(page, 'Skills')
+            area.wait_for()
+            assert area.input_value() == dirty
+            assert area.get_attribute('wrap') == 'off'
+            assert not nav.is_visible()
+            page.get_by_role('button', name='← Back to Skills', exact=True).click()
+            nav.wait_for(state='visible')
+            assert page.locator('[data-sidebar-editor-list="Skills"] .sidebar-editor-detail').is_hidden()
+            assert nav.locator('[data-sidebar-editor-item="aflow-plan"]').get_attribute('aria-pressed') == 'true'
+
+            select_settings_section(page, 'Changelog')
+            page.get_by_role('heading', name='Changelog', exact=True).wait_for()
+            select_settings_section(page, 'Skills')
+            nav.wait_for(state='visible')
+            assert page.locator('[data-sidebar-editor-list="Skills"] .sidebar-editor-detail').is_hidden()
+            assert nav.locator('[data-sidebar-editor-item="aflow-plan"]').get_attribute('aria-pressed') == 'true'
         finally:
             browser.close()

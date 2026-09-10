@@ -1613,6 +1613,7 @@ input::placeholder, textarea::placeholder {
 .sidebar-editor-navigation button { white-space: normal; overflow-wrap: anywhere; }
 .sidebar-entry { display: block; width: 100%; text-align: left; margin-bottom: .35rem; }
 .sidebar-editor-detail > .card { min-width: 0; }
+.sidebar-editor-detail-heading { min-width: 0; }
 
 .plan-editor,
 .plan-list {
@@ -1746,6 +1747,49 @@ input::placeholder, textarea::placeholder {
     position: static;
     max-height: none;
     overflow: visible;
+  }
+
+  /* Skills keeps the existing heading/control hierarchy, but shares its first
+     row with Back so the phone editor starts within the approved viewport. */
+  .sidebar-editor-detail-heading:has(.skill-editor-header) {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-items: flex-start;
+    gap: var(--spacing-sm);
+  }
+
+  .sidebar-editor-detail-heading > .sidebar-editor-back {
+    flex: 0 0 auto;
+    /* Keep the 44px target while freeing title/status width on narrow phones. */
+    padding-inline: var(--spacing-md);
+  }
+
+  .sidebar-editor-detail-heading > .skill-editor-header {
+    flex: 1 1 0;
+    /* The compact heading already provides its own row separation. */
+    gap: 0;
+  }
+
+  .sidebar-editor-detail-heading .skill-editor-control {
+    width: 100%;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .sidebar-editor-detail-heading .skill-editor-control .text-editor-label,
+  .sidebar-editor-detail-heading .skill-editor-control .text-editor-toolbar {
+    min-width: 0;
+    white-space: normal;
+  }
+
+  .sidebar-editor-detail-heading .skill-editor-control .text-editor-toolbar {
+    flex: 1 1 auto;
+  }
+
+  .sidebar-editor-detail-heading .text-editor-wrap-toggle span {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 }
 

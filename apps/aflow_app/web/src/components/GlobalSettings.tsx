@@ -574,7 +574,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : tab === 'Changelog' ? <ChangelogSettings /> : tab === 'Skills' ? <SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
       loadError={skillsError}
       selected={effectiveSkill}
@@ -593,7 +593,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       installOpen={installDisclosureOpen}
       onCloseInstall={() => setInstallDisclosureOpen(false)}
       hosted={hosted}
-    /> : tab === 'General' ? <div className="settings-fields">
+      visible={tab === 'Skills'}
+    /></div>{tab === 'Changelog' ? <ChangelogSettings /> : tab === 'General' ? <div className="settings-fields">
       <AppearanceSelector /><RecentRunsLimit />
       <h3>Server settings</h3>
       {server && Object.values(server.restart).some(Boolean) && <p role="status">Saved server binding or root changes require a server restart.</p>}
@@ -663,7 +664,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           setDeletedPrompts(items => items.filter(entry => entry.name !== name)); setError(null)
         }} />}
       </fieldset>
-    </div> : <p>Loading configuration, or the saved documents contain invalid TOML or mistyped values. Use Advanced TOML to inspect and repair them.</p>}
+    </div> : <p>Loading configuration, or the saved documents contain invalid TOML or mistyped values. Use Advanced TOML to inspect and repair them.</p>}</>}
     {!advanced && tab !== 'Changelog' && snapshot?.aflow_toml === '' && snapshot.workflows_toml === '' && <div className="card settings-fields"><h3>Starter setup</h3>{(['workflow', 'main_branch'] as const).map(key => <label key={key}>{formatMachineLabel(key)}<input className="input" value={starter[key]} onChange={e => setStarter({ ...starter, [key]: e.target.value })} /></label>)}<button className="btn btn-secondary" onClick={async () => {
       try { const form = await api.postGlobalConfigForm({ aflow_toml: '', workflows_toml: '', action: { type: 'build_starter', ...starter } }); setTexts([form.aflow_toml, form.workflows_toml]); setDraft(form.form); setProjection(form); setRawEdited(true); setAdvanced(true) } catch (reason) { setError(reason instanceof Error ? reason.message : 'Starter setup failed') }
     }}>Build starter draft</button></div>}

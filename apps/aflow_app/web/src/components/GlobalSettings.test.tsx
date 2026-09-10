@@ -139,6 +139,27 @@ describe('GlobalSettings', () => {
     expect((await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement).value).toBe(edited)
     expect((screen.getByRole('button', { name: 'Save all changes', exact: true }) as HTMLButtonElement).disabled).toBe(false)
   })
+  it('retains the mounted Skills editor and its wrap preference while Changelog is active', async () => {
+    const view = render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills', exact: true }))
+    const area = await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement
+    const edited = `${skillContent('aflow-manager')}Retained editor draft.\n`
+    fireEvent.change(area, { target: { value: edited } })
+    const wrap = screen.getByRole('checkbox', { name: 'Wrap lines', exact: true }) as HTMLInputElement
+    fireEvent.click(wrap)
+    expect(wrap.checked).toBe(false)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Changelog', exact: true }))
+    const retained = view.container.querySelector('.settings-retained-skills') as HTMLElement
+    expect(retained.hidden).toBe(true)
+    expect((retained.querySelector('textarea') as HTMLTextAreaElement).value).toBe(edited)
+    expect((retained.querySelector('input[type="checkbox"]') as HTMLInputElement).checked).toBe(false)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Skills', exact: true }))
+    expect((await screen.findByLabelText('SKILL.md for aflow-manager') as HTMLTextAreaElement).value).toBe(edited)
+    expect((screen.getByRole('checkbox', { name: 'Wrap lines', exact: true }) as HTMLInputElement).checked).toBe(false)
+  })
   it('keeps Advanced TOML editing actions available from a retained Changelog tab', async () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
     await screen.findByLabelText('Effort codex.worker')

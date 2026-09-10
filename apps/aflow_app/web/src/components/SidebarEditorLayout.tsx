@@ -10,6 +10,10 @@ export interface SidebarEditorLayoutProps {
   selection: string | null
   navigationVersion?: number
   listLabel?: string
+  /** Optional consumer heading that shares the compact Back row. */
+  detailHeading?: ReactNode
+  /** Hidden retained surfaces must not restore focus or document scroll. */
+  active?: boolean
   /** A URL/deep-link entry that should open the detail surface on compact screens. */
   detailEntry?: boolean
 }
@@ -80,6 +84,8 @@ export function SidebarEditorLayout({
   selection,
   navigationVersion = 0,
   listLabel = 'Items',
+  detailHeading,
+  active = true,
   detailEntry = false,
 }: SidebarEditorLayoutProps) {
   const compact = useCompactLayout()
@@ -152,21 +158,21 @@ export function SidebarEditorLayout({
   // selection is included so a URL/deferred detail load gets one retry without
   // making passive polling a focus or scroll event.
   useEffect(() => {
-    if (!pendingOpenRef.current || !detailOpen) return
+    if (!active || !pendingOpenRef.current || !detailOpen) return
     const heading = detailRef.current?.querySelector<HTMLElement>('h1, h2, h3, h4, h5, h6, legend')
     if (!heading) return
     heading.tabIndex = -1
     scrollDocumentTo(0)
     focusWithoutScroll(heading)
     pendingOpenRef.current = false
-  }, [children, detailOpen, selection, navigationVersion])
+  }, [active, children, detailOpen, selection, navigationVersion])
 
   // Back restores the document position captured before the row click. A row
   // may disappear after refresh/delete, so the labelled navigation surface is
   // the stable focus target in that case.
   useEffect(() => {
     const restorePoint = restorePointRef.current
-    if (!compact || detailOpen || restorePoint === null) return
+    if (!active || !compact || detailOpen || restorePoint === null) return
     let finalFrame: number | null = null
     let finalTimer: number | null = null
     const restore = () => {
@@ -200,7 +206,7 @@ export function SidebarEditorLayout({
       window.clearTimeout(timer)
       if (finalTimer !== null) window.clearTimeout(finalTimer)
     }
-  }, [compact, detailOpen])
+  }, [active, compact, detailOpen])
 
   function handleBack(): void {
     if (restorePointRef.current === null) {
@@ -212,7 +218,7 @@ export function SidebarEditorLayout({
 
   const navigationHidden = compact && detailOpen
   const detailHidden = compact && !detailOpen
-  return <div className="sidebar-editor-layout">
+  return <div className="sidebar-editor-layout" data-sidebar-editor-list={listLabel}>
     <nav
       className="sidebar-editor-navigation"
       aria-label={listLabel}
@@ -228,7 +234,10 @@ export function SidebarEditorLayout({
       aria-hidden={detailHidden || undefined}
       ref={detailRef}
     >
-      {compact && detailOpen && <button type="button" className="btn btn-secondary sidebar-editor-back" onClick={handleBack}>← Back to {listLabel}</button>}
+      {detailHeading ? <div className="sidebar-editor-detail-heading">
+        {compact && detailOpen && <button type="button" className="btn btn-secondary sidebar-editor-back" aria-label={`← Back to ${listLabel}`} onClick={handleBack}>← Back</button>}
+        {detailHeading}
+      </div> : compact && detailOpen && <button type="button" className="btn btn-secondary sidebar-editor-back" onClick={handleBack}>← Back to {listLabel}</button>}
       {children}
     </div>
   </div>

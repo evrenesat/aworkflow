@@ -128,6 +128,10 @@ def _assert_no_horizontal_overflow(page: Page) -> None:
         scrollWidth: document.documentElement.scrollWidth,
         documentHeight: document.scrollingElement?.scrollHeight ?? 0,
         viewportHeight: innerHeight,
+        overflowing: [...document.querySelectorAll('*')]
+          .map(element => ({ tag: element.tagName, className: String(element.className || ''), right: element.getBoundingClientRect().right }))
+          .filter(element => element.right > innerWidth + 1)
+          .slice(0, 8),
     })""")
     assert metrics["scrollWidth"] <= metrics["width"] + 1, metrics
     assert metrics["documentHeight"] >= metrics["viewportHeight"], metrics
