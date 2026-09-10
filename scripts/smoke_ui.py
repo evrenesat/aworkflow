@@ -433,7 +433,8 @@ def full_run_flow(installed: InstalledWheel, session: str) -> None:
     if final_status not in {"completed", "done"}:
         fail(f"the smoke run ended as '{final_status}' instead of completing")
 
-    # Restart the UI; the finished run and its snapshot remain inspectable.
+    # Restart the UI; the finished run and its current-source provenance remain
+    # inspectable.
     installed.stop()
     installed.start()
     wait_for_health(base_url)
@@ -446,12 +447,15 @@ def full_run_flow(installed: InstalledWheel, session: str) -> None:
         fail("the completed run disappeared after a UI restart")
     if json.loads(body).get("status") not in {"completed", "done"}:
         fail("the completed run lost its terminal status after restart")
-    snapshot = (
-        installed.home / "code" / "smoke" / ".aflow" / "runs" / run_id / "config"
-    )
-    if not (snapshot / "snapshot.json").is_file():
-        fail("the run has no frozen configuration snapshot")
-    log("full run flow survived a UI restart with its frozen snapshot intact")
+    run_json = installed.home / "code" / "smoke" / ".aflow" / "runs" / run_id / "run.json"
+    try:
+        run_payload = json.loads(run_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        fail(f"the completed run has unreadable current-source metadata: {exc}")
+    expected_live_config = (installed.home / ".config" / "aflow" / "aflow.toml").resolve()
+    if run_payload.get("live_config_path") != str(expected_live_config):
+        fail("the completed run did not retain the smoke configuration source")
+    log("full run flow survived a UI restart with current-source provenance intact")
 
 
 PLAYWRIGHT_DRIVER = """

@@ -18,7 +18,10 @@ from aflow_app_server.main import app
 from test_control_plane_api import (
     PROJECT_ID,
     TOKEN,
+    _add_live_control_targets,
+    _answer_pending as _rest_answer_pending,
     _prepared,
+    _start_pending as _rest_start_pending,
     control_client as _control_client_fixture,  # noqa: F401
 )
 
@@ -38,6 +41,7 @@ EXPECTED_TOOL_NAMES = {
     "get_run",
     "get_run_events",
     "get_run_context",
+    "preflight_run",
     "start_run",
     "answer_startup",
     "control_run",
@@ -141,6 +145,7 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     tool_by_name = {tool["name"]: tool for tool in tools}
     assert set(tool_by_name) == EXPECTED_TOOL_NAMES
     assert tool_by_name["list_projects"]["annotations"]["readOnlyHint"] is True
+    assert tool_by_name["preflight_run"]["annotations"]["readOnlyHint"] is True
     assert tool_by_name["start_run"]["annotations"]["readOnlyHint"] is False
     assert tool_by_name["owner_stop"]["annotations"]["destructiveHint"] is True
 
@@ -158,6 +163,22 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     ).json()
     assert _mcp_tool(client, "list_plans", {"project_id": PROJECT_ID}) == client.get(
         f"/api/control-plane/projects/{PROJECT_ID}/plans",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ).json()
+    preflight_arguments = {
+        "project_id": PROJECT_ID,
+        "plan_path": "plans/todo/test-plan.md",
+        "offset": 0,
+        "limit": 1,
+    }
+    assert _mcp_tool(client, "preflight_run", preflight_arguments) == client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/preflight",
+        json={
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": None,
+            "offset": 0,
+            "limit": 1,
+        },
         headers={"Authorization": f"Bearer {TOKEN}"},
     ).json()
 
@@ -418,6 +439,204 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
         units.start_calls[-1][1][-1]
         == "--extra-instruction=mcp-runtime-guidance"
     )
+
+
+@pytest.mark.parametrize(
+    ("extra_instructions", "expected"),
+    (
+        ("omitted", ("saved guidance",)),
+        (None, ("saved guidance",)),
+        (["replacement guidance"], ("replacement guidance",)),
+        ([], ()),
+    ),
+)
+def test_mcp_resume_extra_instructions_inherit_replace_and_clear(
+    mcp_client,
+    extra_instructions: object,
+    expected: tuple[str, ...],
+) -> None:
+    client, root, units, monkeypatch = mcp_client
+    pending = _rest_start_pending(client, monkeypatch, ["saved guidance"])
+    started = _rest_answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":["saved guidance"]}'
+    )
+    before = source_path.read_bytes()
+    bootstrap_calls: list[dict[str, object]] = []
+
+    def bootstrap(**kwargs):
+        bootstrap_calls.append(kwargs)
+        provided = kwargs["extra_instructions_provided"]
+        effective = (
+            tuple(kwargs["extra_instructions_arg"])
+            if provided
+            else ("saved guidance",)
+        )
+        return SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="implement",
+            extra_instructions=effective,
+            resume_context=object(),
+        )
+
+    monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", bootstrap)
+    arguments = {
+        "project_id": PROJECT_ID,
+        "run_id": run_id,
+        "idempotency_key": "mcp-resume-instructions",
+    }
+    if extra_instructions != "omitted":
+        arguments["extra_instructions"] = extra_instructions
+    resumed = _mcp_tool(client, "resume_run", arguments)
+    successor_id = resumed["run_id"]
+    assert len(units.start_calls) == 2
+    argv = units.start_calls[-1][1]
+    if expected:
+        assert f"--extra-instruction={expected[0]}" in argv
+    else:
+        assert not any(argument.startswith("--extra-instruction=") for argument in argv)
+    assert bootstrap_calls[0]["extra_instructions_provided"] == (
+        extra_instructions != "omitted" and extra_instructions is not None
+    )
+    assert source_path.read_bytes() == before
+
+    replay = _mcp_tool(client, "resume_run", arguments)
+    assert replay["run_id"] == successor_id
+    changed = dict(arguments)
+    changed["extra_instructions"] = ["different guidance"]
+    conflict = _mcp_request(
+        client,
+        "tools/call",
+        {"name": "resume_run", "arguments": changed},
+    )
+    assert conflict["result"]["isError"] is True
+    assert conflict["result"]["content"][0]["text"] == "idempotency_conflict"
+    assert len(units.start_calls) == 2
+    assert source_path.read_bytes() == before
+
+
+def test_mcp_resume_rejects_invalid_extra_instructions_without_reserving(
+    mcp_client,
+) -> None:
+    client, root, units, monkeypatch = mcp_client
+    pending = _rest_start_pending(client, monkeypatch, ["saved guidance"])
+    started = _rest_answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":["saved guidance"]}'
+    )
+    before = source_path.read_bytes()
+    rejected = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": run_id,
+                "idempotency_key": "mcp-resume-invalid",
+                "extra_instructions": [""],
+            },
+        },
+    )
+    assert rejected["result"]["isError"] is True
+    assert rejected["result"]["content"][0]["text"] == "operation_rejected"
+    assert len(units.start_calls) == 1
+    assert source_path.read_bytes() == before
+
+
+def test_mcp_control_uses_live_targets_and_matches_rest_validation(mcp_client) -> None:
+    client, root, _, monkeypatch = mcp_client
+    config_path = root.parent / "global" / "aflow.toml"
+    _add_live_control_targets(config_path)
+    capabilities = _mcp_tool(
+        client,
+        "get_project_capabilities",
+        {"project_id": PROJECT_ID},
+    )
+    assert "new" in capabilities["teams"]
+    assert "reasonix.new" in capabilities["admitted_role_selectors"]["worker"]
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    started = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "idempotency_key": "mcp-live-start-1",
+        },
+    )
+    run_id = started["result"]["run_id"]
+    accepted = _mcp_tool(
+        client,
+        "control_run",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 0,
+            "team": "new",
+            "role_selectors": {"worker": "reasonix.new"},
+            "idempotency_key": "mcp-live-control-1",
+        },
+    )
+    assert accepted["revision"] == 1
+
+    rejected_mcp = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "control_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": run_id,
+                "expected_revision": 1,
+                "role_selectors": {"worker": "reasonix.missing"},
+                "idempotency_key": "mcp-live-control-invalid",
+            },
+        },
+    )
+    assert rejected_mcp["result"]["isError"] is True
+    assert rejected_mcp["result"]["content"][0]["text"] == "validation_error"
+
+    rejected_rest = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "rest-live-control-invalid"},
+        json={
+            "expected_revision": 1,
+            "role_selectors": {"worker": "reasonix.missing"},
+        },
+    )
+    assert rejected_rest.status_code == 422
+    assert rejected_rest.json()["detail"]["code"] == "validation_error"
+    assert rejected_rest.json()["detail"]["field"] == "role_selectors.worker"
+    assert rejected_rest.json()["detail"]["target"] == "reasonix.missing"
+
+    config_path.write_text("[", encoding="utf-8")
+    stopped = _mcp_tool(
+        client,
+        "owner_stop",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 1,
+            "idempotency_key": "mcp-live-stop-1",
+        },
+    )
+    assert stopped["launch_phase"] == "owner_stopped"
 
 
 def test_mcp_client_template_is_secret_free_and_requires_write_approval() -> None:

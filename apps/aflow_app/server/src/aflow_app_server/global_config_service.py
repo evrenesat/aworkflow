@@ -3,10 +3,10 @@
 The global service owns the one shared workflow pair in the global AFlow
 configuration directory (``~/.config/aflow/aflow.toml`` plus its sibling
 ``workflows.toml``).  It reuses the project service's validation, revision,
-and rollback-safe commit machinery, serializes against run-reservation
-snapshots through the shared configuration pair lock, and never blocks a save
-because some project has a running or resumable snapshotted run: those runs
-keep their frozen snapshots, so only new runs observe the new configuration.
+and rollback-safe commit machinery, serializes pair writes through the shared
+configuration lock, and never blocks a save because some project has a running
+or resumable run. Existing runs reload the committed source at their next
+boundary; only an invalid candidate or stale revision rejects the save.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from .project_config_service import (
     CONFIG_DOCUMENT_NAMES,
     ProjectConfigError,
     ProjectConfigRevisionConflict,
-    ProjectConfigRunBlocked,
     ProjectConfigSnapshot,
     _DOCUMENT_HEX_RE,
     _append_audit_line,
@@ -267,8 +266,6 @@ def _commit_pair_locked(
 def _failure_outcome(exc: Exception) -> str:
     if isinstance(exc, ProjectConfigRevisionConflict):
         return "revision_conflict"
-    if isinstance(exc, ProjectConfigRunBlocked):
-        return "run_blocked"
     if isinstance(exc, ProjectConfigError):
         return "rejected"
     return "error"

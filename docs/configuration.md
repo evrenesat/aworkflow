@@ -151,9 +151,11 @@ lifecycle calls do not inherit role prompts.
 
 Prompt keys must name roles declared in `[roles]`, and values must be non-empty
 strings. Role prompts are static instructions: workflow placeholders and
-`file://` expansion are not applied. Global and team prompt maps are included
-in the frozen run fingerprint, and the resolved system prompt is persisted with
-each ordinary turn's durable prompt artifacts.
+`file://` expansion are not applied. Global and team prompt maps may be
+included in the diagnostic launch fingerprint, and the resolved system prompt
+is persisted with each ordinary turn's durable prompt artifacts. The current
+pair is reloaded at the next safe boundary, so a valid prompt edit affects the
+next invocation without changing an in-flight call.
 
 ## Interstep Manager Supervision
 
@@ -192,9 +194,8 @@ Resolution is by presence, never truthiness, so an explicit `false` overrides
 an inherited `true`. The launch-default workflow is unrelated to inheritance.
 Only actual TOML booleans are accepted, and no per-step flag exists. The old
 global `[manager].enabled` is rejected with a message naming this replacement.
-Saving a flag affects new runs; an active or resumed run keeps the frozen
-value from its configuration snapshot while subsequent manager calls still
-read current saved skill text.
+Saving a flag affects the next safe boundary for active and resumed runs;
+subsequent manager calls read current saved manager settings and skill text.
 
 `lite_role` and `full_role` are required for each enabled workflow, must be
 non-empty role names, and resolve through the run's baseline team before the
@@ -213,7 +214,7 @@ complete validated Markdown body as the system instruction; Python contributes
 only structured runtime data (mode, level, eligible actions, proposed
 transition, findings, and limits). A save between two invocations changes the
 next invocation's bytes, while the configured skill names, role routing, and
-workflow configuration stay frozen in the run snapshot. An explicitly
+  workflow configuration is reloaded at each safe boundary. An explicitly
 configured non-bundled name resolves read-only from the account skill store
 and must exist as a valid document; a missing or invalid skill fails the call
 before any provider is invoked, and the engine never falls back to built-in
@@ -221,7 +222,8 @@ prose. Output parsing, eligibility checks, note authority, and repartition
 validation remain enforced in code.
 `repartition_skill` defaults to `aflow-repartition-checkpoint`. The same resolved
 `full_role` performs both strict read-only repartition subcalls; no third role is
-introduced. The controller freezes both skill names in the run configuration.
+introduced. The controller resolves both skill names from the current source at
+each invocation boundary.
 
 At a first scoped reviewer rejection, Lite decides by cause: it may retain the
 same worker for a bounded repair, use one eligible `upgrade_to` edge for a
@@ -429,9 +431,10 @@ The remote app edits the shared workflow pair as one revisioned pair:
 - POST /api/config/validate validates a candidate pair without writing it.
 - PUT /api/config requires both complete documents and the current revision.
   A stale revision, invalid pair, or placeholder selector rejects the write
-  before either file changes. Running runs never block a save: each run
-  freezes its own configuration snapshot at launch, so edits affect only new
-  runs.
+  before either file changes. Running runs never block a valid save: active
+  calls finish with their starting settings and the next turn or resume reads
+  the saved pair. A run may retain a launch-time snapshot for diagnostics, but
+  it is not an execution or admission gate.
 - A successful write stages and fsyncs both documents atomically with
   rollback handling and appends redacted revision metadata to the audit log.
   The save and run-reservation snapshots share one configuration lock, so a

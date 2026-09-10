@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from aflow.config import WorkflowUserConfig
+from aflow.live_config import load_live_config
+
 from .capabilities import CapabilityService
 from .reconciliation import ReconciliationService
 from .repository import RunRepository
@@ -35,8 +38,12 @@ def compose_control_plane(
     """Create the one transport-neutral application graph for a project."""
     repository = RunRepository(repo_root)
     selected_units = units or SystemdUnitManager()
+
+    def load_current_config() -> WorkflowUserConfig:
+        return load_live_config(config_path).workflow_config
+
     capabilities = CapabilityService(
-        config_path=config_path,
+        config_loader=load_current_config,
         service_features=(
             "run_repository",
             "capabilities",
@@ -51,7 +58,7 @@ def compose_control_plane(
     return ControlPlaneApplication(
         repository=repository,
         capabilities=capabilities,
-        controls=ControlService(repository),
+        controls=ControlService(repository, config_loader=load_current_config),
         context=ContextService(repository),
         startup_questions=StartupQuestionService(),
         reconciliation=ReconciliationService(repository, selected_units),

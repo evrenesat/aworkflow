@@ -69,7 +69,7 @@ Guided workflow change (restart):
 
 - Selecting a different workflow for a nonterminal owned run is a guided stop-then-start, never an in-place mutation. After explicit confirmation, the UI issues the owner stop with the expected revision, then polls the canonical status until that exact source run reports `owner_stopped` status **and** launch phase (the engine's own precondition) before submitting the preserved typed start draft with `restarted_from_run_id`. The wait is bounded.
 - If the stop is rejected, the revision changes, inactivity cannot be proven, the network fails, or the successor start fails, automation halts: no retry loops, no overlapping units, the draft stays in the form, and the authoritative source state is shown for an explicitly renewed attempt.
-- Explicit resume remains the separate same-workflow action for `needs_attention` runs and never accepts replacement launch choices. Legacy runs are read-only and offer no controls. Owner stop and workflow restart keep their explicit confirmations; Diagnostics shows a deterministic summary. Opening Raw details loads the best supported context level (sending `level=full&full_scope=true` where supported) without extra acknowledgement. The shared page Refresh retries failures; stale responses are rejected when selection changes.
+- Explicit resume remains the separate same-workflow action for `needs_attention` runs. The current UI intentionally omits the optional run-wide instruction editor; authenticated REST and MCP callers may inherit, replace, or clear instructions. Legacy runs are read-only and offer no controls. Owner stop and workflow restart keep their explicit confirmations; Diagnostics shows a deterministic summary. Opening Raw details loads the best supported context level (sending `level=full&full_scope=true` where supported) without extra acknowledgement. The shared page Refresh retries failures; stale responses are rejected when selection changes.
 
 Run links contain only registered project ID, view and optional run ID. Reload and browser back/forward restore the requested workspace. An older linked run is fetched directly even when absent from the first page. Invalid project/run links show guidance instead of selecting another run; unknown views and legacy Overview links normalize to Runs for valid projects. Copy link uses only validated identifiers. Tokens, configuration text and prompts never belong in links.
 
@@ -133,7 +133,7 @@ environment_file = "/etc/aflowd/worker.env"
 
 Project creation and registration accept only normalized paths relative to the managed root. Existing folders are added without renaming: the registry ID is an internal path-safe label, so basenames with underscores, uppercase letters, spaces, or non-ASCII characters get a deterministic safe ID (safe-slug basenames keep their exact name), and the discovered display name uses the actual folder name. Registration never modifies directory contents — no project-local configuration is written, because every project immediately uses the shared global configuration — and unregister removes the registry record after active-unit checks and never deletes repository files.
 
-Configuration reads return both exact texts, a combined SHA-256 revision, and bounded validation results. Saves require `expected_revision`, validate both candidates through the production loader, and atomically commit or restore the pair. Saves are never blocked by runs: every run freezes an immutable configuration snapshot at reservation (shared lock with saves), so edits apply to new runs in all projects only. Settings changes to bind host/port or the projects root report restart-required; password changes invalidate sessions immediately.
+Configuration reads return both exact texts, a combined SHA-256 revision, and bounded validation results. Saves require `expected_revision`, validate both candidates through the production loader, and atomically commit or restore the pair. Saves are never blocked by runs: active calls finish with their starting settings, and each next turn or resume reloads the current pair. A run may retain an immutable launch-time snapshot for compatibility diagnostics (under the shared lock with saves), but edits apply to existing runs at their next safe boundary. Settings changes to bind host/port or the projects root report restart-required; password changes invalidate sessions immediately.
 
 Settings is global, even with no registered projects. Its freely selectable tabs
 are Agents & Roles, Teams, Workflows, Prompts, and General. Save all changes sends
@@ -196,8 +196,11 @@ fail validation. Capabilities expose the ordered declared/executable/excluded
 workflow steps and admitted selectors so a client can construct valid choices.
 A restart predecessor must have confirmed failure or explicit owner stop and no
 active exact unit; a successful request creates a new run and exposes immutable
-predecessor lineage. Resume continues the saved invocation and does not accept
-replacement launch choices.
+predecessor lineage. Resume continues the saved invocation. Its optional JSON
+`extra_instructions` field uses the same three-way semantics as the CLI:
+omitted or `null` inherits, a bounded string list replaces, and `[]` clears for
+the successor. The predecessor remains unchanged, and a reused idempotency key
+must carry the same effective instructions.
 
 `GET /api/control-plane/projects/{project_id}/runs/{run_id}/restart-options`
 projects eligibility, a bounded reason, and original launch choices. Restart

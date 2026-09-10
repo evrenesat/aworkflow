@@ -11,13 +11,7 @@ from threading import Barrier, Event, Thread
 import pytest
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
-from aflow.config import load_workflow_config
 from aflow.control_plane import StartRunResult
-from aflow.control_plane.persistence import (
-    create_launch_manifest,
-    reserve_run_id,
-    write_launch_phase,
-)
 from aflow.control_plane.units import InMemoryUnitManager
 from aflow.daemon import AflowDaemon
 
@@ -26,7 +20,6 @@ from aflow_app_server.control_plane_service import ControlPlaneService
 from aflow_app_server.project_config_service import (
     ProjectConfigError,
     ProjectConfigRevisionConflict,
-    ProjectConfigRunBlocked,
     ProjectConfigService,
     combined_revision,
     document_path,
@@ -437,7 +430,7 @@ class TestSave:
         with pytest.raises(ProjectConfigError, match="expected_revision"):
             service.save(PROJECT_ID, aflow_text, workflows_text, "not-a-revision")
 
-    def test_save_blocked_while_run_awaits_startup_answer(
+    def test_save_allowed_while_run_awaits_startup_answer(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         service, _, control, root, _ = _env(tmp_path, monkeypatch, initial="valid")
@@ -466,15 +459,12 @@ class TestSave:
         before = service.read(PROJECT_ID)
         aflow_text, workflows_text = _valid_pair(model="updated-model")
 
-        with pytest.raises(ProjectConfigRunBlocked) as exc_info:
-            service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
+        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
 
-        assert exc_info.value.blocking_runs == (
-            (pending.run_id, "awaiting_startup_answer"),
-        )
-        assert service.read(PROJECT_ID).revision == before.revision
+        assert snapshot.revision != before.revision
+        assert service.read(PROJECT_ID).aflow_toml == aflow_text
 
-    def test_save_blocked_while_running_then_allowed_after_owner_stop(
+    def test_save_allowed_while_running_then_owner_stop_remains_available(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         service, _, control, root, units = _env(tmp_path, monkeypatch, initial="valid")
@@ -529,157 +519,12 @@ class TestSave:
         before = service.read(PROJECT_ID)
         aflow_text, workflows_text = _valid_pair(model="post-run-model")
 
-        with pytest.raises(ProjectConfigRunBlocked) as running_block:
-            service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
-        # The controller has not written run metadata yet, so the durable
-        # status is the launch_started phase; it must block either way.
-        assert running_block.value.blocking_runs == ((run_id, "launch_started"),)
+        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
+        assert snapshot.revision != before.revision
 
         control.owner_stop(
             PROJECT_ID, run_id, expected_revision=0, idempotency_key="stop-running"
         )
-
-        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
-        assert snapshot.revision != before.revision
-
-    def _failed_run(
-        self,
-        root: Path,
-        fingerprint: str,
-        *,
-        frozen_config_path: str | None = None,
-        status: str = "failed",
-    ) -> str:
-        from aflow.control_plane.models import LaunchManifest
-
-        run_id = reserve_run_id(root, "failed-run-probe")
-        manifest = LaunchManifest(
-            run_id=run_id,
-            project_root=str(root),
-            plan_path=str(root / "plans" / "todo" / "plan.md"),
-            workflow_name="deliver",
-            max_turns=15,
-            frozen_config_fingerprint=fingerprint,
-        )
-        create_launch_manifest(root, manifest)
-        if status == "failed":
-            write_launch_phase(root, run_id, status)
-        run_dir = root / ".aflow" / "runs" / run_id
-        run_dir.mkdir(parents=True)
-        payload: dict[str, object] = {"status": status, "workflow_name": "deliver"}
-        if frozen_config_path is not None:
-            payload["frozen_config"] = {"config_path": frozen_config_path}
-        (run_dir / "run.json").write_text(json.dumps(payload))
-        return run_id
-
-    def test_save_blocked_by_failed_run_with_matching_fingerprint(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from aflow.workflow import _freeze_run_identity
-
-        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
-        config = load_workflow_config(root / ".aflow" / "config" / "aflow.toml")
-        identity = _freeze_run_identity(
-            "deliver", config, config_dir=root / ".aflow" / "config" / "aflow.toml"
-        )
-        self._failed_run(
-            root,
-            identity.config_fingerprint,
-            frozen_config_path=str(
-                root.resolve() / ".aflow" / "config" / "aflow.toml"
-            ),
-        )
-        before = service.read(PROJECT_ID)
-        aflow_text, workflows_text = _valid_pair(model="next-model")
-
-        with pytest.raises(ProjectConfigRunBlocked) as exc_info:
-            service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
-
-        assert exc_info.value.blocking_runs[0][1] == "failed"
-
-    def test_save_handles_uncomposable_owned_run_snapshots(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial=None)
-        config_path = root / ".aflow" / "config" / "aflow.toml"
-        config_path.parent.mkdir(parents=True)
-        config_path.write_text("[aflow\n", encoding="utf-8")
-        old_config_path = root / "old-global-config" / "aflow.toml"
-        old_config_path.parent.mkdir()
-        old_config_path.write_bytes(config_path.read_bytes())
-        self._failed_run(
-            root,
-            "frozen-fingerprint",
-            frozen_config_path=str(old_config_path.resolve()),
-        )
-        before_revision = combined_revision(config_path.read_bytes(), b"")
-        aflow_text, workflows_text = _valid_pair(model="recovered-model")
-
-        snapshot = service.save(
-            PROJECT_ID, aflow_text, workflows_text, before_revision
-        )
-
-        assert snapshot.validation.state == "ready"
-
-    def test_save_blocks_uncomposable_nonterminal_owned_run(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial=None)
-        config_path = root / ".aflow" / "config" / "aflow.toml"
-        config_path.parent.mkdir(parents=True)
-        config_path.write_text("[aflow\n", encoding="utf-8")
-        self._failed_run(root, "frozen-fingerprint", status="running")
-        before_revision = combined_revision(config_path.read_bytes(), b"")
-        aflow_text, workflows_text = _valid_pair(model="blocked-model")
-
-        with pytest.raises(ProjectConfigRunBlocked) as exc_info:
-            service.save(PROJECT_ID, aflow_text, workflows_text, before_revision)
-
-        assert exc_info.value.blocking_runs[0][1] == "needs_attention"
-
-    def test_save_allows_migrated_identical_config_with_old_frozen_path(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from aflow.workflow import _freeze_run_identity
-
-        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
-        config_path = root / ".aflow" / "config" / "aflow.toml"
-        config = load_workflow_config(config_path)
-        identity = _freeze_run_identity(
-            "deliver", config, config_dir=config_path
-        )
-        old_config_path = root / "old-global-config" / "aflow.toml"
-        old_config_path.parent.mkdir()
-        old_config_path.write_bytes(config_path.read_bytes())
-        run_id = self._failed_run(
-            root,
-            identity.config_fingerprint,
-            frozen_config_path=str(old_config_path.resolve()),
-        )
-        run_dir = root / ".aflow" / "runs" / run_id
-        manifest_path = root / ".aflow" / "launches" / f"{run_id}.json"
-        manifest_before = manifest_path.read_bytes()
-        run_before = (run_dir / "run.json").read_bytes()
-        before = service.read(PROJECT_ID)
-        aflow_text, workflows_text = _valid_pair(model="migrated-model")
-
-        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
-
-        assert snapshot.revision != before.revision
-        assert manifest_path.read_bytes() == manifest_before
-        assert (run_dir / "run.json").read_bytes() == run_before
-
-    def test_save_allowed_when_failed_run_fingerprint_no_longer_matches(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        service, _, _, root, _ = _env(tmp_path, monkeypatch, initial="valid")
-        self._failed_run(root, "0" * 64)
-        before = service.read(PROJECT_ID)
-        aflow_text, workflows_text = _valid_pair(model="fresh-model")
-
-        snapshot = service.save(PROJECT_ID, aflow_text, workflows_text, before.revision)
-
-        assert snapshot.revision != before.revision
 
     def test_second_file_failure_restores_previous_bytes(
         self,
@@ -833,78 +678,6 @@ class TestSave:
             (before.aflow_toml, before.workflows_toml),
             (aflow_text, workflows_text),
         }
-
-    def test_start_waits_for_save_after_blocker_check(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        service, _, control, root, _ = _env(tmp_path, monkeypatch, initial="valid")
-        plan = root / "plans" / "todo" / "plan.md"
-        plan.parent.mkdir(parents=True)
-        plan.write_text("# Plan\\n\\n### [ ] Checkpoint 1: Do\\n- [ ] step\\n")
-        before = service.read(PROJECT_ID)
-        aflow_text, workflows_text = _valid_pair(model="launch-after-save")
-        blocker_checked, release_save, started = Event(), Event(), Event()
-        outcomes: dict[str, object] = {}
-        original_check = service._assert_no_blocking_runs
-
-        def pausing_check(project_id: str, root: Path) -> None:
-            original_check(project_id, root)
-            blocker_checked.set()
-            assert release_save.wait(timeout=30)
-
-        monkeypatch.setattr(service, "_assert_no_blocking_runs", pausing_check)
-        monkeypatch.setattr(
-            "aflow.daemon.prepare_startup",
-            lambda request: StartupQuestion(
-                kind=StartupQuestionKind.PICK_STEP,
-                message="Choose a step",
-                choices=["implement"],
-            ),
-        )
-        saver = Thread(
-            target=lambda: outcomes.setdefault(
-                "save",
-                service.save(PROJECT_ID, aflow_text, workflows_text, before.revision),
-            )
-        )
-        saver.start()
-        assert blocker_checked.wait(timeout=30)
-
-        def start() -> None:
-            outcomes["start"] = control.start_run(
-                PROJECT_ID,
-                plan_path="plans/todo/plan.md",
-                workflow_name="deliver",
-                team=None,
-                start_step=None,
-                max_turns=None,
-                idempotency_key="blocked-start",
-            )
-            started.set()
-
-        launcher = Thread(target=start)
-        launcher.start()
-        assert not started.wait(timeout=0.1)
-        release_save.set()
-        saver.join(timeout=30)
-        launcher.join(timeout=30)
-        assert not saver.is_alive() and not launcher.is_alive()
-        pending = outcomes["start"]
-        assert hasattr(pending, "question_id")
-        manifest = control._project(
-            PROJECT_ID
-        ).daemon.application.repository.get_launch_manifest(pending.run_id)
-        assert manifest is not None
-        config = load_workflow_config(root / ".aflow" / "config" / "aflow.toml")
-        from aflow.workflow import _freeze_run_identity
-
-        assert (
-            manifest.frozen_config_fingerprint
-            == _freeze_run_identity(
-                "deliver", config, config_dir=root / ".aflow" / "config" / "aflow.toml"
-            ).config_fingerprint
-        )
-
 
 class TestAuditAndReload:
     def test_audit_records_are_bounded_and_redacted(

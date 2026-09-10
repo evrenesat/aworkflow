@@ -270,6 +270,71 @@ def test_run_metadata_emits_complete_schema_v2_empty_authority(tmp_path: Path) -
     assert payload["hotplug_history"] == []
 
 
+def test_run_metadata_persists_live_source_and_choice_provenance(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=7)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        live_config_path=str(tmp_path / "current" / "aflow.toml"),
+        team_explicit=False,
+        max_turns_explicit=True,
+        frozen_run_identity=FrozenRunIdentity(
+            workflow_name="managed",
+            live_config_path=str(tmp_path / "current" / "aflow.toml"),
+            team_explicit=False,
+            max_turns_explicit=True,
+        ),
+    )
+    paths = create_run_paths(config)
+
+    RunMetadataWriter(
+        paths=paths,
+        config=config,
+        state=state,
+        workflow_name="managed",
+    ).write(status="running", original_plan_path=plan_path)
+
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert payload["live_config_path"].endswith("current/aflow.toml")
+    assert payload["team_explicit"] is False
+    assert payload["max_turns_explicit"] is True
+    assert payload["frozen_config"]["config_fingerprint"] is None
+    assert payload["frozen_config"]["live_config_path"].endswith(
+        "current/aflow.toml"
+    )
+
+
+def test_run_metadata_allows_new_state_without_deprecated_frozen_identity(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+    config = ControllerConfig(repo_root=tmp_path, plan_path=plan_path, max_turns=7)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        live_config_path=str(tmp_path / "aflow.toml"),
+        team_explicit=True,
+        max_turns_explicit=False,
+    )
+    paths = create_run_paths(config)
+
+    RunMetadataWriter(
+        paths=paths,
+        config=config,
+        state=state,
+        workflow_name="managed",
+    ).write(status="running", original_plan_path=plan_path)
+
+    payload = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert "frozen_config" not in payload
+    assert payload["live_config_path"].endswith("aflow.toml")
+    assert payload["team_explicit"] is True
+    assert payload["max_turns_explicit"] is False
+
+
 def test_run_metadata_persists_resolved_team_before_state_initialization(
     tmp_path: Path,
 ) -> None:

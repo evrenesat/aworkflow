@@ -215,6 +215,26 @@ describe('workflow control API client', () => {
     expect(window.localStorage.length).toBe(0); expect(window.sessionStorage.length).toBe(0)
   })
 
+  it('posts a paged read-only worktree preflight without an idempotency key', async () => {
+    mockOkJson({
+      checkout_path: '/workspace/project', execution_mode: 'same_checkout', dirty: true,
+      requires_confirmation: true, blockers: [], total_items: 3, offset: 2, limit: 1,
+      next_offset: null, items: [{ path: 'src/renamed.ts', index_status: 'R', worktree_status: ' ', original_path: 'src/old.ts' }],
+    })
+    const signal = new AbortController().signal
+    const result = await api.preflightControlPlaneRun(
+      'project-1', { plan_path: 'plans/in-progress/demo.md', dirty_worktree_confirmed: false },
+      { offset: 2, limit: 1, signal },
+    )
+    expect(result.requires_confirmation).toBe(true)
+    expect(result.items[0].original_path).toBe('src/old.ts')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/control-plane/projects/project-1/runs/preflight', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ plan_path: 'plans/in-progress/demo.md', dirty_worktree_confirmed: false, offset: 2, limit: 1 }),
+      signal,
+    }))
+  })
+
   it('surfaces structured API failures', async () => {
     vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: false, status: 409,
@@ -358,13 +378,13 @@ describe('workflow control API client', () => {
     expect((vi.mocked(global.fetch).mock.calls.at(-1)![1] as RequestInit).body).not.toContain('revision')
   })
 
-  it('carries config conflict and blocker detail through ApiError', async () => {
+  it('carries a configuration revision conflict through ApiError', async () => {
     vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: false, status: 409,
       text: async () => JSON.stringify({
         detail: {
-          code: 'config_save_blocked',
-          blocking_runs: [{ run_id: 'run-9', status: 'running' }],
+          code: 'revision_conflict',
+          current_revision: 'b'.repeat(64),
         },
       }),
     } as Response)
@@ -372,8 +392,8 @@ describe('workflow control API client', () => {
       aflow_toml: 'x', workflows_toml: 'y', expected_revision: 'a'.repeat(64),
     })).rejects.toMatchObject({
       status: 409,
-      code: 'config_save_blocked',
-      detail: { blocking_runs: [{ run_id: 'run-9', status: 'running' }] },
+      code: 'revision_conflict',
+      detail: { current_revision: 'b'.repeat(64) },
     })
   })
 

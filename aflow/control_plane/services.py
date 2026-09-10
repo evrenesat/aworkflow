@@ -11,16 +11,23 @@ from uuid import uuid4
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupRequest
 from aflow.api.startup import prepare_startup, prepare_startup_with_answer
+from aflow.config import ConfigError, WorkflowUserConfig
+from aflow.live_config import load_live_config
+from aflow.run_state import OverrideRequest, load_override_request
 
 from .models import ContextBundle, RunControlRequest, StartupQuestionRecord
 from .persistence import (
+    ControlConflictError,
     ControlWriteResult,
+    PersistenceError,
     append_run_event,
     build_context_bundle,
     compare_and_swap_overrides,
     read_events,
+    validate_control_request,
 )
 from .repository import RunRepository
+from .validation import ControlValidationError, validate_override_targets
 
 
 class ServiceAuthorizationError(PermissionError):
@@ -32,14 +39,28 @@ class ControlIdempotencyConflict(ValueError):
 
 
 RunAuthorizer = Callable[[str, object], bool | None]
+ControlConfigLoader = Callable[[], WorkflowUserConfig]
 
 
 class ControlService:
     """Apply safe controls only through the CP01 CAS and journal primitives."""
 
-    def __init__(self, repository: RunRepository, *, authorizer: RunAuthorizer | None = None) -> None:
+    def __init__(
+        self,
+        repository: RunRepository,
+        *,
+        authorizer: RunAuthorizer | None = None,
+        config_loader: ControlConfigLoader | None = None,
+        config_path: Path | None = None,
+    ) -> None:
+        if config_loader is not None and config_path is not None:
+            raise TypeError("pass only one of config_loader and config_path")
+        if config_path is not None:
+            selected_path = Path(config_path)
+            config_loader = lambda: load_live_config(selected_path).workflow_config
         self._repository = repository
         self._authorizer = authorizer
+        self._config_loader = config_loader
 
     def apply(
         self,
@@ -64,6 +85,11 @@ class ControlService:
             )
             if replay is not None:
                 return replay
+        validate_control_request(request)
+        if request.expected_revision != status.revision:
+            raise ControlConflictError(status.revision)
+        if request.owner_stop is not True and self._config_loader is not None:
+            self._validate_live_targets(status, run_dir, request)
         result = compare_and_swap_overrides(self._repository.repo_root, run_id, request)
         append_run_event(
             run_dir,
@@ -78,6 +104,100 @@ class ControlService:
             },
         )
         return result
+
+    def _validate_live_targets(
+        self,
+        status: object,
+        run_dir: Path,
+        request: RunControlRequest,
+    ) -> None:
+        """Validate a merged control proposal against one current config read."""
+        assert self._config_loader is not None
+        try:
+            workflow_config = self._config_loader()
+        except ConfigError as exc:
+            raise ControlValidationError(
+                field="configuration",
+                target="live",
+                message=f"current live workflow configuration is unusable: {exc}",
+            ) from exc
+
+        override_path = run_dir / "overrides.toml"
+        if override_path.exists() and (
+            override_path.is_symlink() or not override_path.is_file()
+        ):
+            raise PersistenceError("overrides.toml must be a regular file")
+        loaded = load_override_request(override_path)
+        if loaded.status == "invalid" or (
+            loaded.request is None and loaded.status != "absent"
+        ):
+            raise ControlValidationError(
+                field="overrides",
+                target="overrides.toml",
+                message=loaded.message or "the existing override file is invalid",
+            )
+        existing = loaded.request
+        effective_team = self._effective_team(
+            status, existing, request, workflow_config
+        )
+        effective_roles = self._effective_roles(existing, request)
+        effective_max_turns = self._effective_max_turns(status, existing, request)
+        pending_step = existing.next_step if existing is not None else None
+        validate_override_targets(
+            workflow_config,
+            workflow_name=str(getattr(status, "workflow_name", "") or ""),
+            step_name=pending_step
+            or getattr(status, "current_step", None)
+            or getattr(status, "selected_start_step", None),
+            team=effective_team,
+            role_selectors=effective_roles,
+            max_turns=effective_max_turns,
+            completed_turns=getattr(status, "turns_completed", None),
+            step_field="next_step" if pending_step is not None else "current_step",
+        )
+
+    def _effective_team(
+        self,
+        status: object,
+        existing: OverrideRequest | None,
+        request: RunControlRequest,
+        workflow_config: WorkflowUserConfig,
+    ) -> str | None:
+        if request.team is not None:
+            return request.team.strip()
+        if existing is not None and existing.team is not None:
+            return existing.team
+        workflow_name = str(getattr(status, "workflow_name", "") or "")
+        manifest = self._repository.get_launch_manifest(
+            str(getattr(status, "run_id", ""))
+        )
+        if manifest is not None and manifest.team is None:
+            workflow = workflow_config.workflows.get(workflow_name)
+            return workflow.team if workflow is not None else None
+        return getattr(status, "team", None) or (
+            manifest.team if manifest is not None else None
+        )
+
+    @staticmethod
+    def _effective_roles(
+        existing: OverrideRequest | None,
+        request: RunControlRequest,
+    ) -> dict[str, str]:
+        roles = dict(existing.role_selectors) if existing is not None else {}
+        roles.update(request.role_selectors)
+        return roles
+
+    @staticmethod
+    def _effective_max_turns(
+        status: object,
+        existing: OverrideRequest | None,
+        request: RunControlRequest,
+    ) -> int | None:
+        if request.max_turns is not None:
+            return request.max_turns
+        if existing is not None and existing.max_turns is not None:
+            return existing.max_turns
+        return getattr(status, "max_turns", None)
 
     def _idempotent_replay(
         self,

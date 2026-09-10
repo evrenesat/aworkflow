@@ -234,7 +234,8 @@ def test_named_resume_can_override_configured_team_and_records_provenance(reloca
     assert result.team == "other"
     assert result.resume_context.resumed_from_team == "base"
     assert result.resume_context.resume_team_override == "other"
-    assert result.resume_context.frozen_run_identity.config_path == str(config_path.resolve())
+    assert result.config_path == config_path.resolve()
+    assert result.resume_context.frozen_run_identity.config_path == "/old/repo/aflow.toml"
     assert result.run_json["team"] == "base"
     assert json.loads((source / "run.json").read_text()) == run
 

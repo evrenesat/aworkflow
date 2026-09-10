@@ -1163,8 +1163,8 @@ def test_daemon_owner_stop_pending_question_remains_terminal_for_reads_and_answe
     record_bytes = record_path.read_bytes()
     manifest_bytes = manifest_path.read_bytes()
     plan_bytes = request.plan_path.read_bytes()
-    # The reservation freezes the run's configuration snapshot, so the run
-    # directory exists; no controller artifacts may exist before the answer.
+    # The reservation creates the diagnostic compatibility directory, so the
+    # run directory exists; no controller artifacts may exist before the answer.
     assert sorted(path.name for path in run_dir.iterdir()) == ["config"]
     assert (run_dir / "config" / "aflow.toml").is_file()
 

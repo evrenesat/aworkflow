@@ -110,17 +110,6 @@ class RunRepository:
             raise RepositoryError("launch manifest may not be a symlink")
         return self._parse_manifest(path)
 
-    def get_frozen_config_path(self, run_id: str) -> str | None:
-        """Return the recorded frozen config path without exposing run metadata."""
-        valid, is_legacy_identity = self._readable_run_id(run_id)
-        if is_legacy_identity:
-            return None
-        metadata = self._read_run_metadata(self.run_directory(valid))
-        frozen_config = metadata.get("frozen_config")
-        if not isinstance(frozen_config, Mapping):
-            return None
-        return _optional_text(frozen_config.get("config_path"))
-
     def get_run_status(self, run_id: str) -> RunStatus:
         valid, is_legacy_identity = self._readable_run_id(run_id)
         run_dir = (

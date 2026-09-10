@@ -53,6 +53,12 @@ class StartupRequest:
     caller_scope: str | None = None
     continue_from_current: bool = False
     restarted_from_run_id: str | None = None
+    # ``None`` preserves the legacy inference rule for callers that predate
+    # explicit-choice provenance.  New CLI/daemon callers set these values
+    # from the submitted request, not from the resolved defaults.
+    team_explicit: bool | None = None
+    max_turns_explicit: bool | None = None
+    start_step_explicit: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,7 @@ class PreparedRun:
     team: str | None
     extra_instructions: tuple[str, ...]
     start_step: str
+    dirty_worktree_confirmed: bool = False
     startup_retry: RetryContext | None = None
     startup_base_head_refresh_sha: str | None = None
     move_completed_plan_to_done: bool = False
@@ -111,6 +118,9 @@ class PreparedRun:
     continuation_mode: str | None = None
     restarted_from_run_id: str | None = None
     skipped_steps: tuple[str, ...] = ()
+    team_explicit: bool | None = None
+    max_turns_explicit: bool | None = None
+    start_step_explicit: bool | None = None
 
 
 # Re-export shared, versioned control-plane models through the public API.

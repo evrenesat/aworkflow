@@ -555,6 +555,7 @@ class WorkflowCliTests(unittest.TestCase):
         *,
         reset_scope: bool = False,
         auto: bool = False,
+        start_step_arg: str | None = None,
         startup_result: PreparedRun | None = None,
     ) -> tuple[int, str, Mock, Mock, Mock, Mock, object | None]:
         import aflow.cli as cli_module
@@ -589,6 +590,8 @@ class WorkflowCliTests(unittest.TestCase):
         argv = ["run", "--resume"]
         if not auto:
             argv.append(run_dir.name)
+        if start_step_arg is not None:
+            argv.extend(["--start-step", start_step_arg])
         if reset_scope:
             argv.append("--resume-reset-scope")
 
@@ -737,6 +740,81 @@ class WorkflowCliTests(unittest.TestCase):
         assert result.extra_instructions == ("keep the patch focused",)
         assert result.frozen_run_identity is not None
 
+    def test_resume_explicit_start_step_correction_replaces_interrupted_step(
+        self,
+    ) -> None:
+        import aflow.cli as cli_module
+
+        tmp_path = self._new_temp_path()
+        repo_root, run_dir, workflow_config, previous_run = (
+            self._resume_bootstrap_fixture(tmp_path)
+        )
+        failed_run = dict(previous_run)
+        failed_run.update(
+            {
+                "status": "failed",
+                "failure_kind": "environment_preflight",
+                "current_step_name": "removed_review",
+                "active_turn": 1,
+                "turns_completed": 1,
+                "environment_preflight": {
+                    "classification": "harness_environment_preflight",
+                    "reason_code": "harness_executable_missing",
+                    "invocation_kind": "workflow_turn",
+                    "step_name": "removed_review",
+                },
+            }
+        )
+
+        with patch(
+            "aflow.cli.resolve_run_id",
+            return_value=(Path(run_dir.name), "explicit_run_id"),
+        ), patch("aflow.cli.load_run_json", return_value=failed_run):
+            bootstrap = cli_module._bootstrap_resume_invocation(
+                repo_root=repo_root,
+                workflow_config=workflow_config,
+                requested_run_id=run_dir.name,
+                workflow_arg=None,
+                plan_file_arg=None,
+                team_arg=None,
+                start_step_arg="implement_plan",
+                max_turns_arg=None,
+                extra_instructions_arg=(),
+                extra_instructions_provided=False,
+            )
+
+        assert bootstrap.start_step == "implement_plan"
+        assert bootstrap.start_step_override is True
+        assert bootstrap.resume_context.start_step_explicit is True
+        assert bootstrap.resume_context.interrupted_step_name == "implement_plan"
+
+        status, _stderr, _startup, execute, *_rest, captured_resume = (
+            self._invoke_resume_command(
+                tmp_path,
+                failed_run,
+                run_dir,
+                workflow_config,
+                start_step_arg="implement_plan",
+            )
+        )
+        assert status == 0
+        execute.assert_called_once()
+        assert captured_resume is not None
+        assert captured_resume.interrupted_step_name == "implement_plan"
+
+        omitted_status, _stderr, _startup, omitted_execute, *_rest, omitted_resume = (
+            self._invoke_resume_command(
+                tmp_path,
+                failed_run,
+                run_dir,
+                workflow_config,
+            )
+        )
+        assert omitted_status == 0
+        omitted_execute.assert_called_once()
+        assert omitted_resume is not None
+        assert omitted_resume.interrupted_step_name == "removed_review"
+
     def test_resume_bootstrap_accepts_exact_modern_frozen_identity(self) -> None:
         import aflow.cli as cli_module
 
@@ -768,7 +846,7 @@ class WorkflowCliTests(unittest.TestCase):
             "frozen_config"
         ]["config_fingerprint"]
 
-    def test_resume_bootstrap_rejects_frozen_identity_path_and_fingerprint_drift(
+    def test_resume_bootstrap_ignores_frozen_identity_path_and_fingerprint_drift(
         self,
     ) -> None:
         import aflow.cli as cli_module
@@ -791,46 +869,45 @@ class WorkflowCliTests(unittest.TestCase):
                 else:
                     current_config_path = config_path
                     frozen_config["config_fingerprint"] = "different-fingerprint"
+                current_config_path.write_text("", encoding="utf-8")
                 modern_run["frozen_config"] = frozen_config
 
                 with patch(
                     "aflow.cli.resolve_run_id",
                     return_value=(Path(run_dir.name), "explicit_run_id"),
                 ), patch("aflow.cli.load_run_json", return_value=modern_run):
-                    with pytest.raises(ValueError, match="frozen configuration mismatch"):
-                        cli_module._bootstrap_resume_invocation(
-                            repo_root=repo_root,
-                            config_path=current_config_path,
-                            workflow_config=workflow_config,
-                            requested_run_id=run_dir.name,
-                            workflow_arg=None,
-                            plan_file_arg=None,
-                            team_arg=None,
-                            start_step_arg=None,
-                            max_turns_arg=None,
-                            extra_instructions_arg=(),
-                            extra_instructions_provided=False,
-                        )
+                    result = cli_module._bootstrap_resume_invocation(
+                        repo_root=repo_root,
+                        config_path=current_config_path,
+                        config_path_is_explicit=True,
+                        workflow_config=workflow_config,
+                        requested_run_id=run_dir.name,
+                        workflow_arg=None,
+                        plan_file_arg=None,
+                        team_arg=None,
+                        start_step_arg=None,
+                        max_turns_arg=None,
+                        extra_instructions_arg=(),
+                        extra_instructions_provided=False,
+                    )
+                assert result.config_path == current_config_path.resolve()
 
-    def test_modern_resume_requires_complete_frozen_identity_before_startup(
+    def test_modern_resume_allows_missing_or_partial_frozen_identity(
         self,
     ) -> None:
         import aflow.cli as cli_module
 
         cases = (
-            (None, "expected a mapping"),
-            ({"workflow_name": "saved_workflow"}, "frozen_config.config_path"),
-            (
-                {
-                    "workflow_name": "saved_workflow",
-                    "config_path": "/tmp/config",
-                    "config_fingerprint": "",
-                },
-                "frozen_config.config_fingerprint",
-            ),
+            None,
+            {"workflow_name": "saved_workflow"},
+            {
+                "workflow_name": "saved_workflow",
+                "config_path": "/tmp/config",
+                "config_fingerprint": "",
+            },
         )
-        for frozen_config, message in cases:
-            with self.subTest(message=message):
+        for frozen_config in cases:
+            with self.subTest(frozen_config=frozen_config):
                 tmp_path = self._new_temp_path()
                 (
                     repo_root,
@@ -845,22 +922,22 @@ class WorkflowCliTests(unittest.TestCase):
                     "aflow.cli.resolve_run_id",
                     return_value=(Path(run_dir.name), "explicit_run_id"),
                 ), patch("aflow.cli.load_run_json", return_value=modern_run):
-                    with pytest.raises(ValueError, match=message):
-                        cli_module._bootstrap_resume_invocation(
-                            repo_root=repo_root,
-                            config_path=config_path,
-                            workflow_config=workflow_config,
-                            requested_run_id=run_dir.name,
-                            workflow_arg=None,
-                            plan_file_arg=None,
-                            team_arg=None,
-                            start_step_arg=None,
-                            max_turns_arg=None,
-                            extra_instructions_arg=(),
-                            extra_instructions_provided=False,
-                        )
+                    result = cli_module._bootstrap_resume_invocation(
+                        repo_root=repo_root,
+                        config_path=config_path,
+                        workflow_config=workflow_config,
+                        requested_run_id=run_dir.name,
+                        workflow_arg=None,
+                        plan_file_arg=None,
+                        team_arg=None,
+                        start_step_arg=None,
+                        max_turns_arg=None,
+                        extra_instructions_arg=(),
+                        extra_instructions_provided=False,
+                    )
+                assert result.workflow_name == "saved_workflow"
 
-    def test_modern_plan_free_resume_rejects_identity_drift_before_startup(
+    def test_modern_plan_free_resume_uses_current_config_despite_identity_drift(
         self,
     ) -> None:
         import aflow.cli as cli_module
@@ -885,7 +962,27 @@ class WorkflowCliTests(unittest.TestCase):
                     modern_run = dict(modern_run)
                     modern_run["frozen_config"] = dict(modern_run["frozen_config"])
                     modern_run["frozen_config"]["config_fingerprint"] = "drifted"
-                startup = Mock()
+                prepared = PreparedRun(
+                    workflow_name="saved_workflow",
+                    repo_root=repo_root,
+                    plan_path=Path(modern_run["original_plan_path"]),
+                    config_path=current_config_path,
+                    max_turns=15,
+                    team="base",
+                    extra_instructions=("keep the patch focused",),
+                    start_step="implement_plan",
+                    team_explicit=True,
+                    max_turns_explicit=True,
+                    start_step_explicit=True,
+                )
+                startup = Mock(return_value=prepared)
+                execute = Mock(
+                    return_value=type(
+                        "RunResult",
+                        (),
+                        {"turns_completed": 0, "end_reason": "done"},
+                    )()
+                )
                 stderr = io.StringIO()
                 with patch.object(
                     cli_module,
@@ -915,15 +1012,26 @@ class WorkflowCliTests(unittest.TestCase):
                     cli_module,
                     "_handle_startup_questions",
                     startup,
+                ), patch.object(
+                    cli_module,
+                    "execute_workflow",
+                    execute,
                 ), redirect_stderr(stderr):
-                    status = cli_module.main(["run", "--resume", run_dir.name])
+                    status = cli_module.main(
+                        [
+                            "run",
+                            "--config",
+                            str(current_config_path),
+                            "--resume",
+                            run_dir.name,
+                        ]
+                    )
 
-                assert status == 1
-                assert "frozen configuration mismatch" in stderr.getvalue()
-                startup.assert_not_called()
-                assert not (repo_root / ".aflow" / "runs").exists()
+                assert status == 0
+                startup.assert_called_once()
+                execute.assert_called_once()
 
-    def test_modern_plan_free_resume_rejects_malformed_identity_before_startup(
+    def test_modern_plan_free_resume_ignores_malformed_historical_identity(
         self,
     ) -> None:
         import aflow.cli as cli_module
@@ -949,8 +1057,27 @@ class WorkflowCliTests(unittest.TestCase):
                 ) = self._modern_resume_fixture(tmp_path)
                 modern_run = dict(modern_run)
                 modern_run["frozen_config"] = frozen_config
-                startup = Mock()
-                execute = Mock()
+                prepared = PreparedRun(
+                    workflow_name="saved_workflow",
+                    repo_root=repo_root,
+                    plan_path=Path(modern_run["original_plan_path"]),
+                    config_path=config_path,
+                    max_turns=15,
+                    team="base",
+                    extra_instructions=("keep the patch focused",),
+                    start_step="implement_plan",
+                    team_explicit=True,
+                    max_turns_explicit=True,
+                    start_step_explicit=True,
+                )
+                startup = Mock(return_value=prepared)
+                execute = Mock(
+                    return_value=type(
+                        "RunResult",
+                        (),
+                        {"turns_completed": 0, "end_reason": "done"},
+                    )()
+                )
                 stderr = io.StringIO()
                 with patch.object(
                     cli_module,
@@ -987,11 +1114,9 @@ class WorkflowCliTests(unittest.TestCase):
                 ), redirect_stderr(stderr):
                     status = cli_module.main(["run", "--resume", run_dir.name])
 
-                assert status == 1
-                assert "invalid frozen_config" in stderr.getvalue()
-                startup.assert_not_called()
-                execute.assert_not_called()
-                assert not (repo_root / ".aflow" / "runs").exists()
+                assert status == 0
+                startup.assert_called_once()
+                execute.assert_called_once()
 
     def test_plan_free_resume_bootstrap_rejects_malformed_saved_metadata(
         self,
@@ -2068,31 +2193,9 @@ class WorkflowCliTests(unittest.TestCase):
                 "invalid lifecycle_setup",
             ),
             (
-                "mismatched frozen identity",
-                lambda run: run.update(
-                    {
-                        "schema_version": 2,
-                        "frozen_config": {
-                            "workflow_name": "other_workflow",
-                            "config_path": str(Path(run["repo_root"]) / "aflow.toml"),
-                            "config_fingerprint": "0" * 64,
-                        },
-                    }
-                ),
-                "frozen configuration mismatch",
-            ),
-            (
-                "incomplete frozen identity",
-                lambda run: run.update(
-                    {
-                        "schema_version": 2,
-                        "frozen_config": {
-                            "workflow_name": "saved_workflow",
-                            "config_path": str(Path(run["repo_root"]) / "aflow.toml"),
-                        },
-                    }
-                ),
-                "invalid frozen_config",
+                "missing current workflow identity",
+                lambda run: run.pop("workflow_name"),
+                "missing required current fields: workflow_name",
             ),
         )
         for name, mutate, expected in cases:
@@ -2151,7 +2254,6 @@ class WorkflowCliTests(unittest.TestCase):
             ),
             ({"workflow_arg": "other_workflow"}, "resume workflow mismatch"),
             ({"team_arg": "other-team"}, "resume team mismatch"),
-            ({"max_turns_arg": 30}, "resume max-turns mismatch"),
         )
         for kwargs, message in cases:
             with self.subTest(message=message):
@@ -5176,6 +5278,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     "returncode": 0,
                     "active_plan_path": "/repo/plan.md",
                     "new_plan_path": "/repo/plan-cp1.md",
+                    "snapshot_before": snapshot,
                     "snapshot_after": snapshot,
                     "conditions": {
                         "DONE": False,
@@ -5212,6 +5315,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert pending.turn_number == 1
         assert pending.step_name == "implement"
         assert pending.chosen_transition == "review"
+        assert pending.snapshot_before == PlanSnapshot(
+            "Checkpoint 1: Test", 1, 1, False, 1, 1
+        )
 
     def test_resume_prompt_declined_returns_none(self) -> None:
         import aflow.cli as cli_module

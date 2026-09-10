@@ -8,6 +8,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 
 class RepoState(Enum):
@@ -87,6 +88,36 @@ class WorktreeProbe:
     sample_paths: tuple[str, ...]
 
 
+WorktreeExecutionMode = Literal["same_checkout", "new_worktree"]
+
+
+@dataclass(frozen=True)
+class WorktreeStatusItem:
+    """One decoded record from ``git status --porcelain=v1 -z``."""
+
+    path: str
+    original_path: str | None
+    index_status: str
+    worktree_status: str
+
+
+@dataclass(frozen=True)
+class WorktreePreflight:
+    """Read-only working-tree state used by startup and lifecycle checks."""
+
+    checkout_path: Path
+    execution_mode: WorktreeExecutionMode
+    dirty: bool
+    requires_confirmation: bool
+    blockers: tuple[str, ...]
+    total_items: int
+    items: tuple[WorktreeStatusItem, ...]
+
+
+class WorktreeInspectionError(RuntimeError):
+    """Git status could not be inspected reliably."""
+
+
 AFLOW_OWNED_PATH_ROOTS = (".aflow",)
 
 
@@ -153,6 +184,90 @@ def _decode_porcelain_path_atom(atom: str) -> str | None:
     return os.fsdecode(bytes(encoded_path))
 
 
+class WorktreeStatusParseError(ValueError):
+    """A status stream was not valid NUL-delimited porcelain-v1 output."""
+
+
+def parse_porcelain_status(
+    output: bytes | str,
+) -> tuple[WorktreeStatusItem, ...]:
+    """Decode NUL-delimited porcelain-v1 records without splitting filenames.
+
+    Git emits the destination followed by the source for rename and copy
+    records when ``-z`` is enabled.  The parser keeps that distinction in the
+    typed item while decoding filenames with the filesystem surrogateescape
+    policy, so spaces, newlines, and non-UTF-8 bytes remain representable.
+    """
+    if isinstance(output, str):
+        output_bytes = os.fsencode(output)
+    elif isinstance(output, bytes):
+        output_bytes = output
+    else:
+        raise TypeError("porcelain status output must be bytes or str")
+
+    records = output_bytes.split(b"\0")
+    items: list[WorktreeStatusItem] = []
+    record_index = 0
+    while record_index < len(records):
+        record = records[record_index]
+        record_index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise WorktreeStatusParseError(
+                "porcelain status record has no XY status separator"
+            )
+
+        try:
+            index_status, worktree_status = record[:2].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise WorktreeStatusParseError(
+                "porcelain status record has non-ASCII XY status"
+            ) from exc
+        xy = index_status + worktree_status
+        if index_status not in " MARDCTU?!" or worktree_status not in " MARDCTU?!":
+            raise WorktreeStatusParseError(
+                f"porcelain status record has invalid XY status {xy!r}"
+            )
+
+        path_bytes = record[3:]
+        if not path_bytes:
+            raise WorktreeStatusParseError("porcelain status record has an empty path")
+        path = os.fsdecode(path_bytes)
+        original_path: str | None = None
+        if "R" in (index_status, worktree_status) or "C" in (
+            index_status,
+            worktree_status,
+        ):
+            if record_index >= len(records) or not records[record_index]:
+                raise WorktreeStatusParseError(
+                    "rename or copy status record has no original path"
+                )
+            original_path = os.fsdecode(records[record_index])
+            record_index += 1
+
+        items.append(
+            WorktreeStatusItem(
+                path=path,
+                original_path=original_path,
+                index_status=index_status,
+                worktree_status=worktree_status,
+            )
+        )
+
+    return tuple(
+        sorted(
+            items,
+            key=lambda item: (item.path, item.original_path or ""),
+        )
+    )
+
+
+# Keep the suffix-bearing name available for callers that want to make the
+# NUL framing explicit while retaining one parser implementation.
+parse_porcelain_status_z = parse_porcelain_status
+
+
 def _rename_copy_atoms(path_field: str) -> tuple[str, str] | None:
     separators: list[int] = []
     in_quotes = False
@@ -217,14 +332,206 @@ def is_lifecycle_owned_path(
     return False
 
 
+def classify_status_items_by_prefix(
+    items: Collection[WorktreeStatusItem],
+    prefix: str = "plans/",
+    *,
+    ignore_lifecycle_owned: bool = False,
+    ignore_untracked: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Classify decoded status records without losing rename source paths."""
+    plan_paths: list[str] = []
+    non_plan_paths: list[str] = []
+
+    for item in items:
+        if ignore_untracked and item.index_status == "?" and item.worktree_status == "?":
+            continue
+        paths = (item.original_path, item.path) if item.original_path else (item.path,)
+        _classify_paths_into(
+            paths,
+            prefix=prefix,
+            ignore_lifecycle_owned=ignore_lifecycle_owned,
+            plan_paths=plan_paths,
+            non_plan_paths=non_plan_paths,
+        )
+
+    return plan_paths, non_plan_paths
+
+
+def _classify_paths_into(
+    paths: Collection[str],
+    *,
+    prefix: str,
+    ignore_lifecycle_owned: bool,
+    plan_paths: list[str],
+    non_plan_paths: list[str],
+) -> None:
+    """Apply the shared lifecycle/plan path classification to decoded paths."""
+    for path in paths:
+        if ignore_lifecycle_owned and is_lifecycle_owned_path(path):
+            continue
+        if path.startswith(prefix):
+            plan_paths.append(path)
+        else:
+            non_plan_paths.append(path)
+
+
+def _git_directory(repo_root: Path) -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        raise WorktreeInspectionError(
+            f"cannot resolve the Git directory for '{repo_root}': {exc}"
+        ) from exc
+    if result.returncode != 0 or not result.stdout.strip():
+        detail = result.stderr.strip() or "git rev-parse --git-dir failed"
+        raise WorktreeInspectionError(
+            f"cannot resolve the Git directory for '{repo_root}': {detail}"
+        )
+    git_dir = Path(result.stdout.strip())
+    return git_dir if git_dir.is_absolute() else repo_root / git_dir
+
+
+def _in_progress_git_operation_markers(repo_root: Path) -> tuple[str, ...]:
+    git_dir = _git_directory(repo_root)
+
+    markers = (
+        "MERGE_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "sequencer",
+    )
+    active: list[str] = []
+    for marker in markers:
+        if (git_dir / marker).exists():
+            active.append(marker)
+    return tuple(active)
+
+
+_UNMERGED_STATUS_CODES = frozenset({
+    "AA",
+    "AU",
+    "DD",
+    "DU",
+    "UA",
+    "UD",
+    "UU",
+})
+
+
+def preflight_worktree(
+    repo_root: Path,
+    execution_mode: WorktreeExecutionMode = "same_checkout",
+    *,
+    allow_untracked: bool = False,
+) -> WorktreePreflight:
+    """Inspect one checkout and return the shared startup/lifecycle result.
+
+    A failed Git inspection raises ``WorktreeInspectionError``.  Callers must
+    not turn an unavailable or malformed status stream into a clean result.
+    """
+    if execution_mode not in {"same_checkout", "new_worktree"}:
+        raise ValueError(f"unsupported worktree execution mode: {execution_mode}")
+
+    checkout_path = Path(repo_root).resolve()
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ],
+            cwd=str(checkout_path),
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        raise WorktreeInspectionError(
+            f"git status inspection failed for '{checkout_path}': {exc}"
+        ) from exc
+    if result.returncode != 0:
+        stderr = result.stderr
+        if isinstance(stderr, bytes):
+            stderr = os.fsdecode(stderr)
+        detail = str(stderr).strip() or "git status returned a failure"
+        raise WorktreeInspectionError(
+            f"git status inspection failed for '{checkout_path}': {detail}"
+        )
+
+    try:
+        items = parse_porcelain_status(result.stdout)
+    except (TypeError, WorktreeStatusParseError) as exc:
+        raise WorktreeInspectionError(
+            f"git status inspection returned malformed porcelain data for "
+            f"'{checkout_path}': {exc}"
+        ) from exc
+
+    plan_paths, non_plan_paths = classify_status_items_by_prefix(
+        items,
+        ignore_lifecycle_owned=True,
+        ignore_untracked=allow_untracked,
+    )
+    effective_items = tuple(
+        item
+        for item in items
+        if not (
+            allow_untracked
+            and item.index_status == "?"
+            and item.worktree_status == "?"
+        )
+    )
+    blockers = [
+        f"unresolved conflict: {item.path}"
+        for item in items
+        if item.index_status + item.worktree_status in _UNMERGED_STATUS_CODES
+        or "U" in (item.index_status, item.worktree_status)
+    ]
+    blockers.extend(
+        f"in-progress Git operation ({marker} exists)"
+        for marker in _in_progress_git_operation_markers(checkout_path)
+    )
+
+    dirty = bool(effective_items)
+    requires_confirmation = dirty and (
+        bool(plan_paths or non_plan_paths)
+        if execution_mode == "same_checkout"
+        else bool(non_plan_paths)
+    )
+    return WorktreePreflight(
+        checkout_path=checkout_path,
+        execution_mode=execution_mode,
+        dirty=dirty,
+        requires_confirmation=requires_confirmation,
+        blockers=tuple(blockers),
+        total_items=len(items),
+        items=items,
+    )
+
+
 def probe_worktree(repo_root: Path) -> WorktreeProbe | None:
     """Return dirty-state summary, or None when git is unavailable."""
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ],
             cwd=str(repo_root),
             capture_output=True,
-            text=True,
             check=False,
         )
     except (OSError, FileNotFoundError):
@@ -238,11 +545,14 @@ def probe_worktree(repo_root: Path) -> WorktreeProbe | None:
     removed_count = 0
     sample_paths: list[str] = []
 
-    for line in result.stdout.splitlines():
-        if len(line) < 3:
-            continue
-        xy = line[:2]
-        path = line[3:]
+    try:
+        items = parse_porcelain_status(result.stdout)
+    except (TypeError, WorktreeStatusParseError):
+        return None
+
+    for item in items:
+        xy = item.index_status + item.worktree_status
+        path = item.path
 
         if len(sample_paths) < 3:
             sample_paths.append(path)
@@ -256,7 +566,7 @@ def probe_worktree(repo_root: Path) -> WorktreeProbe | None:
         else:
             modified_count += 1
 
-    is_dirty = bool(result.stdout.strip())
+    is_dirty = bool(items)
     return WorktreeProbe(
         is_dirty=is_dirty,
         modified_count=modified_count,
@@ -346,13 +656,13 @@ def classify_dirtiness_by_prefix(
             non_plan_paths.append(path_field if path_field is not None else line)
             continue
 
-        for path in paths:
-            if ignore_lifecycle_owned and is_lifecycle_owned_path(path):
-                continue
-            if path.startswith(prefix):
-                plan_paths.append(path)
-            else:
-                non_plan_paths.append(path)
+        _classify_paths_into(
+            paths,
+            prefix=prefix,
+            ignore_lifecycle_owned=ignore_lifecycle_owned,
+            plan_paths=plan_paths,
+            non_plan_paths=non_plan_paths,
+        )
 
     return plan_paths, non_plan_paths
 

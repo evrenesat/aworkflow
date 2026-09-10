@@ -533,7 +533,7 @@ def test_record_surfaces_safe_override_diagnostics() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert "Config fingerprint: 1234567890ab" in record
+    assert "Config fingerprint (diagnostic): 1234567890ab" in record
     assert "Override file: present" in record
     assert "Override result: rejected (abc): team is incompatible" in record
     assert "Override action: correct overrides.toml and resume" in record

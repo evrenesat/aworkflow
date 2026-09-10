@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -17,7 +17,7 @@ from aflow.harnesses.preflight import HarnessPreflightProbe
 from aflow.harnesses.base import HarnessAdapter
 from aflow.plan import ParsedPlan
 from aflow.run_state import ControllerConfig
-from aflow.workflow import run_workflow
+from aflow.workflow import WorkflowError, run_workflow
 
 
 @dataclass(frozen=True)
@@ -47,9 +47,73 @@ class WorkflowRunner:
         """Execute the workflow and return the result."""
         prepared = self._config.prepared_run
 
-        from aflow.config import load_workflow_config
+        from aflow.live_config import load_live_config
 
-        workflow_config = load_workflow_config(prepared.config_path)
+        workflow_config = load_live_config(prepared.config_path).workflow_config
+        workflow = workflow_config.workflows.get(prepared.workflow_name)
+        if workflow is None:
+            raise WorkflowError(
+                f"workflow '{prepared.workflow_name}' is not configured in the current source"
+            )
+        team_explicit = (
+            prepared.team_explicit
+            if prepared.team_explicit is not None
+            else prepared.team is not None
+        )
+        max_turns_explicit = (
+            prepared.max_turns_explicit
+            if prepared.max_turns_explicit is not None
+            else True
+        )
+        start_step_explicit = (
+            prepared.start_step_explicit
+            if prepared.start_step_explicit is not None
+            else True
+        )
+        effective_start_step = (
+            prepared.start_step if start_step_explicit else workflow.first_step
+        )
+        if effective_start_step not in workflow.steps:
+            raise WorkflowError(
+                f"start step '{effective_start_step}' is not configured in "
+                f"workflow '{prepared.workflow_name}'"
+            )
+        if effective_start_step in workflow.excluded_steps:
+            raise WorkflowError(
+                f"start step '{effective_start_step}' is excluded from "
+                f"workflow '{prepared.workflow_name}'"
+            )
+        effective_team = prepared.team if team_explicit else workflow.team
+        if effective_team is not None and effective_team not in workflow_config.teams:
+            raise WorkflowError(
+                f"team '{effective_team}' is not configured in the current source"
+            )
+        effective_max_turns = (
+            prepared.max_turns
+            if max_turns_explicit
+            else workflow_config.aflow.max_turns
+        )
+        if (
+            not isinstance(effective_max_turns, int)
+            or isinstance(effective_max_turns, bool)
+            or effective_max_turns < 1
+        ):
+            raise WorkflowError("current [aflow].max_turns must be a positive integer")
+        effective_skipped_steps = (
+            prepared.skipped_steps
+            if start_step_explicit
+            else tuple(workflow.steps)[: tuple(workflow.steps).index(effective_start_step)]
+        )
+        prepared = replace(
+            prepared,
+            max_turns=effective_max_turns,
+            team=effective_team,
+            start_step=effective_start_step,
+            skipped_steps=effective_skipped_steps,
+            team_explicit=team_explicit,
+            max_turns_explicit=max_turns_explicit,
+            start_step_explicit=start_step_explicit,
+        )
 
         config = ControllerConfig(
             repo_root=prepared.repo_root,
@@ -59,6 +123,7 @@ class WorkflowRunner:
             team=prepared.team,
             extra_instructions=prepared.extra_instructions,
             start_step=prepared.start_step,
+            dirty_worktree_confirmed=prepared.dirty_worktree_confirmed,
             continuation_from_branch=prepared.continuation_from_branch,
             continuation_from_head=prepared.continuation_from_head,
             continuation_mode=prepared.continuation_mode,
@@ -67,6 +132,9 @@ class WorkflowRunner:
             caller_scope=prepared.caller_scope,
             restarted_from_run_id=prepared.restarted_from_run_id,
             skipped_steps=prepared.skipped_steps,
+            team_explicit=prepared.team_explicit,
+            max_turns_explicit=prepared.max_turns_explicit,
+            start_step_explicit=prepared.start_step_explicit,
         )
 
         parsed_plan: ParsedPlan | None = None
@@ -80,6 +148,7 @@ class WorkflowRunner:
             parsed_plan=parsed_plan,
             startup_retry=prepared.startup_retry,
             startup_base_head_refresh_sha=prepared.startup_base_head_refresh_sha,
+            dirty_worktree_confirmed=prepared.dirty_worktree_confirmed,
             config_dir=prepared.config_path,
             adapter=self._config.adapter,
             runner=self._config.runner,

@@ -3,7 +3,8 @@
 The service owns exactly two documents per registered project,
 ``.aflow/config/aflow.toml`` and ``.aflow/config/workflows.toml``.  It never
 reads or writes another project file, never starts or stops workflow units,
-and delegates every run-state question to the daemon-backed control plane.
+and does not gate a valid save on the state or historical configuration of a
+workflow run.
 """
 
 from __future__ import annotations
@@ -38,30 +39,8 @@ CONFIG_DOCUMENT_NAMES = ("aflow.toml", "workflows.toml")
 MAX_CONFIG_DOCUMENT_BYTES = 256 * 1024
 MAX_VALIDATION_ISSUES = 20
 MAX_ISSUE_MESSAGE_CHARS = 300
-MAX_BLOCKING_RUNS = 20
 _AUDIT_SCHEMA_VERSION = 1
 _TOML_LINE_RE = re.compile(r"line (\d+)")
-
-# Nonterminal, startup-gated, stopping, and launch-incomplete runs always
-# block a save.  ``failed``/``interrupted`` runs block only while the current
-# on-disk fingerprint still matches their frozen manifest fingerprint, because
-# only then can explicit resume still reach them.
-_CONFIG_BLOCKING_RUN_STATUSES = frozenset(
-    {
-        "running",
-        "awaiting_startup_answer",
-        "stopping",
-        "needs_attention",
-        "waiting_for_valid_override",
-        "manifest_only",
-        "launch_requested",
-        "launch_started",
-        "unit_started",
-        "prepared",
-    }
-)
-_CONFIG_RESUME_ELIGIBLE_RUN_STATUSES = frozenset({"failed", "interrupted"})
-_CONFIG_TERMINAL_RUN_STATUSES = frozenset({"completed", "done", "owner_stopped"})
 
 _DOCUMENT_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -76,16 +55,6 @@ class ProjectConfigRevisionConflict(ProjectConfigError):
     def __init__(self, current_revision: str) -> None:
         super().__init__("configuration revision does not match the committed revision")
         self.current_revision = current_revision
-
-
-class ProjectConfigRunBlocked(ProjectConfigError):
-    """A nonterminal or still-resumable owned run depends on the current pair."""
-
-    def __init__(self, blocking_runs: tuple[tuple[str, str], ...]) -> None:
-        super().__init__(
-            "configuration save is blocked by nonterminal or resumable runs"
-        )
-        self.blocking_runs = blocking_runs
 
 
 @dataclass(frozen=True)
@@ -461,7 +430,6 @@ class ProjectConfigService:
                 "candidate configuration still contains placeholder selectors: "
                 + ", ".join(report.placeholders[:MAX_VALIDATION_ISSUES])
             )
-        self._assert_no_blocking_runs(project_id, root)
         aflow_bytes = aflow_text.encode("utf-8")
         workflows_bytes = workflows_text.encode("utf-8")
         new_revision = combined_revision(aflow_bytes, workflows_bytes)
@@ -552,65 +520,6 @@ class ProjectConfigService:
             validation=report,
         )
 
-    def _assert_no_blocking_runs(self, project_id: str, root: Path) -> None:
-        snapshots = self._control_plane.owned_run_snapshots(project_id)
-        if not snapshots:
-            return
-        current_config_path = str(root.resolve() / ".aflow" / "config" / "aflow.toml")
-        config = None
-        if any(
-            status in _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES
-            for _, status, _, _, _ in snapshots
-        ):
-            try:
-                config = load_workflow_config(root / ".aflow" / "config" / "aflow.toml")
-            except ConfigError:
-                config = None
-        blockers: list[tuple[str, str]] = []
-        for (
-            run_id,
-            status,
-            workflow_name,
-            manifest_fingerprint,
-            frozen_config_path,
-        ) in snapshots:
-            if status in _CONFIG_BLOCKING_RUN_STATUSES:
-                blockers.append((run_id, status))
-                continue
-            if status in _CONFIG_RESUME_ELIGIBLE_RUN_STATUSES:
-                if frozen_config_path and frozen_config_path != current_config_path:
-                    continue
-                if (
-                    config is not None
-                    and workflow_name is not None
-                    and manifest_fingerprint is not None
-                    and self._current_fingerprint(config, root, workflow_name)
-                    == manifest_fingerprint
-                ):
-                    blockers.append((run_id, status))
-                continue
-            if status not in _CONFIG_TERMINAL_RUN_STATUSES:
-                # An unrecognized status fails closed: saving could strand it.
-                blockers.append((run_id, status))
-        if blockers:
-            raise ProjectConfigRunBlocked(tuple(sorted(blockers)[:MAX_BLOCKING_RUNS]))
-
-    @staticmethod
-    def _current_fingerprint(
-        config: object, root: Path, workflow_name: str
-    ) -> str | None:
-        from aflow.workflow import _freeze_run_identity
-
-        try:
-            identity = _freeze_run_identity(
-                workflow_name,
-                config,  # type: ignore[arg-type]
-                config_dir=root / ".aflow" / "config" / "aflow.toml",
-            )
-        except (KeyError, ValueError, TypeError):
-            return None
-        return identity.config_fingerprint
-
     def _commit_pair(
         self,
         config_dir: Path,
@@ -664,8 +573,6 @@ class ProjectConfigService:
     def _failure_outcome(exc: Exception) -> str:
         if isinstance(exc, ProjectConfigRevisionConflict):
             return "revision_conflict"
-        if isinstance(exc, ProjectConfigRunBlocked):
-            return "run_blocked"
         if isinstance(exc, ControlPlaneUnavailableError):
             return "run_state_unavailable"
         if isinstance(exc, ProjectConfigError):

@@ -393,7 +393,7 @@ def test_fastmcp_stdio_initializes_lists_tools_and_exits_on_input_close(
     async def exercise() -> None:
         async with Client(transport, timeout=10) as client:
             tools = await client.list_tools()
-            assert len(tools) == 13
+            assert len(tools) == 14
             assert {tool.name for tool in tools} >= {"get_capabilities", "start_run"}
             result = await client.call_tool("get_capabilities")
             assert result.is_error is False

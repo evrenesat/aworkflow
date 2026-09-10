@@ -342,6 +342,26 @@ export interface ControlPlaneReadiness {
   projects: string[]
 }
 
+export interface WorktreeStatusItem {
+  path: string
+  index_status: string
+  worktree_status: string
+  original_path: string | null
+}
+
+export interface WorktreePreflight {
+  checkout_path: string
+  execution_mode: 'same_checkout' | 'new_worktree'
+  dirty: boolean
+  requires_confirmation: boolean
+  blockers: string[]
+  total_items: number
+  offset: number
+  limit: number
+  next_offset: number | null
+  items: WorktreeStatusItem[]
+}
+
 export interface RunStatus {
   activity?: 'active' | 'inactive' | 'unknown'
   status_reason_code?: string
@@ -430,6 +450,7 @@ export interface StartRunRequest {
   max_turns?: number
   extra_instructions?: string[]
   restarted_from_run_id?: string
+  dirty_worktree_confirmed?: boolean
 }
 
 export interface StartRunResponse {

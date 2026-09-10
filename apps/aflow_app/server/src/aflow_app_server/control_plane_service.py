@@ -25,10 +25,10 @@ from aflow.control_plane import (
     RunControlRequest,
     RunEvent,
     RunPage,
-    RunRepository,
     RunStatus,
     StartRunResult,
     StartupQuestionRecord,
+    WorktreePreflightResult,
 )
 from aflow.control_plane.run_history import RunHistory
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
@@ -300,6 +300,49 @@ class ControlPlaneService:
             full_scope=full_scope,
         )
 
+    def preflight(
+        self,
+        project_id: str,
+        *,
+        plan_path: str,
+        workflow_name: str | None = None,
+        team: str | None = None,
+        start_step: str | None = None,
+        max_turns: int | None = None,
+        extra_instructions: tuple[str, ...] = (),
+        restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
+        offset: int = 0,
+        limit: int = 200,
+        caller_scope: str = "rest",
+    ) -> WorktreePreflightResult:
+        """Return a current, paged dirtiness inspection without a run."""
+        WorktreePreflightResult.validate_page(offset=offset, limit=limit)
+        with self.project_lock(project_id):
+            item = self._project(project_id)
+            request = StartupRequest(
+                repo_root=item.root,
+                plan_path=self._plan_path(item.root, plan_path),
+                config_path=item.config_path,
+                workflow_config=WorkflowUserConfig(),
+                workflow_name=workflow_name,
+                start_step=start_step,
+                max_turns=max_turns,
+                team=team,
+                extra_instructions=extra_instructions,
+                restarted_from_run_id=restarted_from_run_id,
+                dirty_worktree_confirmed=dirty_worktree_confirmed,
+            )
+            result = item.daemon.service.preflight(
+                request,
+                caller_scope=self._caller_scope(project_id, caller_scope),
+            )
+            return WorktreePreflightResult.from_domain(
+                result,
+                offset=offset,
+                limit=limit,
+            )
+
     def start_run(
         self,
         project_id: str,
@@ -311,6 +354,7 @@ class ControlPlaneService:
         max_turns: int | None,
         extra_instructions: tuple[str, ...] = (),
         restarted_from_run_id: str | None = None,
+        dirty_worktree_confirmed: bool = False,
         idempotency_key: str | None = None,
         caller_scope: str = "rest",
     ) -> StartRunResult | StartupQuestionRecord:
@@ -327,6 +371,7 @@ class ControlPlaneService:
                 team=team,
                 extra_instructions=extra_instructions,
                 restarted_from_run_id=restarted_from_run_id,
+                dirty_worktree_confirmed=dirty_worktree_confirmed,
             )
             return item.daemon.service.start(
                 request,
@@ -392,6 +437,7 @@ class ControlPlaneService:
         run_id: str,
         *,
         idempotency_key: str | None,
+        extra_instructions: tuple[str, ...] | None = None,
         caller_scope: str = "rest",
     ) -> StartRunResult:
         with self.project_lock(project_id):
@@ -399,6 +445,7 @@ class ControlPlaneService:
                 run_id,
                 caller_scope=self._caller_scope(project_id, caller_scope),
                 idempotency_key=idempotency_key,
+                extra_instructions=extra_instructions,
             )
 
     def _project(self, project_id: str) -> _ProjectDaemon:
@@ -444,93 +491,6 @@ class ControlPlaneService:
                     "project control plane is unavailable"
                 )
             return item
-
-    def owned_run_snapshots(
-        self, project_id: str
-    ) -> tuple[tuple[str, str, str | None, str | None], ...]:
-        """Return bounded (run_id, status, workflow, frozen fingerprint) per owned run.
-
-        Legacy runs are excluded: they can never be resumed or launched by the
-        control plane, so they never block a configuration save.  When no
-        daemon can compose for the project (for example a project that has no
-        configuration document yet), the durable run identities are enumerated
-        through the production repository and any evidence fails closed.
-        """
-        try:
-            item = self._project(project_id)
-        except ControlPlaneUnavailableError:
-            return self._uncomposable_run_snapshots(project_id)
-        snapshots: list[tuple[str, str, str | None, str | None, str | None]] = []
-        cursor: str | None = None
-        while True:
-            page = item.daemon.application.repository.list_runs(
-                limit=1_000, cursor=cursor
-            )
-            for record in page.runs:
-                status = item.daemon.service.run_status(record.run_id)
-                if status.ownership != "control_plane":
-                    continue
-                manifest = item.daemon.application.repository.get_launch_manifest(
-                    record.run_id
-                )
-                snapshots.append(
-                    (
-                        status.run_id,
-                        status.status,
-                        status.workflow_name
-                        or (manifest.workflow_name if manifest is not None else None),
-                        manifest.frozen_config_fingerprint
-                        if manifest is not None
-                        else None,
-                        item.daemon.application.repository.get_frozen_config_path(status.run_id),
-                    )
-                )
-            if page.next_cursor is None:
-                return tuple(snapshots)
-            cursor = page.next_cursor
-
-    def _uncomposable_run_snapshots(
-        self, project_id: str
-    ) -> tuple[tuple[str, str, str | None, str | None, str | None], ...]:
-        """Classify durable run state without a composed daemon.
-
-        The repository can classify owned launch phases and legacy history
-        independently.  Legacy runs remain read-only and therefore never
-        block configuration, while any owned evidence is returned for the
-        configuration service to classify conservatively.
-        """
-        if self._registry is None:
-            raise ControlPlaneUnavailableError("project registry is unavailable")
-        try:
-            _, root = self._registry.resolve(project_id)
-        except ProjectRegistryError as exc:
-            raise ControlPlaneUnavailableError(
-                "project registration is unavailable"
-            ) from exc
-        repository = RunRepository(root)
-        snapshots: list[tuple[str, str, str | None, str | None, str | None]] = []
-        cursor: str | None = None
-        while True:
-            page = repository.list_runs(limit=1_000, cursor=cursor)
-            for status in page.runs:
-                if status.ownership != "control_plane":
-                    continue
-                manifest = repository.get_launch_manifest(status.run_id)
-                snapshots.append(
-                    (
-                        status.run_id,
-                        status.status,
-                        status.workflow_name
-                        or (manifest.workflow_name if manifest is not None else None),
-                        manifest.frozen_config_fingerprint
-                        if manifest is not None
-                        else None,
-                        repository.get_frozen_config_path(status.run_id),
-                    )
-                )
-            if page.next_cursor is None:
-                return tuple(snapshots)
-            cursor = page.next_cursor
 
     def reload_project_config(self, project_id: str) -> None:
         """Recompose one cached daemon from the committed configuration files.

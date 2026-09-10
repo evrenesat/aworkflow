@@ -15,6 +15,7 @@ from aflow.control_plane import (
     RunStatus,
     StartRunResult,
     StartupQuestionRecord,
+    WorktreePreflightResult,
 )
 from aflow.skill_catalog import BUNDLED_SKILL_NAMES
 
@@ -105,6 +106,26 @@ class StartResponse(CanonicalTransportModel):
     startup_question: StartupQuestionResponse | None = None
 
 
+class WorktreeStatusItemResponse(CanonicalTransportModel):
+    path: str
+    index_status: str
+    worktree_status: str
+    original_path: str | None = None
+
+
+class WorktreePreflightResponse(CanonicalTransportModel):
+    checkout_path: str
+    execution_mode: Literal["same_checkout", "new_worktree"]
+    dirty: bool
+    requires_confirmation: bool
+    blockers: tuple[str, ...]
+    total_items: int
+    offset: int
+    limit: int
+    next_offset: int | None = None
+    items: tuple[WorktreeStatusItemResponse, ...]
+
+
 class RunControlPayload(CanonicalTransportModel):
     expected_revision: int = Field(ge=0)
     schema_version: int = 1
@@ -189,6 +210,18 @@ class StartRunPayload(CanonicalTransportModel):
     max_turns: int | None = Field(default=None, ge=1)
     extra_instructions: tuple[str, ...] = Field(default=(), max_length=8)
     restarted_from_run_id: str | None = Field(default=None, max_length=64)
+    dirty_worktree_confirmed: StrictBool = False
+
+
+class ResumeRunPayload(CanonicalTransportModel):
+    """Optional run-wide instruction replacement for an explicit resume."""
+
+    extra_instructions: tuple[str, ...] | None = Field(default=None, max_length=8)
+
+
+class PreflightRunPayload(StartRunPayload):
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=200, ge=1, le=1_000)
 
 
 class StartupAnswerPayload(CanonicalTransportModel):
@@ -661,6 +694,14 @@ def canonical_contract_payloads() -> dict[str, dict[str, Any]]:
         "question": StartupQuestionRecord(
             question_id="startup-sample-q1", kind="pick_step", message="Select a step"
         ),
+        "preflight": WorktreePreflightResult(
+            checkout_path="/tmp/project",
+            execution_mode="same_checkout",
+            dirty=False,
+            requires_confirmation=False,
+            blockers=(),
+            total_items=0,
+        ),
     }
     transports: dict[str, type[CanonicalTransportModel]] = {
         "capability": CapabilityResponse,
@@ -670,6 +711,7 @@ def canonical_contract_payloads() -> dict[str, dict[str, Any]]:
         "context": ContextResponse,
         "event": EventResponse,
         "question": StartupQuestionResponse,
+        "preflight": WorktreePreflightResponse,
     }
     return {
         name: transports[name].from_canonical(value).model_dump(mode="json")

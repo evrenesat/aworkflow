@@ -167,8 +167,10 @@ In normal checkouts, ignore `.aflow/`, `.aflow/runs/`, and `plans/backups/` in g
 A scheduled retry:
 
 - skips the pre-turn plan reload
-- reuses the last valid snapshot and saved prompt context
-- reuses the same `ACTIVE_PLAN_PATH`, `NEW_PLAN_PATH`, and resolved selector
+- preserves the last valid snapshot, saved plan paths, failure evidence, and
+  attempt accounting
+- resolves the current step's role/profile and renders its current prompt
+  templates at the retry boundary
 - appends the exact parse error to the retry prompt
 - counts toward `max_turns`
 
@@ -190,12 +192,15 @@ The run fails if recovery exceeds `max_consecutive_recoveries` or a backup-team 
 
 Every new `.aflow/runs/<run-id>/run.json` is a schema-version `2` controller
 snapshot. It records the selected workflow, authoritative original plan path,
-resolved configuration directory, frozen configuration fingerprint, complete
-lifecycle identity, manager authority, hotplug authority, and active-scope
-envelope references. AFlow writes this file through a flushed same-directory
-temporary file and atomic replacement, so an interrupted update cannot expose
-partial JSON. Older or malformed metadata remains readable for inspection but
-is never migrated or resumed.
+the current configuration source used for the boundary, explicit-choice
+provenance, complete lifecycle identity, manager authority, hotplug authority,
+and active-scope envelope references. A legacy `frozen_config` object and its
+fingerprint may remain as diagnostic metadata, but they are not the execution
+source or a resume gate. AFlow writes this file through a flushed
+same-directory temporary file and atomic replacement, so an interrupted update
+cannot expose partial JSON. Required controller, plan, lifecycle, and scope
+metadata remains fail-closed; an absent or damaged compatibility snapshot does
+not by itself invalidate otherwise valid saved progress.
 
 `run.json` is controller-owned output. To request a safe future-turn change,
 create or edit exactly:
@@ -215,13 +220,16 @@ notes = ["Re-run the focused regression before broader tests."]
 ```
 
 All keys are optional, but the file must contain at least one. `next_step` must
-name an executable step in the frozen workflow. `team` must be configured and
+name an executable step in the current workflow. `team` must be configured and
 able to resolve the target step's role. `max_turns` must be positive and cannot
 be below the number of completed turns. `notes` is an array of non-empty
-strings and is appended only to the next worker prompt.
+strings. With `next_step`, they are appended only to that selected step's
+prompt; without `next_step`, they retain the legacy behavior of reaching the
+next worker prompt. They are one-turn recovery guidance, consumed when the
+matching turn is durably started, and retained through a prelaunch failure.
 `roles` maps role names to fully qualified `harness.profile` selectors and is
-the run-local role-selector hotplug surface: it overrides the frozen role
-routing for the next worker turn (validated against the frozen config) and
+the run-local role-selector hotplug surface: it overrides the current role
+routing for the next worker turn (validated against the current config) and
 creates a durable hotplug transaction instead of a plain override. Same-harness
 switches resume the exact active source session (`native_resume`); cross-harness
 switches require a bounded read-only handover brief before the target starts
@@ -233,6 +241,12 @@ records acceptance or rejection atomically before routing or launch, and never
 deletes or rewrites the file. Broad status and analysis output redact the source
 and note contents. An unchanged
 accepted digest is not applied twice; editing the file creates a new request.
+Accepted partial requests retain the latest persistent `team` and `max_turns`
+choices when either field is omitted. `next_step` and `notes` remain scoped to
+the request that supplied them and are not replayed from an older request.
+For a live source, reaching the effective `max_turns` is a normal terminal
+outcome with `end_reason = "max_turns_reached"`; the completed turn and its
+incomplete plan snapshot are preserved, and no additional harness is launched.
 Invalid TOML, unknown keys, incompatible routing, and invalid limits leave the
 run in `waiting_for_valid_override` without launching another harness. Correct
 the same file and resume the recorded run id.
@@ -267,8 +281,10 @@ released. Later boundaries read only the successor's
 `.aflow/runs/<successor-run-id>/overrides.toml`. The accepted digest/result stays
 durable to prevent replay across further resume generations. `team` becomes the
 successor's effective baseline, `max_turns` remains the effective limit,
-`next_step` affects only the applying boundary, and `notes` reach only the next
-worker prompt.
+`next_step` affects only the applying boundary, and `notes` reach only the
+selected one-turn prompt (or the next worker when `next_step` is omitted).
+Text supplied after the CLI `--` remains run-wide guidance and is independent
+of these notes; do not put checkpoint-specific recovery directions there.
 
 Protected state has no override syntax. For example, this is rejected because
 `active_turn` is not a supported key:
@@ -279,8 +295,9 @@ active_turn = 0
 
 Active/completed turn history, plan lineage, lifecycle/worktree ownership,
 manager decisions, the workflow graph, and configuration files cannot be
-changed through this surface. There is no live config reload, file watcher,
-daemon, database, or supported direct-edit workflow for `run.json`.
+changed through this surface. Global configuration is read again at each
+launch and resume boundary, but there is no turn-loop config reload, file
+watcher, daemon, database, or supported direct-edit workflow for `run.json`.
 
 ## Live Role-Selector Hotplug
 
@@ -370,22 +387,40 @@ include `status=... hotplug <stage>: <source_selector> -> <target_selector>
 `aflow analyze` reports
 the current/pending transactions, normalized history, capability paths, and
 active session count.
-## Frozen run configuration snapshots
+## Live run configuration and diagnostic snapshots
 
-Every durably reserved run captures the complete effective workflow pair under
-`.aflow/runs/<run_id>/config/` before startup questions or worker launch. The
-snapshot records its origin paths and the canonical fingerprint in a versioned
-`snapshot.json`; schema-defined relative paths (such as `[aflow] worktree_root`)
-are resolved against the original configuration location before serialization,
-while prompt strings and repository-relative plan paths are never rewritten.
-Startup answers, worker launch, retries, resume, and run inspection all read
-the snapshot, so later global configuration edits affect only new runs.
-Snapshot creation shares one configuration lock with global saves, so a launch
-sees either the old pair or the new pair, never a mixture; a failed or
-fingerprint-mismatched snapshot fails the launch before any worker starts.
-Legacy runs without a snapshot keep their recorded identity checks, and a
-missing or damaged snapshot makes resume unavailable with an explanation
-instead of silently substituting current configuration.
+Each launch, resume, and subsequent turn boundary selects a current
+configuration source. A
+direct CLI invocation uses its explicit `--config` path when supplied, or the
+current default source otherwise. Daemon, UI, and MCP requests use the
+configured daemon source. Reservation records that source and the provenance
+of explicit team, max-turn, and start-step choices; startup answers and worker
+boot re-read the current source and validate the selected workflow, team, and
+step before execution.
+
+`.aflow/runs/<run_id>/config/` and the historical `frozen_config` fingerprint
+are optional compatibility diagnostics. A failed, missing, or changed copy
+does not block valid saved progress, and a successor never copies a
+predecessor snapshot as its execution configuration. Exact run, project, plan,
+unit, idempotency, continuation, original-plan, execution-context, scope, and
+controller-inactivity checks remain required. An explicit resume correction
+for team or step is checked against the current configuration; an omitted
+choice may follow the current default when its saved provenance says it was
+not explicit. Configuration is not reloaded in the middle of a harness turn.
+A completed turn keeps the object it started with; the next boundary reloads
+the current workflow graph, defaults, role/profile resolution, prompts, retry
+policy, and limits. An invalid newly submitted override is recorded once per
+digest and does not discard the last accepted run-local choices when usable
+work can continue. Owner-stop is checked before this reload.
+
+Legacy metadata with no explicit live source uses the old snapshot origin only
+as a best-effort path hint; absent or malformed snapshot data falls through to
+the configured current default. A valid explicit saved value remains explicit,
+even when the current default changes. Invalid current configuration still
+fails before a harness starts, while an owner-stop request can be honored
+without loading TOML. The dirty-worktree preflight/checkbox controls whether
+startup may use an existing checkout containing acknowledged changes; a fresh
+worktree starts from committed content and leaves the source checkout alone.
 
 ## UI process lifecycle and persistent units
 
@@ -411,7 +446,7 @@ adapter and the local-daemon subprocess adapter is unchanged.
 ## Daemon control plane and direct CLI
 
 The lightweight local daemon starts with `aflow daemon start --foreground`.
-It owns one repository and exposes the shared 13-tool MCP registry over stdio;
+It owns one repository and exposes the shared 14-tool MCP registry over stdio;
 closing MCP input stops the daemon. Optional HTTP runs on `127.0.0.1` only and
 may be detached. `aflow daemon status` verifies the pidfile's process-birth
 identity and reports only direct `daemon-worker` children for the verified
@@ -457,8 +492,9 @@ as skipped in status and run events.
 A workflow change uses a fresh successor start with restarted_from_run_id.
 The daemon accepts that lineage only after the same-project, same-caller source
 has explicit owner-stop evidence and its exact unit is inactive. The successor
-gets a new run ID and normal frozen-config validation. Resume remains strict
-continuation of the saved invocation. Bounded extra instructions affect the
+gets a new run ID and validates the current workflow and lifecycle identity.
+Resume remains strict continuation of the saved invocation while resolving
+omitted configuration choices from the current source. Bounded extra instructions affect the
 request digest and worker prompt but their text is omitted from control-plane
 manifests, start records, events, and status.
 
@@ -467,6 +503,13 @@ For CLI resume, omitted extra instructions retain the predecessor's text.
 `aflow run --resume RUN_ID --` clears it. The predecessor and its prompt
 artifacts remain unchanged. Use run-wide instructions for continuing rules,
 not a recovery action that becomes stale after its checkpoint is approved.
+
+Authenticated REST and MCP resume calls use the same three-way choice. An
+omitted field or explicit `null` inherits the predecessor's instructions, a
+bounded string list replaces them, and `[]` clears them for the successor.
+The current UI intentionally omits this optional editor. Resume request
+retries must reuse the same effective instructions with the same idempotency
+key; a changed replacement is rejected without allocating another successor.
 
 `aflow-guard-development-run` remains opt-in supervision for the exact run a
 user explicitly asks it to guard, particularly normal direct-CLI and legacy
@@ -486,9 +529,11 @@ On the last allowed turn:
 - `MAX_TURNS_REACHED` evaluates true.
 - The selected transition is still recorded, including an `END` selected by
   `MAX_TURNS_REACHED`.
-- If the original plan remains incomplete, the run fails with a max-turns
-  error whether or not the transition selected `END`.
-- A max-turn `END` is successful only when the post-turn original-plan
+- For a static configuration, if the original plan remains incomplete, the run
+  fails with a max-turns error whether or not the transition selected `END`.
+- For a live source, a cap-selected `END` is a normal terminal outcome with
+  `end_reason = "max_turns_reached"`; the incomplete plan remains unchanged.
+- A non-limit `END` is successful only when the post-turn original-plan
   snapshot is complete.
 
 `max_same_step_turns` limits consecutive selection of the same step in multi-step workflows. The streak resets only after a different step actually executes. Single-step workflows are not affected.
@@ -675,6 +720,14 @@ Other early stop causes:
 ## Dirty Worktree
 
 `aflow run` checks git working tree state before starting.
+
+The authenticated control plane and MCP adapter expose the same inspection as
+the read-only `preflight_run` operation. It returns the inspected checkout,
+relative status paths, conflict blockers, and bounded `offset`/`limit` pages
+without reserving a run. A start request can set
+`dirty_worktree_confirmed = true`; otherwise the existing structured startup
+question is returned before a worker starts, and the final preparation check
+still rejects conflicts and in-progress Git operations.
 
 For worktree workflows, dirty files under `plans/` are allowed. Dirty files outside `plans/` require interactive confirmation, or fail in non-interactive mode.
 

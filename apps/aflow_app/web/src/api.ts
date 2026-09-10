@@ -33,6 +33,7 @@ import type {
   StartRunRequest,
   StartRunResponse,
   StartRunResult,
+  WorktreePreflight,
 } from './types'
 
 import { consumeActivityMarker, resetActivityMarker } from './activity'
@@ -372,6 +373,19 @@ export async function getControlPlaneCapabilities(projectId: string): Promise<Co
 export async function listControlPlanePlans(projectId: string): Promise<ControlPlanePlan[]> {
   const response = await fetchJson<{ plans: ControlPlanePlan[] }>(`${controlProjectPath(projectId)}/plans`)
   return response.plans
+}
+
+export async function preflightControlPlaneRun(
+  projectId: string,
+  request: StartRunRequest,
+  options: { offset?: number; limit?: number; signal?: AbortSignal } = {},
+): Promise<WorktreePreflight> {
+  const { offset = 0, limit = 200, signal } = options
+  return fetchJson<WorktreePreflight>(`${controlProjectPath(projectId)}/runs/preflight`, {
+    method: 'POST',
+    body: JSON.stringify({ ...request, offset, limit }),
+    signal,
+  })
 }
 
 export async function listControlPlaneRuns(

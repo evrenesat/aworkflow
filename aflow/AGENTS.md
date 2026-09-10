@@ -15,9 +15,14 @@
   workflow process group and writes receipts under the run's durable
   `units/` directory; its `shutdown` contract with `PersistentUnitManager`
   is a no-op by design, so UI shutdown never signals workflow subprocesses.
-- Run configuration is frozen at reservation into
-  `.aflow/runs/<run_id>/config/`; never route worker, retry, or resume loads
-  around the snapshot, and never let a partial snapshot launch a worker.
+- Run configuration is loaded from the current selected source at reservation,
+  startup preparation, worker boot, and resume. Persist the source path and
+  whether team, max-turn, and start-step choices were explicit. A
+  `.aflow/runs/<run_id>/config/` copy and frozen fingerprint are optional
+  compatibility diagnostics only: they are never required for admission and
+  never replace the current source. Revalidate the workflow and selected step
+  before a worker starts, and preserve exact run, project, plan, unit,
+  idempotency, continuation, and lifecycle identity checks.
 
 - The detached wrapper owns bounded redacted stdout/stderr tails and final exit receipts. Drain both pipes concurrently, retain stream identity, and keep early exception records nonce-bound. Never redirect actual worker diagnostics to DEVNULL or put raw output into public events.
 

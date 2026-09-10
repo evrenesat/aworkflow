@@ -12,12 +12,13 @@ import type {
   StartRunRequest,
   StartRunResponse,
   StartupQuestion,
+  WorktreePreflight,
 } from '../types'
 import { ApiError } from '../api'
 import * as api from '../api'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MoreMenu, MenuItem } from './MoreMenu'
-import { NewRunPage } from './NewRunPage'
+import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
 import { statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
@@ -75,6 +76,13 @@ interface CommittedProjection {
   validationState: 'ready' | 'configuration_required' | 'invalid'
   form: GuidedFormProjection | null
   syntaxIssues: ConfigValidationIssue[]
+}
+
+interface WorktreePreflightState {
+  status: WorktreePreflightLoadState
+  result: WorktreePreflight | null
+  error: string | null
+  identity: string
 }
 
 interface RoleResolution {
@@ -288,6 +296,60 @@ function checkpointSummary(context: RunContext | null): CheckpointSummary | null
   return { name, index, count: checkpoints.length, complete: planState.is_complete === true }
 }
 
+interface LastExecutedEvidence {
+  turnNumber: number | null
+  stepName: string | null
+  role: string | null
+  selector: string | null
+  model: string | null
+}
+
+function lastExecutedEvidence(
+  events: RunEvent[],
+  context: RunContext | null,
+): LastExecutedEvidence | null {
+  const textValue = (record: Record<string, unknown>, ...keys: string[]): string | null => {
+    for (const key of keys) {
+      const value = record[key]
+      if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 240)
+    }
+    return null
+  }
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.event_type !== 'turn_started') continue
+    const data = event.data
+    const evidence = {
+      turnNumber: typeof data.turn_number === 'number' ? data.turn_number : null,
+      stepName: textValue(data, 'step_name'),
+      role: textValue(data, 'step_role', 'role'),
+      selector: textValue(data, 'resolved_selector', 'selector'),
+      model: textValue(data, 'resolved_model_display', 'model', 'resolved_model'),
+    }
+    if (evidence.turnNumber !== null || evidence.stepName || evidence.role || evidence.selector || evidence.model) {
+      return evidence
+    }
+  }
+
+  const managerContext = contextRecord(context, 'manager_context')
+  const finishedTurn = managerContext?.finished_turn
+  if (typeof finishedTurn !== 'object' || finishedTurn === null || Array.isArray(finishedTurn)) {
+    return null
+  }
+  const evidence = finishedTurn as Record<string, unknown>
+  const fallback = {
+    turnNumber: typeof evidence.turn_number === 'number' ? evidence.turn_number : null,
+    stepName: textValue(evidence, 'step_name'),
+    role: textValue(evidence, 'role', 'step_role'),
+    selector: textValue(evidence, 'selector', 'resolved_selector'),
+    model: textValue(evidence, 'resolved_model_display', 'model', 'resolved_model'),
+  }
+  return fallback.turnNumber !== null || fallback.stepName || fallback.role || fallback.selector || fallback.model
+    ? fallback
+    : null
+}
+
 interface ManagerOutcome {
   decision: string | null
   finishedTurn: string | null
@@ -440,6 +502,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [feedback, setFeedback] = useState<string | null>(null)
   const [handoffError, setHandoffError] = useState<string | null>(null)
   const [startupQuestion, setStartupQuestion] = useState<StartupQuestion | null>(null)
+  const [dirtyWorktreeConfirmed, setDirtyWorktreeConfirmed] = useState(false)
+  const [worktreePreflight, setWorktreePreflight] = useState<WorktreePreflightState>({
+    status: 'idle',
+    result: null,
+    error: null,
+    identity: '',
+  })
   const [startPlanPath, setStartPlanPath] = useState('')
   const [startWorkflow, setStartWorkflow] = useState('')
   const [startTeam, setStartTeam] = useState('')
@@ -481,12 +550,18 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const contextRequestRef = useRef(0)
   const requestAbortRef = useRef(new AbortController())
   const contextAbortRef = useRef(new AbortController())
+  const preflightRequestRef = useRef(0)
+  const preflightAbortRef = useRef(new AbortController())
   const desiredContextLevelRef = useRef<'lite' | 'full'>('lite')
   desiredContextLevelRef.current = technicalOpen && rawOpen && capabilities?.context_levels.includes('full') ? 'full' : 'lite'
   useEffect(() => {
     requestAbortRef.current = new AbortController()
     return () => { requestAbortRef.current.abort(); contextAbortRef.current.abort() }
   }, [projectId, selectedRunId, visible])
+  useEffect(() => () => {
+    preflightRequestRef.current += 1
+    preflightAbortRef.current.abort()
+  }, [projectId, visible])
   const diagnosticsLoadedForRef = useRef<string | null>(null)
   const controlsForRunRef = useRef<string | null>(null)
   const previousStreamStateRef = useRef<api.StreamState>('stopped')
@@ -904,6 +979,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       await Promise.all([
         selectedRunId ? loadSelectedRun(projectId, selectedRunId, active) : Promise.resolve(),
         loadContext(desiredContextLevelRef.current),
+        newRunPage ? refreshPreflight() : Promise.resolve(),
       ])
     })().finally(() => { if (active()) { pageRefreshRef.current = null; setRefreshing(false) } })
     pageRefreshRef.current = task
@@ -1036,7 +1112,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
    * then the committed default (workflow, max turns, workflow default team),
    * and only a value with no configured source is omitted from the request.
    */
-  function startRequestFromDraft(restartedFromRunId?: string): StartRunRequest {
+  function startRequestFromDraft(restartedFromRunId?: string, dirtyConfirmed = dirtyWorktreeConfirmed): StartRunRequest {
     // One validation result for preview and request alike: empty keeps the
     // configured/default value, a valid override wins, and an invalid
     // nonempty override never reaches a request because the launch is
@@ -1059,10 +1135,16 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         : {}),
       ...(extraInstructions.length ? { extra_instructions: extraInstructions } : {}),
       ...(restartedFromRunId ? { restarted_from_run_id: restartedFromRunId } : {}),
+      dirty_worktree_confirmed: dirtyConfirmed,
     }
   }
 
   async function handleStart() {
+    if (startupQuestion?.kind === 'confirm_worktree_dirty') {
+      if (startDisabled || !dirtyWorktreeConfirmed) return
+      await handleStartupAnswer(true)
+      return
+    }
     const selectedPlan = plans.find((plan) => plan.path === startPlanPath.trim())
     // Launch admission is lifecycle-checked again at submit time: only a
     // saved Ready (in progress) plan path is ever submitted.
@@ -1090,6 +1172,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   async function handleStartResponse(response: StartRunResponse, action: string) {
     if (response.startup_question) {
       setStartupQuestion(response.startup_question)
+      if (response.startup_question.kind === 'confirm_worktree_dirty') {
+        setDirtyWorktreeConfirmed(false)
+        await refreshPreflight()
+      }
       setFeedback(`${action} is awaiting a startup answer. No workflow has been started.`)
       return
     }
@@ -1290,7 +1376,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   async function handleConfirmedRestart() {
     if (!restartDraftReady || !projectId || !restartSource || pendingSuccessorStart) return
     const sourceRunId = restartSource.run_id
-    const startRequest = startRequestFromDraft(sourceRunId)
+    const startRequest = startRequestFromDraft(sourceRunId, dirtyWorktreeConfirmed)
     const stopIntent = {
       project_id: projectId,
       run_id: sourceRunId,
@@ -1497,6 +1583,30 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (unmappedSteps.length > 0) return `The exact role preview is unavailable for ${formatMachineLabel(effectiveWorkflow)} step${unmappedSteps.length > 1 ? 's' : ''} ${unmappedSteps.map(formatMachineLabel).join(', ')} — the committed configuration does not map those executable steps to roles. Refresh, or check the workflow in Settings, before starting a run.`
     return null
   })()
+  const dirtyStartupQuestion = startupQuestion?.kind === 'confirm_worktree_dirty'
+  const preflightEligible = projectAvailable === true
+    && newRunPage
+    && !restartInProgress
+    && launchBlocker === null
+    && startMaxTurnsProblem === null
+    && extraInstructionProblem === null
+  const preflightRequest = preflightEligible
+    ? startRequestFromDraft(restartSource?.run_id, false)
+    : null
+  const preflightSelectionIdentity = JSON.stringify([
+    projectId,
+    startPlanPath.trim(),
+    startWorkflow.trim(),
+    restartSource?.run_id ?? null,
+  ])
+  const preflightRequestIdentity = JSON.stringify([projectId, preflightRequest])
+  const worktreeLaunchBlocked = preflightEligible && (
+    worktreePreflight.status !== 'ready'
+    || worktreePreflight.result === null
+    || worktreePreflight.error !== null
+    || worktreePreflight.result.blockers.length > 0
+    || ((worktreePreflight.result.requires_confirmation || dirtyStartupQuestion) && !dirtyWorktreeConfirmed)
+  )
   const startDisabled = !projectAvailable
     || !startPlanPath
     || busyAction === 'start'
@@ -1505,15 +1615,87 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     || Boolean(extraInstructionProblem)
     || startMaxTurnsProblem !== null
     || launchBlocker !== null
-  const restartDraftReady = Boolean(restartDraftWorkflow && startPlanPath && planOptions.includes(startPlanPath))
+    || worktreeLaunchBlocked
+    || (startupQuestion !== null && !dirtyStartupQuestion)
+  const restartDraftChoicesReady = Boolean(restartDraftWorkflow && startPlanPath && planOptions.includes(startPlanPath))
     && (!missingRestartInstructions || Boolean(startExtraInstructions.trim()))
     && launchBlocker === null && startMaxTurnsProblem === null && !extraInstructionProblem
+  const restartDraftReady = restartDraftChoicesReady && !worktreeLaunchBlocked
   const restartDraftHint = canRestart && !restartDraftReady
-    ? 'Choose an available workflow and a Ready plan. Original choices that are no longer available must be corrected.'
+    ? restartDraftChoicesReady
+      ? 'Working-tree inspection must finish before the successor can start.'
+      : 'Choose an available workflow and a Ready plan. Original choices that are no longer available must be corrected.'
     : null
   const runSteps = effectiveSteps
   const startStepIndex = runSteps.indexOf(startStep.trim())
   const skippedByDraft = startStepIndex > 0 ? runSteps.slice(0, startStepIndex) : []
+
+  async function requestWorktreePreflight(
+    request: StartRunRequest,
+    identity: string,
+    offset: number,
+    append: boolean,
+  ): Promise<void> {
+    const requestNumber = ++preflightRequestRef.current
+    preflightAbortRef.current.abort()
+    const controller = new AbortController()
+    preflightAbortRef.current = controller
+    setWorktreePreflight((current) => ({
+      status: 'loading',
+      identity,
+      result: append || current.identity === identity ? current.result : null,
+      error: null,
+    }))
+    try {
+      const result = await api.preflightControlPlaneRun(projectId, request, { offset, limit: 200, signal: controller.signal })
+      if (requestNumber !== preflightRequestRef.current) return
+      setWorktreePreflight((current) => {
+        if (current.identity !== identity) return current
+        const items = append && current.result
+          ? [...current.result.items, ...result.items]
+          : result.items
+        return { status: 'ready', identity, result: { ...result, items }, error: null }
+      })
+    } catch (preflightError) {
+      if (requestNumber !== preflightRequestRef.current) return
+      if (preflightError instanceof DOMException && preflightError.name === 'AbortError') return
+      setWorktreePreflight((current) => current.identity === identity
+        ? { ...current, status: 'error', error: errorMessage(preflightError, 'Could not inspect the working tree') }
+        : current)
+    }
+  }
+
+  async function refreshPreflight(): Promise<void> {
+    if (!preflightEligible || !preflightRequest) return
+    await requestWorktreePreflight(preflightRequest, preflightRequestIdentity, 0, false)
+  }
+
+  async function loadMorePreflight(): Promise<void> {
+    const nextOffset = worktreePreflight.result?.next_offset
+    if (!preflightEligible || !preflightRequest || nextOffset === null || nextOffset === undefined || worktreePreflight.status === 'loading') return
+    await requestWorktreePreflight(preflightRequest, preflightRequestIdentity, nextOffset, true)
+  }
+
+  useEffect(() => {
+    setDirtyWorktreeConfirmed(false)
+    if (startupQuestion?.kind === 'confirm_worktree_dirty') setStartupQuestion(null)
+    // The acknowledgement follows only the launch identity, not unrelated
+    // draft controls such as max turns, team, or extra instructions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preflightSelectionIdentity])
+
+  useEffect(() => {
+    preflightRequestRef.current += 1
+    preflightAbortRef.current.abort()
+    if (!visible || !preflightEligible || !preflightRequest) {
+      setWorktreePreflight({ status: 'idle', result: null, error: null, identity: preflightRequestIdentity })
+      return
+    }
+    void requestWorktreePreflight(preflightRequest, preflightRequestIdentity, 0, false)
+    // The serialized request is the complete preflight identity; changing a
+    // draft field cannot let a late response update the next launch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, preflightEligible, preflightRequestIdentity])
 
   const readinessLabel = readiness === null
     ? 'Readiness unavailable'
@@ -1539,6 +1721,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     : 'Not reported'
   const roleChoices = capabilities?.roles ?? []
   const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string> } | null
+  const lastExecuted = lastExecutedEvidence(events, context)
 
   const workflowRoleList = stepRoleMap ? [...new Set(Object.values(stepRoleMap))].sort() : []
   const otherConfiguredRoles = committedForm
@@ -1692,12 +1875,24 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               </section>
 
   )
+  const worktreePreflightPanel = (
+    <WorktreePreflightPanel
+      status={worktreePreflight.status}
+      result={worktreePreflight.result}
+      error={worktreePreflight.error}
+      dirtyWorktreeConfirmed={dirtyWorktreeConfirmed}
+      onDirtyWorktreeConfirmedChange={setDirtyWorktreeConfirmed}
+      onRefresh={() => void refreshPreflight()}
+      onLoadMore={() => void loadMorePreflight()}
+      dirtyQuestionMessage={dirtyStartupQuestion ? startupQuestion?.message ?? 'The working tree changed while starting. Review it before continuing.' : null}
+    />
+  )
   const restartActions = restartSource && restartPhase ? (
                 <section className="dashboard-section">
                   <div className="section-heading"><h4>Restart with changes</h4><span className="text-xs text-dim">stop → confirm inactive → successor start</span></div>
                   <div className="notice">
                     Create a new attempt from <span className="mono">{restartSource.run_id}</span> with these choices.
-                    Plan progress is retained. Active sources are stopped first. This attempt uses the current saved configuration; Resume uses the source snapshot.
+                    Plan progress is retained. Active sources are stopped first. This attempt and Resume use the current saved configuration.
                   </div>
                   {restartDraftHint
                     ? <div className="text-xs text-dim">{restartDraftHint}</div>
@@ -1782,7 +1977,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         </div>
       )}
 
-      {projectAvailable && startupQuestion && (newRunPage || selectedRun?.run_id === startupQuestion.run_id) && (
+      {projectAvailable && startupQuestion && (!dirtyStartupQuestion || !newRunPage) && (newRunPage || selectedRun?.run_id === startupQuestion.run_id) && (
         <section className="card startup-question" aria-label="Startup question">
           <div className="status-pill status-awaiting">Input needed</div>
           <h3>{startupQuestion.message}</h3>
@@ -1847,6 +2042,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
                   {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
                   <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
+                  {lastExecuted && <div><dt>Last executed</dt><dd>
+                    {lastExecuted.role ? formatMachineLabel(lastExecuted.role) : 'Role not reported'}
+                    {lastExecuted.model ? <> · {lastExecuted.model}</> : null}
+                    {lastExecuted.turnNumber !== null ? <> · turn {lastExecuted.turnNumber}</> : null}
+                  </dd></div>}
                   {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
                     : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
                   {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
@@ -1868,18 +2068,21 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
               {savedOverrides && <details className="dashboard-section" open><summary>Run changes</summary>
                 {savedOverrides && <div>
-                  <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}</p>
+                  <p>{savedOverrides.state === 'applied' ? 'Applied' : savedOverrides.state === 'rejected' ? 'Rejected' : 'Pending'} changes · revision {savedOverrides.revision}{savedOverrides.state === 'pending' ? ' · applies at the next turn or on resume' : ''}</p>
                   {savedOverrides.max_turns && <p>Max turns: {savedOverrides.max_turns}</p>}
                   {savedOverrides.team && <p>Team: {formatMachineLabel(savedOverrides.team)}</p>}
-                  {Object.entries(savedOverrides.role_selectors ?? {}).map(([role, selector]) => <p key={role}>{formatMachineLabel(role)}: {selector}</p>)}
+                  {Object.entries(savedOverrides.role_selectors ?? {}).map(([role, selector]) => {
+                    const modelEffort = selectorModelEffortText(selector, committedForm)
+                    return <p key={role}>{formatMachineLabel(role)}: {selector}{modelEffort ? <> · {modelEffort}</> : null}</p>
+                  })}
+                  {savedOverrides.state === 'pending' && <p>Saved controls apply at the next turn or when the run resumes.</p>}
                 </div>}
               </details>}
 
               {selectedRunHasLiveControls && <details className="dashboard-section"><summary>Adjust run</summary>
                 {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
                 <div className="notice">
-                  Changes are saved now and applied between turns. They remain marked Pending until the run
-                  confirms them. To use a profile outside this run's available choices, restart the run.
+                  Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
                 </div>
                 <div className="dashboard-form-grid">
                   <label className="dashboard-field"><span>Max turns</span><input className="input" aria-label="Control max turns" type="number" min="1" value={controlMaxTurns} disabled={!canMutate || !hasSafeControl('max_turns')} onChange={(event) => setControlMaxTurns(event.target.value)} /></label>
@@ -1911,7 +2114,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {!confirmOwnerStop ? <button className="btn btn-danger" disabled={restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Owner stop…</button> : <div className="confirmation"><span>Confirm owner stop for {selectedRun.run_id}. This control is recorded by the server.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Confirm stop</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
                 </>}
                 {canResume && <>
-                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and frozen configuration.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
+                  {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
                 </>}
               </section>
 
@@ -2026,6 +2229,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         startMaxTurnsProblem={startMaxTurnsProblem}
         configuredMaxTurns={configuredMaxTurns}
         preview={launchPreview}
+        worktreePreflight={worktreePreflightPanel}
         restartActions={restartActions}
         onCancel={() => { if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }; setLocalPage('runs'); onCancelNewRun?.() }}
         advancedOpen={advancedOpen}

@@ -120,6 +120,7 @@ describe('GlobalSettings', () => {
     expect(screen.getByRole('button', { name: 'Undo deletion of Work' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await screen.findByText(/Workflow settings saved; new runs use the saved configuration/)
+    expect(screen.getByText(/existing control-plane runs can select updated teams and profiles/)).toBeDefined()
     expect(screen.queryByRole('button', { name: 'Undo deletion of Work' })).toBeNull()
   })
   it('keeps an Undo collision recoverable and clears recovery on explicit discard', async () => {

@@ -28,6 +28,7 @@ from aflow.config import ConfigError, validate_starter_main_branch
 from aflow.control_plane import (
     ControlConflictError,
     ControlIdempotencyConflict,
+    ControlValidationError,
     RepositoryNotFoundError,
     RestartRequiredControlError,
     RunIdentityError,
@@ -66,6 +67,7 @@ from .models import (
     GlobalCapabilitiesResponse,
     GuidedStarterDefaults,
     OwnerStopPayload,
+    PreflightRunPayload,
     PlanListResponse,
     PlanResponse,
     ProjectConfigFormPayload,
@@ -80,11 +82,13 @@ from .models import (
     RunListResponse,
     RunStatusResponse,
     ReadinessResponse,
+    ResumeRunPayload,
     StartResponse,
     StartRunPayload,
     StartRunResponse,
     StartupAnswerPayload,
     StartupQuestionResponse,
+    WorktreePreflightResponse,
 )
 from .plan_service import (
     PlanProjectNotFound,
@@ -97,7 +101,6 @@ from .project_config_service import (
     ConfigValidationReport,
     ProjectConfigError,
     ProjectConfigRevisionConflict,
-    ProjectConfigRunBlocked,
     ProjectConfigSnapshot,
 )
 from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
@@ -719,6 +722,19 @@ async def control_conflict_handler(_: Request, exc: ControlConflictError) -> JSO
     )
 
 
+@app.exception_handler(ControlValidationError)
+async def control_validation_handler(
+    _: Request, exc: ControlValidationError
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        exc.code,
+        field=exc.field,
+        target=exc.target,
+        message=" ".join(exc.message.split())[:300],
+    )
+
+
 @app.exception_handler(RestartRequiredControlError)
 async def restart_required_handler(_: Request, exc: RestartRequiredControlError) -> JSONResponse:
     return _error_response(
@@ -824,20 +840,6 @@ async def guided_config_rejected_handler(
         "guided_config_rejected",
         reason=exc.code,
         message=" ".join(str(exc).split())[:300],
-    )
-
-
-@app.exception_handler(ProjectConfigRunBlocked)
-async def config_save_blocked_handler(
-    _: Request, exc: ProjectConfigRunBlocked
-) -> JSONResponse:
-    return _error_response(
-        status.HTTP_409_CONFLICT,
-        "config_save_blocked",
-        blocking_runs=[
-            {"run_id": run_id, "status": run_status}
-            for run_id, run_status in exc.blocking_runs
-        ],
     )
 
 
@@ -1112,6 +1114,34 @@ def run_context(
     )
 
 
+@app.post(
+    "/api/control-plane/projects/{project_id}/runs/preflight",
+    response_model=WorktreePreflightResponse,
+    tags=["control-plane"],
+)
+def preflight_run(
+    project_id: str,
+    payload: PreflightRunPayload,
+    _: str = Depends(verify_token),
+    service: ControlPlaneService = Depends(get_control_plane_service),
+) -> WorktreePreflightResponse:
+    return WorktreePreflightResponse.from_canonical(
+        service.preflight(
+            project_id,
+            plan_path=payload.plan_path,
+            workflow_name=payload.workflow_name,
+            team=payload.team,
+            start_step=payload.start_step,
+            max_turns=payload.max_turns,
+            extra_instructions=payload.extra_instructions,
+            restarted_from_run_id=payload.restarted_from_run_id,
+            dirty_worktree_confirmed=payload.dirty_worktree_confirmed,
+            offset=payload.offset,
+            limit=payload.limit,
+        )
+    )
+
+
 @app.get("/api/control-plane/projects/{project_id}/runs/{run_id}/restart-options", tags=["control-plane"])
 def control_plane_restart_options(
     project_id: str,
@@ -1158,6 +1188,7 @@ def start_run(
         max_turns=payload.max_turns,
         extra_instructions=payload.extra_instructions,
         restarted_from_run_id=payload.restarted_from_run_id,
+        dirty_worktree_confirmed=payload.dirty_worktree_confirmed,
         idempotency_key=idempotency_key,
     )
     adapted = _start_response(result)
@@ -1256,12 +1287,20 @@ def resume_run(
     project_id: str,
     run_id: str,
     response: Response,
+    payload: ResumeRunPayload | None = None,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=256),
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> StartRunResponse:
     result = StartRunResponse.from_canonical(
-        service.resume(project_id, run_id, idempotency_key=idempotency_key)
+        service.resume(
+            project_id,
+            run_id,
+            extra_instructions=(
+                payload.extra_instructions if payload is not None else None
+            ),
+            idempotency_key=idempotency_key,
+        )
     )
     response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     return result
@@ -1439,8 +1478,9 @@ def get_global_config(
 ) -> ProjectConfigResponse:
     """Return both exact global configuration texts with their revision.
 
-    Changes to this shared configuration affect new runs in all projects;
-    existing runs keep the configuration snapshot they were launched with.
+    Changes to this shared configuration affect the next safe boundary in all
+    projects, including existing runs; diagnostic snapshots do not control
+    execution.
     """
     return _config_response(service.read())
 

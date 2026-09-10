@@ -114,7 +114,7 @@ self-references, and cannot form cycles.
 | `lite_role` | string | - | Required for each workflow with `manager_enabled = true`; resolves through baseline team then global roles. |
 | `full_role` | string | - | Required for each workflow with `manager_enabled = true`; same resolution rule. Also performs repartition subcalls. |
 | `full_after_stalled_turns` | int | `2` | Consecutive unchanged same-step executions before Full is chosen. Must be ≥ 1. |
-| `skill` | string | `"aflow-manager"` | Skill name requested in manager prompts (frozen into run config). |
+| `skill` | string | `"aflow-manager"` | Skill name requested in manager prompts; resolved from current configuration at each manager boundary. |
 | `repartition_skill` | string | `"aflow-repartition-checkpoint"` | Skill name for repartition proposal/validation subcalls. |
 
 ### `[error_handling.harness_error_recovery]`
@@ -156,8 +156,8 @@ Bare `[workflow]` is the defaults table, not a runnable workflow:
   `[workflow.<name>].manager_enabled` overrides it per workflow (explicit
   `false` wins over inherited `true`); aliases inherit their concrete base.
   Omitted everywhere means disabled. The old global `[manager].enabled` is
-  rejected. The flag is frozen per run at reservation: later edits affect
-  new runs only.
+  rejected. A saved change is read at the next safe boundary; the in-flight
+  call keeps the settings with which it started.
 
 Accepted lifecycle combinations (validated):
 
@@ -180,9 +180,10 @@ workflow's team or global roles.
   workflow against its team/global roles (disabled workflows need no manager
   roles); step roles and prompt keys exist; lifecycle combos are valid;
   merge teardown has a resolvable team lead.
-- Runs freeze a fingerprint of the resolved workflow, roles, teams, harness
-  profiles, manager policy, and error-handling config into `run.json`.
-  Resume requires the frozen identity to match the currently loaded config.
+- Runs may retain a fingerprint of the resolved workflow, roles, teams, harness
+  profiles, manager policy, and error-handling config in `run.json` for
+  diagnostics. Resume loads the current selected source; that fingerprint and
+  any copied configuration files are not an execution or admission gate.
 
 ## 3. Workflow Definition
 
@@ -338,14 +339,20 @@ roles = { worker = "codex.sol-high" }   # run-local role-selector hotplug
 notes = ["Re-run the focused regression before broader tests."]
 ```
 
-- `next_step` must name an executable step in the frozen workflow.
+- `next_step` must name an executable step in the current workflow at the
+  boundary where the override is applied.
 - `team` must be configured and able to resolve the target step's role.
 - `max_turns` must be positive and not below completed turns.
 - `roles` maps role names to fully qualified `harness.profile` selectors. It
   becomes authoritative for the next worker turn and drives hotplug
-  transactions (below). Selectors are validated against the frozen config.
-- `notes` is an array of non-empty strings appended only to the next worker
-  prompt.
+  transactions (below). Selectors are validated against the current config.
+- `notes` is an array of non-empty strings. When `next_step` is present, the
+  notes are appended once to that selected step's prompt; when it is omitted,
+  they retain the legacy next-worker behavior. They are one-turn recovery
+  guidance, retained through a prelaunch failure and consumed when the target
+  turn durably starts. CLI text after `--` is run-wide guidance and has a
+  separate lifetime; use `next_step = "review_checkpoint"` plus `notes` for
+  recovery directions intended for one review.
 
 The file is read once per pre-turn boundary, never while a harness runs; the
 accepted digest is durable and never applied twice. Invalid content leaves
@@ -587,12 +594,12 @@ Semantics:
 
 `.aflow/runs/<run-id>/`:
 
-- `run.json` — schema-versioned controller snapshot: status, workflow name,
+- `run.json` — schema-versioned controller state: status, workflow name,
   current step, turns completed, `end_reason`, `failure_reason`,
   `merge_failure_reason`, startup recovery fields, retry summary,
   lifecycle context (`execution_repo_root`, `worktree_path`, `main_branch`,
   `feature_branch`), plan paths (`original_plan_path`, `active_plan_path`,
-  `new_plan_path`), frozen config identity, manager history, pending
+  `new_plan_path`), optional diagnostic config identity, manager history, pending
   override, hotplug state, scope/repartition state. Written atomically.
 - `turns/turn-NNN/` — per turn: `result.json` (step name, selector, status,
   return code, error, `end_reason`, chosen transition, evaluated conditions,
@@ -733,9 +740,10 @@ Optional skill (1):
 - `aflow-assistant` — setup help, AFlow concepts, evidence-first run
   debugging (this skill).
 
-Skill names are frozen into run config for manager/repartition prompts, but
-manager and repartition prompts also carry their complete JSON contracts
-inline, so a missing static skill does not weaken protocol validation.
+Skill names and manager/repartition settings are resolved from the current
+configuration at their invocation boundary. Manager and repartition prompts
+also carry their complete JSON contracts inline, so a missing static skill does
+not weaken protocol validation.
 
 ## 14. Plan Format
 
@@ -834,8 +842,10 @@ rejected):
   compare-and-swap control; `expected_revision` is required.
 - `owner_stop(project_id, run_id, expected_revision, idempotency_key)` —
   explicit terminal owner stop (destructive; not a generic control flag).
-- `resume_run(project_id, run_id, idempotency_key)` — explicit
-  lineage-linked continuation with a new run id for a stopped run.
+- `resume_run(project_id, run_id, idempotency_key, extra_instructions=None)` —
+  explicit lineage-linked continuation with a new run id for a stopped run.
+  Omitted or `null` instructions inherit; a bounded list replaces them and
+  `[]` clears them for the successor. The predecessor is unchanged.
 
 **Resources:**
 
@@ -871,6 +881,10 @@ userinfo, or literal bearer values; keep every write tool approval-gated.
 - Failed or ambiguous daemon-owned units are reported `needs_attention` and
   are never auto-restarted; explicit `resume_run` creates one linked
   continuation.
+- Resume instruction replacements are run-wide continuation guidance, not
+  checkpoint notes. REST and MCP callers may inherit, replace, or clear them;
+  the UI intentionally keeps the editor omitted. Reusing an idempotency key
+  with different replacement text is rejected.
 - Legacy runs without the control-plane manifest are read-only and reported
   as legacy/interrupted.
 - Loss of the client, MCP connection, or SSH transport has no lifecycle
@@ -893,8 +907,9 @@ userinfo, or literal bearer values; keep every write tool approval-gated.
   invalid plans, ambiguous failures, scope pressure.
 - Recovery actions: `retry_same_team_after_delay`,
   `switch_to_backup_team_and_retry`, `fail_immediately`.
-- Resume: new successor run dir; frozen config identity must match; hotplug
-  and repartition transactions reconcile before any harness.
+- Resume: new successor run dir; current configuration source is reloaded and
+  hotplug and repartition transactions reconcile before any harness. Lifecycle,
+  ownership, plan, and controller-inactivity identity still must match.
 - MCP: stateless FastMCP server at `/mcp` on the aflowd control plane — 8 read
   tools, 5 write tools (idempotency-keyed, client approval), 3 resources;
   bearer token only via `AFLOW_CONTROL_PLANE_TOKEN` env var (Section 15).

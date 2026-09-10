@@ -16,6 +16,35 @@
   bounded-pane limitation from the planned replacement. No UI implementation is
   claimed by this documentation update.
 
+## 2026-09-10 — Expose dirty-worktree preflight (CP8 implementation)
+
+- Added authenticated REST and read-only MCP preflight over the shared CP7
+  status result, with bounded pages and repository-relative status items.
+- Fresh daemon launches now accept the explicit dirty-worktree choice across
+  transport, replay, and preparation boundaries while retaining the existing
+  structured startup question and conflict/in-progress-operation refusals.
+
+## 2026-09-10 — Repair dirty-worktree lifecycle preflight (CP7 review)
+
+- Lifecycle startup now defers strict Git status inspection only for the
+  existing non-Git/unborn bootstrap path, while inspection failures in real
+  checkouts remain blocking.
+- In-progress Git operation markers are scoped to the selected checkout, so a
+  clean linked worktree is not blocked by a merge in the primary checkout;
+  conflicts and operations in the selected checkout remain blocking.
+
+## 2026-09-10 — Approve live turn configuration (Checkpoint 3)
+
+- Each source-backed turn reloads configuration before controls and limits; persistent partial choices and retry context survive refresh and resume.
+- Limit-driven termination preserves incomplete plan progress; independent incomplete END still fails. Owner stop precedes configuration parsing.
+- CP3 approved after 341 runtime/state/runlog tests and 43 subtests, plus 2 focused CLI tests and 8 subtests. Session and supervision refresh remains CP4.
+
+## 2026-09-10 — Approve live launch and resume configuration (Checkpoint 2)
+
+- CLI and daemon startup/resume use the current source; snapshots are optional diagnostics. Explicit choices retain provenance, while execution identity and resume progress remain authoritative.
+- Resolved the CP2 metadata writer regression and explicit start-step correction equal to the original start. Verified 293 tests and 131 subtests across CP2/API and focused metadata/replay checks.
+- CP2 approved; per-turn reload remains subsequent checkpoint work.
+
 ## 2026-09-10 — Close the publication gap and exercise CI portability
 
 - Add explicitly repository-authorized publication before successful workflow
@@ -1272,3 +1301,33 @@ Final verification: web tests (213), all server tests including Chromium layout 
   retaining raw keys in exact save and control payloads. Verification: 279 web
   tests, production build and four disposable Chromium checks passed; no live
   configuration was changed.
+
+## 2026-09-10 — Shared dirty-worktree preflight
+
+- Added one typed, NUL-aware Git status preflight shared by startup and both
+  lifecycle allocation checks. It preserves rename/source paths and ordered
+  status items, excludes plan/lifecycle-owned dirt for fresh worktrees, and
+  reports conflicts, in-progress operations, and inspection failures explicitly.
+- Dirty non-plan paths now use the existing startup confirmation for eligible
+  worktree runs. The acknowledgment is carried through prepared daemon and
+  controller inputs; final pre-allocation validation rechecks current dirt
+  without relaxing branch, identity, conflict, or teardown protections.
+- Verification: focused dirty-worktree tests (8), Git-status tests (26), CLI
+  tests (154 plus 125 subtests), runtime tests (276 plus 43 subtests), and
+  library startup tests (33 plus 6 subtests) passed; Ruff and diff whitespace
+  checks passed. No real provider or global configuration was used.
+
+## 2026-09-10 — Live configuration without snapshot gates
+
+- Completed the legacy recovery pass: CLI and daemon resume now use the
+  relocated current configuration source, while malformed, absent, edited, or
+  hash-disagreeing compatibility snapshots remain diagnostic only. Removed
+  stale config-save and frozen-configuration admission contracts while
+  retaining lifecycle, plan, ownership, idempotency, and security checks.
+- Added synthetic CLI/daemon resume and snapshot-corruption coverage, updated
+  user-facing and bundled-engine documentation, and isolated ordinary tests
+  from this checkout's explicit publication grant without weakening the
+  dedicated publication tests.
+- Verification: 2,058 Python tests plus 219 subtests, 291 web tests, Ruff,
+  web production build, wheel inspection, and browser smoke passed. No public
+  push, real provider, or live configuration change was used.

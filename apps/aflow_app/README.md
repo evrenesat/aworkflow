@@ -47,8 +47,9 @@ a base, or defaults). Explicit `false` stays `false`, including on aliases,
 and the launch-default workflow never affects inheritance. Changing a
 declaration refreshes the effective preview from the server projection while
 keeping pending edits, and saves emit only the net `set_default_manager_enabled`
-/ `set_workflow_manager_enabled` actions. Supervision flags apply to new runs;
-active runs keep their snapshot.
+/ `set_workflow_manager_enabled` actions. Supervision flags apply at the next
+ safe boundary, including active runs; snapshots are diagnostic compatibility
+ artifacts only.
 
 ## Development
 

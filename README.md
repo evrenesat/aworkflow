@@ -23,7 +23,10 @@ Runs, Teams, Workflows, and Prompts use separate navigation/editor scroll panes.
 Advanced TOML is a settings-wide mode; guided drafts share one save coordinator.
 Failed runs offer Resume when saved execution supports it, or Restart with
 editable launch options. Restart creates a new attempt using current settings
-and retains plan progress; Resume keeps the source configuration snapshot.
+and retains plan progress; Resume reloads the current configuration source and
+keeps only the predecessor's execution and lifecycle facts. A launch-time
+snapshot, when present, is diagnostic compatibility evidence rather than an
+execution gate.
 
 ## How it works
 
@@ -34,6 +37,20 @@ and retains plan progress; Resume keeps the source configuration snapshot.
    instructions.
 4. AFlow re-reads the plan, records the turn, and follows the next matching
    transition.
+
+Configuration is read as a consistent `aflow.toml`/`workflows.toml` pair at
+reservation, startup, resume, and each safe turn boundary. A saved explicit
+team, max-turns value, or start step keeps that choice; omitted defaults follow
+the current source. A completed call keeps the settings it started with, while
+the next boundary sees valid edits to prompts, models, roles, manager policy,
+limits, and workflow steps. Invalid current TOML or an unusable selected target
+fails clearly before a harness starts; an invalid remote control is rejected
+without changing the prior accepted control.
+
+The dirty-worktree checkbox is a separate startup choice. An existing-checkout
+run sees acknowledged source changes, while a fresh worktree starts from the
+selected committed tree and leaves source changes in place. Configuration edits
+do not require a second acknowledgment or a controller restart.
 
 AFlow invokes existing CLIs rather than provider APIs. The selected harness must
 already be installed and authenticated. Adapters are included for Claude,
@@ -172,9 +189,13 @@ Node; editable development installs build the web assets automatically.
 
 ## Run the lightweight local daemon
 
-`aflow daemon` exposes the same 13 control-plane MCP tools without the remote
+`aflow daemon` exposes the same 14 control-plane MCP tools without the remote
 web app, FastAPI, or systemd. Stdio is the default and must stay attached to its
 client; optional HTTP binds only to loopback.
+
+The read-only `preflight_run` tool reports bounded dirty-path pages before a
+launch. The `start_run` tool accepts `dirty_worktree_confirmed` and otherwise
+returns the existing startup question before any worker starts.
 
 ```bash
 aflow daemon start --foreground
@@ -295,7 +316,7 @@ An override may change a worker selector at the next safe worker boundary:
 worker = "codex.strong"
 ```
 
-The frozen workflow configuration validates selectors before accepting the
+The current workflow configuration validates selectors before accepting the
 digest. `team` and manager-owned one-turn upgrades retain their existing
 precedence; a run-local `[roles]` change is applied only after the current
 worker turn is durable. Same-harness changes require exact session resume and

@@ -22,12 +22,14 @@ if TYPE_CHECKING:
 
 from .config import (
     AflowSection,
+    ConfigError,
     GoTransition,
     VALID_CONDITION_SYMBOLS,
     WorkflowConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
 )
+from .live_config import load_live_config
 from .manager import (
     ManagerDecisionError,
     ManagerDecisionV1,
@@ -56,10 +58,12 @@ from .manager_context import (
 from .skill_store import SkillStoreError
 from .publication import PublicationError, publish_completed_run
 from .git_status import (
-    classify_dirtiness_by_prefix,
+    classify_status_items_by_prefix,
     is_lifecycle_owned_path,
     porcelain_status_paths,
     RepoState,
+    WorktreeInspectionError,
+    preflight_worktree,
     probe_repo_state,
 )
 from .harnesses import get_adapter
@@ -102,12 +106,14 @@ from .recovery import (
     TeamLeadRecoveryDecision,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
+from .control_plane.validation import ControlValidationError, validate_override_targets
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
     build_handover_context_v1, render_handover_prompt, validate_handover_output,
     workspace_fingerprint, write_handover_artifacts, hotplug_transaction_id,
     classify_hotplug_resume_stage, copy_hotplug_resume_artifacts,
+    safe_hotplug_artifact_path, validate_hotplug_resume_artifacts,
 )
 from .harnesses.session import SessionDriver, SessionRequest, SessionResult
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, RunPaths, write_turn_artifacts_start
@@ -350,7 +356,7 @@ def _manager_repo_fingerprint(
     return head.strip(), status, tuple(plan_hashes)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ManagerCallExecutor:
     workflow_config: WorkflowUserConfig
     workflow_name: str
@@ -364,6 +370,16 @@ class _ManagerCallExecutor:
     banner: BannerRenderer
     adapter: HarnessAdapter | None
     preflight_or_fail: Callable[..., None]
+
+    def refresh_configuration(
+        self,
+        workflow_config: WorkflowUserConfig,
+        *,
+        max_turns: int,
+    ) -> None:
+        """Replace live configuration without resetting manager state."""
+        self.workflow_config = workflow_config
+        self.max_turns = max_turns
 
     def run(
         self,
@@ -892,7 +908,7 @@ class _ManagerCallExecutor:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RepartitionCycleExecutor:
     workflow_config: WorkflowUserConfig
     state: ControllerState
@@ -902,6 +918,10 @@ class _RepartitionCycleExecutor:
     persist_repartition: Callable[[PendingRepartitionV1], None]
     prepare_repartition_invocation: Callable[..., HarnessInvocation]
     invoke_repartition_full: Callable[..., tuple[str, str, str | None]]
+
+    def refresh_configuration(self, workflow_config: WorkflowUserConfig) -> None:
+        """Use the current manager/repartition settings for the next call."""
+        self.workflow_config = workflow_config
 
     def run(
         self,
@@ -1420,7 +1440,7 @@ def _persist_pending_repartition(
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RepartitionApplicationCoordinator:
     workflow_config: WorkflowUserConfig
     workflow: WorkflowConfig
@@ -1430,6 +1450,15 @@ class _RepartitionApplicationCoordinator:
     execution_context: ExecutionContext | None
     observer: ExecutionObserver | None
     run_metadata: RunMetadataWriter
+
+    def refresh_configuration(
+        self,
+        workflow_config: WorkflowUserConfig,
+        workflow: WorkflowConfig,
+    ) -> None:
+        """Refresh routing validation while retaining pending transaction state."""
+        self.workflow_config = workflow_config
+        self.workflow = workflow
 
     def run(
         self,
@@ -1744,7 +1773,7 @@ def _manager_level_for_boundary(
         return "full"
     return "lite"
 
-@dataclass(frozen=True)
+@dataclass
 class _ManagerGateCoordinator:
     workflow_config: WorkflowUserConfig
     workflow: WorkflowConfig
@@ -1757,6 +1786,18 @@ class _ManagerGateCoordinator:
     fail_manager_gate: Callable[..., NoReturn]
     run_repartition_cycle: Callable[..., None]
     apply_pending_repartition: Callable[[], None]
+
+    def refresh_configuration(
+        self,
+        workflow_config: WorkflowUserConfig,
+        workflow: WorkflowConfig,
+        *,
+        max_turns: int,
+    ) -> None:
+        """Refresh manager policy and graph without touching controller history."""
+        self.workflow_config = workflow_config
+        self.workflow = workflow
+        self.max_turns = max_turns
 
     def run(
         self,
@@ -2226,40 +2267,6 @@ _REVIEW_SKILL_NAMES = frozenset({
 _PLAN_BRANCH_LINE_RE = re.compile(r"^(\s*-\s+Plan Branch:\s+`)([^`]*)(`.*)$", re.MULTILINE)
 
 
-def _resume_identity_config_dir(
-    config: "ControllerConfig", config_dir: Path,
-    saved_identity: FrozenRunIdentity | None = None,
-) -> Path:
-    """Keep a validated snapshot's identity stable across resumed copies.
-
-    When the controller loaded its configuration from the run's frozen
-    snapshot (worker/resume path), the fingerprint is identical but the
-    CLI runs may record the original location, while detached workers record
-    their snapshot location. Preserve either predecessor convention; the
-    caller still compares the loaded configuration's fingerprint.
-    """
-    from .run_config_snapshot import SnapshotError, load_run_config_snapshot
-
-    snapshot_run_id = config.reserved_run_id
-    if not snapshot_run_id:
-        # Direct CLI resume loads the predecessor snapshot before reserving
-        # its successor. Recognize only the exact repository-owned path.
-        candidate = config_dir.resolve()
-        runs_root = (config.repo_root / ".aflow" / "runs").resolve()
-        if candidate.parent.name != "config" or candidate.parent.parent.parent != runs_root:
-            return config_dir
-        snapshot_run_id = candidate.parent.parent.name
-    try:
-        snapshot = load_run_config_snapshot(config.repo_root, snapshot_run_id)
-    except SnapshotError:
-        return config_dir
-    if snapshot is None:
-        return config_dir
-    if not config.reserved_run_id and snapshot.config_path.resolve() != config_dir.resolve():
-        return config_dir
-    return Path(saved_identity.config_path if saved_identity is not None else snapshot.origin_config_path)
-
-
 def _freeze_run_identity(
     workflow_name: str,
     workflow_config: WorkflowUserConfig,
@@ -2297,33 +2304,42 @@ def _freeze_run_identity(
     )
 
 
-def _daemon_manifest_matches_execution(existing: object, expected: object) -> bool:
+def _daemon_manifest_matches_execution(
+    existing: object,
+    expected: object,
+    *,
+    match_max_turns: bool = True,
+    match_team: bool = True,
+    match_start_step: bool = True,
+) -> bool:
     """Accept only a daemon's pre-preparation manifest for its exact worker.
 
     A daemon records request-level intent before startup questions are
     answered, so its immutable manifest may deliberately omit ``start_step``.
-    Every other execution identity field remains exact.  This narrow bridge is
-    never used by direct CLI execution.
+    Non-explicit configuration defaults can be re-resolved from the current
+    source; every identity field and every explicit choice remains exact. This
+    narrow bridge is never used by direct CLI execution.
     """
-    fields = (
+    fields = [
         "run_id",
         "project_root",
         "plan_path",
         "workflow_name",
-        "max_turns",
-        "team",
         "idempotency_key",
         "caller_scope",
-        "frozen_config_fingerprint",
         "restarted_from_run_id",
-    )
+    ]
+    if match_max_turns:
+        fields.append("max_turns")
+    if match_team:
+        fields.append("team")
     if any(getattr(existing, field, None) != getattr(expected, field, None) for field in fields):
         return False
     if getattr(existing, "intended_unit", None) != f"aflow-run-{getattr(expected, 'run_id', '')}.service":
         return False
     existing_start_step = getattr(existing, "start_step", None)
     expected_start_step = getattr(expected, "start_step", None)
-    if existing_start_step is None:
+    if existing_start_step is None or not match_start_step:
         return True
     return (
         existing_start_step == expected_start_step
@@ -2332,17 +2348,15 @@ def _daemon_manifest_matches_execution(existing: object, expected: object) -> bo
     )
 
 
-def _frozen_identity_mismatch(
+def _resume_lifecycle_mismatch(
     saved: FrozenRunIdentity,
     current: FrozenRunIdentity,
 ) -> str | None:
-    """Describe the persisted identity fields that differ from current config."""
+    """Describe the immutable lifecycle fields that differ on resume."""
     differences = [
         f"{field} saved '{getattr(saved, field)}' but current '{getattr(current, field)}'"
         for field in (
             "workflow_name",
-            "config_path",
-            "config_fingerprint",
             "continuation_from_branch",
             "continuation_from_head",
             "continuation_mode",
@@ -3344,6 +3358,525 @@ def render_step_prompts(
     return "\n\n".join(parts)
 
 
+@dataclass(frozen=True)
+class _CheckpointReviewPromptTarget:
+    checkpoint_index: int | None
+    checkpoint_name: str | None
+    worker_artifact_path: str | None
+    source: str
+    ambiguity: str | None = None
+
+
+@dataclass(frozen=True)
+class _RecoveredWorkerReviewEvidence:
+    source_run_dir: Path
+    turn_number: int
+    snapshot_before: PlanSnapshot | None
+
+
+_APPROVAL_TARGET_AFTER_RE = re.compile(
+    r"\b(?:approved|approval\s+commit|reviewed\s+through)\b"
+    r"[\s:=-]*`?\s*#?\s*"
+    r"(?:cp(?P<cp>\d+)(?:\s+v\d+)?|checkpoint\s+#?\s*(?P<checkpoint>\d+))\b",
+    re.IGNORECASE,
+)
+_APPROVAL_TARGET_BEFORE_RE = re.compile(
+    r"`?\s*(?:cp(?P<cp>\d+)(?:\s+v\d+)?|"
+    r"checkpoint\s+#?\s*(?P<checkpoint>\d+))\b"
+    r"[^.\n]{0,48}\bapproved\b",
+    re.IGNORECASE,
+)
+
+
+def _snapshot_from_review_result(value: object) -> PlanSnapshot | None:
+    """Decode only the checkpoint fields needed from a recovered result."""
+    if not isinstance(value, Mapping):
+        return None
+    checkpoint_name = value.get("current_checkpoint_name")
+    checkpoint_index = value.get("current_checkpoint_index")
+    counts = (
+        value.get("unchecked_checkpoint_count"),
+        value.get("current_checkpoint_unchecked_step_count"),
+        value.get("total_checkpoint_count", 0),
+    )
+    if (
+        checkpoint_name is not None
+        and not isinstance(checkpoint_name, str)
+    ) or (
+        checkpoint_index is not None
+        and (
+            not isinstance(checkpoint_index, int)
+            or isinstance(checkpoint_index, bool)
+        )
+    ) or not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in counts
+    ) or not isinstance(value.get("is_complete"), bool):
+        return None
+    return PlanSnapshot(
+        current_checkpoint_name=checkpoint_name,
+        unchecked_checkpoint_count=counts[0],
+        current_checkpoint_unchecked_step_count=counts[1],
+        is_complete=value["is_complete"],
+        total_checkpoint_count=counts[2],
+        current_checkpoint_index=checkpoint_index,
+    )
+
+
+def _recovered_worker_snapshot_before(
+    pending: PendingFinalizedTurn,
+) -> PlanSnapshot | None:
+    """Use carried metadata, with a bounded legacy result-artifact fallback."""
+    if pending.snapshot_before is not None:
+        return pending.snapshot_before
+    result_path = (
+        pending.source_run_dir
+        / "turns"
+        / f"turn-{pending.turn_number:03d}"
+        / "result.json"
+    )
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(result, Mapping):
+        return None
+    return _snapshot_from_review_result(result.get("snapshot_before"))
+
+
+def _review_target_from_snapshot(
+    snapshot_before: PlanSnapshot | None,
+    *,
+    original_plan_path: Path,
+    worker_artifact_path: str,
+    source: str,
+) -> _CheckpointReviewPromptTarget | None:
+    """Validate one recovered worker snapshot against the original plan."""
+    try:
+        plan_text = original_plan_path.read_text(encoding="utf-8")
+        parsed = load_plan_tolerant(original_plan_path).parsed_plan
+    except (OSError, UnicodeError, PlanParseError):
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity=(
+                "the original plan could not be read as checkpointed review state"
+            ),
+        )
+    if not parsed.sections:
+        return None
+    if snapshot_before is None:
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity=(
+                "the recovered worker result has no usable snapshot_before checkpoint"
+            ),
+        )
+    checkpoint_index = snapshot_before.current_checkpoint_index
+    if checkpoint_index is None or not 1 <= checkpoint_index <= len(parsed.sections):
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity=(
+                "the recovered worker result does not identify one existing checkpoint"
+            ),
+        )
+    section = parsed.sections[checkpoint_index - 1]
+    if (
+        snapshot_before.current_checkpoint_name is not None
+        and snapshot_before.current_checkpoint_name != section.name
+    ):
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity="the result checkpoint name disagrees with the original plan",
+        )
+    approved_index = _latest_approved_checkpoint_index(plan_text)
+    if approved_index is not None and checkpoint_index <= approved_index:
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=f"{source} and review state",
+            ambiguity=(
+                f"checkpoint #{checkpoint_index} is already recorded as approved; "
+                "an explicit target is required to review it again"
+            ),
+        )
+    return _CheckpointReviewPromptTarget(
+        checkpoint_index=checkpoint_index,
+        checkpoint_name=section.name,
+        worker_artifact_path=worker_artifact_path,
+        source=f"{source} and review state",
+    )
+
+
+def _latest_approved_checkpoint_index(plan_text: str) -> int | None:
+    """Read approval markers without treating implementation boxes as approval."""
+    approved_indices: list[int] = []
+    for line in plan_text.splitlines():
+        marker = re.search(
+            r"^\s*(?:[-*]\s*)?Last Reviewed Checkpoint:\s*`?\s*"
+            r"(?:cp(?P<cp>\d+)(?:\s+v\d+)?|checkpoint\s+(?P<checkpoint>\d+))",
+            line,
+            re.IGNORECASE,
+        )
+        if marker is not None:
+            approved_indices.append(int(marker.group("cp") or marker.group("checkpoint")))
+
+    review_log_entries: list[str] = []
+    try:
+        metadata = parse_git_tracking_metadata(plan_text)
+    except ValueError:
+        metadata = None
+    if metadata is not None:
+        review_log_entries.extend(metadata.review_log_entries)
+    in_review_log = False
+    for line in plan_text.splitlines():
+        if re.match(r"^\s*#{2,3}\s+Review Log\b", line, re.IGNORECASE):
+            in_review_log = True
+            continue
+        if in_review_log and re.match(r"^\s*#{1,3}\s+", line):
+            in_review_log = False
+        if in_review_log and line.strip().startswith("-"):
+            review_log_entries.append(line.strip().lstrip("-").strip())
+
+    for entry in review_log_entries:
+        normalized = entry.lower()
+        if (
+            not re.search(r"\bapproved\b|\bapproval commit\b|\breviewed through\b", normalized)
+            or re.search(r"\b(?:not approved|never approved)\b", normalized)
+        ):
+            continue
+        matches = [
+            int(match.group("cp") or match.group("checkpoint"))
+            for match in _APPROVAL_TARGET_AFTER_RE.finditer(entry)
+        ]
+        if not matches:
+            matches = [
+                int(match.group("cp") or match.group("checkpoint"))
+                for match in _APPROVAL_TARGET_BEFORE_RE.finditer(entry)
+            ]
+        approved_indices.extend(matches)
+    return max(approved_indices) if approved_indices else None
+
+
+def _review_worker_artifact_reference(
+    state: ControllerState,
+    *,
+    attempt: ImplementationAttempt,
+    repo_root: Path,
+    run_dir: Path,
+    resumed_from_run_id: str | None = None,
+) -> str:
+    """Return a stable reference to the selected worker's result metadata."""
+    for record in reversed(state.turn_history):
+        if (
+            record.turn_number == attempt.turn_number
+            and record.step_role == "worker"
+            and record.turn_dir is not None
+        ):
+            try:
+                return str((record.turn_dir / "result.json").relative_to(repo_root))
+            except ValueError:
+                break
+    current_result = (
+        run_dir / "turns" / f"turn-{attempt.turn_number:03d}" / "result.json"
+    )
+    if current_result.is_file():
+        try:
+            return str(current_result.relative_to(repo_root))
+        except ValueError:
+            pass
+    source_run_id = resumed_from_run_id
+    prefix = f"resumed-from/{source_run_id}/" if source_run_id else ""
+    return f"{prefix}turns/turn-{attempt.turn_number:03d}/result.json"
+
+
+def _recovered_review_target(
+    pending: PendingFinalizedTurn,
+    *,
+    original_plan_path: Path,
+    worker_artifact_path: str,
+) -> _CheckpointReviewPromptTarget | None:
+    """Resolve a legacy pending worker only when its review state is clear."""
+    if pending.step_role != "worker":
+        return None
+    return _review_target_from_snapshot(
+        _recovered_worker_snapshot_before(pending),
+        original_plan_path=original_plan_path,
+        worker_artifact_path=worker_artifact_path,
+        source="recovered finalized worker metadata",
+    )
+
+
+_RECOVERED_REVIEW_RESULT_SCAN_LIMIT = 64
+
+
+def _resume_source_run_dir(
+    repo_root: Path,
+    resume: ResumeContext,
+) -> Path | None:
+    run_id = resume.resumed_from_run_id
+    run_id_path = Path(run_id)
+    if not run_id or run_id in {".", ".."} or run_id_path.name != run_id:
+        return None
+    source_run_dir = repo_root / ".aflow" / "runs" / run_id
+    if source_run_dir.is_symlink() or not source_run_dir.is_dir():
+        return None
+    return source_run_dir
+
+
+def _recovered_review_turn_numbers(
+    source_run_dir: Path,
+    metadata: Mapping[str, object] | None,
+) -> tuple[int, ...]:
+    known_turns: list[int] = []
+    if metadata is not None:
+        for key in ("active_turn", "turns_completed"):
+            value = metadata.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                known_turns.append(value)
+    if known_turns:
+        newest_turn = max(known_turns)
+        return tuple(
+            range(
+                newest_turn,
+                max(0, newest_turn - _RECOVERED_REVIEW_RESULT_SCAN_LIMIT),
+                -1,
+            )
+        )
+    turns_dir = source_run_dir / "turns"
+    try:
+        children = list(turns_dir.iterdir())
+    except OSError:
+        return ()
+    turn_numbers = []
+    for child in children:
+        match = re.fullmatch(r"turn-(\d+)", child.name)
+        if match is not None and child.is_dir() and not child.is_symlink():
+            turn_numbers.append(int(match.group(1)))
+    return tuple(sorted(turn_numbers, reverse=True)[:_RECOVERED_REVIEW_RESULT_SCAN_LIMIT])
+
+
+def _latest_scope_less_worker_evidence(
+    *,
+    repo_root: Path,
+    resume: ResumeContext,
+) -> _RecoveredWorkerReviewEvidence | None:
+    """Find only the latest finalized worker result in a predecessor run."""
+    source_run_dir = _resume_source_run_dir(repo_root, resume)
+    if source_run_dir is None:
+        return None
+    metadata = load_run_json(source_run_dir)
+    for turn_number in _recovered_review_turn_numbers(source_run_dir, metadata):
+        result_path = (
+            source_run_dir
+            / "turns"
+            / f"turn-{turn_number:03d}"
+            / "result.json"
+        )
+        if result_path.parent.is_symlink() or result_path.is_symlink():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("step_role") != "worker":
+            continue
+        if result.get("status") in {"starting", "running"}:
+            continue
+        return _RecoveredWorkerReviewEvidence(
+            source_run_dir=source_run_dir,
+            turn_number=turn_number,
+            snapshot_before=_snapshot_from_review_result(
+                result.get("snapshot_before")
+            ),
+        )
+    return None
+
+
+def _scope_less_recovered_review_target(
+    *,
+    repo_root: Path,
+    resume: ResumeContext,
+    original_plan_path: Path,
+) -> _CheckpointReviewPromptTarget | None:
+    """Resolve review evidence when legacy resume did not persist a scope."""
+    try:
+        if not load_plan_tolerant(original_plan_path).parsed_plan.sections:
+            return None
+    except (OSError, UnicodeError, PlanParseError):
+        return None
+    evidence = _latest_scope_less_worker_evidence(
+        repo_root=repo_root,
+        resume=resume,
+    )
+    source_run_id = resume.resumed_from_run_id
+    if evidence is None:
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=None,
+            source="scope-less resumed predecessor metadata",
+            ambiguity=(
+                "no finalized worker result was found with usable predecessor evidence"
+            ),
+        )
+    worker_artifact_path = (
+        f"resumed-from/{source_run_id}/turns/"
+        f"turn-{evidence.turn_number:03d}/result.json"
+    )
+    return _review_target_from_snapshot(
+        evidence.snapshot_before,
+        original_plan_path=original_plan_path,
+        worker_artifact_path=worker_artifact_path,
+        source="scope-less resumed predecessor worker result",
+    )
+
+
+def _render_checkpoint_review_context(
+    *,
+    state: ControllerState,
+    repo_root: Path,
+    run_dir: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    resume: ResumeContext | None,
+    recovered_boundary: PendingFinalizedTurn | None,
+) -> str:
+    """Render controller-owned pending-target evidence for a reviewer."""
+    scope = state.active_implementation_scope
+    target: _CheckpointReviewPromptTarget | None = None
+    attempts: list[ImplementationAttempt] = []
+    if scope is not None and scope.awaiting_review:
+        attempts = state.implementation_attempts.get(scope.scope_id, [])
+        worker_attempts = [item for item in attempts if item.role == "worker"]
+        if worker_attempts:
+            attempt = worker_attempts[-1]
+            target = _CheckpointReviewPromptTarget(
+                checkpoint_index=scope.checkpoint_index,
+                checkpoint_name=scope.checkpoint_name,
+                worker_artifact_path=_review_worker_artifact_reference(
+                    state,
+                    attempt=attempt,
+                    repo_root=repo_root,
+                    run_dir=run_dir,
+                    resumed_from_run_id=(
+                        resume.resumed_from_run_id if resume is not None else None
+                    ),
+                ),
+                source="active implementation scope awaiting review",
+            )
+        else:
+            target = _CheckpointReviewPromptTarget(
+                checkpoint_index=scope.checkpoint_index,
+                checkpoint_name=scope.checkpoint_name,
+                worker_artifact_path=None,
+                source="active implementation scope awaiting review",
+                ambiguity="the scope has no recorded worker attempt",
+            )
+    elif (
+        recovered_boundary is not None
+        and recovered_boundary.step_role == "worker"
+        and state.turns_completed == 0
+    ):
+        target = _recovered_review_target(
+            recovered_boundary,
+            original_plan_path=original_plan_path,
+            worker_artifact_path=(
+                f"resumed-from/{recovered_boundary.source_run_dir.name}/"
+                f"turns/turn-{recovered_boundary.turn_number:03d}/result.json"
+            ),
+        )
+    elif (
+        scope is None
+        and recovered_boundary is None
+        and resume is not None
+        and state.turns_completed == 0
+    ):
+        target = _scope_less_recovered_review_target(
+            repo_root=repo_root,
+            resume=resume,
+            original_plan_path=original_plan_path,
+        )
+
+    if target is None:
+        return ""
+    if (
+        target.ambiguity is None
+        and (target.checkpoint_index is None or target.checkpoint_name is None)
+    ):
+        target = replace(
+            target,
+            ambiguity="the active scope has no complete original checkpoint identity",
+        )
+    lines = ["## Checkpoint under review"]
+    if target.ambiguity is not None:
+        lines.append(
+            "- Pending target: unresolved from "
+            f"{target.source}; {target.ambiguity}."
+        )
+        if target.worker_artifact_path is not None:
+            lines.append(f"- Worker artifact reference: {target.worker_artifact_path}")
+        if active_plan_path != original_plan_path:
+            lines.append(f"- Active plan/overlay: {active_plan_path}")
+        lines.append(
+            "- An explicit operator checkpoint target may resolve this ambiguity; "
+            "do not infer one from the newest approval or current next checkpoint."
+        )
+        return "\n".join(lines)
+    if target.checkpoint_index is None or target.checkpoint_name is None:
+        return ""
+    lines.extend([
+        f"- Original checkpoint: #{target.checkpoint_index} — {target.checkpoint_name}",
+        f"- Original plan: {original_plan_path}",
+        f"- Review evidence: {target.source}",
+    ])
+    if active_plan_path != original_plan_path:
+        lines.append(f"- Active plan/overlay: {active_plan_path}")
+    if target.worker_artifact_path is not None:
+        lines.append(f"- Worker artifact reference: {target.worker_artifact_path}")
+    return "\n".join(lines)
+
+
+def _append_checkpoint_review_context(
+    prompt: str,
+    *,
+    step_role: str,
+    state: ControllerState,
+    repo_root: Path,
+    run_dir: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    resume: ResumeContext | None,
+    recovered_boundary: PendingFinalizedTurn | None,
+) -> str:
+    if step_role != "reviewer":
+        return prompt
+    context = _render_checkpoint_review_context(
+        state=state,
+        repo_root=repo_root,
+        run_dir=run_dir,
+        original_plan_path=original_plan_path,
+        active_plan_path=active_plan_path,
+        resume=resume,
+        recovered_boundary=recovered_boundary,
+    )
+    return "\n\n".join((prompt, context)) if context else prompt
+
+
 def _rewrite_plan_branch_text(text: str, branch_name: str) -> str:
     return _PLAN_BRANCH_LINE_RE.sub(
         lambda match: f"{match.group(1)}{branch_name}{match.group(3)}",
@@ -4289,6 +4822,7 @@ def _lifecycle_preflight_git(
     worktree_path: Path | None,
     *,
     allow_untracked: bool = False,
+    dirty_worktree_confirmed: bool = False,
 ) -> None:
     """Phase B: git-dependent lifecycle preflight checks.
 
@@ -4327,37 +4861,36 @@ def _lifecycle_preflight_git(
             f"but workflow requires starting from '{main_branch}'"
         )
 
-    rc, status_out, _ = _run_git(
-        ["status", "--porcelain=v1", "--untracked-files=all"], cwd=primary_root
-    )
-    if rc != 0:
+    try:
+        worktree_preflight = preflight_worktree(
+            primary_root,
+            execution_mode=("new_worktree" if uses_worktree else "same_checkout"),
+            allow_untracked=allow_untracked,
+        )
+    except WorktreeInspectionError as exc:
         raise WorkflowError(
-            f"lifecycle preflight: cannot check working tree state in '{primary_root}'"
+            f"lifecycle preflight: cannot check working tree state in '{primary_root}': {exc}"
+        ) from exc
+
+    if worktree_preflight.blockers:
+        raise WorkflowError(
+            "lifecycle preflight: " + "; ".join(worktree_preflight.blockers)
         )
 
-    effective_status = status_out
-    if allow_untracked:
-        tracked_lines = [
-            line for line in status_out.splitlines()
-            if len(line) >= 2 and line[:2] != "??"
-        ]
-        effective_status = "\n".join(tracked_lines)
-
-    if effective_status.strip():
+    if worktree_preflight.requires_confirmation and not dirty_worktree_confirmed:
         if uses_worktree:
-            _, non_plan_paths = classify_dirtiness_by_prefix(
-                effective_status,
+            _, non_plan_paths = classify_status_items_by_prefix(
+                worktree_preflight.items,
                 ignore_lifecycle_owned=True,
+                ignore_untracked=allow_untracked,
             )
-            if non_plan_paths:
-                raise WorkflowError(
-                    f"lifecycle preflight: primary checkout at '{primary_root}' has non-plan dirtiness: "
-                    f"{', '.join(non_plan_paths[:3])}{'...' if len(non_plan_paths) > 3 else ''}"
-                )
-        else:
             raise WorkflowError(
-                f"lifecycle preflight: primary checkout at '{primary_root}' has uncommitted changes"
+                f"lifecycle preflight: primary checkout at '{primary_root}' has non-plan dirtiness: "
+                f"{', '.join(non_plan_paths[:3])}{'...' if len(non_plan_paths) > 3 else ''}"
             )
+        raise WorkflowError(
+            f"lifecycle preflight: primary checkout at '{primary_root}' has uncommitted changes"
+        )
 
     rc, _, _ = _run_git(["show-ref", "--verify", f"refs/heads/{feature_branch}"], cwd=primary_root)
     if rc == 0:
@@ -4387,6 +4920,7 @@ def _lifecycle_preflight(
     *,
     skip_phase_b: bool = False,
     main_branch_override: str | None = None,
+    dirty_worktree_confirmed: bool = False,
 ) -> _LifecyclePlan | None:
     setup = wf.setup or ()
     teardown = wf.teardown or ()
@@ -4464,7 +4998,14 @@ def _lifecycle_preflight(
     # Runs after bootstrap has ensured commits exist.
     # skip_phase_b=True defers this call to after the bootstrap handoff in run_workflow.
     if not skip_phase_b:
-        _lifecycle_preflight_git(primary_root, main_branch, feature_branch, uses_worktree, worktree_path)
+        _lifecycle_preflight_git(
+            primary_root,
+            main_branch,
+            feature_branch,
+            uses_worktree,
+            worktree_path,
+            dirty_worktree_confirmed=dirty_worktree_confirmed,
+        )
 
     return _LifecyclePlan(
         main_branch=main_branch,
@@ -5823,6 +6364,7 @@ def run_workflow(
     parsed_plan: ParsedPlan | None = None,
     startup_retry: RetryContext | None = None,
     startup_base_head_refresh_sha: str | None = None,
+    dirty_worktree_confirmed: bool | None = None,
     config_dir: Path,
     working_dir: Path | None = None,
     adapter: HarnessAdapter | None = None,
@@ -5837,12 +6379,32 @@ def run_workflow(
     allow_existing_launch_manifest: bool = False,
     snapshot_config: bool = True,
 ) -> ControllerRunResult:
+    config_dir = Path(config_dir)
+    live_config_source_path: Path | None = None
+    if config_dir.is_file() or config_dir.suffix == ".toml":
+        live_config_source_path = config_dir.resolve()
+    elif (
+        (config_dir / "aflow.toml").is_file()
+        and (config_dir / "workflows.toml").is_file()
+    ):
+        live_config_source_path = (config_dir / "aflow.toml").resolve()
+    prompt_config_dir = (
+        live_config_source_path.parent
+        if live_config_source_path is not None
+        else config_dir
+    )
     if workflow_name not in workflow_config.workflows:
         raise WorkflowError(f"workflow '{workflow_name}' not found in config")
 
     wf = workflow_config.workflows[workflow_name]
     if wf.first_step is None:
         raise WorkflowError(f"workflow '{workflow_name}' has no steps")
+
+    effective_dirty_worktree_confirmed = (
+        config.dirty_worktree_confirmed
+        if dirty_worktree_confirmed is None
+        else dirty_worktree_confirmed
+    )
 
     continuation_from_branch = config.continuation_from_branch
     continuation_from_head = config.continuation_from_head
@@ -5855,21 +6417,19 @@ def run_workflow(
     current_frozen_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
-        config_dir=_resume_identity_config_dir(config, config_dir, resume.frozen_run_identity)
-        if resume is not None
-        else config_dir,
+        config_dir=config_dir,
         continuation_from_branch=continuation_from_branch,
         continuation_from_head=continuation_from_head,
         continuation_mode=continuation_mode,
     )
     if resume is not None and resume.frozen_run_identity is not None:
-        identity_mismatch = _frozen_identity_mismatch(
+        identity_mismatch = _resume_lifecycle_mismatch(
             resume.frozen_run_identity,
             current_frozen_identity,
         )
         if identity_mismatch is not None:
             raise WorkflowError(
-                "resume frozen configuration mismatch: "
+                "resume lifecycle identity mismatch: "
                 f"{identity_mismatch}"
             )
         if resume.resume_team_override is not None:
@@ -5901,6 +6461,7 @@ def run_workflow(
                 if config.continuation_mode == "current_branch"
                 else None
             ),
+            dirty_worktree_confirmed=effective_dirty_worktree_confirmed,
         )
 
     try:
@@ -5966,6 +6527,9 @@ def run_workflow(
         if existing_manifest is not None and _daemon_manifest_matches_execution(
             existing_manifest,
             launch_manifest,
+            match_max_turns=config.max_turns_explicit is not False,
+            match_team=config.team_explicit is not False,
+            match_start_step=config.start_step_explicit is not False,
         ):
             launch_result = StartRunResult(
                 run_id=reserved_run_id,
@@ -5984,17 +6548,11 @@ def run_workflow(
             f"launch intent already exists for run '{reserved_run_id}'; refusing duplicate controller"
         )
 
-    from .run_config_snapshot import (
-        SnapshotError,
-        create_run_config_snapshot,
-        load_run_config_snapshot,
-    )
+    from .run_config_snapshot import SnapshotError, create_run_config_snapshot
 
     if launch_result.created and snapshot_config:
-        # Freeze the effective workflow pair before any startup answer or
-        # worker launch. A failed snapshot must never launch a worker.
-        # Direct library callers with a synthetic in-memory config may opt
-        # out; every CLI, daemon, and UI launch path keeps the default.
+        # Keep the compatibility copy best-effort.  It is never the execution
+        # source and its failure must not block a valid current configuration.
         try:
             create_run_config_snapshot(
                 repo_root=config.repo_root,
@@ -6003,23 +6561,8 @@ def run_workflow(
                 workflow_name=workflow_name,
                 fingerprint=current_frozen_identity.config_fingerprint,
             )
-        except SnapshotError as exc:
-            raise WorkflowError(f"cannot freeze run configuration: {exc}") from exc
-    else:
-        # A daemon reserved this run earlier; its snapshot must exist and
-        # match the manifest fingerprint before a worker attaches.
-        try:
-            existing_snapshot = load_run_config_snapshot(config.repo_root, reserved_run_id)
-        except SnapshotError as exc:
-            raise WorkflowError(str(exc)) from None
-        if (
-            existing_snapshot is not None
-            and existing_snapshot.fingerprint != current_frozen_identity.config_fingerprint
-        ):
-            raise WorkflowError(
-                f"run '{reserved_run_id}' configuration snapshot does not match "
-                "the launch intent; refusing to attach"
-            )
+        except SnapshotError:
+            pass
 
     _emit_event(observer, RunStartedEvent.create(
         workflow_name=workflow_name,
@@ -6065,15 +6608,33 @@ def run_workflow(
         and resume.override_source_run_dir.parent.resolve()
         == (config.repo_root / ".aflow" / "runs").resolve()
     )
+    preserved_resume_run_ids: set[str] = set()
+    if resume is not None and (
+        resume.resume_relocation is not None
+        or resume.resume_team_override is not None
+    ):
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if (
+        resume is not None
+        and resume.active_implementation_scope is None
+        and resume.pending_finalized_turn is None
+        and current_step_name in wf.steps
+        and wf.steps[current_step_name].role == "reviewer"
+    ):
+        source_run_dir = _resume_source_run_dir(config.repo_root, resume)
+        if source_run_dir is not None:
+            preserved_resume_run_ids.add(source_run_dir.name)
     run_paths = create_run_paths(
         replace(
             config,
             keep_runs=(config.keep_runs + 1) if preserve_resume_override_source else config.keep_runs,
             reserved_run_id=reserved_run_id,
         ),
-        **({"preserved_run_ids": frozenset({resume.resumed_from_run_id})}
-           if resume is not None and (resume.resume_relocation is not None or resume.resume_team_override is not None)
-           else {}),
+        **(
+            {"preserved_run_ids": frozenset(preserved_resume_run_ids)}
+            if preserved_resume_run_ids
+            else {}
+        ),
     )
     journal = EventJournal(run_paths.run_dir)
     if launch_result.created:
@@ -6154,6 +6715,24 @@ def run_workflow(
     state.run_id = run_paths.run_dir.name
     state.resumed_from_run_id = resumed_from_run_id
     state.frozen_run_identity = current_frozen_identity
+    state.live_config_path = str(
+        live_config_source_path if live_config_source_path is not None else config_dir.resolve()
+    )
+    state.team_explicit = (
+        config.team_explicit
+        if config.team_explicit is not None
+        else config.team is not None
+    )
+    state.max_turns_explicit = (
+        config.max_turns_explicit
+        if config.max_turns_explicit is not None
+        else True
+    )
+    state.start_step_explicit = (
+        config.start_step_explicit
+        if config.start_step_explicit is not None
+        else True
+    )
     state.effective_max_turns = (
         resume.effective_max_turns
         if resume is not None and resume.effective_max_turns is not None
@@ -6161,6 +6740,16 @@ def run_workflow(
     )
     if resume is not None:
         state.override_result = resume.override_result
+        state.last_accepted_override = resume.last_accepted_override
+        if (
+            state.last_accepted_override is None
+            and state.override_result is not None
+            and state.override_result.status == "accepted"
+        ):
+            state.last_accepted_override = merge_accepted_override_choices(
+                None,
+                state.override_result,
+            )
         state.role_selectors = dict(resume.role_selectors)
         state.current_hotplug_transaction = resume.current_hotplug_transaction
         state.pending_hotplug_transaction = resume.pending_hotplug_transaction
@@ -6168,6 +6757,7 @@ def run_workflow(
         state.hotplug_transaction_number = resume.hotplug_transaction_number
         state.hotplug_history = list(resume.hotplug_history)
         state.pending_override_notes = resume.pending_override_notes
+        state.pending_override_target_step = resume.pending_override_target_step
         state.override_source_run_dir = resume.override_source_run_dir
         state.override_file_present = resume.override_file_present
         transactions = [
@@ -6180,10 +6770,6 @@ def run_workflow(
             transaction = transactions[0]
             if runner is None:
                 try:
-                    source_profile = resolve_profile(
-                        transaction.source_selector, workflow_config,
-                        step_path="resume.hotplug.source",
-                    )
                     target_profile = resolve_profile(
                         transaction.target_selector, workflow_config,
                         step_path="resume.hotplug.target",
@@ -6192,11 +6778,35 @@ def run_workflow(
                     raise WorkflowError(
                         f"resume hotplug configuration drift: {exc}"
                     ) from exc
+                source_profile = None
+                try:
+                    source_profile = resolve_profile(
+                        transaction.source_selector, workflow_config,
+                        step_path="resume.hotplug.source",
+                    )
+                except WorkflowError as exc:
+                    # The source session and its harness/profile identity are
+                    # durable execution facts.  A deleted source catalog
+                    # entry must not discard the source needed to complete a
+                    # handover; the target still has to resolve live below.
+                    message = str(exc)
+                    if (
+                        "references unknown harness" not in message
+                        and "references unknown profile" not in message
+                    ):
+                        raise WorkflowError(
+                            f"resume hotplug configuration drift: {exc}"
+                        ) from exc
                 if (
-                    source_profile.harness_name != transaction.source_harness
-                    or source_profile.profile_name != transaction.source_profile
-                    or target_profile.harness_name != transaction.target_harness
+                    target_profile.harness_name != transaction.target_harness
                     or target_profile.profile_name != transaction.target_profile
+                    or (
+                        source_profile is not None
+                        and (
+                            source_profile.harness_name != transaction.source_harness
+                            or source_profile.profile_name != transaction.source_profile
+                        )
+                    )
                 ):
                     raise WorkflowError(
                         "resume hotplug configuration drift: transaction selector "
@@ -6843,14 +7453,15 @@ def run_workflow(
                     f"on branch '{lifecycle_plan.main_branch}'",
                     file=sys.stderr,
                 )
-                _lifecycle_preflight_git(
-                    config.repo_root,
-                    lifecycle_plan.main_branch,
-                    lifecycle_plan.feature_branch,
-                    "worktree" in (wf.setup or ()),
-                    lifecycle_plan.worktree_path,
-                    allow_untracked=True,
-                )
+            _lifecycle_preflight_git(
+                config.repo_root,
+                lifecycle_plan.main_branch,
+                lifecycle_plan.feature_branch,
+                "worktree" in (wf.setup or ()),
+                lifecycle_plan.worktree_path,
+                allow_untracked=needs_bootstrap,
+                dirty_worktree_confirmed=effective_dirty_worktree_confirmed,
+            )
             exec_ctx = _do_lifecycle_setup(config.repo_root, lifecycle_plan)
             _sync_startup_plan_metadata_for_execution(
                 original_plan_path,
@@ -8440,6 +9051,24 @@ def run_workflow(
         apply_pending_repartition=_apply_pending_repartition,
     )
 
+    def _refresh_live_supervision_consumers() -> None:
+        """Point cached supervisors at the current boundary configuration."""
+        manager_max_turns = state.effective_max_turns or config.max_turns
+        manager_call_executor.refresh_configuration(
+            workflow_config,
+            max_turns=manager_max_turns,
+        )
+        repartition_cycle_executor.refresh_configuration(workflow_config)
+        repartition_application_coordinator.refresh_configuration(
+            workflow_config,
+            wf,
+        )
+        manager_gate_coordinator.refresh_configuration(
+            workflow_config,
+            wf,
+            max_turns=manager_max_turns,
+        )
+
     def _manager_terminal_incident(
         *,
         trigger: str,
@@ -9065,6 +9694,219 @@ def run_workflow(
             new_plan_path=new_plan_path,
         )
 
+    def _build_worker_hotplug_transaction(
+        *,
+        source_selector: str,
+        source_harness: str,
+        source_profile: str,
+        source_model_display: str,
+        target_selector: str,
+        target_profile: ResolvedProfile,
+        accepted_override_digest: str,
+    ) -> HotplugTransactionV1:
+        """Create one durable worker transition from captured source facts."""
+        transaction_number = state.hotplug_transaction_number + 1
+        transaction = HotplugTransactionV1(
+            transaction_id=hotplug_transaction_id(
+                state.run_id or run_paths.run_dir.name,
+                accepted_override_digest,
+                transaction_number,
+            ),
+            run_id=state.run_id or run_paths.run_dir.name,
+            accepted_override_digest=accepted_override_digest,
+            transaction_number=transaction_number,
+            source_role="worker",
+            target_role="worker",
+            source_selector=source_selector,
+            target_selector=target_selector,
+            source_harness=source_harness,
+            target_harness=target_profile.harness_name,
+            source_profile=source_profile,
+            target_profile=target_profile.profile_name,
+            source_model_display=source_model_display,
+            target_model_display=format_harness_model_display(
+                target_profile.harness_name, target_profile.model, target_profile.effort
+            ),
+            # The source is the last completed worker turn.  This remains a
+            # durable boundary for both a saved mapping change and a control.
+            source_turn_number=max(1, state.turns_completed),
+            capability_path=(
+                "native_resume"
+                if source_harness == target_profile.harness_name
+                else "handover_required"
+            ),
+            stage="accepted",
+        )
+        state.hotplug_transaction_number = transaction_number
+        return transaction
+
+    def _live_worker_handover_digest(
+        source_session: HarnessSessionRefV1,
+        *,
+        target_selector: str,
+        target_profile: ResolvedProfile,
+    ) -> str:
+        """Bind an automatic mapping transition to one boundary's facts."""
+        payload = {
+            "kind": "live-worker-handover",
+            "source_turn_number": state.turns_completed,
+            "source_session": source_session.to_dict(),
+            "target": {
+                "selector": target_selector,
+                "harness": target_profile.harness_name,
+                "profile": target_profile.profile_name,
+                "model": target_profile.model,
+                "effort": target_profile.effort,
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _reconcile_live_worker_target(
+        *,
+        selector: str,
+        resolved: ResolvedProfile,
+        step_role: str,
+    ) -> None:
+        """Route live cross-harness mapping changes through hotplug once."""
+        if step_role != "worker":
+            return
+        for transaction in (
+            state.current_hotplug_transaction,
+            state.pending_hotplug_transaction,
+        ):
+            if transaction is not None and transaction.stage not in {"applied", "failed"}:
+                return
+        source_session = next(
+            (
+                item for item in state.active_role_sessions
+                if item.role == "worker" and item.status == "active"
+            ),
+            None,
+        )
+        if source_session is None or source_session.harness == resolved.harness_name:
+            return
+        digest = _live_worker_handover_digest(
+            source_session,
+            target_selector=selector,
+            target_profile=resolved,
+        )
+        transaction = _build_worker_hotplug_transaction(
+            source_selector=source_session.selector,
+            source_harness=source_session.harness,
+            source_profile=source_session.profile,
+            source_model_display=source_session.model_display,
+            target_selector=selector,
+            target_profile=resolved,
+            accepted_override_digest=digest,
+        )
+        state.current_hotplug_transaction = transaction
+        state.pending_hotplug_transaction = transaction
+        _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_REQUESTED, transaction)
+        _write_override_boundary(status="running")
+
+    def _last_accepted_boundary_override() -> OverrideResult | None:
+        accepted = state.last_accepted_override
+        if accepted is None and (
+            state.override_result is not None
+            and state.override_result.status == "accepted"
+        ):
+            accepted = merge_accepted_override_choices(
+                None,
+                state.override_result,
+            )
+            state.last_accepted_override = accepted
+        return accepted
+
+    def _honor_owner_stop_before_live_reload() -> None:
+        """Honor a stop request without requiring the current config to parse."""
+        source_run_dir = state.override_source_run_dir or run_paths.run_dir
+        override_path = source_run_dir / "overrides.toml"
+        prior = state.override_result
+        if (
+            prior is not None
+            and prior.status == "accepted"
+            and not prior.applied
+            and prior.owner_stop
+        ):
+            state.override_result = replace(prior, applied=True)
+            _write_override_boundary(status="owner_stop_requested")
+            raise OwnerStopRequested()
+
+        consumed_digest = (
+            prior.digest
+            if prior is not None
+            and prior.status == "accepted"
+            and prior.applied
+            else None
+        )
+        loaded = load_override_request(
+            override_path,
+            consumed_digest=consumed_digest,
+        )
+        state.override_file_present = loaded.status != "absent"
+        if loaded.status == "valid" and loaded.request is not None:
+            request = loaded.request
+            if request.owner_stop:
+                state.override_result = OverrideResult(
+                    status="accepted",
+                    digest=request.digest,
+                    message="owner stop accepted at pre-turn boundary",
+                    source_text=request.source_text,
+                    owner_stop=True,
+                    applied=True,
+                )
+                _write_override_boundary(status="owner_stop_requested")
+                raise OwnerStopRequested()
+
+    def _reload_live_configuration_at_boundary() -> None:
+        """Refresh all configuration-derived turn inputs exactly once."""
+        nonlocal workflow_config, wf, retry_limit, baseline_team_name
+        if live_config_source_path is None:
+            return
+        try:
+            loaded = load_live_config(live_config_source_path)
+        except ConfigError as exc:
+            raise WorkflowError(
+                "current live workflow configuration is unusable: "
+                f"{exc}"
+            ) from exc
+        refreshed_config = loaded.workflow_config
+        refreshed_workflow = refreshed_config.workflows.get(workflow_name)
+        if refreshed_workflow is None:
+            raise WorkflowError(
+                f"current live configuration removed workflow '{workflow_name}'"
+            )
+        if refreshed_workflow.first_step is None:
+            raise WorkflowError(
+                f"current live configuration gives workflow '{workflow_name}' no steps"
+            )
+
+        workflow_config = refreshed_config
+        wf = refreshed_workflow
+        retry_limit = _effective_retry_limit(wf, workflow_config.aflow)
+        state.live_config_path = str(loaded.source.config_path)
+
+        accepted = _last_accepted_boundary_override()
+        if accepted is not None and accepted.team is not None:
+            refreshed_team = accepted.team
+        elif state.team_explicit:
+            refreshed_team = config.team if config.team is not None else state.current_team
+        else:
+            refreshed_team = wf.team
+        if state.current_team_override is None:
+            state.current_team = refreshed_team
+        baseline_team_name = refreshed_team
+
+        if accepted is not None and accepted.max_turns is not None:
+            state.effective_max_turns = accepted.max_turns
+        elif state.max_turns_explicit:
+            state.effective_max_turns = config.max_turns
+        else:
+            state.effective_max_turns = workflow_config.aflow.max_turns
+        _refresh_live_supervision_consumers()
+
     def _finish_owner_stop(
         *,
         invocation: HarnessInvocation | None = None,
@@ -9166,6 +10008,7 @@ def run_workflow(
         source_run_dir = state.override_source_run_dir or run_paths.run_dir
         override_path = source_run_dir / "overrides.toml"
         prior = state.override_result
+        accepted = _last_accepted_boundary_override()
         required_predecessor_override = (
             state.override_source_run_dir is not None
             and source_run_dir.resolve() != run_paths.run_dir.resolve()
@@ -9175,22 +10018,29 @@ def run_workflow(
             and prior.status == "accepted"
             and not prior.applied
         ):
+            applied_override = replace(prior, applied=True)
+            accepted = merge_accepted_override_choices(
+                state.last_accepted_override,
+                applied_override,
+            )
             if prior.owner_stop:
                 raise OwnerStopRequested()
             if prior.next_step is not None:
                 current_step_name = prior.next_step
-            if prior.team is not None:
-                state.current_team = prior.team
+            if accepted.team is not None:
+                state.current_team = accepted.team
                 state.current_team_override = None
-                baseline_team_name = prior.team
-            if prior.max_turns is not None:
-                state.effective_max_turns = prior.max_turns
-            state.override_result = replace(prior, applied=True)
+                baseline_team_name = accepted.team
+            if accepted.max_turns is not None:
+                state.effective_max_turns = accepted.max_turns
+            state.override_result = applied_override
+            state.last_accepted_override = accepted
             state.role_selectors.update(prior.role_selectors)
             transaction = state.current_hotplug_transaction
             if transaction is not None and transaction.stage == "accepted":
                 state.role_selectors[transaction.target_role] = transaction.target_selector
             state.override_source_run_dir = None
+            _refresh_live_supervision_consumers()
             _write_override_boundary(status="running")
             if preserve_resume_override_source:
                 prune_old_runs(run_paths.runs_root, config.keep_runs)
@@ -9212,6 +10062,14 @@ def run_workflow(
             and prior is not None
             and prior.status == "accepted"
             and prior.applied
+        ):
+            return current_step_name, baseline_team_name
+        if (
+            not required_predecessor_override
+            and prior is not None
+            and prior.status == "rejected"
+            and loaded.digest == prior.digest
+            and (state.turns_completed > 0 or accepted is not None)
         ):
             return current_step_name, baseline_team_name
         request = loaded.request
@@ -9240,74 +10098,38 @@ def run_workflow(
                     f"workflow '{workflow_name}'"
                 )
             target_team = request.team or state.current_team
-            if validation_error is None and request.team is not None:
-                if request.team not in workflow_config.teams:
-                    validation_error = f"team '{request.team}' is not configured"
-                else:
-                    try:
-                        _resolve_step_runtime(
-                            wf.steps[target_step],
-                            workflow_config,
-                            team_name=target_team,
-                            step_path=(
-                                f"workflow.{workflow_name}.steps.{target_step}"
-                            ),
-                        )
-                    except Exception as exc:
-                        validation_error = (
-                            f"team '{request.team}' is incompatible with step "
-                            f"'{target_step}': {exc}"
-                        )
-            if (
-                validation_error is None
-                and request.max_turns is not None
-                and request.max_turns < state.turns_completed
-            ):
-                validation_error = (
-                    f"max_turns ({request.max_turns}) cannot be below completed "
-                    f"turns ({state.turns_completed})"
-                )
             if validation_error is None:
-                allowed_roles = {
-                    candidate.role for candidate in wf.steps.values()
-                    if candidate.role not in {
-                        "manager", "lifecycle", "initialization", "merge", "recovery"
-                    } and "." not in candidate.role
-                }
-                configured_selectors = {
-                    f"{harness_name}.{profile_name}"
-                    for harness_name, harness in workflow_config.harnesses.items()
-                    for profile_name in harness.profiles
-                }
-                unknown_roles = sorted(set(request.role_selectors) - allowed_roles)
-                unknown_selectors = sorted(
-                    set(request.role_selectors.values()) - configured_selectors
+                try:
+                    validate_override_targets(
+                        workflow_config,
+                        workflow_name=workflow_name,
+                        step_name=target_step,
+                        team=target_team,
+                        role_selectors={
+                            **state.role_selectors,
+                            **request.role_selectors,
+                        },
+                        max_turns=request.max_turns,
+                        completed_turns=state.turns_completed,
+                        step_field="next_step",
+                    )
+                except ControlValidationError as exc:
+                    validation_error = str(exc)
+            if validation_error is None and request.role_selectors:
+                terminal_hotplug_stages = {"applied", "failed"}
+                in_progress = tuple(
+                    transaction for transaction in (
+                        state.current_hotplug_transaction,
+                        state.pending_hotplug_transaction,
+                    )
+                    if transaction is not None
+                    and transaction.stage not in terminal_hotplug_stages
                 )
-                if unknown_roles:
+                if in_progress:
                     validation_error = (
-                        "roles contains undeclared ordinary roles: "
-                        + ", ".join(unknown_roles)
+                        "hotplug_in_progress: a non-terminal hotplug transaction "
+                        "must be completed before accepting another roles digest"
                     )
-                elif unknown_selectors:
-                    validation_error = (
-                        "roles contains selectors outside frozen config: "
-                        + ", ".join(unknown_selectors)
-                    )
-                elif request.role_selectors:
-                    terminal_hotplug_stages = {"applied", "failed"}
-                    in_progress = tuple(
-                        transaction for transaction in (
-                            state.current_hotplug_transaction,
-                            state.pending_hotplug_transaction,
-                        )
-                        if transaction is not None
-                        and transaction.stage not in terminal_hotplug_stages
-                    )
-                    if in_progress:
-                        validation_error = (
-                            "hotplug_in_progress: a non-terminal hotplug transaction "
-                            "must be completed before accepting another roles digest"
-                        )
 
         if validation_error is not None or request is None:
             digest = (
@@ -9323,11 +10145,22 @@ def run_workflow(
                 message=validation_error or "invalid override request",
                 source_text=loaded.source_text,
             )
+            state.override_source_run_dir = source_run_dir
+            can_continue_with_rejected_override = (
+                not required_predecessor_override
+                and (state.turns_completed > 0 or accepted is not None)
+            )
+            if can_continue_with_rejected_override:
+                state.status_message = (
+                    "invalid_override_ignored: "
+                    f"{state.override_result.message}"
+                )
+                _write_override_boundary(status="running")
+                return current_step_name, baseline_team_name
             state.status_message = (
                 "waiting_for_valid_override: "
                 f"{state.override_result.message}"
             )
-            state.override_source_run_dir = source_run_dir
             _write_override_boundary(status="waiting_for_valid_override")
             if preserve_resume_override_source:
                 prune_old_runs(run_paths.runs_root, config.keep_runs)
@@ -9338,6 +10171,9 @@ def run_workflow(
             )
 
         state.pending_override_notes = request.notes
+        state.pending_override_target_step = (
+            request.next_step if request.notes else None
+        )
         state.override_result = OverrideResult(
             status="accepted",
             digest=request.digest,
@@ -9355,55 +10191,62 @@ def run_workflow(
         worker_target_selector = request.role_selectors.get("worker")
         worker_transaction: HotplugTransactionV1 | None = None
         if worker_target_selector is not None:
-            source_selector = resolve_role_selector(
-                "worker",
-                state.current_team,
-                workflow_config,
-                run_local_role_selectors=state.role_selectors,
+            target_profile = resolve_profile(
+                worker_target_selector, workflow_config, step_path="hotplug target"
             )
-            if source_selector != worker_target_selector:
+            source_session = next(
+                (
+                    item for item in state.active_role_sessions
+                    if item.role == "worker" and item.status == "active"
+                ),
+                None,
+            )
+            if source_session is not None:
+                source_selector = source_session.selector
+                source_harness = source_session.harness
+                source_profile_name = source_session.profile
+                source_model_display = source_session.model_display
+                target_model_display = format_harness_model_display(
+                    target_profile.harness_name, target_profile.model, target_profile.effort
+                )
+                execution_changed = (
+                    source_harness != target_profile.harness_name
+                    or source_model_display != target_model_display
+                )
+            else:
+                source_selector = resolve_role_selector(
+                    "worker",
+                    state.current_team,
+                    workflow_config,
+                    run_local_role_selectors=state.role_selectors,
+                )
                 source_profile = resolve_profile(
                     source_selector, workflow_config, step_path="hotplug source"
                 )
-                target_profile = resolve_profile(
-                    worker_target_selector, workflow_config, step_path="hotplug target"
+                source_harness = source_profile.harness_name
+                source_profile_name = source_profile.profile_name
+                source_model_display = format_harness_model_display(
+                    source_profile.harness_name, source_profile.model, source_profile.effort
                 )
-                transaction_number = state.hotplug_transaction_number + 1
-                worker_transaction = HotplugTransactionV1(
-                    transaction_id=hotplug_transaction_id(
-                        state.run_id or run_paths.run_dir.name,
-                        request.digest,
-                        transaction_number,
-                    ),
-                    run_id=state.run_id or run_paths.run_dir.name,
-                    accepted_override_digest=request.digest,
-                    transaction_number=transaction_number,
-                    source_role="worker",
-                    target_role="worker",
+                execution_changed = (
+                    source_harness,
+                    source_profile.model,
+                    source_profile.effort,
+                ) != (
+                    target_profile.harness_name,
+                    target_profile.model,
+                    target_profile.effort,
+                )
+            if execution_changed:
+                worker_transaction = _build_worker_hotplug_transaction(
                     source_selector=source_selector,
+                    source_harness=source_harness,
+                    source_profile=source_profile_name,
+                    source_model_display=source_model_display,
                     target_selector=worker_target_selector,
-                    source_harness=source_profile.harness_name,
-                    target_harness=target_profile.harness_name,
-                    source_profile=source_profile.profile_name,
-                    target_profile=target_profile.profile_name,
-                    source_model_display=format_harness_model_display(
-                        source_profile.harness_name, source_profile.model, source_profile.effort
-                    ),
-                    target_model_display=format_harness_model_display(
-                        target_profile.harness_name, target_profile.model, target_profile.effort
-                    ),
-                    # The request is consumed at the boundary after the
-                    # source turn finalized; bind the transaction to that
-                    # completed source turn, not the target turn.
-                    source_turn_number=max(1, state.turns_completed),
-                    capability_path=(
-                        "native_resume"
-                        if source_profile.harness_name == target_profile.harness_name
-                        else "handover_required"
-                    ),
-                    stage="accepted",
+                    target_profile=target_profile,
+                    accepted_override_digest=request.digest,
                 )
-                state.hotplug_transaction_number = transaction_number
                 state.current_hotplug_transaction = worker_transaction
         _write_override_boundary(status="running")
 
@@ -9415,6 +10258,7 @@ def run_workflow(
             baseline_team_name = request.team
         if request.max_turns is not None:
             state.effective_max_turns = request.max_turns
+        _refresh_live_supervision_consumers()
         # This boundary is reached only after the source turn has finalized;
         # make the accepted target authoritative for the next worker turn.
         state.role_selectors.update(request.role_selectors)
@@ -9437,6 +10281,10 @@ def run_workflow(
                     replace(worker_transaction, stage="applied"),
                 )
         state.override_result = replace(state.override_result, applied=True)
+        state.last_accepted_override = merge_accepted_override_choices(
+            state.last_accepted_override,
+            state.override_result,
+        )
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
         if preserve_resume_override_source:
@@ -9474,7 +10322,7 @@ def run_workflow(
 
     def _prepare_cross_harness_handover(
         transaction: HotplugTransactionV1,
-        source_driver: SessionDriver,
+        source_driver: SessionDriver | None,
         target_driver: SessionDriver,
         *,
         selector: str,
@@ -9483,6 +10331,46 @@ def run_workflow(
         target_preflight: Callable[[], None],
     ) -> str:
         """Collect one bounded read-only source brief before a cross-harness target."""
+        def _render_handover_suffix(
+            normalized: str,
+            artifact_refs: tuple[str, ...],
+            artifact_hashes: tuple[str, ...],
+        ) -> str:
+            handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
+            projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
+            full_context_path = str((run_paths.run_dir / artifact_refs[2]).resolve())
+            return (
+                "\n\nSource worker handover:\n" + normalized
+                + "\nSource worker handover artifact: " + handover_path
+                + " (sha256=" + artifact_hashes[0] + ")"
+                + "\n\nController continuity context:\n"
+                + "Projection artifact: " + projection_path
+                + " (sha256=" + artifact_hashes[1] + ")"
+                + "\nFull context artifact: " + full_context_path
+                + " (sha256=" + artifact_hashes[2] + ")"
+            )
+
+        if transaction.stage == "handover_ready":
+            # A completed source handover is immutable evidence.  Reuse it
+            # after resume/retry while still preflighting the current target
+            # invocation so live model/effort settings apply at launch.
+            target_preflight()
+            try:
+                validate_hotplug_resume_artifacts(run_paths.run_dir, transaction)
+                handover_path = safe_hotplug_artifact_path(
+                    run_paths.run_dir, transaction.artifact_paths[0]
+                )
+                normalized = validate_handover_output(
+                    handover_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"cannot reuse completed cross-harness handover: {exc}"
+                ) from exc
+            return _render_handover_suffix(
+                normalized, transaction.artifact_paths, transaction.artifact_hashes
+            )
+
         if source_driver is target_driver:
             raise RuntimeError("cross-harness hotplug requires distinct source and target drivers")
         capabilities = getattr(source_driver, "capabilities", None)
@@ -9558,30 +10446,253 @@ def run_workflow(
         state.pending_hotplug_transaction = ready
         _emit_hotplug_event(observer, ExecutionEventType.HOTPLUG_STAGE_CHANGED, ready)
         _write_override_boundary(status="running")
-        handover_path = str((run_paths.run_dir / artifact_refs[0]).resolve())
-        projection_path = str((run_paths.run_dir / artifact_refs[1]).resolve())
-        full_context_path = str((run_paths.run_dir / artifact_refs[2]).resolve())
-        return (
-            "\n\nSource worker handover:\n" + normalized
-            + "\nSource worker handover artifact: " + handover_path
-            + " (sha256=" + artifact_hashes[0] + ")"
-            + "\n\nController continuity context:\n"
-            + "Projection artifact: " + projection_path
-            + " (sha256=" + artifact_hashes[1] + ")"
-            + "\nFull context artifact: " + full_context_path
-            + " (sha256=" + artifact_hashes[2] + ")"
+        return _render_handover_suffix(
+            normalized, artifact_refs, artifact_hashes
+        )
+
+    def _finish_normal_terminal(
+        *,
+        final_snapshot: PlanSnapshot,
+        end_reason: WorkflowEndReason,
+        terminal_step_name: str,
+        terminal_step_role: str | None,
+        terminal_selector: str | None,
+        active_team: str | None,
+    ) -> ControllerRunResult:
+        """Finalize a normal terminal boundary, including an incomplete cap."""
+        nonlocal original_plan_path, active_plan_path
+
+        state.end_reason = end_reason
+        recovered_turn = state.current_team_override is not None
+        if recovered_turn:
+            state.current_team_override = None
+        merge_team_name = baseline_team_name if recovered_turn else active_team
+
+        merge_status: str | None = None
+        merge_failure_reason: str | None = None
+
+        if exec_ctx is not None and "merge" in exec_ctx.teardown:
+            try:
+                merge_status, merge_failure_reason = _perform_merge_teardown(
+                    exec_ctx,
+                    wf,
+                    workflow_config,
+                    preflight_probe=resolved_preflight_probe,
+                    repo_root=config.repo_root,
+                    team_name=merge_team_name,
+                    adapter=adapter,
+                    runner=runner,
+                    config_dir=config_dir,
+                    working_dir=working_dir,
+                    original_plan_path=original_plan_path,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    banner=banner,
+                    state=state,
+                )
+            except HarnessEnvironmentPreflightError as exc:
+                _handle_environment_preflight_failure(exc)
+
+        if final_snapshot.is_complete and merge_status != "failed":
+            try:
+                merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                publish_completed_run(
+                    config.repo_root if merging else working_dir,
+                    run_paths.run_dir,
+                    source_ref=exec_ctx.main_branch if merging else "HEAD",
+                )
+            except PublicationError as exc:
+                failure_finalizer.raise_failure(
+                    str(exc),
+                    original_plan_path=original_plan_path,
+                    current_step_name=terminal_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    last_snapshot=final_snapshot,
+                    cause=exc,
+                )
+
+        if merge_status == "failed":
+            state.status_message = "failed"
+            report = _manager_terminal_incident(
+                trigger="merge_failure",
+                reason=merge_failure_reason or "merge teardown failed",
+                current_step=terminal_step_name,
+                current_role=terminal_step_role,
+                active_team=merge_team_name,
+                active_selector=terminal_selector,
+            )
+            summary = report or _format_failure(
+                reason=merge_failure_reason or "merge teardown failed",
+                run_dir=run_paths.run_dir,
+                snapshot=final_snapshot,
+            )
+            run_metadata.write(
+                status="failed",
+                merge_status=merge_status,
+                merge_failure_reason=merge_failure_reason,
+                execution_context=exec_ctx,
+                last_snapshot=final_snapshot,
+                turns_completed=state.turns_completed,
+                original_plan_path=original_plan_path,
+                current_step_name=terminal_step_name,
+                active_plan_path=active_plan_path,
+                new_plan_path=new_plan_path,
+            )
+            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            banner.stop(state)
+            raise WorkflowError(summary, run_dir=run_paths.run_dir)
+
+        if final_snapshot.is_complete:
+            prior_original_plan_path = original_plan_path
+            finalized_original_plan_path = _finalize_original_plan_if_complete(
+                config.repo_root,
+                original_plan_path,
+                snapshot=final_snapshot,
+            )
+            if finalized_original_plan_path != prior_original_plan_path:
+                original_plan_path = finalized_original_plan_path
+                if active_plan_path == prior_original_plan_path:
+                    active_plan_path = original_plan_path
+
+        state.status_message = "completed"
+        _emit_event(observer, StatusChangedEvent.create(
+            status_message="completed",
+            turns_completed=state.turns_completed,
+            active_turn=None,
+            current_step_name=terminal_step_name,
+        ))
+        result = ControllerRunResult(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=final_snapshot,
+            issues_accumulated=state.issues_accumulated,
+            end_reason=end_reason,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        )
+        run_metadata.write(
+            status="completed",
+            merge_status=merge_status,
+            execution_context=exec_ctx,
+            last_snapshot=final_snapshot,
+            turns_completed=state.turns_completed,
+            end_reason=end_reason,
+            original_plan_path=original_plan_path,
+            current_step_name=terminal_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+        prune_old_runs(run_paths.runs_root, config.keep_runs)
+        banner.stop(state)
+
+        _emit_event(observer, RunCompletedEvent.create(
+            run_dir=run_paths.run_dir,
+            turns_completed=state.turns_completed,
+            final_snapshot=final_snapshot,
+            end_reason=end_reason,
+            issues_accumulated=state.issues_accumulated,
+            recovery_summary=state.current_harness_recovery,
+            recovery_history=tuple(state.harness_recovery_history),
+        ))
+
+        return result
+
+    def _find_previous_worker_session(
+        *,
+        selector: str,
+        resolved: ResolvedProfile,
+        transaction: HotplugTransactionV1 | None,
+    ) -> HarnessSessionRefV1 | None:
+        """Find continuity by effective harness, with hotplug source binding."""
+        if transaction is not None:
+            if (
+                transaction.target_selector != selector
+                or transaction.source_harness != resolved.harness_name
+                or transaction.target_harness != resolved.harness_name
+            ):
+                return None
+            source_selector = transaction.source_selector
+            source_harness = transaction.source_harness
+            return next(
+                (
+                    item for item in state.active_role_sessions
+                    if item.role == "worker"
+                    and item.status == "active"
+                    and item.selector == source_selector
+                    and item.harness == source_harness
+                ),
+                None,
+            )
+
+        # Selector aliases can point at the same effective execution target.
+        # Match the active session by its resolved harness so a catalog rename
+        # does not force a needless new session.  The current model/effort are
+        # still carried by SessionRequest and the driver's capability decides
+        # whether an edited target may resume that session.
+        return next(
+            (
+                item for item in state.active_role_sessions
+                if item.role == "worker"
+                and item.status == "active"
+                and item.harness == resolved.harness_name
+            ),
+            None,
         )
 
     turn_number = 1
-    while turn_number <= (state.effective_max_turns or config.max_turns):
+    while True:
+        try:
+            _honor_owner_stop_before_live_reload()
+        except OwnerStopRequested:
+            return _finish_owner_stop()
+        try:
+            _reload_live_configuration_at_boundary()
+        except WorkflowError as exc:
+            _raise_pre_turn_failure(
+                reason=exc.summary,
+                snapshot=state.last_snapshot,
+                active_path=active_plan_path,
+                new_path=new_plan_path,
+            )
         try:
             current_step_name, baseline_team_name = _apply_boundary_override()
         except OwnerStopRequested:
             return _finish_owner_stop()
         effective_max_turns = state.effective_max_turns or config.max_turns
         if turn_number > effective_max_turns:
+            if live_config_source_path is not None:
+                return _finish_normal_terminal(
+                    final_snapshot=state.last_snapshot,
+                    end_reason="max_turns_reached",
+                    terminal_step_name=current_step_name,
+                    terminal_step_role=None,
+                    terminal_selector=None,
+                    active_team=state.current_team,
+                )
             break
         retry_ctx = state.pending_retry
+        boundary_active_path = (
+            retry_ctx.active_plan_path if retry_ctx is not None else active_plan_path
+        )
+        boundary_new_path = (
+            retry_ctx.new_plan_path if retry_ctx is not None else new_plan_path
+        )
+        if current_step_name not in wf.steps:
+            _raise_pre_turn_failure(
+                reason=(
+                    f"current step '{current_step_name}' is not an executable step "
+                    f"in current workflow '{workflow_name}'; correct the live "
+                    "configuration or submit a valid next_step override"
+                ),
+                snapshot=(
+                    retry_ctx.snapshot_before
+                    if retry_ctx is not None
+                    else state.last_snapshot
+                ),
+                active_path=boundary_active_path,
+                new_path=boundary_new_path,
+            )
         active_team_name = (
             state.current_team_override
             if state.current_team_override is not None
@@ -9676,6 +10787,11 @@ def run_workflow(
                     state.pending_step_team_override if consume_team_override else None
                 ),
             )
+            _reconcile_live_worker_target(
+                selector=selector,
+                resolved=resolved,
+                step_role=step.role,
+            )
             system_prompt = resolve_role_prompt(
                 step.role,
                 active_team_name,
@@ -9695,12 +10811,46 @@ def run_workflow(
                 active_team=active_team_name,
             )
             try:
-                user_prompt = retry_ctx.base_user_prompt + "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
+                user_prompt = render_step_prompts(
+                    step,
+                    workflow_config,
+                    config_dir=prompt_config_dir,
+                    working_dir=working_dir,
+                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                    new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
+                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                )
+                user_prompt = _append_checkpoint_review_context(
+                    user_prompt,
+                    step_role=step.role,
+                    state=state,
+                    repo_root=run_paths.repo_root,
+                    run_dir=run_paths.run_dir,
+                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    resume=resume,
+                    recovered_boundary=(
+                        replayed_boundary
+                        if state.turns_completed == 0
+                        else None
+                    ),
+                )
+                if config.extra_instructions:
+                    extra_text = " ".join(config.extra_instructions).strip()
+                    user_prompt = "\n\n".join((user_prompt, extra_text))
+                user_prompt += "\n\n" + _build_retry_appendix(retry_ctx.parse_error_str)
                 if manager_notes:
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
                         f"- {note}" for note in manager_notes
                     )
-                if step.role == "worker" and state.pending_override_notes:
+                override_notes_match = bool(state.pending_override_notes) and (
+                    state.pending_override_target_step == current_step_name
+                    or (
+                        state.pending_override_target_step is None
+                        and step.role == "worker"
+                    )
+                )
+                if override_notes_match:
                     user_prompt += (
                         "\n\n## User override notes for this turn\n"
                         + "\n".join(
@@ -9765,34 +10915,10 @@ def run_workflow(
                     )
                 if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
                     transaction = state.current_hotplug_transaction
-                    source_selector = (
-                        transaction.source_selector
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else selector
-                    )
-                    source_harness = (
-                        transaction.source_harness
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else resolved.harness_name
-                    )
-                    previous_session = next(
-                        (
-                            item for item in state.active_role_sessions
-                            if item.role == "worker" and item.status == "active"
-                            and item.selector == source_selector
-                            and item.harness == source_harness
-                            and (
-                                transaction is None
-                                or (
-                                    transaction.target_selector == selector
-                                    and transaction.source_harness == resolved.harness_name
-                                    and transaction.target_harness == resolved.harness_name
-                                )
-                            )
-                        ),
-                        None,
+                    previous_session = _find_previous_worker_session(
+                        selector=selector,
+                        resolved=resolved,
+                        transaction=transaction,
                     )
                     turn_session_request = SessionRequest(
                         repo_root=execution_repo_root,
@@ -9980,6 +11106,11 @@ def run_workflow(
                     state.pending_step_team_override if consume_team_override else None
                 ),
             )
+            _reconcile_live_worker_target(
+                selector=selector,
+                resolved=resolved,
+                step_role=step.role,
+            )
             system_prompt = resolve_role_prompt(
                 step.role,
                 active_team_name,
@@ -10009,11 +11140,27 @@ def run_workflow(
                 user_prompt = render_step_prompts(
                     step,
                     workflow_config,
-                    config_dir=config_dir,
+                    config_dir=prompt_config_dir,
                     working_dir=working_dir,
                     original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
                     new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
                     active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                )
+
+                user_prompt = _append_checkpoint_review_context(
+                    user_prompt,
+                    step_role=step.role,
+                    state=state,
+                    repo_root=run_paths.repo_root,
+                    run_dir=run_paths.run_dir,
+                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    resume=resume,
+                    recovered_boundary=(
+                        replayed_boundary
+                        if state.turns_completed == 0
+                        else None
+                    ),
                 )
 
                 if config.extra_instructions:
@@ -10024,7 +11171,14 @@ def run_workflow(
                     user_prompt += "\n\n## Manager notes for this turn\n" + "\n".join(
                         f"- {note}" for note in manager_notes
                     )
-                if step.role == "worker" and state.pending_override_notes:
+                override_notes_match = bool(state.pending_override_notes) and (
+                    state.pending_override_target_step == current_step_name
+                    or (
+                        state.pending_override_target_step is None
+                        and step.role == "worker"
+                    )
+                )
+                if override_notes_match:
                     user_prompt += (
                         "\n\n## User override notes for this turn\n"
                         + "\n".join(
@@ -10086,34 +11240,10 @@ def run_workflow(
                     )
                 if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
                     transaction = state.current_hotplug_transaction
-                    source_selector = (
-                        transaction.source_selector
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else selector
-                    )
-                    source_harness = (
-                        transaction.source_harness
-                        if transaction is not None
-                        and transaction.target_selector == selector
-                        else resolved.harness_name
-                    )
-                    previous_session = next(
-                        (
-                            item for item in state.active_role_sessions
-                            if item.role == "worker" and item.status == "active"
-                            and item.selector == source_selector
-                            and item.harness == source_harness
-                            and (
-                                transaction is None
-                                or (
-                                    transaction.target_selector == selector
-                                    and transaction.source_harness == resolved.harness_name
-                                    and transaction.target_harness == resolved.harness_name
-                                )
-                            )
-                        ),
-                        None,
+                    previous_session = _find_previous_worker_session(
+                        selector=selector,
+                        resolved=resolved,
+                        transaction=transaction,
                     )
                     turn_session_request = SessionRequest(
                         repo_root=execution_repo_root,
@@ -10192,17 +11322,6 @@ def run_workflow(
                     new_path=new_plan_path,
                 )
 
-        if step.role == "worker":
-            state.pending_override_notes = ()
-        if step.role == "worker":
-            run_metadata.write(
-                status="running",
-                last_snapshot=state.last_snapshot,
-                original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-            )
-
         turn_dir, turn_started_at = _start_turn(
             turn_number=turn_number,
             step_name=current_step_name,
@@ -10221,6 +11340,17 @@ def run_workflow(
         selected_transition: GoTransition | None = None
         transition_target: str | None = None
         try:
+            if override_notes_match:
+                state.pending_override_notes = ()
+                state.pending_override_target_step = None
+                run_metadata.write(
+                    status="running",
+                    last_snapshot=state.last_snapshot,
+                    original_plan_path=original_plan_path,
+                    current_step_name=current_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                )
             if consume_manager_notes:
                 state.pending_manager_notes = None
             if consume_team_override:
@@ -10671,6 +11801,10 @@ def run_workflow(
             if new_plan_exists:
                 active_plan_path = new_plan_path
 
+            # A source-backed run must reach the next boundary before deciding
+            # that the limit is terminal. The saved turn still uses the
+            # current limit for accounting, but a boundary edit may increase
+            # it before the next synthetic/provider launch.
             max_turns_reached = turn_number >= effective_max_turns
 
             conditions = {
@@ -10742,6 +11876,19 @@ def run_workflow(
                     conditions=conditions,
                 )
 
+            limit_terminal = (
+                transition_target == "END"
+                and live_config_source_path is not None
+                and max_turns_reached
+                and selected_transition is not None
+                and selected_transition.when is not None
+                and not evaluate_condition(
+                    selected_transition.when,
+                    done=done,
+                    new_plan_exists=new_plan_exists,
+                    max_turns_reached=False,
+                )
+            )
             review_rejection: ReviewRejectionRecord | None = None
             scope_before_finalize = state.active_implementation_scope
             controller_next_step = (
@@ -10797,7 +11944,7 @@ def run_workflow(
                 )
 
             _finalize_turn_record(
-                status="completed" if done else "running",
+                status="completed" if done or limit_terminal else "running",
                 started_at=turn_started_at,
                 snapshot_before=snapshot_before,
                 snapshot_after=post_snapshot,
@@ -10823,7 +11970,7 @@ def run_workflow(
                     if (
                         transition_target == "END"
                         and selected_transition is not None
-                        and post_snapshot.is_complete
+                        and (post_snapshot.is_complete or limit_terminal)
                     )
                     else None
                 ),
@@ -10914,10 +12061,12 @@ def run_workflow(
         ):
             _close_implementation_scope(state)
 
-        # Exhaustion is a finalized terminal boundary regardless of whether
-        # manager supervision is enabled. Full enriches the incident when it
-        # is available, but cannot turn an incomplete plan into success.
-        if max_turns_reached and not done:
+        # A live source may change the effective limit at the next boundary;
+        # let the completed turn reach that reload before deciding whether
+        # another provider launch is allowed. Static runs retain their
+        # existing terminal manager gate, while live END transitions flow
+        # through normal END finalization so their edge is recorded.
+        if max_turns_reached and not done and live_config_source_path is None:
             reason = f"reached max turns limit of {effective_max_turns} without completing the active plan"
             report = _manager_terminal_incident(
                 trigger="max_turns", reason=reason, current_step=current_step_name,
@@ -11039,11 +12188,15 @@ def run_workflow(
         )
 
         if transition_target == "END":
-            if not post_snapshot.is_complete:
+            if not post_snapshot.is_complete and not limit_terminal:
+                terminal_reason = (
+                    f"reached max turns limit of {effective_max_turns} without "
+                    "completing the active plan"
+                    if max_turns_reached
+                    else "workflow selected END while the active plan remains incomplete"
+                )
                 _raise_incomplete_terminal_failure(
-                    reason=(
-                        "workflow selected END while the active plan remains incomplete"
-                    ),
+                    reason=terminal_reason,
                     post_snapshot=post_snapshot,
                     turn_dir=turn_dir,
                 )
@@ -11052,130 +12205,14 @@ def run_workflow(
                 done=done,
                 max_turns_reached=max_turns_reached,
             )
-            state.end_reason = end_reason
-            recovered_turn = state.current_team_override is not None
-            if recovered_turn:
-                state.current_team_override = None
-            merge_team_name = baseline_team_name if recovered_turn else active_team_name
-
-            merge_status: str | None = None
-            merge_failure_reason: str | None = None
-
-            if exec_ctx is not None and "merge" in exec_ctx.teardown:
-                try:
-                    merge_status, merge_failure_reason = _perform_merge_teardown(
-                        exec_ctx,
-                        wf,
-                        workflow_config,
-                        preflight_probe=resolved_preflight_probe,
-                        repo_root=config.repo_root,
-                        team_name=merge_team_name,
-                        adapter=adapter,
-                        runner=runner,
-                        config_dir=config_dir,
-                        working_dir=working_dir,
-                        original_plan_path=original_plan_path,
-                        active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path,
-                        banner=banner,
-                        state=state,
-                    )
-                except HarnessEnvironmentPreflightError as exc:
-                    _handle_environment_preflight_failure(exc)
-
-            if merge_status != "failed":
-                try:
-                    merging = exec_ctx is not None and "merge" in exec_ctx.teardown
-                    publish_completed_run(
-                        config.repo_root if merging else working_dir,
-                        run_paths.run_dir,
-                        source_ref=exec_ctx.main_branch if merging else "HEAD",
-                    )
-                except PublicationError as exc:
-                    failure_finalizer.raise_failure(
-                        str(exc), original_plan_path=original_plan_path,
-                        current_step_name=current_step_name, active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
-                    )
-
-            if merge_status == "failed":
-                state.status_message = "failed"
-                report = _manager_terminal_incident(
-                    trigger="merge_failure", reason=merge_failure_reason or "merge teardown failed",
-                    current_step=current_step_name, current_role=step.role,
-                    active_team=merge_team_name, active_selector=selector,
-                )
-                summary = report or _format_failure(
-                    reason=merge_failure_reason or "merge teardown failed",
-                    run_dir=run_paths.run_dir, snapshot=post_snapshot,
-                )
-                run_metadata.write(
-                    status="failed",
-                    merge_status=merge_status,
-                    merge_failure_reason=merge_failure_reason,
-                    execution_context=exec_ctx,
-                    last_snapshot=post_snapshot,
-                    turns_completed=state.turns_completed,
-                     original_plan_path=original_plan_path,
-                    current_step_name=current_step_name, active_plan_path=active_plan_path,
-                    new_plan_path=new_plan_path,
-                )
-                prune_old_runs(run_paths.runs_root, config.keep_runs)
-                banner.stop(state)
-                raise WorkflowError(summary, run_dir=run_paths.run_dir)
-
-            prior_original_plan_path = original_plan_path
-            finalized_original_plan_path = _finalize_original_plan_if_complete(
-                config.repo_root,
-                original_plan_path,
-                snapshot=post_snapshot,
-            )
-            if finalized_original_plan_path != prior_original_plan_path:
-                original_plan_path = finalized_original_plan_path
-                if active_plan_path == prior_original_plan_path:
-                    active_plan_path = original_plan_path
-
-            state.status_message = "completed"
-            _emit_event(observer, StatusChangedEvent.create(
-                status_message="completed",
-                turns_completed=state.turns_completed,
-                active_turn=None,
-                current_step_name=current_step_name,
-            ))
-            result = ControllerRunResult(
-                run_dir=run_paths.run_dir,
-                turns_completed=state.turns_completed,
-                final_snapshot=post_snapshot,
-                issues_accumulated=state.issues_accumulated,
-                end_reason=end_reason,
-                recovery_summary=state.current_harness_recovery,
-                recovery_history=tuple(state.harness_recovery_history),
-            )
-            run_metadata.write(
-                status="completed",
-                merge_status=merge_status,
-                execution_context=exec_ctx,
-                last_snapshot=post_snapshot,
-                turns_completed=state.turns_completed,
-                end_reason=end_reason,
-                 original_plan_path=original_plan_path,
-                current_step_name=current_step_name, active_plan_path=active_plan_path,
-                new_plan_path=new_plan_path,
-            )
-            prune_old_runs(run_paths.runs_root, config.keep_runs)
-            banner.stop(state)
-
-            _emit_event(observer, RunCompletedEvent.create(
-                run_dir=run_paths.run_dir,
-                turns_completed=state.turns_completed,
+            return _finish_normal_terminal(
+                terminal_step_name=current_step_name,
+                terminal_step_role=step.role,
+                terminal_selector=selector,
+                active_team=active_team_name,
                 final_snapshot=post_snapshot,
                 end_reason=end_reason,
-                issues_accumulated=state.issues_accumulated,
-                recovery_summary=state.current_harness_recovery,
-                recovery_history=tuple(state.harness_recovery_history),
-            ))
-
-            return result
+            )
 
         if len(wf.steps) > 1:
             max_cap = workflow_config.aflow.max_same_step_turns
