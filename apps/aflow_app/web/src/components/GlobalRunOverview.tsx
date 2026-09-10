@@ -3,6 +3,7 @@ import { fetchGlobalRuns, selectGlobalRuns, useRecentRunsLimit } from '../global
 import type { ProjectInfo, RunStatus } from '../types'
 import { executionDuration, statusLabel } from '../runPresentation'
 import { formatMachineLabel } from '../label'
+import { useHeaderSlots } from './HeaderSlots'
 
 export function RecentRunsLimit() {
   const [limit, setLimit] = useRecentRunsLimit()
@@ -47,9 +48,14 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   }, [ids, nonce, history])
   const rows = projects.flatMap(project => (byProject[project.id] ?? []).map(run => ({ projectId: project.id, run })))
   const selected = selectGlobalRuns(rows, limit, history)
+  const hosted = useHeaderSlots('global-run-overview', {
+    context: <h2 className="header-context-title">All runs</h2>,
+    local: <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={history} onChange={event => { setByProject({}); setHistory(event.target.value as typeof history) }}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
+    primary: <button className="btn btn-secondary btn-sm" onClick={() => setNonce(n => n + 1)}>Refresh</button>,
+  })
   return <div className="workspace-content">
-    <div className="section-heading"><h2>All runs</h2><button className="btn btn-secondary" onClick={() => setNonce(n => n + 1)}>Refresh</button></div>
-    <label>Run history<select className="input" aria-label="Run history" value={history} onChange={event => { setByProject({}); setHistory(event.target.value as typeof history) }}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>
+    {!hosted && <div className="section-heading"><h2>All runs</h2><button className="btn btn-secondary" onClick={() => setNonce(n => n + 1)}>Refresh</button></div>}
+    {!hosted && <label>Run history<select className="input" aria-label="Run history" value={history} onChange={event => { setByProject({}); setHistory(event.target.value as typeof history) }}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
     {errors.length > 0 && <p role="alert" className="notice">Partial or stale results: {errors.join(', ')}. Last available runs are retained.</p>}
     {loading && <p>Loading runs…</p>}
     {registryError && <p role="alert">Project list unavailable: {registryError}. Open Projects to retry.</p>}

@@ -34,9 +34,26 @@
 
 - Follow [UI_GUIDELINES.md](../../../UI_GUIDELINES.md): two compact desktop
   header rows, mobile hamburger navigation and list → detail → Back, document
-  scrolling, and outcome-based browser checks. The previous bounded-pane design
-  is superseded; its replacement is planned, not yet implemented. Preserve the
-  existing draft owners while migrating presentation.
+  scrolling, and outcome-based browser checks. Checkpoints 1–2 implement the
+  document-scroll and list/detail ownership boundary: the shell, workspace,
+  editor details and settings fields flow with the document; only the named wide
+  navigation, option-list and raw-payload exceptions may scroll locally. CP3 adds
+  the registered header-slot composition and compact in-flow menu; page
+  consumers still own exact selections, drafts, saves, and run URL state. The
+  shared SidebarEditorLayout keeps inactive surfaces mounted under actual
+  `hidden` semantics, captures list position/item identity before compact
+  selection, and restores focus on Back. The reviewed responsive implementation
+  carries this ownership through the editor and journey coverage; preserve
+  those owners in future changes.
+
+- The responsive acceptance boundary is exercised by
+  `apps/aflow_app/server/tests/test_responsive_browser.py` across the required
+  viewport matrix. It defaults to Chromium; `AFLOW_TEST_BROWSER=webkit` runs
+  the same journeys in WebKit. The module checks document ownership, list/detail
+  navigation, keyboard/focus and resize retention, touch-sized primary controls,
+  long-content reflow, and disposable light/dark screenshot artifacts. Physical
+  mobile keyboard and browser-toolbar behavior remains explicitly unverified
+  unless separately exercised on hardware.
 
 - Keep history mutation keys by exact project/run/action until acknowledged or
   definitively rejected (including acknowledgement-required validation). Deletion tombstones suppress late rows and

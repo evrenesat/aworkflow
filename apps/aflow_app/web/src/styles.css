@@ -34,11 +34,6 @@
   padding: 0;
 }
 
-html, body {
-  height: 100%;
-  overflow: hidden;
-}
-
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', sans-serif;
   background: var(--color-bg);
@@ -51,7 +46,8 @@ body {
 }
 
 #root {
-  height: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
 }
@@ -292,7 +288,6 @@ input::placeholder, textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-md);
-  min-height: 0;
 }
 
 .run-dashboard-header,
@@ -305,6 +300,13 @@ input::placeholder, textarea::placeholder {
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
+}
+
+.section-heading > *,
+.run-dashboard-header > *,
+.confirmation > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .header-actions {
@@ -357,6 +359,15 @@ input::placeholder, textarea::placeholder {
   margin: 0;
 }
 
+.run-dashboard h2,
+.run-dashboard h3,
+.run-dashboard h4,
+.run-dashboard strong,
+.run-dashboard span,
+.run-dashboard dd {
+  overflow-wrap: anywhere;
+}
+
 .dashboard-loading {
   display: flex;
   justify-content: center;
@@ -400,6 +411,11 @@ input::placeholder, textarea::placeholder {
   padding: var(--spacing-sm);
   border-radius: var(--radius-md);
   border: 1px solid transparent;
+}
+
+.run-list-item > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .run-list-item.selected {
@@ -471,6 +487,7 @@ input::placeholder, textarea::placeholder {
   margin: 0;
   padding: var(--spacing-sm);
   max-height: 16rem;
+  /* Expanded raw payload/event data is an explicitly local scroll exception. */
   overflow: auto;
   background: var(--color-surface-hover);
   border-radius: var(--radius-sm);
@@ -483,8 +500,6 @@ input::placeholder, textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);
-  max-height: 30rem;
-  overflow: auto;
 }
 
 .timeline-event {
@@ -502,13 +517,13 @@ input::placeholder, textarea::placeholder {
   flex-wrap: wrap;
 }
 
-@media (max-width: 800px) {
+@media (max-width: 800px), (max-height: 599px) {
   .dashboard-columns {
     grid-template-columns: minmax(0, 1fr);
   }
 }
 
-@media (max-width: 640px) {
+@media (max-width: 640px), (max-height: 599px) {
   .run-metadata {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -517,26 +532,249 @@ input::placeholder, textarea::placeholder {
 /* App shell and workspace navigation */
 
 .app-shell {
-  height: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
 }
 
-.app-header {
-  padding: var(--spacing-sm) var(--spacing-md);
-  border-bottom: 1px solid var(--color-border);
+.auth-gate {
+  min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  gap: var(--spacing-md);
+  justify-content: center;
+  padding: var(--spacing-lg);
 }
 
-.workspace-nav {
+.auth-gate code {
+  overflow-wrap: anywhere;
+}
+
+.app-header {
+  padding: 0 var(--spacing-md);
   display: flex;
-  gap: var(--spacing-xs);
-  padding: var(--spacing-xs) var(--spacing-md);
+  flex-direction: column;
+  min-width: 0;
+}
+
+.app-header-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  min-height: 56px;
+  padding: 4px 0;
+}
+
+.app-header-row-one {
+  width: 100%;
+}
+
+.app-header-row-two {
+  width: 100%;
+  border-top: 1px solid var(--color-border);
   border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg);
+  z-index: 25;
+  padding-inline: var(--spacing-md);
+  padding-block-start: max(4px, env(safe-area-inset-top));
+}
+
+.app-branding {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.app-branding-compact {
+  flex: 1 1 auto;
+  gap: var(--spacing-sm);
+}
+
+.app-brand-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.workspace-global-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-x: auto;
+}
+
+.app-header .nav-tab {
+  min-height: var(--tap-target);
+  padding: 0 var(--spacing-md);
+}
+
+.app-header-row-one .btn,
+.app-header-row-two .btn {
+  min-height: var(--tap-target);
+}
+
+.app-account-action {
+  flex: 0 0 auto;
+}
+
+.app-menu-trigger {
+  flex: 0 0 var(--tap-target);
+  width: var(--tap-target);
+  padding: 0;
+  font-size: 1.2rem;
+}
+
+.mobile-page-context {
+  display: none;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.header-slot-context {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.header-context-title {
+  max-width: min(28rem, 30vw);
+  font-size: 1rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.header-context-stack {
+  display: flex;
+  align-items: baseline;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.header-slot-local {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.header-slot-local > label {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.header-slot-local > label > span {
+  flex: 0 0 auto;
+  font-size: 0.875rem;
+  color: var(--color-text-dim);
+}
+
+.header-slot-local .input,
+.header-slot-local select,
+.header-slot-local input {
+  min-height: var(--tap-target);
+  min-width: 0;
+}
+
+.header-section-select select,
+.header-filter-select select {
+  width: clamp(9rem, 20vw, 15rem);
+  padding: 0 var(--spacing-sm);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+/* GlobalSettings switches to its labelled select before this tab row can wrap. */
+.header-settings-tabs {
+  flex-wrap: nowrap;
+}
+
+.header-search input {
+  width: clamp(9rem, 24vw, 18rem);
+  padding-inline: var(--spacing-sm);
+}
+
+.header-plan-name input {
+  width: clamp(9rem, 24vw, 18rem);
+  padding-inline: var(--spacing-sm);
+}
+
+.header-plan-name {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.header-slot-spacer {
+  flex: 1 1 0;
+  min-width: var(--spacing-sm);
+}
+
+.header-slot-primary,
+.header-slot-more {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.header-dirty-state {
+  white-space: nowrap;
+}
+
+.project-server-context {
+  overflow-wrap: anywhere;
+}
+
+.app-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+
+.app-notice > :first-child {
+  min-width: 0;
+  flex: 1 1 14rem;
+}
+
+.app-mobile-menu {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  width: 100%;
+  padding: var(--spacing-sm) 0;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-mobile-menu .nav-tab {
+  width: 100%;
+  text-align: left;
+  white-space: normal;
+}
+
+.app-mobile-menu-separator {
+  height: 1px;
+  margin: var(--spacing-xs) 0;
+  background: var(--color-border);
+}
+
+.app-mobile-logout {
+  color: var(--color-error);
 }
 
 .nav-item-group {
@@ -628,20 +866,19 @@ input::placeholder, textarea::placeholder {
 }
 
 .workspace-main {
-  flex: 1;
-  min-height: 0;
-  padding: var(--spacing-md);
+  flex: 1 0 auto;
+  min-width: 0;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-md);
-  overflow-y: auto;
+  gap: 12px;
 }
 
 .workspace-content {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-md);
-  min-height: 0;
+  min-width: 0;
 }
 
 .unsaved-guard {
@@ -751,6 +988,7 @@ input::placeholder, textarea::placeholder {
   flex-direction: column;
   gap: var(--spacing-xs);
   max-height: 220px;
+  /* Bounded discovery suggestions are a local options-list exception. */
   overflow-y: auto;
 }
 
@@ -818,6 +1056,66 @@ input::placeholder, textarea::placeholder {
   overflow-x: auto;
 }
 
+/* Text editors keep the document as the vertical scroll owner. Wrapping is a
+   visual choice only; the native textarea always owns its own overflow. */
+.text-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  min-width: 0;
+}
+
+.text-editor-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  min-height: var(--tap-target);
+  align-items: center;
+  padding-inline: var(--spacing-xs);
+  border-radius: var(--radius-sm);
+}
+
+.text-editor-wrap-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  min-height: var(--tap-target);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.text-editor-wrap-toggle input {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.text-editor-input {
+  width: 100%;
+  min-width: 0;
+  height: clamp(18rem, 50dvh, 36rem);
+  min-height: 18rem;
+  padding: var(--spacing-md);
+  resize: vertical;
+  font-size: 16px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.text-editor-input-nowrap {
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.text-editor-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
 .validation-report {
   display: flex;
   flex-direction: column;
@@ -855,7 +1153,7 @@ input::placeholder, textarea::placeholder {
   }
 
   .config-textarea {
-    min-height: 240px;
+    min-height: 280px;
   }
 }
 
@@ -866,10 +1164,6 @@ input::placeholder, textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-md);
-}
-
-.guided-panel {
-  min-height: 0;
 }
 
 .guided-table {
@@ -889,6 +1183,10 @@ input::placeholder, textarea::placeholder {
   padding: var(--spacing-xs) var(--spacing-sm);
   border-bottom: 1px solid var(--color-border);
   overflow-wrap: anywhere;
+}
+
+.responsive-data-table {
+  min-width: 0;
 }
 
 .guided-team {
@@ -949,14 +1247,25 @@ input::placeholder, textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-xs);
-  max-height: 220px;
+  width: 100%;
+  max-inline-size: calc(100vw - 24px);
+  max-height: min(220px, calc(100dvh - 24px));
+  /* Combobox options stay bounded so keyboard/touch selection remains local. */
   overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
 }
 
+.combobox-listbox-above {
+  top: auto;
+  bottom: 100%;
+}
+
 .combobox-option {
+  min-height: var(--tap-target);
   padding: var(--spacing-xs) var(--spacing-sm);
   flex-direction: row;
   justify-content: space-between;
@@ -1027,6 +1336,7 @@ input::placeholder, textarea::placeholder {
 .run-preview-list dd {
   margin: 0;
   font-size: 0.875rem;
+  overflow-wrap: anywhere;
 }
 
 :root[data-theme="dark"] {
@@ -1072,6 +1382,105 @@ input::placeholder, textarea::placeholder {
 .global-run-row { width: 100%; display: flex; flex-direction: column; gap: var(--spacing-xs); text-align: left; color: var(--color-text); cursor: pointer; overflow-wrap: anywhere; }
 .global-settings textarea { min-width: 0; width: 100%; }
 
+.text-editor-field { display: flex; flex-direction: column; gap: var(--spacing-xs); min-width: 0; }
+
+.skill-editor-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.skill-editor-title {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.skill-editor-title h3,
+.skill-editor-title p {
+  overflow-wrap: anywhere;
+}
+
+.skill-editor-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  min-height: var(--tap-target);
+  flex: 0 1 auto;
+}
+
+.skill-editor-control .text-editor-label {
+  white-space: nowrap;
+}
+
+.skill-editor-control .text-editor-toolbar {
+  flex: 0 0 auto;
+  padding-inline: 0;
+}
+
+.profile-editor-row {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.8fr) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--spacing-md);
+  min-width: 0;
+  margin-block: var(--spacing-md);
+}
+
+.profile-editor-name,
+.profile-editor-field {
+  min-width: 0;
+}
+
+.profile-editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.profile-editor-name {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  overflow-wrap: anywhere;
+}
+
+.profile-editor-note {
+  grid-column: 2 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.profile-editor-new-fields {
+  grid-column: 2 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-md);
+  min-width: 0;
+}
+
+.app-header > *,
+.app-header-row-two > *,
+.workspace-main > *,
+.workspace-content > *,
+.dashboard-form-grid > *,
+.dashboard-columns > *,
+.content-button-row > * {
+  min-width: 0;
+}
+
+.input,
+.textarea,
+.global-settings input,
+.global-settings select,
+.global-settings textarea {
+  max-width: 100%;
+}
+
 /* Team editors and the Add team form. */
 .add-team-form { display: flex; align-items: flex-end; gap: var(--spacing-sm); flex-wrap: wrap; }
 .add-team-form label { flex: 1 1 240px; display: flex; flex-direction: column; gap: var(--spacing-xs); }
@@ -1089,7 +1498,7 @@ input::placeholder, textarea::placeholder {
 /* Sticky Settings toolbar keeps tabs and Save reachable during long scrolls. */
 /* Its containing block must span all fields, not shrink to the scroll viewport. */
 .global-settings { flex: 0 0 auto; }
-.settings-toolbar { position: sticky; top: 0; z-index: 15; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: var(--spacing-sm) 0; margin: 0; background: var(--color-bg); border-bottom: 1px solid var(--color-border); scroll-margin-top: 0; }
+.settings-toolbar { position: sticky; top: 0; z-index: 15; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: max(var(--spacing-sm), env(safe-area-inset-top)) 0 var(--spacing-sm); margin: 0; background: var(--color-bg); border-bottom: 1px solid var(--color-border); scroll-margin-top: 0; }
 .settings-toolbar .config-tabs { flex: 1 1 auto; min-width: 0; }
 .settings-body .settings-fields, .settings-body label, .settings-body input, .settings-body textarea, .settings-body select, .settings-body .card { scroll-margin-top: 4.5rem; }
 
@@ -1104,29 +1513,180 @@ input::placeholder, textarea::placeholder {
 .compact-row:has(.content-button):hover { background: var(--color-surface-hover); border-color: var(--color-primary); }
 
 @media (max-width: 640px) {
+  .input, select, textarea { font-size: 16px; }
   .config-tabs { flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; }
   .config-tabs .btn { scroll-snap-align: start; white-space: nowrap; }
   .compact-row { flex-wrap: wrap; }
   .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
+  .profile-editor-row { grid-template-columns: minmax(0, 1fr); }
+  .profile-editor-note,
+  .profile-editor-new-fields { grid-column: 1; }
+  .profile-editor-new-fields { grid-template-columns: minmax(0, 1fr); }
 }
 
-/* Only Runs and Settings take ownership of the available viewport. */
-.workspace-panes { overflow: hidden; }
-.workspace-panes > .dashboard-host:not([hidden]), .workspace-panes .run-dashboard,
-.workspace-panes > .global-settings { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
-.sidebar-editor-layout { display: grid; grid-template-columns: minmax(12rem, 28%) minmax(0, 1fr); gap: var(--spacing-md); flex: 1; min-height: 0; min-width: 0; }
-.sidebar-editor-navigation, .sidebar-editor-detail { overflow: auto; min-height: 0; min-width: 0; overscroll-behavior: contain; }
+/* The document owns ordinary vertical flow. Only wide navigation gets a
+   bounded local scroll surface; detail and editor content stay in the page. */
+.sidebar-editor-layout {
+  display: grid;
+  grid-template-columns: minmax(12rem, 16rem) minmax(0, 1fr);
+  gap: var(--spacing-md);
+  align-items: start;
+  min-width: 0;
+  /* Back restores the document offset explicitly while a sibling is hidden. */
+  overflow-anchor: none;
+}
+.sidebar-editor-navigation {
+  position: sticky;
+  top: var(--spacing-md);
+  align-self: start;
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  min-width: 0;
+}
+.sidebar-editor-detail { min-width: 0; }
+.sidebar-editor-layout > * { min-width: 0; }
 .sidebar-editor-navigation button { white-space: normal; overflow-wrap: anywhere; }
-.sidebar-editor-navigation .section-heading { position: sticky; top: 0; background: var(--color-bg); z-index: 1; }
 .sidebar-entry { display: block; width: 100%; text-align: left; margin-bottom: .35rem; }
 .sidebar-editor-detail > .card { min-width: 0; }
-.workspace-panes .settings-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.workspace-panes .global-settings > .settings-body > .settings-fields { overflow: auto; }
-.settings-guided-content { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.settings-guided-content > .settings-body { overflow: auto; }
-.settings-guided-content > .settings-body > :not(.sidebar-editor-layout):not(.settings-guided-content) { flex-shrink: 0; }
-.settings-guided-content:has(.sidebar-editor-layout) > .settings-body { overflow: hidden; }
-@media (max-width: 767px) {
-  .sidebar-editor-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(5rem, 35dvh) minmax(0, 1fr); }
-  .sidebar-editor-navigation { max-height: 35dvh; }
+
+.plan-editor,
+.plan-list {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.plan-editor { gap: var(--spacing-md); }
+.plan-list { gap: var(--spacing-lg); }
+.plan-editor-header,
+.plan-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.plan-editor-header > * { min-width: 0; overflow-wrap: anywhere; }
+.plan-editor-textarea { min-height: 360px; resize: vertical; width: 100%; }
+
+.skill-install-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.skill-install-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+
+.more-menu [role='menu'] .btn {
+  min-height: var(--tap-target);
+  width: 100%;
+  justify-content: flex-start;
+  white-space: normal;
+  text-align: left;
+}
+
+@media (min-height: 600px) {
+  /* Row two remains available while the first row scrolls away on tall screens. */
+  .app-header-row-two {
+    position: sticky;
+    top: 0;
+  }
+}
+
+@media (max-width: 959px), (max-height: 599px) {
+  .mobile-page-context { display: block; }
+  .header-context-title { max-width: none; font-size: 0.95rem; }
+  .header-slot-spacer { display: none; }
+  .header-slot-local { flex: 1 1 8rem; }
+  .app-header-row-two { flex-wrap: wrap; }
+
+  .header-plan-name input {
+    flex: 1 1 9rem;
+    width: auto;
+  }
+
+  .dashboard-form-grid,
+  .run-preview-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .btn-sm {
+    min-height: var(--tap-target);
+  }
+
+  .responsive-data-table,
+  .responsive-data-table tbody,
+  .responsive-data-table tr {
+    display: block;
+    width: 100%;
+  }
+
+  .responsive-data-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .responsive-data-table tr {
+    border-bottom: 1px solid var(--color-border);
+    padding-block: var(--spacing-xs);
+  }
+
+  /* Block rows need captions to use the table's available width as well. */
+  .responsive-data-table caption {
+    display: block;
+    width: 100%;
+  }
+
+  .responsive-data-table td {
+    display: grid;
+    grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
+    gap: var(--spacing-sm);
+    align-items: baseline;
+    border-bottom: 0;
+    padding-inline: 0;
+  }
+
+  .responsive-data-table td::before {
+    content: attr(data-label);
+    color: var(--color-text-dim);
+    font-family: inherit;
+    font-size: 0.75rem;
+    overflow-wrap: anywhere;
+  }
+
+  /* Compact/short screens expose one mounted list or detail surface at a time;
+     SidebarEditorLayout owns the hidden presentation state. */
+  .sidebar-editor-layout {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar-editor-navigation {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+@media (max-height: 599px) {
+  /* Short viewports cannot reserve reliable space for a sticky action row. */
+  .app-header-row-two { position: static; }
+  .settings-toolbar { position: static; }
 }

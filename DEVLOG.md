@@ -1478,3 +1478,177 @@ Final verification: web tests (213), all server tests including Chromium layout 
 - Verification: 2,058 Python tests plus 219 subtests, 291 web tests, Ruff,
   web production build, wheel inspection, and browser smoke passed. No public
   push, real provider, or live configuration change was used.
+
+## 2026-09-10 — Responsive document-scroll checkpoint 1
+
+- Removed root/body/shell/workspace viewport locks and the detail/editor scroll
+  ownership rules. Runs, Settings and plan content now grow in document flow;
+  wide navigation alone retains a sticky bounded local list exception, while
+  compact and short layouts stack natural-height blocks until the next
+  list/detail checkpoint.
+- Removed `SidebarEditorLayout` selection-time detail resets and PlanPanel
+  inline height/overflow ownership. Added targeted minimum-width and wrapping
+  rules without changing draft, save, history or request identities.
+- Replaced independent-pane browser expectations with document wheel movement,
+  positive detail dimensions, reachable final controls, natural long Settings
+  and plan-list scrolling, and exact long-plan text persistence.
+- Verification: 279 web tests, production build, four disposable Chromium
+  browser checks and `git diff --check` passed. No live configuration or
+  production run was changed.
+
+## 2026-09-10 — Responsive list/detail checkpoint 2
+
+- Added compact list → detail → Back presentation to the shared
+  `SidebarEditorLayout` for Skills, Teams, Workflows, Prompts and Run history.
+  The compact helper follows the CSS media query through a cleaned-up
+  `matchMedia` listener; wide layouts retain both columns. Domain consumers
+  continue to own exact selections, drafts, saves, URL state and requests.
+- Compact selection captures document position and the clicked machine identity
+  before opening, focuses the detail heading once, and Back restores the row or
+  the labelled list surface if refresh removed it. Both surfaces stay mounted,
+  with the inactive one removed from keyboard/accessibility traversal. A run URL
+  opens detail explicitly; passive refresh does not reset focus or scroll, and
+  resize preserves an opened detail.
+- Added seven focused layout tests and extended disposable Chromium Settings and
+  run journeys for compact deep links, list/detail/Back, focus, position and
+  re-entry. Verification for this checkpoint: 174 targeted web tests, a
+  production build, four Chromium browser checks and `git diff --check` passed.
+  No live configuration, production run, publication or CI deployment was
+  changed.
+
+## 2026-09-10 — CP2 run-entry intent repair
+
+- Separated App-owned explicit run URL/browser-navigation intent from the
+  synchronized selected-run URL. Ordinary default selection therefore remains
+  list-first on compact screens while direct links and browser navigation still
+  open the exact run detail; existing selection, URL and request behavior is
+  unchanged.
+- All runs and successful launch handoffs now mark that existing explicit
+  intent before moving to their exact Runs URL, so compact detail opens even
+  when the dashboard was not visible or was locally backed out of.
+- Added compact App and disposable Chromium regressions for fresh and repeated
+  All runs selection, alongside passive default synchronization, explicit
+  initial links, later browser navigation, row Back, identity and focus
+  restoration.
+- Verification: the CP2 subset passed 178 web tests; the production build and
+  all four disposable Chromium browser checks passed; and `git diff --check`
+  passed. No live configuration, production run, publication, CI, or live
+  activation was changed.
+
+## 2026-09-10 — Responsive shell checkpoint 3
+
+- Added registered header slots so the shell owns compact two-row navigation
+  while pages retain their existing action handlers and draft/request owners.
+  Settings now places section navigation, Save all changes and secondary actions
+  in the shared row; Skills installation is an in-flow disclosure opened from
+  More instead of a permanent card.
+- Compact navigation uses an accessible in-flow Menu with current context,
+  existing destinations and Logout, including Escape/focus return. Settings
+  uses one active native section selector on compact layouts and keyboard tabs
+  on wide layouts without fixed section-count assumptions.
+- Verification: the CP3 web tests, production build, disposable Settings
+  Chromium suite and `git diff --check` passed. No live configuration,
+  production run, publication, CI or live activation was changed.
+
+## 2026-09-10 — CP3 repair evidence
+
+- Kept the list/detail breakpoint unchanged while switching Settings to its
+  labelled section selector before the shared header can wrap at 960–1024px.
+  More → Install skills now completes the guarded Advanced TOML → Guided
+  transition, preserving valid and invalid raw drafts; Hide controls only the
+  disclosure while retained success/failure outcomes remain available on reopen.
+- Updated compact run-navigation coverage for the shared Menu and header More
+  actions. Verification: 100 targeted web tests, production build, both
+  disposable Chromium modules (4 passed), and `git diff --check` passed. No
+  live configuration, production run, publication, CI or live activation was
+  changed.
+
+## 2026-09-10 — CP3 hosted recovery selector correction
+
+- Updated the hosted successor-recovery regression to exercise the shared
+  More → Cancel action after the header migration; standalone dashboard Cancel
+  coverage remains unchanged and exact request/owner-stop assertions remain
+  intact.
+- Verification: the focused recovery test, full 295-test web suite, production
+  build, two disposable Chromium modules, and `git diff --check` passed. No
+  live configuration, publication, CI or live activation changed.
+
+## 2026-09-10 — Responsive editor checkpoint 4
+
+- Added a shared native text editor for settings, skills, prompts, plans and
+  connection TOML. It defaults to soft visual wrapping with a labelled
+  `Wrap lines` control; disabling wrapping keeps horizontal overflow inside
+  the editor, while native vertical scrolling, desktop resize and exact draft
+  bytes remain owned by the existing callers.
+- Reflowed profile rows into readable name/model/effort columns with compact
+  stacked fields, and kept combobox suggestions bounded and lower-edge safe.
+  Existing draft, conflict, partial-save, acknowledgement and Undo paths stay
+  in ordinary document flow.
+- Verification: the exact CP4 web suite passed 120 tests, the full web suite
+  passed 297 tests, the production build passed, the Settings Chromium module
+  passed 3 tests including 20,000-character Markdown/TOML and partial-save
+  journeys, and `git diff --check` passed. No publication, CI, or live
+  activation was performed.
+
+## 2026-09-10 — CP4 native editor overlay repair
+
+- Moved the shared `Wrap lines` control into normal document flow and removed
+  the overlay-only textarea padding. Skills places the shared toolbar beside
+  its existing title/`SKILL.md` label, leaving the native textarea as the sole
+  editor scroll and hit-test surface while preserving the 44px control and
+  16px editor text requirements.
+- Extended the disposable Skills Chromium journey to verify 1280×720 and
+  390×844 geometry, actual client editing height, toolbar/editor non-overlap,
+  post-scroll hit-testing, caret movement, exact wrap-toggle bytes, saved
+  content, and retained partial-save acknowledgements. Inspected the captured
+  dark-theme scrolled-editor screenshot.
+- Verification: full web suite (297 tests), production build, both required
+  Chromium modules (4 tests), and `git diff --check` passed. Original CP4
+  approval remains with the reviewer; no publication, CI, or live activation
+  was performed.
+
+## 2026-09-10 — Responsive browser acceptance checkpoint 6
+
+- Added the disposable responsive-browser module covering 320×568, 390×844,
+  768×1024, 844×390, 1280×720, 1440×900 and 390×420. It exercises the shared
+  header budget, document scrolling, list/detail/Back and focus restoration,
+  long plans/runs/configuration, 200% text reflow, keyboard menu behavior,
+  resize-retained drafts, validation and failed-save retention, touch-sized
+  primary controls, safe-area-aware sticky controls, and light/dark screenshots.
+- The module rejects unsupported browser names and runs unchanged with
+  `AFLOW_TEST_BROWSER=webkit`. The Ubuntu/Python 3.12 dashboard job installs
+  WebKit, runs this module, and uploads its screenshot artifacts. Physical
+  mobile keyboard/browser-toolbar behavior remains unverified.
+- Repair revalidation persists the existing `aflow.appearance` preference
+  before every screenshot navigation and asserts the loaded theme. Its test
+  zoom snapshots computed visible text/control sizes before applying doubled
+  inline sizes, proving the Skills editor text—not only the root—reflows at
+  200%. Chromium and WebKit screenshots were regenerated and inspected.
+- Repair verification: full web tests (297), production build, combined
+  Chromium browser checks (13), responsive Chromium (8), responsive WebKit
+  (8), and `git diff --check` passed. Original CP6 remains unapproved; no
+  publication, remote CI receipt, or live activation was performed.
+
+## 2026-09-10 — Responsive UI integration checkpoint 1
+
+- HISTORY: Integrated approved responsive source `61d5988` with accepted main
+  `5259740` using a no-commit merge. `MERGE_HEAD` remains the source commit for
+  reviewer-owned approval; the source worktree and the separate issue38 work
+  remain untouched.
+- HISTORY: Preserved both implementation histories and retained current main's
+  live configuration, dirty-worktree preflight, restart/successor controls,
+  API semantics, merge context and delivery gates alongside the responsive
+  header, document scrolling, list/detail navigation and native editors.
+- HISTORY: The first combined backend/browser attempt exposed the fixture's
+  unacknowledged dirty-worktree preflight. The acceptance test now waits for a
+  loaded inspection result, checks the real confirmation control, and then
+  asserts that Start is enabled; no sleep, timeout inflation or retry-only
+  acceptance was added.
+- Combined verification passed: web suite (309 tests), production build, full
+  backend suite (2043 passed, 223 subtests), Chromium combined journeys (13),
+  WebKit responsive journeys (8), Ruff, and `git diff --check`.
+- Fresh Chromium and WebKit screenshots for Skills, run detail, New Run and
+  Plans were inspected in light/dark and landscape states; New Run evidence
+  shows the loaded preflight result rather than a loading state. Physical mobile
+  keyboard/browser-toolbar behavior remains unverified. Publication, exact CI
+  and live activation remain downstream delivery checks.

@@ -4,6 +4,7 @@ import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { TemplateVariablesHelp } from './TemplateVariablesHelp'
 import { formatMachineChoice, formatMachineLabel } from '../label'
+import { TextEditor } from './TextEditor'
 
 type ChangeFn = (update: (value: GuidedFormProjection) => void) => void
 
@@ -41,7 +42,7 @@ function NamedPromptCard({ name, text, displayName, usages, templateVariables, r
     ) : (
       <>
         <label>Prompt key <input className="input" value={displayName} aria-label="Prompt key" onChange={e => rename(name, e.target.value)} /></label>
-        <label>Prompt text <textarea className="input" rows={7} aria-label="Prompt text" value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></label>
+        <div className="text-editor-field"><span className="text-editor-label">Prompt text</span><TextEditor rows={7} aria-label="Prompt text" value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></div>
         <TemplateVariablesHelp variables={templateVariables} context="named" />
         {referenced
           ? <details className="prompt-usages">
@@ -104,7 +105,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
       <label>Restore under key <input className="input" aria-label="Restore key" value={restoreKeys[item.name] ?? item.name} onChange={event => setRestoreKeys(keys => ({ ...keys, [item.name]: event.target.value }))} /></label>
       <button type="button" className="btn btn-secondary btn-sm" aria-label={`Undo deletion of ${formatMachineLabel(item.name)}`} onClick={() => onUndo(item.name, restoreKeys[item.name] ?? item.name)}>Undo</button>
     </div>)}
-    <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} navigation={<div><h3>Prompts</h3>{entries.map(entry => <button className={`btn sidebar-entry ${selected === entry.id ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === entry.id} key={entry.id} onClick={() => select(entry.id)}><span>{entry.label}</span>{entryLabelCounts.get(entry.label)! > 1 && entry.rawLabel !== entry.label && <span className="mono text-xs text-dim">{entry.rawLabel}</span>}</button>)}</div>}>
+    <SidebarEditorLayout selection={selected} navigationVersion={navigationVersion} listLabel="Prompts" navigation={<div><h3>Prompts</h3>{entries.map(entry => <button data-sidebar-editor-item={entry.id} className={`btn sidebar-entry ${selected === entry.id ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selected === entry.id} key={entry.id} onClick={() => select(entry.id)}><span>{entry.label}</span>{entryLabelCounts.get(entry.label)! > 1 && entry.rawLabel !== entry.label && <span className="mono text-xs text-dim">{entry.rawLabel}</span>}</button>)}</div>}>
     <h3>{entries.find(entry => entry.id === selected)?.label ?? 'No prompts'}{(() => { const entry = entries.find(item => item.id === selected); return entry && entryLabelCounts.get(entry.label)! > 1 && entry.rawLabel !== entry.label ? <span className="mono text-xs text-dim"> {entry.rawLabel}</span> : null })()}</h3>
     {Object.entries(draft.prompts ?? {}).filter(([name]) => selected === `named:${name}`).map(([name, text]) => <NamedPromptCard
       key={name}
@@ -120,7 +121,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
     <div className="settings-fields">
       {role && <>
         <span>{role in map ? 'Explicit override' : team ? 'Inherited global text' : 'Default role prompt'}</span>
-        <textarea className="input" rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} />
+        <div className="text-editor-field"><span className="text-editor-label">Role prompt text</span><TextEditor rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} /></div>
         <TemplateVariablesHelp variables={draft.template_variables} context="role" />
         {role in map && <button className="btn btn-secondary" onClick={() => setRoleText(null)}>Remove override</button>}
         {role in map && <details><summary>Move override</summary>

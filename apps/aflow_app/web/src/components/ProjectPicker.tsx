@@ -10,6 +10,7 @@ import { readinessClass, readinessLabel } from '../readiness'
 import * as api from '../api'
 import { ProjectCreateForm } from './ProjectCreateForm'
 import { MenuItem, MoreMenu } from './MoreMenu'
+import { useHeaderSlots } from './HeaderSlots'
 
 interface ProjectPickerProps {
   projects: ProjectInfo[]
@@ -126,10 +127,28 @@ export function ProjectPicker({
   const suggestions = filteredCandidates.filter(
     (candidate) => candidate.registered_project_id === null && candidate.addable,
   )
+  const hosted = useHeaderSlots('project-picker', {
+    context: <h2 className="header-context-title">Projects</h2>,
+    local: <label className="header-search"><span>Search</span><input
+      className="input"
+      aria-label="Search projects and available candidates"
+      placeholder="Filter projects"
+      value={search}
+      onChange={(event) => setSearch(event.target.value)}
+    /></label>,
+    primary: <button
+      className="btn btn-primary btn-sm"
+      onClick={() => setShowCreateForm((current) => !current)}
+      aria-expanded={showCreateForm}
+    >{showCreateForm ? 'Close form' : 'Add project'}</button>,
+    more: <MoreMenu label="More project actions" triggerLabel="More">
+      <MenuItem disabled={loading || discoveryLoading} onClick={() => void handleRefresh()}>Refresh</MenuItem>
+    </MoreMenu>,
+  })
 
   return (
     <div className="project-picker">
-      <div className="section-heading">
+      {!hosted && <div className="section-heading">
         <div>
           <h2 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Projects</h2>
           <div className="text-xs text-dim">
@@ -149,7 +168,7 @@ export function ProjectPicker({
             {showCreateForm ? 'Close form' : 'Add project'}
           </button>
         </div>
-      </div>
+      </div>}
 
       {error && (
         <div className="error-message" role="alert">
@@ -164,7 +183,10 @@ export function ProjectPicker({
 
       {!loading && !error && (
         <>
-          <label className="dashboard-field project-search">
+          {hosted && discovery && <div className="project-server-context text-xs text-dim">
+            Registered beneath the server's managed root — <span className="mono">{discovery.managed_root}</span>.
+          </div>}
+          {!hosted && <label className="dashboard-field project-search">
             <span>Search projects</span>
             <input
               className="input"
@@ -173,7 +195,7 @@ export function ProjectPicker({
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
-          </label>
+          </label>}
 
           <h3 className="project-subheading">Added projects</h3>
           {projects.length > 0 && filteredProjects.length === 0 && (

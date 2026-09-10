@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react'
 import { ApiError } from '../api'
 import * as api from '../api'
 import type { PlanDocument, ProjectInfo } from '../types'
+import { MenuItem, MoreMenu } from './MoreMenu'
+import { useHeaderSlots } from './HeaderSlots'
+import { TextEditor } from './TextEditor'
 
 interface PlanPanelProps {
   project: ProjectInfo
@@ -220,10 +223,22 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
     setConfirmClose(false)
   }
 
+  const runnable = selected !== null && selected.status === 'in_progress' && !dirty
+  const hosted = useHeaderSlots('plan-panel', {
+    context: selected ? <h2 className="header-context-title">{selected.name} <span className="text-xs text-dim">{selected.status === 'todo' ? 'Draft' : selected.status === 'in_progress' ? 'Ready' : 'Done'}</span></h2> : <h2 className="header-context-title">Plans</h2>,
+    compactContext: selected ? <span className="header-context-title">{selected.name}</span> : undefined,
+    local: selected ? <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button> : <label className="header-plan-name"><span>New plan</span><input className="input mono" aria-label="New plan filename" placeholder="new-plan.md" value={newName} onChange={(event) => setNewName(event.target.value)} /></label>,
+    primary: selected ? <button className="btn btn-primary btn-sm" onClick={() => void savePlan()} disabled={busy}>{busy ? 'Working…' : 'Save'}</button> : <button className="btn btn-primary btn-sm" onClick={() => void createPlan()} disabled={busy || !newName.trim()}>Create plan</button>,
+    more: selected ? <MoreMenu label="More plan actions" triggerLabel="More">
+      {conflict && !confirmReload && <MenuItem onClick={() => setConfirmReload(true)}>Reload from server…</MenuItem>}
+      {selected.status !== 'done' && <MenuItem disabled={busy || dirty} onClick={() => void promotePlan()}>Move to {selected.status === 'todo' ? 'Ready' : 'Done'}</MenuItem>}
+      {selected.status === 'in_progress' && <MenuItem disabled={!runnable} onClick={() => onOpenRunDashboard(selected.path)}>Run this plan</MenuItem>}
+    </MoreMenu> : <MoreMenu label="More plan actions" triggerLabel="More"><MenuItem onClick={() => void refresh()}>Refresh plans</MenuItem></MoreMenu>,
+  })
+
   if (selected) {
     // Only a saved Ready plan can run: a dirty draft or another lifecycle
     // state explains its next step instead of exposing a button that no-ops.
-    const runnable = selected.status === 'in_progress' && !dirty
     const lifecycleExplanation = selected.status === 'todo'
       ? 'This draft is not runnable yet. Save it and move it to Ready (in progress) to enable “Run this plan”.'
       : selected.status === 'done'
@@ -233,9 +248,9 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           : null
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--spacing-md)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
-          <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← All plans</button>
+      <div className="plan-editor">
+        {!hosted && <div className="plan-editor-header">
+          <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
           <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>
             {selected.status === 'todo' ? 'Draft — not runnable yet' : selected.status === 'in_progress' ? 'Ready — runnable' : 'Done — not runnable'}
@@ -243,7 +258,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           <span className="text-xs text-dim mono" title={selected.revision}>
             Revision {shortRevision(selected.revision)}
           </span>
-        </div>
+        </div>}
         {error && <div className="error-message" role="alert">{error}</div>}
         {conflict && (
           <div className="error-message" role="alert">
@@ -278,14 +293,13 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
             </div>
           </div>
         )}
-        <textarea
-          className="input mono"
+        <TextEditor
+          className="mono plan-editor-textarea"
           aria-label="Plan content"
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          style={{ flex: 1, minHeight: '360px', resize: 'vertical' }}
         />
-        <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap', alignItems: 'center' }}>
+        {!hosted && <div className="plan-editor-actions">
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
           {selected.status !== 'done' && (
             <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy || dirty}>
@@ -301,7 +315,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
               Run this plan
             </button>
           )}
-        </div>
+        </div>}
         {lifecycleExplanation && <div className="text-sm text-dim">{lifecycleExplanation}</div>}
         {dirty && selected.status !== 'in_progress' && (
           <div className="text-sm text-dim">Save this draft before moving it through the lifecycle.</div>
@@ -311,9 +325,9 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-lg)', height: '100%', overflowY: 'auto' }}>
+    <div className="plan-list">
       {error && <div className="error-message" role="alert">{error}</div>}
-      <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
+      {!hosted && <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
         <input
           className="input mono"
           aria-label="New plan filename"
@@ -324,7 +338,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
         <button className="btn btn-primary" onClick={() => void createPlan()} disabled={busy || !newName.trim()}>
           Create plan
         </button>
-      </div>
+      </div>}
       {LIFECYCLE_SECTIONS.map(({ status, title, hint }) => {
         const matching = plans.filter((plan) => plan.status === status)
         return (

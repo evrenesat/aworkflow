@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import type { ProjectConfig, ProjectCreateRequest, ProjectCreateResult, ProjectInfo } from './types'
 import { markUserActivity } from './activity'
 import { ProjectPicker } from './components/ProjectPicker'
@@ -6,6 +6,8 @@ import { GlobalSettings } from './components/GlobalSettings'
 import { GlobalRunOverview } from './components/GlobalRunOverview'
 import { PlanPanel } from './components/PlanPanel'
 import { RunDashboard, type PendingSuccessorStart, type RunSelectionChange } from './components/RunDashboard'
+import { HeaderSlotsProvider, type HeaderSlotContribution } from './components/HeaderSlots'
+import { useCompactLayout } from './components/SidebarEditorLayout'
 import * as api from './api'
 import {
   normalizeWorkspaceQuery,
@@ -16,6 +18,17 @@ import {
 } from './urlState'
 
 type View = WorkspaceQuery['view']
+
+interface RunNavigationIntent {
+  projectId: string
+  runId: string
+}
+
+/** Returns only URL entries that were capable of explicitly opening a run. */
+function runNavigationIntentFor(query: WorkspaceQuery): RunNavigationIntent | null {
+  if (query.view !== 'runs' || query.project === null || query.run === null) return null
+  return { projectId: query.project, runId: query.run }
+}
 
 /** Why the login gate is (or is not) shown. */
 type AuthGate = 'checking' | 'signedOut' | 'restoreFailed' | 'expired' | 'signedIn'
@@ -37,6 +50,117 @@ const readinessGuidance: Record<string, string> = {
     + 'Fix the directory (a valid Git commit HEAD is required), then re-check the project.',
 }
 
+interface AppHeaderProps {
+  selectedProject: ProjectInfo | null
+  view: View
+  slots: HeaderSlotContribution
+  onSwitchView: (view: View) => void
+  onLogout: () => void
+  logoutPending: boolean
+}
+
+function AppHeader({ selectedProject, view, slots, onSwitchView, onLogout, logoutPending }: AppHeaderProps) {
+  const compact = useCompactLayout()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
+  const menuId = useId()
+  const pageLabel = NAV_ITEMS.find(item => item.view === view)?.label ?? 'Workspace'
+  const defaultContext = <span className="header-context-title">{pageLabel}</span>
+
+  useEffect(() => {
+    if (!compact) setMenuOpen(false)
+  }, [compact])
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setMenuOpen(false)
+      menuButtonRef.current?.focus()
+    }
+    document.addEventListener('keydown', handleEscape)
+    return () => document.removeEventListener('keydown', handleEscape)
+  }, [menuOpen])
+
+  function closeMenu(returnFocus = false) {
+    setMenuOpen(false)
+    if (returnFocus) menuButtonRef.current?.focus()
+  }
+
+  function navigate(next: View) {
+    closeMenu(true)
+    onSwitchView(next)
+  }
+
+  function navigationButton(item: typeof NAV_ITEMS[number], menuItem = false) {
+    const disabled = item.needsProject && !selectedProject
+    return <button
+      key={item.view}
+      className={`nav-tab ${view === item.view ? 'active' : ''}`}
+      role={menuItem ? 'menuitem' : undefined}
+      aria-current={view === item.view ? 'page' : undefined}
+      disabled={disabled}
+      title={disabled ? 'Open a project first' : undefined}
+      onClick={() => navigate(item.view)}
+    >
+      {item.label}
+    </button>
+  }
+
+  return <>
+    <header className="app-header">
+      <div className="app-header-row app-header-row-one">
+        {compact ? <>
+          <button
+            ref={menuButtonRef}
+            type="button"
+            className="btn btn-secondary app-menu-trigger"
+            aria-label="Menu"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            aria-controls={menuId}
+            onClick={() => setMenuOpen(open => !open)}
+          ><span aria-hidden="true">☰</span></button>
+          <div className="app-branding app-branding-compact">
+            <h1 className="app-brand-title truncate" title={selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}>
+              {selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}
+            </h1>
+            <div className="mobile-page-context">{slots.compactContext ?? slots.context ?? defaultContext}</div>
+          </div>
+        </> : <>
+          <div className="app-branding">
+            <h1 className="app-brand-title truncate" title={selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}>
+              {selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}
+          </h1>
+        </div>
+        <nav className="workspace-global-nav" aria-label="Global navigation">
+            {NAV_ITEMS.filter(item => !item.needsProject || selectedProject).map(item => navigationButton(item))}
+          </nav>
+          <button className="btn btn-secondary app-account-action" onClick={onLogout} disabled={logoutPending}>
+            {logoutPending ? 'Signing out…' : 'Logout'}
+          </button>
+        </>}
+      </div>
+
+      {compact && menuOpen && <nav id={menuId} className="app-mobile-menu" role="menu" aria-label="Workspace navigation">
+        {NAV_ITEMS.map(item => navigationButton(item, true))}
+        <div className="app-mobile-menu-separator" />
+        <button role="menuitem" className="nav-tab app-mobile-logout" onClick={() => { closeMenu(true); onLogout() }} disabled={logoutPending}>
+          {logoutPending ? 'Signing out…' : 'Logout'}
+        </button>
+      </nav>}
+    </header>
+    <div className="app-header-row app-header-row-two">
+      {!compact && <div className="header-slot-context">{slots.context ?? defaultContext}</div>}
+      {slots.local && <div className="header-slot-local">{slots.local}</div>}
+      <div className="header-slot-spacer" />
+      {slots.primary && <div className="header-slot-primary">{slots.primary}</div>}
+      {slots.more && <div className="header-slot-more">{slots.more}</div>}
+    </div>
+  </>
+}
+
 function initialWorkspaceQuery(): WorkspaceQuery {
   return normalizeWorkspaceQuery(parseWorkspaceQuery(window.location.search))
 }
@@ -53,6 +177,9 @@ export function App() {
   const [projectsLoading, setProjectsLoading] = useState(true)
   const [projectsError, setProjectsError] = useState<string | null>(null)
   const [query, setQuery] = useState<WorkspaceQuery>(initialWorkspaceQuery)
+  const [runNavigationIntent, setRunNavigationIntent] = useState<RunNavigationIntent | null>(() => (
+    runNavigationIntentFor(initialWorkspaceQuery())
+  ))
   const [visitedProjects, setVisitedProjects] = useState<string[]>([])
   useEffect(() => {
     if (query.project) setVisitedProjects(ids => ids.includes(query.project!) ? ids : [...ids, query.project!])
@@ -63,6 +190,10 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void; onCancel?: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
   const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
+  const alertRef = useRef<HTMLElement | null>(null)
+  const setAlertRef = useCallback((element: HTMLElement | null) => {
+    alertRef.current = element
+  }, [])
   // Bumped on logout so late responses cannot restore signed-in UI.
   const authEpoch = useRef(0)
 
@@ -70,6 +201,28 @@ export function App() {
   queryRef.current = query
   const dirtyRef = useRef(false)
   dirtyRef.current = configDirty || planDirty
+
+  useEffect(() => {
+    if (!loginError && !logoutError && !pendingAction && !pendingSuccessorStart) return
+    const alert = alertRef.current
+    if (!alert) return
+    try {
+      alert.focus({ preventScroll: true })
+    } catch {
+      alert.focus()
+    }
+    if (typeof alert.scrollIntoView === 'function') {
+      alert.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    }
+  }, [loginError, logoutError, pendingAction, pendingSuccessorStart])
+
+  // A passive selected-run URL replacement must not leave an old explicit
+  // entry marker armed for a later visit to the same run.
+  useEffect(() => {
+    if (!runNavigationIntent) return
+    if (query.view === 'runs' && query.project === runNavigationIntent.projectId && query.run === runNavigationIntent.runId) return
+    setRunNavigationIntent(null)
+  }, [query, runNavigationIntent])
 
   // On load, ask the server whether the browser session cookie is still
   // valid. Only a definitive 401 shows Login; a network/server failure
@@ -174,7 +327,10 @@ export function App() {
       const target = normalizeWorkspaceQuery(parseWorkspaceQuery(window.location.search))
       const current = queryRef.current
       if (sameWorkspaceQuery(target, current)) return
-      const apply = () => applyQuery(target, 'replace')
+      const apply = () => {
+        setRunNavigationIntent(runNavigationIntentFor(target))
+        applyQuery(target, 'replace')
+      }
       if (dirtyRef.current) {
         setPendingAction({
           description: 'follow the browser navigation',
@@ -381,9 +537,15 @@ export function App() {
     else applyQuery({ ...current, run: change.runId }, 'replace')
   }, [applyQuery])
 
+  /** Opens a run from outside its mounted history list as an explicit detail entry. */
+  const openExplicitRun = useCallback((project: string, run: string) => {
+    setRunNavigationIntent({ projectId: project, runId: run })
+    applyQuery({ project, view: 'runs', run }, 'push')
+  }, [applyQuery])
+
   if (authGate !== 'signedIn') {
     return (
-      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--spacing-lg)' }}>
+      <div className="auth-gate">
         <div className="card" style={{ maxWidth: '420px', width: '100%' }}>
           <h1 style={{ fontSize: '1.5rem', fontWeight: 600, marginBottom: 'var(--spacing-lg)' }}>aflow Remote</h1>
           {authGate === 'checking' && (
@@ -391,7 +553,7 @@ export function App() {
           )}
           {authGate === 'restoreFailed' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
-              <p className="text-sm" role="alert">
+              <p ref={setAlertRef} className="text-sm" role="alert" tabIndex={-1}>
                 The server could not be reached to check your session. This is a connection problem, not a signed-out state.
               </p>
               <button
@@ -410,7 +572,7 @@ export function App() {
                   Sign in again to return to your current project and view.
                 </p>
               )}
-              {loginError && <p className="text-sm" role="alert">{loginError}</p>}
+              {loginError && <p ref={setAlertRef} className="text-sm" role="alert" tabIndex={-1}>{loginError}</p>}
               <input className="input" type="password" placeholder="Auth token" value={loginDraft}
                 onChange={(event) => setLoginDraft(event.target.value)}
                 onKeyDown={(event) => event.key === 'Enter' && void handleLogin()} />
@@ -435,63 +597,44 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }} className="truncate" title={selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}>
-            {selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}
-          </h1>
-        </div>
-        <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()} disabled={logoutPending}>
-          {logoutPending ? 'Signing out…' : 'Logout'}
-        </button>
-      </header>
-
-      {logoutError && (
-        <div className="notice" role="alert" style={{ display: 'flex', gap: 'var(--spacing-md)', alignItems: 'center' }}>
-          <span className="text-sm">{logoutError}</span>
-          <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()}>Retry logout</button>
-        </div>
-      )}
-
-      <nav className="workspace-nav" aria-label="Workspace views">
-        {NAV_ITEMS.filter(item => !item.needsProject || selectedProject).map((item) => (
-          <span key={item.view} className="nav-item-group">
-            <button
-              className={`nav-tab ${view === item.view ? 'active' : ''}`}
-              aria-current={view === item.view ? 'page' : undefined}
-              disabled={item.needsProject && !selectedProject}
-              title={item.needsProject && !selectedProject ? 'Open a project first' : undefined}
-              onClick={() => switchView(item.view)}
-            >
-              {item.label}
-            </button>
-          </span>
-        ))}
-      </nav>
-
-      {pendingSuccessorStart && ((view !== 'runs' && view !== 'new-run') || query.project !== pendingSuccessorStart.projectId) && (
-        <div className="notice" role="status">
-          A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
-          <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
-            applyQuery({ project: pendingSuccessorStart.projectId, view: 'new-run', run: null }, 'push')
-          })}>Resolve pending successor</button>
-        </div>
-      )}
-
-      {pendingAction && (
-        <div className="card unsaved-guard" role="alertdialog" aria-label="Unsaved editor edits">
-          <span className="text-sm">
-            You have unsaved editor edits. Leave anyway to continue?
-          </span>
-          <div className="dashboard-actions">
-            <button className="btn btn-danger btn-sm" onClick={confirmPendingAction}>Leave anyway</button>
-            <button className="btn btn-secondary btn-sm" onClick={cancelPendingAction}>Stay</button>
+      <HeaderSlotsProvider renderHeader={(slots) => <AppHeader
+        selectedProject={selectedProject}
+        view={view}
+        slots={slots}
+        onSwitchView={switchView}
+        onLogout={() => void handleLogout()}
+        logoutPending={logoutPending}
+      />}>
+        {logoutError && (
+          <div ref={setAlertRef} className="notice app-notice" role="alert" tabIndex={-1}>
+            <span className="text-sm">{logoutError}</span>
+            <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()}>Retry logout</button>
           </div>
-        </div>
-      )}
+        )}
 
-      <main className={`workspace-main ${view === 'runs' || view === 'settings' ? 'workspace-panes' : ''}`}>
-        {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={(project, run) => applyQuery({ project, view: 'runs', run }, 'push')} />}
+        {pendingSuccessorStart && ((view !== 'runs' && view !== 'new-run') || query.project !== pendingSuccessorStart.projectId) && (
+          <div ref={setAlertRef} className="notice app-notice" role="status" tabIndex={-1}>
+            A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
+            <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
+              applyQuery({ project: pendingSuccessorStart.projectId, view: 'new-run', run: null }, 'push')
+            })}>Resolve pending successor</button>
+          </div>
+        )}
+
+        {pendingAction && (
+          <div ref={setAlertRef} className="card unsaved-guard" role="alertdialog" aria-label="Unsaved editor edits" tabIndex={-1}>
+            <span className="text-sm">
+              You have unsaved editor edits. Leave anyway to continue?
+            </span>
+            <div className="dashboard-actions">
+              <button className="btn btn-danger btn-sm" onClick={confirmPendingAction}>Leave anyway</button>
+              <button className="btn btn-secondary btn-sm" onClick={cancelPendingAction}>Stay</button>
+            </div>
+          </div>
+        )}
+
+        <main className="workspace-main">
+        {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={openExplicitRun} />}
         {view === 'settings' && (
             <GlobalSettings
               onDirtyChange={handleConfigDirty}
@@ -583,6 +726,9 @@ export function App() {
               visible={query.project === id && (view === 'runs' || view === 'new-run')}
               page={query.project === id && view === 'new-run' ? 'new-run' : 'runs'}
               requestedRunId={query.project === id ? query.run : null}
+              explicitRunNavigation={query.project === id
+                && runNavigationIntent?.projectId === id
+                && runNavigationIntent.runId === query.run}
               onRunSelectionChange={change => { if (queryRef.current.project === id) handleRunSelectionChange(change) }}
               initialPlanPath={query.project === id ? runDashboardPlanPath : null}
               onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
@@ -591,11 +737,14 @@ export function App() {
               onOpenSettings={() => switchView('settings')}
               onNewRun={() => applyQuery({ project: id, view: 'new-run', run: null }, 'push')}
               onCancelNewRun={() => applyQuery({ project: id, view: 'runs', run: null }, 'push')}
-              onRunStarted={runId => { if (queryRef.current.project === id && ['runs', 'new-run'].includes(queryRef.current.view)) applyQuery({ project: id, view: 'runs', run: runId }, 'push') }}
+              onRunStarted={runId => {
+                if (queryRef.current.project === id && ['runs', 'new-run'].includes(queryRef.current.view)) openExplicitRun(id, runId)
+              }}
             />
           </div>
         ))}
-      </main>
+        </main>
+      </HeaderSlotsProvider>
     </div>
   )
 }

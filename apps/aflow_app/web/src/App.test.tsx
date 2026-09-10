@@ -170,11 +170,51 @@ function setUrl(search: string) {
   window.location.href = window.location.origin + search
 }
 
+function mockMatchMedia(initialMatches: boolean) {
+  const original = window.matchMedia
+  let matches = initialMatches
+  const listeners = new Set<(event: MediaQueryListEvent) => void>()
+  const media = {
+    media: '(max-width: 959px), (max-height: 599px)',
+    onchange: null,
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    addListener: (listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeListener: (listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    dispatchEvent: () => true,
+  } as unknown as MediaQueryList
+  Object.defineProperty(media, 'matches', { configurable: true, get: () => matches })
+  Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: vi.fn(() => media) })
+  return {
+    setMatches(next: boolean) {
+      matches = next
+      const event = { matches: next, media: media.media } as MediaQueryListEvent
+      listeners.forEach(listener => listener(event))
+    },
+    restore() {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: original })
+    },
+  }
+}
+
 /** Opens an added project from its compact row (the row itself is the open control). */
 async function openAddedProject(name: RegExp) {
   const list = await screen.findByRole('list', { name: 'Added projects' })
   // Anchored so the row button matches without its More-actions trigger.
   fireEvent.click(within(list).getByRole('button', { name: new RegExp('^' + name.source, name.flags) }))
+}
+
+async function openAdvancedSettings() {
+  fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
+  const advanced = await screen.findByRole('menuitem', { name: 'Advanced TOML', exact: true })
+  await waitFor(() => expect((advanced as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(advanced)
+  await screen.findByLabelText('aflow.toml contents')
+}
+
+async function clickHeaderMenuItem(name: string | RegExp) {
+  fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
+  fireEvent.click(await screen.findByRole('menuitem', { name }))
 }
 
 describe('App workspace shell', () => {
@@ -337,6 +377,75 @@ describe('App workspace shell', () => {
     expect(screen.queryByText('Choose a project first')).toBeNull()
   })
 
+  it('keeps compact navigation and secondary Settings actions accessible in flow', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      render(<App />)
+      await screen.findByText(/No registered projects/)
+
+      const menuButton = screen.getByRole('button', { name: 'Menu', exact: true })
+      fireEvent.click(menuButton)
+      expect(menuButton.getAttribute('aria-expanded')).toBe('true')
+      expect(screen.getByRole('menu', { name: 'Workspace navigation' })).toBeDefined()
+      expect((screen.getByRole('menuitem', { name: 'Plans' }) as HTMLButtonElement).disabled).toBe(true)
+
+      fireEvent.keyDown(document, { key: 'Escape' })
+      expect(menuButton.getAttribute('aria-expanded')).toBe('false')
+      expect(document.activeElement).toBe(menuButton)
+
+      fireEvent.click(menuButton)
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Settings', exact: true }))
+      await screen.findByRole('heading', { name: 'Settings' })
+      const section = await screen.findByRole('combobox', { name: 'Settings section' })
+      const sectionLabels = within(section).getAllByRole('option').map((option) => option.textContent?.trim())
+      expect(sectionLabels).toEqual(expect.arrayContaining(['General', 'Agents & Roles', 'Skills']))
+      expect(screen.queryAllByRole('tab')).toHaveLength(0)
+      expect(screen.queryByRole('button', { name: 'Reload server settings' })).toBeNull()
+
+      fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
+      expect(screen.getByRole('menu', { name: 'More settings actions' })).toBeDefined()
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Install skills', exact: true }))
+      expect(await screen.findByRole('heading', { name: 'Install skills' })).toBeDefined()
+      expect(screen.getByRole('button', { name: 'Hide', exact: true })).toBeDefined()
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('routes hosted Install skills through guided mode and retains raw drafts', async () => {
+    render(<App />)
+    await screen.findByText(/No registered projects/)
+    fireEvent.click(screen.getByRole('button', { name: 'Settings', exact: true }))
+    await openAdvancedSettings()
+    const raw = screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement
+    fireEvent.change(raw, { target: { value: '# retained raw draft\n' } })
+
+    await clickHeaderMenuItem('Install skills')
+    await screen.findByRole('heading', { name: 'Install skills' })
+    expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
+    expect(api.postGlobalConfigForm).toHaveBeenCalledWith(expect.objectContaining({ aflow_toml: '# retained raw draft\n' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide', exact: true }))
+    expect(screen.queryByRole('heading', { name: 'Install skills' })).toBeNull()
+    await clickHeaderMenuItem('Advanced TOML')
+    expect((await screen.findByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('# retained raw draft\n')
+  })
+
+  it('keeps invalid raw text and actionable errors when Install skills cannot switch modes', async () => {
+    render(<App />)
+    await screen.findByText(/No registered projects/)
+    fireEvent.click(screen.getByRole('button', { name: 'Settings', exact: true }))
+    await openAdvancedSettings()
+    const raw = screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement
+    fireEvent.change(raw, { target: { value: 'invalid = [' } })
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValueOnce({ ...guidedFormResponse(), form: null })
+
+    await clickHeaderMenuItem('Install skills')
+    await screen.findByText(/Correct the TOML syntax before switching to guided settings\./)
+    expect((screen.getByLabelText('aflow.toml contents') as HTMLTextAreaElement).value).toBe('invalid = [')
+    expect(screen.queryByRole('heading', { name: 'Install skills' })).toBeNull()
+  })
+
   it('guides an empty registry into the create form and shows the server context', async () => {
     render(<App />)
     await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
@@ -400,9 +509,7 @@ describe('App workspace shell', () => {
       display_name: null,
       main_branch: 'main',
     }))
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     expect(screen.getByText(/The shared AFlow configuration needs explicit settings/)).toBeDefined()
   })
 
@@ -417,9 +524,7 @@ describe('App workspace shell', () => {
     fireEvent.change(screen.getByLabelText('Relative project path'), { target: { value: 'beta' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create project' }))
 
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     expect(screen.queryByText(/Failed to create or register/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
     await screen.findByText(/Project Beta was created, but the project list could not refresh/)
@@ -457,9 +562,7 @@ describe('App workspace shell', () => {
     render(<App />)
     await openAddedProject(/Beta Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# ready\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await waitFor(() => expect(screen.queryByText('Configuration required')).toBeNull())
@@ -477,8 +580,7 @@ describe('App workspace shell', () => {
     render(<App />)
     await openAddedProject(/Beta Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# guided draft\n' } })
     await screen.findByText(/Unsaved changes/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
@@ -515,7 +617,7 @@ describe('App workspace shell', () => {
     expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('disabled')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Plans' })).toBeNull()
     expect(await screen.findByPlaceholderText('team/project')).toBeDefined()
-    expect(screen.getByRole('button', { name: 'Refresh' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'More', exact: true })).toBeDefined()
   })
 
   it('returns a blocked project to Projects for re-checking instead of emphasizing Settings', async () => {
@@ -527,7 +629,8 @@ describe('App workspace shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
 
-    const refresh = await screen.findByRole('button', { name: 'Refresh' })
+    fireEvent.click(screen.getByRole('button', { name: 'More', exact: true }))
+    const refresh = await screen.findByRole('menuitem', { name: 'Refresh', exact: true })
     expect(screen.getByRole('button', { name: 'Projects' }).getAttribute('aria-current')).toBe('page')
     expect(screen.queryByLabelText('aflow.toml contents')).toBeNull()
     fireEvent.click(refresh)
@@ -592,8 +695,7 @@ describe('App workspace shell', () => {
     render(<App />)
     await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# kept\n' } })
 
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
@@ -602,7 +704,7 @@ describe('App workspace shell', () => {
     await screen.findByLabelText('New plan filename')
     // Returning to Settings starts from the saved documents again.
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    await screen.findByRole('button', { name: 'Advanced TOML', exact: true })
+    await openAdvancedSettings()
   })
 
   it('hands an in-progress plan to a New run that opens with the exact plan selected', async () => {
@@ -620,7 +722,7 @@ describe('App workspace shell', () => {
     await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
+    await clickHeaderMenuItem('Run this plan')
 
     await screen.findByRole('heading', { name: 'New run' })
     expect(push).toHaveBeenCalledWith(null, '', '/?project=alpha&view=new-run')
@@ -647,9 +749,7 @@ describe('App workspace shell', () => {
     render(<App />)
     await openAddedProject(/Alpha Project/)
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# edited\n' } })
     await screen.findByText(/Unsaved changes/)
 
@@ -799,6 +899,106 @@ describe('App workspace shell', () => {
     await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-older'))
   })
 
+  it('keeps an ordinary compact Runs entry on history after passive URL sync', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?project=alpha&view=runs')
+      const replace = vi.spyOn(window.history, 'replaceState')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard()
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Runs' })
+      await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+
+      const navigation = document.querySelector('.sidebar-editor-navigation') as HTMLElement
+      const detail = document.querySelector('.sidebar-editor-detail') as HTMLElement
+      expect(navigation.hidden).toBe(false)
+      expect(detail.hidden).toBe(true)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('keeps a wide default Runs entry on history when resized compact', async () => {
+    const media = mockMatchMedia(false)
+    try {
+      setUrl('/?project=alpha&view=runs')
+      const replace = vi.spyOn(window.history, 'replaceState')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard()
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Runs' })
+      await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+
+      media.setMatches(true)
+      await waitFor(() => expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(true))
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(false)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('opens explicit initial and later browser run URLs on compact screens', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?project=alpha&view=runs&run=run-9')
+      const other = { ...dashboardRun, run_id: 'run-other', plan_path: 'plans/in-progress/other.md' }
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard({ runs: [dashboardRun, other] })
+      vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-other' ? other : dashboardRun)
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Runs' })
+      await screen.findByRole('heading', { name: 'demo.md' })
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+
+      setUrl('/?project=alpha&view=runs&run=run-other')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-other', expect.objectContaining({ signal: expect.any(AbortSignal) })))
+      await screen.findByRole('heading', { name: 'other.md' })
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+
+      setUrl('/?project=alpha&view=runs&run=run-9')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+      await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenLastCalledWith('alpha', 'run-9', expect.objectContaining({ signal: expect.any(AbortSignal) })))
+      await screen.findByRole('heading', { name: 'demo.md' })
+      expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('opens fresh and repeated compact All runs selections in the exact detail', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?view=all-runs')
+      const push = vi.spyOn(window.history, 'pushState')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      mockRunDashboard()
+      render(<App />)
+
+      const openFromAllRuns = async () => {
+        const row = await screen.findByRole('button', { name: /Alpha Project.*run-9/ })
+        fireEvent.click(row)
+        await waitFor(() => expect(push).toHaveBeenLastCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
+        await screen.findByRole('heading', { name: 'demo.md' })
+        expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
+        expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(false)
+      }
+
+      await openFromAllRuns()
+      fireEvent.click(screen.getByRole('button', { name: '← Back to Run history', exact: true }))
+      await waitFor(() => expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(false))
+      expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(true)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Menu', exact: true }))
+      fireEvent.click(screen.getByRole('menuitem', { name: 'All runs', exact: true }))
+      await screen.findByRole('heading', { name: 'All runs' })
+      await openFromAllRuns()
+    } finally {
+      media.restore()
+    }
+  })
+
   it('clears a stale project link with guidance instead of a substitute', async () => {
     setUrl('/?project=ghost&view=runs')
     const replace = vi.spyOn(window.history, 'replaceState')
@@ -872,8 +1072,7 @@ describe('App workspace shell', () => {
     render(<App />)
     await screen.findByRole('heading', { name: 'Runs' })
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# dirty\n' } })
 
     window.location.href = window.location.origin + '/?project=alpha&view=runs'
@@ -918,9 +1117,7 @@ describe('App workspace shell', () => {
     await screen.findByRole('heading', { name: /AFlow · Alpha Project/ })
 
     // Guided save: an invalid draft keeps the draft; the corrected retry saves.
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Advanced TOML', exact: true }) as HTMLButtonElement).disabled).toBe(false))
-    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
-    await screen.findByLabelText('aflow.toml contents')
+    await openAdvancedSettings()
     fireEvent.change(screen.getByLabelText('aflow.toml contents'), { target: { value: '# still placeholder\n' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await screen.findByText(/Replace placeholder selectors before saving/)
@@ -932,7 +1129,7 @@ describe('App workspace shell', () => {
     // Ready-plan launch and an exact link reload.
     fireEvent.click(screen.getByRole('button', { name: 'Plans' }))
     fireEvent.click(await screen.findByRole('button', { name: /demo\.md/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Run this plan' }))
+    await clickHeaderMenuItem('Run this plan')
     await screen.findByRole('heading', { name: 'New run' })
     await waitFor(() => expect((screen.getByLabelText('Run plan') as HTMLInputElement).value).toBe('plans/in-progress/demo.md'))
   })

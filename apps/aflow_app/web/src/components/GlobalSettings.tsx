@@ -10,9 +10,40 @@ import { PromptsSettings, type DeletedPrompt } from './PromptsSettings'
 import { SkillsSettings } from './SkillsSettings'
 import type { SkillDetail, SkillInstallResult, SkillSummary } from '../types'
 import { formatMachineChoice, formatMachineLabel } from '../label'
+import { MenuItem, MoreMenu } from './MoreMenu'
+import { useHeaderSlots } from './HeaderSlots'
+import { TextEditor } from './TextEditor'
 
 const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General'] as const
+// Header fit is deliberately wider than the list/detail breakpoint: the six
+// labelled tabs plus dirty-state actions do not fit reliably at 960–1024px.
+// Keep this presentation query independent so the SidebarEditorLayout
+// list/detail ownership boundary remains unchanged.
+const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1199px), (max-height: 599px)'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
+
+function useSettingsHeaderCompact(): boolean {
+  const [compact, setCompact] = useState(() => (
+    typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia(SETTINGS_HEADER_COMPACT_QUERY).matches
+  ))
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const media = window.matchMedia(SETTINGS_HEADER_COMPACT_QUERY)
+    const update = () => setCompact(media.matches)
+    update()
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', update)
+      return () => media.removeEventListener('change', update)
+    }
+    media.addListener(update)
+    return () => media.removeListener(update)
+  }, [])
+
+  return compact
+}
 
 export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dirty: boolean) => void; onSaved: (saved: ProjectConfig) => void }) {
   const [tab, setTab] = useState<typeof tabs[number]>('Agents & Roles')
@@ -57,6 +88,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [installing, setInstalling] = useState(false)
   const [installResult, setInstallResult] = useState<SkillInstallResult | null>(null)
   const [installError, setInstallError] = useState<string | null>(null)
+  const [installDisclosureOpen, setInstallDisclosureOpen] = useState(false)
   // Bumped by every load/discard so a response that resolves after an
   // explicit discard can never restore cleared edits.
   const epochRef = useRef(0)
@@ -158,7 +190,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
     setSkills(null); setSkillsError(null); setSelectedSkill(''); setSkillContents({}); setSkillRevisions({}); setSkillDrafts({})
     skillInflight.current.clear()
-    setSkillContentLoading(false); setInstallResult(null); setInstallError(null); setInstalling(false)
+    setSkillContentLoading(false); setInstallResult(null); setInstallError(null); setInstalling(false); setInstallDisclosureOpen(false)
     setSkillContentError(null)
     void load()
   }
@@ -316,7 +348,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     if (source === 'workflow') return 'this workflow'
     return 'defaults'
   }
-  async function toggleAdvanced() {
+  async function toggleAdvanced(): Promise<boolean> {
     setBusy(true); setError(null)
     try {
       if (!advanced) {
@@ -334,13 +366,21 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         setBaseline(form.form); setPendingNames({})
       }
       setAdvanced(!advanced)
+      return true
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not switch editors') }
     finally { setBusy(false) }
+    return false
+  }
+  async function openSkillsInstallation() {
+    if (advanced && !await toggleAdvanced()) return
+    setTab('Skills')
+    setInstallDisclosureOpen(true)
   }
   /** Shared installer action: one call, no draft changes, then clean baselines reload. */
   async function installSkillsAction() {
     if (installing || skillsDirty) return
     const epoch = epochRef.current
+    setInstallDisclosureOpen(true)
     setInstalling(true); setInstallError(null); setInstallResult(null)
     try {
       const result = await api.installSkills()
@@ -387,6 +427,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       }
     } catch (reason) {
       if (epochRef.current !== epoch) return
+      setInstallDisclosureOpen(true)
       setInstallError(reason instanceof Error ? reason.message : 'Installation failed.')
     } finally {
       if (epochRef.current === epoch) setInstalling(false)
@@ -487,32 +528,51 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   function profileFields(harness: string, profile: string, model: string, effort: string, update: (field: 'model' | 'effort', text: string) => void) {
     const suggestions = projection?.suggestions.profiles.filter(p => p.harness === harness) ?? []
     const adapter = projection?.suggestions.harnesses.find(h => h.name === harness)
-    return harness === 'zcode' ? <p>Model and effort are configured in ZCode.</p> : <>
-      <Combobox label={`Model ${harness}.${profile}`} value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} />
-      {adapter?.supports_effort && <><Combobox label={`Effort ${harness}.${profile}`} value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></>}
+    return harness === 'zcode' ? <p className="profile-editor-note">Model and effort are configured in ZCode.</p> : <>
+      <div className="profile-editor-field"><Combobox label={`Model ${harness}.${profile}`} value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} /></div>
+      {adapter?.supports_effort && <div className="profile-editor-field"><Combobox label={`Effort ${harness}.${profile}`} value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></div>}
     </>
   }
+  const headerCompact = useSettingsHeaderCompact()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
-  useEffect(() => {
-    // Keep the selected tab visible in the single-row mobile tablist.
-    try { tabRefs.current[tabs.indexOf(tab)]?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) } catch { /* layout scrolling is best-effort */ }
-  }, [tab])
+  const sectionNavigation = advanced ? <span className="header-local-label">Advanced TOML</span> : headerCompact ? <label className="header-section-select">
+    <span>Section</span>
+    <select aria-label="Settings section" value={tab} onChange={event => setTab(event.target.value as typeof tabs[number])}>
+      {tabs.map(name => <option key={name} value={name}>{name}</option>)}
+    </select>
+  </label> : <div className="config-tabs header-settings-tabs" role="tablist" aria-label="Settings sections">{tabs.map((name, index) => <button key={name} ref={el => { tabRefs.current[index] = el }} role="tab" id={`settings-tab-${index}`} aria-controls="settings-domain-panel" aria-selected={tab === name} tabIndex={tab === name ? 0 : -1} className={`btn ${tab === name ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setTab(name)} onKeyDown={event => {
+    const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1
+    if (next >= 0) { event.preventDefault(); setTab(tabs[next]); (event.currentTarget.parentElement?.children[next] as HTMLElement).focus() }
+  }}>{name}</button>)}</div>
+  const settingsSlots = {
+    context: <h2 className="header-context-title">Settings</h2>,
+    local: sectionNavigation,
+    primary: <>
+      <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
+      {dirty && <span className="text-xs text-dim header-dirty-state">Unsaved changes</span>}
+    </>,
+    more: <MoreMenu label="More settings actions" triggerLabel="More">
+      <MenuItem disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</MenuItem>
+      <MenuItem disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</MenuItem>
+      <MenuItem disabled={busy} onClick={() => void openSkillsInstallation()}>Install skills</MenuItem>
+    </MoreMenu>,
+  }
+  const hosted = useHeaderSlots('global-settings', settingsSlots)
   return <div className="workspace-content global-settings">
-    <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
+    {!hosted && <>
+      <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
+      <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>
+      <div className="settings-toolbar">
+        {sectionNavigation}
+        {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
+        <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
+      </div>
+    </>}
     {error && <p className="error-message" role="alert">{error}</p>}
     {notice && <p className="success-message" role="status">{notice}</p>}
-    <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
-    <div className="settings-toolbar">
-      {!advanced && <div className="config-tabs" role="tablist" aria-label="Settings sections">{tabs.map((name, index) => <button key={name} ref={el => { tabRefs.current[index] = el }} role="tab" id={`settings-tab-${index}`} aria-controls="settings-domain-panel" aria-selected={tab === name} tabIndex={tab === name ? 0 : -1} className={`btn ${tab === name ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setTab(name)} onKeyDown={event => {
-        const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1
-        if (next >= 0) { event.preventDefault(); setTab(tabs[next]); (event.currentTarget.parentElement?.children[next] as HTMLElement).focus() }
-      }}>{name}</button>)}</div>}
-      {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
-      <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
-    </div>
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <label key={index}>{index ? 'workflows.toml' : 'aflow.toml'}<textarea className="input mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></label>)}</div> : tab === 'Skills' ? <SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : tab === 'Skills' ? <SkillsSettings
       skills={skills}
       loadError={skillsError}
       selected={effectiveSkill}
@@ -528,6 +588,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       installing={installing}
       installResult={installResult}
       installError={installError}
+      installOpen={installDisclosureOpen}
+      onCloseInstall={() => setInstallDisclosureOpen(false)}
+      hosted={hosted}
     /> : tab === 'General' ? <div className="settings-fields">
       <AppearanceSelector /><RecentRunsLimit />
       <h3>Server settings</h3>
@@ -535,23 +598,26 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       {(['bind_host', 'bind_port', 'managed_projects_root'] as const).map(key => <label key={key}>{({ bind_host: 'Bind host', bind_port: 'Bind port', managed_projects_root: 'Projects root' })[key]}<input className="input" value={serverDraft[key]} onChange={e => setServerDraft({ ...serverDraft, [key]: e.target.value })} /></label>)}
       <label>New password (leave empty to keep current)<input className="input" type="password" autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
       {password && <p>Saving the password ends existing sessions.</p>}
-      <details><summary>Connection settings TOML</summary><textarea className="input config-textarea" aria-label="Advanced connection settings TOML" value={serverText} onChange={e => setServerText(e.target.value)} /></details>
+      <details><summary>Connection settings TOML</summary><TextEditor className="config-textarea" aria-label="Advanced connection settings TOML" value={serverText} onChange={e => setServerText(e.target.value)} /></details>
     </div> : draft ? <div className="settings-guided-content">
       {rawEdited && <p className="notice">Advanced document edits are pending. Saving replaces only the edited documents, including subsequent guided changes.</p>}
       <fieldset className="settings-body">
       {tab === 'Agents & Roles' && <>
         <h3>Profiles</h3>
-        {Object.entries(draft.harnesses).flatMap(([harness, profiles]) => Object.entries(profiles).map(([profile, value]) => <div className="card settings-fields" key={`${harness}.${profile}`}><strong>{harness}.{profile}</strong>{profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}</div>))}
-        <div className="card settings-fields"><h4>New profile</h4><label>Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' })}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label><Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => setNewProfile({ ...newProfile, profile })} />{newProfile.harness && profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => setNewProfile({ ...newProfile, [field]: text }))}</div>
+        {Object.entries(draft.harnesses).flatMap(([harness, profiles]) => Object.entries(profiles).map(([profile, value]) => <div className="card profile-editor-row" key={`${harness}.${profile}`}>
+          <div className="profile-editor-name"><span className="text-xs text-dim">Profile</span><strong className="mono">{harness}.{profile}</strong></div>
+          {profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}
+        </div>))}
+        <div className="card profile-editor-row profile-editor-new"><h4 className="profile-editor-name">New profile</h4><label className="profile-editor-field">Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' })}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label><div className="profile-editor-field"><Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => setNewProfile({ ...newProfile, profile })} /></div>{newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => setNewProfile({ ...newProfile, [field]: text }))}</div>}</div>
         <h3>Global roles</h3>{Object.entries(draft.roles).map(([role, selector]) => <Combobox key={role} label={`Role ${formatMachineChoice(role, Object.keys(draft.roles))}`} value={selector} options={selectors} onChange={value => change(next => { next.roles[role] = value })} />)}
         <div className="settings-fields"><label>New role name<input className="input" value={newRole.role} onChange={e => setNewRole({ ...newRole, role: e.target.value })} /></label><Combobox label="New role profile" value={newRole.selector} options={selectors} allowCustom onChange={selector => setNewRole({ ...newRole, selector })} /></div>
       </>}
-      {tab === 'Teams' && <SidebarEditorLayout selection={selectedTeam || teamNames[0] || null} navigationVersion={navigationVersion} navigation={<div>
+      {tab === 'Teams' && <SidebarEditorLayout selection={selectedTeam || teamNames[0] || null} navigationVersion={navigationVersion} listLabel="Teams" navigation={<div>
         <div className="add-team-form">
           <label>Add team<input className="input" aria-label="New team name" placeholder="team-name" value={newTeamName} onChange={e => { setNewTeamName(e.target.value); setNewTeamError(null) }} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addTeam() } }} /></label>
           <span className="inline-action"><button type="button" className="btn btn-secondary" onClick={addTeam}>Add team</button>{newTeamError && <span role="alert" className="text-sm add-team-error">{newTeamError}</span>}</span>
         </div>
-        {teamNames.map(team => <button className={`btn sidebar-entry ${(selectedTeam || teamNames[0]) === team ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={(selectedTeam || teamNames[0]) === team} key={team} onClick={() => { setSelectedTeam(team); setNavigationVersion(value => value + 1) }}>{formatMachineChoice(team, teamNames)}</button>)}
+        {teamNames.map(team => <button data-sidebar-editor-item={team} className={`btn sidebar-entry ${(selectedTeam || teamNames[0]) === team ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={(selectedTeam || teamNames[0]) === team} key={team} onClick={() => { setSelectedTeam(team); setNavigationVersion(value => value + 1) }}>{formatMachineChoice(team, teamNames)}</button>)}
         </div>}>
         {Object.entries(draft.teams).filter(([team]) => team === (selectedTeam in draft.teams ? selectedTeam : teamNames[0])).map(([team, value]) => {
           const chainInfo = draftUpgradeChain(team)
@@ -571,7 +637,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           </fieldset>
         })}
       </SidebarEditorLayout>}
-      {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} navigation={<div>{['Defaults', ...workflowNames].map(name => <button className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
+      {tab === 'Workflows' && <SidebarEditorLayout selection={selectedWorkflow} navigationVersion={navigationVersion} listLabel="Workflows" navigation={<div>{['Defaults', ...workflowNames].map(name => <button data-sidebar-editor-item={name} className={`btn sidebar-entry ${selectedWorkflow === name ? 'btn-primary' : 'btn-secondary'}`} aria-pressed={selectedWorkflow === name} key={name} onClick={() => { setSelectedWorkflow(name); setNavigationVersion(value => value + 1) }}>{name === 'Defaults' ? name : formatMachineChoice(name, workflowNames)}</button>)}</div>}><div className="settings-fields">{selectedWorkflow === 'Defaults' && <><h3>Defaults</h3><Combobox label="Default workflow" value={draft.default_workflow ?? ''} options={workflowNames} optionLabel={value => formatMachineChoice(value, workflowNames)} onChange={value => change(next => { next.default_workflow = value })} /><label>Max turns<input className="input" type="number" min="1" value={draft.max_turns ?? ''} onChange={e => change(next => { next.max_turns = e.target.value === '' ? null : Number(e.target.value) })} /></label><label>Manager supervision<select className="input" aria-label="Default manager supervision" value={draft.default_manager_enabled == null ? 'unset' : draft.default_manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.default_manager_enabled = raw === 'unset' ? null : raw === 'enabled' })}><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="unset">Disabled (default)</option></select></label><p className="text-xs text-dim">Applies to new runs in every workflow without its own override. Omitted means disabled.</p></>}{Object.entries(draft.workflows).filter(([name]) => name === selectedWorkflow).map(([workflow, value]) => <div className="card" key={workflow}><h3>{formatMachineChoice(workflow, workflowNames)}</h3><p>{(value.executable_steps ?? value.declared_steps).map(formatMachineLabel).join(' → ')}</p><label>Default team<select className="input" value={draft.workflow_default_teams[workflow] ?? ''} onChange={e => change(next => { next.workflow_default_teams[workflow] = e.target.value || null })}><option value="">Unset</option>{teamNames.map(team => <option key={team} value={team}>{formatMachineChoice(team, teamNames)}</option>)}</select></label><label>Manager supervision<select className="input" aria-label={`Manager supervision for workflow ${formatMachineChoice(workflow, workflowNames)}`} value={value.manager_enabled == null ? 'inherit' : value.manager_enabled ? 'enabled' : 'disabled'} onChange={e => change(next => { const raw = e.target.value; next.workflows[workflow].manager_enabled = raw === 'inherit' ? null : raw === 'enabled' })}><option value="inherit">Inherit</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label><p className="text-xs text-dim">Effective supervision: {(value.effective_manager_enabled ?? false) ? 'Enabled' : 'Disabled'} ({managerSourceLabel(value.manager_enabled_source)}). Applies to new runs; the launch-default workflow does not affect inheritance.</p></div>)}</div></SidebarEditorLayout>}
       {tab === 'Prompts' && <PromptsSettings selected={selectedPrompt} onSelect={setSelectedPrompt} draft={draft} change={change} names={pendingNames} rename={(name, target) => setPendingNames({ ...pendingNames, [name]: target })}
         deleted={deletedPrompts}
         onDelete={(name, text) => {

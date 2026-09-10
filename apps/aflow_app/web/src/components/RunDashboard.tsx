@@ -19,6 +19,7 @@ import * as api from '../api'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
+import { useHeaderSlots } from './HeaderSlots'
 import { statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
@@ -56,6 +57,8 @@ interface RunDashboardProps {
    * missing request never selects a substitute.
    */
   requestedRunId?: string | null
+  /** True only for an explicit initial URL or browser navigation to a run. */
+  explicitRunNavigation?: boolean
   onRunSelectionChange?: (change: RunSelectionChange) => void
   initialPlanPath: string | null
   onInitialPlanHandled: () => void
@@ -464,7 +467,7 @@ function configuredWorkflowSteps(
   return []
 }
 
-export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
+export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, explicitRunNavigation, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
   const [projectAvailable, setProjectAvailable] = useState<boolean | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
@@ -1746,10 +1749,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const modelEffort = resolution.selector ? selectorModelEffortText(resolution.selector, committedForm) : ''
     return (
       <tr key={`${teamName ?? 'workspace'}-${role}`}>
-        <td>{formatMachineLabel(role)}</td>
-        <td className="mono">{resolution.selector ?? <span className="text-dim">not assigned</span>}</td>
-        <td>{modelEffort || '—'}</td>
-        <td className="text-sm">
+        <td data-label="Role">{formatMachineLabel(role)}</td>
+        <td data-label="Selector" className="mono">{resolution.selector ?? <span className="text-dim">not assigned</span>}</td>
+        <td data-label="Model / effort">{modelEffort || '—'}</td>
+        <td data-label="Source" className="text-sm">
           {resolution.source === 'team'
             ? <span>team override</span>
             : resolution.source === 'global'
@@ -1783,7 +1786,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {workflowRoleList.length > 0 && (
                   <div>
                     <h4>Team members</h4>
-                    <table className="guided-table">
+                    <table className="guided-table responsive-data-table">
                       <caption className="text-xs text-dim">
                         Effective role assignments for this workflow{effectiveTeam ? ` with team ${formatMachineLabel(effectiveTeam)}` : ''} (team override → global fallback)
                       </caption>
@@ -1795,7 +1798,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     {otherConfiguredRoles.length > 0 && (
                       <details>
                         <summary className="text-xs text-dim">Other configured roles ({otherConfiguredRoles.length})</summary>
-                        <table className="guided-table">
+                        <table className="guided-table responsive-data-table">
                           <tbody>
                             {otherConfiguredRoles.map((role) => membershipRow(role, effectiveTeamRoles, effectiveTeam || null))}
                           </tbody>
@@ -1805,7 +1808,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   </div>
                 )}
                 {effectiveWorkflow && (effectiveSteps.length ? (
-                  <table className="guided-table">
+                  <table className="guided-table responsive-data-table">
                     <caption className="text-xs text-dim">
                       Executable steps with their exact role ({effectiveTeam ? `team ${formatMachineLabel(effectiveTeam)} override → global` : 'global selector'})
                     </caption>
@@ -1818,8 +1821,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                           : null
                         return (
                           <tr key={step}>
-                            <td className="mono">{formatMachineLabel(step)}</td>
-                            <td>
+                            <td data-label="Step" className="mono">{formatMachineLabel(step)}</td>
+                            <td data-label="Role → selector">
                               {!resolution
                                 ? <span className="text-dim text-sm">Exact role preview unavailable for this step.</span>
                                 : resolution.selector
@@ -1868,7 +1871,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                                 {stageRoles.length > 0 && (
                                   <details className="upgrade-stage-details">
                                     <summary className="text-xs text-dim">stage team members</summary>
-                                    <table className="guided-table">
+                                    <table className="guided-table responsive-data-table">
                                       <tbody>
                                         {stageRoles.map((role) => membershipRow(role, teamRoles, team))}
                                       </tbody>
@@ -1936,13 +1939,31 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </section>
               ) : null
 
+  function cancelNewRun() {
+    if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }
+    setLocalPage('runs')
+    onCancelNewRun?.()
+  }
+
+  const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
+    context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
+    local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
+    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void handleStart()} disabled={startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : 'Start run'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
+    more: <MoreMenu label={newRunPage ? 'More new run actions' : 'More run page actions'} triggerLabel="More">
+      {newRunPage ? <MenuItem onClick={cancelNewRun}>Cancel</MenuItem> : <>
+        <MenuItem onClick={() => void handleCopyLink()}>Copy link</MenuItem>
+        <MenuItem disabled={refreshing || loading} onClick={() => void refreshPage()}>{refreshing ? 'Refreshing…' : 'Refresh'}</MenuItem>
+      </>}
+    </MoreMenu>,
+  }, visible && !loading)
+
   if (loading) {
     return <div className="card dashboard-loading"><div className="spinner" />Loading runs…</div>
   }
 
   return (
     <div className="run-dashboard">
-      <div className="run-dashboard-header">
+      {!hosted && <div className="run-dashboard-header">
         <div>
           <h2>{newRunPage ? 'New run' : 'Runs'}</h2>
         </div>
@@ -1953,7 +1974,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             {refreshing ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
-      </div>
+      </div>}
 
       {copyState === 'copied' && <div className="success-message" role="status">Link copied to the clipboard.</div>}
       {copyState === 'failed' && <div className="notice" role="status">Clipboard access failed — copy the address from the browser address bar instead.</div>}
@@ -2010,12 +2031,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       )}
 
       {projectAvailable && !newRunPage && (
-        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} navigation={
+        <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} navigation={
           <section className="card run-list" aria-label="Project runs">
             <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
-            <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>
+            {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
             {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => (
-              <button className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
+              <button data-sidebar-editor-item={run.run_id} className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
                 <span>{run.plan_path?.split('/').pop() ?? run.run_id}</span>
                 <span className="status-pill">{statusLabel(run)}</span>
                 <span className="text-xs text-dim">
@@ -2259,6 +2280,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         handleStart={handleStart}
         startDisabled={startDisabled}
         busyAction={busyAction}
+        hideActions={hosted}
       />}
 
     </div>
