@@ -1,15 +1,39 @@
-# Checkpoint 4 review
+# Responsive document scrolling: CP1 v01 review
 
-Reviewed the immediately preceding worker repair overlay `plans/in-progress/readable-cli-status-output-20260909-cp01-v01.md` and retained checkpoint 4 implementation against `plans/in-progress/readable-cli-status-output-20260909.md`. Used current-worktree fallback from checkpoint 3 approval `a1ce533`: no checkpoint 4 worker commit existed. Scope: compact manager projections, immutable complete structured history, current control facts, exact prompt budgets, read-only analysis compatibility, bundled instructions, tests and documentation.
+Original and active plan: `plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910.md`.
+Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`.
 
-## Findings
+Reviewed the immediately preceding worker's nine-file uncommitted diff from
+`ee1757579b216afe9c02f3ca763038cae59a8498` through current worktree state.
+No checkpoint commit existed, so current-worktree fallback was used. There
+were zero implementation commits beyond the base before this review. The
+prechecked CP1 heading represented worker completion, not earlier approval.
+CP2 was not the review target.
 
-Zero material findings. Both previous findings are resolved: unrecognized structured-stream fallback remains reference-only in the history and inline projections while preserving extraction metadata and stdout pointers; combined history sorting retains legacy decisions with absent or null finalized-turn association without a None/integer comparison. Recognized final assistant responses and plain-text semantic results remain complete on disk.
+Scope: document/root/workspace scrolling, wide navigation exception, natural
+compact stacking expressly allowed by CP1, PlanPanel sizing, removal of pane
+selection resets, corresponding browser checks and documentation. No material
+findings survived the admission gate, exclusions and proportionate-fix review.
 
-## Verification and disposition
+Reviewer verification:
 
-`uv run pytest -q tests/test_manager.py tests/test_manager_context.py tests/test_runtime.py`: 398 passed, 43 subtests passed. `uv run ruff check aflow/manager.py aflow/manager_context.py aflow/runlog.py aflow/api/analyze.py` and `git diff --check` passed. Reviewed synthetic growth, Unicode bounds, exact-reference validation, capture failure, read-only rebuilding, prompt limits and fake-manager routing coverage. No live providers, global configuration, services or public publishing were used.
+- `npm --prefix apps/aflow_app/web test -- --run`: 279 passed.
+- `npm --prefix apps/aflow_app/web run build`: passed.
+- `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_settings_browser.py apps/aflow_app/server/tests/test_run_navigation_browser.py`: 4 passed.
+- `git diff --check`: passed.
 
-Approved checkpoint 4 through `cp4 v01 codex/aflow-dogfood-20260909: Approve compact manager history`. Only checkpoint 4 review state advances; checkpoints 1–3 and original baseline remain unchanged. The repair overlay is satisfied, and no new fix plan is needed. This is checkpoint approval, not whole-plan review; no squash or history rewrite.
+Checks covered document wheel movement, final-control reachability, long-plan
+text persistence and run-history behavior using disposable configuration,
+fixture projects and ephemeral localhost ports. React act warnings and Python
+dependency deprecation warnings did not fail verification. No live/global
+settings or shared uv tool were changed.
+
+Approve CP1 v01 with a reviewer-owned checkpoint commit; original plan remains
+in progress and CP2–6 stay unchecked. No fix plan is required. Full mobile
+list/detail, editor-space budgets, WebKit, inspected screenshots and physical
+keyboard proof remain later-checkpoint work and are not claimed here.
+
+Publication: pending workflow delivery. Exact-SHA CI: unverified.
+Live activation/usability: unverified.
 
 No material findings

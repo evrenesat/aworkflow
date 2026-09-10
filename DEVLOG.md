@@ -1272,3 +1272,20 @@ Final verification: web tests (213), all server tests including Chromium layout 
   retaining raw keys in exact save and control payloads. Verification: 279 web
   tests, production build and four disposable Chromium checks passed; no live
   configuration was changed.
+
+## 2026-09-10 — Responsive document-scroll checkpoint 1
+
+- Removed root/body/shell/workspace viewport locks and the detail/editor scroll
+  ownership rules. Runs, Settings and plan content now grow in document flow;
+  wide navigation alone retains a sticky bounded local list exception, while
+  compact and short layouts stack natural-height blocks until the next
+  list/detail checkpoint.
+- Removed `SidebarEditorLayout` selection-time detail resets and PlanPanel
+  inline height/overflow ownership. Added targeted minimum-width and wrapping
+  rules without changing draft, save, history or request identities.
+- Replaced independent-pane browser expectations with document wheel movement,
+  positive detail dimensions, reachable final controls, natural long Settings
+  and plan-list scrolling, and exact long-plan text persistence.
+- Verification: 279 web tests, production build, four disposable Chromium
+  browser checks and `git diff --check` passed. No live configuration or
+  production run was changed.

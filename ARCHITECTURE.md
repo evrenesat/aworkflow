@@ -30,15 +30,15 @@ history mutations require authentication, revision and idempotency checks;
 external deleted reads return 410. No history action signals a process or removes
 workflow artifacts.
 
-The current web `SidebarEditorLayout` still bounds navigation and detail panes
-within Runs and Settings. This is a known layout limitation, superseded by the
-owner-approved [UI guidelines](UI_GUIDELINES.md); migration remains planned.
-The target uses document scrolling and shared shell slots: one desktop row for
-app/project/global navigation, one for page/section context and primary actions.
-Pages contribute actions to those slots instead of adding persistent toolbars.
-Mobile uses hamburger navigation and list → detail → Back; secondary maintenance
-and help remain available through menus/disclosures. See the guidelines for
-pixel budgets, allowed scroll exceptions, focus rules, and browser evidence.
+The web `SidebarEditorLayout` keeps detail and editor content in document flow.
+In wide/tall mode its navigation may be sticky with a bounded local scroll
+surface; in compact/short mode navigation and detail stack at natural height
+until the list → detail migration checkpoint. The shell and workspace no longer
+lock the root or create ordinary nested pane scrollers. Bounded option lists,
+native textareas, and explicitly expanded raw payloads remain named local
+exceptions. This implements the document-scroll portion of the owner-approved
+[UI guidelines](UI_GUIDELINES.md); shared shell slots, hamburger navigation and
+mobile Back behavior remain subsequent checkpoints.
 
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
 selected editor IDs across guided/raw mode changes; run dashboards retain pending

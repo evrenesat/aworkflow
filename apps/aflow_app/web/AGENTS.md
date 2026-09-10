@@ -34,9 +34,12 @@
 
 - Follow [UI_GUIDELINES.md](../../../UI_GUIDELINES.md): two compact desktop
   header rows, mobile hamburger navigation and list → detail → Back, document
-  scrolling, and outcome-based browser checks. The previous bounded-pane design
-  is superseded; its replacement is planned, not yet implemented. Preserve the
-  existing draft owners while migrating presentation.
+  scrolling, and outcome-based browser checks. Checkpoint 1 now implements the
+  document-scroll ownership boundary: the shell, workspace, editor details and
+  settings fields flow with the document; only the named wide navigation,
+  option-list and raw-payload exceptions may scroll locally. Checkpoints 2–6
+  still own list/detail navigation, shell compaction and the remaining evidence.
+  Preserve the existing draft owners while migrating presentation.
 
 - Keep history mutation keys by exact project/run/action until acknowledged or
   definitively rejected (including acknowledgement-required validation). Deletion tombstones suppress late rows and

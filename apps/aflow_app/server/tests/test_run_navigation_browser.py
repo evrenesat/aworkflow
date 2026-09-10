@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
-from test_settings_browser import pane_metrics
+from test_settings_browser import document_metrics
 
 
 def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch):
@@ -31,22 +31,39 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                     page.wait_for_function("document.querySelectorAll('.run-list-item').length === 130")
                     nav.get_by_role('button', name='history-069.md', exact=False).click()
                     page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
-                    metrics = pane_metrics(page)
-                    assert metrics['navScroll'] > 0 and metrics['navContent'] > metrics['navHeight'], metrics
-                    assert metrics['detailTop'] <= metrics['headingTop'] < metrics['detailBottom'], metrics
-                    assert not metrics['overflow']
-                    page.get_by_role('button', name='Refresh', exact=True).click()
+                    metrics = document_metrics(page)
+                    assert metrics['detailHeight'] > 0, metrics
+                    assert metrics['detailContent'] <= metrics['detailHeight'] + 1, metrics
+                    assert metrics['detailScroll'] == 0, metrics
+                    assert not metrics['overflow'], metrics
+                    if width >= 960 and height >= 600:
+                        assert metrics['navContent'] > metrics['navHeight'], metrics
+                        assert metrics['navScroll'] > 0, metrics
+                    else:
+                        assert metrics['documentHeight'] > height, metrics
+                        assert metrics['navScroll'] == 0, metrics
+                        assert metrics['documentScroll'] > 0, metrics
+                    actions = page.get_by_role('button', name='More run actions', exact=True)
+                    actions.scroll_into_view_if_needed()
+                    action_box = actions.bounding_box()
+                    assert action_box and 0 <= action_box['y'] < height and action_box['x'] + action_box['width'] <= width
+                    # Keep the current document position while exercising the
+                    # existing refresh handler; a normal locator click would
+                    # first scroll its off-screen trigger into view on compact
+                    # stacked layouts.
+                    page.get_by_role('button', name='Refresh', exact=True).evaluate('(element) => element.click()')
                     page.wait_for_timeout(250)
                     assert page.locator('.run-list-item').count() == 130
-                    assert pane_metrics(page)['navScroll'] == metrics['navScroll']
-                    page.add_style_tag(content='.sidebar-editor-detail::after { content: ""; display: block; height: 1600px; }')
-                    page.locator('.sidebar-editor-detail').evaluate("el => { el.scrollTop = 400 }")
-                    assert pane_metrics(page)['navScroll'] == metrics['navScroll']
+                    refreshed = document_metrics(page)
+                    if width >= 960 and height >= 600:
+                        assert refreshed['navScroll'] == metrics['navScroll'], refreshed
+                    else:
+                        assert refreshed['documentScroll'] >= metrics['documentScroll'] - 2, refreshed
                     nav.get_by_role('button', name='history-068.md', exact=False).click()
-                    assert pane_metrics(page)['detailScroll'] == 0
+                    assert document_metrics(page)['detailScroll'] == 0
                     page.go_back()
                     page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
-                    assert pane_metrics(page)['detailScroll'] == 0
+                    assert document_metrics(page)['detailScroll'] == 0
                     page.reload()
                     page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
             page.get_by_role('button', name='More run actions').click()

@@ -383,7 +383,7 @@ export function App() {
 
   if (authGate !== 'signedIn') {
     return (
-      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--spacing-lg)' }}>
+      <div className="auth-gate">
         <div className="card" style={{ maxWidth: '420px', width: '100%' }}>
           <h1 style={{ fontSize: '1.5rem', fontWeight: 600, marginBottom: 'var(--spacing-lg)' }}>aflow Remote</h1>
           {authGate === 'checking' && (
@@ -490,7 +490,7 @@ export function App() {
         </div>
       )}
 
-      <main className={`workspace-main ${view === 'runs' || view === 'settings' ? 'workspace-panes' : ''}`}>
+      <main className="workspace-main">
         {view === 'all-runs' && <GlobalRunOverview projects={projects} registryLoading={projectsLoading} registryError={projectsError} onOpen={(project, run) => applyQuery({ project, view: 'runs', run }, 'push')} />}
         {view === 'settings' && (
             <GlobalSettings

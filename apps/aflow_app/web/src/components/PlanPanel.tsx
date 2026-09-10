@@ -233,8 +233,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           : null
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--spacing-md)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
+      <div className="plan-editor">
+        <div className="plan-editor-header">
           <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← All plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
           <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>
@@ -279,13 +279,12 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           </div>
         )}
         <textarea
-          className="input mono"
+          className="input mono plan-editor-textarea"
           aria-label="Plan content"
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          style={{ flex: 1, minHeight: '360px', resize: 'vertical' }}
         />
-        <div style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap', alignItems: 'center' }}>
+        <div className="plan-editor-actions">
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
           {selected.status !== 'done' && (
             <button className="btn btn-secondary" onClick={() => void promotePlan()} disabled={busy || dirty}>
@@ -311,7 +310,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-lg)', height: '100%', overflowY: 'auto' }}>
+    <div className="plan-list">
       {error && <div className="error-message" role="alert">{error}</div>}
       <div className="card" style={{ display: 'flex', gap: 'var(--spacing-sm)', flexWrap: 'wrap' }}>
         <input
