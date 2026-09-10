@@ -1,34 +1,13 @@
-# Checkpoint 1 review: lifecycle backup preflight
+# Checkpoint 1 review — cp1 v01
 
-Reviewed checkpoint/version: `cp1 v01` on
-`aflow-fix-lifecycle-backup-preflight-ci-20260910-20260910-124847`.
+Reviewed the immediately preceding worker's uncommitted checkpoint 1 implementation on branch `aflow-remove-standalone-daemons-keep-ui-mcp-20260908-20260910-131652`, against `186fba177b079281d1ebaccdd65dcf54c33ff4bb`. Worktree fallback was used because this run has no checkpoint implementation commit; the base's older cp1 commit belongs to a different plan. The supplied worker result artifact was absent from this worktree; the explicit checkpoint scope and actual diff determined the target.
 
-The original and active plan are both
-`plans/in-progress/fix-lifecycle-backup-preflight-ci-20260910.md`.
-The review uses the current-worktree fallback: this plan has no checkpoint
-commit yet. The target is the immediately preceding worker's six-file diff
-against `0eda48f2bd03a0a9550a96b549680a09c8339fc6`, not older approved commits.
+Original and active plan: `plans/in-progress/remove-standalone-daemons-keep-ui-mcp-20260908.md`. Scope: shared process identity extraction, temporary standalone alias, UI wrapper, persistent-unit and preparation activity consumers, and directly affected tests. Checkpoints 2–4 were not reviewed or approved.
 
-Scope: untracked lifecycle backup confirmation classification, consistent
-startup/lifecycle callers and merge boundary reuse, focused protection tests,
-branch-only startup/resume regression, and DEVLOG. Raw status/dirty evidence,
-tracked changes, rename endpoints, conflicts, Git operation blockers and
-inspection failures retain their existing handling. Responsive UI work is
-outside this review and was untouched.
+Findings: none. The helper AST is identical to the original implementation apart from its function name. Linux start ticks, zombie rejection, ps fallback and failure behavior are preserved. Consumer ownership checks remain unchanged; focused tests verify reused identities are rejected. Remaining absolute daemon_cli imports are confined to standalone tests, and the temporary standalone CLI dispatch remains appropriate until checkpoint 2. No MCP registry, configuration or worker lifetime behavior changed.
 
-Verification performed independently in this review:
+Verification: `uv run pytest -q tests/test_process_identity.py tests/test_ui_cli.py tests/test_persistent_units.py tests/test_worker_diagnostics.py tests/test_run_history.py tests/test_daemon_cli.py` with an isolated temporary HOME: **87 passed in 21.37s**. `git diff --check` passed. Import search and AST equivalence check passed.
 
-- Clean Git configuration and disposable HOME/config: 97 focused tests and
-  21 subtests passed.
-- Same isolation for the full suite: 1,779 tests and 219 subtests passed.
-- `uv run ruff check aflow apps/aflow_app/server/src` passed.
-- `git diff --check` passed.
-
-Findings: none admitted by the material-code-review gate.
-Checkpoint 1 is approved; this review creates the `cp1 v01` approval commit
-and advances the original plan's review log. No fix overlay is required.
-Normal publication follows the approval commit under the standing grant.
-Exact-SHA CI and live deployment verification belong to the coordinator;
-local approval is not deployment evidence.
+Checkpoint 1 approved as `cp1 v01`; original plan review metadata advanced for this checkpoint only. No fix plan required. Publication, CI and live activation are not established by this local checkpoint approval and remain coordinator-owned delivery work.
 
 No material findings

@@ -69,8 +69,8 @@ def fake_aflow(tmp_path: Path) -> Path:
                 os.replace(temp, receipt_dir / name)
 
             def _birth(pid):
-                from aflow.daemon_cli import _process_birth_identity
-                return _process_birth_identity(pid)
+                from aflow.process_identity import process_birth_identity
+                return process_birth_identity(pid)
 
             if inner and inner[0] == "FAIL":
                 write("error.json", {"schema": 1, "nonce": args.nonce, "error": inner[1]})
@@ -236,9 +236,9 @@ def test_stop_signals_only_the_owned_process_group(tmp_path, fake_aflow, repo, m
 
 
 def _process_dead(pid: int) -> bool:
-    from aflow.daemon_cli import _process_birth_identity
+    from aflow.process_identity import process_birth_identity
 
-    return _process_birth_identity(pid) is None
+    return process_birth_identity(pid) is None
 
 
 def test_shutdown_is_a_documented_no_op(tmp_path, fake_aflow, repo, monkeypatch):
