@@ -1872,3 +1872,16 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   web suite (331 tests), the production build, and `git diff --check`.
   Backend/browser evidence is reused; CI, publication, activation, and
   physical-device behavior remain downstream.
+
+## 2026-09-10 — Canonical CLI isolation fixture paths
+
+- Canonicalized the existing `test_cli_workflow_override` temporary home before
+  deriving its plan path. The exact run ownership, run-count, workflow and
+  durable plan-path assertions remain unchanged; this aligns the fixture with
+  macOS's `/private/var` resolution of its `/var` temporary-directory alias.
+- The independent disposable proof ran from an outer Git directory with
+  `TMPDIR` set to a symlink, using the checkout's `.venv/bin/python` and the
+  absolute `tests/test_cli.py` path. `tempfile` used the symlink alias, the
+  focused test passed, and the outer caller remained free of `.aflow`.
+- Verification: focused CLI test passed (`1 passed, 156 deselected`); full CLI
+  module passed (`157 passed, 129 subtests`); no production changes were made.

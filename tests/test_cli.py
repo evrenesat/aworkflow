@@ -3245,9 +3245,9 @@ p = "do it"
     def test_cli_workflow_override(self) -> None:
         import aflow.cli as cli_module
         with tempfile.TemporaryDirectory() as tmpdir:
-            home_dir = Path(tmpdir)
+            home_dir = Path(tmpdir).resolve()
             _write_config(home_dir, '[aflow]\ndefault_workflow = "simple"\n\n[workflow.simple.steps.implement_plan]\nrole = "architect"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n[workflow.other.steps.review]\nrole = "architect"\nprompts = ["p"]\ngo = [{ to = "END" }]\n\n[harness.opencode.profiles.default]\nmodel = "m"\n\n[roles]\narchitect = "opencode.default"\n\n[prompts]\np = "do it"\n')
-            plan_path = Path(tmpdir) / 'plan.md'
+            plan_path = home_dir / 'plan.md'
             _write_plan(plan_path, '# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n')
             original_home = os.environ.get('HOME')
             original_cwd = Path.cwd()

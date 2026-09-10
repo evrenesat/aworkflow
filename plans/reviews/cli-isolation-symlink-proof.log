@@ -1,0 +1,4 @@
+PASS: tempfile uses symlink alias before fixture resolution
+.                                                                        [100%]
+1 passed, 156 deselected in 0.16s
+PASS: disposable outer Git caller remains without .aflow
