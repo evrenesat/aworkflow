@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-10 — Prefer parallel development with owned integration
+
+- Persist coordinator guidance to run independent plans in isolated worktrees,
+  preserve both sides of overlapping changes, and serialize main integration.
+- Require prompt per-plan publication and exact CI/live evidence; isolate shared
+  runtime/test resources and keep checkpoint workers within their assigned scope.
+- This is operating guidance, not a new scheduler or workflow implementation.
+
 ## 2026-09-10 — Record compact UI acceptance requirements
 
 - Record the owner-approved two-row desktop header, mobile hamburger navigation,

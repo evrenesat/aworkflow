@@ -46,3 +46,8 @@
   validated Markdown body live once per invocation and pass it as the system
   instruction; Python contributes only structured runtime data, and skill
   failures become prelaunch failures before any provider starts.
+
+- For multi-plan coordination, follow the root AGENTS parallel-development and
+  integration policy. Keep execution worktrees and test resources isolated;
+  serialize shared-main integration and publication. Checkpoint workers retain
+  their assigned scope and do not take over queue management.

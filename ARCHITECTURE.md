@@ -45,6 +45,23 @@ selected editor IDs across guided/raw mode changes; run dashboards retain pendin
 history keys and deletion tombstones across navigation and late responses.
 Polling preserves scroll/focus. Responsive transitions preserve those owners.
 
+## Development coordination policy
+
+For an authorized multi-plan goal, the coordinator should execute independent
+plans concurrently in workflow-managed worktrees, following root AGENTS.md.
+Each run retains its own controller, plan ledger and execution state; worktrees
+are execution details beneath the existing project, not extra UI registrations.
+This is an operating policy, not a claim that an automatic parallel scheduler
+has been implemented.
+
+Integration is a serialized coordinator responsibility: reconcile accepted main
+history, preserve both changes' behavior, verify the combined result and publish
+each completed plan promptly. Existing publication-before-Done and CI-gated
+activation remain the delivery boundaries. Concurrent development must isolate
+test state and respect shared installed runtimes/services; Git worktree isolation
+alone does not provide process or configuration isolation. Bounded checkpoint
+workers do not acquire multi-plan scheduling authority from this policy.
+
 ## High-Level Data Flow
 
 `aflow noop-plan` copies a packaged template from `aflow/templates/` and creates

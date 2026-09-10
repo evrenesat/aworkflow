@@ -27,6 +27,53 @@
   from a local approval. Fix a failed delivery gate before accumulating more
   completed local plans. Preserve active execution worktrees and never force-push.
 
+## Parallel development and integration
+
+These rules apply when coordinating an authorized multi-plan development goal,
+not to a worker assigned one bounded checkpoint.
+
+- Prefer concurrent execution of independent, ready plans over serial queue
+  processing. Start with two runs when capacity permits; expand only within
+  actual provider, host and controller limits. Do not wait for unrelated work
+  to finish merely because it was started first. Respect explicit owner priority.
+- Before dispatch, identify each plan's scope, dependencies, execution root and
+  integration owner in the existing handoff ledger. Each logical run gets one
+  workflow-managed branch/worktree and one controller. Never duplicate a run or
+  let concurrent workers edit the same checkout. Keep worktrees internal to the
+  registered parent project; ordinary execution requires no extra UI project.
+- Use web/MCP and a workflow with worktree/branch setup and merge teardown;
+  `checkpoint_delivery` is the current normal choice. Select the authorized
+  worker/reviewer team explicitly. Verify resolved lifecycle and publication
+  settings rather than relying on a name. Reserve in-place workflows for
+  existing-lineage recovery with an explicit coordinator-owned delivery step.
+- Shared files alone do not prohibit parallel work: agree interfaces and let
+  independent changes proceed in isolated worktrees. Sequence genuine producer/
+  consumer dependencies and incompatible schema changes. Do not invent stubs,
+  duplicate APIs, or broad rewrites merely to make parallelism possible.
+- Keep tests, temporary HOME/state, ports and artifacts isolated. A worktree does
+  not isolate shared installations or services. Use one deliberate AFlow source
+  or verified pinned runtimes; never repoint a shared tool or restart another
+  run's controller as a side effect of concurrent work.
+- The coordinator owns integration. Serialize updates to local main and remote
+  main, fetch accepted history before integrating, and resolve conflicts in an
+  integration checkout or at a clean owned boundary. Preserve both intended
+  behaviors; inspect overlapping changes even when Git merges cleanly. Never
+  blanket-select ours/theirs, reset active trees, discard another run's work,
+  or force-push to make integration pass.
+- Test affected combined behavior after reconciliation; run relevant browser
+  checks for UI integration. Publish each independently completed, reviewed
+  plan promptly to origin/main without waiting for the whole batch. Confirm the
+  publication receipt and exact-SHA CI/deployment; a rejected push is an
+  integration task to resolve, not a completed delivery.
+- Independent implementation may continue while another result passes CI.
+  Prioritize repairing failed delivery before publishing more completed work;
+  do not stack new releases over a known failing gate. Distinguish local review,
+  merge, remote publication, CI and live verification in the handoff.
+- Use event-driven completion signals or bounded scheduled checks. Notify on
+  meaningful progress, failure or required decisions; avoid repeated unchanged
+  transcript/status polling. If parallelism is blocked, record the concrete
+  dependency or resource limit and continue other useful authorized work.
+
 ## UI and interaction work
 
 - Read and follow [UI_GUIDELINES.md](UI_GUIDELINES.md) for every web UI change.
