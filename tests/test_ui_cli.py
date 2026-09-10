@@ -165,6 +165,19 @@ class TestOwnershipRecord:
 
 
 class TestPortConflicts:
+    def test_port_probe_allows_restart_after_a_closed_connection(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            port = server.getsockname()[1]
+            server.listen(1)
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+                accepted, _ = server.accept()
+                accepted.shutdown(socket.SHUT_WR)
+                accepted.close()
+                assert client.recv(1) == b""
+        assert ui_cli._port_bound(port) is False
+
     def test_port_bound_detects_an_occupied_port(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
