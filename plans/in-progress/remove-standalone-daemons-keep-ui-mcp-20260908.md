@@ -13,6 +13,10 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 - Review Log: Checkpoint 1 approved through `cp1 v01` on 2026-09-10. Reviewed the immediately preceding worker changes using the worktree fallback against the pre-handoff base; 87 checkpoint tests passed.
 - Review Log: Checkpoint 2 approved through `cp2 v01` on 2026-09-10. Reviewed the immediately preceding worker's uncommitted changes against `8703a85` using the worktree fallback; 335 tests and 136 subtests passed with an isolated test home. Removed-interface source search returned no matches. No material findings. Checkpoints 3–4 remain unreviewed.
 
+- Review Log: Checkpoint 3 rejected on 2026-09-10; reviewed immediately preceding worker turn-005 using the uncommitted worktree fallback against `ff25d25` (`cp2 v01`). Installer still generates and hashes the removed executable. Focused non-checkpoint repair overlay: `remove-standalone-daemons-keep-ui-mcp-20260908-cp04-v01.md` (filename supplied by controller; repairs original checkpoint 3). 233 tests and 129 subtests passed; ShellCheck and metadata checks passed. Checkpoint 4 remains untouched.
+
+- Review Log: Checkpoint 3 approved through `cp3 v01` on 2026-09-10. Reviewed immediately preceding worker turn-007 and original checkpoint 3 using the uncommitted worktree fallback against `ff25d25` (`cp2 v01`). The cp04-named non-checkpoint overlay repairs checkpoint 3; release staging now omits the removed launcher and its hash. 233 tests and 129 subtests passed with an isolated HOME/cache; ShellCheck, package metadata and diff checks passed. No material findings. Checkpoint 4 remains unreviewed; publication and exact-SHA CI/live verification remain coordinator-owned.
+
 ## Done Means
 
 - `aflow daemon` is an unknown command; fresh package metadata has no `aflowd` executable. Neither has a compatibility shim.
@@ -127,7 +131,7 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 - Stop and report if new consumers require a removed standalone-only interface or unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 3: Remove the aflowd executable while preserving deployment
+### [x] Checkpoint 3: Remove the aflowd executable while preserving deployment
 
 **Goal:**
 
@@ -146,9 +150,9 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 **Steps:**
 
-- [ ] Remove `aflowd = "aflow.daemon:main"` from project scripts and remove the standalone `main` implementation. Retain shared `AflowDaemon` lifecycle methods and other consumers; clean only now-unused imports and executable-specific wording.
-- [ ] Change the runtime validator's required executable list from `aflow aflowd aflow-app-server` to `aflow aflow-app-server`. Adjust only other explicit executable requirements found by the search; keep service names and deployment state unchanged.
-- [ ] Update release fixtures to omit `bin/aflowd`. Prove valid fixtures pass without it and missing `aflow` or `aflow-app-server` still fail. Add a package metadata assertion that project scripts omit `aflowd` while retaining `aflow` and existing other scripts; use `tomllib` rather than reinstalling into the shared environment.
+- [x] Remove `aflowd = "aflow.daemon:main"` from project scripts and remove the standalone `main` implementation. Retain shared `AflowDaemon` lifecycle methods and other consumers; clean only now-unused imports and executable-specific wording.
+- [x] Change the runtime validator's required executable list from `aflow aflowd aflow-app-server` to `aflow aflow-app-server`. Adjust only other explicit executable requirements found by the search; keep service names and deployment state unchanged.
+- [x] Update release fixtures to omit `bin/aflowd`. Prove valid fixtures pass without it and missing `aflow` or `aflow-app-server` still fail. Add a package metadata assertion that project scripts omit `aflowd` while retaining `aflow` and existing other scripts; use `tomllib` rather than reinstalling into the shared environment.
 
 **Dependencies:** Checkpoint 2.
 

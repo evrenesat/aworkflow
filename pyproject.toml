@@ -40,7 +40,6 @@ select = ["F401", "F811", "F821", "F841"]
 [project.scripts]
 aflow = "aflow.cli:main"
 aworkflow = "aflow.cli:main"
-aflowd = "aflow.daemon:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["aflow", "apps/aflow_app/server/src/aflow_app_server"]

@@ -1,16 +1,17 @@
-# Checkpoint 2 review — cp2 v01
+# Checkpoint 3 review — cp3 v01
 
-Original and active plan: `plans/in-progress/remove-standalone-daemons-keep-ui-mcp-20260908.md`.
+Original plan: `plans/in-progress/remove-standalone-daemons-keep-ui-mcp-20260908.md`.
+Active repair overlay: `plans/in-progress/remove-standalone-daemons-keep-ui-mcp-20260908-cp04-v01.md`; despite its filename, this repairs original checkpoint 3.
 Branch: `aflow-remove-standalone-daemons-keep-ui-mcp-20260908-20260910-131652`.
 
-Reviewed the immediately preceding worker's uncommitted checkpoint 2 slice against approved checkpoint 1 HEAD `8703a85`. Worktree fallback was used because no checkpoint 2 commit existed. The supplied turn-003 result artifact was absent from this execution worktree; the explicit checkpoint scope and actual diff determined the target. The plan branch matches and its pre-handoff base remains reachable. Worker plan changes only marked checkpoint 2 steps complete; this review validates those marks and records approval.
+Reviewed immediately preceding worker turn-007 and the complete uncommitted original checkpoint 3 slice against `ff25d251bcdbc5c4a82073fa067351a8a1c24aa8` (`cp2 v01`). Used the worktree fallback because no checkpoint 3 commit existed. Branch matches the original plan and its pre-handoff base remains reachable. Worker result evidence was read from the primary repository at `/root/code/agent_flow/.aflow/runs/20260910t131651z-d1e1ee36/turns/turn-007/result.json`. Existing dirty review artifacts belong to the previous rejection; original plan step changes are authorized progress bookkeeping.
 
-Scope: standalone daemon parser and dispatch removal, deletion of daemon_cli.py and standalone tests, removal of dedicated user configuration and split-merge propagation, negative CLI/config tests and preserved UI/worker parser coverage. Shared daemon lifecycle, process identity, UI background controls, MCP registry including preflight_run, and live configuration consumers remain unchanged by this slice. Package executable removal and full MCP/documentation acceptance remain checkpoints 3–4, not findings against checkpoint 2.
+Scope: package script removal, standalone daemon main removal, installer launcher and manifest removal, retained deployment executable validation, and direct tests. The prior installer finding is resolved: newly staged releases omit bin/aflowd and its manifest entry while retaining executable, hashed aflow and aflow-app-server launchers. Shared lifecycle classes, worker_main, service settings, MCP tools including preflight_run, live configuration and UI background controls are unchanged by this slice. Earlier approved checkpoints and checkpoint 4 are outside this review.
 
-Verification: `uv run pytest -q tests/test_cli.py tests/test_config.py tests/test_ui_cli.py tests/test_process_identity.py tests/test_persistent_units.py tests/test_run_config_snapshot.py` with an isolated temporary HOME: 335 passed, 136 subtests passed. Removed-interface search in aflow returned no matches (expected exit 1). Broader consumer inspection found no imports of deleted interfaces. `git diff --check` passed.
+Verification: isolated HOME and UV cache, `uv run pytest -q tests/test_aflowd_deploy.py tests/test_aflowd_continuous_deploy.py tests/test_control_plane_resume.py tests/test_cli.py`: 233 passed and 129 subtests passed. ShellCheck passed for install.sh and validate-runtime.sh. Package metadata assertion and git diff --check passed. Installer obsolete-launcher search returned no matches. Retained executable rejection, stale integrity hashes and fresh staging are covered by the passing tests. aflowd.service still executes aflow-app-server.
 
-Findings: none admitted under the material-code-review gate.
+Findings: none admitted by the material finding gate. No production edits made by the reviewer.
 
-Checkpoint 2 approved as cp2 v01; checkpoints 3–4 remain pending. This is local checkpoint approval. Publication, exact-SHA CI, and live activation are not established by this review and remain coordinator delivery responsibilities.
+Checkpoint 3 approved as cp3 v01; only its original checkpoint header advances. The reviewer creates the checkpoint approval commit in this turn. Checkpoint 4 remains pending. No new fix plan is needed. Publication, exact-SHA CI and live activation remain unverified and coordinator-owned; local approval is not deployed usability.
 
 No material findings

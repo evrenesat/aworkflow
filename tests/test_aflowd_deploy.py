@@ -128,18 +128,26 @@ def _release_fixture(tmp_path: Path, release_id: str = "b" * 40) -> Path:
     (release / "bin").mkdir(parents=True)
     (release / "config").mkdir()
     (release / "src" / "apps" / "aflow_app" / "web" / "dist").mkdir(parents=True)
-    for entrypoint in ("aflow", "aflowd", "aflow-app-server"):
+    for entrypoint in ("aflow", "aflow-app-server"):
         _write_executable(release / "bin" / entrypoint, "#!/bin/sh\nexit 0\n")
     (release / "config" / "config.toml").write_text("[server]\n")
     (release / "src" / "apps" / "aflow_app" / "web" / "dist" / "index.html").write_text("ok\n")
     manifest = [f"source_commit={release_id}"]
     for relative in (
-        "bin/aflow", "bin/aflowd", "bin/aflow-app-server", "config/config.toml", "src/apps/aflow_app/web/dist/index.html"
+        "bin/aflow", "bin/aflow-app-server", "config/config.toml", "src/apps/aflow_app/web/dist/index.html"
     ):
         digest = hashlib.sha256((release / relative).read_bytes()).hexdigest()
         manifest.append(f"{digest}  {relative}")
     (release / "release-manifest.sha256").write_text("\n".join(manifest) + "\n")
     return release
+
+
+def test_package_scripts_omit_aflowd_but_retain_aflow_entrypoints() -> None:
+    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["scripts"]
+
+    assert "aflowd" not in scripts
+    assert scripts["aflow"] == "aflow.cli:main"
+    assert scripts["aworkflow"] == "aflow.cli:main"
 
 
 def _registry_record(project_id: str, relative_root: str) -> dict[str, object]:
@@ -202,6 +210,16 @@ def test_fresh_install_is_immutable_and_registry_backed(tmp_path: Path) -> None:
     assert parsed["control_plane"]["aflow_executable"] == f"{release}/bin/aflow"
     assert parsed["control_plane"]["release_identity"] == commit
     assert "/current/" not in (release / "config" / "config.toml").read_text()
+    manifest_entries = {
+        line.split("  ", 1)[1]
+        for line in (release / "release-manifest.sha256").read_text().splitlines()
+        if "  " in line
+    }
+    assert not (release / "bin" / "aflowd").exists()
+    assert {"bin/aflow", "bin/aflow-app-server"} <= manifest_entries
+    assert "bin/aflowd" not in manifest_entries
+    for entrypoint in ("aflow", "aflow-app-server"):
+        assert os.access(release / "bin" / entrypoint, os.X_OK)
     (release / "bin" / "aflow").write_text("corrupt\n")
     stale = _run(*_install_args(source, commit, state_root, project.parent, token, tools), "--apply", "--skip-service", "--skip-readiness", env=env)
     assert stale.returncode != 0
@@ -293,9 +311,55 @@ def test_runtime_validator_checks_loopback_registry_and_release_snapshot(tmp_pat
 
 def _rewrite_manifest(release: Path) -> None:
     lines = [f"source_commit={release.name}"]
-    for relative in ("bin/aflow", "bin/aflowd", "bin/aflow-app-server", "config/config.toml", "src/apps/aflow_app/web/dist/index.html"):
+    for relative in ("bin/aflow", "bin/aflow-app-server", "config/config.toml", "src/apps/aflow_app/web/dist/index.html"):
         lines.append(f"{hashlib.sha256((release / relative).read_bytes()).hexdigest()}  {relative}")
     (release / "release-manifest.sha256").write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("missing", ["aflow", "aflow-app-server"])
+def test_runtime_validator_requires_retained_entrypoints(
+    tmp_path: Path, missing: str
+) -> None:
+    release = _release_fixture(tmp_path)
+    project, _, _, token = _project_and_token(tmp_path)
+    registry = tmp_path / "projects.json"
+    registry.write_text(
+        json.dumps(
+            {"schema_version": 1, "projects": [_registry_record("project", "project")]}
+        )
+        + "\n"
+    )
+    config = release / "config" / "config.toml"
+    config.write_text(
+        "[server]\nbind_host = '127.0.0.1'\nbind_port = 8765\n"
+        "[control_plane]\n"
+        f'managed_projects_root = "{project.parent}"\n'
+        f'project_registry_path = "{registry}"\n'
+        f'aflow_executable = "{release}/bin/aflow"\n'
+        f'environment_file = "{token}"\n'
+        f'release_identity = "{release.name}"\n'
+        'environment = { HOME = "/root" }\n'
+    )
+    _rewrite_manifest(release)
+    (release / "bin" / missing).unlink()
+
+    result = _run(
+        "bash",
+        str(DEPLOY / "validate-runtime.sh"),
+        "--release",
+        str(release),
+        "--config",
+        str(config),
+        "--environment-file",
+        str(token),
+        "--managed-projects-root",
+        str(project.parent),
+        "--project-registry-path",
+        str(registry),
+    )
+
+    assert result.returncode != 0
+    assert f"release entrypoint is not a regular executable: {missing}" in result.stderr
 
 
 def _migration_args(release: Path, project: Path, aflow: Path, workflows: Path, registry: Path, backup_root: Path) -> list[str]:
