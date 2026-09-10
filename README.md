@@ -23,7 +23,10 @@ Runs, Teams, Workflows, and Prompts use separate navigation/editor scroll panes.
 Advanced TOML is a settings-wide mode; guided drafts share one save coordinator.
 Failed runs offer Resume when saved execution supports it, or Restart with
 editable launch options. Restart creates a new attempt using current settings
-and retains plan progress; Resume keeps the source configuration snapshot.
+and retains plan progress; Resume reloads the current configuration source and
+keeps only the predecessor's execution and lifecycle facts. A launch-time
+snapshot, when present, is diagnostic compatibility evidence rather than an
+execution gate.
 
 ## How it works
 
@@ -34,6 +37,20 @@ and retains plan progress; Resume keeps the source configuration snapshot.
    instructions.
 4. AFlow re-reads the plan, records the turn, and follows the next matching
    transition.
+
+Configuration is read as a consistent `aflow.toml`/`workflows.toml` pair at
+reservation, startup, resume, and each safe turn boundary. A saved explicit
+team, max-turns value, or start step keeps that choice; omitted defaults follow
+the current source. A completed call keeps the settings it started with, while
+the next boundary sees valid edits to prompts, models, roles, manager policy,
+limits, and workflow steps. Invalid current TOML or an unusable selected target
+fails clearly before a harness starts; an invalid remote control is rejected
+without changing the prior accepted control.
+
+The dirty-worktree checkbox is a separate startup choice. An existing-checkout
+run sees acknowledged source changes, while a fresh worktree starts from the
+selected committed tree and leaves source changes in place. Configuration edits
+do not require a second acknowledgment or a controller restart.
 
 AFlow invokes existing CLIs rather than provider APIs. The selected harness must
 already be installed and authenticated. Adapters are included for Claude,
@@ -299,7 +316,7 @@ An override may change a worker selector at the next safe worker boundary:
 worker = "codex.strong"
 ```
 
-The frozen workflow configuration validates selectors before accepting the
+The current workflow configuration validates selectors before accepting the
 digest. `team` and manager-owned one-turn upgrades retain their existing
 precedence; a run-local `[roles]` change is applied only after the current
 worker turn is durable. Same-harness changes require exact session resume and
@@ -362,3 +379,23 @@ installation, activation, verification, and rollback.
 - [Architecture](ARCHITECTURE.md)
 
 Worker failures before controller startup are now visible from validated detached-worker receipts. Diagnostics provides a readable summary and expandable raw details; the page Refresh updates run data together. The browser-local recent-run count is edited only in Settings → General.
+
+### Publish completed workflows
+
+An explicitly enabled repository publishes successful workflows to its existing
+remote branch before moving the plan to Done. This also covers in-place runs:
+
+```sh
+git config --local aflow.publishRemote origin
+git config --local aflow.publishBranch main
+```
+
+These local Git settings grant publication for this repository; neither setting
+is enabled by a clone. Configure both, or unset both to disable publication.
+The controller requires a clean completed checkout, fetches the target, and uses
+a normal push. Concurrent accepted remote changes merge in a separate temporary
+checkout; conflicts preserve that checkout and fail delivery rather than overwrite
+history. `publication.json` in the run directory records the source and published
+commit or a failed delivery. Existing CI/CD then validates and deploys main.
+Local approval, remote publication, passing CI, and live deployment are distinct
+outcomes; a successful push alone does not establish live availability.

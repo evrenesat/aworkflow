@@ -332,7 +332,7 @@ def load_override_request(
             )
             if unknown_selectors:
                 raise ValueError(
-                    "roles contains selectors outside frozen config: "
+                    "roles contains selectors not configured in current configuration: "
                     + ", ".join(unknown_selectors)
                 )
     except ValueError as exc:

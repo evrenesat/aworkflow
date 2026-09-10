@@ -1091,7 +1091,7 @@ class BannerRenderer:
             lines.append(f"  Resumed from: {projection.resumed_from_run_id}")
         if projection.diagnostics.frozen_fingerprint is not None:
             lines.append(
-                f"  Config fingerprint: {projection.diagnostics.frozen_fingerprint}"
+                f"  Config fingerprint (diagnostic): {projection.diagnostics.frozen_fingerprint}"
             )
         if projection.selected_start_step is not None:
             lines.append(f"  Start step: {projection.selected_start_step}")
@@ -1438,7 +1438,9 @@ class BannerRenderer:
             return include_all or previous is None or getattr(previous, name) != getattr(diagnostics, name)
 
         if diagnostics.frozen_fingerprint is not None and changed("frozen_fingerprint"):
-            lines.append(f"  Config fingerprint: {diagnostics.frozen_fingerprint}")
+            lines.append(
+                f"  Config fingerprint (diagnostic): {diagnostics.frozen_fingerprint}"
+            )
         if diagnostics.override_file is not None and changed("override_file"):
             lines.append("  Override file: present")
         if diagnostics.override_result is not None and changed("override_result"):

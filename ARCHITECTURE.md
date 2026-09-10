@@ -450,8 +450,8 @@ classifier while retaining its backup-plan and active-plan allowances.
 4. For each turn (up to `max_turns`):
    a. Reload the plan from disk (the agent may have modified it). For worktree flows, plan path placeholders (`{ORIGINAL_PLAN_PATH}`, `{ACTIVE_PLAN_PATH}`, `{NEW_PLAN_PATH}`) are translated from primary-root-relative to worktree-root-relative before being handed to the agent; they are translated back after the turn.
    b. For worktree flows, sync the original plan into the worktree before rendering prompts (so untracked plans under `plans/` are available for the agent to read and modify).
-   c. Resolve the step's role through the selected team and global role map to get the concrete harness selector.
-   d. Render prompt templates with path placeholders.
+   c. Reload the selected current configuration pair at the boundary, then resolve the step's role through the selected team and global role map to get the concrete harness selector.
+   d. Render current prompt templates with path placeholders.
    e. Build a `HarnessInvocation` via the adapter, using `execution_repo_root` as the subprocess cwd.
    f. Before the harness runs, copy a non-original active plan into `plans/backups/` (content-aware, collision-safe naming shared with the startup original-plan backup; identical content deduplicates and changed content gains a `_vNN` version while existing backups and unrelated files are preserved). Original active plans skip this per-turn path because they already have the startup backup, and a missing active plan is skipped, while backup I/O failures fail the turn before the harness starts.
    g. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
@@ -630,13 +630,12 @@ handling.
 ### `run_state.py`
 Data classes for runtime state:
 - `ControllerConfig` -- immutable run parameters (repo root, plan path, max turns, keep runs, extra instructions).
-- `ControllerState` -- mutable per-run state (snapshot, turn count, issues, timing, status, pending retry context, consecutive same-step streak tracking, frozen configuration identity, effective turn limit, and safe override result).
+- `ControllerState` -- mutable per-run state (plan snapshot, turn count, issues, timing, status, pending retry context, consecutive same-step streak tracking, diagnostic configuration identity, effective turn limit, and safe override result).
   - Also carries the current run id and, for resumed runs, the source run id so the banner and startup output can surface both immediately.
-- `FrozenRunIdentity` -- selected workflow name, resolved configuration path, and a canonical SHA-256 fingerprint computed once from the resolved in-memory execution configuration.
-- Resume with a validated copied snapshot preserves the predecessor's recorded
-  identity path (original config for CLI runs or snapshot config for workers).
-  It compares the loaded snapshot's fingerprint independently; copying the
-  snapshot never substitutes live configuration or relaxes drift validation.
+- `FrozenRunIdentity` -- selected workflow name, resolved configuration path, and a canonical SHA-256 fingerprint retained as diagnostic compatibility metadata.
+- Resume selects the current source path and never compares its fingerprint
+  with a launch-time copy; the predecessor's lifecycle, plan, ownership, and
+  controller-inactivity facts remain independently validated.
 - `OverrideRequest` / `OverrideResult` -- the strict user request and durable controller decision for one `overrides.toml` content digest. Raw notes stay out of broad status output.
 - `ResumeOverrideResolution` -- the selected predecessor's persisted result plus actual-file classification for the successor's first boundary. It uses the normal override loader and never scans other runs.
 - `RetryContext` -- frozen dataclass holding everything needed to rerun the same step on the next turn without re-parsing the broken plan (step name, role, resolved selector, pre-failure snapshot, saved plan paths, base prompt, parse error string, attempt counter, retry limit).
@@ -653,9 +652,10 @@ Persists run data under `.aflow/runs/<timestamp>-<uuid>/`:
 - `create_run_paths()` also writes `.aflow/last_run_id` immediately after the run directory is created, and writes `.aflow/last_run_ids/<shell-id>` when a stable shell/session id is available, so later `aflow analyze` invocations can prefer shell-local state without losing the repo-wide fallback if the workflow fails mid-run.
 
 `run.json` is written through a sibling temporary file, flushed and fsynced,
-then replaced in the same directory. The resolved workflow/config fingerprint
-is frozen at startup; runtime never reloads global TOML. Accepted override
-digests are durable before routing changes, rejected digests produce
+then replaced in the same directory. It records the current configuration
+source used at each boundary and may retain a launch-time fingerprint for
+diagnostics; runtime reloads the current pair rather than treating that copy as
+authority. Accepted override digests are durable before routing changes, rejected digests produce
 `waiting_for_valid_override`, and corrected content can be retried on resume.
 Direct `run.json` editing, graph mutation, active-harness mutation, and
 lifecycle/manager/plan-lineage overrides are intentionally unsupported.
@@ -822,8 +822,8 @@ Startup models (`models.py`):
   bounded offset pages without creating run artifacts or units. Fresh starts
   carry `dirty_worktree_confirmed` through the request record and preparation;
   an omitted or false value preserves the structured startup question.
-- Immutable launch manifests carry canonical step, skipped-step, frozen-config,
-  and optional restarted_from_run_id metadata. Extra-instruction text stays
+- Immutable launch manifests carry canonical step, skipped-step, diagnostic
+  frozen-config, and optional restarted_from_run_id metadata. Extra-instruction text stays
   transient while its digest binds idempotency.
 - A restart successor is a normal fresh launch with a new run ID. Its source
   must have same-project control-plane ownership, confirmed failure or an
@@ -959,7 +959,7 @@ default `dev` dependency group rather than the installed runtime package.
 - **Interactive startup decisions are structured.** Startup decisions that require human input are represented as `StartupQuestion` objects with a `kind` enum, prompt text, and metadata. The CLI renders these as TTY prompts; library callers can present them in any UI or handle them programmatically via `prepare_startup_with_answer()`.
 - **Condition-based transitions.** Step transitions use a small expression language over three boolean symbols rather than hardcoded control flow. This keeps workflow definitions declarative.
 - **Structured run logging.** Every turn's prompts, outputs, and snapshots are persisted to `.aflow/runs/` for debugging and auditability. Old runs are pruned automatically.
-- **Skills as Markdown.** The bundled skills are plain SKILL.md files installed as absolute directory symlinks from each harness's skill directory to the account-local canonical store (`~/.config/aflow/skills/<name>`), never copied. The default set stays separate from the optional `aflow-assistant` helper. They contain behavioral instructions that the agent reads at runtime, not executable code; manager instruction bodies are read live from the canonical Markdown on every invocation while names and configuration stay frozen in the run snapshot.
+- **Skills as Markdown.** The bundled skills are plain SKILL.md files installed as absolute directory symlinks from each harness's skill directory to the account-local canonical store (`~/.config/aflow/skills/<name>`), never copied. The default set stays separate from the optional `aflow-assistant` helper. They contain behavioral instructions that the agent reads at runtime, not executable code; manager instruction bodies, names, and configuration are resolved from current sources at each invocation boundary while lifecycle identity remains durable in the run record.
 - **Local-only lifecycle.** Branch and worktree creation, feature branch setup, and merge handoff all operate on local refs only. The engine never fetches, pulls, or pushes. The primary checkout is the control root for run artifacts and merge verification even when normal steps execute inside a linked worktree.
 
 
@@ -986,9 +986,10 @@ to the same control-plane service. A remote ACP interface is deferred. Codex is
 an optional engine harness, and the web app has no provider-specific client.
 
 All projects read the one global workflow pair (`~/.config/aflow/aflow.toml`
-plus `workflows.toml`); every durably reserved run freezes an immutable copy
-under `.aflow/runs/<run_id>/config/` (`aflow/run_config_snapshot.py`) so
-global edits affect only new runs. Session cookies take their Secure
+plus `workflows.toml`); every boundary reloads the current pair. A durably
+reserved run may retain an immutable copy under
+`.aflow/runs/<run_id>/config/` (`aflow/run_config_snapshot.py`) for legacy
+inspection, but global edits affect the next safe turn and resume. Session cookies take their Secure
 attribute from the effective request scheme, which makes direct LAN/Tailscale
 HTTP work without weakening HTTPS deployments.
 
@@ -1115,7 +1116,7 @@ browser -> login (bearer header once) -> signed HttpOnly session cookie
 ### Live worker hotplug boundary
 
 The controller consumes a run-owned override digest at a post-turn boundary,
-validates the selector against the frozen workflow configuration, and persists
+validates the selector against the current workflow configuration, and persists
 one immutable `HotplugTransactionV1`. Its stages are accepted, preflighted,
 quiescing/source-finalized, handover-ready, target-starting, applied, failed,
 or waiting-for-hotplug-recovery. Only applied and failed are terminal.
@@ -1156,3 +1157,12 @@ exposure.
 The installed `ui-worker` wrapper drains both child pipes concurrently and atomically replaces `units/diagnostic.json` with redacted recent output (4,096 characters per stream, bounded line buffers; oversized lines omitted). It writes exit time/code even if diagnostic capture fails. `daemon-worker` writes a nonce-bound structured early exception with its stage. Context reads expose these bounded artifacts even without `run.json`.
 
 The dashboard coordinates manual, timer and stream refreshes, preserves selected-run state on partial failure and gives context a single loader with cancellation and stale-response guards. Summary fields are deterministic; raw artifacts are grouped under collapsed details. Settings owns outstanding prompt-deletion recovery across tabs and editor modes. Browser count edits commit only valid integers on blur/Enter.
+
+### Repository-authorized publication
+
+`aflow/publication.py` runs at successful normal and resumed terminal boundaries,
+after optional local merge and before plan finalization. Local Git configuration
+selects an existing remote/branch. Publication preserves the execution checkout,
+merges concurrent accepted history in an isolated checkout, never force-pushes,
+and writes a bounded run-local receipt. An error prevents normal completion.
+CI and deployment remain downstream of the remote main update.

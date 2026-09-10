@@ -1,6 +1,7 @@
 """Real Chromium assertions for independently scrolling settings editors."""
 import json
 import os
+import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
@@ -186,7 +187,8 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
         stub.chmod(0o755)
     # Pin browser discovery before HOME is replaced: the disposable HOME must
     # not relocate Playwright's own cache.
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
+    cache = Path.home() / "Library" / "Caches" if sys.platform == "darwin" else Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(cache / "ms-playwright")))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", str(bindir))
     config_dir = root.parent / 'global'

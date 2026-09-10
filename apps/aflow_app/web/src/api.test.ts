@@ -378,13 +378,13 @@ describe('workflow control API client', () => {
     expect((vi.mocked(global.fetch).mock.calls.at(-1)![1] as RequestInit).body).not.toContain('revision')
   })
 
-  it('carries config conflict and blocker detail through ApiError', async () => {
+  it('carries a configuration revision conflict through ApiError', async () => {
     vi.mocked(global.fetch).mockResolvedValueOnce({
       ok: false, status: 409,
       text: async () => JSON.stringify({
         detail: {
-          code: 'config_save_blocked',
-          blocking_runs: [{ run_id: 'run-9', status: 'running' }],
+          code: 'revision_conflict',
+          current_revision: 'b'.repeat(64),
         },
       }),
     } as Response)
@@ -392,8 +392,8 @@ describe('workflow control API client', () => {
       aflow_toml: 'x', workflows_toml: 'y', expected_revision: 'a'.repeat(64),
     })).rejects.toMatchObject({
       status: 409,
-      code: 'config_save_blocked',
-      detail: { blocking_runs: [{ run_id: 'run-9', status: 'running' }] },
+      code: 'revision_conflict',
+      detail: { current_revision: 'b'.repeat(64) },
     })
   })
 

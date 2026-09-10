@@ -24,10 +24,6 @@ jobs:
         python-version:
           - "3.11"
           - "3.12"
-        exclude:
-          # Tiered matrix: the deploy/runtime-specific p100 address step only
-          # applies to Linux, so no exclusions are needed today.
-          - {}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -92,10 +88,6 @@ jobs:
         working-directory: apps/aflow_app/server
         run: uv sync --frozen --group dev
 
-      - name: Run server tests
-        working-directory: apps/aflow_app/server
-        run: uv run pytest -q
-
       - name: Install web dependencies
         working-directory: apps/aflow_app/web
         run: npm ci
@@ -107,6 +99,13 @@ jobs:
       - name: Build web app
         working-directory: apps/aflow_app/web
         run: npm run build
+
+      - name: Run server tests
+        working-directory: apps/aflow_app/server
+        run: |
+          uv run playwright install --with-deps chromium
+          uv run pytest -q
+
 
   packaging:
     name: Packaging (${{ matrix.os }})

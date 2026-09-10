@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import redirect_stderr
+import io
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from aflow.api.models import PreparedRun
 from aflow.config import load_workflow_config
 from aflow.hotplug import HANDOVER_HEADINGS
 from aflow.harnesses.base import HarnessInvocation
@@ -248,6 +252,38 @@ future = "Live follow-up prompt {{ACTIVE_PLAN_PATH}}."
 '''
 
 
+def _incident_config(*, current: bool) -> str:
+    """Return the old/current pair used by the legacy recovery fixture."""
+    current_profile = (
+        '\n[harness.codex.profiles.muspark]\nmodel = "model-muspark"\n'
+        if current
+        else ""
+    )
+    current_team = (
+        '\n[teams.MusparkGLM]\nworker = "codex.muspark"\n'
+        if current
+        else ""
+    )
+    return f'''
+[aflow]
+default_workflow = "live"
+max_turns = 2
+
+[harness.codex.profiles.base]
+model = "model-base"
+{current_profile}
+[roles]
+worker = "codex.base"
+
+[teams.base]
+worker = "codex.base"
+{current_team}
+[prompts]
+p = "Incident worker prompt {{ACTIVE_PLAN_PATH}}."
+future = "Incident follow-up prompt {{ACTIVE_PLAN_PATH}}."
+'''
+
+
 def _live_handover() -> str:
     return "\n".join(
         f"## {heading}\n- bounded operational evidence"
@@ -314,18 +350,20 @@ def _run_live(
     max_turns_explicit: bool = False,
     session_driver=None,
 ):
+    run_config = _run_config(
+        config_path,
+        plan_path,
+        max_turns=max_turns,
+        team=team,
+        team_explicit=team_explicit,
+        max_turns_explicit=max_turns_explicit,
+    )
     return run_workflow(
-        _run_config(
-            config_path,
-            plan_path,
-            max_turns=max_turns,
-            team=team,
-            team_explicit=team_explicit,
-            max_turns_explicit=max_turns_explicit,
-        ),
+        run_config,
         load_workflow_config(config_path),
         "live",
         config_dir=config_path,
+        working_dir=run_config.repo_root,
         snapshot_config=False,
         adapter=adapter,
         runner=runner,
@@ -503,11 +541,13 @@ def test_live_mapping_change_hands_over_from_captured_source_session(
             _write_plan(plan_path, _COMPLETE_PLAN)
         return subprocess.CompletedProcess(argv, 0, "synthetic output", "")
 
+    run_config = _run_config(config_path, plan_path, max_turns=2)
     result = run_workflow(
-        _run_config(config_path, plan_path, max_turns=2),
+        run_config,
         load_workflow_config(config_path),
         "live",
         config_dir=config_path,
+        working_dir=run_config.repo_root,
         snapshot_config=False,
         adapter=CodexAdapter(),
         runner=runner,
@@ -574,11 +614,13 @@ def test_live_manager_profile_refresh_preserves_decision_history(
             _write_plan(plan_path, _COMPLETE_PLAN)
         return subprocess.CompletedProcess(argv, 0, "worker output", "")
 
+    run_config = _run_config(config_path, plan_path, max_turns=3)
     result = run_workflow(
-        _run_config(config_path, plan_path, max_turns=3),
+        run_config,
         load_workflow_config(config_path),
         "live",
         config_dir=config_path,
+        working_dir=run_config.repo_root,
         snapshot_config=False,
         adapter=CodexAdapter(),
         runner=runner,
@@ -1065,6 +1107,139 @@ def test_new_profile_in_current_config_can_be_selected_by_boundary_override(
     )
 
     assert any("model-new" in argument for argument in invocations[1])
+
+
+def test_legacy_snapshot_does_not_gate_cli_resume_after_live_team_control(
+    tmp_path: Path,
+) -> None:
+    """A stopped run resumes from relocated current TOML, not its old copy."""
+    import aflow.cli as cli_module
+
+    plan_path = tmp_path / "plan.md"
+    _write_plan(plan_path, _VALID_PLAN)
+    old_config, _ = _write_split_config(
+        tmp_path / "old-config",
+        _incident_config(current=False),
+        _live_workflows(),
+    )
+    current_config, _ = _write_split_config(
+        tmp_path / "relocated-config",
+        _incident_config(current=True),
+        _live_workflows(),
+    )
+
+    with pytest.raises(WorkflowError) as first_failure:
+        run_workflow(
+            ControllerConfig(
+                repo_root=tmp_path,
+                plan_path=plan_path,
+                max_turns=2,
+                start_step="work",
+                team_explicit=False,
+                max_turns_explicit=True,
+                start_step_explicit=True,
+            ),
+            load_workflow_config(old_config),
+            "live",
+            config_dir=old_config,
+            working_dir=tmp_path,
+            adapter=RecordingAdapter(),
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 1, "old worker failure", ""
+            ),
+        )
+
+    source_run_dir = first_failure.value.run_dir
+    assert source_run_dir is not None
+    old_snapshot = source_run_dir / "config"
+    assert (old_snapshot / "snapshot.json").is_file()
+    assert "MusparkGLM" not in (old_snapshot / "aflow.toml").read_text(
+        encoding="utf-8"
+    )
+    (old_snapshot / "snapshot.json").write_text("{malformed", encoding="utf-8")
+    (source_run_dir / "overrides.toml").write_text(
+        'team = "MusparkGLM"\n',
+        encoding="utf-8",
+    )
+
+    resumed_adapter = RecordingAdapter()
+    resumed_calls = 0
+
+    def resumed_runner(argv, **kwargs):
+        nonlocal resumed_calls
+        resumed_calls += 1
+        _write_plan(plan_path, _COMPLETE_PLAN)
+        return subprocess.CompletedProcess(argv, 0, "resumed", "")
+
+    def prepare(request):
+        assert request.config_path == current_config.resolve()
+        return PreparedRun(
+            workflow_name=request.workflow_name,
+            repo_root=request.repo_root,
+            plan_path=request.plan_path,
+            config_path=request.config_path,
+            max_turns=request.max_turns or 2,
+            team=request.team,
+            extra_instructions=request.extra_instructions,
+            start_step=request.start_step or "work",
+            team_explicit=request.team_explicit,
+            max_turns_explicit=request.max_turns_explicit,
+            start_step_explicit=True,
+        )
+
+    executed_resumes = []
+
+    def execute(prepared, *, resume, **kwargs):
+        del kwargs
+        executed_resumes.append(resume)
+        return run_workflow(
+            ControllerConfig(
+                repo_root=prepared.repo_root,
+                plan_path=prepared.plan_path,
+                max_turns=prepared.max_turns,
+                team=prepared.team,
+                extra_instructions=prepared.extra_instructions,
+                start_step=prepared.start_step,
+                team_explicit=prepared.team_explicit,
+                max_turns_explicit=prepared.max_turns_explicit,
+                start_step_explicit=prepared.start_step_explicit,
+            ),
+            load_workflow_config(current_config),
+            "live",
+            config_dir=current_config,
+            working_dir=tmp_path,
+            adapter=resumed_adapter,
+            runner=resumed_runner,
+            resume=resume,
+            snapshot_config=False,
+        )
+
+    stderr = io.StringIO()
+    with (
+        patch.object(cli_module, "_resolve_repo_root", return_value=tmp_path),
+        patch.object(cli_module, "_handle_startup_questions", side_effect=prepare),
+        patch.object(cli_module, "execute_workflow", side_effect=execute),
+        patch.object(cli_module, "BannerRenderer", return_value=object()),
+        redirect_stderr(stderr),
+    ):
+        status = cli_module.main(
+            ["run", "--config", str(current_config), "--resume", source_run_dir.name]
+        )
+
+    assert status == 0, stderr.getvalue()
+    assert resumed_calls == 1
+    assert executed_resumes and executed_resumes[0] is not None
+    assert resumed_adapter.invocations[0]["model"] == "model-muspark"
+    resumed_run_dir = max(
+        (tmp_path / ".aflow" / "runs").iterdir(),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    resumed_payload = json.loads(
+        (resumed_run_dir / "run.json").read_text(encoding="utf-8")
+    )
+    assert resumed_payload["resumed_from_run_id"] == source_run_dir.name
+    assert resumed_payload["live_config_path"] == str(current_config.resolve())
+    assert resumed_payload["last_snapshot"]["is_complete"] is True
 
 
 def test_effectively_unchanged_selector_alias_reuses_session_without_hotplug(

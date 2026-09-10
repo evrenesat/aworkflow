@@ -18,9 +18,11 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp12 v01` — approved.
+- Last Reviewed Checkpoint: `cp13 v01` — approved; coordinator publication and CI/live verification pending.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp13 v01` from the immediately preceding worker worktree against approved CP12 `1949bae`; worktree fallback, zero intervening implementation commits. Reviewed legacy recovery fixtures, config-only gate removal, documentation, and authorized integration of `9d11b37`. Reviewer verification: 2,058 backend tests and 219 subtests passed; web 290 passed with one readiness-navigation failure passing focused retry; source Ruff, production build, diff checks, rebuilt wheel inspection and full synthetic browser smoke passed. No material findings. Approval is a two-parent merge retaining both histories. Manager 40 KiB hard guard and compact 16 KiB summary retained. Plan remains in progress pending coordinator publication and exact-SHA CI/live verification.
 
 - 2026-09-10: Approved `cp12 v01` from the immediately preceding worker worktree against approved CP11 `bb95fef`; worktree fallback, zero intervening implementation commits. Reviewed CLI preservation, daemon/worker instruction inheritance, replacement and clearing, REST/MCP validation, idempotency and predecessor preservation. Required suite plus server MCP: 221 passed, 125 subtests; local daemon/MCP: 33 passed; runtime instruction prompt: 1 passed; source Ruff and diff check passed. No material findings. CP13 remains unchecked; manager 40 KiB hard guard and compact 16 KiB summary retained.
 
@@ -391,7 +393,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** Conflicting request ownership must use the existing idempotency contract; do not bypass authorization or rewrite predecessor metadata.
 
-### [ ] Checkpoint 13: Verify legacy recovery and remove stale restriction contracts
+### [x] Checkpoint 13: Verify legacy recovery and remove stale restriction contracts
 
 **Goal:** Demonstrate the original failure is fixed across entrypoints and remove leftover execution gates and misleading documentation.
 
@@ -401,11 +403,11 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Add a sanitized temporary fixture reproducing the incident: old snapshot lacks MusparkGLM, live config adds it and a new profile, revisioned team control arrives during a fake review, next execution uses the new target. Repeat through stopped-run CLI and daemon resume; preserve pending checkpoint/progress.
-- [ ] Cover absent/malformed snapshot manifests, disagreeing old hashes, live config relocation and an explicit edited config copy. Historical damage must not affect current-source launch. Missing/malformed current config must still fail clearly without a harness launch.
-- [ ] Audit every search hit: remove remaining config equality/catalog gates and tests requiring them; keep deprecated serialized names only where needed for compatibility. Preserve non-config ownership/security/idempotency hashes. Remove unused snapshot/fingerprint helpers rather than maintaining competing authority paths.
-- [ ] Update the documents above in the same pass, with a concise DEVLOG entry. Explain precedence, next-turn timing, legacy explicit-value default, retained lifecycle facts, invalid-request behavior and correction/resume. Document dirty-worktree preflight/checkbox and the difference between using an existing checkout and starting a fresh worktree from committed content. Update an existing relevant README section only; if none needs changing, record why. Update nested guidance that demands snapshot execution. Leave historical completed plans alone.
-- [ ] Run final verification once; fix failures in scope, then repeat only affected checks. Record actual results and limitations in the plan ledger.
+- [x] Add a sanitized temporary fixture reproducing the incident: old snapshot lacks MusparkGLM, live config adds it and a new profile, revisioned team control arrives during a fake review, next execution uses the new target. Repeat through stopped-run CLI and daemon resume; preserve pending checkpoint/progress.
+- [x] Cover absent/malformed snapshot manifests, disagreeing old hashes, live config relocation and an explicit edited config copy. Historical damage must not affect current-source launch. Missing/malformed current config must still fail clearly without a harness launch.
+- [x] Audit every search hit: remove remaining config equality/catalog gates and tests requiring them; keep deprecated serialized names only where needed for compatibility. Preserve non-config ownership/security/idempotency hashes. Remove unused snapshot/fingerprint helpers rather than maintaining competing authority paths.
+- [x] Update the documents above in the same pass, with a concise DEVLOG entry. Explain precedence, next-turn timing, legacy explicit-value default, retained lifecycle facts, invalid-request behavior and correction/resume. Document dirty-worktree preflight/checkbox and the difference between using an existing checkout and starting a fresh worktree from committed content. Update an existing relevant README section only; if none needs changing, record why. Update nested guidance that demands snapshot execution. Leave historical completed plans alone.
+- [x] Run final verification once; fix failures in scope, then repeat only affected checks. Record actual results and limitations in the plan ledger.
 
 **Dependencies:** Checkpoints 1–12.
 
@@ -414,6 +416,14 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 **Done When:** The reproduced run continues/resumes using current settings with no hash repair, import step or fresh plan. Source audit shows no snapshot/config hash gates remain. Every completed step is verified and scope checks pass.
 
 **Blockers:** Pre-existing unrelated suite failures must be identified separately, not fixed by expanding scope or weakening tests.
+
+## CP13 Verification Ledger
+
+- 2026-09-10: Integrated published revision `9d11b373f8820209fa3c827002840267696caf6c` with `git merge --no-ff --no-commit`; both histories are retained and `MERGE_HEAD` remains for reviewer approval. The merge preserved the current-source implementation and added the required publication/CI/smoke changes.
+- 2026-09-10: Added synthetic stopped-run CLI and daemon resume fixtures. They prove a relocated current pair supplies the new `MusparkGLM` team/profile after a malformed legacy snapshot, while the predecessor metadata and plan remain unchanged. Added absent/malformed legacy-snapshot fallback and disagreeing-fingerprint coverage; existing current-source strict-invalid tests remain green.
+- 2026-09-10: Removed executable config-save/run-status gates and dead snapshot-path helpers. Retained diagnostic serialized identity, lifecycle/plan/ownership/idempotency checks, and the existing non-configuration integrity checks. The bounded source audit found no remaining old gate/helper references outside intentionally preserved historical plans and compatibility documentation.
+- 2026-09-10: Updated README, architecture, CLI/configuration/runtime/remote-app docs, bundled engine reference, app copy, UI copy, status labels, nested guidance, and DEVLOG. The test-only publication isolation fixture prevents ordinary synthetic workflows from inheriting this checkout's explicit local publication grant; dedicated publication tests still exercise the real hook.
+- 2026-09-10: Verification passed: `uv run pytest tests apps/aflow_app/server/tests -q` — 2,058 passed, 219 subtests, one unrelated Starlette deprecation warning; `uv run ruff check aflow apps/aflow_app/server/src`; web tests — 291 passed; web production build; `git diff --check`; wheel inspection; and full browser smoke against `aworkflow-0.1.12-py3-none-any.whl`. No public push, real provider, global configuration change, or service edit was used.
 
 ## Behavioral Acceptance Tests
 

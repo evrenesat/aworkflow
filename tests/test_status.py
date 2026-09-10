@@ -533,7 +533,7 @@ def test_record_surfaces_safe_override_diagnostics() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert "Config fingerprint: 1234567890ab" in record
+    assert "Config fingerprint (diagnostic): 1234567890ab" in record
     assert "Override file: present" in record
     assert "Override result: rejected (abc): team is incompatible" in record
     assert "Override action: correct overrides.toml and resume" in record
@@ -800,18 +800,17 @@ def test_tty_and_non_tty_streams_receive_identical_ordered_output(monkeypatch) -
         with os.fdopen(slave, "w", encoding="utf-8") as tty_stream:
             _drive(_renderer(tty_stream))
             tty_stream.flush()
-        tty_output = b""
-        while True:
-            readable, _, _ = select.select((master,), (), (), 1.0)
-            if not readable:
-                break
-            try:
+            # BSD PTYs can discard unread output when the last slave closes.
+            # Drain while the writer remains open on every supported platform.
+            tty_output = b""
+            while True:
+                readable, _, _ = select.select((master,), (), (), 1.0)
+                if not readable:
+                    break
                 chunk = os.read(master, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            tty_output += chunk
+                if not chunk:
+                    break
+                tty_output += chunk
     finally:
         os.close(master)
     tty_text = tty_output.decode("utf-8").replace("\r\n", "\n")

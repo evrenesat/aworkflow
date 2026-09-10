@@ -226,6 +226,13 @@ class TestRegistryInteraction:
     def test_case_distinct_relative_roots_stay_distinct(self, tmp_path: Path) -> None:
         registry, managed = _registry(tmp_path)
         _committed_repo(managed, "Team/shared")
+        if (managed / "team/shared").exists():
+            assert (managed / "team/shared").samefile(managed / "Team/shared")
+            registry.register("shared", "Shared", "Team/shared")
+            found = _candidates(discover_projects(registry))
+            assert len(found) == 1
+            assert next(iter(found.values()))["registered_project_id"] == "shared"
+            return
         _committed_repo(managed, "team/shared")
         registry.register("shared", "Shared", "Team/shared")
 

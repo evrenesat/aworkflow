@@ -242,8 +242,8 @@ export function ConfigEditor({ onDirtyChange, onSaved, onReady }: ConfigEditorPr
         <div>
           <h3 style={{ fontWeight: 600 }}>Configuration</h3>
           <div className="text-xs text-dim">
-            These shared files apply to new runs in every project; existing runs keep the
-            configuration they were started with. Both files are checked and saved together.
+            These shared files apply at the next safe boundary in every project, including
+            existing runs. Both files are checked and saved together.
           </div>
         </div>
         <span className="text-xs text-dim mono" title={snapshot.revision}>

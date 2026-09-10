@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from aflow.config import (
     WorkflowConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
+    load_workflow_config,
 )
 from aflow.control_plane import InMemoryUnitManager, LaunchManifest, create_launch_manifest, read_events, write_launch_phase
 from aflow.control_plane.repository import RunRepository
@@ -24,7 +26,57 @@ from aflow.daemon import (
     DaemonIdempotencyConflict,
     _worker_prepared,
 )
+from aflow.harnesses.codex import CodexAdapter
 from aflow.run_config_snapshot import SnapshotError
+from aflow.run_state import ControllerConfig
+from aflow.workflow import (
+    WorkflowError,
+    resolve_profile,
+    resolve_role_selector,
+    run_workflow,
+)
+from tests._support import _write_split_config
+
+
+def _incident_aflow_config(*, current: bool) -> str:
+    extra_profile = (
+        '\n[harness.codex.profiles.muspark]\nmodel = "model-muspark"\n'
+        if current
+        else ""
+    )
+    extra_team = (
+        '\n[teams.MusparkGLM]\nworker = "codex.muspark"\n'
+        if current
+        else ""
+    )
+    return f'''\
+[aflow]
+default_workflow = "live"
+max_turns = 2
+
+[harness.codex.profiles.base]
+model = "model-base"
+{extra_profile}
+[roles]
+worker = "codex.base"
+
+[teams.base]
+worker = "codex.base"
+{extra_team}
+[prompts]
+p = "Incident worker prompt {{ACTIVE_PLAN_PATH}}."
+'''
+
+
+_INCIDENT_WORKFLOWS = '''\
+[workflow.live]
+team = "base"
+
+[workflow.live.steps.work]
+role = "worker"
+prompts = ["p"]
+go = [{ to = "END", when = "DONE" }, { to = "work" }]
+'''
 
 
 def _workflow_config() -> WorkflowUserConfig:
@@ -188,6 +240,125 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     source_events = read_events(source_dir)
     assert [event.event_type for event in source_events].count("resume_requested") == 1
     assert source_dir.joinpath("run.json").read_bytes() == before
+
+
+def test_daemon_resume_uses_relocated_live_config_after_legacy_snapshot_damage(
+    tmp_path: Path,
+) -> None:
+    """A control-plane continuation resolves its team and profile from live TOML."""
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
+        encoding="utf-8",
+    )
+    old_config, _ = _write_split_config(
+        tmp_path / "old-config",
+        _incident_aflow_config(current=False),
+        _INCIDENT_WORKFLOWS,
+    )
+    current_config, _ = _write_split_config(
+        tmp_path / "relocated-config",
+        _incident_aflow_config(current=True),
+        _INCIDENT_WORKFLOWS.replace('team = "base"', 'team = "MusparkGLM"'),
+    )
+
+    with pytest.raises(WorkflowError) as first_failure:
+        run_workflow(
+            ControllerConfig(
+                repo_root=tmp_path,
+                plan_path=plan_path,
+                max_turns=2,
+                start_step="work",
+                idempotency_key="source-key",
+                caller_scope="project:daemon-test",
+                max_turns_explicit=True,
+                start_step_explicit=True,
+            ),
+            load_workflow_config(old_config),
+            "live",
+            config_dir=old_config,
+            working_dir=tmp_path,
+            adapter=CodexAdapter(),
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 1, "synthetic old worker failure", ""
+            ),
+        )
+
+    source_run_dir = first_failure.value.run_dir
+    assert source_run_dir is not None
+    snapshot_dir = source_run_dir / "config"
+    assert (snapshot_dir / "snapshot.json").is_file()
+    assert "MusparkGLM" not in (snapshot_dir / "aflow.toml").read_text(
+        encoding="utf-8"
+    )
+    (snapshot_dir / "snapshot.json").write_text("{malformed", encoding="utf-8")
+    (source_run_dir / "overrides.toml").write_text(
+        'team = "MusparkGLM"\n',
+        encoding="utf-8",
+    )
+    source_metadata_before_resume = (source_run_dir / "run.json").read_bytes()
+    source_plan_before_resume = plan_path.read_bytes()
+
+    environment_file = tmp_path / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = tmp_path / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    units = InMemoryUnitManager()
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=tmp_path,
+            config_path=current_config,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    continuation = daemon.service.resume(
+        source_run_dir.name,
+        caller_scope="project:daemon-test",
+        idempotency_key="resume-current",
+    )
+
+    assert continuation.status == "running"
+    assert len(units.start_calls) == 1
+    record = daemon.service._read_record(continuation.run_id)
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    current_workflow_config = load_workflow_config(current_config)
+    prepared, resume_context = _worker_prepared(
+        record,
+        manifest,
+        tmp_path,
+        current_config,
+        current_workflow_config,
+    )
+    assert resume_context is not None
+    assert prepared.config_path == current_config.resolve()
+    assert prepared.plan_path == plan_path.resolve()
+    assert prepared.team == manifest.team == "MusparkGLM"
+    assert prepared.start_step == manifest.start_step == "work"
+    selector = resolve_role_selector(
+        "worker",
+        prepared.team,
+        current_workflow_config,
+        step_path="workflow.live.steps.work",
+        step_name=prepared.start_step,
+    )
+    assert selector == "codex.muspark"
+    assert resolve_profile(
+        selector,
+        current_workflow_config,
+        step_path="workflow.live.steps.work",
+    ).model == "model-muspark"
+    assert record["prepared"]["config_path"] == str(current_config.resolve())
+    assert (source_run_dir / "run.json").read_bytes() == source_metadata_before_resume
+    assert plan_path.read_bytes() == source_plan_before_resume
 
 
 @pytest.mark.parametrize(

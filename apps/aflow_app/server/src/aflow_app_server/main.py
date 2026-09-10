@@ -101,7 +101,6 @@ from .project_config_service import (
     ConfigValidationReport,
     ProjectConfigError,
     ProjectConfigRevisionConflict,
-    ProjectConfigRunBlocked,
     ProjectConfigSnapshot,
 )
 from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
@@ -844,20 +843,6 @@ async def guided_config_rejected_handler(
     )
 
 
-@app.exception_handler(ProjectConfigRunBlocked)
-async def config_save_blocked_handler(
-    _: Request, exc: ProjectConfigRunBlocked
-) -> JSONResponse:
-    return _error_response(
-        status.HTTP_409_CONFLICT,
-        "config_save_blocked",
-        blocking_runs=[
-            {"run_id": run_id, "status": run_status}
-            for run_id, run_status in exc.blocking_runs
-        ],
-    )
-
-
 @app.exception_handler(DaemonAuthorizationError)
 @app.exception_handler(ServiceAuthorizationError)
 async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse:
@@ -1493,8 +1478,9 @@ def get_global_config(
 ) -> ProjectConfigResponse:
     """Return both exact global configuration texts with their revision.
 
-    Changes to this shared configuration affect new runs in all projects;
-    existing runs keep the configuration snapshot they were launched with.
+    Changes to this shared configuration affect the next safe boundary in all
+    projects, including existing runs; diagnostic snapshots do not control
+    execution.
     """
     return _config_response(service.read())
 

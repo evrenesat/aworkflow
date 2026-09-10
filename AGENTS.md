@@ -13,3 +13,16 @@
 - Treat plan files and `.aflow` durable state as authoritative when starting or resuming runs.
 - Before launching, distinguish independent AFlow controller roots from their launcher/child processes and avoid duplicate controllers for one logical run.
 - Preserve managed worktrees, unrelated dirty files, and run lineage during recovery.
+
+## Completed-work delivery
+
+- The owner authorizes publishing completed, reviewed AFlow work to `origin/main`
+  and its existing CI-gated deployment. Do not leave completed plans only on local
+  main or feature branches, or ask again for this already-granted publication.
+- In-place workflows do not merge by themselves. The controller publication
+  boundary uses the repository-local Git settings `aflow.publishRemote=origin`
+  and `aflow.publishBranch=main`; configure them in the working repository.
+- Complete a plan only after its approved commits reach origin/main. Report
+  publication, CI, and live activation separately; do not claim deployed usability
+  from a local approval. Fix a failed delivery gate before accumulating more
+  completed local plans. Preserve active execution worktrees and never force-push.

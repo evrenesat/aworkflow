@@ -413,6 +413,15 @@ policy, and limits. An invalid newly submitted override is recorded once per
 digest and does not discard the last accepted run-local choices when usable
 work can continue. Owner-stop is checked before this reload.
 
+Legacy metadata with no explicit live source uses the old snapshot origin only
+as a best-effort path hint; absent or malformed snapshot data falls through to
+the configured current default. A valid explicit saved value remains explicit,
+even when the current default changes. Invalid current configuration still
+fails before a harness starts, while an owner-stop request can be honored
+without loading TOML. The dirty-worktree preflight/checkbox controls whether
+startup may use an existing checkout containing acknowledged changes; a fresh
+worktree starts from committed content and leaves the source checkout alone.
+
 ## UI process lifecycle and persistent units
 
 `aflow ui` serves the web app in the foreground by default; `--daemon`

@@ -29,6 +29,27 @@
 - Resolved the CP2 metadata writer regression and explicit start-step correction equal to the original start. Verified 293 tests and 131 subtests across CP2/API and focused metadata/replay checks.
 - CP2 approved; per-turn reload remains subsequent checkpoint work.
 
+## 2026-09-10 — Close the publication gap and exercise CI portability
+
+- Add explicitly repository-authorized publication before successful workflow
+  completion, including in-place and resumed boundaries. Preserve active trees
+  and remote history; record the delivered SHA or failed delivery in the run.
+- Build web assets and install Chromium before server browser tests; preserve
+  the correct platform browser cache when using disposable HOME. Drain PTY output before closing
+  its slave, handle protected macOS executables in the no-Node packaging smoke,
+  use the macOS boot-session identity, and confirm listener conflicts while
+  preserving address reuse for clean restarts. Filesystem identity tests now exercise aliases on case-insensitive disks.
+- Probe live loopback listeners before wildcard binding on BSD, and give the
+  workspace-shell plan-list mock a valid empty response after project creation.
+
+## 2026-09-10 — Release approved work through main
+
+- Publish the completed Skills/settings, manager-context, and readable CLI work
+  to main. Remove the invalid empty CI matrix exclusion so CI can run and the
+  existing exact-SHA deployment gate can advance the live UI.
+- The active live-configuration plan remains in its execution worktree until
+  complete. Local plan approval alone is not evidence of publication or deployment.
+
 ## 2026-09-10 — Store manager history outside the live context (Checkpoint 4)
 
 - Added an additive content-addressed JSON evidence kind for complete manager
@@ -1279,3 +1300,18 @@ Final verification: web tests (213), all server tests including Chromium layout 
   tests (154 plus 125 subtests), runtime tests (276 plus 43 subtests), and
   library startup tests (33 plus 6 subtests) passed; Ruff and diff whitespace
   checks passed. No real provider or global configuration was used.
+
+## 2026-09-10 — Live configuration without snapshot gates
+
+- Completed the legacy recovery pass: CLI and daemon resume now use the
+  relocated current configuration source, while malformed, absent, edited, or
+  hash-disagreeing compatibility snapshots remain diagnostic only. Removed
+  stale config-save and frozen-configuration admission contracts while
+  retaining lifecycle, plan, ownership, idempotency, and security checks.
+- Added synthetic CLI/daemon resume and snapshot-corruption coverage, updated
+  user-facing and bundled-engine documentation, and isolated ordinary tests
+  from this checkout's explicit publication grant without weakening the
+  dedicated publication tests.
+- Verification: 2,058 Python tests plus 219 subtests, 291 web tests, Ruff,
+  web production build, wheel inspection, and browser smoke passed. No public
+  push, real provider, or live configuration change was used.

@@ -205,6 +205,67 @@ def test_missing_legacy_origin_falls_back_to_current_default(
     assert loaded.workflow_config.harnesses["codex"].profiles["default"].model == "default-model"
 
 
+@pytest.mark.parametrize(
+    "snapshot_text",
+    [None, "{malformed"],
+    ids=["absent", "malformed"],
+)
+def test_absent_or_malformed_legacy_snapshot_falls_back_to_current_default(
+    tmp_path: Path,
+    snapshot_text: str | None,
+) -> None:
+    repo = _repo(tmp_path)
+    if snapshot_text is not None:
+        directory = snapshot_directory(repo, "damaged-run")
+        directory.mkdir(parents=True)
+        (directory / "snapshot.json").write_text(snapshot_text, encoding="utf-8")
+
+    current = tmp_path / "current" / "aflow.toml"
+    _write_pair(
+        current,
+        VALID_AFLOW.replace("test-model", "current-model"),
+        VALID_WORKFLOWS,
+    )
+    loaded = load_live_config_for_run(
+        repo,
+        "damaged-run",
+        default_config_path=current,
+    )
+
+    assert loaded.source.kind == "default"
+    assert loaded.config_path == current.resolve()
+    assert loaded.workflow_config.harnesses["codex"].profiles["default"].model == "current-model"
+
+
+def test_live_metadata_wins_over_disagreeing_legacy_fingerprint(
+    tmp_path: Path,
+    global_pair: tuple[Path, Path],
+) -> None:
+    _, legacy = global_pair
+    repo = _repo(tmp_path)
+    _snapshot(repo, legacy, "hash-disagreement", fingerprint="stale-hash")
+    current = tmp_path / "current" / "aflow.toml"
+    _write_pair(
+        current,
+        VALID_AFLOW.replace("test-model", "current-model"),
+        VALID_WORKFLOWS,
+    )
+
+    loaded = load_live_config_for_run(
+        repo,
+        "hash-disagreement",
+        run_metadata={
+            "live_config_path": str(current),
+            "config_fingerprint": "new-hash",
+        },
+        default_config_path=legacy,
+    )
+
+    assert loaded.source.kind == "saved"
+    assert loaded.config_path == current.resolve()
+    assert loaded.workflow_config.harnesses["codex"].profiles["default"].model == "current-model"
+
+
 def test_explicit_source_wins_over_saved_legacy_and_default_paths(
     tmp_path: Path, global_pair: tuple[Path, Path]
 ) -> None:
@@ -299,7 +360,6 @@ def test_configuration_pair_lock_still_serializes_snapshot_and_live_reads(
     tmp_path: Path, global_pair: tuple[Path, Path]
 ) -> None:
     _, config_path = global_pair
-    repo = _repo(tmp_path)
     acquired: list[str] = []
     import threading
 

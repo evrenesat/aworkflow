@@ -18,8 +18,8 @@ server and exits successfully. A port held by another program is an
 actionable error.
 
 Workflows launched by the UI run as detached worker units that survive UI
-shutdown and reconnect on restart; each run freezes its configuration at
-launch (see docs/runtime-behavior.md).
+shutdown and reconnect on restart; each run records its live configuration
+source and reloads it at the next safe boundary (see docs/runtime-behavior.md).
 
 ## Run
 
@@ -132,10 +132,12 @@ Only schema-version `2` run metadata is resumable. Older, missing, boolean,
 string, and future schema values are readable for inspection but are rejected
 before plan lookup, startup questions, allocation, or daemon continuation; AFlow
 does not migrate or rewrite them. Current metadata must also contain the full
-manager, lifecycle, frozen-configuration, hotplug, and active-scope envelope
-state. Its frozen configuration identity—workflow name, canonical configuration
-path, and fingerprint—must match the currently resolved workflow, roles, teams,
-harness profiles, manager policy, and error-handling configuration.
+manager, lifecycle, compatibility, hotplug, and active-scope envelope state.
+The saved workflow name, plan, lifecycle, ownership, and controller evidence
+remain authoritative, but a legacy configuration path or fingerprint is
+diagnostic only. Resume loads the current selected configuration source; an
+absent, malformed, relocated, or hash-disagreeing snapshot does not reject
+otherwise valid saved progress.
 
 Lookup order for a previous run is:
 
@@ -152,6 +154,12 @@ A prior run is resumable only when all of these are true:
 - normally, `last_snapshot.is_complete` is not `true` and the run has not
   entered merge teardown
 - the invocation still matches on repo root, workflow name, absolute plan path, effective team, selected start step, max turns, extra instructions, and lifecycle setup
+
+At the first resumed boundary, an omitted explicit choice may follow the
+current default; a saved explicit team, start step, or max-turns value remains
+explicit. Invalid current TOML or an unusable selected target fails before a
+harness starts and can be corrected before resuming. Invalid remote controls
+are rejected without changing the saved accepted choice.
 
 The sole completed-plan exception is a failed terminal integration. It must
 record a complete snapshot, `end_reason = "transition_end"`, failed merge

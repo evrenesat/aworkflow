@@ -110,7 +110,8 @@ class ResumeRelocation:
                         value[key] = f"{self.map_path(path)}::{suffix}"
                     elif isinstance(item, (dict, list)):
                         transform(item)
-        # Only known durable state subtrees; frozen configuration remains byte-equivalent.
+        # Only known durable state subtrees; diagnostic configuration metadata
+        # is not used to reconstruct the current execution source.
         for field in (
             "manager_history", "review_rejection_history", "active_implementation_scope",
             "pending_manager_notes", "pending_step_team_override", "pending_boundary_decision",

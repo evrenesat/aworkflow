@@ -56,6 +56,7 @@ from .manager_context import (
     summarize_review_rejection,
 )
 from .skill_store import SkillStoreError
+from .publication import PublicationError, publish_completed_run
 from .git_status import (
     classify_status_items_by_prefix,
     is_lifecycle_owned_path,
@@ -2266,20 +2267,6 @@ _REVIEW_SKILL_NAMES = frozenset({
 _PLAN_BRANCH_LINE_RE = re.compile(r"^(\s*-\s+Plan Branch:\s+`)([^`]*)(`.*)$", re.MULTILINE)
 
 
-def _resume_identity_config_dir(
-    config: "ControllerConfig", config_dir: Path,
-    saved_identity: FrozenRunIdentity | None = None,
-) -> Path:
-    """Return the selected current source for diagnostic identity metadata.
-
-    Snapshot directories are compatibility artifacts only.  A resume may use
-    the source's saved live path, but once that source has been resolved the
-    identity must describe the path actually selected for this invocation.
-    """
-    del config, saved_identity
-    return config_dir
-
-
 def _freeze_run_identity(
     workflow_name: str,
     workflow_config: WorkflowUserConfig,
@@ -2361,11 +2348,11 @@ def _daemon_manifest_matches_execution(
     )
 
 
-def _frozen_identity_mismatch(
+def _resume_lifecycle_mismatch(
     saved: FrozenRunIdentity,
     current: FrozenRunIdentity,
 ) -> str | None:
-    """Describe the persisted identity fields that differ from current config."""
+    """Describe the immutable lifecycle fields that differ on resume."""
     differences = [
         f"{field} saved '{getattr(saved, field)}' but current '{getattr(current, field)}'"
         for field in (
@@ -6430,21 +6417,19 @@ def run_workflow(
     current_frozen_identity = _freeze_run_identity(
         workflow_name,
         workflow_config,
-        config_dir=_resume_identity_config_dir(config, config_dir, resume.frozen_run_identity)
-        if resume is not None
-        else config_dir,
+        config_dir=config_dir,
         continuation_from_branch=continuation_from_branch,
         continuation_from_head=continuation_from_head,
         continuation_mode=continuation_mode,
     )
     if resume is not None and resume.frozen_run_identity is not None:
-        identity_mismatch = _frozen_identity_mismatch(
+        identity_mismatch = _resume_lifecycle_mismatch(
             resume.frozen_run_identity,
             current_frozen_identity,
         )
         if identity_mismatch is not None:
             raise WorkflowError(
-                "resume frozen configuration mismatch: "
+                "resume lifecycle identity mismatch: "
                 f"{identity_mismatch}"
             )
         if resume.resume_team_override is not None:
@@ -9349,6 +9334,21 @@ def run_workflow(
             )
         except HarnessEnvironmentPreflightError as exc:
             _handle_environment_preflight_failure(exc)
+        if merge_status != "failed":
+            try:
+                merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                publish_completed_run(
+                    config.repo_root if merging else working_dir,
+                    run_paths.run_dir,
+                    source_ref=exec_ctx.main_branch if merging else "HEAD",
+                )
+            except PublicationError as exc:
+                failure_finalizer.raise_failure(
+                    str(exc), original_plan_path=original_plan_path,
+                    current_step_name=current_step_name, active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                )
+
         if merge_status == "failed":
             state.status_message = "failed"
             current_step = wf.steps.get(current_step_name)
@@ -9563,6 +9563,21 @@ def run_workflow(
                     )
                 except HarnessEnvironmentPreflightError as exc:
                     _handle_environment_preflight_failure(exc)
+            if merge_status != "failed":
+                try:
+                    merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                    publish_completed_run(
+                        config.repo_root if merging else working_dir,
+                        run_paths.run_dir,
+                        source_ref=exec_ctx.main_branch if merging else "HEAD",
+                    )
+                except PublicationError as exc:
+                    failure_finalizer.raise_failure(
+                        str(exc), original_plan_path=original_plan_path,
+                        current_step_name=current_step_name, active_plan_path=active_plan_path,
+                        new_plan_path=new_plan_path, last_snapshot=state.last_snapshot, cause=exc,
+                    )
+
             if merge_status == "failed":
                 state.status_message = "failed"
                 report = _manager_terminal_incident(
@@ -10477,6 +10492,25 @@ def run_workflow(
                 )
             except HarnessEnvironmentPreflightError as exc:
                 _handle_environment_preflight_failure(exc)
+
+        if final_snapshot.is_complete and merge_status != "failed":
+            try:
+                merging = exec_ctx is not None and "merge" in exec_ctx.teardown
+                publish_completed_run(
+                    config.repo_root if merging else working_dir,
+                    run_paths.run_dir,
+                    source_ref=exec_ctx.main_branch if merging else "HEAD",
+                )
+            except PublicationError as exc:
+                failure_finalizer.raise_failure(
+                    str(exc),
+                    original_plan_path=original_plan_path,
+                    current_step_name=terminal_step_name,
+                    active_plan_path=active_plan_path,
+                    new_plan_path=new_plan_path,
+                    last_snapshot=final_snapshot,
+                    cause=exc,
+                )
 
         if merge_status == "failed":
             state.status_message = "failed"
@@ -12172,12 +12206,12 @@ def run_workflow(
                 max_turns_reached=max_turns_reached,
             )
             return _finish_normal_terminal(
-                final_snapshot=post_snapshot,
-                end_reason=end_reason,
                 terminal_step_name=current_step_name,
                 terminal_step_role=step.role,
                 terminal_selector=selector,
                 active_team=active_team_name,
+                final_snapshot=post_snapshot,
+                end_reason=end_reason,
             )
 
         if len(wf.steps) > 1:
