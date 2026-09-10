@@ -6706,6 +6706,76 @@ class WorkflowPreflightTests(unittest.TestCase):
             assert len(reservation_observations) == 1
             assert (repo_root / 'plans' / 'backups' / 'plan.md').read_text(encoding='utf-8') == original
 
+    def test_review_workflow_accepts_numbered_blank_git_tracking_before_run_reservation(self) -> None:
+        from aflow.control_plane import reserve_run_id as real_reserve_run_id
+        from aflow.plan import parse_git_tracking_metadata
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            rc, current_head, _ = _run_git_in_test(
+                ['rev-parse', '--verify', 'HEAD'], cwd=repo_root
+            )
+            assert rc == 0
+            plan_path = repo_root / 'plan.md'
+            original = textwrap.dedent('''\
+                # Plan
+
+                ## 3. Git Tracking
+
+                - Plan Branch: ``
+                - Pre-Handoff Base HEAD: ``
+                - Last Reviewed HEAD: `none`
+                - Review Log:
+                  - None yet.
+
+                ### [ ] Checkpoint 1: First
+                - [ ] step one
+            ''')
+            _write_plan(plan_path, original)
+            reservation_observations: list[str] = []
+            runner_calls: list[int] = []
+
+            def observing_reservation(root, requested_run_id=None):
+                plan_text = plan_path.read_text(encoding='utf-8')
+                metadata = parse_git_tracking_metadata(plan_text)
+                assert metadata is not None
+                assert metadata.plan_branch == ''
+                assert metadata.pre_handoff_base_head == ''
+                assert plan_text == original
+                reservation_observations.append(plan_text)
+                return real_reserve_run_id(root, requested_run_id)
+
+            def runner(argv, **kwargs):
+                runner_calls.append(1)
+                text = plan_path.read_text(encoding='utf-8')
+                assert '## 3. Git Tracking' in text
+                assert f'- Pre-Handoff Base HEAD: `{current_head}`' in text
+                _write_plan(
+                    plan_path,
+                    text.replace('### [ ] Checkpoint 1', '### [x] Checkpoint 1').replace(
+                        '- [ ] step one',
+                        '- [x] step one',
+                    ),
+                )
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            with patch('aflow.control_plane.reserve_run_id', side_effect=observing_reservation):
+                result = run_workflow(
+                    ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                    self._make_review_wf_config(),
+                    'review_wf',
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    runner=runner,
+                )
+
+            assert result.final_snapshot.is_complete
+            assert runner_calls == [1]
+            assert len(reservation_observations) == 1
+            assert plan_path.read_text(encoding='utf-8').count('## 3. Git Tracking') == 1
+
     def test_readme_minimal_review_workflow_reaches_first_turn_after_git_tracking_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -6918,7 +6988,7 @@ class WorkflowPreflightTests(unittest.TestCase):
             original = (
                 '# Plan\n\n'
                 '## Git Tracking\n\n- Plan Branch: ``\n- Pre-Handoff Base HEAD: `abc`\n\n'
-                '## Git Tracking\n\n- Plan Branch: ``\n- Pre-Handoff Base HEAD: `def`\n\n'
+                '## 3. Git Tracking\n\n- Plan Branch: ``\n- Pre-Handoff Base HEAD: `def`\n\n'
                 '### [ ] Checkpoint 1: First\n- [ ] step one\n'
             )
             _write_plan(plan_path, original)

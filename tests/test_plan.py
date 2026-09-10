@@ -166,6 +166,147 @@ class PlanParserFenceTests(unittest.TestCase):
         text = '# Plan\n\n### [ ] Checkpoint 1\n\n```\n## Git Tracking\n```\n'
         assert not plan_has_git_tracking(text)
 
+    def test_numbered_git_tracking_heading_matches_canonical_helpers(self) -> None:
+        from aflow.plan import (
+            _collect_sections,
+            _live_git_tracking_heading_line_numbers,
+            insert_git_tracking_section,
+            is_handoff_pristine_for_base_refresh,
+            is_plan_pristine_for_git_tracking_bootstrap,
+            parse_git_tracking_metadata,
+            parse_plan_text,
+            plan_has_git_tracking,
+            rewrite_git_tracking_field,
+        )
+
+        canonical = textwrap.dedent('''\
+            # Plan
+
+            ## Git Tracking
+
+            - Plan Branch: `main`
+            - Pre-Handoff Base HEAD: `abc123`
+            - Last Reviewed HEAD: `none`
+            - Review Log:
+              - None yet.
+
+            ### [ ] Checkpoint 1
+            - [ ] step
+        ''')
+        numbered = canonical.replace('## Git Tracking', '## 3. Git Tracking', 1)
+
+        canonical_metadata = parse_git_tracking_metadata(canonical)
+        numbered_metadata = parse_git_tracking_metadata(numbered)
+        assert canonical_metadata == numbered_metadata
+        assert plan_has_git_tracking(numbered)
+        assert _live_git_tracking_heading_line_numbers(numbered) == (3,)
+        assert parse_plan_text(numbered, source_path=Path('plan.md')).snapshot == parse_plan_text(
+            canonical,
+            source_path=Path('plan.md'),
+        ).snapshot
+
+        sections = _collect_sections(numbered, source_path=Path('plan.md'))
+        assert numbered_metadata is not None
+        assert is_handoff_pristine_for_base_refresh(numbered_metadata, sections)
+        assert not is_plan_pristine_for_git_tracking_bootstrap(numbered, sections)
+
+        updated = rewrite_git_tracking_field(numbered, 'Pre-Handoff Base HEAD', 'def456')
+        assert updated == numbered.replace('`abc123`', '`def456`', 1)
+        with pytest.raises(ValueError, match='already exists'):
+            insert_git_tracking_section(numbered, pre_handoff_base_head='def456')
+
+    def test_numbered_git_tracking_heading_ignores_fenced_example(self) -> None:
+        from aflow.plan import _live_git_tracking_heading_line_numbers, parse_git_tracking_metadata
+
+        text = textwrap.dedent('''\
+            # Plan
+
+            ```md
+            ## 7. Git Tracking
+            - Plan Branch: `fake`
+            - Pre-Handoff Base HEAD: `fake123`
+            ```
+
+            ## 3. Git Tracking
+
+            - Plan Branch: `main`
+            - Pre-Handoff Base HEAD: `abc123`
+
+            ### [ ] Checkpoint 1
+            - [ ] step
+        ''')
+
+        assert _live_git_tracking_heading_line_numbers(text) == (9,)
+        metadata = parse_git_tracking_metadata(text)
+        assert metadata is not None
+        assert metadata.plan_branch == 'main'
+        assert metadata.pre_handoff_base_head == 'abc123'
+
+    def test_canonical_and_numbered_git_tracking_sections_are_ambiguous(self) -> None:
+        from aflow.plan import parse_git_tracking_metadata
+
+        text = textwrap.dedent('''\
+            # Plan
+
+            ## Git Tracking
+
+            - Plan Branch: `main`
+            - Pre-Handoff Base HEAD: `abc123`
+
+            ## 3. Git Tracking
+
+            - Plan Branch: `main`
+            - Pre-Handoff Base HEAD: `abc123`
+
+            ### [ ] Checkpoint 1
+            - [ ] step
+        ''')
+
+        with pytest.raises(ValueError, match='git tracking metadata is ambiguous'):
+            parse_git_tracking_metadata(text)
+
+    def test_non_ascii_or_malformed_numbered_git_tracking_prefix_is_not_reserved(self) -> None:
+        from aflow.plan import parse_git_tracking_metadata, plan_has_git_tracking
+
+        for heading in (
+            '## 3 Git Tracking',
+            '## 3.Git Tracking',
+            '## ٣. Git Tracking',
+            '## three. Git Tracking',
+        ):
+            with self.subTest(heading=heading):
+                text = f'# Plan\n\n{heading}\n\n### [ ] Checkpoint 1\n- [ ] step\n'
+                assert not plan_has_git_tracking(text)
+                assert parse_git_tracking_metadata(text) is None
+
+    def test_numbered_git_tracking_history_is_not_pristine(self) -> None:
+        from aflow.plan import (
+            _collect_sections,
+            is_handoff_pristine_for_base_refresh,
+            parse_git_tracking_metadata,
+        )
+
+        text = textwrap.dedent('''\
+            # Plan
+
+            ## 3. Git Tracking
+
+            - Plan Branch: `main`
+            - Pre-Handoff Base HEAD: `abc123`
+            - Last Reviewed HEAD: `def456`
+            - Review Log:
+              - Reviewed checkpoint 1.
+
+            ### [ ] Checkpoint 1
+            - [x] started step
+            - [ ] remaining step
+        ''')
+
+        metadata = parse_git_tracking_metadata(text)
+        assert metadata is not None
+        sections = _collect_sections(text, source_path=Path('plan.md'))
+        assert not is_handoff_pristine_for_base_refresh(metadata, sections)
+
     def test_parse_git_tracking_metadata_extract_fields_outside_fence(self) -> None:
         from aflow.plan import parse_git_tracking_metadata, GitTrackingMetadata
         text = textwrap.dedent('''\

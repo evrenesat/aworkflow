@@ -8,7 +8,7 @@ from pathlib import Path
 SECTION_RE = re.compile(r"^###\s+\[([ xX])\]\s+(Checkpoint\b.*)$")
 STEP_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+")
 FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
-GIT_TRACKING_RE = re.compile(r"^##\s+Git Tracking\b")
+GIT_TRACKING_RE = re.compile(r"^##\s+(?:[0-9]+\.\s+)?Git Tracking\b")
 NON_CHECKPOINT_HEADING_RE = re.compile(r"^#{1,3}\s+")
 GIT_TRACKING_FIELD_RE = re.compile(
     r"^\s*(?:[-*]\s+)?(?:Plan Branch|Pre-Handoff Base HEAD|Last Reviewed HEAD|Review Log):"
