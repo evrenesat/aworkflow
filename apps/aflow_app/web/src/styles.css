@@ -513,20 +513,207 @@ input::placeholder, textarea::placeholder {
 }
 
 .app-header {
-  padding: var(--spacing-sm) var(--spacing-md);
-  border-bottom: 1px solid var(--color-border);
+  padding: 0 var(--spacing-md);
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: var(--spacing-md);
+  flex-direction: column;
+  min-width: 0;
 }
 
-.workspace-nav {
+.app-header-row {
   display: flex;
-  gap: var(--spacing-xs);
-  padding: var(--spacing-xs) var(--spacing-md);
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  min-height: 56px;
+  padding: 4px 0;
+}
+
+.app-header-row-one {
+  width: 100%;
+}
+
+.app-header-row-two {
+  width: 100%;
+  border-top: 1px solid var(--color-border);
   border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg);
+  z-index: 25;
+  padding-inline: var(--spacing-md);
+}
+
+.app-branding {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.app-branding-compact {
+  flex: 1 1 auto;
+  gap: var(--spacing-sm);
+}
+
+.app-brand-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.workspace-global-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-x: auto;
+}
+
+.app-header .nav-tab {
+  min-height: var(--tap-target);
+  padding: 0 var(--spacing-md);
+}
+
+.app-header-row-one .btn,
+.app-header-row-two .btn {
+  min-height: var(--tap-target);
+}
+
+.app-account-action {
+  flex: 0 0 auto;
+}
+
+.app-menu-trigger {
+  flex: 0 0 var(--tap-target);
+  width: var(--tap-target);
+  padding: 0;
+  font-size: 1.2rem;
+}
+
+.mobile-page-context {
+  display: none;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.header-slot-context {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.header-context-title {
+  max-width: min(28rem, 30vw);
+  font-size: 1rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.header-context-stack {
+  display: flex;
+  align-items: baseline;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.header-slot-local {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.header-slot-local > label {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.header-slot-local > label > span {
+  flex: 0 0 auto;
+  font-size: 0.875rem;
+  color: var(--color-text-dim);
+}
+
+.header-slot-local .input,
+.header-slot-local select,
+.header-slot-local input {
+  min-height: var(--tap-target);
+  min-width: 0;
+}
+
+.header-section-select select,
+.header-filter-select select {
+  width: clamp(9rem, 20vw, 15rem);
+  padding: 0 var(--spacing-sm);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+/* GlobalSettings switches to its labelled select before this tab row can wrap. */
+.header-settings-tabs {
+  flex-wrap: nowrap;
+}
+
+.header-search input {
+  width: clamp(9rem, 24vw, 18rem);
+  padding-inline: var(--spacing-sm);
+}
+
+.header-plan-name input {
+  width: clamp(9rem, 24vw, 18rem);
+  padding-inline: var(--spacing-sm);
+}
+
+.header-slot-spacer {
+  flex: 1 1 0;
+  min-width: var(--spacing-sm);
+}
+
+.header-slot-primary,
+.header-slot-more {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.header-dirty-state {
+  white-space: nowrap;
+}
+
+.project-server-context {
+  overflow-wrap: anywhere;
+}
+
+.app-mobile-menu {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  width: 100%;
+  padding: var(--spacing-sm) 0;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-mobile-menu .nav-tab {
+  width: 100%;
+  text-align: left;
+  white-space: normal;
+}
+
+.app-mobile-menu-separator {
+  height: 1px;
+  margin: var(--spacing-xs) 0;
+  background: var(--color-border);
+}
+
+.app-mobile-logout {
+  color: var(--color-error);
 }
 
 .nav-item-group {
@@ -620,10 +807,10 @@ input::placeholder, textarea::placeholder {
 .workspace-main {
   flex: 1 0 auto;
   min-width: 0;
-  padding: var(--spacing-md);
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-md);
+  gap: 12px;
 }
 
 .workspace-content {
@@ -845,7 +1032,7 @@ input::placeholder, textarea::placeholder {
   }
 
   .config-textarea {
-    min-height: 240px;
+    min-height: 280px;
   }
 }
 
@@ -1060,6 +1247,7 @@ input::placeholder, textarea::placeholder {
 .global-settings textarea { min-width: 0; width: 100%; }
 
 .app-header > *,
+.app-header-row-two > *,
 .workspace-main > *,
 .workspace-content > *,
 .dashboard-form-grid > *,
@@ -1160,7 +1348,46 @@ input::placeholder, textarea::placeholder {
 .plan-editor-header > * { min-width: 0; overflow-wrap: anywhere; }
 .plan-editor-textarea { min-height: 360px; resize: vertical; width: 100%; }
 
+.skill-install-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.skill-install-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+
+.more-menu [role='menu'] .btn {
+  min-height: var(--tap-target);
+  width: 100%;
+  justify-content: flex-start;
+  white-space: normal;
+  text-align: left;
+}
+
+@media (min-height: 600px) {
+  /* Row two remains available while the first row scrolls away on tall screens. */
+  .app-header-row-two {
+    position: sticky;
+    top: 0;
+  }
+}
+
 @media (max-width: 959px), (max-height: 599px) {
+  .mobile-page-context { display: block; }
+  .header-context-title { max-width: none; font-size: 0.95rem; }
+  .header-slot-spacer { display: none; }
+  .header-slot-local { flex: 1 1 8rem; }
+  .app-header-row-two { flex-wrap: wrap; }
+
   /* Compact/short screens expose one mounted list or detail surface at a time;
      SidebarEditorLayout owns the hidden presentation state. */
   .sidebar-editor-layout {
@@ -1177,5 +1404,6 @@ input::placeholder, textarea::placeholder {
 
 @media (max-height: 599px) {
   /* Short viewports cannot reserve reliable space for a sticky action row. */
+  .app-header-row-two { position: static; }
   .settings-toolbar { position: static; }
 }

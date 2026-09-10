@@ -12,7 +12,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 - Plan Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`
 - Pre-Handoff Base HEAD: `ee1757579b216afe9c02f3ca763038cae59a8498`
-- Last Approved Checkpoint: `cp2 v02`
+- Last Approved Checkpoint: `cp3 v02`
 
 ### Review Log
 
@@ -68,6 +68,44 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
   Reviewer owns the cp2 v02 approval commit. Only CP2 advances; CP3–6 remain
   unchecked. Publication, exact-SHA CI and live proof remain pending normal
   workflow delivery; broader task-space budgets and WebKit belong to later CPs.
+
+- 2026-09-10: Rejected the immediately preceding uncommitted CP3 attempt,
+  using current-worktree fallback from approved cp2 v02 (`c3cee36`); no CP3
+  commit exists. The worker-checked CP3 heading was completion intent, not
+  approval or authority to review CP4. Four high-confidence P2 findings:
+  Settings tabs wrap at 960px (header bottom y158); Advanced TOML → Install
+  skills leaves installation hidden; Hide cannot dismiss retained installation
+  outcomes; the Runs browser test still targets old compact navigation.
+  Verification: 97 targeted web tests, build, three Settings Chromium tests and
+  diff check passed. Runs Chromium failed at its obsolete All runs selector;
+  a disposable browser probe confirmed all three UI findings. CP3 remains
+  unapproved; CP4–6 remain unchecked. Focused non-checkpoint repair overlay:
+  `responsive-document-scroll-and-mobile-editing-20260910-cp04-v01.md` (CP3 scope).
+  No approval commit/history rewrite, publication, CI or live activation proof.
+
+- 2026-09-10: Rejected the immediately preceding uncommitted CP3 repair
+  (active cp04-v01 overlay), using current-worktree fallback from approved
+  cp2 v02 (`c3cee36`); no CP3 commit exists. Prior four findings are repaired.
+  One high-confidence P2 remains: hosted successor-recovery test still seeks
+  the removed Cancel button at RunDashboard.test.tsx:689, failing before exact
+  request-identity assertions. Full suite: 294 passed, 1 failed; isolated rerun
+  confirms it. Targeted100 tests, build, four disposable Chromium tests, extra
+  six-page geometry at1280/1440 (header112/content124) and diff check passed.
+  CP3 remains unapproved; CP4–6 unchecked. Replaced cp04-v01 with focused
+  non-checkpoint cp03-v01 repair. No approval commit/history rewrite,
+  publication, exact-SHA CI or live activation proof.
+
+- 2026-09-10: Approved `cp3 v02` against original CP3 and active cp03-v01
+  repair overlay. Current-worktree fallback from approved cp2 v02 (`c3cee36`)
+  was used because no CP3 commit existed. Reviewed accumulated header slots,
+  page contributions, compact navigation, Settings sections, guarded installation
+  disclosure and hosted successor recovery. No material findings. Full web suite
+  passed295 on repeat; initial run passed294 with one colliding-role control
+  test failure, followed by all67 dashboard tests passing. Build, four disposable
+  Chromium tests, six-page geometry at1280/1440 (header112/content124), Skills
+  editor position/height checks and diff check passed. Reviewer creates cp3 v02
+  approval commit; only CP3 advances. CP4–6 remain unchecked. Publication,
+  exact-SHA CI and live activation remain pending normal workflow delivery.
 
 ## Done Means
 
@@ -149,7 +187,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Blockers:** If a consumer's selection is only inferred from list order, keep domain behavior and add an explicit UI open signal; never fabricate identity.
 
-### [ ] Checkpoint 3: Compact the shell and Settings action hierarchy
+### [x] Checkpoint 3: Compact the shell and Settings action hierarchy
 
 **Goal:** Navigation and occasional actions stop consuming the editor's viewport.
 
@@ -159,12 +197,12 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Steps:**
 
-- [ ] Implement shared header slots across the app: desktop row1 contains AFlow/project context, global destinations and account action; row2 contains concise page context, local sections/filters, the primary action and More. Target44px controls plus compact padding for two rows of about56px each,112px combined. Main content begins by y128. Remove duplicate page headings/action bars from page bodies. Render page-owned action nodes into these slots using a small shared composition API/context; do not duplicate action state/handlers. Register/clear contributions on page changes so hidden dashboards cannot supply stale actions.
-- [ ] Mobile/compact mode uses a visible hamburger icon with accessible name Menu, current context and primary action. Expanded Menu is in document flow with existing destinations and Logout, `aria-expanded`/`aria-controls`, Escape-to-close and focus return; no modal/body lock. Preserve current project identity. Local navigation uses a labelled selector/menu rather than multiple ambiguous hamburger buttons.
-- [ ] Settings uses row2 for its context, sections, Save all changes and More, with no separate title/reload/tab rows below. More exposes Reload, Advanced/Guided and Install skills using existing safeguards. When controls cannot fit, collapse section tabs to a labelled selector and secondary actions to More before creating a third row; preserve readable labels/targets. At most row2 may stick to top0 on screens ≥600px high; row1 scrolls away. Reserve flow space and focus offsets. Short screens use static actions. Enlarged text may flow or use compact presentation, never clip to meet the budget.
-- [ ] Compact Settings section selector is a labelled native select with all current sections, including later-added sections such as Changelog. Wide mode keeps keyboard tabs. Render only the active navigation variant; both use the same tab state and preserve all drafts. Do not hardcode six sections in acceptance tests.
-- [ ] Move Skills installation behind the row2 More → Install skills action, which reveals an in-flow installation disclosure in the task area only when requested. No permanent install card or separate disclosure-trigger row. One short description inside; default install action and disabled-while-dirty behavior unchanged. Installation failure expands the disclosure and announces the error; subsequent tab navigation retains the result as currently owned. Remove CLI implementation prose from the default editing surface, retain useful instructions within help.
-- [ ] Use8/12/16px gaps and12px compact page padding. No larger borders/cards around single toolbar actions. Preserve44px touch targets; no icon-only unlabeled controls. Test all actions with keyboard and narrow wrapping.
+- [x] Implement shared header slots across the app: desktop row1 contains AFlow/project context, global destinations and account action; row2 contains concise page context, local sections/filters, the primary action and More. Target44px controls plus compact padding for two rows of about56px each,112px combined. Main content begins by y128. Remove duplicate page headings/action bars from page bodies. Render page-owned action nodes into these slots using a small shared composition API/context; do not duplicate action state/handlers. Register/clear contributions on page changes so hidden dashboards cannot supply stale actions.
+- [x] Mobile/compact mode uses a visible hamburger icon with accessible name Menu, current context and primary action. Expanded Menu is in document flow with existing destinations and Logout, `aria-expanded`/`aria-controls`, Escape-to-close and focus return; no modal/body lock. Preserve current project identity. Local navigation uses a labelled selector/menu rather than multiple ambiguous hamburger buttons.
+- [x] Settings uses row2 for its context, sections, Save all changes and More, with no separate title/reload/tab rows below. More exposes Reload, Advanced/Guided and Install skills using existing safeguards. When controls cannot fit, collapse section tabs to a labelled selector and secondary actions to More before creating a third row; preserve readable labels/targets. At most row2 may stick to top0 on screens ≥600px high; row1 scrolls away. Reserve flow space and focus offsets. Short screens use static actions. Enlarged text may flow or use compact presentation, never clip to meet the budget.
+- [x] Compact Settings section selector is a labelled native select with all current sections, including later-added sections such as Changelog. Wide mode keeps keyboard tabs. Render only the active navigation variant; both use the same tab state and preserve all drafts. Do not hardcode six sections in acceptance tests.
+- [x] Move Skills installation behind the row2 More → Install skills action, which reveals an in-flow installation disclosure in the task area only when requested. No permanent install card or separate disclosure-trigger row. One short description inside; default install action and disabled-while-dirty behavior unchanged. Installation failure expands the disclosure and announces the error; subsequent tab navigation retains the result as currently owned. Remove CLI implementation prose from the default editing surface, retain useful instructions within help.
+- [x] Use8/12/16px gaps and12px compact page padding. No larger borders/cards around single toolbar actions. Preserve44px touch targets; no icon-only unlabeled controls. Test all actions with keyboard and narrow wrapping.
 
 **Dependencies:** CP2.
 

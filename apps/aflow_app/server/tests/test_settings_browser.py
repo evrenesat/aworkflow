@@ -28,6 +28,8 @@ def document_metrics(page):
         const nav = document.querySelector('.sidebar-editor-navigation');
         const detail = document.querySelector('.sidebar-editor-detail')
             ?? document.querySelector('.settings-guided-content > .settings-body');
+        const rowTwo = document.querySelector('.app-header-row-two');
+        const mainChild = document.querySelector('.workspace-main')?.firstElementChild;
         const heading = detail?.querySelector('h3, h2, legend');
         const box = detail?.getBoundingClientRect();
         return {documentScroll: root?.scrollTop ?? window.scrollY,
@@ -38,8 +40,22 @@ def document_metrics(page):
             headingBottom: heading?.getBoundingClientRect().bottom ?? null,
             navHeight: nav?.clientHeight ?? 0, navContent: nav?.scrollHeight ?? 0,
             detailHeight: detail?.clientHeight ?? 0, detailContent: detail?.scrollHeight ?? 0,
+            headerBottom: rowTwo?.getBoundingClientRect().bottom ?? null,
+            contentTop: mainChild?.getBoundingClientRect().top ?? null,
             overflow: document.documentElement.scrollWidth > innerWidth};
     }''')
+
+
+def select_settings_section(page, name):
+    selector = page.get_by_role('combobox', name='Settings section', exact=True)
+    if selector.count():
+        selector.select_option(label=name)
+    else:
+        page.get_by_role('tab', name=name, exact=True).click()
+
+
+def open_settings_more(page):
+    page.get_by_role('button', name='More', exact=True).click()
 
 
 def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monkeypatch):
@@ -66,13 +82,35 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
             page.get_by_role('button', name='Settings', exact=True).click()
+            for width, height in ((960, 720), (1024, 720), (1280, 720), (1440, 900)):
+                page.set_viewport_size({'width': width, 'height': height})
+                page.wait_for_timeout(100)
+                page.evaluate('window.scrollTo(0, 0)')
+                select_settings_section(page, 'Agents & Roles')
+                if width < 1200:
+                    section_selector = page.get_by_role('combobox', name='Settings section', exact=True)
+                    section_selector.wait_for()
+                    assert page.get_by_role('tab').count() == 0
+                else:
+                    page.get_by_role('tab', name='Agents & Roles', exact=True).wait_for()
+                    assert page.get_by_role('combobox', name='Settings section', exact=True).count() == 0
+                metrics = document_metrics(page)
+                assert metrics['headerBottom'] <= 112, metrics
+                assert metrics['contentTop'] <= 128, metrics
+                if width == 960:
+                    page.get_by_label('Effort codex.profile_29', exact=True).fill('dirty header test')
+                    page.wait_for_timeout(50)
+                    dirty_metrics = document_metrics(page)
+                    assert dirty_metrics['headerBottom'] <= 112, dirty_metrics
+                    assert dirty_metrics['contentTop'] <= 128, dirty_metrics
             for theme in ('light', 'dark'):
-                page.get_by_role('tab', name='General', exact=True).click()
+                select_settings_section(page, 'General')
                 page.get_by_label('Color theme').select_option(theme)
                 for width, height in ((1365, 900), (390, 844), (844, 390)):
                     page.set_viewport_size({'width': width, 'height': height})
+                    page.wait_for_timeout(100)
                     compact = width < 960 or height < 600
-                    page.get_by_role('tab', name='Agents & Roles', exact=True).click()
+                    select_settings_section(page, 'Agents & Roles')
                     page.get_by_label('Effort codex.profile_29', exact=True).wait_for()
                     metrics = document_metrics(page)
                     assert metrics['documentHeight'] > height, metrics
@@ -98,7 +136,7 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                         save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                     assert save and 0 <= save['y'] < height
                     for tab, display_name in [('Teams', 'Team 39'), ('Workflows', 'Workflow 39'), ('Prompts', 'Scroll test 39')]:
-                        page.get_by_role('tab', name=tab, exact=True).click()
+                        select_settings_section(page, tab)
                         nav = page.locator('.sidebar-editor-navigation')
                         nav.wait_for(state='visible')
                         if tab == 'Workflows':
@@ -157,11 +195,24 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
                             page.wait_for_timeout(50)
                         nav.get_by_role('button', name=display_name.replace('39', '38'), exact=True).click()
                         assert document_metrics(page)['detailScroll'] == 0
-            page.get_by_role('button', name='Advanced TOML', exact=True).click()
+            open_settings_more(page)
+            page.get_by_role('menuitem', name='Advanced TOML', exact=True).click()
+            page.get_by_label('aflow.toml contents', exact=True).wait_for()
             assert page.get_by_role('tab').count() == 0
             assert page.locator('.sidebar-editor-layout').count() == 0
-            page.get_by_role('button', name='Guided settings', exact=True).click()
-            assert page.get_by_role('tab').count() == 6
+            open_settings_more(page)
+            page.get_by_role('menuitem', name='Guided settings', exact=True).click()
+            if compact:
+                section_selector = page.get_by_role('combobox', name='Settings section', exact=True)
+                section_selector.wait_for()
+                section_labels = section_selector.locator('option').all_text_contents()
+                assert {'General', 'Agents & Roles', 'Skills'}.issubset(
+                    {label.strip() for label in section_labels}
+                )
+            else:
+                page.get_by_role('tab', name='Agents & Roles', exact=True).wait_for()
+                assert page.get_by_role('tab', name='General', exact=True).count() == 1
+                assert page.get_by_role('tab', name='Skills', exact=True).count() == 1
         finally:
             browser.close()
 
@@ -226,8 +277,9 @@ def test_new_draft_plan_template_smoke(control_client, monkeypatch):
             page.wait_for_timeout(500)
             assert page.get_by_label('Plan content').input_value() == long_content
             # Skeleton placeholders do not block promotion: no new validator.
-            page.get_by_role('button', name='Move to Ready', exact=True).click()
-            page.get_by_text('Ready — runnable').wait_for()
+            open_settings_more(page)
+            page.get_by_role('menuitem', name='Move to Ready', exact=True).click()
+            page.locator('.header-context-title').filter(has_text='Ready').wait_for()
             assert (root / 'plans' / 'in-progress' / 'draft-smoke.md').read_text() == long_content
         finally:
             browser.close()
@@ -290,7 +342,7 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
             page.get_by_placeholder('Auth token').fill(TOKEN)
             page.get_by_role('button', name='Login', exact=True).click()
             page.get_by_role('button', name='Settings', exact=True).click()
-            page.get_by_role('tab', name='Skills', exact=True).click()
+            select_settings_section(page, 'Skills')
             nav = page.locator('.sidebar-editor-navigation')
             nav.get_by_role('button', name='aflow-plan', exact=True).click()
             area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
@@ -298,11 +350,12 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
             original = area.input_value()
             assert 'aflow-plan' in original
             for theme in ('light', 'dark'):
-                page.get_by_role('tab', name='General', exact=True).click()
+                select_settings_section(page, 'General')
                 page.get_by_label('Color theme').select_option(theme)
-                page.get_by_role('tab', name='Skills', exact=True).click()
+                select_settings_section(page, 'Skills')
                 for width, height in ((1365, 900), (390, 844)):
                     page.set_viewport_size({'width': width, 'height': height})
+                    page.wait_for_timeout(100)
                     compact = width < 960 or height < 600
                     if compact:
                         nav = page.locator('.sidebar-editor-navigation')
@@ -320,16 +373,27 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                         assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == 'aflow-plan'
                         row.click()
                         page.locator('.sidebar-editor-detail').wait_for(state='visible')
+                    area_box = page.get_by_label('SKILL.md for aflow-plan', exact=True).bounding_box()
+                    assert area_box and area_box['y'] <= (280 if compact else 208), area_box
+                    assert area_box['height'] >= 280, area_box
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                     save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                     assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width
             # One shared install action on the clean registry, then an edit.
+            open_settings_more(page)
+            page.get_by_role('menuitem', name='Install skills', exact=True).click()
             page.get_by_role('button', name='Install/reinstall all', exact=True).click()
             page.wait_for_function("typeof window.__releaseAflowSkillsList === 'function'")
             area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
             assert area.is_disabled()
             assert page.get_by_text('Install finished', exact=False).count() == 0
             page.evaluate("window.__releaseAflowSkillsList()")
+            page.get_by_text('Install finished').wait_for()
+            page.get_by_role('button', name='Hide', exact=True).click()
+            assert page.get_by_role('heading', name='Install skills', exact=True).count() == 0
+            open_settings_more(page)
+            page.get_by_role('menuitem', name='Install skills', exact=True).click()
+            page.get_by_role('heading', name='Install skills', exact=True).wait_for()
             page.get_by_text('Install finished').wait_for()
             area.fill(original + '\n\nBrowser edit.\n')
             install = page.get_by_role('button', name='Install/reinstall all', exact=True)

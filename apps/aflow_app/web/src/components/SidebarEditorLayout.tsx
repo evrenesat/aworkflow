@@ -14,7 +14,7 @@ export interface SidebarEditorLayoutProps {
   detailEntry?: boolean
 }
 
-function useCompactLayout(): boolean {
+export function useCompactLayout(): boolean {
   const [compact, setCompact] = useState(() => (
     typeof window !== 'undefined'
       && typeof window.matchMedia === 'function'

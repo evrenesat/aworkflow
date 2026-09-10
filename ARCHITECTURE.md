@@ -30,7 +30,12 @@ history mutations require authentication, revision and idempotency checks;
 external deleted reads return 410. No history action signals a process or removes
 workflow artifacts.
 
-The web `SidebarEditorLayout` keeps detail and editor content in document flow.
+The web shell composes page-owned context, local navigation, primary actions and
+secondary actions through registered header slots. Wide pages use two compact
+rows; compact pages expose the same destinations through an in-flow hamburger
+menu with Escape-to-close and focus return. Settings uses the shared row for its
+section selector/tabs, save coordinator and More actions, while the consumer
+continues to own drafts and handlers. The web `SidebarEditorLayout` keeps detail and editor content in document flow.
 In wide/tall mode its navigation may be sticky with a bounded local scroll
 surface; in compact/short mode its local presentation state exposes one
 already-mounted list or detail surface at a time. Selection remains owned by
@@ -43,8 +48,8 @@ draft/editor owners. The shell and workspace no longer lock the root or create
 ordinary nested pane scrollers. Bounded option lists, native textareas, and
 explicitly expanded raw payloads remain named local exceptions. This implements
 the document-scroll and list/detail portions of the owner-approved [UI
-guidelines](UI_GUIDELINES.md); shared shell slots and hamburger navigation
-remain subsequent checkpoints.
+guidelines](UI_GUIDELINES.md); later checkpoints extend the same contract to
+editor readability and the remaining journeys.
 
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
 selected editor IDs across guided/raw mode changes; run dashboards retain pending

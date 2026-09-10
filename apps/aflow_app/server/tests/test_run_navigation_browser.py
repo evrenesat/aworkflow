@@ -6,6 +6,19 @@ from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_I
 from test_settings_browser import document_metrics
 
 
+def open_global_destination(page, name: str, compact: bool) -> None:
+    if compact:
+        page.get_by_role('button', name='Menu', exact=True).click()
+        page.get_by_role('menuitem', name=name, exact=True).click()
+    else:
+        page.get_by_role('button', name=name, exact=True).click()
+
+
+def refresh_from_header(page) -> None:
+    page.get_by_role('button', name='More', exact=True).click()
+    page.get_by_role('menuitem', name='Refresh', exact=True).click()
+
+
 def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch):
     _, root, _, _ = control_client
     for index in range(130):
@@ -39,7 +52,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                 page.locator('.sidebar-editor-navigation').wait_for(state='visible')
                 assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == selected_id
                 if attempt == 0:
-                    page.get_by_role('button', name='All runs', exact=True).click()
+                    open_global_destination(page, 'All runs', compact=True)
                     page.get_by_role('heading', name='All runs', exact=True).wait_for()
             # An ordinary Runs URL has no explicit run entry. The dashboard
             # still reports its default selection so the URL stays truthful,
@@ -108,7 +121,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                     # existing refresh handler; a normal locator click would
                     # first scroll its off-screen trigger into view on compact
                     # stacked layouts.
-                    page.get_by_role('button', name='Refresh', exact=True).evaluate('(element) => element.click()')
+                    refresh_from_header(page)
                     page.wait_for_timeout(250)
                     assert page.locator('.run-list-item').count() == 130
                     refreshed = document_metrics(page)

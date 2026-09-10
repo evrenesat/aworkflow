@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useId, useState, type ReactNode } from 'react'
 
 const MenuCloseContext = createContext<() => void>(() => {})
 
@@ -7,9 +7,10 @@ const MenuCloseContext = createContext<() => void>(() => {})
  * accessible name; Escape and focus loss close it, and menu items close it
  * when activated. Primary actions never belong in here.
  */
-export function MoreMenu({ label, children }: { label: string; children: ReactNode }) {
+export function MoreMenu({ label, triggerLabel = label, children }: { label: string; triggerLabel?: string; children: ReactNode }) {
   const [open, setOpen] = useState(false)
   const close = useCallback(() => setOpen(false), [])
+  const menuId = useId()
   return <div
     className="more-menu"
     onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false) }}
@@ -20,11 +21,12 @@ export function MoreMenu({ label, children }: { label: string; children: ReactNo
       className="btn btn-secondary btn-sm more-menu-trigger"
       aria-haspopup="menu"
       aria-expanded={open}
-      aria-label={label}
+      aria-controls={menuId}
+      aria-label={triggerLabel}
       onClick={() => setOpen(current => !current)}
     >⋯</button>
     {open && (
-      <div role="menu" aria-label={label}>
+      <div id={menuId} role="menu" aria-label={label}>
         <MenuCloseContext.Provider value={close}>{children}</MenuCloseContext.Provider>
       </div>
     )}
@@ -32,12 +34,13 @@ export function MoreMenu({ label, children }: { label: string; children: ReactNo
 }
 
 /** A single action inside a MoreMenu. */
-export function MenuItem({ children, onClick, danger = false }: { children: ReactNode; onClick: () => void; danger?: boolean }) {
+export function MenuItem({ children, onClick, danger = false, disabled = false }: { children: ReactNode; onClick: () => void; danger?: boolean; disabled?: boolean }) {
   const close = useContext(MenuCloseContext)
   return <button
     type="button"
     role="menuitem"
     className={`btn btn-sm ${danger ? 'btn-danger' : 'btn-secondary'}`}
-    onClick={() => { close(); onClick() }}
+    disabled={disabled}
+    onClick={() => { if (disabled) return; close(); onClick() }}
   >{children}</button>
 }

@@ -16,7 +16,7 @@ function skillStatusLine(skill: SkillSummary, dirty: boolean): string {
  * Saving Markdown updates every installed link; installation itself runs
  * through the shared installer action owned by GlobalSettings.
  */
-export function SkillsSettings({ skills, loadError, selected, onSelect, content, contentLoading, contentError, draft, unsavedNames, onEdit, hasUnsavedEdits, onInstall, installing, installResult, installError }: {
+export function SkillsSettings({ skills, loadError, selected, onSelect, content, contentLoading, contentError, draft, unsavedNames, onEdit, hasUnsavedEdits, onInstall, installing, installResult, installError, installOpen = false, onCloseInstall, hosted = false }: {
   skills: SkillSummary[] | null
   loadError: string | null
   selected: string
@@ -32,21 +32,27 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
   installing: boolean
   installResult: SkillInstallResult | null
   installError: string | null
+  /** The shell opens this task-area disclosure from Settings → More. */
+  installOpen?: boolean
+  onCloseInstall?: () => void
+  /** Standalone renders retain a local fallback for focused component tests. */
+  hosted?: boolean
 }) {
   const [navigationVersion, setNavigationVersion] = useState(0)
   function select(name: string) { onSelect(name); setNavigationVersion(value => value + 1) }
   const active = skills?.find(skill => skill.name === selected) ?? null
   const dirty = draft !== null && content !== null && draft !== content
+  // GlobalSettings owns the disclosure lifecycle. Results and errors remain
+  // props so hiding only changes presentation; reopening shows the retained
+  // outcome without making a dismissed disclosure sticky.
+  const showInstall = hosted ? installOpen : true
   return <section className="settings-guided-content" aria-label="Skills settings">
-    <div className="card settings-fields">
-      <h3>Install skills</h3>
-      <p className="text-sm text-dim">
-        Install or reinstall the default bundled skills through the shared installer
-        (the same action as <span className="mono">aflow install-skills --yes</span>).
-        Saving Markdown already updates every linked destination, so edited skills
-        need no reinstall. Optional skills install only through existing CLI options
-        such as <span className="mono">--include-optional</span>.
-      </p>
+    {showInstall && <section className={hosted ? 'skill-install-disclosure' : 'card settings-fields'} aria-label="Install skills">
+      <div className="skill-install-heading">
+        <h3>Install skills</h3>
+        {hosted && <button type="button" className="btn btn-secondary btn-sm" onClick={onCloseInstall}>Hide</button>}
+      </div>
+      <p className="text-sm text-dim">Install or reinstall the default bundled skills. Save edited skills before installing.</p>
       {hasUnsavedEdits && <p role="note">Save your skill edits first; installation is unavailable while any skill has unsaved edits, and drafts are kept.</p>}
       <span className="inline-action">
         <button type="button" className="btn btn-secondary btn-sm" disabled={installing || hasUnsavedEdits || !skills || skills.length === 0} onClick={onInstall}>
@@ -61,7 +67,11 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
         {installResult.operations.filter(op => op.status !== 'linked' && op.status !== 'already_linked').length} pending or failed.
         {installResult.operations.filter(op => op.status === 'failed' || op.status === 'unattempted').map(op => ` ${op.harness}/${op.skill}: ${op.error_code ?? op.status}${op.error ? ` — ${op.error}` : ''}`).join('')}
       </p>}
-    </div>
+      <details>
+        <summary>Installation help</summary>
+        <p className="text-sm text-dim">Optional skills remain available through the existing installer options. Saving Markdown already updates linked destinations, so edited skills do not need a reinstall.</p>
+      </details>
+    </section>}
     {loadError && <p role="alert" className="error-message">Skills could not be loaded: {loadError}</p>}
     {!skills && !loadError && <p>Loading skills…</p>}
     {skills && skills.length === 0 && <p>No bundled skills are registered.</p>}

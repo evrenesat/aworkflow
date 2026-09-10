@@ -10,9 +10,39 @@ import { PromptsSettings, type DeletedPrompt } from './PromptsSettings'
 import { SkillsSettings } from './SkillsSettings'
 import type { SkillDetail, SkillInstallResult, SkillSummary } from '../types'
 import { formatMachineChoice, formatMachineLabel } from '../label'
+import { MenuItem, MoreMenu } from './MoreMenu'
+import { useHeaderSlots } from './HeaderSlots'
 
 const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General'] as const
+// Header fit is deliberately wider than the list/detail breakpoint: the six
+// labelled tabs plus dirty-state actions do not fit reliably at 960–1024px.
+// Keep this presentation query independent so the SidebarEditorLayout
+// list/detail ownership boundary remains unchanged.
+const SETTINGS_HEADER_COMPACT_QUERY = '(max-width: 1199px), (max-height: 599px)'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
+
+function useSettingsHeaderCompact(): boolean {
+  const [compact, setCompact] = useState(() => (
+    typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia(SETTINGS_HEADER_COMPACT_QUERY).matches
+  ))
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const media = window.matchMedia(SETTINGS_HEADER_COMPACT_QUERY)
+    const update = () => setCompact(media.matches)
+    update()
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', update)
+      return () => media.removeEventListener('change', update)
+    }
+    media.addListener(update)
+    return () => media.removeListener(update)
+  }, [])
+
+  return compact
+}
 
 export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dirty: boolean) => void; onSaved: (saved: ProjectConfig) => void }) {
   const [tab, setTab] = useState<typeof tabs[number]>('Agents & Roles')
@@ -57,6 +87,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [installing, setInstalling] = useState(false)
   const [installResult, setInstallResult] = useState<SkillInstallResult | null>(null)
   const [installError, setInstallError] = useState<string | null>(null)
+  const [installDisclosureOpen, setInstallDisclosureOpen] = useState(false)
   // Bumped by every load/discard so a response that resolves after an
   // explicit discard can never restore cleared edits.
   const epochRef = useRef(0)
@@ -158,7 +189,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
     setSkills(null); setSkillsError(null); setSelectedSkill(''); setSkillContents({}); setSkillRevisions({}); setSkillDrafts({})
     skillInflight.current.clear()
-    setSkillContentLoading(false); setInstallResult(null); setInstallError(null); setInstalling(false)
+    setSkillContentLoading(false); setInstallResult(null); setInstallError(null); setInstalling(false); setInstallDisclosureOpen(false)
     setSkillContentError(null)
     void load()
   }
@@ -316,7 +347,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     if (source === 'workflow') return 'this workflow'
     return 'defaults'
   }
-  async function toggleAdvanced() {
+  async function toggleAdvanced(): Promise<boolean> {
     setBusy(true); setError(null)
     try {
       if (!advanced) {
@@ -334,13 +365,21 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         setBaseline(form.form); setPendingNames({})
       }
       setAdvanced(!advanced)
+      return true
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not switch editors') }
     finally { setBusy(false) }
+    return false
+  }
+  async function openSkillsInstallation() {
+    if (advanced && !await toggleAdvanced()) return
+    setTab('Skills')
+    setInstallDisclosureOpen(true)
   }
   /** Shared installer action: one call, no draft changes, then clean baselines reload. */
   async function installSkillsAction() {
     if (installing || skillsDirty) return
     const epoch = epochRef.current
+    setInstallDisclosureOpen(true)
     setInstalling(true); setInstallError(null); setInstallResult(null)
     try {
       const result = await api.installSkills()
@@ -387,6 +426,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       }
     } catch (reason) {
       if (epochRef.current !== epoch) return
+      setInstallDisclosureOpen(true)
       setInstallError(reason instanceof Error ? reason.message : 'Installation failed.')
     } finally {
       if (epochRef.current === epoch) setInstalling(false)
@@ -492,25 +532,44 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       {adapter?.supports_effort && <><Combobox label={`Effort ${harness}.${profile}`} value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></>}
     </>
   }
+  const headerCompact = useSettingsHeaderCompact()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
-  useEffect(() => {
-    // Keep the selected tab visible in the single-row mobile tablist.
-    try { tabRefs.current[tabs.indexOf(tab)]?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) } catch { /* layout scrolling is best-effort */ }
-  }, [tab])
+  const sectionNavigation = advanced ? <span className="header-local-label">Advanced TOML</span> : headerCompact ? <label className="header-section-select">
+    <span>Section</span>
+    <select aria-label="Settings section" value={tab} onChange={event => setTab(event.target.value as typeof tabs[number])}>
+      {tabs.map(name => <option key={name} value={name}>{name}</option>)}
+    </select>
+  </label> : <div className="config-tabs header-settings-tabs" role="tablist" aria-label="Settings sections">{tabs.map((name, index) => <button key={name} ref={el => { tabRefs.current[index] = el }} role="tab" id={`settings-tab-${index}`} aria-controls="settings-domain-panel" aria-selected={tab === name} tabIndex={tab === name ? 0 : -1} className={`btn ${tab === name ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setTab(name)} onKeyDown={event => {
+    const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1
+    if (next >= 0) { event.preventDefault(); setTab(tabs[next]); (event.currentTarget.parentElement?.children[next] as HTMLElement).focus() }
+  }}>{name}</button>)}</div>
+  const settingsSlots = {
+    context: <h2 className="header-context-title">Settings</h2>,
+    local: sectionNavigation,
+    primary: <>
+      <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
+      {dirty && <span className="text-xs text-dim header-dirty-state">Unsaved changes</span>}
+    </>,
+    more: <MoreMenu label="More settings actions" triggerLabel="More">
+      <MenuItem disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</MenuItem>
+      <MenuItem disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</MenuItem>
+      <MenuItem disabled={busy} onClick={() => void openSkillsInstallation()}>Install skills</MenuItem>
+    </MoreMenu>,
+  }
+  const hosted = useHeaderSlots('global-settings', settingsSlots)
   return <div className="workspace-content global-settings">
-    <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
+    {!hosted && <>
+      <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
+      <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>
+      <div className="settings-toolbar">
+        {sectionNavigation}
+        {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
+        <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
+      </div>
+    </>}
     {error && <p className="error-message" role="alert">{error}</p>}
     {notice && <p className="success-message" role="status">{notice}</p>}
-    <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
-    <div className="settings-toolbar">
-      {!advanced && <div className="config-tabs" role="tablist" aria-label="Settings sections">{tabs.map((name, index) => <button key={name} ref={el => { tabRefs.current[index] = el }} role="tab" id={`settings-tab-${index}`} aria-controls="settings-domain-panel" aria-selected={tab === name} tabIndex={tab === name ? 0 : -1} className={`btn ${tab === name ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setTab(name)} onKeyDown={event => {
-        const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1
-        if (next >= 0) { event.preventDefault(); setTab(tabs[next]); (event.currentTarget.parentElement?.children[next] as HTMLElement).focus() }
-      }}>{name}</button>)}</div>}
-      {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
-      <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>
-    </div>
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
     {advanced ? <div className="settings-fields">{texts.map((text, index) => <label key={index}>{index ? 'workflows.toml' : 'aflow.toml'}<textarea className="input mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></label>)}</div> : tab === 'Skills' ? <SkillsSettings
       skills={skills}
@@ -528,6 +587,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       installing={installing}
       installResult={installResult}
       installError={installError}
+      installOpen={installDisclosureOpen}
+      onCloseInstall={() => setInstallDisclosureOpen(false)}
+      hosted={hosted}
     /> : tab === 'General' ? <div className="settings-fields">
       <AppearanceSelector /><RecentRunsLimit />
       <h3>Server settings</h3>

@@ -34,15 +34,16 @@
 
 - Follow [UI_GUIDELINES.md](../../../UI_GUIDELINES.md): two compact desktop
   header rows, mobile hamburger navigation and list → detail → Back, document
-  scrolling, and outcome-based browser checks. Checkpoints 1–2 now implement
-  the document-scroll and list/detail ownership boundary: the shell, workspace,
+  scrolling, and outcome-based browser checks. Checkpoints 1–2 implement the
+  document-scroll and list/detail ownership boundary: the shell, workspace,
   editor details and settings fields flow with the document; only the named wide
-  navigation, option-list and raw-payload exceptions may scroll locally. The
+  navigation, option-list and raw-payload exceptions may scroll locally. CP3 adds
+  the registered header-slot composition and compact in-flow menu; page
+  consumers still own exact selections, drafts, saves, and run URL state. The
   shared SidebarEditorLayout keeps inactive surfaces mounted under actual
   `hidden` semantics, captures list position/item identity before compact
-  selection, and restores focus on Back. Consumers still own exact selections,
-  drafts, saves, and run URL state; later checkpoints own shell compaction and
-  the remaining evidence. Preserve those owners while migrating presentation.
+  selection, and restores focus on Back. Preserve those owners while completing
+  the remaining editor and journey work.
 
 - Keep history mutation keys by exact project/run/action until acknowledged or
   definitively rejected (including acknowledgement-required validation). Deletion tombstones suppress late rows and

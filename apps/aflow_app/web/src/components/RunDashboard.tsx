@@ -18,6 +18,7 @@ import * as api from '../api'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage } from './NewRunPage'
+import { useHeaderSlots } from './HeaderSlots'
 import { statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
@@ -1731,13 +1732,31 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </section>
               ) : null
 
+  function cancelNewRun() {
+    if (!restartInProgress && !pendingSuccessorStart) { setRestartPhase(null); setRestartSource(null) }
+    setLocalPage('runs')
+    onCancelNewRun?.()
+  }
+
+  const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
+    context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
+    local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
+    primary: newRunPage ? <button className="btn btn-primary btn-sm" onClick={() => void handleStart()} disabled={startDisabled || Boolean(restartActions)}>{busyAction === 'start' ? 'Starting…' : 'Start run'}</button> : <button className="btn btn-primary btn-sm" onClick={openNewRunPage}>New run</button>,
+    more: <MoreMenu label={newRunPage ? 'More new run actions' : 'More run page actions'} triggerLabel="More">
+      {newRunPage ? <MenuItem onClick={cancelNewRun}>Cancel</MenuItem> : <>
+        <MenuItem onClick={() => void handleCopyLink()}>Copy link</MenuItem>
+        <MenuItem disabled={refreshing || loading} onClick={() => void refreshPage()}>{refreshing ? 'Refreshing…' : 'Refresh'}</MenuItem>
+      </>}
+    </MoreMenu>,
+  }, visible && !loading)
+
   if (loading) {
     return <div className="card dashboard-loading"><div className="spinner" />Loading runs…</div>
   }
 
   return (
     <div className="run-dashboard">
-      <div className="run-dashboard-header">
+      {!hosted && <div className="run-dashboard-header">
         <div>
           <h2>{newRunPage ? 'New run' : 'Runs'}</h2>
         </div>
@@ -1748,7 +1767,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             {refreshing ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
-      </div>
+      </div>}
 
       {copyState === 'copied' && <div className="success-message" role="status">Link copied to the clipboard.</div>}
       {copyState === 'failed' && <div className="notice" role="status">Clipboard access failed — copy the address from the browser address bar instead.</div>}
@@ -1808,7 +1827,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         <SidebarEditorLayout selection={selectedRunId} navigationVersion={navigationVersion} listLabel="Run history" detailEntry={explicitRunNavigation ?? Boolean(requestedRunId)} navigation={
           <section className="card run-list" aria-label="Project runs">
             <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
-            <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>
+            {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
             {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => (
               <button data-sidebar-editor-item={run.run_id} className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
                 <span>{run.plan_path?.split('/').pop() ?? run.run_id}</span>
@@ -2045,6 +2064,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         handleStart={handleStart}
         startDisabled={startDisabled}
         busyAction={busyAction}
+        hideActions={hosted}
       />}
 
     </div>

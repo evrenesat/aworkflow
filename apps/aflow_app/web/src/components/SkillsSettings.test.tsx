@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { SkillsSettings } from './SkillsSettings'
 import type { SkillInstallResult, SkillSummary } from '../types'
@@ -58,6 +58,33 @@ describe('SkillsSettings', () => {
     expect((screen.getByRole('button', { name: 'Install/reinstall all' }) as HTMLButtonElement).disabled).toBe(true)
     expect(screen.getByText(/Save your skill edits first/)).toBeTruthy()
     expect(screen.getByText(/Install finished with failures\..*file_collision/)).toBeTruthy()
+  })
+
+  it('keeps hosted installation controls in a task-area disclosure', () => {
+    const view = render(<SkillsSettings {...baseProps} hosted installOpen={false} />)
+    expect(view.queryByRole('button', { name: 'Install/reinstall all' })).toBeNull()
+    view.rerender(<SkillsSettings {...baseProps} hosted installOpen />)
+    expect(view.getByRole('heading', { name: 'Install skills' })).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Hide', exact: true })).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Install/reinstall all' })).toBeTruthy()
+  })
+
+  it('lets Hide close retained success and failure outcomes until reopened', () => {
+    const result: SkillInstallResult = { mode: 'auto', succeeded: true, cancelled: false, refresh: [], operations: [] }
+    const onCloseInstall = vi.fn()
+    const view = render(<SkillsSettings {...baseProps} hosted installOpen installResult={result} onCloseInstall={onCloseInstall} />)
+    const disclosure = view.getByRole('region', { name: 'Install skills' })
+    expect(within(disclosure).getByRole('status').textContent).toMatch(/Install finished\./)
+    fireEvent.click(view.getByRole('button', { name: 'Hide', exact: true }))
+    expect(onCloseInstall).toHaveBeenCalledTimes(1)
+    view.rerender(<SkillsSettings {...baseProps} hosted installOpen={false} installResult={result} installError={null} onCloseInstall={onCloseInstall} />)
+    expect(view.queryByRole('heading', { name: 'Install skills' })).toBeNull()
+
+    const error = 'Installation failed.'
+    view.rerender(<SkillsSettings {...baseProps} hosted installOpen={false} installResult={null} installError={error} onCloseInstall={onCloseInstall} />)
+    expect(view.queryByRole('alert')).toBeNull()
+    view.rerender(<SkillsSettings {...baseProps} hosted installOpen installResult={null} installError={error} onCloseInstall={onCloseInstall} />)
+    expect(view.getByRole('alert').textContent).toContain(error)
   })
 
   it('shows load, empty, and error states', () => {

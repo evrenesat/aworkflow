@@ -1328,3 +1328,41 @@ Final verification: web tests (213), all server tests including Chromium layout 
   all four disposable Chromium browser checks passed; and `git diff --check`
   passed. No live configuration, production run, publication, CI, or live
   activation was changed.
+
+## 2026-09-10 — Responsive shell checkpoint 3
+
+- Added registered header slots so the shell owns compact two-row navigation
+  while pages retain their existing action handlers and draft/request owners.
+  Settings now places section navigation, Save all changes and secondary actions
+  in the shared row; Skills installation is an in-flow disclosure opened from
+  More instead of a permanent card.
+- Compact navigation uses an accessible in-flow Menu with current context,
+  existing destinations and Logout, including Escape/focus return. Settings
+  uses one active native section selector on compact layouts and keyboard tabs
+  on wide layouts without fixed section-count assumptions.
+- Verification: the CP3 web tests, production build, disposable Settings
+  Chromium suite and `git diff --check` passed. No live configuration,
+  production run, publication, CI or live activation was changed.
+
+## 2026-09-10 — CP3 repair evidence
+
+- Kept the list/detail breakpoint unchanged while switching Settings to its
+  labelled section selector before the shared header can wrap at 960–1024px.
+  More → Install skills now completes the guarded Advanced TOML → Guided
+  transition, preserving valid and invalid raw drafts; Hide controls only the
+  disclosure while retained success/failure outcomes remain available on reopen.
+- Updated compact run-navigation coverage for the shared Menu and header More
+  actions. Verification: 100 targeted web tests, production build, both
+  disposable Chromium modules (4 passed), and `git diff --check` passed. No
+  live configuration, production run, publication, CI or live activation was
+  changed.
+
+## 2026-09-10 — CP3 hosted recovery selector correction
+
+- Updated the hosted successor-recovery regression to exercise the shared
+  More → Cancel action after the header migration; standalone dashboard Cancel
+  coverage remains unchanged and exact request/owner-stop assertions remain
+  intact.
+- Verification: the focused recovery test, full 295-test web suite, production
+  build, two disposable Chromium modules, and `git diff --check` passed. No
+  live configuration, publication, CI or live activation changed.

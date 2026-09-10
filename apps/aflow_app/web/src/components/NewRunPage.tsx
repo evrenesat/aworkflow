@@ -50,10 +50,12 @@ interface NewRunPageProps {
   handleStart: () => Promise<void>
   startDisabled: boolean
   busyAction: string | null
+  /** The hosted shell renders Start/Cancel in its shared row-2 slots. */
+  hideActions?: boolean
 }
 
 /** Presentation only; the workspace retains request and answer identity across navigation. */
-export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeam, setStartTeam, teamOptions, teamBadges, teamPresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction }: NewRunPageProps) {
+export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planBadges, restartDraftFrozen, startWorkflow, changeStartWorkflow, workflowOptions, workflowBadges, workflowPresentation, startTeam, setStartTeam, teamOptions, teamBadges, teamPresentation, startMaxTurns, setStartMaxTurns, startMaxTurnsProblem, configuredMaxTurns, preview, restartActions, onCancel, advancedOpen, setAdvancedOpen, startStep, setStartStep, effectiveWorkflow, runSteps, skippedByDraft, startExtraInstructions, setStartExtraInstructions, extraInstructionProblem, launchBlocker, onOpenSettings, handleStart, startDisabled, busyAction, hideActions = false }: NewRunPageProps) {
   const advancedId = useId()
   return (
         <section className="card start-run-form">
@@ -165,7 +167,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 </div>
               )}
               {restartActions}
-              <div className="dashboard-actions">
+              {!hideActions && <div className="dashboard-actions">
                 <button
                   className="btn btn-primary"
                   onClick={() => void handleStart()}
@@ -174,7 +176,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                   {busyAction === 'start' ? 'Starting…' : 'Start run'}
                 </button>
                 <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
-              </div>
+              </div>}
             </div>
         </section>
   )
