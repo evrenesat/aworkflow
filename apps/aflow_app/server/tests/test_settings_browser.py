@@ -51,10 +51,12 @@ def document_metrics(page):
 
 def select_settings_section(page, name):
     selector = page.get_by_role('combobox', name='Settings section', exact=True)
-    if selector.count():
+    tab = page.get_by_role('tab', name=name, exact=True)
+    selector.or_(tab).first.wait_for(state='visible')
+    if selector.is_visible():
         selector.select_option(label=name)
     else:
-        page.get_by_role('tab', name=name, exact=True).click()
+        tab.click()
 
 
 def open_settings_more(page):
@@ -109,7 +111,9 @@ def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeyp
             assert page.get_by_role('menuitem', name='Advanced TOML', exact=True).count() == 1
             page.get_by_role('menuitem', name='Advanced TOML', exact=True).click()
             page.get_by_label('aflow.toml contents').wait_for()
-            assert page.get_by_role('button', name='Save all changes', exact=True).count() == 1
+            save = page.locator('.app-header-row-two').get_by_role('button', name='Save all changes', exact=True)
+            save.wait_for(state='visible')
+            assert save.count() == 1
             open_settings_more(page)
             page.get_by_role('menuitem', name='Guided settings', exact=True).click()
             page.get_by_role('heading', name='Changelog', exact=True).wait_for()

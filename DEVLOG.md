@@ -1,5 +1,12 @@
 # DEVLOG
 
+## 2026-09-10 — Await Settings navigation and header actions (Checkpoint 1)
+
+- HISTORY: CI failure evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-fdc9ff2-failed.log` showed the mobile Skills journey waiting for a desktop `tab` after the responsive combobox count was observed as zero, and the macOS Changelog journey observed zero Save buttons immediately after the Advanced TOML editor appeared.
+- HISTORY: Source inspection established both as render-order boundaries: `GlobalSettings` conditionally renders the named combobox or tabs, while `useHeaderSlots` registers the hosted header actions in an effect that can settle after the editor itself is visible. No local reproduction is claimed.
+- The browser helper now waits for the visible union of the requested combobox and tab before selecting the actual rendered control. The Advanced TOML journey waits for the visible Save action in the hosted header before retaining its exact count assertion; paging, draft bytes, geometry, and read-only assertions are unchanged.
+- Verification passed with `cd apps/aflow_app/web && npm ci && npm run build`, `cd apps/aflow_app/server && uv sync --frozen --group dev`, and the complete `tests/test_settings_browser.py` file under both `AFLOW_TEST_BROWSER=chromium` (5 passed) and `AFLOW_TEST_BROWSER=webkit` (5 passed). Only the Changelog and dirty mobile Skills journeys use the selected engine; the toolbar, draft-template, and skill-save/install tests in this same file remain hard-coded Chromium. `git diff --check` also passed.
+
 ## 2026-09-10 — Stabilize hosted browser ordering and Dashboard CI Python (Checkpoint 1)
 
 - HISTORY: A controlled browser probe held the Restore fetch after the server
