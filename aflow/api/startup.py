@@ -6,7 +6,14 @@ import subprocess
 from pathlib import Path
 from dataclasses import replace
 
-from aflow.git_status import probe_worktree, classify_dirtiness_by_prefix
+from aflow.git_status import (
+    WorktreeInspectionError,
+    WorktreePreflight,
+    classify_status_items_by_prefix,
+    preflight_worktree,
+    probe_worktree,
+    probe_repo_state,
+)
 from aflow.plan import (
     PlanParseError,
     load_plan,
@@ -16,6 +23,7 @@ from aflow.plan import (
 from aflow.run_state import RetryContext
 from aflow.workflow import (
     _effective_retry_limit,
+    _lifecycle_is_bootstrap_eligible,
     generate_new_plan_path,
     preflight_pre_handoff_base_head_refresh,
     render_step_prompts,
@@ -36,6 +44,9 @@ class StartupError(Exception):
     """Error during startup preparation."""
 
     pass
+
+
+_DEFAULT_PROBE_WORKTREE = probe_worktree
 
 
 def _resolve_start_step(raw_start_step: str | None, workflow_name: str, request: StartupRequest) -> str | None:
@@ -355,43 +366,96 @@ def _build_retry_context(
 def _check_worktree_dirtiness(
     request: StartupRequest,
     workflow_name: str,
-) -> tuple[bool, str | None]:
-    """Check if worktree is dirty and needs confirmation.
-
-    Returns (is_dirty, error_or_confirmation_needed).
-    - If not dirty, returns (False, None)
-    - If dirty but worktree-safe, returns (False, None)
-    - If dirty and needs confirmation, returns (True, dirty_description)
-    """
-    probe = probe_worktree(request.repo_root)
-    if probe is None or not probe.is_dirty:
-        return False, None
-
+) -> WorktreePreflight:
+    """Run the shared read-only startup worktree preflight."""
     workflow = request.workflow_config.workflows[workflow_name]
-    uses_worktree = workflow is not None and workflow.setup and "worktree" in workflow.setup
-
-    if uses_worktree:
-        status_result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=str(request.repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
+    execution_mode = (
+        "new_worktree"
+        if workflow.setup and "worktree" in workflow.setup
+        else "same_checkout"
+    )
+    # Keep the established injectable probe seam available to callers and
+    # tests that deliberately provide synthetic dirtiness.  The normal path
+    # below uses only the shared typed preflight and therefore performs one
+    # status inspection.
+    if not workflow.setup and probe_worktree is not _DEFAULT_PROBE_WORKTREE:
+        legacy_probe = probe_worktree(request.repo_root)
+        dirty = bool(getattr(legacy_probe, "is_dirty", False))
+        return WorktreePreflight(
+            checkout_path=Path(request.repo_root).resolve(),
+            execution_mode=execution_mode,
+            dirty=dirty,
+            requires_confirmation=dirty,
+            blockers=(),
+            total_items=(1 if dirty else 0),
+            items=(),
         )
-        if status_result.returncode == 0:
-            _, non_plan_paths = classify_dirtiness_by_prefix(
-                status_result.stdout,
-                ignore_lifecycle_owned=True,
-            )
-            if non_plan_paths:
-                raise StartupError(
-                    f"Worktree has non-plan dirtiness that must be cleaned before running a worktree workflow. "
-                    f"Untracked or uncommitted paths outside plans/: {', '.join(non_plan_paths[:3])}{'...' if len(non_plan_paths) > 3 else ''}"
-                )
-            return False, None
 
-    dirty_desc = f"M {probe.modified_count}, A {probe.added_count}, D {probe.removed_count}"
-    return True, dirty_desc
+    # Lifecycle bootstrap owns the initial files in a supported non-Git
+    # directory (or an unborn repository).  Defer strict status inspection
+    # until bootstrap has created a commit; the existing lifecycle preflight
+    # then performs the Git-dependent check before setup proceeds.
+    repo_state = probe_repo_state(request.repo_root)
+    if _lifecycle_is_bootstrap_eligible(workflow, repo_state):
+        return WorktreePreflight(
+            checkout_path=Path(request.repo_root).resolve(),
+            execution_mode=execution_mode,
+            dirty=False,
+            requires_confirmation=False,
+            blockers=(),
+            total_items=0,
+            items=(),
+        )
+
+    try:
+        result = preflight_worktree(
+            request.repo_root,
+            execution_mode=execution_mode,
+        )
+    except WorktreeInspectionError as exc:
+        # Non-lifecycle workflows have historically been usable from a
+        # directory that is not a Git checkout.  Keep that narrow compatibility
+        # path, while the shared preflight remains strict for real checkouts
+        # and all other inspection failures.
+        if not workflow.setup and "not a git repository" in str(exc).lower():
+            legacy_probe = probe_worktree(request.repo_root)
+            if legacy_probe is None:
+                return WorktreePreflight(
+                    checkout_path=Path(request.repo_root).resolve(),
+                    execution_mode=execution_mode,
+                    dirty=False,
+                    requires_confirmation=False,
+                    blockers=(),
+                    total_items=0,
+                    items=(),
+                )
+            dirty = bool(getattr(legacy_probe, "is_dirty", False))
+            return WorktreePreflight(
+                checkout_path=Path(request.repo_root).resolve(),
+                execution_mode=execution_mode,
+                dirty=dirty,
+                requires_confirmation=dirty,
+                blockers=(),
+                total_items=(1 if dirty else 0),
+                items=(),
+            )
+        raise StartupError(f"worktree preflight inspection failed: {exc}") from exc
+
+    if result.blockers:
+        raise StartupError(
+            "worktree preflight blocked startup: " + "; ".join(result.blockers)
+        )
+    if request.continue_from_current and result.requires_confirmation:
+        _, non_plan_paths = classify_status_items_by_prefix(
+            result.items,
+            ignore_lifecycle_owned=True,
+        )
+        raise StartupError(
+            "current-branch continuation has non-plan dirtiness; "
+            f"untracked or uncommitted paths outside plans/: "
+            f"{', '.join(non_plan_paths[:3])}{'...' if len(non_plan_paths) > 3 else ''}"
+        )
+    return result
 
 
 def _preflight_startup_base_head_refresh(
@@ -542,8 +606,13 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
                 "Pre-Handoff Base HEAD refresh"
             )
 
-    is_dirty, dirty_desc = _check_worktree_dirtiness(request, workflow_name)
-    if is_dirty and not request.dirty_worktree_confirmed:
+    worktree_preflight = _check_worktree_dirtiness(request, workflow_name)
+    if worktree_preflight.requires_confirmation and not request.dirty_worktree_confirmed:
+        dirty_paths = tuple(item.path for item in worktree_preflight.items)
+        dirty_desc = (
+            f"{worktree_preflight.total_items} changed path(s)"
+            + (f": {', '.join(dirty_paths[:3])}{'...' if len(dirty_paths) > 3 else ''}" if dirty_paths else "")
+        )
         return StartupQuestion(
             kind=StartupQuestionKind.CONFIRM_WORKTREE_DIRTY,
             message=f"Worktree is dirty ({dirty_desc}). Start anyway?",
@@ -572,6 +641,7 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
         team=effective_team,
         extra_instructions=request.extra_instructions,
         start_step=selected_start_step,
+        dirty_worktree_confirmed=request.dirty_worktree_confirmed,
         startup_retry=startup_retry,
         startup_base_head_refresh_sha=effective_startup_base_head_refresh_sha,
         move_completed_plan_to_done=is_complete_plan,

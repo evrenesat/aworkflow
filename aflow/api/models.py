@@ -105,6 +105,7 @@ class PreparedRun:
     team: str | None
     extra_instructions: tuple[str, ...]
     start_step: str
+    dirty_worktree_confirmed: bool = False
     startup_retry: RetryContext | None = None
     startup_base_head_refresh_sha: str | None = None
     move_completed_plan_to_done: bool = False

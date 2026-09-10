@@ -18,9 +18,13 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp6 v01` — approved.
+- Last Reviewed Checkpoint: `cp7 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp7 v01` from the immediately preceding repaired worker worktree against approved CP6 `f77b5b1`; worktree fallback used because no pending CP7 commit exists (zero intervening implementation commits). Reviewed shared dirty preflight, acknowledgment handoffs and final lifecycle recheck. Both cp08-v01 overlay findings are resolved: supported non-Git bootstrap reaches preparation and operation markers remain local to the selected worktree. Verification: 467 passed, 168 subtests; library API 33 passed, 6 subtests; scoped Ruff and diff check passed. No material findings. CP8 remains unchecked; manager 40 KiB guard and compact 16 KiB summary retained.
+
+- 2026-09-10: Rejected pending CP7 worker worktree against approved CP6 `f77b5b1`; worktree fallback used because no pending CP7 commit exists (zero intervening implementation commits). Two reproduced P2 defects: strict startup inspection blocks documented non-Git lifecycle bootstrap, and common-directory operation markers falsely block a clean linked worktree. Required CP7 suite: 438 passed, 168 subtests; Git-status suite: 26 passed; diff check passed. CP7 approval unchecked, implementation markers retained, CP8 untouched. Non-checkpoint repair overlay `live-configuration-without-snapshot-gates-20260909-cp08-v01.md` targets original CP7 despite filename. Manager 40 KiB guard and compact 16 KiB summary retained.
 
 - 2026-09-10: Approved `cp6 v01` from the immediately preceding worker worktree against approved CP5 `281bdeb`; worktree fallback used because no pending CP6 commit exists (zero intervening implementation commits). Reviewed live UI option refresh, draft/error preservation, pending versus executed role/model evidence and timing copy. Verification: 282 web tests passed, production build and diff check passed; Chromium with temporary config and in-memory units passed Settings team save → existing-run selection → accepted/rejected feedback with retained draft. No material findings. CP7 remains unchecked; manager 40 KiB hard guard and 16 KiB compact summary retained.
 
@@ -231,7 +235,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** No browser test environment available: record that limitation rather than claiming the smoke passed.
 
-### [ ] Checkpoint 7: Shared dirty-worktree preflight and acknowledged startup
+### [x] Checkpoint 7: Shared dirty-worktree preflight and acknowledged startup
 
 **Goal:** Inspect dirty paths once through shared domain logic and honor explicit continuation throughout CLI and lifecycle preparation.
 
@@ -241,10 +245,10 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Add a small typed read-only preflight result containing `checkout_path`, `execution_mode` (`same_checkout` or `new_worktree`), `dirty`, `requires_confirmation`, `blockers`, `total_items`, and ordered items `{path, original_path?, index_status, worktree_status}`. Use one NUL-aware status parser and the existing lifecycle-artifact classification. Handle Git failures as inspection errors, never as clean status. Sort by path for predictable display.
-- [ ] Make startup reuse this result. Return the existing `CONFIRM_WORKTREE_DIRTY` question for confirmation-required dirt when unacknowledged, including worktree workflows currently hard-rejected. Preserve CLI yes/no handling; a positive answer carries the existing boolean and a negative answer aborts normally.
-- [ ] Thread the boolean through prepared/controller launch inputs and the duplicate lifecycle startup check. Bypass only acknowledged dirty-path prohibitions, not branch/HEAD identity, unresolved-conflict, in-progress-operation or teardown checks. Recheck at final preparation. A fresh worktree receives the selected committed tree; source modifications remain untouched.
-- [ ] Test tracked/staged/untracked/deleted/renamed files and newline/space filenames; plan-only/lifecycle-owned exclusions; clean checkout; positive/negative acknowledgment; dirt appearing after preflight; unresolved conflicts; and fresh-worktree launch preserving source bytes.
+- [x] Add a small typed read-only preflight result containing `checkout_path`, `execution_mode` (`same_checkout` or `new_worktree`), `dirty`, `requires_confirmation`, `blockers`, `total_items`, and ordered items `{path, original_path?, index_status, worktree_status}`. Use one NUL-aware status parser and the existing lifecycle-artifact classification. Handle Git failures as inspection errors, never as clean status. Sort by path for predictable display.
+- [x] Make startup reuse this result. Return the existing `CONFIRM_WORKTREE_DIRTY` question for confirmation-required dirt when unacknowledged, including worktree workflows currently hard-rejected. Preserve CLI yes/no handling; a positive answer carries the existing boolean and a negative answer aborts normally.
+- [x] Thread the boolean through prepared/controller launch inputs and the duplicate lifecycle startup check. Bypass only acknowledged dirty-path prohibitions, not branch/HEAD identity, unresolved-conflict, in-progress-operation or teardown checks. Recheck at final preparation. A fresh worktree receives the selected committed tree; source modifications remain untouched.
+- [x] Test tracked/staged/untracked/deleted/renamed files and newline/space filenames; plan-only/lifecycle-owned exclusions; clean checkout; positive/negative acknowledgment; dirt appearing after preflight; unresolved conflicts; and fresh-worktree launch preserving source bytes.
 
 **Dependencies:** Checkpoint 2 startup changes; independent of runtime session integration.
 

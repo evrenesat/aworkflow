@@ -2446,6 +2446,11 @@ def _request_from_payload(
         if value is not None and not isinstance(value, bool):
             raise DaemonError(f"startup record request has invalid {field_name}")
         choice_values[field_name] = value
+    dirty_worktree_confirmed = payload.get("dirty_worktree_confirmed", False)
+    if not isinstance(dirty_worktree_confirmed, bool):
+        raise DaemonError(
+            "startup record request has invalid dirty_worktree_confirmed"
+        )
     return StartupRequest(
         repo_root=Path(str(payload["repo_root"])),
         plan_path=Path(str(payload["plan_path"])),
@@ -2463,7 +2468,7 @@ def _request_from_payload(
         startup_base_head_refresh_sha=_optional_string(
             payload.get("startup_base_head_refresh_sha")
         ),
-        dirty_worktree_confirmed=bool(payload.get("dirty_worktree_confirmed", False)),
+        dirty_worktree_confirmed=dirty_worktree_confirmed,
         reserved_run_id=reserved_run_id,
         caller_scope=caller_scope,
         idempotency_key=idempotency_key,
@@ -2487,6 +2492,7 @@ def _prepared_payload(prepared: PreparedRun) -> dict[str, object]:
         "start_step_explicit": prepared.start_step_explicit,
         "start_step": prepared.start_step,
         "startup_base_head_refresh_sha": prepared.startup_base_head_refresh_sha,
+        "dirty_worktree_confirmed": prepared.dirty_worktree_confirmed,
         "move_completed_plan_to_done": prepared.move_completed_plan_to_done,
         "extra_instructions_digest": _extra_instructions_digest(
             prepared.extra_instructions
@@ -2529,6 +2535,11 @@ def _prepared_from_payload(
         if value is not None and not isinstance(value, bool):
             raise DaemonError(f"prepared startup record has invalid {field_name}")
         choice_values[field_name] = value
+    dirty_worktree_confirmed = payload.get("dirty_worktree_confirmed", False)
+    if not isinstance(dirty_worktree_confirmed, bool):
+        raise DaemonError(
+            "prepared startup record has invalid dirty_worktree_confirmed"
+        )
     return PreparedRun(
         workflow_name=str(payload["workflow_name"]),
         repo_root=repo_root,
@@ -2541,6 +2552,7 @@ def _prepared_from_payload(
         start_step_explicit=choice_values["start_step_explicit"],
         extra_instructions=extra_instructions,
         start_step=str(payload["start_step"]),
+        dirty_worktree_confirmed=dirty_worktree_confirmed,
         startup_base_head_refresh_sha=_optional_string(payload.get("startup_base_head_refresh_sha")),
         move_completed_plan_to_done=bool(payload.get("move_completed_plan_to_done", False)),
         restarted_from_run_id=_optional_string(

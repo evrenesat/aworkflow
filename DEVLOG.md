@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-09-10 — Repair dirty-worktree lifecycle preflight (CP7 review)
+
+- Lifecycle startup now defers strict Git status inspection only for the
+  existing non-Git/unborn bootstrap path, while inspection failures in real
+  checkouts remain blocking.
+- In-progress Git operation markers are scoped to the selected checkout, so a
+  clean linked worktree is not blocked by a merge in the primary checkout;
+  conflicts and operations in the selected checkout remain blocking.
+
 ## 2026-09-10 — Approve live turn configuration (Checkpoint 3)
 
 - Each source-backed turn reloads configuration before controls and limits; persistent partial choices and retry context survive refresh and resume.
@@ -1247,3 +1256,18 @@ Final verification: web tests (213), all server tests including Chromium layout 
   retaining raw keys in exact save and control payloads. Verification: 279 web
   tests, production build and four disposable Chromium checks passed; no live
   configuration was changed.
+
+## 2026-09-10 — Shared dirty-worktree preflight
+
+- Added one typed, NUL-aware Git status preflight shared by startup and both
+  lifecycle allocation checks. It preserves rename/source paths and ordered
+  status items, excludes plan/lifecycle-owned dirt for fresh worktrees, and
+  reports conflicts, in-progress operations, and inspection failures explicitly.
+- Dirty non-plan paths now use the existing startup confirmation for eligible
+  worktree runs. The acknowledgment is carried through prepared daemon and
+  controller inputs; final pre-allocation validation rechecks current dirt
+  without relaxing branch, identity, conflict, or teardown protections.
+- Verification: focused dirty-worktree tests (8), Git-status tests (26), CLI
+  tests (154 plus 125 subtests), runtime tests (276 plus 43 subtests), and
+  library startup tests (33 plus 6 subtests) passed; Ruff and diff whitespace
+  checks passed. No real provider or global configuration was used.

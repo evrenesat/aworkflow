@@ -438,12 +438,14 @@ The core engine. `run_workflow()` executes the turn loop:
 
 1. Probe repository state, validate lifecycle-bootstrap eligibility, back up and load the original plan, and normalize required Git Tracking metadata before reserving a run ID or writing a launch manifest.
 2. For a pristine fresh review plan with no live Git Tracking section, insert the exact two controller-owned fields atomically and reload the plan. Existing sections are never rebuilt. Started, resumed, recovery, malformed, ambiguous, and no-HEAD/non-bootstrap inputs fail before allocation.
-3. If the workflow's `setup` is non-empty, inspect the repo state at `repo_root`. If no `.git/` directory exists or the repo has no commits, auto-bootstrap runs before lifecycle preflight: `run_workflow()` probes the repo state via `probe_repo_state()`, determines that bootstrap is needed, runs git-independent preflight (plan path existence, worktree root, `main_branch` config), then invokes the team-lead bootstrap handoff. The handoff resolves `[aflow].team_lead` exactly as merge teardown does, constructs a `README.md` title and body from the plan preamble via `derive_readme_content()`, and runs the agent from the primary checkout using the built-in `aflow-init-repo` skill instruction. After the agent returns, the engine verifies: `HEAD` resolves to a commit, `HEAD` is on `main_branch`, `README.md` exists and is tracked, and the working tree has no tracked-file dirtiness. A deferred empty Git Tracking base is then filled with that exact verified commit, while `Plan Branch` is filled from the lifecycle execution context, before the first ordinary prompt. Existing pristine sections with an empty or stale base are refreshed automatically to the verified current `HEAD`; there is no interactive base-refresh confirmation. Only after bootstrap verification passes does `run_workflow()` continue into the git-dependent phase of lifecycle preflight. For already-committed repos, bootstrap is skipped entirely and the original behavior is preserved. If git is missing, lifecycle workflows fail early with a clear bootstrap error. Preflight validates: branch name collision, worktree path collision, correct startup branch, that `main_branch` points to a local commit, and (for worktree workflows only) that any dirty files in the primary checkout are confined to `plans/` (untracked or gitignored plan files are allowed). For non-worktree workflows, the working tree must be clean. Branch-only setup creates a local feature branch from `main_branch` in the primary checkout. Worktree setup creates a linked worktree from `main_branch` under `worktree_root` and creates the feature branch inside that worktree. The primary checkout remains the control root for run artifacts; the worktree is the execution root for normal steps.
+3. If the workflow's `setup` is non-empty, inspect the repo state at `repo_root`. If no `.git/` directory exists or the repo has no commits, auto-bootstrap runs before lifecycle preflight: `run_workflow()` probes the repo state via `probe_repo_state()`, determines that bootstrap is needed, runs git-independent preflight (plan path existence, worktree root, `main_branch` config), then invokes the team-lead bootstrap handoff. The handoff resolves `[aflow].team_lead` exactly as merge teardown does, constructs a `README.md` title and body from the plan preamble via `derive_readme_content()`, and runs the agent from the primary checkout using the built-in `aflow-init-repo` skill instruction. After the agent returns, the engine verifies: `HEAD` resolves to a commit, `HEAD` is on `main_branch`, `README.md` exists and is tracked, and the working tree has no tracked-file dirtiness. A deferred empty Git Tracking base is then filled with that exact verified commit, while `Plan Branch` is filled from the lifecycle execution context, before the first ordinary prompt. Existing pristine sections with an empty or stale base are refreshed automatically to the verified current `HEAD`; there is no interactive base-refresh confirmation. Only after bootstrap verification passes does `run_workflow()` continue into the git-dependent phase of lifecycle preflight. For already-committed repos, bootstrap is skipped entirely and the original behavior is preserved. If git is missing, lifecycle workflows fail early with a clear bootstrap error. Preflight validates: branch name collision, worktree path collision, correct startup branch, that `main_branch` points to a local commit, and Git working-tree state. A shared NUL-aware status result lists each changed path (including rename source paths), distinguishes plan/lifecycle-owned dirt, and reports inspection, conflict, and in-progress-operation blockers. Same-checkout and branch-only runs ask for explicit dirty-worktree confirmation; a new-worktree run proceeds automatically for `plans/` and lifecycle-owned paths and asks the same confirmation question for other dirt. An acknowledged dirty path only bypasses that path gate; branch/HEAD identity, conflict, in-progress-operation, worktree-collision, and teardown checks remain enforced. Branch-only setup creates a local feature branch from `main_branch` in the primary checkout. Worktree setup creates a linked worktree from `main_branch` under `worktree_root` and creates the feature branch inside that worktree. The primary checkout remains the control root for run artifacts; the worktree is the execution root for normal steps.
 
 Worktree startup also excludes aflow-owned `.aflow` runtime state from this
 dirtiness decision. Ownership matches only the exact repository-relative
 `.aflow` root and descendants; deceptive names such as `.aflow-copy` and nested
-`src/.aflow` paths remain unrelated dirt. Merge teardown reuses the same
+`src/.aflow` paths remain unrelated dirt. The startup acknowledgment is carried
+through prepared and controller inputs, and lifecycle startup rechecks the
+shared result immediately before allocation. Merge teardown reuses the same
 classifier while retaining its backup-plan and active-plan allowances.
 4. For each turn (up to `max_turns`):
    a. Reload the plan from disk (the agent may have modified it). For worktree flows, plan path placeholders (`{ORIGINAL_PLAN_PATH}`, `{ACTIVE_PLAN_PATH}`, `{NEW_PLAN_PATH}`) are translated from primary-root-relative to worktree-root-relative before being handed to the agent; they are translated back after the turn.
@@ -673,12 +675,24 @@ is missing or unreadable.
 Prunes old run directories to respect `keep_runs`.
 
 ### `git_status.py`
-Git snapshot helpers used by the banner and CLI. Provides three public data classes (`GitBaseline`, `GitSummary`, `WorktreeProbe`) and three functions:
-- `probe_worktree(repo_root)` — checks whether the working tree is dirty at startup.
+Git snapshot helpers used by the banner and CLI. Provides the snapshot data
+classes (`GitBaseline`, `GitSummary`, `WorktreeProbe`) plus the typed
+`WorktreeStatusItem` and `WorktreePreflight` result. Its working-tree API is:
+- `preflight_worktree(repo_root, execution_mode)` — performs one strict,
+  NUL-aware status inspection for startup and lifecycle validation; inspection
+  failures raise `WorktreeInspectionError` instead of being treated as clean.
+- `probe_worktree(repo_root)` — retains the compact legacy dirty-state summary.
 - `capture_baseline(repo_root)` — snapshots the current HEAD SHA and a working-tree tree OID (using a temporary `GIT_INDEX_FILE`) as a before-run baseline.
 - `summarize_since_baseline(repo_root, baseline)` — compares the current working tree against the baseline and returns file-change counts, net line deltas, commit count, and changed paths.
 
-All three functions return `None` when git is unavailable or fails, so the workflow always runs regardless of git state.
+The snapshot and legacy probe helpers retain their best-effort `None` result
+when Git is unavailable or fails. For an existing Git checkout, the
+startup/lifecycle preflight is strict and raises `WorktreeInspectionError`,
+because an unavailable status cannot be treated as a clean checkout. A
+lifecycle workflow in the supported `NOT_A_REPO` or `UNBORN` bootstrap state
+defers Git-dependent inspection until bootstrap creates the initial commit;
+the normal strict preflight then runs before lifecycle setup. Non-lifecycle
+startup retains its established compatibility for directories outside Git.
 
 ### `status.py`
 Readable append-only status blocks rendered to stderr during a run. The

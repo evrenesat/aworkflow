@@ -395,6 +395,7 @@ class ControllerConfig:
     team: str | None = None
     extra_instructions: tuple[str, ...] = ()
     start_step: str | None = None
+    dirty_worktree_confirmed: bool = False
     reserved_run_id: str | None = None
     idempotency_key: str | None = None
     caller_scope: str | None = None

@@ -57,10 +57,12 @@ from .manager_context import (
 )
 from .skill_store import SkillStoreError
 from .git_status import (
-    classify_dirtiness_by_prefix,
+    classify_status_items_by_prefix,
     is_lifecycle_owned_path,
     porcelain_status_paths,
     RepoState,
+    WorktreeInspectionError,
+    preflight_worktree,
     probe_repo_state,
 )
 from .harnesses import get_adapter
@@ -4314,6 +4316,7 @@ def _lifecycle_preflight_git(
     worktree_path: Path | None,
     *,
     allow_untracked: bool = False,
+    dirty_worktree_confirmed: bool = False,
 ) -> None:
     """Phase B: git-dependent lifecycle preflight checks.
 
@@ -4352,37 +4355,36 @@ def _lifecycle_preflight_git(
             f"but workflow requires starting from '{main_branch}'"
         )
 
-    rc, status_out, _ = _run_git(
-        ["status", "--porcelain=v1", "--untracked-files=all"], cwd=primary_root
-    )
-    if rc != 0:
+    try:
+        worktree_preflight = preflight_worktree(
+            primary_root,
+            execution_mode=("new_worktree" if uses_worktree else "same_checkout"),
+            allow_untracked=allow_untracked,
+        )
+    except WorktreeInspectionError as exc:
         raise WorkflowError(
-            f"lifecycle preflight: cannot check working tree state in '{primary_root}'"
+            f"lifecycle preflight: cannot check working tree state in '{primary_root}': {exc}"
+        ) from exc
+
+    if worktree_preflight.blockers:
+        raise WorkflowError(
+            "lifecycle preflight: " + "; ".join(worktree_preflight.blockers)
         )
 
-    effective_status = status_out
-    if allow_untracked:
-        tracked_lines = [
-            line for line in status_out.splitlines()
-            if len(line) >= 2 and line[:2] != "??"
-        ]
-        effective_status = "\n".join(tracked_lines)
-
-    if effective_status.strip():
+    if worktree_preflight.requires_confirmation and not dirty_worktree_confirmed:
         if uses_worktree:
-            _, non_plan_paths = classify_dirtiness_by_prefix(
-                effective_status,
+            _, non_plan_paths = classify_status_items_by_prefix(
+                worktree_preflight.items,
                 ignore_lifecycle_owned=True,
+                ignore_untracked=allow_untracked,
             )
-            if non_plan_paths:
-                raise WorkflowError(
-                    f"lifecycle preflight: primary checkout at '{primary_root}' has non-plan dirtiness: "
-                    f"{', '.join(non_plan_paths[:3])}{'...' if len(non_plan_paths) > 3 else ''}"
-                )
-        else:
             raise WorkflowError(
-                f"lifecycle preflight: primary checkout at '{primary_root}' has uncommitted changes"
+                f"lifecycle preflight: primary checkout at '{primary_root}' has non-plan dirtiness: "
+                f"{', '.join(non_plan_paths[:3])}{'...' if len(non_plan_paths) > 3 else ''}"
             )
+        raise WorkflowError(
+            f"lifecycle preflight: primary checkout at '{primary_root}' has uncommitted changes"
+        )
 
     rc, _, _ = _run_git(["show-ref", "--verify", f"refs/heads/{feature_branch}"], cwd=primary_root)
     if rc == 0:
@@ -4412,6 +4414,7 @@ def _lifecycle_preflight(
     *,
     skip_phase_b: bool = False,
     main_branch_override: str | None = None,
+    dirty_worktree_confirmed: bool = False,
 ) -> _LifecyclePlan | None:
     setup = wf.setup or ()
     teardown = wf.teardown or ()
@@ -4489,7 +4492,14 @@ def _lifecycle_preflight(
     # Runs after bootstrap has ensured commits exist.
     # skip_phase_b=True defers this call to after the bootstrap handoff in run_workflow.
     if not skip_phase_b:
-        _lifecycle_preflight_git(primary_root, main_branch, feature_branch, uses_worktree, worktree_path)
+        _lifecycle_preflight_git(
+            primary_root,
+            main_branch,
+            feature_branch,
+            uses_worktree,
+            worktree_path,
+            dirty_worktree_confirmed=dirty_worktree_confirmed,
+        )
 
     return _LifecyclePlan(
         main_branch=main_branch,
@@ -5848,6 +5858,7 @@ def run_workflow(
     parsed_plan: ParsedPlan | None = None,
     startup_retry: RetryContext | None = None,
     startup_base_head_refresh_sha: str | None = None,
+    dirty_worktree_confirmed: bool | None = None,
     config_dir: Path,
     working_dir: Path | None = None,
     adapter: HarnessAdapter | None = None,
@@ -5882,6 +5893,12 @@ def run_workflow(
     wf = workflow_config.workflows[workflow_name]
     if wf.first_step is None:
         raise WorkflowError(f"workflow '{workflow_name}' has no steps")
+
+    effective_dirty_worktree_confirmed = (
+        config.dirty_worktree_confirmed
+        if dirty_worktree_confirmed is None
+        else dirty_worktree_confirmed
+    )
 
     continuation_from_branch = config.continuation_from_branch
     continuation_from_head = config.continuation_from_head
@@ -5940,6 +5957,7 @@ def run_workflow(
                 if config.continuation_mode == "current_branch"
                 else None
             ),
+            dirty_worktree_confirmed=effective_dirty_worktree_confirmed,
         )
 
     try:
@@ -6912,14 +6930,15 @@ def run_workflow(
                     f"on branch '{lifecycle_plan.main_branch}'",
                     file=sys.stderr,
                 )
-                _lifecycle_preflight_git(
-                    config.repo_root,
-                    lifecycle_plan.main_branch,
-                    lifecycle_plan.feature_branch,
-                    "worktree" in (wf.setup or ()),
-                    lifecycle_plan.worktree_path,
-                    allow_untracked=True,
-                )
+            _lifecycle_preflight_git(
+                config.repo_root,
+                lifecycle_plan.main_branch,
+                lifecycle_plan.feature_branch,
+                "worktree" in (wf.setup or ()),
+                lifecycle_plan.worktree_path,
+                allow_untracked=needs_bootstrap,
+                dirty_worktree_confirmed=effective_dirty_worktree_confirmed,
+            )
             exec_ctx = _do_lifecycle_setup(config.repo_root, lifecycle_plan)
             _sync_startup_plan_metadata_for_execution(
                 original_plan_path,
