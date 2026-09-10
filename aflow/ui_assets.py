@@ -82,7 +82,7 @@ def _hash_file(path: Path) -> str:
 
 
 def compute_source_fingerprint(web_dir: Path) -> str:
-    """Hash every web build input: sources, configs, and the npm lockfile."""
+    """Hash web inputs plus the root DEVLOG used to generate release content."""
     entries: list[tuple[str, str]] = []
     for path in sorted(web_dir.rglob("*")):
         if not path.is_file():
@@ -93,6 +93,7 @@ def compute_source_fingerprint(web_dir: Path) -> str:
             continue
         if (
             rel.startswith(("node_modules/", "dist/", "."))
+            or rel.startswith("src/generated/")
             or fnmatch.fnmatch(rel, "src/*.test.*")
             or rel == "src/test-setup.ts"
         ):
@@ -100,6 +101,13 @@ def compute_source_fingerprint(web_dir: Path) -> str:
         entries.append((rel, _hash_file(path)))
     if not any(rel == "package-lock.json" for rel, _ in entries):
         raise AssetBuildError(f"missing package-lock.json in {web_dir}")
+    repository_root = web_dir.parent.parent.parent
+    devlog = repository_root / "DEVLOG.md"
+    if not devlog.is_file():
+        raise AssetBuildError(
+            f"missing DEVLOG.md next to the web checkout at {repository_root}"
+        )
+    entries.append(("__repository__/DEVLOG.md", _hash_file(devlog)))
     digest = hashlib.sha256()
     for rel, hash_value in sorted(entries):
         digest.update(rel.encode("utf-8"))

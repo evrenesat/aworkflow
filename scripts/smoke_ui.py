@@ -100,6 +100,31 @@ def verify_wheel(wheel: Path) -> str:
         assets = [name for name in names if name.startswith("aflow/ui_web/assets/")]
         if not assets:
             fail("wheel does not bundle compiled UI assets")
+        changelog_name = "aflow/ui_web/changelog.json"
+        if changelog_name not in names:
+            fail(f"wheel {wheel.name} is missing generated changelog asset")
+        try:
+            changelog = json.loads(archive.read(changelog_name).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            fail(f"wheel {wheel.name} has invalid generated changelog JSON: {exc}")
+        entries = changelog.get("entries") if isinstance(changelog, dict) else None
+        if (
+            not isinstance(changelog, dict)
+            or changelog.get("schema_version") != 1
+            or not isinstance(entries, list)
+            or not entries
+        ):
+            fail(f"wheel {wheel.name} has invalid generated changelog schema")
+        for index, entry in enumerate(entries):
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"date", "title"}
+                or not isinstance(entry["date"], str)
+                or not entry["date"]
+                or not isinstance(entry["title"], str)
+                or not entry["title"].strip()
+            ):
+                fail(f"wheel {wheel.name} has invalid changelog entry {index}")
         metadata = next(
             (name for name in names if name.endswith("METADATA")), None
         )

@@ -1036,6 +1036,15 @@ React client expose four product areas: registered projects, the shared
 global workflow configuration pair plus server settings, filesystem plans,
 and durable workflow runs.
 
+The web build derives compact release content from the repository root
+`DEVLOG.md` through `apps/aflow_app/web/scripts/generate-changelog.mjs`. The
+generator emits deterministic `src/generated/changelog.json` and root
+`CHANGELOG.md` artifacts; both are ignored build outputs, so DEVLOG remains the
+only authored changelog source. The asset fingerprint includes DEVLOG and the
+generator inputs while excluding generated output, which makes a DEVLOG-only
+edit rebuild once and then cache normally. Wheels bundle the generated assets,
+and sdist builds carry the DEVLOG and generator source needed to reproduce them.
+
 REST plus SSE is the canonical remote interface, and authenticated MCP is an
 HTTP adapter mounted by the same UI server at `/mcp` and `/mcp/`. Both use the
 same `ControlPlaneService`, project registry, and lifecycle domain services. A

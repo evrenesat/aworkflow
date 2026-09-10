@@ -46,8 +46,11 @@ packages = ["aflow", "apps/aflow_app/server/src/aflow_app_server"]
 
 [tool.hatch.build.targets.sdist]
 only-include = [
+    "DEVLOG.md",
     "aflow",
     "apps/aflow_app/server/src/aflow_app_server",
+    "apps/aflow_app/web/public",
+    "apps/aflow_app/web/scripts",
     "apps/aflow_app/web/src",
     "apps/aflow_app/web/index.html",
     "apps/aflow_app/web/package.json",

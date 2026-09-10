@@ -184,6 +184,12 @@ reattach when it returns. Each run freezes a copy of the workflow
 configuration at launch, so later configuration edits affect only new runs.
 Normal installations ship the UI inside the `aworkflow` wheel and never need
 Node; editable development installs build the web assets automatically.
+The release Changelog is generated deterministically from the root `DEVLOG.md`
+as part of every web build; run `npm --prefix apps/aflow_app/web run changelog`
+to regenerate the ignored JSON and Markdown artifacts in a checkout. DEVLOG is
+the only authored changelog source. Built wheels carry the same release data as
+`aflow/ui_web/changelog.json`, so installed clients do not need Node or a
+repository checkout to read it.
 
 ## Use MCP through the UI server
 

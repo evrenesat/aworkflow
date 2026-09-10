@@ -4,8 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "changelog": "node scripts/generate-changelog.mjs",
     "dev": "vite",
+    "predev": "npm run changelog",
     "build": "tsc && vite build",
+    "prebuild": "npm run changelog",
     "preview": "vite preview",
     "test": "vitest",
     "lint": "eslint src --ext ts,tsx"

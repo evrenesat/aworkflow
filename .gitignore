@@ -9,3 +9,7 @@ t
 # Generated AFlow UI web assets (built for editable installs)
 aflow/ui_web/
 apps/aflow_app/web/.ui-assets.lock
+
+# Release changelog artifacts derived from DEVLOG.md
+CHANGELOG.md
+apps/aflow_app/web/src/generated/

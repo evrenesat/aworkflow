@@ -67,6 +67,13 @@
   with its adjacent `result.json`. No sleeps, retries, assertion weakening, UI
   redesign, live configuration, publication, CI, or deployment was changed.
 
+## 2026-09-10 — Generate compact release changelog from DEVLOG
+
+- Added deterministic build-time JSON and Markdown changelog generation from
+  dated DEVLOG headings, with the source and generator included in sdist builds.
+- Added cache fingerprint coverage and focused generator/asset tests without
+  changing the existing UI deployment pipeline.
+
 ## 2026-09-10 — Approve issue38 checkpoint 1
 
 - Review reran the retained four-case comparison: all passed; both setups preserved
