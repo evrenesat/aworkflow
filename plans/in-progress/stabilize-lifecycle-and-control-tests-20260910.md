@@ -24,6 +24,18 @@ CI34493456633 at24ab54e failed two Linux/Python3.12 jobs while equivalent matrix
   Checkpoint 2 remains pending; publication, exact-SHA CI and live activation
   remain coordinator-owned delivery gates.
 
+- 2026-09-10: Approved Checkpoint 2 through `cp2 v01`, reviewing the immediately
+  preceding worker's worktree diff against `5620137` (no checkpoint-2 commit
+  boundary; supplied turn-003 artifact unavailable). No material findings.
+  Full web suite: 291 passed; build passed; clean-Git-config Python suite:
+  1,748 tests and 223 subtests passed. Focused RunDashboard: 77 passed, one
+  unchanged clipboard test failed at line 1854; changed tests passed. Recorded
+  independently as https://github.com/evrenesat/aworkflow/issues/38; no rerun-only
+  recovery. See `plans/reviews/latest_review.md` for evidence and limitations.
+  Checkpoint implementation is approved, but delivery is not complete or fully
+  green: coordinator must resolve that verification failure, publish, and verify
+  exact-SHA CI and live activation. Original base and merge-context code preserved.
+
 ## Done Means
 
 Synthetic lifecycle repos do not launch automatic Git maintenance that can outlive their scope. The rejected-control test interacts only after the real control is enabled and baseline loaded, then proves rejection preserves draft/status. Full relevant suites and CI pass without skips, retries inside tests, arbitrary sleeps, or weakened assertions.
@@ -60,7 +72,7 @@ No production special-case for pytest, global maintenance disable, rmtree(ignore
 
 **Blockers:** If evidence reveals another process writes after fixture exit, identify and fix its test ownership in scope; do not suppress cleanup errors or claim maintenance configuration proved an unrelated process fixed.
 
-### [ ] Checkpoint 2: Wait for admitted controls before testing rejection
+### [x] Checkpoint 2: Wait for admitted controls before testing rejection
 
 **Goal:** The test models an available user action and deterministically proves error handling.
 
@@ -70,9 +82,9 @@ No production special-case for pytest, global maintenance disable, rmtree(ignore
 
 **Steps:**
 
-- [ ] Wait for the control team's actual baseline value and enabled admission before interaction. Change through the existing test interaction mechanism, verify the selected draft, and wait for the Save control to be enabled before clicking. Keep default timeout and no sleeps; element existence alone is insufficient readiness.
-- [ ] Assert the mocked control request was sent for the exact run with the selected draft and current revision, then assert the exact error, retained draft and unchanged running status. Use a controlled deferred admission response if needed to prove no test action occurs before readiness; do not duplicate production initialization logic.
-- [ ] Repair the demonstrated adjacent successor-restart readiness case too: wait for admitted plan/workflow controls, preserve the selected identities, wait for preflight matching that current selection and the actual enabled successor confirmation/summary, then assert the existing owner-stop, inactive-proof and lineage sequence. Do not treat a prior selection's preflight or absence of a loading label as proof the current draft is ready. Use existing helpers or a small shared test readiness helper tied to observed user state; no arbitrary delays. Check adjacent tests only for the same confirmed readiness interaction. Preserve all existing conflict, selector and request identity assertions. Run the complete web suite/build and add concise DEVLOG verification.
+- [x] Wait for the control team's actual baseline value and enabled admission before interaction. Change through the existing test interaction mechanism, verify the selected draft, and wait for the Save control to be enabled before clicking. Keep default timeout and no sleeps; element existence alone is insufficient readiness.
+- [x] Assert the mocked control request was sent for the exact run with the selected draft and current revision, then assert the exact error, retained draft and unchanged running status. Use a controlled deferred admission response if needed to prove no test action occurs before readiness; do not duplicate production initialization logic.
+- [x] Repair the demonstrated adjacent successor-restart readiness case too: wait for admitted plan/workflow controls, preserve the selected identities, wait for preflight matching that current selection and the actual enabled successor confirmation/summary, then assert the existing owner-stop, inactive-proof and lineage sequence. Do not treat a prior selection's preflight or absence of a loading label as proof the current draft is ready. Use existing helpers or a small shared test readiness helper tied to observed user state; no arbitrary delays. Check adjacent tests only for the same confirmed readiness interaction. Preserve all existing conflict, selector and request identity assertions. Run the complete web suite/build and add concise DEVLOG verification.
 
 **Dependencies:** CP1 only for sequential ledger; implementation is otherwise independent.
 

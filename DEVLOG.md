@@ -1,5 +1,21 @@
 # DEVLOG
 
+## 2026-09-10 — Wait for admitted dashboard controls before interaction (Checkpoint 2)
+
+- The rejected-control and capability-admitted selector tests now wait for the
+  canonical control baseline and enabled admission, confirm the selected draft,
+  and wait for the Save action to be enabled before interacting. The rejection
+  test still checks the exact run, revision, error, retained draft, and running
+  status.
+- Shared launch readiness now requires the clean preflight result and an
+  enabled actionable button. The demonstrated successor-restart test also
+  verifies the latest preflight request matches its selected plan, workflow,
+  and source before preserving the owner-stop, inactive-proof, and lineage
+  assertions. No production UI behavior changed.
+- Verification: focused RunDashboard tests passed (78); full web tests passed
+  (291); the web build passed; the full Python suite passed (1,748 tests and
+  223 subtests); `git diff --check` passed.
+
 ## 2026-09-10 — Keep synthetic Git maintenance inside fixture ownership (Checkpoint 1)
 
 - CI34493456633 at `24ab54e` failed

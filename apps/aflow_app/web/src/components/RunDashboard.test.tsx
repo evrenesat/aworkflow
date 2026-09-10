@@ -171,8 +171,31 @@ async function openNewRun() {
   fireEvent.click(await screen.findByRole('button', { name: 'New run' }))
 }
 
-async function waitForPreflightReady() {
-  await waitFor(() => expect(screen.getByText('No uncommitted changes detected.')).toBeDefined())
+async function waitForPreflightReady(expectedRequest: Record<string, unknown> = {}) {
+  await waitFor(() => {
+    expect(screen.getByText('No uncommitted changes detected.')).toBeDefined()
+    const successorButton = screen.queryByRole('button', { name: 'Confirm stop and start successor' })
+    const actionButton = successorButton ?? screen.getByRole('button', { name: 'Start run' })
+    expect(actionButton.getAttribute('disabled')).toBeNull()
+    if (Object.keys(expectedRequest).length > 0) {
+      expect(api.preflightControlPlaneRun).toHaveBeenLastCalledWith(
+        'control-project',
+        expect.objectContaining(expectedRequest),
+        expect.objectContaining({ offset: 0, limit: 200, signal: expect.any(AbortSignal) }),
+      )
+    }
+  })
+}
+
+async function waitForControlAdmission(selectorLabel?: string) {
+  await waitFor(() => {
+    const team = screen.getByLabelText('Control team') as HTMLSelectElement
+    expect(team.value).toBe('base')
+    expect(team.disabled).toBe(false)
+    if (selectorLabel) {
+      expect((screen.getByLabelText(selectorLabel) as HTMLSelectElement).disabled).toBe(false)
+    }
+  })
 }
 
 function openTechnicalDetails() {
@@ -840,11 +863,21 @@ describe('RunDashboard', () => {
     )
     renderDashboard()
 
-    await waitFor(() => expect(screen.getByLabelText('Control team')).toBeDefined())
-    fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
+    await waitForControlAdmission()
+    const team = screen.getByLabelText('Control team') as HTMLSelectElement
+    fireEvent.change(team, { target: { value: 'full' } })
+    await waitFor(() => expect(team.value).toBe('full'))
+    const save = screen.getByRole('button', { name: 'Save run settings' })
+    await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
+    fireEvent.click(save)
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      'run-owned',
+      { expected_revision: 1, team: 'full' },
+      expect.stringMatching(/^control-/),
+    ))
     await waitFor(() => expect(screen.getByText('saved-team is not admitted for this run')).toBeDefined())
-    expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('full')
+    expect(team.value).toBe('full')
     expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
@@ -864,11 +897,15 @@ describe('RunDashboard', () => {
     expect(screen.getByRole('option', { name: 'harness/impl-b' })).toBeDefined()
     expect(screen.getByText(/Changes are saved now and apply at the next safe turn/)).toBeDefined()
 
-    await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('base'))
-    fireEvent.change(screen.getByLabelText('Control team'), { target: { value: 'full' } })
-    fireEvent.change(screen.getByLabelText('Selector for Worker'), { target: { value: 'harness/impl-b' } })
+    await waitForControlAdmission('Selector for Worker')
+    const team = screen.getByLabelText('Control team') as HTMLSelectElement
+    const selector = screen.getByLabelText('Selector for Worker') as HTMLSelectElement
+    fireEvent.change(team, { target: { value: 'full' } })
+    fireEvent.change(selector, { target: { value: 'harness/impl-b' } })
     await waitFor(() => expect((screen.getByLabelText('Control team') as HTMLSelectElement).value).toBe('full'))
-    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
+    const save = screen.getByRole('button', { name: 'Save run settings' })
+    await waitFor(() => expect(save.getAttribute('disabled')).toBeNull())
+    fireEvent.click(save)
     await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
       'control-project',
       'run-owned',
@@ -927,7 +964,11 @@ describe('RunDashboard', () => {
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
-    await waitForPreflightReady()
+    await waitForPreflightReady({
+      plan_path: 'plans/in-progress/demo.md',
+      workflow_name: 'other',
+      restarted_from_run_id: 'run-owned',
+    })
     expect(screen.getByText(/and start successor workflow/)).toBeDefined()
     expect(screen.getAllByText('run-owned').length).toBeGreaterThanOrEqual(2)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm stop and start successor' }))
