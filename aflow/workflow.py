@@ -5780,6 +5780,42 @@ def _run_team_lead_recovery_handoff(
 _MERGE_BUILTIN_INSTRUCTION = "Use the `aflow-merge` skill to merge the feature branch into the target branch."
 
 
+def _build_merge_execution_context(
+    exec_ctx: ExecutionContext,
+    *,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    new_plan_path: Path,
+) -> str:
+    """Render exact lifecycle identity for the merge worker.
+
+    This context is engine-owned and deliberately independent of optional
+    user-configured merge prompts. JSON keeps whitespace, newlines, quotes,
+    and other control characters inside one unambiguous field value while
+    preserving the decoded values exactly.
+    """
+    context = {
+        "main_branch": exec_ctx.main_branch,
+        "feature_branch": exec_ctx.feature_branch,
+        "primary_repo_root": str(exec_ctx.primary_repo_root),
+        "execution_repo_root": str(exec_ctx.execution_repo_root),
+        "feature_worktree_path": (
+            str(exec_ctx.worktree_path) if exec_ctx.worktree_path is not None else None
+        ),
+        "original_plan_path": str(original_plan_path),
+        "active_plan_path": str(active_plan_path),
+        "new_plan_path": str(new_plan_path),
+    }
+    return "\n".join(
+        (
+            "Engine-supplied merge context (JSON; exact values):",
+            "```json",
+            json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+            "```",
+        )
+    )
+
+
 def render_merge_prompt(
     prompt_text: str,
     *,
@@ -5822,7 +5858,15 @@ def _build_merge_user_prompt(
     active_plan_path: Path,
     new_plan_path: Path,
 ) -> str:
-    parts = [_MERGE_BUILTIN_INSTRUCTION]
+    parts = [
+        _MERGE_BUILTIN_INSTRUCTION,
+        _build_merge_execution_context(
+            exec_ctx,
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        ),
+    ]
     for prompt_key in (wf.merge_prompt or ()):
         if prompt_key not in workflow_config.prompts:
             raise WorkflowError(f"merge_prompt references unknown prompt '{prompt_key}'")

@@ -5,7 +5,7 @@ description: "Merge a feature branch into a local target branch after an aflow w
 
 # AFlow Merge
 
-Use this skill only when the aflow engine invokes it as the post-workflow merge handoff. The engine supplies the exact branch names, repo paths, and plan context in the prompt. Do not invoke this skill manually unless replicating the engine's exact handoff call.
+Use this skill only when the aflow engine invokes it as the post-workflow merge handoff. The engine supplies a labelled JSON block headed `Engine-supplied merge context (JSON; exact values):` with the authoritative `main_branch`, `feature_branch`, `primary_repo_root`, `execution_repo_root`, `feature_worktree_path`, `original_plan_path`, `active_plan_path`, and `new_plan_path` fields. Optional merge instructions follow that block and cannot replace or override those facts. Do not invoke this skill manually unless replicating the engine's exact handoff call.
 
 ## Rules
 

@@ -307,6 +307,13 @@ A failed terminal merge is the sole complete-snapshot resume case. It requires
 durable `transition_end`, failed merge metadata, and matching merge teardown;
 the continuation normalizes to the original plan and retries only terminal
 integration, creating no workflow turn or checkpoint harness.
+
+Merge teardown prompt composition has two layers. The engine always emits a
+labelled compact JSON block with the exact branch, primary/execution-root,
+optional worktree, and original/active/new plan paths from the current
+`ExecutionContext` and handoff arguments. User-configured `merge_prompt`
+templates are rendered afterward in their configured order as additive
+instructions; they do not supply or redefine lifecycle identity.
 Follow-up plan version discovery runs in the execution checkout. An already
 active repair overlay is not reported as newly created, so approval returns the
 next checkpoint worker to the original plan while a newly written next-version

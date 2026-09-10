@@ -61,6 +61,15 @@ def _runner_invocation_text(argv, kwargs) -> str:
     return f"{' '.join(argv)} {prompt}"
 
 
+def _merge_prompt_context(prompt: str) -> dict[str, object]:
+    marker = "Engine-supplied merge context (JSON; exact values):\n```json\n"
+    assert marker in prompt
+    payload = prompt.split(marker, 1)[1].split("\n```", 1)[0]
+    parsed = json.loads(payload)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
 def _scope_envelope_observation(run_dir: Path) -> tuple[object, ...]:
     payload = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     scope = payload["active_implementation_scope"]
@@ -8699,6 +8708,133 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             assert len(captured_repo_roots) >= 1
             assert captured_repo_roots[0] == str(repo_root)
 
+    def test_merge_handoff_empty_prompt_carries_exact_engine_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_commit_file(repo_root, plan_path)
+            wf_config = _make_branch_only_wf_config(main_branch='main')
+            call_count = 0
+            feature_branch: str | None = None
+            captured: list[tuple[Path, str]] = []
+
+            def runner(argv, **kwargs):
+                nonlocal call_count, feature_branch
+                call_count += 1
+                cwd = Path(kwargs['cwd'])
+                if call_count == 1:
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    _git_commit_file(repo_root, plan_path)
+                    rc, feature_branch_value, err = _run_git_in_test(
+                        ['branch', '--show-current'], cwd=repo_root
+                    )
+                    assert rc == 0, err
+                    feature_branch = feature_branch_value
+                    subprocess.run(
+                        ['git', 'checkout', 'main'],
+                        cwd=repo_root,
+                        check=True,
+                        capture_output=True,
+                    )
+                    main_only = repo_root / 'main-only.txt'
+                    main_only.write_text('main change\n', encoding='utf-8')
+                    _git_commit_file(repo_root, main_only)
+                    subprocess.run(
+                        ['git', 'checkout', feature_branch],
+                        cwd=repo_root,
+                        check=True,
+                        capture_output=True,
+                    )
+                    return subprocess.CompletedProcess(argv, 0, 'worked', '')
+
+                assert feature_branch is not None
+                prompt = kwargs.get('input')
+                assert isinstance(prompt, str)
+                captured.append((cwd, prompt))
+                rc, out, err = _run_git_in_test(
+                    ['merge', '--no-edit', feature_branch], cwd=cwd
+                )
+                return subprocess.CompletedProcess(argv, rc, out, err)
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                wf_config,
+                'branch_wf',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert call_count == 2
+            assert len(captured) == 1
+            cwd, prompt = captured[0]
+            payload = json.loads((result.run_dir / 'run.json').read_text(encoding='utf-8'))
+            assert cwd == repo_root
+            assert _merge_prompt_context(prompt) == {
+                'main_branch': 'main',
+                'feature_branch': payload['feature_branch'],
+                'primary_repo_root': str(repo_root),
+                'execution_repo_root': str(repo_root),
+                'feature_worktree_path': None,
+                'original_plan_path': str(plan_path),
+                'active_plan_path': str(plan_path),
+                'new_plan_path': str(repo_root / 'plan-cp01-v01.md'),
+            }
+
+    def test_merge_prompt_custom_text_follows_context_and_preserves_values(self) -> None:
+        from aflow.workflow import _build_merge_user_prompt
+
+        primary_root = Path('/primary root/line\nbreak')
+        execution_root = Path('/execution root/with space')
+        worktree_path = Path('/feature worktree/line\nbreak')
+        original_plan_path = Path('/plans/original plan\n.md')
+        active_plan_path = Path('/plans/active "plan".md')
+        new_plan_path = Path('/plans/new\tplan.md')
+        exec_ctx = ExecutionContext(
+            primary_repo_root=primary_root,
+            execution_repo_root=execution_root,
+            main_branch='main branch',
+            feature_branch='feature branch\nwith quote "x"',
+            worktree_path=worktree_path,
+            setup=('worktree', 'branch'),
+            teardown=('merge', 'rm_worktree'),
+        )
+        wf = WorkflowConfig(merge_prompt=('first', 'second'))
+        workflow_config = WorkflowUserConfig(
+            prompts={
+                'first': 'FIRST custom instruction for {MAIN_BRANCH}.',
+                'second': 'SECOND custom instruction for {FEATURE_WORKTREE_PATH}.',
+            }
+        )
+
+        prompt = _build_merge_user_prompt(
+            wf,
+            workflow_config,
+            exec_ctx=exec_ctx,
+            config_dir=Path('/config'),
+            working_dir=Path('/working'),
+            original_plan_path=original_plan_path,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+
+        assert prompt.index('Engine-supplied merge context') < prompt.index('FIRST custom')
+        assert prompt.index('FIRST custom') < prompt.index('SECOND custom')
+        assert _merge_prompt_context(prompt) == {
+            'main_branch': 'main branch',
+            'feature_branch': 'feature branch\nwith quote "x"',
+            'primary_repo_root': str(primary_root),
+            'execution_repo_root': str(execution_root),
+            'feature_worktree_path': str(worktree_path),
+            'original_plan_path': str(original_plan_path),
+            'active_plan_path': str(active_plan_path),
+            'new_plan_path': str(new_plan_path),
+        }
+        assert str(worktree_path) in prompt
+
     def test_branch_only_resume_reuses_primary_checkout_and_completes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -10491,10 +10627,14 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             _git_commit_file(repo_root, main_file)
             wf_config = _make_branch_only_wf_config(main_branch='main')
             calls: list[Path] = []
+            prompts: list[str] = []
 
             def runner(argv, **kwargs):
                 cwd = Path(kwargs['cwd'])
                 calls.append(cwd)
+                prompt = kwargs.get('input')
+                assert isinstance(prompt, str)
+                prompts.append(prompt)
                 rc, out, err = _run_git_in_test(
                     ['merge', '--no-edit', 'feature/terminal-integration'],
                     cwd=cwd,
@@ -10528,6 +10668,17 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             )
 
             assert calls == [repo_root]
+            assert len(prompts) == 1
+            assert _merge_prompt_context(prompts[0]) == {
+                'main_branch': 'main',
+                'feature_branch': 'feature/terminal-integration',
+                'primary_repo_root': str(repo_root),
+                'execution_repo_root': str(repo_root),
+                'feature_worktree_path': None,
+                'original_plan_path': str(plan_path),
+                'active_plan_path': str(plan_path),
+                'new_plan_path': str(plan_path),
+            }
             assert result.turns_completed == 0
             payload = json.loads(
                 (result.run_dir / 'run.json').read_text(encoding='utf-8')

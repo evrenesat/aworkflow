@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-10 — Supply engine-owned merge handoff context (Checkpoint 1)
+
+- Merge teardown now always gives the `aflow-merge` worker exact branch, root,
+  worktree, and original/active/new plan paths in a labelled JSON block,
+  including when `merge_prompt` is empty. Optional custom instructions remain
+  appended in their existing order and cannot replace lifecycle identity.
+- Added disposable captured-invocation coverage for ordinary completion,
+  terminal integration-only resume, custom prompt ordering, and escaped unusual
+  path values. No real provider, live service, or global configuration is used.
+- Verification: runtime/config `422 passed` plus `50 subtests passed`, docs
+  `23 passed`, Ruff for `aflow`, and `git diff --check` passed.
+
 ## 2026-09-10 — Keep MCP on the UI server after standalone removal
 
 - The standalone `aflow daemon` command and `aflowd` executable are removed;
