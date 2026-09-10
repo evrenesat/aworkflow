@@ -169,6 +169,7 @@ function choose(label: string, value: string) {
 
 async function openNewRun() {
   fireEvent.click(await screen.findByRole('button', { name: 'New run' }))
+  await screen.findByLabelText('Run plan')
 }
 
 async function waitForPreflightReady(expectedRequest: Record<string, unknown> = {}) {
@@ -542,7 +543,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
@@ -570,7 +571,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
@@ -819,7 +820,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     openAdvanced()
@@ -855,7 +856,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
@@ -885,7 +886,7 @@ describe('RunDashboard', () => {
     vi.mocked(api.startControlPlaneRun).mockRejectedValue(new Error('connection lost'))
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
@@ -1144,7 +1145,6 @@ describe('RunDashboard', () => {
 
 
     await openNewRun()
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
@@ -1172,8 +1172,8 @@ describe('RunDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
     expect(api.startControlPlaneRun).toHaveBeenCalledTimes(1)
     fireEvent.click(screen.getByRole('button', { name: 'Resolve pending successor' }))
-    await screen.findByRole('button', { name: 'Retry exact successor request' })
-    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+    const destinationStart = await screen.findByRole('button', { name: 'Start run' })
+    expect(destinationStart.getAttribute('disabled')).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact successor request' }))
 
     await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledTimes(2))
@@ -1194,7 +1194,6 @@ describe('RunDashboard', () => {
     renderDashboard({ restartPollIntervalMs: 1 })
 
     await openNewRun()
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
@@ -1235,7 +1234,6 @@ describe('RunDashboard', () => {
     renderDashboard({ restartPollIntervalMs: 1 })
 
     await openNewRun()
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
@@ -1259,7 +1257,6 @@ describe('RunDashboard', () => {
     renderDashboard({ restartPollIntervalMs: 1 })
 
     await openNewRun()
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
@@ -1280,7 +1277,6 @@ describe('RunDashboard', () => {
     renderDashboard({ restartPollIntervalMs: 1 })
 
     await openNewRun()
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'other')
@@ -1612,7 +1608,7 @@ describe('RunDashboard', () => {
     })
     const first = renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
@@ -1640,7 +1636,7 @@ describe('RunDashboard', () => {
       },
     })
     renderDashboard()
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')
@@ -1661,7 +1657,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
 
@@ -1745,7 +1741,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
 
@@ -1831,7 +1827,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     openAdvanced()
@@ -1861,7 +1857,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
@@ -1879,7 +1875,7 @@ describe('RunDashboard', () => {
     })
     renderDashboard()
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
@@ -2007,7 +2003,7 @@ describe('RunDashboard', () => {
     const onRunSelectionChange = vi.fn()
     renderDashboard({ onRunSelectionChange })
 
-    if (!screen.queryByLabelText('Run plan')) await openNewRun()
+    await openNewRun()
     await screen.findByLabelText('Run plan')
     choose('Run plan', 'plans/in-progress/demo.md')
     choose('Run workflow', 'managed')

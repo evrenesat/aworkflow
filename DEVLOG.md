@@ -1800,3 +1800,9 @@ HISTORY: The focused acceptance repair now waits for the hosted capabilities to 
 HISTORY: The first post-edit full backend invocation recorded a real readiness gap: native `<option>` locators were awaited as visible and all three new live-control viewports timed out, with `2043 passed`, `3 failed`, `223 subtests`. The waits were corrected to exact attachment state without delay, timeout, skip or assertion weakening.
 HISTORY: The corrected combined Chromium browser command passed 16 tests, responsive WebKit passed 11 tests, the full backend command passed `2046`, `223 subtests`, the web suite passed `309`, the production build passed and Ruff passed. Physical keyboard and browser-toolbar behavior remain unverified.
 HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and must be preserved by coordinator-owned delivery; no publication, CI receipt or live activation is claimed.
+
+## 2026-09-10 — Dashboard recovery transition readiness
+
+- The CI failure was a cross-surface ordering mistake: after `Resolve pending successor`, the preserved retry control can render before the destination's effect-registered `Start run` header. The recovery test now waits for that destination button, then asserts its disabled state without changing exact request, body, key, retry, owner-stop, or existing-run assertions.
+- `openNewRun` now performs one navigation action and awaits the New-run form. Removed 18 conditional second-navigation fallbacks in RunDashboard tests; App New-run handoffs already wait for their destination heading and selected-plan field, so no App or production changes were needed.
+- Verification: focused App/RunDashboard tests passed (136), the normal parallel web suite passed (324), production build passed, and `git diff --check` passed. Browser/server/CI jobs were not rerun because the change is test-only; no publication or live activation occurred.

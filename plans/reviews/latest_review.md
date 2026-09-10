@@ -1,30 +1,15 @@
-# Checkpoint 1 review — 2026-09-10
+# Checkpoint 1 review — cp1 v01
 
-Target: `cp1 v02` approval of “Make hosted actions and CI interpreter selection deterministic,” branch `aflow-stabilize-hosted-browser-loading-and-ci-python-202-20260910-194923`.
+Checkpoint 1 approved in reviewer-created `cp1 v01` commit. Zero material findings.
 
-Reviewed the original plan and its stable `stabilize-hosted-browser-loading-and-ci-python-20260910-cp01-v01.md` overlay. Used current-worktree fallback: no implementation checkpoint commit exists; HEAD equals reachable Pre-Handoff Base HEAD `be19c4ffffef80b4a53c8644a6908f8807557315`. The six dirty implementation files and reviewer bookkeeping form the reviewed slice. No unrelated changes were included.
+Scope: worktree changes from `0b6b645258ad3a77949747b4693e96437209eb40` on `aflow-settle-dashboard-recovery-test-transitions-2026091-20260910-210159`. No checkpoint commit existed for this attempt, so review used the worktree fallback. Original and active plan: `plans/in-progress/settle-dashboard-recovery-test-transitions-20260910.md`.
 
-## Findings
+The destination Start run query now waits for its effect-registered header before asserting disabled state. One New run navigation action is followed by the form predicate; conditional navigation fallbacks are removed. Exact project/body/key, retry count, one owner stop, wrong-project disabled recovery and definitive rejection assertions remain intact. App handoffs already wait for the destination heading and selected plan. Only RunDashboard.test.tsx and DEVLOG changed. Production, browser/server and CI files are unchanged.
 
-Zero material findings. The prior engine-selection finding is resolved: both navigation launches now reuse the existing validated Chromium/WebKit selector. Exact assertions remain intact. Reviewed admission predicates, workflow selection/disclosure readiness, scroll/refresh settlement, archive/restore/delete/reload semantics, the minimal history busy/confirmation guard, component regression, and CI interpreter selection. No further production correction or broader test redesign is warranted by the evidence.
+Evidence: retained CI log `/root/code/evidence/aflow-dogfood-20260909/ci-0b6b645-failed.log` lines 1653–1658 and HeaderSlots effect registration establish the cross-surface ordering failure. No production ownership defect was demonstrated. Supplied worker artifact was absent; independent source review and verification were used.
 
-## Evidence
+Reviewer verification: `npm --prefix apps/aflow_app/web test -- --run` passed 324 tests in 19 files on the first invocation; `npm --prefix apps/aflow_app/web run build` passed; `git diff --check` passed. No retry/serial workaround or unrelated backend/browser execution. Logs: `/tmp/aflow-cp01-review-web.log` and `/tmp/aflow-cp01-review-build.log`.
 
-Reviewer executed:
-- Web build: passed.
-- `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py apps/aflow_app/server/tests/test_run_navigation_browser.py`: 13 passed, no skips, 119.64 seconds.
-- Same command with `AFLOW_TEST_BROWSER=webkit`: 13 passed, no skips, 132.78 seconds.
-- YAML validation: root 3.11/3.12, Dashboard 3.12/3.13, both OSes, explicit UV_PYTHON, executed version assertion before server tests, build ordering and designated WebKit artifacts preserved. `actionlint` unavailable; actual GitHub execution remains separate evidence.
-- `git diff --check`: passed.
-
-Reused unchanged frontend evidence: focused RunDashboard 85 passed and full web 316 passed. Browser runs emitted existing dependency deprecation warnings. No test failure or passing retry occurred in this reviewer pass.
-
-The supplied worker result resolves beneath `/root/code/agent_flow/.aflow/runs/20260910t194922z-d0da40bf/turns/turn-003/result.json`, not this worktree. Causal probe source/output and frontend result summaries are retained in `plans/reviews/hosted-browser-cp1-ordering.txt`, with every historical line prefixed. Exact provenance is turn-001 `transport.stdout`, diagnostic source line 132, baseline output lines 141/146, observed ordering lines 142/147, frontend summaries lines 338/339. This is the precise probe provenance; DEVLOG's external STATUS/CI references provide incident context, not the full controlled probe source.
-
-## Disposition
-
-Checkpoint 1 approved through `cp1 v02`; reviewer creates its approval commit in this turn and advances only this checkpoint and its remaining verification step. Original base and stable overlay filename are preserved. Previous review rotated byte-for-byte. No new fix plan is required.
-
-Local checkpoint approval does not establish whole-plan delivery: coordinator integration, origin/main publication, exact-SHA CI and live desktop/mobile usability remain pending. No other worktree edits, services, shared tools, GitHub messages, squash or history rewrite.
+Original-plan review state advanced. Publication, exact-SHA CI and live desktop/mobile verification remain coordinator-owned and pending.
 
 No material findings
