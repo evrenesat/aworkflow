@@ -106,6 +106,24 @@ jobs:
           uv run playwright install --with-deps chromium
           uv run pytest -q
 
+      - name: Install WebKit and run responsive browser checks
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        working-directory: apps/aflow_app/server
+        env:
+          AFLOW_TEST_BROWSER: webkit
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/responsive-browser"
+          uv run playwright install --with-deps webkit
+          uv run pytest -q tests/test_responsive_browser.py --basetemp="$GITHUB_WORKSPACE/artifacts/responsive-browser"
+
+      - name: Upload responsive browser artifacts
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: responsive-browser-${{ github.run_id }}
+          path: artifacts/responsive-browser
+          if-no-files-found: warn
+
 
   packaging:
     name: Packaging (${{ matrix.os }})

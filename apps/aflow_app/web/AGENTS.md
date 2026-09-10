@@ -45,6 +45,15 @@
   selection, and restores focus on Back. Preserve those owners while completing
   the remaining editor and journey work.
 
+- The responsive acceptance boundary is exercised by
+  `apps/aflow_app/server/tests/test_responsive_browser.py` across the required
+  viewport matrix. It defaults to Chromium; `AFLOW_TEST_BROWSER=webkit` runs
+  the same journeys in WebKit. The module checks document ownership, list/detail
+  navigation, keyboard/focus and resize retention, touch-sized primary controls,
+  long-content reflow, and disposable light/dark screenshot artifacts. Physical
+  mobile keyboard and browser-toolbar behavior remains explicitly unverified
+  unless separately exercised on hardware.
+
 - Keep history mutation keys by exact project/run/action until acknowledged or
   definitively rejected (including acknowledgement-required validation). Deletion tombstones suppress late rows and
   close streams; archive retains opened details while removing default-list rows.

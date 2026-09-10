@@ -1400,3 +1400,25 @@ Final verification: web tests (213), all server tests including Chromium layout 
   Chromium modules (4 tests), and `git diff --check` passed. Original CP4
   approval remains with the reviewer; no publication, CI, or live activation
   was performed.
+
+## 2026-09-10 — Responsive browser acceptance checkpoint 6
+
+- Added the disposable responsive-browser module covering 320×568, 390×844,
+  768×1024, 844×390, 1280×720, 1440×900 and 390×420. It exercises the shared
+  header budget, document scrolling, list/detail/Back and focus restoration,
+  long plans/runs/configuration, 200% text reflow, keyboard menu behavior,
+  resize-retained drafts, validation and failed-save retention, touch-sized
+  primary controls, safe-area-aware sticky controls, and light/dark screenshots.
+- The module rejects unsupported browser names and runs unchanged with
+  `AFLOW_TEST_BROWSER=webkit`. The Ubuntu/Python 3.12 dashboard job installs
+  WebKit, runs this module, and uploads its screenshot artifacts. Physical
+  mobile keyboard/browser-toolbar behavior remains unverified.
+- Repair revalidation persists the existing `aflow.appearance` preference
+  before every screenshot navigation and asserts the loaded theme. Its test
+  zoom snapshots computed visible text/control sizes before applying doubled
+  inline sizes, proving the Skills editor text—not only the root—reflows at
+  200%. Chromium and WebKit screenshots were regenerated and inspected.
+- Repair verification: full web tests (297), production build, combined
+  Chromium browser checks (13), responsive Chromium (8), responsive WebKit
+  (8), and `git diff --check` passed. Original CP6 remains unapproved; no
+  publication, remote CI receipt, or live activation was performed.

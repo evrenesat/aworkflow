@@ -51,6 +51,15 @@ the document-scroll and list/detail portions of the owner-approved [UI
 guidelines](UI_GUIDELINES.md); later checkpoints extend the same contract to
 editor readability and the remaining journeys.
 
+Responsive acceptance is kept at the real-browser boundary in
+`apps/aflow_app/server/tests/test_responsive_browser.py`. Its disposable
+fixture provides long plans, forty run records, long configuration fields,
+validation and failed-save responses, and captures light/dark route evidence.
+The same module runs in Chromium by default and WebKit when
+`AFLOW_TEST_BROWSER=webkit`; CI installs the required WebKit browser and uploads
+the generated screenshot artifacts. These emulated checks do not stand in for
+physical mobile keyboard or browser-toolbar verification.
+
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
 selected editor IDs across guided/raw mode changes; run dashboards retain pending
 history keys and deletion tombstones across navigation and late responses.

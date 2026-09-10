@@ -564,6 +564,7 @@ input::placeholder, textarea::placeholder {
   background: var(--color-bg);
   z-index: 25;
   padding-inline: var(--spacing-md);
+  padding-block-start: max(4px, env(safe-area-inset-top));
 }
 
 .app-branding {
@@ -1483,7 +1484,7 @@ input::placeholder, textarea::placeholder {
 /* Sticky Settings toolbar keeps tabs and Save reachable during long scrolls. */
 /* Its containing block must span all fields, not shrink to the scroll viewport. */
 .global-settings { flex: 0 0 auto; }
-.settings-toolbar { position: sticky; top: 0; z-index: 15; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: var(--spacing-sm) 0; margin: 0; background: var(--color-bg); border-bottom: 1px solid var(--color-border); scroll-margin-top: 0; }
+.settings-toolbar { position: sticky; top: 0; z-index: 15; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: max(var(--spacing-sm), env(safe-area-inset-top)) 0 var(--spacing-sm); margin: 0; background: var(--color-bg); border-bottom: 1px solid var(--color-border); scroll-margin-top: 0; }
 .settings-toolbar .config-tabs { flex: 1 1 auto; min-width: 0; }
 .settings-body .settings-fields, .settings-body label, .settings-body input, .settings-body textarea, .settings-body select, .settings-body .card { scroll-margin-top: 4.5rem; }
 

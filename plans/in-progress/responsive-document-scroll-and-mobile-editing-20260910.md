@@ -12,7 +12,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 - Plan Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`
 - Pre-Handoff Base HEAD: `ee1757579b216afe9c02f3ca763038cae59a8498`
-- Last Approved Checkpoint: `cp5 v02`
+- Last Approved Checkpoint: `cp6 v02`
 
 ### Review Log
 
@@ -151,6 +151,30 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
   with ordinary desktop table layout retained. Reviewer creates cp5 v02
   approval commit; only CP5 advances. CP6 remains unchecked. Publication,
   exact-SHA CI and live proof remain pending normal workflow delivery.
+
+- 2026-09-10: Rejected the immediately preceding uncommitted CP6 attempt v01
+  against original CP6 using current-worktree fallback from approved cp5 v02
+  (`ac50551`); no CP6 commit exists. Two high-confidence P2 evidence defects:
+  dark-labelled screenshots reload into light mode, and the 200% text check
+  leaves actual editor text at16px. Confirmed by a disposable Chromium probe
+  and inspected fresh WebKit screenshot. Full web suite297, production build,
+  combined Chromium13, responsive WebKit8 and diff check passed. CP6 remains
+  unapproved; CP1–5 approvals unchanged. Focused non-checkpoint repair overlay:
+  `responsive-document-scroll-and-mobile-editing-20260910-cp01-v01.md` (CP6 scope).
+  No approval commit/history rewrite, publication, exact-SHA CI or live proof.
+
+- 2026-09-10: Approved `cp6 v02` against original CP6 and active cp01-v01
+  non-checkpoint repair overlay. Reviewed the immediately preceding accumulated
+  worktree attempt from approved cp5 v02 (`ac50551`); no CP6 commit existed,
+  so current-worktree fallback was used. No material findings. Theme persistence
+  and actual doubled editor/control font assertions repair both prior findings.
+  Reviewer verification: full web suite297 passed on repeat (initial296 passed
+  with one unchanged starter-draft test failure), production build, combined
+  Chromium13, responsive WebKit8 and diff check passed. Inspected fresh light/
+  dark Chromium/WebKit phone and landscape screenshots. Reviewer creates the
+  cp6 v02 approval commit; only CP6 advances. Physical mobile keyboard behavior
+  remains unverified. Plan stays in progress pending workflow-owned publication,
+  exact-SHA CI and live read-only proof; none is claimed by local approval.
 
 ## Done Means
 
@@ -312,7 +336,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 - Extended the disposable Chromium journey with plan create/edit/save, project creation-form reachability and selection, intercepted startup-question launch, populated All runs detail/Back, and logout failure checks at320×844 and844×390. No worker or production run was started.
 - Local verification: full web suite297/297, production build, browser modules5/5, and `git diff --check` passed. Changes remain uncommitted; publication, CI, and live proof are not part of this checkpoint execution.
 
-### [ ] Checkpoint 6: Verify task usability across browsers and viewport changes
+### [x] Checkpoint 6: Verify task usability across browsers and viewport changes
 
 **Goal:** Prevent recurrence with behavioral geometry checks and inspected artifacts.
 
@@ -322,12 +346,12 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Steps:**
 
-- [ ] Add parameterized Chromium journeys across320×568,390×844,768×1024,844×390,1280×720,1440×900 and390×420. Reuse authenticated disposable live-server fixtures and built real assets; deterministic long names,40-list entries, long text, validation/partial-save failures. Wait for loaded task controls before measuring.
-- [ ] Assert the shared two-row desktop header budget on Settings, Runs, All runs, Plans, Projects and New Run; expand/collapse secondary menus and verify every action remains reachable. At enlarged text sizes require reflow instead of enforcing fixed heights. Assert document scrolling on ordinary content, no unauthorized vertical scrollers, no horizontal page overflow, positive visible detail/editor height, task-space budgets under normal text conditions, last action reachability, and click hit-testing after scrolling. Check list/detail/back position, focus and dirty resize. Do not rely on scrollbar counts alone or inject artificial height as the main acceptance fixture.
-- [ ] Run phone journeys in WebKit using the same module with `AFLOW_TEST_BROWSER=webkit` (default chromium; reject unsupported values). Add one Ubuntu/Python3.12 dashboard CI step to install WebKit and run this module in WebKit, leaving other jobs' browser matrix unchanged. Missing required browser is a failed prerequisite, not a passing skip.
-- [ ] Check200% text enlargement and320 CSS px reflow, keyboard Tab/Shift-Tab/Enter/Escape, all section selectors, touch-sized controls, safe-area padding on any sticky element, and visible focused fields after390×844→390×420 resize. No stacked sticky bars. Record a physical iOS/Android keyboard/browser-toolbar check if available; otherwise explicitly report it unverified rather than equating emulation with hardware.
-- [ ] Capture representative light/dark screenshots for Skills list/detail, profile editing, Run history/detail, New Run and Plans, including landscape. Inspect images for clipping, sparse hierarchy, accidental whitespace and obscured actions. Persist artifacts through the existing test/CI artifact mechanism; add a narrowly scoped upload step if none exists.
-- [ ] Update web AGENTS/ARCHITECTURE/DEVLOG with the implemented scroll contract and acceptance evidence, and existing README usage if navigation help changes. Root AGENTS stays unchanged. Mention superseded old-layout acceptance without marking unrelated plans done.
+- [x] Add parameterized Chromium journeys across320×568,390×844,768×1024,844×390,1280×720,1440×900 and390×420. Reuse authenticated disposable live-server fixtures and built real assets; deterministic long names,40-list entries, long text, validation/partial-save failures. Wait for loaded task controls before measuring.
+- [x] Assert the shared two-row desktop header budget on Settings, Runs, All runs, Plans, Projects and New Run; expand/collapse secondary menus and verify every action remains reachable. At enlarged text sizes require reflow instead of enforcing fixed heights. Assert document scrolling on ordinary content, no unauthorized vertical scrollers, no horizontal page overflow, positive visible detail/editor height, task-space budgets under normal text conditions, last action reachability, and click hit-testing after scrolling. Check list/detail/back position, focus and dirty resize. Do not rely on scrollbar counts alone or inject artificial height as the main acceptance fixture.
+- [x] Run phone journeys in WebKit using the same module with `AFLOW_TEST_BROWSER=webkit` (default chromium; reject unsupported values). Add one Ubuntu/Python3.12 dashboard CI step to install WebKit and run this module in WebKit, leaving other jobs' browser matrix unchanged. Missing required browser is a failed prerequisite, not a passing skip.
+- [x] Check200% text enlargement and320 CSS px reflow, keyboard Tab/Shift-Tab/Enter/Escape, all section selectors, touch-sized controls, safe-area padding on any sticky element, and visible focused fields after390×844→390×420 resize. No stacked sticky bars. Record a physical iOS/Android keyboard/browser-toolbar check if available; otherwise explicitly report it unverified rather than equating emulation with hardware.
+- [x] Capture representative light/dark screenshots for Skills list/detail, profile editing, Run history/detail, New Run and Plans, including landscape. Inspect images for clipping, sparse hierarchy, accidental whitespace and obscured actions. Persist artifacts through the existing test/CI artifact mechanism; add a narrowly scoped upload step if none exists.
+- [x] Update web AGENTS/ARCHITECTURE/DEVLOG with the implemented scroll contract and acceptance evidence, and existing README usage if navigation help changes. Root AGENTS stays unchanged. Mention superseded old-layout acceptance without marking unrelated plans done.
 
 **Dependencies:** CP1–5.
 
@@ -343,6 +367,31 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 **Done When:** Required browser/test/build checks pass, screenshots are inspected, observed limitations are explicit, and no pre-existing semantic guarantees were weakened. After normal delivery, verify the exact deployed revision and live Settings→Skills read-only without editing production content; report live proof separately from local acceptance.
 
 **Blockers:** Missing browser binaries or an unavailable live environment is an explicit verification gap, not permission to claim success. Do not bypass CI or restart active workers.
+
+#### Completion note
+
+- Added `test_responsive_browser.py` with disposable long-content, forty-entry,
+  validation, failed-save and partial-state fixtures across all seven required
+  viewports. It checks header/task-space budgets, document ownership, list/detail
+  and Back state, hit-testing, focus and dirty draft retention, 200%/320px
+  reflow, keyboard menu behavior, touch-sized controls and safe-area styling.
+  The repair persists `aflow.appearance` before each screenshot navigation and
+  asserts the loaded `data-theme`; its test-only text enlargement snapshots
+  loaded computed sizes, then doubles them inline and asserts the Skills
+  textarea and Back control actually render at twice their baselines.
+- The same module passed in Chromium and WebKit. The CI dashboard keeps the
+  existing browser matrix and adds only an Ubuntu/Python 3.12 WebKit run with
+  screenshot artifact upload. Web AGENTS, ARCHITECTURE and DEVLOG document the
+  acceptance boundary; README navigation help did not change.
+- Regenerated and inspected light/dark Chromium and WebKit screenshots for
+  Skills list/detail, profile editing, Run history/detail, New Run landscape
+  and Plans landscape; the labelled themes now match the rendered images.
+  Physical iOS/Android keyboard and browser-toolbar behavior remains
+  unverified.
+- Local verification: web tests297/297, production build, combined Chromium
+  browser checks13/13, responsive Chromium8/8, responsive WebKit8/8, browser
+  installation, and `git diff --check` passed. Changes remain uncommitted;
+  publication, remote CI receipt and live proof were not performed.
 
 ## Behavioral Acceptance Tests
 

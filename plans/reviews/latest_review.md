@@ -1,32 +1,50 @@
-# CP5 checkpoint review
+# CP6 v02 checkpoint review
 
-Reviewed `cp5 v02` against original CP5 and the active cp06-v01 non-checkpoint
-caption repair overlay. Current-worktree fallback from approved `cp4 v02`
-(`12c9af1`) was necessary because no CP5 commit existed. The original plan
-owns checkpoint authority; the overlay filename does not authorize CP6.
+Original authority: `plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910.md`.
+Active repair: `plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910-cp01-v01.md`
+(non-checkpoint overlay for CP6 despite its filename).
 
-Scope: accumulated responsive Runs/New Run/Plans/Projects/All runs/login
-presentation, labelled compact launch tables and captions, Plans Back actions,
-App-owned alert focus, and associated component/browser checks. No material
-findings survived the finding admission gate. No production code was edited
-by this review.
+Reviewed the immediately preceding accumulated CP6 worktree attempt from
+approved `cp5 v02`, HEAD `ac50551303ffd93ad3d278b9f9cd0da1bafaae6e`.
+No CP6 commit boundary existed, so current-worktree fallback was used. The branch
+matches Git Tracking and the pre-handoff base remains reachable. Review covers
+CP6 only: seven-viewport browser journeys, text enlargement/theme repairs,
+WebKit CI/artifacts, safe-area padding, and acceptance documentation. Earlier
+checkpoint approvals remain unchanged. Existing plan/review changes are
+intentional worker-completion and reviewer bookkeeping.
 
-Verification:
+## Findings
 
-- Full web suite: 297 passed; production build passed.
-- Disposable Chromium Runs/Settings modules: 5 passed.
-- Caption widths match available table width at 320×568 and 844×390;
-  desktop retains ordinary table/caption layout.
-- Inspected fresh 320px launch screenshot: captions readable, labels and
-  launch controls retained, no sideways page overflow.
-- Existing browser journeys cover plan save/draft guard, project form
-  reachability/selection, intercepted startup questions, run history/Back,
-  and login/logout failure focus. Git diff check passed.
+Zero findings admitted by the material-code-review gate. Both prior CP6 findings
+are repaired: screenshot navigation persists the appearance preference and
+asserts the loaded theme; computed-size assertions prove the editor and Back
+control actually double before reflow checks at390px and320px.
 
-Approved only CP5; reviewer creates the `cp5 v02` checkpoint commit with the
-original plan bookkeeping and this review. CP6 remains unchecked. Broader
-WebKit, enlarged-text and physical-device acceptance belongs to CP6.
-Publication, exact-SHA CI and live activation proof remain pending the normal
-workflow delivery; this local review makes no deployment claim.
+## Verification
+
+- Full web suite:297 passed on repeat. Initial run:296 passed and one failure in
+  the unchanged GuidedConfigForm starter-draft test (empty Workflow value before
+  asynchronous defaults). No CP6 JavaScript or component-test changes.
+- Production build passed.
+- Combined Settings, run-navigation and responsive Chromium suite:13 passed.
+- Responsive WebKit suite:8 passed, with no skipped browser prerequisites.
+- `git diff --check` passed.
+- Inspected fresh Chromium dark Skills detail, light Skills list/run detail and
+  dark New Run landscape; WebKit light/dark Skills detail, light New Run and
+  dark Plans landscape. Themes match labels; phone editor and landscape task
+  content are readable without obscured actions in the inspected images.
+- Screenshot roots: `/tmp/cp6-review-chromium-1602/test_responsive_focus_resize_a0/`
+  and `/tmp/cp6-review-webkit-1602/test_responsive_focus_resize_a0/`.
+
+## Disposition
+
+Approve `cp6 v02` with a reviewer-owned checkpoint commit. Advance only CP6 and
+Last Approved Checkpoint in the original plan; retain it in progress pending
+normal delivery. No repair plan is needed. No production/global settings,
+shared uv tool, controllers or concurrent worktrees were changed.
+
+Local verification passed. Publication: pending workflow delivery. Remote CI:
+pending exact-SHA receipt. Live activation/read-only proof: pending delivery.
+Physical iOS/Android keyboard/browser-toolbar behavior remains unverified.
 
 No material findings
