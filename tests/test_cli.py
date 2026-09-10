@@ -2666,6 +2666,76 @@ class WorkflowCliTests(unittest.TestCase):
         parser = build_parser()
         assert parser.prog == 'aflow'
 
+    def test_removed_daemon_commands_reject_without_runtime_state(self) -> None:
+        for argv in (
+            ("daemon",),
+            ("daemon", "start"),
+            ("daemon", "status"),
+            ("daemon", "stop"),
+        ):
+            with self.subTest(argv=argv):
+                tmp_path = self._new_temp_path()
+                home = tmp_path / "home"
+                home.mkdir()
+                before = tuple(
+                    sorted(
+                        path.relative_to(tmp_path).as_posix()
+                        for path in tmp_path.rglob("*")
+                    )
+                )
+
+                with patch.dict(os.environ, {"HOME": str(home)}), pytest.raises(
+                    SystemExit
+                ) as caught:
+                    main(list(argv))
+
+                assert caught.value.code == 2
+                after = tuple(
+                    sorted(
+                        path.relative_to(tmp_path).as_posix()
+                        for path in tmp_path.rglob("*")
+                    )
+                )
+                assert after == before
+
+    def test_ui_and_worker_parsers_remain_accepted_without_dispatch(self) -> None:
+        tmp_path = self._new_temp_path()
+        parser = build_parser()
+        for flag in ("--daemon", "--status", "--stop"):
+            args = parser.parse_args(["ui", flag])
+            assert args.command == "ui"
+            assert getattr(args, flag.removeprefix("--")) is True
+
+        ui_worker = parser.parse_args(
+            [
+                "ui-worker",
+                "--receipt-dir",
+                str(tmp_path),
+                "--nonce",
+                "nonce",
+                "--",
+                "python",
+                "-c",
+                "pass",
+            ]
+        )
+        assert ui_worker.command == "ui-worker"
+        assert ui_worker.receipt_dir == tmp_path
+
+        daemon_worker = parser.parse_args(
+            [
+                "daemon-worker",
+                "--repo-root",
+                str(tmp_path),
+                "--config",
+                str(tmp_path / "aflow.toml"),
+                "--run-id",
+                "run-id",
+            ]
+        )
+        assert daemon_worker.command == "daemon-worker"
+        assert daemon_worker.run_id == "run-id"
+
     def test_analyze_parser_accepts_manager_context_and_turn(self) -> None:
         args = build_parser().parse_args([
             'analyze', 'run-123', '--manager-context', 'full', '--turn', '4',

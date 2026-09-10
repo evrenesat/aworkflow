@@ -10,7 +10,8 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 - Plan Branch: `aflow-remove-standalone-daemons-keep-ui-mcp-20260908-20260910-131652`
 - Pre-Handoff Base HEAD: `186fba177b079281d1ebaccdd65dcf54c33ff4bb`
-- Review Log: Checkpoint 1 approved through `cp1 v01` on 2026-09-10. Reviewed the immediately preceding worker changes using the worktree fallback against the pre-handoff base; 87 checkpoint tests passed. Checkpoints 2–4 remain unreviewed.
+- Review Log: Checkpoint 1 approved through `cp1 v01` on 2026-09-10. Reviewed the immediately preceding worker changes using the worktree fallback against the pre-handoff base; 87 checkpoint tests passed.
+- Review Log: Checkpoint 2 approved through `cp2 v01` on 2026-09-10. Reviewed the immediately preceding worker's uncommitted changes against `8703a85` using the worktree fallback; 335 tests and 136 subtests passed with an isolated test home. Removed-interface source search returned no matches. No material findings. Checkpoints 3–4 remain unreviewed.
 
 ## Done Means
 
@@ -84,7 +85,7 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 - Stop and report if current ownership behavior cannot be preserved or unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 2: Remove the standalone daemon command and configuration
+### [x] Checkpoint 2: Remove the standalone daemon command and configuration
 
 **Goal:**
 
@@ -103,10 +104,10 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 **Steps:**
 
-- [ ] Remove `daemon` subparser and start/status/stop options and dispatch. Remove only imports rendered unused. Do not remove the `daemon-worker` subcommand.
-- [ ] Delete standalone daemon implementation, including stdio/HTTP serving, single-repository routing, pidfile ownership, detach, and stop/status helpers.
-- [ ] Remove `DaemonUserConfig`, its field on `WorkflowUserConfig`, parsing, top-level allowlist admission, and propagation during split-file merges. Preserve internal `DaemonConfig` and server lifecycle settings.
-- [ ] Replace standalone configuration tests with normal-config loading/non-regression and `[daemon]` rejection tests for both single-file and split-file loading. Remove obsolete standalone tests; add CLI tests asserting `daemon`, `daemon start`, `daemon status`, and `daemon stop` reject with argparse status 2 without creating runtime state. Assert UI background and worker parsers remain accepted without launching them.
+- [x] Remove `daemon` subparser and start/status/stop options and dispatch. Remove only imports rendered unused. Do not remove the `daemon-worker` subcommand.
+- [x] Delete standalone daemon implementation, including stdio/HTTP serving, single-repository routing, pidfile ownership, detach, and stop/status helpers.
+- [x] Remove `DaemonUserConfig`, its field on `WorkflowUserConfig`, parsing, top-level allowlist admission, and propagation during split-file merges. Preserve internal `DaemonConfig` and server lifecycle settings.
+- [x] Replace standalone configuration tests with normal-config loading/non-regression and `[daemon]` rejection tests for both single-file and split-file loading. Remove obsolete standalone tests; add CLI tests asserting `daemon`, `daemon start`, `daemon status`, and `daemon stop` reject with argparse status 2 without creating runtime state. Assert UI background and worker parsers remain accepted without launching them.
 
 **Dependencies:** Checkpoint 1.
 
