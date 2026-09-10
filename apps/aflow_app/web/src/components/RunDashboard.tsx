@@ -1554,10 +1554,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const modelEffort = resolution.selector ? selectorModelEffortText(resolution.selector, committedForm) : ''
     return (
       <tr key={`${teamName ?? 'workspace'}-${role}`}>
-        <td>{formatMachineLabel(role)}</td>
-        <td className="mono">{resolution.selector ?? <span className="text-dim">not assigned</span>}</td>
-        <td>{modelEffort || '—'}</td>
-        <td className="text-sm">
+        <td data-label="Role">{formatMachineLabel(role)}</td>
+        <td data-label="Selector" className="mono">{resolution.selector ?? <span className="text-dim">not assigned</span>}</td>
+        <td data-label="Model / effort">{modelEffort || '—'}</td>
+        <td data-label="Source" className="text-sm">
           {resolution.source === 'team'
             ? <span>team override</span>
             : resolution.source === 'global'
@@ -1591,7 +1591,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {workflowRoleList.length > 0 && (
                   <div>
                     <h4>Team members</h4>
-                    <table className="guided-table">
+                    <table className="guided-table responsive-data-table">
                       <caption className="text-xs text-dim">
                         Effective role assignments for this workflow{effectiveTeam ? ` with team ${formatMachineLabel(effectiveTeam)}` : ''} (team override → global fallback)
                       </caption>
@@ -1603,7 +1603,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     {otherConfiguredRoles.length > 0 && (
                       <details>
                         <summary className="text-xs text-dim">Other configured roles ({otherConfiguredRoles.length})</summary>
-                        <table className="guided-table">
+                        <table className="guided-table responsive-data-table">
                           <tbody>
                             {otherConfiguredRoles.map((role) => membershipRow(role, effectiveTeamRoles, effectiveTeam || null))}
                           </tbody>
@@ -1613,7 +1613,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   </div>
                 )}
                 {effectiveWorkflow && (effectiveSteps.length ? (
-                  <table className="guided-table">
+                  <table className="guided-table responsive-data-table">
                     <caption className="text-xs text-dim">
                       Executable steps with their exact role ({effectiveTeam ? `team ${formatMachineLabel(effectiveTeam)} override → global` : 'global selector'})
                     </caption>
@@ -1626,8 +1626,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                           : null
                         return (
                           <tr key={step}>
-                            <td className="mono">{formatMachineLabel(step)}</td>
-                            <td>
+                            <td data-label="Step" className="mono">{formatMachineLabel(step)}</td>
+                            <td data-label="Role → selector">
                               {!resolution
                                 ? <span className="text-dim text-sm">Exact role preview unavailable for this step.</span>
                                 : resolution.selector
@@ -1676,7 +1676,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                                 {stageRoles.length > 0 && (
                                   <details className="upgrade-stage-details">
                                     <summary className="text-xs text-dim">stage team members</summary>
-                                    <table className="guided-table">
+                                    <table className="guided-table responsive-data-table">
                                       <tbody>
                                         {stageRoles.map((role) => membershipRow(role, teamRoles, team))}
                                       </tbody>

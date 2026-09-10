@@ -227,7 +227,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   const hosted = useHeaderSlots('plan-panel', {
     context: selected ? <h2 className="header-context-title">{selected.name} <span className="text-xs text-dim">{selected.status === 'todo' ? 'Draft' : selected.status === 'in_progress' ? 'Ready' : 'Done'}</span></h2> : <h2 className="header-context-title">Plans</h2>,
     compactContext: selected ? <span className="header-context-title">{selected.name}</span> : undefined,
-    local: selected ? <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← All plans</button> : <label className="header-plan-name"><span>New plan</span><input className="input mono" aria-label="New plan filename" placeholder="new-plan.md" value={newName} onChange={(event) => setNewName(event.target.value)} /></label>,
+    local: selected ? <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button> : <label className="header-plan-name"><span>New plan</span><input className="input mono" aria-label="New plan filename" placeholder="new-plan.md" value={newName} onChange={(event) => setNewName(event.target.value)} /></label>,
     primary: selected ? <button className="btn btn-primary btn-sm" onClick={() => void savePlan()} disabled={busy}>{busy ? 'Working…' : 'Save'}</button> : <button className="btn btn-primary btn-sm" onClick={() => void createPlan()} disabled={busy || !newName.trim()}>Create plan</button>,
     more: selected ? <MoreMenu label="More plan actions" triggerLabel="More">
       {conflict && !confirmReload && <MenuItem onClick={() => setConfirmReload(true)}>Reload from server…</MenuItem>}
@@ -250,7 +250,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
     return (
       <div className="plan-editor">
         {!hosted && <div className="plan-editor-header">
-          <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← All plans</button>
+          <button className="btn btn-secondary btn-sm" onClick={() => (dirty ? setConfirmClose(true) : closePlan())}>← Back to Plans</button>
           <strong className="mono text-sm">{selected.path}</strong>
           <span className={`status-pill ${selected.status === 'in_progress' ? 'status-awaiting' : ''}`}>
             {selected.status === 'todo' ? 'Draft — not runnable yet' : selected.status === 'in_progress' ? 'Ready — runnable' : 'Done — not runnable'}

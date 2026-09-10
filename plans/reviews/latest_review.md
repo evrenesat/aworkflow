@@ -1,36 +1,32 @@
-# Checkpoint 4 review — cp4 v02
+# CP5 checkpoint review
 
-Original authority: `plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910.md`.
-Active repair: `plans/in-progress/responsive-document-scroll-and-mobile-editing-20260910-cp05-v01.md`, a non-checkpoint CP4 overlay.
+Reviewed `cp5 v02` against original CP5 and the active cp06-v01 non-checkpoint
+caption repair overlay. Current-worktree fallback from approved `cp4 v02`
+(`12c9af1`) was necessary because no CP5 commit existed. The original plan
+owns checkpoint authority; the overlay filename does not authorize CP6.
 
-Reviewed the immediately preceding worker attempt and accumulated CP4 changes
-against original CP4. No CP4 commit existed: current-worktree fallback from
-approved cp3 v02 (`8246325`) was used. The branch matches the original plan;
-its pre-handoff base is reachable. The cp05 filename does not advance scope.
+Scope: accumulated responsive Runs/New Run/Plans/Projects/All runs/login
+presentation, labelled compact launch tables and captions, Plans Back actions,
+App-owned alert focus, and associated component/browser checks. No material
+findings survived the finding admission gate. No production code was edited
+by this review.
 
-Covered shared native Markdown/TOML editors, visual wrapping and exact values,
-normal-flow toolbar repair, Skills task space, profile layout, combobox placement,
-and preservation of existing draft/save/conflict/Undo ownership. Applied the
-material-code-review admission gate and exclusions. No material findings.
+Verification:
 
-Local verification:
+- Full web suite: 297 passed; production build passed.
+- Disposable Chromium Runs/Settings modules: 5 passed.
+- Caption widths match available table width at 320×568 and 844×390;
+  desktop retains ordinary table/caption layout.
+- Inspected fresh 320px launch screenshot: captions readable, labels and
+  launch controls retained, no sideways page overflow.
+- Existing browser journeys cover plan save/draft guard, project form
+  reachability/selection, intercepted startup questions, run history/Back,
+  and login/logout failure focus. Git diff check passed.
 
-- Full web suite: 297 passed.
-- Production web build: passed.
-- Disposable Settings and Runs Chromium modules: 4 passed.
-- Skills at 1280×720 and 390×844: editor geometry checks passed; native deep
-  scrolling, toolbar non-overlap, hit-testing, caret movement, exact long-text
-  save and partial acknowledgement passed. Inspected the dark scrolled-editor
-  screenshot at `/tmp/pytest-of-root/pytest-2238/test_skills_edit_save_and_inst0/skills-scrolled-dark.png`.
-- `git diff --check`: passed.
-
-Approve cp4 v02; this review creates its checkpoint approval commit and advances
-only original CP4. CP5–6 remain unchecked. No production code was changed by the
-reviewer. WebKit, the broader viewport matrix and physical-device proof are not
-claimed here; later checkpoint acceptance remains outstanding.
-
-Publication: pending normal workflow delivery. Exact-SHA CI: pending.
-Live activation/proof: pending. No live service/global settings or shared uv tool
-were changed, and no concurrent workflow/worktree was modified.
+Approved only CP5; reviewer creates the `cp5 v02` checkpoint commit with the
+original plan bookkeeping and this review. CP6 remains unchecked. Broader
+WebKit, enlarged-text and physical-device acceptance belongs to CP6.
+Publication, exact-SHA CI and live activation proof remain pending the normal
+workflow delivery; this local review makes no deployment claim.
 
 No material findings

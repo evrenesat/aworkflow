@@ -12,7 +12,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 - Plan Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`
 - Pre-Handoff Base HEAD: `ee1757579b216afe9c02f3ca763038cae59a8498`
-- Last Approved Checkpoint: `cp4 v02`
+- Last Approved Checkpoint: `cp5 v02`
 
 ### Review Log
 
@@ -128,6 +128,29 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
   and partial-save retention passed. Reviewer creates cp4 v02 approval commit;
   only CP4 advances. CP5–6 remain unchecked. Publication, exact-SHA CI and live
   proof remain pending normal workflow delivery.
+
+- 2026-09-10: Rejected the immediately preceding uncommitted CP5 attempt v01
+  against original CP5 using current-worktree fallback from approved cp4 v02
+  (`12c9af1`); no CP5 commit exists. P2: compact launch tables retain native
+  table-caption layout, squeezing captions to 59–67px within 246px tables and
+  wasting 180px of phone task space. Confirmed with disposable Chromium geometry,
+  inspected screenshot and a browser-only CSS correction. Full web suite297,
+  build, five Chromium tests, additional Plans/New Run geometry and diff check
+  passed. CP5 remains unapproved; CP6 unchecked. Focused non-checkpoint repair:
+  `responsive-document-scroll-and-mobile-editing-20260910-cp06-v01.md` (CP5 scope).
+  No approval commit/history rewrite, publication, exact-SHA CI or live proof.
+
+- 2026-09-10: Approved `cp5 v02` against original CP5 and active cp06-v01
+  non-checkpoint repair overlay. Used current-worktree fallback from approved
+  cp4 v02 (`12c9af1`) because no CP5 commit existed. Reviewed accumulated
+  remaining-route presentation, compact launch tables/captions, Plans Back,
+  and App-owned alert focus without changing domain ownership. No material
+  findings. Reviewer verification: full web suite297, production build, five
+  disposable Chromium tests and diff check passed. Inspected the fresh320px
+  launch screenshot; caption width assertions passed at320×568 and844×390,
+  with ordinary desktop table layout retained. Reviewer creates cp5 v02
+  approval commit; only CP5 advances. CP6 remains unchecked. Publication,
+  exact-SHA CI and live proof remain pending normal workflow delivery.
 
 ## Done Means
 
@@ -258,7 +281,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Blockers:** Preserve unsupported provider configuration semantics; do not invent controls to fill grid cells.
 
-### [ ] Checkpoint 5: Apply the same responsive contract to remaining journeys
+### [x] Checkpoint 5: Apply the same responsive contract to remaining journeys
 
 **Goal:** Runs, New Run, Plans, Projects, All runs, and login remain fully operable.
 
@@ -268,11 +291,11 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Steps:**
 
-- [ ] Apply the shared list/detail behavior to Runs; explicit run links open detail, Back retains history filter/loaded pages/position. Detail summary/actions/form sections follow document flow; Technical/Raw remain disclosures with only raw blocks allowed local overflow.
-- [ ] Keep New Run controls and Start/Cancel in a natural single-column compact form. Stack tables into labelled rows when their meaning survives it; confine truly two-dimensional raw data to an explicit overflow block. Preserve workflow/team/plan selection, advanced settings, startup questions and restart confirmations. No action may be hidden merely to shorten the page.
-- [ ] Plans retains its existing list/editor navigation but gains document scrolling, a consistent Back action, wrapping editor and reachable Save/Ready/Run actions. Preserve revision conflicts and dirty confirmations. Collapse New plan creation behind a labelled action if needed, keeping filename validation and flow unchanged.
-- [ ] Check Projects create/open/configuration states, All runs populated/empty/partial-failure states, login/error, and unsaved/logout confirmations. Wrap long names/paths, stack narrow controls, and ensure newly shown alerts scroll/focus into view without covering content. Existing App guards keep ownership; do not introduce competing modal state.
-- [ ] Extend meaningful browser journeys with disposable fixture data for plan creation/edit/save, launch/startup question, run detail/back/history refresh, and project selection. Do not launch or alter production runs for tests.
+- [x] Apply the shared list/detail behavior to Runs; explicit run links open detail, Back retains history filter/loaded pages/position. Detail summary/actions/form sections follow document flow; Technical/Raw remain disclosures with only raw blocks allowed local overflow.
+- [x] Keep New Run controls and Start/Cancel in a natural single-column compact form. Stack tables into labelled rows when their meaning survives it; confine truly two-dimensional raw data to an explicit overflow block. Preserve workflow/team/plan selection, advanced settings, startup questions and restart confirmations. No action may be hidden merely to shorten the page.
+- [x] Plans retains its existing list/editor navigation but gains document scrolling, a consistent Back action, wrapping editor and reachable Save/Ready/Run actions. Preserve revision conflicts and dirty confirmations. Collapse New plan creation behind a labelled action if needed, keeping filename validation and flow unchanged.
+- [x] Check Projects create/open/configuration states, All runs populated/empty/partial-failure states, login/error, and unsaved/logout confirmations. Wrap long names/paths, stack narrow controls, and ensure newly shown alerts scroll/focus into view without covering content. Existing App guards keep ownership; do not introduce competing modal state.
+- [x] Extend meaningful browser journeys with disposable fixture data for plan creation/edit/save, launch/startup question, run detail/back/history refresh, and project selection. Do not launch or alter production runs for tests.
 
 **Dependencies:** CP4.
 
@@ -281,6 +304,13 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 **Done When:** All listed flows reach their final action at320px width and844×390 without horizontal page scrolling, lost input, or hidden controls. Report Git scope checks.
 
 **Blockers:** Real execution/provider errors outside presentation remain visible; do not change lifecycle to make a visual test pass.
+
+#### Completion note
+
+- Added compact/short-screen flow rules for New Run forms, launch previews, responsive choice tables, run metadata, long route content, and plan Back navigation without changing lifecycle or launch semantics.
+- Kept App-owned login/logout and unsaved-navigation guards authoritative; newly shown login/logout/guard alerts are focusable and remain in document flow.
+- Extended the disposable Chromium journey with plan create/edit/save, project creation-form reachability and selection, intercepted startup-question launch, populated All runs detail/Back, and logout failure checks at320×844 and844×390. No worker or production run was started.
+- Local verification: full web suite297/297, production build, browser modules5/5, and `git diff --check` passed. Changes remain uncommitted; publication, CI, and live proof are not part of this checkpoint execution.
 
 ### [ ] Checkpoint 6: Verify task usability across browsers and viewport changes
 

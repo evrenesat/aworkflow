@@ -302,6 +302,13 @@ input::placeholder, textarea::placeholder {
   flex-wrap: wrap;
 }
 
+.section-heading > *,
+.run-dashboard-header > *,
+.confirmation > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .header-actions {
   display: flex;
   gap: var(--spacing-sm);
@@ -352,6 +359,15 @@ input::placeholder, textarea::placeholder {
   margin: 0;
 }
 
+.run-dashboard h2,
+.run-dashboard h3,
+.run-dashboard h4,
+.run-dashboard strong,
+.run-dashboard span,
+.run-dashboard dd {
+  overflow-wrap: anywhere;
+}
+
 .dashboard-loading {
   display: flex;
   justify-content: center;
@@ -395,6 +411,11 @@ input::placeholder, textarea::placeholder {
   padding: var(--spacing-sm);
   border-radius: var(--radius-md);
   border: 1px solid transparent;
+}
+
+.run-list-item > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .run-list-item.selected {
@@ -482,13 +503,13 @@ input::placeholder, textarea::placeholder {
   flex-wrap: wrap;
 }
 
-@media (max-width: 800px) {
+@media (max-width: 800px), (max-height: 599px) {
   .dashboard-columns {
     grid-template-columns: minmax(0, 1fr);
   }
 }
 
-@media (max-width: 640px) {
+@media (max-width: 640px), (max-height: 599px) {
   .run-metadata {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -510,6 +531,10 @@ input::placeholder, textarea::placeholder {
   align-items: center;
   justify-content: center;
   padding: var(--spacing-lg);
+}
+
+.auth-gate code {
+  overflow-wrap: anywhere;
 }
 
 .app-header {
@@ -670,6 +695,14 @@ input::placeholder, textarea::placeholder {
   padding-inline: var(--spacing-sm);
 }
 
+.header-plan-name {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .header-slot-spacer {
   flex: 1 1 0;
   min-width: var(--spacing-sm);
@@ -688,6 +721,19 @@ input::placeholder, textarea::placeholder {
 
 .project-server-context {
   overflow-wrap: anywhere;
+}
+
+.app-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+
+.app-notice > :first-child {
+  min-width: 0;
+  flex: 1 1 14rem;
 }
 
 .app-mobile-menu {
@@ -1124,6 +1170,10 @@ input::placeholder, textarea::placeholder {
   overflow-wrap: anywhere;
 }
 
+.responsive-data-table {
+  min-width: 0;
+}
+
 .guided-team {
   display: flex;
   flex-direction: column;
@@ -1271,6 +1321,7 @@ input::placeholder, textarea::placeholder {
 .run-preview-list dd {
   margin: 0;
   font-size: 0.875rem;
+  overflow-wrap: anywhere;
 }
 
 :root[data-theme="dark"] {
@@ -1543,6 +1594,67 @@ input::placeholder, textarea::placeholder {
   .header-slot-spacer { display: none; }
   .header-slot-local { flex: 1 1 8rem; }
   .app-header-row-two { flex-wrap: wrap; }
+
+  .header-plan-name input {
+    flex: 1 1 9rem;
+    width: auto;
+  }
+
+  .dashboard-form-grid,
+  .run-preview-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .btn-sm {
+    min-height: var(--tap-target);
+  }
+
+  .responsive-data-table,
+  .responsive-data-table tbody,
+  .responsive-data-table tr {
+    display: block;
+    width: 100%;
+  }
+
+  .responsive-data-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .responsive-data-table tr {
+    border-bottom: 1px solid var(--color-border);
+    padding-block: var(--spacing-xs);
+  }
+
+  /* Block rows need captions to use the table's available width as well. */
+  .responsive-data-table caption {
+    display: block;
+    width: 100%;
+  }
+
+  .responsive-data-table td {
+    display: grid;
+    grid-template-columns: minmax(7rem, 35%) minmax(0, 1fr);
+    gap: var(--spacing-sm);
+    align-items: baseline;
+    border-bottom: 0;
+    padding-inline: 0;
+  }
+
+  .responsive-data-table td::before {
+    content: attr(data-label);
+    color: var(--color-text-dim);
+    font-family: inherit;
+    font-size: 0.75rem;
+    overflow-wrap: anywhere;
+  }
 
   /* Compact/short screens expose one mounted list or detail surface at a time;
      SidebarEditorLayout owns the hidden presentation state. */

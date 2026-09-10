@@ -190,6 +190,10 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void; onCancel?: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
   const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
+  const alertRef = useRef<HTMLElement | null>(null)
+  const setAlertRef = useCallback((element: HTMLElement | null) => {
+    alertRef.current = element
+  }, [])
   // Bumped on logout so late responses cannot restore signed-in UI.
   const authEpoch = useRef(0)
 
@@ -197,6 +201,20 @@ export function App() {
   queryRef.current = query
   const dirtyRef = useRef(false)
   dirtyRef.current = configDirty || planDirty
+
+  useEffect(() => {
+    if (!loginError && !logoutError && !pendingAction && !pendingSuccessorStart) return
+    const alert = alertRef.current
+    if (!alert) return
+    try {
+      alert.focus({ preventScroll: true })
+    } catch {
+      alert.focus()
+    }
+    if (typeof alert.scrollIntoView === 'function') {
+      alert.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    }
+  }, [loginError, logoutError, pendingAction, pendingSuccessorStart])
 
   // A passive selected-run URL replacement must not leave an old explicit
   // entry marker armed for a later visit to the same run.
@@ -535,7 +553,7 @@ export function App() {
           )}
           {authGate === 'restoreFailed' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--spacing-md)' }}>
-              <p className="text-sm" role="alert">
+              <p ref={setAlertRef} className="text-sm" role="alert" tabIndex={-1}>
                 The server could not be reached to check your session. This is a connection problem, not a signed-out state.
               </p>
               <button
@@ -554,7 +572,7 @@ export function App() {
                   Sign in again to return to your current project and view.
                 </p>
               )}
-              {loginError && <p className="text-sm" role="alert">{loginError}</p>}
+              {loginError && <p ref={setAlertRef} className="text-sm" role="alert" tabIndex={-1}>{loginError}</p>}
               <input className="input" type="password" placeholder="Auth token" value={loginDraft}
                 onChange={(event) => setLoginDraft(event.target.value)}
                 onKeyDown={(event) => event.key === 'Enter' && void handleLogin()} />
@@ -588,14 +606,14 @@ export function App() {
         logoutPending={logoutPending}
       />}>
         {logoutError && (
-          <div className="notice" role="alert" style={{ display: 'flex', gap: 'var(--spacing-md)', alignItems: 'center' }}>
+          <div ref={setAlertRef} className="notice app-notice" role="alert" tabIndex={-1}>
             <span className="text-sm">{logoutError}</span>
             <button className="btn btn-secondary btn-sm" onClick={() => void handleLogout()}>Retry logout</button>
           </div>
         )}
 
         {pendingSuccessorStart && ((view !== 'runs' && view !== 'new-run') || query.project !== pendingSuccessorStart.projectId) && (
-          <div className="notice" role="status">
+          <div ref={setAlertRef} className="notice app-notice" role="status" tabIndex={-1}>
             A successor request for {pendingSuccessorStart.sourceRunId} is unresolved. Its exact request remains preserved.
             <button className="btn btn-secondary btn-sm" onClick={() => requestGuarded('return to the pending successor request', () => {
               applyQuery({ project: pendingSuccessorStart.projectId, view: 'new-run', run: null }, 'push')
@@ -604,7 +622,7 @@ export function App() {
         )}
 
         {pendingAction && (
-          <div className="card unsaved-guard" role="alertdialog" aria-label="Unsaved editor edits">
+          <div ref={setAlertRef} className="card unsaved-guard" role="alertdialog" aria-label="Unsaved editor edits" tabIndex={-1}>
             <span className="text-sm">
               You have unsaved editor edits. Leave anyway to continue?
             </span>

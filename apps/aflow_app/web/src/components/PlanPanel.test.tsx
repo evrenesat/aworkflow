@@ -83,7 +83,7 @@ describe('PlanPanel', () => {
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Unsaved\n' } })
     expect(screen.getByRole('button', { name: 'Run this plan' }).getAttribute('disabled')).not.toBeNull()
     expect(screen.getByText(/Save this draft before running the plan/)).toBeDefined()
-    fireEvent.click(screen.getByRole('button', { name: '← All plans' }))
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
     expect(screen.getByRole('alertdialog', { name: 'Unsaved plan edits' })).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: 'Discard edits' }))
 
@@ -93,7 +93,7 @@ describe('PlanPanel', () => {
     expect(screen.getByText(/not runnable yet\. Save it and move it to Ready/)).toBeDefined()
 
     // Done plans explain that they are archival.
-    fireEvent.click(screen.getByRole('button', { name: '← All plans' }))
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
     await openPlan(donePlan, '# Done plan\n')
     expect(screen.queryByRole('button', { name: 'Run this plan' })).toBeNull()
     expect(screen.getByText(/kept for the record and cannot run/)).toBeDefined()
@@ -168,7 +168,7 @@ describe('PlanPanel', () => {
     render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
     await openPlan(todoPlan, '# Original\n')
     fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Draft\n' } })
-    fireEvent.click(screen.getByRole('button', { name: '← All plans' }))
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans' }))
 
     expect(screen.getByRole('alertdialog', { name: 'Unsaved plan edits' })).toBeDefined()
     expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Draft\n')
