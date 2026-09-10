@@ -1,15 +1,13 @@
-# Checkpoint 4 review
+# Checkpoint 1 review
 
-Reviewed the immediately preceding worker repair overlay `plans/in-progress/readable-cli-status-output-20260909-cp01-v01.md` and retained checkpoint 4 implementation against `plans/in-progress/readable-cli-status-output-20260909.md`. Used current-worktree fallback from checkpoint 3 approval `a1ce533`: no checkpoint 4 worker commit existed. Scope: compact manager projections, immutable complete structured history, current control facts, exact prompt budgets, read-only analysis compatibility, bundled instructions, tests and documentation.
+Approved `cp1 v01` for `codex/aflow-dogfood-20260909` under `plans/in-progress/live-configuration-without-snapshot-gates-20260909.md`, the original and active plan.
 
-## Findings
+Reviewed pending worker worktree against base `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`. Worktree fallback applies because this plan's checkpoint 1 has no implementation commit boundary; preceding checkpoint approvals belong to older plans. Implementation boxes were already checked; this review records approval. Checkpoint 2 remains unchecked.
 
-Zero material findings. Both previous findings are resolved: unrecognized structured-stream fallback remains reference-only in the history and inline projections while preserving extraction metadata and stdout pointers; combined history sorting retains legacy decisions with absent or null finalized-turn association without a None/integer comparison. Recognized final assistant responses and plain-text semantic results remain complete on disk.
+Scope: current-source selection and locked pair loading, strict missing-source behavior, legacy origin fallback, relative worktree paths, snapshot hash admission removal, optional compatibility/provenance fields and serialization, focused tests. Applied the material finding admission gate, exclusions and proportionate-fix discipline. No findings survived. Launch/resume and turn-boundary integration remain later checkpoint work.
 
-## Verification and disposition
+Validation: `uv run pytest tests/test_live_config.py tests/test_run_config_snapshot.py tests/test_config.py tests/test_run_state.py tests/test_runlog.py -q` — 211 passed, 7 subtests passed. `git diff --check` passed. Branch, reachable base and changed scope verified. The approved 40 KiB manager guard and 16 KiB summary remain untouched. No production provider calls, service edits, global config/skill edits or public push.
 
-`uv run pytest -q tests/test_manager.py tests/test_manager_context.py tests/test_runtime.py`: 398 passed, 43 subtests passed. `uv run ruff check aflow/manager.py aflow/manager_context.py aflow/runlog.py aflow/api/analyze.py` and `git diff --check` passed. Reviewed synthetic growth, Unicode bounds, exact-reference validation, capture failure, read-only rebuilding, prompt limits and fake-manager routing coverage. No live providers, global configuration, services or public publishing were used.
-
-Approved checkpoint 4 through `cp4 v01 codex/aflow-dogfood-20260909: Approve compact manager history`. Only checkpoint 4 review state advances; checkpoints 1–3 and original baseline remain unchanged. The repair overlay is satisfied, and no new fix plan is needed. This is checkpoint approval, not whole-plan review; no squash or history rewrite.
+Original plan remains in progress. No fix overlay required.
 
 No material findings

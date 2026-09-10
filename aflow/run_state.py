@@ -30,8 +30,13 @@ OverrideLoadStatus = Literal[
 @dataclass(frozen=True)
 class FrozenRunIdentity:
     workflow_name: str
-    config_path: str
-    config_fingerprint: str
+    # Retained as optional diagnostic compatibility fields. Current-source
+    # admission must use live_config_path, not these historical values.
+    config_path: str | None = None
+    config_fingerprint: str | None = None
+    live_config_path: str | None = None
+    team_explicit: bool | None = None
+    max_turns_explicit: bool | None = None
     continuation_from_branch: str | None = None
     continuation_from_head: str | None = None
     continuation_mode: str | None = None
@@ -684,6 +689,9 @@ class ResumeContext:
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
+    live_config_path: str | None = None
+    team_explicit: bool | None = None
+    max_turns_explicit: bool | None = None
     override_result: OverrideResult | None = None
     role_selectors: Mapping[str, str] = field(default_factory=dict)
     current_hotplug_transaction: HotplugTransactionV1 | None = None
@@ -804,6 +812,9 @@ class ControllerState:
     scope_pressure_reason: str | None = None
     last_manager_report_path: str | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
+    live_config_path: str | None = None
+    team_explicit: bool | None = None
+    max_turns_explicit: bool | None = None
     override_result: OverrideResult | None = None
     role_selectors: dict[str, str] = field(default_factory=dict)
     current_hotplug_transaction: HotplugTransactionV1 | None = None

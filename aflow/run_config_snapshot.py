@@ -1,17 +1,15 @@
-"""Immutable per-run workflow configuration snapshots.
+"""Compatibility snapshots and the lock for a configuration pair.
 
-Every durably reserved run captures the complete effective workflow pair
-(``aflow.toml`` plus sibling ``workflows.toml``) under
-``.aflow/runs/<run_id>/config/`` before startup questions or worker launch.
-Workers, startup answers, retries, resume, and run inspection read the
-snapshot, so later global configuration edits only affect new runs.
+Snapshots are ordinary launch-time diagnostic copies.  They remain readable
+for legacy inspection and may preserve their historical origin metadata, but
+their copied TOML and old fingerprints never decide whether a current run may
+execute.  New current-source reads belong in :mod:`aflow.live_config`, which
+holds :func:`configuration_pair_lock` while parsing ``aflow.toml`` and its
+optional sibling ``workflows.toml``.
 
-Snapshot creation and global configuration saves share one configuration
-lock, so a launch observes either the old pair or the new pair, never a
-mixture. The canonical fingerprint computation is untouched: server/UI
-transport settings live in ``config.toml`` and never enter the workflow
-pair's fingerprint, so fingerprints recorded before snapshots existed still
-match.
+Snapshot creation still uses exclusive atomic writes and resolves the
+schema-defined relative ``worktree_root`` against the selected source
+directory so old diagnostic copies retain their original meaning.
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -47,16 +44,30 @@ class RunConfigSnapshot:
     manifest: dict
 
     @property
-    def fingerprint(self) -> str:
-        return str(self.manifest["origin"]["config_fingerprint"])
+    def fingerprint(self) -> str | None:
+        """Return an old diagnostic fingerprint, when one was recorded."""
+        origin = self.manifest.get("origin")
+        if not isinstance(origin, dict):
+            return None
+        value = origin.get("config_fingerprint")
+        return value if isinstance(value, str) else None
 
     @property
-    def origin_config_path(self) -> str:
-        return str(self.manifest["origin"]["config_path"])
+    def origin_config_path(self) -> str | None:
+        """Return the legacy origin hint, if the manifest recorded one."""
+        origin = self.manifest.get("origin")
+        if not isinstance(origin, dict):
+            return None
+        value = origin.get("config_path")
+        return value if isinstance(value, str) and value.strip() else None
 
     @property
-    def workflow_name(self) -> str:
-        return str(self.manifest["origin"]["workflow_name"])
+    def workflow_name(self) -> str | None:
+        origin = self.manifest.get("origin")
+        if not isinstance(origin, dict):
+            return None
+        value = origin.get("workflow_name")
+        return value if isinstance(value, str) and value.strip() else None
 
 
 @contextmanager
@@ -151,10 +162,6 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _digest(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _resolve_relative_paths(aflow_bytes: bytes, origin_dir: Path) -> bytes:
     """Rewrite schema-defined relative filesystem paths to absolute form.
 
@@ -187,23 +194,19 @@ def create_run_config_snapshot(
     run_id: str,
     config_path: Path,
     workflow_name: str,
-    fingerprint: str,
+    fingerprint: str | None = None,
     loader=None,
 ) -> RunConfigSnapshot:
     """Capture the effective workflow pair for a durably reserved run.
 
-    ``fingerprint`` is the value already recorded in the run's launch
-    manifest; the snapshot must reproduce it exactly or the launch fails
-    before any worker starts. Creation is exclusive: a concurrent launch of
-    the same run id reuses the existing identical snapshot. ``loader``
-    defaults to the production loader; callers that resolve configuration
-    through a module-level indirection pass their own reference so the
-    snapshot validates the same view they froze.
+    ``fingerprint`` is retained only as optional diagnostic metadata for old
+    callers. It is never recomputed or compared. Creation is exclusive: a
+    concurrent launch of the same run id reuses the existing snapshot.
+    ``loader`` defaults to the production loader and still validates the pair
+    before a diagnostic copy is published.
     """
     if loader is None:
         from aflow.config import load_workflow_config as loader  # noqa: F811
-    from aflow.workflow import _freeze_run_identity
-
     origin_config = Path(config_path)
     if not origin_config.is_file() or origin_config.is_symlink():
         raise SnapshotError(f"workflow configuration is not a regular file: {origin_config}")
@@ -213,11 +216,6 @@ def create_run_config_snapshot(
     with configuration_pair_lock(origin_dir):
         existing = load_run_config_snapshot(repo_root, run_id)
         if existing is not None:
-            if existing.fingerprint != fingerprint or existing.workflow_name != workflow_name:
-                raise SnapshotError(
-                    f"run {run_id} already has a configuration snapshot with a "
-                    "different fingerprint; refusing to replace it"
-                )
             return existing
 
         aflow_bytes = _read_stable(origin_config)
@@ -234,16 +232,7 @@ def create_run_config_snapshot(
             (candidate_dir / "aflow.toml").write_bytes(resolved_aflow)
             if workflows_bytes is not None:
                 (candidate_dir / "workflows.toml").write_bytes(workflows_bytes)
-            validated = loader(candidate_dir / "aflow.toml")
-            recomputed = _freeze_run_identity(
-                workflow_name, validated, config_dir=origin_config
-            )
-            if recomputed.config_fingerprint != fingerprint:
-                raise SnapshotError(
-                    "the workflow configuration changed during run reservation "
-                    f"(fingerprint {recomputed.config_fingerprint} != recorded "
-                    f"{fingerprint}); no worker was launched"
-                )
+            loader(candidate_dir / "aflow.toml")
             directory.mkdir(parents=True, exist_ok=True)
             _write_exclusive(directory / "aflow.toml", resolved_aflow)
             if workflows_bytes is not None:
@@ -258,15 +247,10 @@ def create_run_config_snapshot(
                     if workflows_bytes is not None
                     else None,
                     "workflow_name": workflow_name,
-                    "config_fingerprint": fingerprint,
-                },
-                "files": {
-                    "aflow.toml": _digest(resolved_aflow),
-                    "workflows.toml": _digest(workflows_bytes)
-                    if workflows_bytes is not None
-                    else None,
                 },
             }
+            if fingerprint is not None:
+                manifest["origin"]["config_fingerprint"] = fingerprint
             _write_exclusive(
                 directory / SNAPSHOT_MANIFEST_NAME,
                 json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n",
@@ -284,26 +268,18 @@ def copy_run_config_snapshot(
     source: RunConfigSnapshot,
     run_id: str,
     workflow_name: str,
-    fingerprint: str,
+    fingerprint: str | None = None,
 ) -> RunConfigSnapshot:
     """Give a resumed successor run its own snapshot copied from its source.
 
     The successor's manifest origin stays the source run's original
-    configuration location, so recorded identity comparisons remain stable
-    across the resume boundary.
+    configuration location for diagnostic continuity. ``fingerprint`` is
+    accepted for compatibility but is never compared or recomputed.
     """
-    if fingerprint != source.fingerprint:
-        raise SnapshotError(
-            "continuation fingerprint does not match the source run snapshot"
-        )
     directory = snapshot_directory(repo_root, run_id)
     with configuration_pair_lock(source.directory):
         existing = load_run_config_snapshot(repo_root, run_id)
         if existing is not None:
-            if existing.fingerprint != fingerprint:
-                raise SnapshotError(
-                    f"run {run_id} already has a different configuration snapshot"
-                )
             return existing
         directory.parent.mkdir(parents=True, exist_ok=True)
         directory.mkdir(parents=True, exist_ok=True)
@@ -338,21 +314,6 @@ def load_run_config_snapshot(repo_root: Path, run_id: str) -> RunConfigSnapshot 
         raise SnapshotError(
             f"run {run_id} has a malformed configuration snapshot manifest"
         )
-    for name in DOCUMENT_NAMES:
-        recorded = manifest.get("files", {}).get(name)
-        path = directory / name
-        if recorded is None:
-            continue
-        if not path.is_file():
-            raise SnapshotError(
-                f"run {run_id} configuration snapshot is missing {name}; "
-                "resume with the original snapshot is unavailable"
-            )
-        if _digest(path.read_bytes()) != recorded:
-            raise SnapshotError(
-                f"run {run_id} configuration snapshot file {name} was modified; "
-                "refusing to use it"
-            )
     return RunConfigSnapshot(
         run_id=run_id,
         directory=directory,

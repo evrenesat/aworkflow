@@ -1300,6 +1300,17 @@ class RunMetadataWriter:
                 raise ValueError(
                     "selected_start_step must be null or a non-empty string"
                 )
+            if self.state.live_config_path is not None and (
+                not isinstance(self.state.live_config_path, str)
+                or not self.state.live_config_path.strip()
+            ):
+                raise ValueError(
+                    "live_config_path must be null or a non-empty string"
+                )
+            for field_name in ("team_explicit", "max_turns_explicit"):
+                value = getattr(self.state, field_name)
+                if value is not None and not isinstance(value, bool):
+                    raise ValueError(f"{field_name} must be null or a boolean")
         previous: Mapping[str, object] = {}
         run_json_present = self.paths.run_json.exists() or self.paths.run_json.is_symlink()
         if run_json_present:
@@ -1404,6 +1415,16 @@ class RunMetadataWriter:
                 else self.config.max_turns
             )
             payload["override_file_present"] = self.state.override_file_present
+            if self.state.live_config_path is not None:
+                payload["live_config_path"] = self.state.live_config_path
+            elif isinstance(previous.get("live_config_path"), str):
+                payload["live_config_path"] = previous["live_config_path"]
+            for field_name in ("team_explicit", "max_turns_explicit"):
+                value = getattr(self.state, field_name)
+                if value is not None:
+                    payload[field_name] = value
+                elif isinstance(previous.get(field_name), bool):
+                    payload[field_name] = previous[field_name]
             if self.state.frozen_run_identity is not None:
                 payload["frozen_config"] = asdict(self.state.frozen_run_identity)
             if self.state.override_result is not None:
@@ -1436,25 +1457,38 @@ class RunMetadataWriter:
         frozen_config = payload.get("frozen_config")
         if frozen_config is None and previous.get("schema_version") == RUN_STATE_SCHEMA_VERSION:
             frozen_config = previous.get("frozen_config")
-        if not isinstance(frozen_config, Mapping) or any(
-            not isinstance(frozen_config.get(field), str)
-            or not str(frozen_config.get(field)).strip()
-            for field in ("workflow_name", "config_path", "config_fingerprint")
-        ):
-            raise ValueError("frozen_config must contain current non-empty identity fields")
-        for field in (
-            "continuation_from_branch",
-            "continuation_from_head",
-            "continuation_mode",
-        ):
-            value = frozen_config.get(field)
-            if value is not None and (
-                not isinstance(value, str) or not value.strip()
+        if frozen_config is not None:
+            if not isinstance(frozen_config, Mapping):
+                raise ValueError("frozen_config must contain a mapping")
+            for field in ("workflow_name", "config_path", "config_fingerprint", "live_config_path"):
+                value = frozen_config.get(field)
+                if field == "workflow_name" and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise ValueError("frozen_config.workflow_name must be a non-empty string")
+                if field != "workflow_name" and value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise ValueError(
+                        f"frozen_config.{field} must be a non-empty string or null"
+                    )
+            for field in ("team_explicit", "max_turns_explicit"):
+                value = frozen_config.get(field)
+                if value is not None and not isinstance(value, bool):
+                    raise ValueError(f"frozen_config.{field} must be a boolean or null")
+            for field in (
+                "continuation_from_branch",
+                "continuation_from_head",
+                "continuation_mode",
             ):
-                raise ValueError(
-                    f"frozen_config.{field} must be a non-empty string or null"
-                )
-        payload["frozen_config"] = dict(frozen_config)
+                value = frozen_config.get(field)
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise ValueError(
+                        f"frozen_config.{field} must be a non-empty string or null"
+                    )
+            payload["frozen_config"] = dict(frozen_config)
 
         durable_state = self.state
         if durable_state is None:
