@@ -161,8 +161,9 @@ class SubprocessUnitManager:
 
     Spawns each workflow as an independent subprocess in its own process
     group. ``stop`` signals the whole group (SIGTERM, then SIGKILL after the
-    configured timeout). Intended for terminal ``aflow daemon`` use on hosts
-    without systemd; the production ``SystemdUnitManager`` is unchanged.
+    configured timeout). This adapter remains available to local control-plane
+    callers without systemd; ``aflow ui`` uses the persistent adapter and the
+    production ``SystemdUnitManager`` remains unchanged.
     """
 
     def __init__(self, *, stop_timeout_seconds: float = 30.0) -> None:

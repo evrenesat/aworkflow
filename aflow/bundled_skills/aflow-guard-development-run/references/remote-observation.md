@@ -1,23 +1,20 @@
 # Read-only remote observation
 
-Use this reference for a run owned by either AFlow daemon. Capability discovery
-is authoritative and occurs once during guard setup.
+Use this reference for a run owned by an AFlow UI/server deployment. Capability
+discovery is authoritative and occurs once during guard setup.
 
 ## Ownership surfaces
 
-### Lightweight local daemon
+### UI server
 
-- Start forms are `aflow daemon start --foreground` for stdio MCP and
-  `aflow daemon start --mcp-transport http --mcp-port 8765` for loopback
-  HTTP MCP.
-- Status is `aflow daemon status --repo-root <repo>`.
-- It owns one repository and reports only workers it directly owns.
-- Stdio must remain attached. EOF stops the daemon and drains its workers.
-- HTTP binds to `127.0.0.1` and may detach.
-- It has no REST API, web UI, or systemd ownership. Never invent UI URLs.
-
-Observe an existing instance only. Never start a temporary stdio daemon for a
-tick and never close a daemon-owned stdio session.
+- Start forms are `aflow ui` and `aflow ui --daemon`; observe an existing UI
+  server rather than starting a second owner.
+- Use the advertised URL plus `/mcp` or `/mcp/` with the configured bearer
+  token in the `Authorization` header. Browser cookies are not accepted.
+- It owns the server process record while persistent workflow units remain
+  independently owned and observable after UI shutdown.
+- Never guess a host, scheme, or port, and never stop the UI or a workflow from
+  an observation tick.
 
 ### Remote aflowd
 
@@ -32,7 +29,7 @@ logs, or reports.
 
 ## MCP version 1 contract
 
-The shared server is named `AFlow Control Plane`. Permit only these eight read
+The shared server is named `AFlow Control Plane`. Permit only these nine read
 tools:
 
 - `get_capabilities`
@@ -43,6 +40,7 @@ tools:
 - `get_run`
 - `get_run_events`
 - `get_run_context` with Lite context only for a new anomaly
+- `preflight_run` with bounded dirty-worktree pages only when needed
 
 Never call these five writes:
 

@@ -842,6 +842,8 @@ Startup models (`models.py`):
 
 - REST and MCP adapt into one StartupRequest; transport models reject unknown
   fields and the daemon resolves numeric start steps before run reservation.
+  MCP is served only by the UI server's authenticated `/mcp` and `/mcp/`
+  mounts; there is no standalone stdio or HTTP listener.
 - Authenticated REST `POST .../runs/preflight` and the read-only MCP
   `preflight_run` tool share the daemon's CP7 worktree inspection. They return
   the inspected checkout, repository-relative status items, blockers, and
@@ -894,9 +896,9 @@ aflow/
   config.py            # TOML config loading and validation
   plan.py              # Markdown plan parser
   workflow.py          # workflow engine (turn loop, conditions, transitions)
-  daemon.py            # durable lifecycle daemon and aflowd entry point
-  daemon_cli.py        # lightweight local daemon adapter
-  mcp_control_plane.py # shared MCP tools and resources
+  daemon.py            # shared durable lifecycle and worker support
+  process_identity.py  # portable process-birth ownership identity
+  mcp_control_plane.py # single UI-server MCP tools and resources
   manager.py           # interstep manager protocol and decisions
   manager_context.py   # versioned Lite/Full manager context
   hotplug.py           # live worker selector transactions
@@ -1007,9 +1009,12 @@ React client expose four product areas: registered projects, the shared
 global workflow configuration pair plus server settings, filesystem plans,
 and durable workflow runs.
 
-REST plus SSE is the canonical remote interface; MCP is an optional adapter
-to the same control-plane service. A remote ACP interface is deferred. Codex is
-an optional engine harness, and the web app has no provider-specific client.
+REST plus SSE is the canonical remote interface, and authenticated MCP is an
+HTTP adapter mounted by the same UI server at `/mcp` and `/mcp/`. Both use the
+same `ControlPlaneService`, project registry, and lifecycle domain services. A
+remote ACP interface is deferred; no standalone MCP listener or stdio transport
+is maintained. Codex is an optional engine harness, and the web app has no
+provider-specific client.
 
 All projects read the one global workflow pair (`~/.config/aflow/aflow.toml`
 plus `workflows.toml`); every boundary reloads the current pair. A durably
@@ -1023,6 +1028,8 @@ The production backend binds only to `127.0.0.1:8765`. Tailscale Serve supplies
 the private MagicDNS HTTPS entry point; operators discover its advertised
 address with `tailscale serve status --json`. The
 [deployment runbook](deploy/aflowd/README.md) owns activation and rollback steps.
+The retained `aflowd.service` unit runs `aflow-app-server`; the standalone
+`aflowd` executable is not part of release staging.
 
 Continuous deployment is a bounded local poll, not a service. The optional
 `aflowd-deploy.timer` runs `continuous-deploy.py`, which deploys an exact
@@ -1113,11 +1120,13 @@ System/Light/Dark, with OS and cross-tab listeners. A same-origin blocking scrip
 sets the root theme before paint, with CSS system fallback; semantic variables
 provide the supplied light and dark base palettes.
 
-The REST control-plane routes and `/mcp` mount delegate to the same durable
-`ControlPlaneService`. The HTTP layer does not own workflow processes. Bearer
-credentials are accepted only in headers, while project roots and executable
-inputs remain server-owned. The remote application has no agent-provider client;
-provider selection occurs only through configured engine harness profiles.
+The REST control-plane routes and the `/mcp` and `/mcp/` mounts delegate to the
+same durable `ControlPlaneService`. The HTTP layer does not own workflow
+processes. Bearer credentials are accepted only in headers, while project
+roots and executable inputs remain server-owned; the MCP mounts never accept
+the browser session cookie. The remote application has no agent-provider
+client; provider selection occurs only through configured engine harness
+profiles.
 
 The web client authenticates through a rolling browser session instead of a
 long-lived in-memory bearer. Login verifies the deployment token in the

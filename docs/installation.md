@@ -71,11 +71,11 @@ legacy runs in tmux, then attaches one observer-only 30-minute heartbeat to the
 task that requested supervision. It stays silent while healthy, never repairs
 or steers implementation, audits the terminal result, and then stops. Remote
 MCP use is read-only and ownership-aware: direct legacy controllers use the
-bounded local snapshot, lightweight `aflow daemon` runs use daemon status
-plus its configured MCP transport, and production `aflowd` runs use the
-advertised authenticated control-plane endpoint and exact systemd unit.
-The lightweight daemon has no REST or web UI; production `aflowd` may
-advertise both. Deployment requires explicit per-run authorization. The
+bounded local snapshot, UI-server runs use the advertised authenticated
+`/mcp` endpoint and exact UI/persistent-unit ownership, and production
+`aflowd` runs use the same endpoint plus the exact systemd unit. The UI server
+provides REST, web, and MCP surfaces; deployment requires explicit per-run
+authorization. The
 optional `aflow-assistant` skill is not installed
 unless you ask for it. Keep the legacy recovery skill installed even when using
 manager supervision: manager-disabled configurations retain that recovery path.

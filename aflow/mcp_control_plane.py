@@ -1,8 +1,9 @@
-"""Shared FastMCP tool registry for the daemon-owned control plane.
+"""Shared FastMCP tool registry for the UI-server control plane.
 
-Transport-neutral: the same registry backs the FastAPI `/mcp` mount and the
-`aflow daemon` stdio/HTTP listener. The service instance is injected through
-a getter; app-specific error types can extend the public error-code mapping.
+Transport-neutral: the same registry backs the FastAPI `/mcp` and `/mcp/`
+HTTP mounts. The service instance is injected through a getter; app-specific
+error types can extend the public error-code mapping. There is no standalone
+MCP listener in this module.
 """
 
 from __future__ import annotations

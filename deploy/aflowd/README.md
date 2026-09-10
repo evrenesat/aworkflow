@@ -4,7 +4,22 @@ This directory is the environment-specific systemd deployment for p100. It
 installs one immutable, commit-addressed release, binds the backend to
 `127.0.0.1:8765`, and uses private Tailscale Serve HTTPS as the user-facing
 entry point. REST plus SSE is the canonical control contract. MCP is optional;
-ACP is deferred. Codex is only an optional engine harness.
+the same authenticated MCP registry is mounted by the UI/server application at
+`/mcp` and `/mcp/`. ACP is deferred. Codex is only an optional engine harness.
+
+The `aflowd.service` unit is retained as the systemd deployment boundary and
+continues to execute `aflow-app-server`. The standalone `aflowd` package
+executable is removed and is not staged in release `bin/` directories. Local
+users should run `aflow ui`; this deployment runbook covers the retained
+systemd service, release paths, registry, and state directories.
+
+## MCP access
+
+After authenticated readiness succeeds, connect to the private HTTPS URL from
+Tailscale Serve plus `/mcp` (or `/mcp/`) and send the configured bearer token
+in the `Authorization` header. Use the [secret-free client template](../../apps/aflow_app/server/aflow-control-plane.mcp.example.toml);
+never put the token in a URL or request body. The endpoint exposes the shared
+14-tool registry and three resource templates without opening another port.
 
 The deployment uses one managed project root and one versioned registry at
 `/var/lib/aflowd/projects.json`. Registry records contain relative project roots.

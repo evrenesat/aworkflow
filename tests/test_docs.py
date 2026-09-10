@@ -86,13 +86,15 @@ class SkillDocsTests(unittest.TestCase):
         remote_normalized = ' '.join(remote_text.split())
 
         assert 'legacy' in skill_text
-        assert 'local-daemon' in skill_text
+        assert 'ui-server' in skill_text
+        assert 'local-daemon' not in skill_text
         assert 'aflowd' in skill_text
-        assert 'aflow daemon status --repo-root <guarded-repo>' in skill_text
-        assert 'Never create a disposable stdio connection' in skill_text
+        assert 'aflow ui --daemon' in skill_text
+        assert 'aflow daemon' not in skill_text
+        assert 'Never use browser cookies' in skill_text
         assert 'aflow-run-<run-id>.service' in skill_text
         assert 'needs_attention' in skill_text
-        assert 'no REST API, web UI, or systemd ownership' in remote_text
+        assert 'persistent workflow units' in remote_text
         assert '/mcp' in remote_text
         assert 'no host, scheme, or port is a product default' in remote_normalized
         assert '100.103.69.9' not in remote_text
@@ -100,7 +102,7 @@ class SkillDocsTests(unittest.TestCase):
         read_tools = (
             'get_capabilities', 'list_projects', 'get_project_capabilities',
             'list_plans', 'list_runs', 'get_run', 'get_run_events',
-            'get_run_context',
+            'get_run_context', 'preflight_run',
         )
         write_tools = (
             'start_run', 'answer_startup', 'control_run', 'owner_stop',

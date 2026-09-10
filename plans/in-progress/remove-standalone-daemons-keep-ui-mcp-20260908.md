@@ -17,6 +17,8 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 - Review Log: Checkpoint 3 approved through `cp3 v01` on 2026-09-10. Reviewed immediately preceding worker turn-007 and original checkpoint 3 using the uncommitted worktree fallback against `ff25d25` (`cp2 v01`). The cp04-named non-checkpoint overlay repairs checkpoint 3; release staging now omits the removed launcher and its hash. 233 tests and 129 subtests passed with an isolated HOME/cache; ShellCheck, package metadata and diff checks passed. No material findings. Checkpoint 4 remains unreviewed; publication and exact-SHA CI/live verification remain coordinator-owned.
 
+- Review Log: Checkpoint 4 approved through `cp4 v01` on 2026-09-10. Reviewed immediately preceding worker turn-009 using the uncommitted worktree fallback against `7c9fa53` (`cp3 v01`), limited to original checkpoint 4. 60 server tests and 436 root/documentation tests plus 136 subtests passed with isolated HOME/cache; required Ruff, documentation audit and diff checks passed. All 14 tools including `preflight_run`, three resource templates, bearer-only MCP, UI composition and independent worker lifetimes are preserved. No material findings. Corrected the stale acceptance-test count from 13 to 14 to match the explicit tool contract. Publication and exact-SHA CI/live verification remain coordinator-owned; the workflow owns the eventual plan move.
+
 ## Done Means
 
 - `aflow daemon` is an unknown command; fresh package metadata has no `aflowd` executable. Neither has a compatibility shim.
@@ -173,7 +175,7 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 - Stop and report if an actual production code path invokes the removed executable beyond the identified validation checks, or unrelated dirty files make change ownership ambiguous.
 
-### [ ] Checkpoint 4: Verify and document UI-server HTTP MCP
+### [x] Checkpoint 4: Verify and document UI-server HTTP MCP
 
 **Goal:**
 
@@ -192,12 +194,12 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 
 **Steps:**
 
-- [ ] Retain shared and server registry construction. Update stale descriptions claiming the registry backs a standalone listener; explain the UI-server HTTP mount and shared domain services.
-- [ ] Use existing `test_mcp.py` fixtures to verify all 14 names and three resource templates, authenticated discovery/read behavior, startup questions, write idempotency, revision conflicts, stop/resume, and REST parity. Retain existing coverage rather than duplicate it. Fill only identified gaps for both mount spellings and preserved auth failures.
-- [ ] Verify the actual application wired by `aflow ui` remains the same MCP-serving app via existing UI/server composition tests. Keep UI lifecycle tests proving server stop does not signal workflow processes; never carry over standalone client-EOF shutdown semantics.
-- [ ] Replace the README standalone daemon section with UI-server MCP usage: start `aflow ui` or `aflow ui --daemon`; connect to the server's URL plus `/mcp`; supply the configured server token in the Authorization header; discover projects/plans, then start and inspect runs. List all 14 tools with short purposes, explain write idempotency/revision arguments, and link the existing secret-free client template. Explain that HTTP connection loss does not stop runs, network reachability follows existing server settings, and there is no standalone stdio transport. Do not introduce new client-specific configuration keys.
-- [ ] Remove active README `[daemon]` and standalone help examples. Update architecture module listing and ownership explanation, server README, and deployment README to distinguish retained `aflowd.service` from removed executable. Update obsolete helper/test references in `docs/ui-global-config-handoff.md` without rewriting its unrelated design. Record a concise DEVLOG entry noting removal and lack of backward compatibility. Update `aflow/AGENTS.md` with the new shared helper responsibility if useful; root AGENTS remains unchanged. Other nested instructions need no changes unless their responsibilities actually change.
-- [ ] Audit current user-facing documentation for removed-command recommendations. Leave historical DEVLOG entries and prior plan ledgers intact. Audit full accumulated changes for unrelated edits.
+- [x] Retain shared and server registry construction. Update stale descriptions claiming the registry backs a standalone listener; explain the UI-server HTTP mount and shared domain services.
+- [x] Use existing `test_mcp.py` fixtures to verify all 14 names and three resource templates, authenticated discovery/read behavior, startup questions, write idempotency, revision conflicts, stop/resume, and REST parity. Retain existing coverage rather than duplicate it. Fill only identified gaps for both mount spellings and preserved auth failures.
+- [x] Verify the actual application wired by `aflow ui` remains the same MCP-serving app via existing UI/server composition tests. Keep UI lifecycle tests proving server stop does not signal workflow processes; never carry over standalone client-EOF shutdown semantics.
+- [x] Replace the README standalone daemon section with UI-server MCP usage: start `aflow ui` or `aflow ui --daemon`; connect to the server's URL plus `/mcp`; supply the configured server token in the Authorization header; discover projects/plans, then start and inspect runs. List all 14 tools with short purposes, explain write idempotency/revision arguments, and link the existing secret-free client template. Explain that HTTP connection loss does not stop runs, network reachability follows existing server settings, and there is no standalone stdio transport. Do not introduce new client-specific configuration keys.
+- [x] Remove active README `[daemon]` and standalone help examples. Update architecture module listing and ownership explanation, server README, and deployment README to distinguish retained `aflowd.service` from removed executable. Update obsolete helper/test references in `docs/ui-global-config-handoff.md` without rewriting its unrelated design. Record a concise DEVLOG entry noting removal and lack of backward compatibility. Update `aflow/AGENTS.md` with the new shared helper responsibility if useful; root AGENTS remains unchanged. Other nested instructions need no changes unless their responsibilities actually change.
+- [x] Audit current user-facing documentation for removed-command recommendations. Leave historical DEVLOG entries and prior plan ledgers intact. Audit full accumulated changes for unrelated edits.
 
 **Dependencies:** Checkpoints 1–3.
 
@@ -224,7 +226,7 @@ Preserve `aflow ui --daemon`, `--status`, `--stop`, the `aflow-app-server` entry
 1. Given normal CLI arguments, `daemon` and its former subcommands fail with status 2 and create no daemon pidfile or environment file. UI background/status/stop parsing still works.
 2. Given a fresh package script table, `aflowd` is absent and `aflow` remains. A valid deployment fixture without `bin/aflowd` passes validation; missing either retained required executable fails.
 3. Given config containing `[daemon]`, both single and split loading reject the unsupported section. Config without it retains existing defaults and workflow merge behavior.
-4. Given a valid server token, MCP discovery at either mount spelling returns exactly the 13 existing tools and three resource templates. Read results and mutations retain existing REST parity.
+4. Given a valid server token, MCP discovery at either mount spelling returns exactly the 14 existing tools and three resource templates. Read results and mutations retain existing REST parity.
 5. Given missing/wrong token or browser-cookie-only credentials, MCP rejects access. URL/body credentials remain rejected, and project/path restrictions remain enforced.
 6. Given duplicate write requests with the same idempotency key, no duplicate run/action occurs. Stale revision changes fail; valid startup answers and explicit stop/resume retain existing outcomes and lineage.
 7. Given an independently running UI worker, UI-server shutdown does not signal it; restarting or reconnecting to the server retains access to durable status. Use controlled worker fixtures, not real agent runs.

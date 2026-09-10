@@ -5,8 +5,7 @@ checkpointed Markdown plan, runs configured steps through installed agent CLIs,
 and uses the updated plan to decide what runs next.
 
 The Python package is named `aworkflow`; it installs `aflow` and `aworkflow`
-as equivalent workflow commands. It also installs the optional `aflowd`
-durable control-plane service entry point.
+as equivalent workflow commands.
 
 The remote app opens on All runs: every ongoing run across registered projects
 a separate Needs attention group for unconfirmed outcomes, and the latest 10
@@ -81,9 +80,8 @@ aflow show
 ```
 
 Configuration is split across two TOML files: `aflow.toml` contains harness
-profiles, roles, teams, prompts, controller settings, and the optional
-`[daemon]` section. `workflows.toml` contains workflow graphs and lifecycle
-defaults.
+profiles, roles, teams, prompts, and controller settings. `workflows.toml`
+contains workflow graphs and lifecycle defaults.
 
 ## Run a plan
 
@@ -187,31 +185,56 @@ configuration at launch, so later configuration edits affect only new runs.
 Normal installations ship the UI inside the `aworkflow` wheel and never need
 Node; editable development installs build the web assets automatically.
 
-## Run the lightweight local daemon
+## Use MCP through the UI server
 
-`aflow daemon` exposes the same 14 control-plane MCP tools without the remote
-web app, FastAPI, or systemd. Stdio is the default and must stay attached to its
-client; optional HTTP binds only to loopback.
-
-The read-only `preflight_run` tool reports bounded dirty-path pages before a
-launch. The `start_run` tool accepts `dirty_worktree_confirmed` and otherwise
-returns the existing startup question before any worker starts.
+`aflow ui` serves the existing authenticated HTTP MCP endpoint from the same
+FastAPI application as the dashboard. Start the server in the foreground or
+background, then connect to its configured URL plus `/mcp` (the equivalent
+`/mcp/` spelling is supported):
 
 ```bash
-aflow daemon start --foreground
-aflow daemon start --mcp-transport http --mcp-port 8765
-aflow daemon status
-aflow daemon stop
+aflow ui
+aflow ui --daemon
+aflow ui --status
+aflow ui --stop
 ```
 
-The daemon owns one repository. Each workflow runs in its own subprocess group;
-client EOF, `daemon stop`, SIGINT, and SIGTERM drain those owned children. A
-mode-0600 pidfile binds stop/status operations to the daemon's process-birth
-identity. Status reports only direct workers for the verified repository, using
-Linux procfs or a portable process-table fallback. If ownership inspection is
-unavailable or untrusted, status returns an ambiguous nonzero result instead
-of claiming zero workers. This local mode does not serve REST or the optional
-remote app's React dashboard.
+Send the configured `[server] auth_token` (or `auth_token_file`) as an
+`Authorization: Bearer <token>` header. Do not put credentials in URLs, JSON
+arguments, or browser cookies; MCP is header-only. The [secret-free client
+template](apps/aflow_app/server/aflow-control-plane.mcp.example.toml) uses an
+environment-backed token and approves write tools.
+
+The shared registry exposes these 14 tools:
+
+- `get_capabilities` — list capabilities for every allowlisted project.
+- `list_projects` — list registered projects.
+- `get_project_capabilities` — inspect one project's capabilities.
+- `list_plans` — page through a project's plans.
+- `list_runs` — page through a project's run status.
+- `get_run` — read one run's canonical state.
+- `get_run_events` — read a bounded run-event tail.
+- `get_run_context` — read bounded run context.
+- `preflight_run` — inspect launch dirtiness without allocating a run.
+- `start_run` — reserve and start a run, or return its startup question.
+- `answer_startup` — answer a pending startup question.
+- `control_run` — apply a revision-checked run control.
+- `owner_stop` — request an owner stop for a run.
+- `resume_run` — create an idempotent continuation of a run.
+
+Three read-only resource templates expose project capabilities, run state, and
+lite run context. Write tools require client approval and an idempotency key;
+`control_run` and `owner_stop` also require the expected run revision. Reusing
+an idempotency key returns the original result, while a changed request is
+rejected. `preflight_run` is read-only and reports bounded dirty-path pages
+before a launch; `start_run` preserves the existing startup-question flow.
+
+HTTP connection loss, UI restart, and `aflow ui --stop` do not stop workflow
+workers. Network reachability follows the server's existing bind and private
+Tailscale Serve settings; MCP does not open another port. There is no
+standalone `aflow daemon` command, stdio transport, or `aflowd` executable.
+The retained systemd `aflowd.service` deployment runs `aflow-app-server` and
+keeps its existing service/state paths.
 
 A minimal plan has checkpoint headings and task items:
 
@@ -336,7 +359,7 @@ normal operation:
 ```bash
 uv tool install -e . --force
 aflow run path/to/plan.md
-aflow daemon --help
+aflow ui --help
 uv run ruff check aflow apps/aflow_app/server/src
 uv run pytest -q
 ```
@@ -353,7 +376,8 @@ calls the same reusable CI workflow before uploading a package.
 The optional remote workflow-control app lives in `apps/aflow_app/` and is
 not included in the published wheel. Its Python 3.12+ server manages registered
 projects, revisioned configuration and Markdown plans, and durable runs through
-the canonical REST API and SSE stream, with MCP as an optional adapter.
+the canonical REST API and SSE stream, with the same authenticated MCP registry
+mounted at `/mcp` and `/mcp/` by the UI server.
 The web client is the interactive dashboard: typed run starts
 (plan, workflow, team, start step, max turns, bounded extra instructions),
 SSE progress with reconnect-safe snapshots, capability-gated compare-and-swap

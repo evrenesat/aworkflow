@@ -1,3 +1,6 @@
+# Start `aflow ui` or `aflow ui --daemon` first. This is the UI server's
+# authenticated HTTP MCP mount; use the configured token only through the
+# environment-backed bearer-token setting below.
 # Copy these entries into the Codex client's config.toml. Set
 # AFLOW_CONTROL_PLANE_TOKEN through the operating system's secret storage or
 # another non-repository environment source before starting Codex.

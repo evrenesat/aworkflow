@@ -11,9 +11,9 @@ import json
 import os
 from pathlib import Path
 import socket
-import subprocess
 import sys
 import time
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -273,6 +273,42 @@ class TestBackgroundLifecycle:
         assert record.port == port
         # A ready record requires the actual HTTP server to accept requests.
         assert ui_cli._probe_health("127.0.0.1", port)
+
+        def mcp_call(method: str) -> dict:
+            request = Request(
+                f"http://127.0.0.1:{port}/mcp/",
+                data=json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}
+                ).encode(),
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": "Bearer test-token-123",
+                    "Content-Type": "application/json",
+                    "MCP-Protocol-Version": "2025-11-25",
+                },
+            )
+            with urlopen(request, timeout=5) as response:
+                assert response.status == 200
+                return json.load(response)
+
+        tools = mcp_call("tools/list")["result"]["tools"]
+        assert {tool["name"] for tool in tools} == {
+            "get_capabilities",
+            "list_projects",
+            "get_project_capabilities",
+            "list_plans",
+            "list_runs",
+            "get_run",
+            "get_run_events",
+            "get_run_context",
+            "preflight_run",
+            "start_run",
+            "answer_startup",
+            "control_run",
+            "owner_stop",
+            "resume_run",
+        }
+        assert len(mcp_call("resources/templates/list")["result"]["resourceTemplates"]) == 3
 
         # A second start reports the existing server and exits successfully.
         args_again = argparse_module.Namespace(

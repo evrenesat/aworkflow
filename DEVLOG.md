@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-10 — Keep MCP on the UI server after standalone removal
+
+- The standalone `aflow daemon` command and `aflowd` executable are removed;
+  the existing authenticated MCP registry remains mounted by the UI server at
+  `/mcp` and `/mcp/`.
+- All 14 tools, three resource templates, bearer-header authentication,
+  idempotency/revision contracts, live configuration behavior, UI background
+  controls, and independently owned workflow workers remain in the existing
+  shared services.
+- The retained `aflowd.service` deployment still runs `aflow-app-server`; no
+  standalone stdio transport or compatibility alias is provided.
+
 ## 2026-09-10 — Exempt untracked lifecycle backups from confirmation (Checkpoint 1)
 
 - Phase-B branch-only preflight was classifying AFlow's newly created

@@ -443,28 +443,21 @@ finished while the UI was absent reports its real terminal result.
 workflow groups. The systemd unit manager remains the production-deployment
 adapter and the local-daemon subprocess adapter is unchanged.
 
-## Daemon control plane and direct CLI
+## UI-server MCP and direct CLI
 
-The lightweight local daemon starts with `aflow daemon start --foreground`.
-It owns one repository and exposes the shared 14-tool MCP registry over stdio;
-closing MCP input stops the daemon. Optional HTTP runs on `127.0.0.1` only and
-may be detached. `aflow daemon status` verifies the pidfile's process-birth
-identity and reports only direct `daemon-worker` children for the verified
-repository, using Linux procfs or one bounded portable process-table snapshot.
-It rechecks the daemon's process-birth identity after worker inspection and
-before printing success. If ownership inspection is unavailable or untrusted,
-status is ambiguous and returns 2 rather than claiming zero workers; it does
-not inspect every legacy run directory. `aflow daemon stop`, SIGINT, and
-SIGTERM drain each child process group with SIGTERM followed by bounded SIGKILL
-escalation. A malformed pidfile or reused PID is ambiguous and never
-authorizes a signal.
+`aflow ui` serves the shared 14-tool MCP registry through the authenticated
+FastAPI application at `/mcp` and `/mcp/`. Clients use the configured bearer
+token in the `Authorization` header; the browser session cookie is not an MCP
+credential. The endpoint also exposes the three read-only resource templates
+and shares the REST `ControlPlaneService`, project allowlist, idempotency, and
+revision semantics.
 
-The optional remote control plane is a separate, allowlisted deployment over
-the same durable AFlow run state. `aflowd.service` uses systemd workflow units,
-serves authenticated REST, React, and FastAPI `/mcp`, and survives client
-disconnects. The lightweight daemon does not serve those surfaces. FastAPI
-bearer authorization remains header-only and server-owned even though both MCP
-transports share the core registry.
+The UI process owns only its server record. Its persistent workflow units
+survive UI shutdown and client disconnects, and an explicit run control is
+required to stop a workflow. The retained `aflowd.service` systemd deployment
+uses the same server application and runs `aflow-app-server`; it is the
+deployment boundary, not a second MCP implementation. There is no standalone
+stdio or local-daemon MCP transport.
 
 A normal `aflow run ...` invocation remains the direct local/developer
 interface and keeps its existing lifecycle, plan, and resume behavior. Do not

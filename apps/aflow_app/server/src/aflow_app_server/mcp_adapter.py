@@ -1,9 +1,9 @@
-"""Compatibility re-export of the shared control-plane MCP registry.
+"""FastAPI adapter for the shared UI-server MCP registry.
 
-The tool registry now lives in ``aflow.mcp_control_plane`` so the same
-surface backs the FastAPI `/mcp` mount and the ``aflow daemon`` listener.
-This module keeps the app-specific error-code mapping and the historical
-import path (``from .mcp_adapter import create_control_plane_mcp``).
+The tool registry lives in ``aflow.mcp_control_plane`` and is mounted by the
+UI server at both ``/mcp`` and ``/mcp/``. This module keeps the app-specific
+error-code mapping and the stable import path
+(``from .mcp_adapter import create_control_plane_mcp``).
 """
 
 from __future__ import annotations
