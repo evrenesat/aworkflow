@@ -1723,6 +1723,41 @@ def _manager_budget_prelaunch_failed(run_dir: Path, prev_run: Mapping[str, objec
     )
 
 
+def _resume_plan_snapshot(value: object) -> PlanSnapshot | None:
+    """Decode the bounded checkpoint metadata needed by resume routing."""
+    if not isinstance(value, Mapping):
+        return None
+    checkpoint_name = value.get("current_checkpoint_name")
+    checkpoint_index = value.get("current_checkpoint_index")
+    snapshot_values = (
+        value.get("unchecked_checkpoint_count"),
+        value.get("current_checkpoint_unchecked_step_count"),
+        value.get("total_checkpoint_count", 0),
+    )
+    if (
+        checkpoint_name is not None
+        and not isinstance(checkpoint_name, str)
+    ) or (
+        checkpoint_index is not None
+        and (
+            not isinstance(checkpoint_index, int)
+            or isinstance(checkpoint_index, bool)
+        )
+    ) or not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in snapshot_values
+    ) or not isinstance(value.get("is_complete"), bool):
+        return None
+    return PlanSnapshot(
+        current_checkpoint_name=checkpoint_name,
+        unchecked_checkpoint_count=snapshot_values[0],
+        current_checkpoint_unchecked_step_count=snapshot_values[1],
+        is_complete=value["is_complete"],
+        total_checkpoint_count=snapshot_values[2],
+        current_checkpoint_index=checkpoint_index,
+    )
+
+
 def _completed_manager_budget_boundary_pending(prev_run: Mapping[str, object], repo_root: Path) -> bool:
     run_dir_value = prev_run.get("run_dir")
     if not isinstance(run_dir_value, str):
@@ -1822,26 +1857,8 @@ def _pending_finalized_resume_turn(
     }
     if not all(isinstance(value, bool) for value in condition_values.values()):
         return None
-    checkpoint_name = snapshot.get("current_checkpoint_name")
-    checkpoint_index = snapshot.get("current_checkpoint_index")
-    snapshot_values = (
-        snapshot.get("unchecked_checkpoint_count"),
-        snapshot.get("current_checkpoint_unchecked_step_count"),
-        snapshot.get("total_checkpoint_count", 0),
-    )
-    if (
-        checkpoint_name is not None
-        and not isinstance(checkpoint_name, str)
-    ) or (
-        checkpoint_index is not None
-        and (
-            not isinstance(checkpoint_index, int)
-            or isinstance(checkpoint_index, bool)
-        )
-    ) or not all(
-        isinstance(value, int) and not isinstance(value, bool)
-        for value in snapshot_values
-    ) or not isinstance(snapshot.get("is_complete"), bool):
+    snapshot_after = _resume_plan_snapshot(snapshot)
+    if snapshot_after is None:
         return None
     return PendingFinalizedTurn(
         source_run_dir=run_dir,
@@ -1851,14 +1868,8 @@ def _pending_finalized_resume_turn(
         selector=selector,
         active_plan_path=Path(active_plan_path),
         new_plan_path=Path(new_plan_path),
-        snapshot_after=PlanSnapshot(
-            current_checkpoint_name=checkpoint_name,
-            unchecked_checkpoint_count=snapshot_values[0],
-            current_checkpoint_unchecked_step_count=snapshot_values[1],
-            is_complete=snapshot["is_complete"],
-            total_checkpoint_count=snapshot_values[2],
-            current_checkpoint_index=checkpoint_index,
-        ),
+        snapshot_after=snapshot_after,
+        snapshot_before=_resume_plan_snapshot(result.get("snapshot_before")),
         conditions={key: bool(value) for key, value in condition_values.items()},
         chosen_transition=chosen_transition,
         chosen_transition_condition=chosen_condition,

@@ -707,6 +707,9 @@ class PendingFinalizedTurn:
     conditions: Mapping[str, bool]
     chosen_transition: str
     chosen_transition_condition: str | None = None
+    # Preserve the worker's pre-turn checkpoint across a stopped-run resume.
+    # Older result artifacts do not contain a value here and remain readable.
+    snapshot_before: PlanSnapshot | None = None
 
 
 @dataclass(frozen=True)

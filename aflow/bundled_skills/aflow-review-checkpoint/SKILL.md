@@ -11,11 +11,17 @@ Use this skill only for checkpoint-scoped review of work produced under an aflow
 
 - Load the active plan before reviewing code or history.
 - Review one checkpoint at a time, not the whole accumulated handoff.
-- Treat checkpoint/version commit prefixes such as `cp4 v01`, `cp4 v02`, and `cp5 v01` as the primary review target. Use exact SHAs as supporting evidence, not as the only way to understand state.
+- Treat checkpoint/version commit prefixes such as `cp4 v01`, `cp4 v02`, and `cp5 v01` as commit-boundary labels when they identify the pending target. Use exact SHAs as supporting evidence, not as the only way to understand state.
 - Treat `Git Tracking` as lightweight support metadata. In worktree-first plans, `Plan Branch` and `Pre-Handoff Base HEAD` may have been auto-populated by the engine, while `Last Reviewed HEAD` and `Review Log` may be absent.
 - If the latest checkpoint commit boundary is missing or ambiguous, review the current worktree state and say that the fallback was used.
 - Treat files under `plans/` as architect or reviewer-owned artifacts. If an implementation commit modifies plan files unexpectedly, reject that work unless the user explicitly asked for plan-file commits from the implementer.
 - Treat prompt-supplied concrete review context as authoritative when it is present. Use repo discovery only when the prompt leaves a target ambiguous.
+- When the controller supplies a `## Checkpoint under review` section, treat its
+  original checkpoint identity, active overlay, and worker artifact reference as
+  the pending implementation evidence. A direct operator target still takes
+  precedence over that context.
+- If that section marks the target unresolved, report the ambiguity and use an
+  explicit operator target before approving; do not invent a numeric fallback.
 - If the original plan is already effectively complete, do not repurpose this skill for whole-plan review.
 - If the checkpoint looks correct, approve that checkpoint and advance the original plan's review state.
 - If the checkpoint is not acceptable, do not approve it. Create a focused non-checkpoint fix plan for the failed checkpoint or behaviors instead of a whole-plan redo.
@@ -50,11 +56,18 @@ Selection rules:
 
 1. Read the original plan's `Git Tracking` section and checkpoint state.
 2. Confirm the current branch matches `Plan Branch`.
-3. Confirm the checkpoint under review is the next checkpoint to validate or that the user explicitly asked for a non-standard review.
+3. Confirm the checkpoint under review is the pending implementation target or
+   that the user explicitly asked for a non-standard review.
 4. Determine the review target in this order:
-   - honor an explicit user instruction such as "latest checkpoint commit"
-   - otherwise use the latest checkpoint commit recorded by the `cpN vNN` prefix
-   - otherwise review the current worktree state as a fallback
+   - honor an explicit operator checkpoint target
+   - otherwise use the controller-supplied pending target, including its
+     original heading and worker artifact reference
+   - otherwise use the next implemented-but-unapproved checkpoint identified
+     by the original plan's review markers/log and finalized worker evidence
+   - otherwise use a checkpoint commit boundary only when it represents that
+     pending checkpoint; an already-approved `cpN vNN` commit is review base
+     context, not the default target
+   - otherwise review the current worktree state and say that the fallback was used
 5. Review the checkpoint scope from that target through the current code state.
 6. Report:
    - the checkpoint/version reviewed

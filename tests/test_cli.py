@@ -5275,6 +5275,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                     "returncode": 0,
                     "active_plan_path": "/repo/plan.md",
                     "new_plan_path": "/repo/plan-cp1.md",
+                    "snapshot_before": snapshot,
                     "snapshot_after": snapshot,
                     "conditions": {
                         "DONE": False,
@@ -5311,6 +5312,9 @@ class WorkflowStartupFlowTests(unittest.TestCase):
         assert pending.turn_number == 1
         assert pending.step_name == "implement"
         assert pending.chosen_transition == "review"
+        assert pending.snapshot_before == PlanSnapshot(
+            "Checkpoint 1: Test", 1, 1, False, 1, 1
+        )
 
     def test_resume_prompt_declined_returns_none(self) -> None:
         import aflow.cli as cli_module

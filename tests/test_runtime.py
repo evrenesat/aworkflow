@@ -35,6 +35,7 @@ from aflow.workflow import (
     _run_injected_runner,
     _run_process,
     _pending_matches_scope_and_plan,
+    _append_checkpoint_review_context,
     _reconcile_repartition_plan_copies,
     _WorkflowFailureFinalizer,
 )
@@ -2387,6 +2388,538 @@ class WorkflowRuntimeTests(unittest.TestCase):
         config = WorkflowUserConfig(prompts={'p1': 'First {ORIGINAL_PLAN_PATH}', 'p2': 'Second {ACTIVE_PLAN_PATH}'})
         result = render_step_prompts(step, config, config_dir=Path('/cfg'), working_dir=Path('/cwd'), original_plan_path=Path('/orig.md'), new_plan_path=Path('/new.md'), active_plan_path=Path('/active.md'))
         assert result == 'First /orig.md\n\nSecond /active.md'
+
+    def test_reviewer_prompt_uses_active_scope_target_over_next_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            active_overlay = root / "plan-cp07-v01.md"
+            original_plan.write_text(
+                "# Plan\n\n"
+                "### [x] Checkpoint 6: Approved\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 7: Pending implementation\n"
+                "- [x] implement\n\n"
+                "### [ ] Checkpoint 8: Next\n"
+                "- [ ] implement\n",
+                encoding="utf-8",
+            )
+            run_dir = root / ".aflow" / "runs" / "current"
+            worker_turn = run_dir / "turns" / "turn-003"
+            worker_turn.mkdir(parents=True)
+            state = ControllerState(
+                last_snapshot=PlanSnapshot("Checkpoint 8: Next", 1, 1, False, 3, 3)
+            )
+            scope = ActiveImplementationScope(
+                scope_id="plan::checkpoint-7::pending",
+                original_plan_path=str(original_plan),
+                checkpoint_index=7,
+                checkpoint_name="Checkpoint 7: Pending implementation",
+                opened_turn_number=2,
+                awaiting_review=True,
+            )
+            state.active_implementation_scope = scope
+            state.implementation_attempts[scope.scope_id] = [
+                ImplementationAttempt(
+                    turn_number=3,
+                    step_name="implement",
+                    role="worker",
+                    team="default",
+                    selector="codex.worker",
+                    outcome="progress",
+                )
+            ]
+            state.turn_history.append(
+                TurnRecord(
+                    turn_number=3,
+                    step_name="implement",
+                    resolved_harness_name="codex",
+                    resolved_model_display="worker",
+                    turn_dir=worker_turn,
+                    step_role="worker",
+                )
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=run_dir,
+                original_plan_path=original_plan,
+                active_plan_path=active_overlay,
+                resume=None,
+                recovered_boundary=None,
+            )
+
+            assert "## Checkpoint under review" in prompt
+            assert "Original checkpoint: #7 — Checkpoint 7: Pending implementation" in prompt
+            assert f"Active plan/overlay: {active_overlay}" in prompt
+            assert "turns/turn-003/result.json" in prompt
+            assert "Checkpoint 6" not in prompt
+            assert "Checkpoint 8" not in prompt
+
+    def test_reviewer_prompt_recovers_pending_target_from_worker_snapshot_before(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            original_plan.write_text(
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 2: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 3: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 4: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 5: Earlier\n"
+                "- [x] finish\n\n"
+                "## Git Tracking\n\n"
+                "- Plan Branch: `test`\n"
+                "- Pre-Handoff Base HEAD: `base`\n"
+                "- Last Reviewed Checkpoint: `cp6 v01` — approved.\n\n"
+                "### Review Log\n"
+                "- Approved `cp6 v01` against the base; CP8 remains unchecked.\n\n"
+                "### [x] Checkpoint 6: Approved\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 7: Pending implementation\n"
+                "- [x] implement\n\n"
+                "### [ ] Checkpoint 8: Next\n"
+                "- [ ] implement\n",
+                encoding="utf-8",
+            )
+            source_run = root / ".aflow" / "runs" / "prior-run"
+            pending = PendingFinalizedTurn(
+                source_run_dir=source_run,
+                turn_number=4,
+                step_name="implement",
+                step_role="worker",
+                selector="codex.worker",
+                active_plan_path=original_plan,
+                new_plan_path=root / "plan-cp07-v01.md",
+                snapshot_after=PlanSnapshot(
+                    "Checkpoint 8: Next", 1, 1, False, 8, 8
+                ),
+                snapshot_before=PlanSnapshot(
+                    "Checkpoint 7: Pending implementation", 2, 1, False, 8, 7
+                ),
+                conditions={
+                    "DONE": False,
+                    "NEW_PLAN_EXISTS": True,
+                    "MAX_TURNS_REACHED": False,
+                },
+                chosen_transition="review",
+            )
+            result_path = source_run / "turns" / "turn-004" / "result.json"
+            result_path.parent.mkdir(parents=True)
+            result_path.write_text(
+                json.dumps({"snapshot_before": pending.snapshot_before.to_dict()}),
+                encoding="utf-8",
+            )
+            pending = replace(pending, snapshot_before=None)
+            state = ControllerState(
+                last_snapshot=pending.snapshot_after,
+                turns_completed=0,
+            )
+            resume = ResumeContext(
+                resumed_from_run_id="prior-run",
+                feature_branch=None,
+                worktree_path=None,
+                main_branch=None,
+                setup=(),
+                teardown=(),
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=state,
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=pending.new_plan_path,
+                resume=resume,
+                recovered_boundary=pending,
+            )
+
+            assert "Original checkpoint: #7 — Checkpoint 7: Pending implementation" in prompt
+            assert "resumed-from/prior-run/turns/turn-004/result.json" in prompt
+            assert "Checkpoint 6" not in prompt
+            assert "Checkpoint 8" not in prompt
+
+    def test_non_reviewer_prompt_does_not_receive_checkpoint_review_context(self) -> None:
+        state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, True))
+        prompt = _append_checkpoint_review_context(
+            "Implement the plan.",
+            step_role="worker",
+            state=state,
+            repo_root=Path("/repo"),
+            run_dir=Path("/repo/.aflow/runs/run"),
+            original_plan_path=Path("/repo/plan.md"),
+            active_plan_path=Path("/repo/plan.md"),
+            resume=None,
+            recovered_boundary=None,
+        )
+        assert prompt == "Implement the plan."
+
+    def test_recovered_reviewer_prompt_exposes_approved_target_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            original_plan.write_text(
+                "# Plan\n\n"
+                "- Last Reviewed Checkpoint: `cp1 v01` — approved.\n\n"
+                "### [x] Checkpoint 1: Already approved\n"
+                "- [x] finish\n\n"
+                "### [ ] Checkpoint 2: Next\n"
+                "- [ ] implement\n",
+                encoding="utf-8",
+            )
+            pending = PendingFinalizedTurn(
+                source_run_dir=root / ".aflow" / "runs" / "prior",
+                turn_number=2,
+                step_name="implement",
+                step_role="worker",
+                selector="codex.worker",
+                active_plan_path=original_plan,
+                new_plan_path=root / "plan-cp01-v02.md",
+                snapshot_after=PlanSnapshot(
+                    "Checkpoint 2: Next", 1, 1, False, 2, 2
+                ),
+                snapshot_before=PlanSnapshot(
+                    "Checkpoint 1: Already approved", 1, 1, False, 2, 1
+                ),
+                conditions={
+                    "DONE": False,
+                    "NEW_PLAN_EXISTS": False,
+                    "MAX_TURNS_REACHED": False,
+                },
+                chosen_transition="review",
+            )
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=ControllerState(last_snapshot=pending.snapshot_after),
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=original_plan,
+                resume=None,
+                recovered_boundary=pending,
+            )
+
+            assert "Pending target: unresolved" in prompt
+            assert "already recorded as approved" in prompt
+            assert "explicit operator checkpoint target" in prompt
+            assert "Original checkpoint: #1" not in prompt
+
+    def test_worker_review_loop_advances_pending_target_one_checkpoint_at_a_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            plan_path.write_text(
+                "# Plan\n\n"
+                "### [ ] Checkpoint 1: First\n"
+                "- [ ] implement first\n\n"
+                "### [ ] Checkpoint 2: Second\n"
+                "- [ ] implement second\n",
+                encoding="utf-8",
+            )
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("implement",),
+                        go=(GoTransition(to="review"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("review",),
+                        go=(
+                            GoTransition(to="implement", when="!DONE"),
+                            GoTransition(to="END", when="DONE"),
+                        ),
+                    ),
+                },
+                first_step="implement",
+            )
+            config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker",
+                    "reviewer": "codex.reviewer",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                })},
+                workflows={"review_loop": workflow},
+                prompts={
+                    "implement": "Implement {ACTIVE_PLAN_PATH}.",
+                    "review": "Review {ACTIVE_PLAN_PATH}.",
+                },
+            )
+            prompts: list[str] = []
+            turn = 0
+
+            def runner(argv, **kwargs):
+                nonlocal turn
+                turn += 1
+                prompt = _runner_prompt(argv, kwargs)
+                prompts.append(prompt)
+                if turn == 1:
+                    plan_path.write_text(
+                        "# Plan\n\n"
+                        "### [ ] Checkpoint 1: First\n"
+                        "- [x] implement first\n\n"
+                        "### [ ] Checkpoint 2: Second\n"
+                        "- [ ] implement second\n",
+                        encoding="utf-8",
+                    )
+                elif turn == 2:
+                    plan_path.write_text(
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n"
+                        "- [x] implement first\n\n"
+                        "### [ ] Checkpoint 2: Second\n"
+                        "- [ ] implement second\n",
+                        encoding="utf-8",
+                    )
+                elif turn == 3:
+                    plan_path.write_text(
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n"
+                        "- [x] implement first\n\n"
+                        "### [ ] Checkpoint 2: Second\n"
+                        "- [x] implement second\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    plan_path.write_text(
+                        "# Plan\n\n"
+                        "### [x] Checkpoint 1: First\n"
+                        "- [x] implement first\n\n"
+                        "### [x] Checkpoint 2: Second\n"
+                        "- [x] implement second\n",
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=4),
+                config,
+                "review_loop",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert len(prompts) == 4
+            assert "Original checkpoint: #1 — Checkpoint 1: First" in prompts[1]
+            assert "Original checkpoint: #2 — Checkpoint 2: Second" in prompts[3]
+            assert "Checkpoint under review" not in prompts[0]
+            assert "Checkpoint 2" not in prompts[1]
+            assert "Checkpoint 1" not in prompts[3]
+            assert "turns/turn-001/result.json" in prompts[1]
+            assert "turns/turn-003/result.json" in prompts[3]
+
+    def test_scope_less_resume_recovers_latest_worker_review_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            plan_text = (
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 2: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 3: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 4: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 5: Earlier\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 6: Approved\n"
+                "- [x] finish\n\n"
+                "### [x] Checkpoint 7: Pending implementation\n"
+                "- [x] implement\n\n"
+                "### [ ] Checkpoint 8: Next\n"
+                "- [ ] implement\n\n"
+                "## Git Tracking\n\n"
+                "- Plan Branch: `test`\n"
+                "- Pre-Handoff Base HEAD: `base`\n"
+                "- Last Reviewed Checkpoint: `cp6 v01` — approved.\n\n"
+                "### Review Log\n"
+                "- Approved `cp6 v01`; CP8 remains unchecked.\n"
+            )
+            plan_path.write_text(plan_text, encoding="utf-8")
+            active_overlay = repo_root / "plan-cp07-v01.md"
+            active_overlay.write_text(plan_text, encoding="utf-8")
+
+            source_run = repo_root / ".aflow" / "runs" / "prior-run"
+            result_path = source_run / "turns" / "turn-005" / "result.json"
+            result_path.parent.mkdir(parents=True)
+            snapshot_before = PlanSnapshot(
+                "Checkpoint 7: Pending implementation", 2, 1, False, 8, 7
+            )
+            snapshot_after = PlanSnapshot("Checkpoint 8: Next", 1, 1, False, 8, 8)
+            (source_run / "run.json").write_text(
+                json.dumps({"active_turn": 5, "turns_completed": 5}),
+                encoding="utf-8",
+            )
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "step_name": "implement",
+                        "step_role": "worker",
+                        "snapshot_before": snapshot_before.to_dict(),
+                        "snapshot_after": snapshot_after.to_dict(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            workflow = WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("implement",),
+                        go=(GoTransition(to="review"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("review",),
+                        go=(GoTransition(to="END"),),
+                    ),
+                },
+                first_step="implement",
+            )
+            config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker",
+                    "reviewer": "codex.reviewer",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                })},
+                workflows={"resume_review": workflow},
+                prompts={
+                    "implement": "Implement {ACTIVE_PLAN_PATH}.",
+                    "review": "Review {ACTIVE_PLAN_PATH}.",
+                },
+            )
+            prompts: list[str] = []
+
+            def runner(argv, **kwargs):
+                prompts.append(_runner_prompt(argv, kwargs))
+                completed_plan_text = plan_text.replace(
+                    "### [ ] Checkpoint 8: Next\n- [ ] implement",
+                    "### [x] Checkpoint 8: Next\n- [x] implement",
+                )
+                plan_path.write_text(completed_plan_text, encoding="utf-8")
+                active_overlay.write_text(completed_plan_text, encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "reviewed", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=1,
+                    keep_runs=1,
+                    start_step="review",
+                ),
+                config,
+                "resume_review",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+                resume=ResumeContext(
+                    resumed_from_run_id="prior-run",
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                    active_plan_path=active_overlay,
+                    interrupted_step_name="review",
+                ),
+            )
+
+            assert result.turns_completed == 1
+            assert len(prompts) == 1
+            assert "Original checkpoint: #7 — Checkpoint 7: Pending implementation" in prompts[0]
+            assert f"Active plan/overlay: {active_overlay}" in prompts[0]
+            assert "resumed-from/prior-run/turns/turn-005/result.json" in prompts[0]
+            assert "Checkpoint 6" not in prompts[0]
+            assert "Checkpoint 8" not in prompts[0]
+            turn_result = json.loads(
+                (result.run_dir / "turns" / "turn-001" / "result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert turn_result["step_role"] == "reviewer"
+            assert not (result.run_dir / "turns" / "turn-002").exists()
+
+    def test_scope_less_resume_without_worker_evidence_exposes_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_plan = root / "plan.md"
+            original_plan.write_text(
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: Earlier\n"
+                "- [x] finish\n\n"
+                "### [ ] Checkpoint 2: Next\n"
+                "- [ ] implement\n",
+                encoding="utf-8",
+            )
+            active_overlay = root / "plan-cp01-v01.md"
+            active_overlay.write_text(
+                original_plan.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            source_run = root / ".aflow" / "runs" / "prior-run"
+            (source_run / "run.json").parent.mkdir(parents=True)
+            (source_run / "run.json").write_text(
+                json.dumps({"active_turn": 2, "turns_completed": 2}),
+                encoding="utf-8",
+            )
+            result_path = source_run / "turns" / "turn-002" / "result.json"
+            result_path.parent.mkdir(parents=True)
+            result_path.write_text(
+                json.dumps({"status": "completed", "step_role": "reviewer"}),
+                encoding="utf-8",
+            )
+
+            prompt = _append_checkpoint_review_context(
+                "Review the active plan.",
+                step_role="reviewer",
+                state=ControllerState(
+                    last_snapshot=PlanSnapshot("Checkpoint 2: Next", 1, 1, False, 2, 2)
+                ),
+                repo_root=root,
+                run_dir=root / ".aflow" / "runs" / "resumed",
+                original_plan_path=original_plan,
+                active_plan_path=active_overlay,
+                resume=ResumeContext(
+                    resumed_from_run_id="prior-run",
+                    feature_branch=None,
+                    worktree_path=None,
+                    main_branch=None,
+                    setup=(),
+                    teardown=(),
+                ),
+                recovered_boundary=None,
+            )
+
+            assert "Pending target: unresolved" in prompt
+            assert "no finalized worker result" in prompt
+            assert f"Active plan/overlay: {active_overlay}" in prompt
+            assert "explicit operator checkpoint target" in prompt
+            assert "Original checkpoint:" not in prompt
 
     def test_new_plan_path_increments_version_for_checkpoint_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

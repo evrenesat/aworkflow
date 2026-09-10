@@ -3371,6 +3371,525 @@ def render_step_prompts(
     return "\n\n".join(parts)
 
 
+@dataclass(frozen=True)
+class _CheckpointReviewPromptTarget:
+    checkpoint_index: int | None
+    checkpoint_name: str | None
+    worker_artifact_path: str | None
+    source: str
+    ambiguity: str | None = None
+
+
+@dataclass(frozen=True)
+class _RecoveredWorkerReviewEvidence:
+    source_run_dir: Path
+    turn_number: int
+    snapshot_before: PlanSnapshot | None
+
+
+_APPROVAL_TARGET_AFTER_RE = re.compile(
+    r"\b(?:approved|approval\s+commit|reviewed\s+through)\b"
+    r"[\s:=-]*`?\s*#?\s*"
+    r"(?:cp(?P<cp>\d+)(?:\s+v\d+)?|checkpoint\s+#?\s*(?P<checkpoint>\d+))\b",
+    re.IGNORECASE,
+)
+_APPROVAL_TARGET_BEFORE_RE = re.compile(
+    r"`?\s*(?:cp(?P<cp>\d+)(?:\s+v\d+)?|"
+    r"checkpoint\s+#?\s*(?P<checkpoint>\d+))\b"
+    r"[^.\n]{0,48}\bapproved\b",
+    re.IGNORECASE,
+)
+
+
+def _snapshot_from_review_result(value: object) -> PlanSnapshot | None:
+    """Decode only the checkpoint fields needed from a recovered result."""
+    if not isinstance(value, Mapping):
+        return None
+    checkpoint_name = value.get("current_checkpoint_name")
+    checkpoint_index = value.get("current_checkpoint_index")
+    counts = (
+        value.get("unchecked_checkpoint_count"),
+        value.get("current_checkpoint_unchecked_step_count"),
+        value.get("total_checkpoint_count", 0),
+    )
+    if (
+        checkpoint_name is not None
+        and not isinstance(checkpoint_name, str)
+    ) or (
+        checkpoint_index is not None
+        and (
+            not isinstance(checkpoint_index, int)
+            or isinstance(checkpoint_index, bool)
+        )
+    ) or not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in counts
+    ) or not isinstance(value.get("is_complete"), bool):
+        return None
+    return PlanSnapshot(
+        current_checkpoint_name=checkpoint_name,
+        unchecked_checkpoint_count=counts[0],
+        current_checkpoint_unchecked_step_count=counts[1],
+        is_complete=value["is_complete"],
+        total_checkpoint_count=counts[2],
+        current_checkpoint_index=checkpoint_index,
+    )
+
+
+def _recovered_worker_snapshot_before(
+    pending: PendingFinalizedTurn,
+) -> PlanSnapshot | None:
+    """Use carried metadata, with a bounded legacy result-artifact fallback."""
+    if pending.snapshot_before is not None:
+        return pending.snapshot_before
+    result_path = (
+        pending.source_run_dir
+        / "turns"
+        / f"turn-{pending.turn_number:03d}"
+        / "result.json"
+    )
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(result, Mapping):
+        return None
+    return _snapshot_from_review_result(result.get("snapshot_before"))
+
+
+def _review_target_from_snapshot(
+    snapshot_before: PlanSnapshot | None,
+    *,
+    original_plan_path: Path,
+    worker_artifact_path: str,
+    source: str,
+) -> _CheckpointReviewPromptTarget | None:
+    """Validate one recovered worker snapshot against the original plan."""
+    try:
+        plan_text = original_plan_path.read_text(encoding="utf-8")
+        parsed = load_plan_tolerant(original_plan_path).parsed_plan
+    except (OSError, UnicodeError, PlanParseError):
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity=(
+                "the original plan could not be read as checkpointed review state"
+            ),
+        )
+    if not parsed.sections:
+        return None
+    if snapshot_before is None:
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity=(
+                "the recovered worker result has no usable snapshot_before checkpoint"
+            ),
+        )
+    checkpoint_index = snapshot_before.current_checkpoint_index
+    if checkpoint_index is None or not 1 <= checkpoint_index <= len(parsed.sections):
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity=(
+                "the recovered worker result does not identify one existing checkpoint"
+            ),
+        )
+    section = parsed.sections[checkpoint_index - 1]
+    if (
+        snapshot_before.current_checkpoint_name is not None
+        and snapshot_before.current_checkpoint_name != section.name
+    ):
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=source,
+            ambiguity="the result checkpoint name disagrees with the original plan",
+        )
+    approved_index = _latest_approved_checkpoint_index(plan_text)
+    if approved_index is not None and checkpoint_index <= approved_index:
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=worker_artifact_path,
+            source=f"{source} and review state",
+            ambiguity=(
+                f"checkpoint #{checkpoint_index} is already recorded as approved; "
+                "an explicit target is required to review it again"
+            ),
+        )
+    return _CheckpointReviewPromptTarget(
+        checkpoint_index=checkpoint_index,
+        checkpoint_name=section.name,
+        worker_artifact_path=worker_artifact_path,
+        source=f"{source} and review state",
+    )
+
+
+def _latest_approved_checkpoint_index(plan_text: str) -> int | None:
+    """Read approval markers without treating implementation boxes as approval."""
+    approved_indices: list[int] = []
+    for line in plan_text.splitlines():
+        marker = re.search(
+            r"^\s*(?:[-*]\s*)?Last Reviewed Checkpoint:\s*`?\s*"
+            r"(?:cp(?P<cp>\d+)(?:\s+v\d+)?|checkpoint\s+(?P<checkpoint>\d+))",
+            line,
+            re.IGNORECASE,
+        )
+        if marker is not None:
+            approved_indices.append(int(marker.group("cp") or marker.group("checkpoint")))
+
+    review_log_entries: list[str] = []
+    try:
+        metadata = parse_git_tracking_metadata(plan_text)
+    except ValueError:
+        metadata = None
+    if metadata is not None:
+        review_log_entries.extend(metadata.review_log_entries)
+    in_review_log = False
+    for line in plan_text.splitlines():
+        if re.match(r"^\s*#{2,3}\s+Review Log\b", line, re.IGNORECASE):
+            in_review_log = True
+            continue
+        if in_review_log and re.match(r"^\s*#{1,3}\s+", line):
+            in_review_log = False
+        if in_review_log and line.strip().startswith("-"):
+            review_log_entries.append(line.strip().lstrip("-").strip())
+
+    for entry in review_log_entries:
+        normalized = entry.lower()
+        if (
+            not re.search(r"\bapproved\b|\bapproval commit\b|\breviewed through\b", normalized)
+            or re.search(r"\b(?:not approved|never approved)\b", normalized)
+        ):
+            continue
+        matches = [
+            int(match.group("cp") or match.group("checkpoint"))
+            for match in _APPROVAL_TARGET_AFTER_RE.finditer(entry)
+        ]
+        if not matches:
+            matches = [
+                int(match.group("cp") or match.group("checkpoint"))
+                for match in _APPROVAL_TARGET_BEFORE_RE.finditer(entry)
+            ]
+        approved_indices.extend(matches)
+    return max(approved_indices) if approved_indices else None
+
+
+def _review_worker_artifact_reference(
+    state: ControllerState,
+    *,
+    attempt: ImplementationAttempt,
+    repo_root: Path,
+    run_dir: Path,
+    resumed_from_run_id: str | None = None,
+) -> str:
+    """Return a stable reference to the selected worker's result metadata."""
+    for record in reversed(state.turn_history):
+        if (
+            record.turn_number == attempt.turn_number
+            and record.step_role == "worker"
+            and record.turn_dir is not None
+        ):
+            try:
+                return str((record.turn_dir / "result.json").relative_to(repo_root))
+            except ValueError:
+                break
+    current_result = (
+        run_dir / "turns" / f"turn-{attempt.turn_number:03d}" / "result.json"
+    )
+    if current_result.is_file():
+        try:
+            return str(current_result.relative_to(repo_root))
+        except ValueError:
+            pass
+    source_run_id = resumed_from_run_id
+    prefix = f"resumed-from/{source_run_id}/" if source_run_id else ""
+    return f"{prefix}turns/turn-{attempt.turn_number:03d}/result.json"
+
+
+def _recovered_review_target(
+    pending: PendingFinalizedTurn,
+    *,
+    original_plan_path: Path,
+    worker_artifact_path: str,
+) -> _CheckpointReviewPromptTarget | None:
+    """Resolve a legacy pending worker only when its review state is clear."""
+    if pending.step_role != "worker":
+        return None
+    return _review_target_from_snapshot(
+        _recovered_worker_snapshot_before(pending),
+        original_plan_path=original_plan_path,
+        worker_artifact_path=worker_artifact_path,
+        source="recovered finalized worker metadata",
+    )
+
+
+_RECOVERED_REVIEW_RESULT_SCAN_LIMIT = 64
+
+
+def _resume_source_run_dir(
+    repo_root: Path,
+    resume: ResumeContext,
+) -> Path | None:
+    run_id = resume.resumed_from_run_id
+    run_id_path = Path(run_id)
+    if not run_id or run_id in {".", ".."} or run_id_path.name != run_id:
+        return None
+    source_run_dir = repo_root / ".aflow" / "runs" / run_id
+    if source_run_dir.is_symlink() or not source_run_dir.is_dir():
+        return None
+    return source_run_dir
+
+
+def _recovered_review_turn_numbers(
+    source_run_dir: Path,
+    metadata: Mapping[str, object] | None,
+) -> tuple[int, ...]:
+    known_turns: list[int] = []
+    if metadata is not None:
+        for key in ("active_turn", "turns_completed"):
+            value = metadata.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                known_turns.append(value)
+    if known_turns:
+        newest_turn = max(known_turns)
+        return tuple(
+            range(
+                newest_turn,
+                max(0, newest_turn - _RECOVERED_REVIEW_RESULT_SCAN_LIMIT),
+                -1,
+            )
+        )
+    turns_dir = source_run_dir / "turns"
+    try:
+        children = list(turns_dir.iterdir())
+    except OSError:
+        return ()
+    turn_numbers = []
+    for child in children:
+        match = re.fullmatch(r"turn-(\d+)", child.name)
+        if match is not None and child.is_dir() and not child.is_symlink():
+            turn_numbers.append(int(match.group(1)))
+    return tuple(sorted(turn_numbers, reverse=True)[:_RECOVERED_REVIEW_RESULT_SCAN_LIMIT])
+
+
+def _latest_scope_less_worker_evidence(
+    *,
+    repo_root: Path,
+    resume: ResumeContext,
+) -> _RecoveredWorkerReviewEvidence | None:
+    """Find only the latest finalized worker result in a predecessor run."""
+    source_run_dir = _resume_source_run_dir(repo_root, resume)
+    if source_run_dir is None:
+        return None
+    metadata = load_run_json(source_run_dir)
+    for turn_number in _recovered_review_turn_numbers(source_run_dir, metadata):
+        result_path = (
+            source_run_dir
+            / "turns"
+            / f"turn-{turn_number:03d}"
+            / "result.json"
+        )
+        if result_path.parent.is_symlink() or result_path.is_symlink():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("step_role") != "worker":
+            continue
+        if result.get("status") in {"starting", "running"}:
+            continue
+        return _RecoveredWorkerReviewEvidence(
+            source_run_dir=source_run_dir,
+            turn_number=turn_number,
+            snapshot_before=_snapshot_from_review_result(
+                result.get("snapshot_before")
+            ),
+        )
+    return None
+
+
+def _scope_less_recovered_review_target(
+    *,
+    repo_root: Path,
+    resume: ResumeContext,
+    original_plan_path: Path,
+) -> _CheckpointReviewPromptTarget | None:
+    """Resolve review evidence when legacy resume did not persist a scope."""
+    try:
+        if not load_plan_tolerant(original_plan_path).parsed_plan.sections:
+            return None
+    except (OSError, UnicodeError, PlanParseError):
+        return None
+    evidence = _latest_scope_less_worker_evidence(
+        repo_root=repo_root,
+        resume=resume,
+    )
+    source_run_id = resume.resumed_from_run_id
+    if evidence is None:
+        return _CheckpointReviewPromptTarget(
+            checkpoint_index=None,
+            checkpoint_name=None,
+            worker_artifact_path=None,
+            source="scope-less resumed predecessor metadata",
+            ambiguity=(
+                "no finalized worker result was found with usable predecessor evidence"
+            ),
+        )
+    worker_artifact_path = (
+        f"resumed-from/{source_run_id}/turns/"
+        f"turn-{evidence.turn_number:03d}/result.json"
+    )
+    return _review_target_from_snapshot(
+        evidence.snapshot_before,
+        original_plan_path=original_plan_path,
+        worker_artifact_path=worker_artifact_path,
+        source="scope-less resumed predecessor worker result",
+    )
+
+
+def _render_checkpoint_review_context(
+    *,
+    state: ControllerState,
+    repo_root: Path,
+    run_dir: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    resume: ResumeContext | None,
+    recovered_boundary: PendingFinalizedTurn | None,
+) -> str:
+    """Render controller-owned pending-target evidence for a reviewer."""
+    scope = state.active_implementation_scope
+    target: _CheckpointReviewPromptTarget | None = None
+    attempts: list[ImplementationAttempt] = []
+    if scope is not None and scope.awaiting_review:
+        attempts = state.implementation_attempts.get(scope.scope_id, [])
+        worker_attempts = [item for item in attempts if item.role == "worker"]
+        if worker_attempts:
+            attempt = worker_attempts[-1]
+            target = _CheckpointReviewPromptTarget(
+                checkpoint_index=scope.checkpoint_index,
+                checkpoint_name=scope.checkpoint_name,
+                worker_artifact_path=_review_worker_artifact_reference(
+                    state,
+                    attempt=attempt,
+                    repo_root=repo_root,
+                    run_dir=run_dir,
+                    resumed_from_run_id=(
+                        resume.resumed_from_run_id if resume is not None else None
+                    ),
+                ),
+                source="active implementation scope awaiting review",
+            )
+        else:
+            target = _CheckpointReviewPromptTarget(
+                checkpoint_index=scope.checkpoint_index,
+                checkpoint_name=scope.checkpoint_name,
+                worker_artifact_path=None,
+                source="active implementation scope awaiting review",
+                ambiguity="the scope has no recorded worker attempt",
+            )
+    elif (
+        recovered_boundary is not None
+        and recovered_boundary.step_role == "worker"
+        and state.turns_completed == 0
+    ):
+        target = _recovered_review_target(
+            recovered_boundary,
+            original_plan_path=original_plan_path,
+            worker_artifact_path=(
+                f"resumed-from/{recovered_boundary.source_run_dir.name}/"
+                f"turns/turn-{recovered_boundary.turn_number:03d}/result.json"
+            ),
+        )
+    elif (
+        scope is None
+        and recovered_boundary is None
+        and resume is not None
+        and state.turns_completed == 0
+    ):
+        target = _scope_less_recovered_review_target(
+            repo_root=repo_root,
+            resume=resume,
+            original_plan_path=original_plan_path,
+        )
+
+    if target is None:
+        return ""
+    if (
+        target.ambiguity is None
+        and (target.checkpoint_index is None or target.checkpoint_name is None)
+    ):
+        target = replace(
+            target,
+            ambiguity="the active scope has no complete original checkpoint identity",
+        )
+    lines = ["## Checkpoint under review"]
+    if target.ambiguity is not None:
+        lines.append(
+            "- Pending target: unresolved from "
+            f"{target.source}; {target.ambiguity}."
+        )
+        if target.worker_artifact_path is not None:
+            lines.append(f"- Worker artifact reference: {target.worker_artifact_path}")
+        if active_plan_path != original_plan_path:
+            lines.append(f"- Active plan/overlay: {active_plan_path}")
+        lines.append(
+            "- An explicit operator checkpoint target may resolve this ambiguity; "
+            "do not infer one from the newest approval or current next checkpoint."
+        )
+        return "\n".join(lines)
+    if target.checkpoint_index is None or target.checkpoint_name is None:
+        return ""
+    lines.extend([
+        f"- Original checkpoint: #{target.checkpoint_index} — {target.checkpoint_name}",
+        f"- Original plan: {original_plan_path}",
+        f"- Review evidence: {target.source}",
+    ])
+    if active_plan_path != original_plan_path:
+        lines.append(f"- Active plan/overlay: {active_plan_path}")
+    if target.worker_artifact_path is not None:
+        lines.append(f"- Worker artifact reference: {target.worker_artifact_path}")
+    return "\n".join(lines)
+
+
+def _append_checkpoint_review_context(
+    prompt: str,
+    *,
+    step_role: str,
+    state: ControllerState,
+    repo_root: Path,
+    run_dir: Path,
+    original_plan_path: Path,
+    active_plan_path: Path,
+    resume: ResumeContext | None,
+    recovered_boundary: PendingFinalizedTurn | None,
+) -> str:
+    if step_role != "reviewer":
+        return prompt
+    context = _render_checkpoint_review_context(
+        state=state,
+        repo_root=repo_root,
+        run_dir=run_dir,
+        original_plan_path=original_plan_path,
+        active_plan_path=active_plan_path,
+        resume=resume,
+        recovered_boundary=recovered_boundary,
+    )
+    return "\n\n".join((prompt, context)) if context else prompt
+
+
 def _rewrite_plan_branch_text(text: str, branch_name: str) -> str:
     return _PLAN_BRANCH_LINE_RE.sub(
         lambda match: f"{match.group(1)}{branch_name}{match.group(3)}",
@@ -6104,15 +6623,33 @@ def run_workflow(
         and resume.override_source_run_dir.parent.resolve()
         == (config.repo_root / ".aflow" / "runs").resolve()
     )
+    preserved_resume_run_ids: set[str] = set()
+    if resume is not None and (
+        resume.resume_relocation is not None
+        or resume.resume_team_override is not None
+    ):
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if (
+        resume is not None
+        and resume.active_implementation_scope is None
+        and resume.pending_finalized_turn is None
+        and current_step_name in wf.steps
+        and wf.steps[current_step_name].role == "reviewer"
+    ):
+        source_run_dir = _resume_source_run_dir(config.repo_root, resume)
+        if source_run_dir is not None:
+            preserved_resume_run_ids.add(source_run_dir.name)
     run_paths = create_run_paths(
         replace(
             config,
             keep_runs=(config.keep_runs + 1) if preserve_resume_override_source else config.keep_runs,
             reserved_run_id=reserved_run_id,
         ),
-        **({"preserved_run_ids": frozenset({resume.resumed_from_run_id})}
-           if resume is not None and (resume.resume_relocation is not None or resume.resume_team_override is not None)
-           else {}),
+        **(
+            {"preserved_run_ids": frozenset(preserved_resume_run_ids)}
+            if preserved_resume_run_ids
+            else {}
+        ),
     )
     journal = EventJournal(run_paths.run_dir)
     if launch_result.created:
@@ -10245,6 +10782,21 @@ def run_workflow(
                     new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
                     active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
                 )
+                user_prompt = _append_checkpoint_review_context(
+                    user_prompt,
+                    step_role=step.role,
+                    state=state,
+                    repo_root=run_paths.repo_root,
+                    run_dir=run_paths.run_dir,
+                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    resume=resume,
+                    recovered_boundary=(
+                        replayed_boundary
+                        if state.turns_completed == 0
+                        else None
+                    ),
+                )
                 if config.extra_instructions:
                     extra_text = " ".join(config.extra_instructions).strip()
                     user_prompt = "\n\n".join((user_prompt, extra_text))
@@ -10548,6 +11100,22 @@ def run_workflow(
                     original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
                     new_plan_path=_exec_plan_path(new_plan_path, exec_ctx),
                     active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                )
+
+                user_prompt = _append_checkpoint_review_context(
+                    user_prompt,
+                    step_role=step.role,
+                    state=state,
+                    repo_root=run_paths.repo_root,
+                    run_dir=run_paths.run_dir,
+                    original_plan_path=_exec_plan_path(original_plan_path, exec_ctx),
+                    active_plan_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    resume=resume,
+                    recovered_boundary=(
+                        replayed_boundary
+                        if state.turns_completed == 0
+                        else None
+                    ),
                 )
 
                 if config.extra_instructions:
