@@ -4,6 +4,7 @@ import * as api from '../api'
 import type { PlanDocument, ProjectInfo } from '../types'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { useHeaderSlots } from './HeaderSlots'
+import { TextEditor } from './TextEditor'
 
 interface PlanPanelProps {
   project: ProjectInfo
@@ -292,8 +293,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
             </div>
           </div>
         )}
-        <textarea
-          className="input mono plan-editor-textarea"
+        <TextEditor
+          className="mono plan-editor-textarea"
           aria-label="Plan content"
           value={content}
           onChange={(event) => setContent(event.target.value)}

@@ -56,6 +56,7 @@ export function Combobox({
   const [open, setOpen] = useState(false)
   const [text, setText] = useState<string | null>(null)
   const [activeIndex, setActiveIndex] = useState(-1)
+  const [listPlacement, setListPlacement] = useState<'below' | 'above'>('below')
 
   const labelForOption = optionLabel ?? ((option: string) => option)
   const visibleLabels = options.map(labelForOption)
@@ -79,11 +80,20 @@ export function Combobox({
     setOpen(false)
   }
 
+  function openFromUser() {
+    const rect = inputRef.current?.getBoundingClientRect()
+    const viewportHeight = typeof window === 'undefined' ? Number.POSITIVE_INFINITY : window.innerHeight
+    const roomBelow = rect ? viewportHeight - rect.bottom : viewportHeight
+    const roomAbove = rect?.top ?? viewportHeight
+    setListPlacement(roomBelow < Math.min(220, viewportHeight - 24) && roomAbove > roomBelow ? 'above' : 'below')
+    setOpen(true)
+  }
+
   function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
       if (!open) {
-        setOpen(true)
+        openFromUser()
         setActiveIndex(0)
         return
       }
@@ -134,13 +144,13 @@ export function Combobox({
           placeholder={placeholder}
           value={showResolved ? resolvedDisplay! : !open && text === null && optionLabel ? labelForOption(value) : query}
           onFocus={() => {
-            setOpen(true)
+            openFromUser()
             setActiveIndex(-1)
           }}
           onChange={(event) => {
             setText(event.target.value)
             if (allowCustom) onChange(event.target.value)
-            setOpen(true)
+            openFromUser()
             setActiveIndex(-1)
           }}
           onBlur={() => {
@@ -156,7 +166,7 @@ export function Combobox({
         {showResolved && resolvedBadge && <span className="text-xs text-dim combobox-badge">{resolvedBadge}</span>}
       </div>
       {expanded && (
-        <ul id={listboxId} role="listbox" aria-label={`${label} suggestions`} className="combobox-listbox">
+        <ul id={listboxId} role="listbox" aria-label={`${label} suggestions`} className={`combobox-listbox ${listPlacement === 'above' ? 'combobox-listbox-above' : ''}`}>
           {defaultOption && showDefaultRow && (
             <li
               key={defaultOption.value}

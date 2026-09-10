@@ -1366,3 +1366,37 @@ Final verification: web tests (213), all server tests including Chromium layout 
 - Verification: the focused recovery test, full 295-test web suite, production
   build, two disposable Chromium modules, and `git diff --check` passed. No
   live configuration, publication, CI or live activation changed.
+
+## 2026-09-10 — Responsive editor checkpoint 4
+
+- Added a shared native text editor for settings, skills, prompts, plans and
+  connection TOML. It defaults to soft visual wrapping with a labelled
+  `Wrap lines` control; disabling wrapping keeps horizontal overflow inside
+  the editor, while native vertical scrolling, desktop resize and exact draft
+  bytes remain owned by the existing callers.
+- Reflowed profile rows into readable name/model/effort columns with compact
+  stacked fields, and kept combobox suggestions bounded and lower-edge safe.
+  Existing draft, conflict, partial-save, acknowledgement and Undo paths stay
+  in ordinary document flow.
+- Verification: the exact CP4 web suite passed 120 tests, the full web suite
+  passed 297 tests, the production build passed, the Settings Chromium module
+  passed 3 tests including 20,000-character Markdown/TOML and partial-save
+  journeys, and `git diff --check` passed. No publication, CI, or live
+  activation was performed.
+
+## 2026-09-10 — CP4 native editor overlay repair
+
+- Moved the shared `Wrap lines` control into normal document flow and removed
+  the overlay-only textarea padding. Skills places the shared toolbar beside
+  its existing title/`SKILL.md` label, leaving the native textarea as the sole
+  editor scroll and hit-test surface while preserving the 44px control and
+  16px editor text requirements.
+- Extended the disposable Skills Chromium journey to verify 1280×720 and
+  390×844 geometry, actual client editing height, toolbar/editor non-overlap,
+  post-scroll hit-testing, caret movement, exact wrap-toggle bytes, saved
+  content, and retained partial-save acknowledgements. Inspected the captured
+  dark-theme scrolled-editor screenshot.
+- Verification: full web suite (297 tests), production build, both required
+  Chromium modules (4 tests), and `git diff --check` passed. Original CP4
+  approval remains with the reviewer; no publication, CI, or live activation
+  was performed.

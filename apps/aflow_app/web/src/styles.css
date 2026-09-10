@@ -995,6 +995,66 @@ input::placeholder, textarea::placeholder {
   overflow-x: auto;
 }
 
+/* Text editors keep the document as the vertical scroll owner. Wrapping is a
+   visual choice only; the native textarea always owns its own overflow. */
+.text-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  min-width: 0;
+}
+
+.text-editor-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  min-height: var(--tap-target);
+  align-items: center;
+  padding-inline: var(--spacing-xs);
+  border-radius: var(--radius-sm);
+}
+
+.text-editor-wrap-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  min-height: var(--tap-target);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.text-editor-wrap-toggle input {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.text-editor-input {
+  width: 100%;
+  min-width: 0;
+  height: clamp(18rem, 50dvh, 36rem);
+  min-height: 18rem;
+  padding: var(--spacing-md);
+  resize: vertical;
+  font-size: 16px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.text-editor-input-nowrap {
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.text-editor-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
 .validation-report {
   display: flex;
   flex-direction: column;
@@ -1122,15 +1182,25 @@ input::placeholder, textarea::placeholder {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-xs);
-  max-height: 220px;
+  width: 100%;
+  max-inline-size: calc(100vw - 24px);
+  max-height: min(220px, calc(100dvh - 24px));
   /* Combobox options stay bounded so keyboard/touch selection remains local. */
   overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
 }
 
+.combobox-listbox-above {
+  top: auto;
+  bottom: 100%;
+}
+
 .combobox-option {
+  min-height: var(--tap-target);
   padding: var(--spacing-xs) var(--spacing-sm);
   flex-direction: row;
   justify-content: space-between;
@@ -1246,6 +1316,87 @@ input::placeholder, textarea::placeholder {
 .global-run-row { width: 100%; display: flex; flex-direction: column; gap: var(--spacing-xs); text-align: left; color: var(--color-text); cursor: pointer; overflow-wrap: anywhere; }
 .global-settings textarea { min-width: 0; width: 100%; }
 
+.text-editor-field { display: flex; flex-direction: column; gap: var(--spacing-xs); min-width: 0; }
+
+.skill-editor-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.skill-editor-title {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.skill-editor-title h3,
+.skill-editor-title p {
+  overflow-wrap: anywhere;
+}
+
+.skill-editor-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  min-height: var(--tap-target);
+  flex: 0 1 auto;
+}
+
+.skill-editor-control .text-editor-label {
+  white-space: nowrap;
+}
+
+.skill-editor-control .text-editor-toolbar {
+  flex: 0 0 auto;
+  padding-inline: 0;
+}
+
+.profile-editor-row {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.8fr) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--spacing-md);
+  min-width: 0;
+  margin-block: var(--spacing-md);
+}
+
+.profile-editor-name,
+.profile-editor-field {
+  min-width: 0;
+}
+
+.profile-editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.profile-editor-name {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  overflow-wrap: anywhere;
+}
+
+.profile-editor-note {
+  grid-column: 2 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.profile-editor-new-fields {
+  grid-column: 2 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-md);
+  min-width: 0;
+}
+
 .app-header > *,
 .app-header-row-two > *,
 .workspace-main > *,
@@ -1296,10 +1447,15 @@ input::placeholder, textarea::placeholder {
 .compact-row:has(.content-button):hover { background: var(--color-surface-hover); border-color: var(--color-primary); }
 
 @media (max-width: 640px) {
+  .input, select, textarea { font-size: 16px; }
   .config-tabs { flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; }
   .config-tabs .btn { scroll-snap-align: start; white-space: nowrap; }
   .compact-row { flex-wrap: wrap; }
   .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
+  .profile-editor-row { grid-template-columns: minmax(0, 1fr); }
+  .profile-editor-note,
+  .profile-editor-new-fields { grid-column: 1; }
+  .profile-editor-new-fields { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* The document owns ordinary vertical flow. Only wide navigation gets a

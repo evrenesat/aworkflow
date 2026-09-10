@@ -4,6 +4,7 @@ import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { TemplateVariablesHelp } from './TemplateVariablesHelp'
 import { formatMachineChoice, formatMachineLabel } from '../label'
+import { TextEditor } from './TextEditor'
 
 type ChangeFn = (update: (value: GuidedFormProjection) => void) => void
 
@@ -41,7 +42,7 @@ function NamedPromptCard({ name, text, displayName, usages, templateVariables, r
     ) : (
       <>
         <label>Prompt key <input className="input" value={displayName} aria-label="Prompt key" onChange={e => rename(name, e.target.value)} /></label>
-        <label>Prompt text <textarea className="input" rows={7} aria-label="Prompt text" value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></label>
+        <div className="text-editor-field"><span className="text-editor-label">Prompt text</span><TextEditor rows={7} aria-label="Prompt text" value={text} onChange={e => change(value => { value.prompts![name] = e.target.value })} /></div>
         <TemplateVariablesHelp variables={templateVariables} context="named" />
         {referenced
           ? <details className="prompt-usages">
@@ -120,7 +121,7 @@ export function PromptsSettings({ draft, change, rename, names, deleted, onDelet
     <div className="settings-fields">
       {role && <>
         <span>{role in map ? 'Explicit override' : team ? 'Inherited global text' : 'Default role prompt'}</span>
-        <textarea className="input" rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} />
+        <div className="text-editor-field"><span className="text-editor-label">Role prompt text</span><TextEditor rows={7} aria-label="Role prompt text" value={map[role] ?? inherited ?? ''} onChange={e => setRoleText(e.target.value)} /></div>
         <TemplateVariablesHelp variables={draft.template_variables} context="role" />
         {role in map && <button className="btn btn-secondary" onClick={() => setRoleText(null)}>Remove override</button>}
         {role in map && <details><summary>Move override</summary>

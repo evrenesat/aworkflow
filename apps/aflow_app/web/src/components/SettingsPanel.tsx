@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../api'
 import * as api from '../api'
 import type { SettingsResponse } from '../types'
+import { TextEditor } from './TextEditor'
 
 /**
  * Global transport settings panel: shared password, binding, and projects
@@ -160,8 +161,8 @@ export function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolea
             stored password. Editing this file by hand also works — the legacy
             <code> aflow-app-server</code> entry point reads the same file.
           </p>
-          <textarea
-            className="input mono config-textarea"
+          <TextEditor
+            className="mono config-textarea"
             aria-label="Advanced connection settings TOML"
             spellCheck={false}
             value={advancedText}

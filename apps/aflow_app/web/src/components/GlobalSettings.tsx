@@ -12,6 +12,7 @@ import type { SkillDetail, SkillInstallResult, SkillSummary } from '../types'
 import { formatMachineChoice, formatMachineLabel } from '../label'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { useHeaderSlots } from './HeaderSlots'
+import { TextEditor } from './TextEditor'
 
 const tabs = ['Agents & Roles', 'Teams', 'Workflows', 'Prompts', 'Skills', 'General'] as const
 // Header fit is deliberately wider than the list/detail breakpoint: the six
@@ -527,9 +528,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   function profileFields(harness: string, profile: string, model: string, effort: string, update: (field: 'model' | 'effort', text: string) => void) {
     const suggestions = projection?.suggestions.profiles.filter(p => p.harness === harness) ?? []
     const adapter = projection?.suggestions.harnesses.find(h => h.name === harness)
-    return harness === 'zcode' ? <p>Model and effort are configured in ZCode.</p> : <>
-      <Combobox label={`Model ${harness}.${profile}`} value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} />
-      {adapter?.supports_effort && <><Combobox label={`Effort ${harness}.${profile}`} value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></>}
+    return harness === 'zcode' ? <p className="profile-editor-note">Model and effort are configured in ZCode.</p> : <>
+      <div className="profile-editor-field"><Combobox label={`Model ${harness}.${profile}`} value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} /></div>
+      {adapter?.supports_effort && <div className="profile-editor-field"><Combobox label={`Effort ${harness}.${profile}`} value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></div>}
     </>
   }
   const headerCompact = useSettingsHeaderCompact()
@@ -571,7 +572,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <label key={index}>{index ? 'workflows.toml' : 'aflow.toml'}<textarea className="input mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></label>)}</div> : tab === 'Skills' ? <SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : tab === 'Skills' ? <SkillsSettings
       skills={skills}
       loadError={skillsError}
       selected={effectiveSkill}
@@ -597,14 +598,17 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
       {(['bind_host', 'bind_port', 'managed_projects_root'] as const).map(key => <label key={key}>{({ bind_host: 'Bind host', bind_port: 'Bind port', managed_projects_root: 'Projects root' })[key]}<input className="input" value={serverDraft[key]} onChange={e => setServerDraft({ ...serverDraft, [key]: e.target.value })} /></label>)}
       <label>New password (leave empty to keep current)<input className="input" type="password" autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
       {password && <p>Saving the password ends existing sessions.</p>}
-      <details><summary>Connection settings TOML</summary><textarea className="input config-textarea" aria-label="Advanced connection settings TOML" value={serverText} onChange={e => setServerText(e.target.value)} /></details>
+      <details><summary>Connection settings TOML</summary><TextEditor className="config-textarea" aria-label="Advanced connection settings TOML" value={serverText} onChange={e => setServerText(e.target.value)} /></details>
     </div> : draft ? <div className="settings-guided-content">
       {rawEdited && <p className="notice">Advanced document edits are pending. Saving replaces only the edited documents, including subsequent guided changes.</p>}
       <fieldset className="settings-body">
       {tab === 'Agents & Roles' && <>
         <h3>Profiles</h3>
-        {Object.entries(draft.harnesses).flatMap(([harness, profiles]) => Object.entries(profiles).map(([profile, value]) => <div className="card settings-fields" key={`${harness}.${profile}`}><strong>{harness}.{profile}</strong>{profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}</div>))}
-        <div className="card settings-fields"><h4>New profile</h4><label>Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' })}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label><Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => setNewProfile({ ...newProfile, profile })} />{newProfile.harness && profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => setNewProfile({ ...newProfile, [field]: text }))}</div>
+        {Object.entries(draft.harnesses).flatMap(([harness, profiles]) => Object.entries(profiles).map(([profile, value]) => <div className="card profile-editor-row" key={`${harness}.${profile}`}>
+          <div className="profile-editor-name"><span className="text-xs text-dim">Profile</span><strong className="mono">{harness}.{profile}</strong></div>
+          {profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}
+        </div>))}
+        <div className="card profile-editor-row profile-editor-new"><h4 className="profile-editor-name">New profile</h4><label className="profile-editor-field">Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' })}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label><div className="profile-editor-field"><Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => setNewProfile({ ...newProfile, profile })} /></div>{newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => setNewProfile({ ...newProfile, [field]: text }))}</div>}</div>
         <h3>Global roles</h3>{Object.entries(draft.roles).map(([role, selector]) => <Combobox key={role} label={`Role ${formatMachineChoice(role, Object.keys(draft.roles))}`} value={selector} options={selectors} onChange={value => change(next => { next.roles[role] = value })} />)}
         <div className="settings-fields"><label>New role name<input className="input" value={newRole.role} onChange={e => setNewRole({ ...newRole, role: e.target.value })} /></label><Combobox label="New role profile" value={newRole.selector} options={selectors} allowCustom onChange={selector => setNewRole({ ...newRole, selector })} /></div>
       </>}

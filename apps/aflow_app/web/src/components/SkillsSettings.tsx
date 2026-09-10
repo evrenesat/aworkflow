@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import type { SkillInstallResult, SkillSummary } from '../types'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
+import { TextEditor, TextEditorToolbar } from './TextEditor'
 
 function skillStatusLine(skill: SkillSummary, dirty: boolean): string {
   const parts = [skill.source === 'saved' ? 'saved' : 'bundled', skill.edited || dirty ? 'edited' : 'unmodified']
@@ -39,6 +40,8 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
   hosted?: boolean
 }) {
   const [navigationVersion, setNavigationVersion] = useState(0)
+  const editorId = `${useId()}-skill-editor`
+  const [wrapLines, setWrapLines] = useState(true)
   function select(name: string) { onSelect(name); setNavigationVersion(value => value + 1) }
   const active = skills?.find(skill => skill.name === selected) ?? null
   const dirty = draft !== null && content !== null && draft !== content
@@ -81,21 +84,33 @@ export function SkillsSettings({ skills, loadError, selected, onSelect, content,
         {skill.name}{skill.default ? '' : ' (optional)'}{unsavedNames.includes(skill.name) ? ' · unsaved' : ''}
       </button>)}
     </div>}>
-      <h3>{active ? <>{active.name}{active.default ? '' : ' (optional)'}</> : 'No skill selected'}</h3>
-      {active && <p className="text-xs text-dim" role="status">
-        {skillStatusLine(active, dirty)}{active.source === 'saved' && !active.installed ? ' — saved but not installed; run Install/reinstall all or the CLI to link it.' : ''}
-        {!active.default ? ' An optional skill: the default install excludes it; use existing CLI options to install it.' : ''}
-      </p>}
+      <div className="skill-editor-header">
+        <div className="skill-editor-title">
+          <h3>{active ? <>{active.name}{active.default ? '' : ' (optional)'}</> : 'No skill selected'}</h3>
+          {active && <p className="text-xs text-dim" role="status">
+            {skillStatusLine(active, dirty)}{active.source === 'saved' && !active.installed ? ' — saved but not installed; run Install/reinstall all or the CLI to link it.' : ''}
+            {!active.default ? ' An optional skill: the default install excludes it; use existing CLI options to install it.' : ''}
+          </p>}
+        </div>
+        {active && <div className="skill-editor-control">
+          <span className="text-editor-label">SKILL.md</span>
+          <TextEditorToolbar editorId={editorId} wrapLines={wrapLines} onWrapLinesChange={setWrapLines} />
+        </div>}
+      </div>
       {contentLoading && <p>Loading skill content…</p>}
       {contentError && <p role="alert" className="error-message">{contentError}</p>}
-      {!contentLoading && !contentError && content !== null && active && <label>SKILL.md<textarea
-        className="input mono config-textarea"
+      {!contentLoading && !contentError && content !== null && active && <TextEditor
+        id={editorId}
+        className="mono config-textarea"
         rows={20}
+        showWrapToggle={false}
+        wrapLines={wrapLines}
+        onWrapLinesChange={setWrapLines}
         aria-label={`SKILL.md for ${active.name}`}
         disabled={installing}
         value={draft ?? content}
         onChange={e => onEdit(active.name, e.target.value)}
-      /></label>}
+      />}
       {!contentLoading && !contentError && content !== null && active && dirty && <p role="note" className="text-sm">Unsaved edits — they save with Save all changes.</p>}
     </SidebarEditorLayout>}
   </section>

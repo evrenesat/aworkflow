@@ -12,7 +12,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 - Plan Branch: `aflow-responsive-document-scroll-and-mobile-editing-2026-20260910-110307`
 - Pre-Handoff Base HEAD: `ee1757579b216afe9c02f3ca763038cae59a8498`
-- Last Approved Checkpoint: `cp3 v02`
+- Last Approved Checkpoint: `cp4 v02`
 
 ### Review Log
 
@@ -106,6 +106,28 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
   editor position/height checks and diff check passed. Reviewer creates cp3 v02
   approval commit; only CP3 advances. CP4–6 remain unchecked. Publication,
   exact-SHA CI and live activation remain pending normal workflow delivery.
+
+- 2026-09-10: Rejected the immediately preceding uncommitted CP4 attempt v01
+  against original CP4, using current-worktree fallback from approved cp3 v02
+  (`8246325`); no CP4 commit exists. P2: the absolute Wrap lines toolbar covers
+  text and intercepts caret clicks after native textarea scrolling, confirmed
+  in disposable Chromium with real Skills assets, geometry and screenshot.
+  Full web suite297, build, four existing Chromium tests and diff check passed;
+  two additional disposable probes completed. CP4 remains unapproved; CP5–6
+  unchecked. Focused non-checkpoint repair overlay uses supplied cp05-v01 path.
+  No approval commit/history rewrite, publication, exact-SHA CI or live proof.
+
+- 2026-09-10: Approved `cp4 v02` against original CP4 and active cp05-v01
+  non-checkpoint repair. Current-worktree fallback from approved cp3 v02
+  (`8246325`) was used because no CP4 commit existed. Reviewed accumulated
+  native editors, normal-flow wrapping controls, profile presentation, combobox
+  placement and exact draft/save behavior. No material findings. Reviewer
+  verification: full web suite297, build, four disposable Chromium tests,
+  inspected dark scrolled-editor screenshot and diff check passed. Skills
+  geometry, deep-scroll hit-testing/caret movement, long Markdown/TOML bytes
+  and partial-save retention passed. Reviewer creates cp4 v02 approval commit;
+  only CP4 advances. CP5–6 remain unchecked. Publication, exact-SHA CI and live
+  proof remain pending normal workflow delivery.
 
 ## Done Means
 
@@ -212,7 +234,7 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Blockers:** If new sections/actions were added concurrently, include them through the shared registry rather than dropping them to meet the space budget.
 
-### [ ] Checkpoint 4: Make settings and text editors readable on phones
+### [x] Checkpoint 4: Make settings and text editors readable on phones
 
 **Goal:** Editing works without sideways prose reading or nested form scrollers.
 
@@ -222,11 +244,11 @@ This plan supersedes the scrolling/layout directions in `clear-run-and-settings-
 
 **Steps:**
 
-- [ ] Text editors use soft visual wrapping by default, with a labelled Wrap lines toggle for Markdown/TOML/raw text; turning wrapping off permits horizontal scrolling only inside that native editor. Never transform the value or persisted bytes. Use16px minimum input text, width100%, sensible padding, and default height `clamp(18rem,50dvh,36rem)`. Allow native vertical scrolling and desktop resize; parent remains natural flow.
-- [ ] Group wide profile rows into name/model/effort columns; compact mode stacks labelled fields. Natural row height, concise visible labels, full accessible identity; preserve custom models, unset effort, unsupported-effort behavior, add/remove/Enter behavior, and errors. No per-card scrollers or faux disabled inputs.
-- [ ] Keep Save/error/conflict/partial acknowledgement and prompt Undo reachable in document flow. Maintain textarea drafts across tabs, Advanced/Guided, Back, resize, failed save, and partial skill save. Ensure the save action scrolls into view through ordinary keyboard traversal.
-- [ ] Combobox popovers stay within viewport inline size and use their existing bounded options scroller; selection works by touch/keyboard near the lower edge. Add explicit scroll-into-view only for user navigation/error focus, never render/poll effects.
-- [ ] Browser checks use long Markdown/TOML lines and20k-character content, several profile rows, error messages, and partial-save responses. Verify exact stored text, wrapping, textarea scroll versus document scroll, and at least280px visible textarea height at390×844 initial detail.
+- [x] Text editors use soft visual wrapping by default, with a labelled Wrap lines toggle for Markdown/TOML/raw text; turning wrapping off permits horizontal scrolling only inside that native editor. Never transform the value or persisted bytes. Use16px minimum input text, width100%, sensible padding, and default height `clamp(18rem,50dvh,36rem)`. Allow native vertical scrolling and desktop resize; parent remains natural flow.
+- [x] Group wide profile rows into name/model/effort columns; compact mode stacks labelled fields. Natural row height, concise visible labels, full accessible identity; preserve custom models, unset effort, unsupported-effort behavior, add/remove/Enter behavior, and errors. No per-card scrollers or faux disabled inputs.
+- [x] Keep Save/error/conflict/partial acknowledgement and prompt Undo reachable in document flow. Maintain textarea drafts across tabs, Advanced/Guided, Back, resize, failed save, and partial skill save. Ensure the save action scrolls into view through ordinary keyboard traversal.
+- [x] Combobox popovers stay within viewport inline size and use their existing bounded options scroller; selection works by touch/keyboard near the lower edge. Add explicit scroll-into-view only for user navigation/error focus, never render/poll effects.
+- [x] Browser checks use long Markdown/TOML lines and20k-character content, several profile rows, error messages, and partial-save responses. Verify exact stored text, wrapping, textarea scroll versus document scroll, and at least280px visible textarea height at390×844 initial detail.
 
 **Dependencies:** CP3.
 

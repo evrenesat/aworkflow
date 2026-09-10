@@ -200,6 +200,21 @@ def test_settings_toolbar_stays_visible_through_long_scroll(control_client, monk
             page.get_by_label('aflow.toml contents', exact=True).wait_for()
             assert page.get_by_role('tab').count() == 0
             assert page.locator('.sidebar-editor-layout').count() == 0
+            aflow_editor = page.get_by_label('aflow.toml contents', exact=True)
+            long_toml = aflow_editor.input_value() + '\n# CP4 long TOML comment ' + ('t' * 20000) + '\n'
+            aflow_editor.fill(long_toml)
+            wrap_toggle = aflow_editor.locator('xpath=..').get_by_role(
+                'checkbox', name='Wrap lines', exact=True
+            )
+            assert wrap_toggle.is_checked()
+            wrap_toggle.uncheck()
+            assert aflow_editor.get_attribute('wrap') == 'off'
+            assert aflow_editor.evaluate('(element) => element.scrollWidth > element.clientWidth')
+            wrap_toggle.check()
+            assert aflow_editor.get_attribute('wrap') == 'soft'
+            page.get_by_role('button', name='Save all changes', exact=True).click()
+            page.get_by_text('Workflow settings saved; new runs use the saved configuration', exact=False).wait_for()
+            assert ('# CP4 long TOML comment ' + ('t' * 20000)) in config.read_text()
             open_settings_more(page)
             page.get_by_role('menuitem', name='Guided settings', exact=True).click()
             if compact:
@@ -353,10 +368,11 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                 select_settings_section(page, 'General')
                 page.get_by_label('Color theme').select_option(theme)
                 select_settings_section(page, 'Skills')
-                for width, height in ((1365, 900), (390, 844)):
+                for width, height in ((1280, 720), (390, 844)):
                     page.set_viewport_size({'width': width, 'height': height})
                     page.wait_for_timeout(100)
                     compact = width < 960 or height < 600
+                    assert page.get_by_role('heading', name='Install skills', exact=True).count() == 0
                     if compact:
                         nav = page.locator('.sidebar-editor-navigation')
                         nav.wait_for(state='visible')
@@ -376,6 +392,9 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
                     area_box = page.get_by_label('SKILL.md for aflow-plan', exact=True).bounding_box()
                     assert area_box and area_box['y'] <= (280 if compact else 208), area_box
                     assert area_box['height'] >= 280, area_box
+                    assert page.get_by_label('SKILL.md for aflow-plan', exact=True).evaluate(
+                        '(element) => element.clientHeight >= 280'
+                    )
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                     save = page.get_by_role('button', name='Save all changes', exact=True).bounding_box()
                     assert save and 0 <= save['y'] < height and save['x'] + save['width'] <= width
@@ -395,7 +414,53 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
             page.get_by_role('menuitem', name='Install skills', exact=True).click()
             page.get_by_role('heading', name='Install skills', exact=True).wait_for()
             page.get_by_text('Install finished').wait_for()
-            area.fill(original + '\n\nBrowser edit.\n')
+            long_markdown = original + '\n\n' + ('Browser long Markdown line ' + ('x' * 20000) + '\n')
+            area.fill(long_markdown)
+            wrap_toggle = page.get_by_role('checkbox', name='Wrap lines', exact=True)
+            editor_box = area.bounding_box()
+            toolbar_box = page.locator('.skill-editor-control').bounding_box()
+            assert editor_box and toolbar_box
+            intersects = (
+                toolbar_box['x'] < editor_box['x'] + editor_box['width']
+                and toolbar_box['x'] + toolbar_box['width'] > editor_box['x']
+                and toolbar_box['y'] < editor_box['y'] + editor_box['height']
+                and toolbar_box['y'] + toolbar_box['height'] > editor_box['y']
+            )
+            assert not intersects, {'toolbar': toolbar_box, 'editor': editor_box}
+            assert wrap_toggle.is_checked()
+            assert area.get_attribute('wrap') == 'soft'
+            area.evaluate('''element => {
+                element.focus();
+                element.scrollTop = element.scrollHeight;
+                element.setSelectionRange(element.value.length, element.value.length);
+            }''')
+            assert area.evaluate('(element) => element.scrollTop > 0')
+            caret_before = area.evaluate('(element) => element.selectionStart')
+            area.press('ArrowLeft')
+            assert area.evaluate('(element) => element.selectionStart') == caret_before - 1
+            area.press('ArrowRight')
+            assert area.input_value() == long_markdown
+            for offset in (12, min(80, editor_box['height'] - 12)):
+                assert page.evaluate('''({x, y}) => {
+                    const target = document.elementFromPoint(x, y);
+                    return target instanceof HTMLTextAreaElement || target?.closest('textarea') !== null;
+                }''', {'x': editor_box['x'] + min(24, editor_box['width'] / 2), 'y': editor_box['y'] + offset})
+            screenshot_path = tmp_path / f'skills-scrolled-{theme}.png'
+            page.screenshot(path=str(screenshot_path))
+            print('SKILLS_SCROLLED_SCREENSHOT', screenshot_path)
+            wrap_toggle.uncheck()
+            assert area.get_attribute('wrap') == 'off'
+            assert area.evaluate('(element) => element.scrollWidth > element.clientWidth')
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            wrap_toggle.check()
+            assert area.get_attribute('wrap') == 'soft'
+            assert area.input_value() == long_markdown
+            assert area.evaluate('(element) => element.scrollHeight > element.clientHeight')
+            area.evaluate('(element) => { element.scrollTop = 0 }')
+            before_document_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
+            area.evaluate('(element) => { element.scrollTop = element.scrollHeight }')
+            assert area.evaluate('(element) => element.scrollTop > 0')
+            assert page.evaluate('() => document.scrollingElement.scrollTop') == before_document_scroll
             install = page.get_by_role('button', name='Install/reinstall all', exact=True)
             assert install.is_disabled()
             assert page.get_by_text('Save your skill edits first').count() > 0
@@ -403,9 +468,48 @@ def test_skills_edit_save_and_install_through_links(control_client, tmp_path, mo
             page.get_by_text('the next manager invocation uses it').wait_for()
             for destination in ('.claude/skills', '.agents/skills', '.kiro/skills', '.zcode/skills'):
                 linked = home / destination / 'aflow-plan' / 'SKILL.md'
-                assert linked.read_text() == original + '\n\nBrowser edit.\n', linked
+                assert linked.read_text() == long_markdown, linked
                 assert os.readlink(home / destination / 'aflow-plan') == str(
                     home / '.config' / 'aflow' / 'skills' / 'aflow-plan'
                 )
+
+            failed_save = {'enabled': True}
+
+            def fail_plan_save(route):
+                if route.request.method == 'PUT' and failed_save['enabled']:
+                    route.fulfill(status=500, content_type='application/json', body=json.dumps({'detail': 'browser partial failure'}))
+                else:
+                    route.continue_()
+
+            page.route('**/api/skills/aflow-plan', fail_plan_save)
+            page.get_by_role('button', name='← Back to Skills', exact=True).click()
+            nav = page.locator('.sidebar-editor-navigation')
+            nav.wait_for(state='visible')
+            assistant_row = nav.get_by_role('button', name='aflow-assistant (optional)', exact=True)
+            assistant_row.click()
+            assistant_area = page.get_by_label('SKILL.md for aflow-assistant', exact=True)
+            assistant_area.wait_for()
+            assistant_partial = assistant_area.input_value() + '\n\nPartial-save assistant edit.\n'
+            assistant_area.fill(assistant_partial)
+            page.get_by_role('button', name='← Back to Skills', exact=True).click()
+            nav.wait_for(state='visible')
+            nav.get_by_role('button', name='aflow-plan', exact=True).click()
+            area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
+            partial_plan = long_markdown + '\nPartial-save plan edit.\n'
+            area.fill(partial_plan)
+            page.get_by_role('button', name='Save all changes', exact=True).click()
+            page.get_by_text('Skill aflow-plan was not saved', exact=False).wait_for()
+            assert area.input_value() == partial_plan
+            page.get_by_role('button', name='← Back to Skills', exact=True).click()
+            nav.wait_for(state='visible')
+            assert 'unsaved' not in nav.get_by_role('button', name='aflow-assistant (optional)', exact=True).inner_text()
+            plan_row = nav.get_by_role('button', name='aflow-plan · unsaved', exact=True)
+            assert plan_row.count() == 1
+            plan_row.click()
+            area = page.get_by_label('SKILL.md for aflow-plan', exact=True)
+            failed_save['enabled'] = False
+            page.get_by_role('button', name='Save all changes', exact=True).click()
+            page.get_by_text('the next manager invocation uses it').wait_for()
+            assert (home / '.claude' / 'skills' / 'aflow-plan' / 'SKILL.md').read_text() == partial_plan
         finally:
             browser.close()

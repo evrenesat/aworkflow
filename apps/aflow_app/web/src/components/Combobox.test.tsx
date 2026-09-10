@@ -23,4 +23,18 @@ describe('Combobox readable machine labels', () => {
     fireEvent.click(screen.getByRole('option', { name: 'Implementation plans implementation__plans' }))
     expect(onChange).toHaveBeenCalledWith('implementation__plans')
   })
+
+  it('opens the bounded suggestions above a lower-edge control and keeps keyboard selection exact', () => {
+    const onChange = vi.fn()
+    render(<Combobox label="Profile" value="" options={['codex.worker', 'codex.reviewer']} onChange={onChange} />)
+    const input = screen.getByRole('combobox', { name: 'Profile' })
+    vi.spyOn(input, 'getBoundingClientRect').mockReturnValue({ top: 700, bottom: 740, left: 20, right: 300, width: 280, height: 40 } as DOMRect)
+
+    fireEvent.focus(input)
+    const listbox = screen.getByRole('listbox', { name: 'Profile suggestions' })
+    expect(listbox.className).toContain('combobox-listbox-above')
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('codex.reviewer')
+  })
 })
