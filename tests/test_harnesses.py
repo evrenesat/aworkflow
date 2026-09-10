@@ -620,7 +620,7 @@ class PlainStatusOutputTests(unittest.TestCase):
 
     @staticmethod
     def _records(stream):
-        return [line for line in stream.getvalue().splitlines() if line.startswith("aflow ")]
+        return [block for block in stream.getvalue().strip().split("\n\n") if block]
 
     def test_records_include_git_rows_and_respect_files_limit(self) -> None:
         import aflow.git_status as git_status_mod
@@ -645,13 +645,13 @@ class PlainStatusOutputTests(unittest.TestCase):
         with patch.object(git_status_mod, "capture_baseline", return_value=object()), \
              patch.object(git_status_mod, "summarize_since_baseline", return_value=summary):
             renderer.start(state)
+            renderer.stop(state)
 
-        record = self._records(stream)[0]
-        assert 'git="M 1, A 1, D 0 | +12/-3 | 2 commits"' in record
-        files_value = record.split("files=", 1)[1].split(" status=", 1)[0]
-        assert "src/file9.py" in files_value
-        assert "src/file10.py" not in files_value
-        assert "+2 more" in files_value
+        record = self._records(stream)[-1]
+        assert "Git:      M 1, A 1, D 0 | +12/-3 | 2 commits" in record
+        assert "src/file9.py" in record
+        assert "src/file10.py" not in record
+        assert "+2 more" in record
 
     def test_records_show_clean_git_state_without_files_row(self) -> None:
         import aflow.git_status as git_status_mod
@@ -673,9 +673,9 @@ class PlainStatusOutputTests(unittest.TestCase):
              patch.object(git_status_mod, "summarize_since_baseline", return_value=summary):
             renderer.start(state)
 
-        record = self._records(stream)[0]
-        assert 'git="clean since start | +0/-0 | 0 commits"' in record
-        assert "files=" not in record
+        output = stream.getvalue()
+        assert "Git:" not in output
+        assert "Files:" not in output
 
     def test_git_probe_failure_still_emits_records(self) -> None:
         import aflow.git_status as git_status_mod
@@ -690,9 +690,9 @@ class PlainStatusOutputTests(unittest.TestCase):
             renderer.stop(state)
 
         records = self._records(stream)
-        assert len(records) == 2
-        assert "git=" not in records[0]
-        assert "event=final" in records[1]
+        assert len(records) == 3
+        assert all("Git:" not in record for record in records)
+        assert records[-1].startswith("AFlow run run-git -")
 
     def test_records_carry_run_lineage_and_skipped_step_words(self) -> None:
         from aflow.status import WorkflowGraphSource
@@ -722,11 +722,11 @@ class PlainStatusOutputTests(unittest.TestCase):
         renderer.start(state)
 
         record = self._records(stream)[0]
-        assert "run=run-lineage" in record
-        assert "resumed_from=run-source" in record
-        assert "start_step=review" in record
-        assert "skipped=implement" in record
-        assert "skipped=plan" not in record
+        assert "AFlow run run-lineage" in record
+        assert "Resumed from: run-source" in record
+        assert "Start step: review" in record
+        assert "Skipped steps: implement" in record
+        assert "Skipped steps: plan" not in record
 
     def test_turn_finalization_records_transition_words(self) -> None:
         state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
@@ -751,10 +751,12 @@ class PlainStatusOutputTests(unittest.TestCase):
         renderer = self._renderer(stream, workflow_name="managed")
         renderer.update(state)
 
-        record = self._records(stream)[0]
-        assert "step=review" in record
-        assert "transition=END" in record
-        assert "outcome=completed" in record
+        records = self._records(stream)
+        assert len(records) == 2
+        record = records[-1]
+        assert "Step:     review" in record
+        assert "Next:     END" in record
+        assert "Outcome:  completed" in record
 
     def test_set_context_feeds_next_record_without_emitting(self) -> None:
         state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
@@ -769,9 +771,9 @@ class PlainStatusOutputTests(unittest.TestCase):
         renderer.update(state)
 
         record = self._records(stream)[0]
-        assert "step=implement" in record
-        assert "active_plan=plans/in-progress/demo.md" in record
-        assert "harness=claude" in record
+        assert "Step:     implement" in record
+        assert "plans/in-progress/demo.md" in record
+        assert "Harness:  claude" in record
 
     def test_workflow_show_renders_end_transitions_and_excluded_words(self) -> None:
         import aflow.status as status_mod

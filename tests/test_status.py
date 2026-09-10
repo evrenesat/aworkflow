@@ -19,6 +19,7 @@ from aflow.run_state import (
     CheckpointRepartitionRecord,
     ControllerState,
     FrozenRunIdentity,
+    IssueRecord,
     ManagerDecisionSummary,
     OverrideResult,
     PendingManagerNotes,
@@ -49,7 +50,7 @@ def _renderer(stream: object, **kwargs: object) -> BannerRenderer:
 
 
 def _records(stream: io.StringIO) -> list[str]:
-    return [line for line in stream.getvalue().splitlines() if line.startswith("aflow ")]
+    return [block for block in stream.getvalue().strip().split("\n\n") if block]
 
 
 def _basic_state() -> ControllerState:
@@ -62,7 +63,7 @@ def _basic_state() -> ControllerState:
     return state
 
 
-def test_records_are_ordered_append_only_key_value_lines() -> None:
+def test_blocks_are_ordered_append_only_human_readable_sections() -> None:
     stream = io.StringIO()
     renderer = _renderer(stream, workflow_name="demo")
     renderer.start(_basic_state())
@@ -73,16 +74,16 @@ def test_records_are_ordered_append_only_key_value_lines() -> None:
     renderer.stop(state)
 
     records = _records(stream)
-    assert [line.split()[2] for line in records] == ["event=start", "event=update", "event=final"]
-    for line in records:
-        assert line.startswith("aflow time=2026-09-05T12:00:00Z ")
-        assert "\x1b" not in line
-    assert "run=20260905T120000Z-abc123" in records[0]
-    assert "workflow=demo" in records[0]
-    assert "checkpoint=2/5" in records[0]
-    assert 'checkpoint_name="Checkpoint 1: Test"' in records[0]
-    assert "turn=3/5" in records[0]
-    assert "elapsed=" in records[2]
+    assert len(records) == 4
+    assert records[0].startswith("AFlow run 20260905T120000Z-abc123")
+    assert "Workflow: demo" in records[0]
+    assert "plans/demo.md" in records[0]
+    assert records[1].startswith("Preparing run")
+    assert "Preparation update" in records[2]
+    assert "Status:   running turn 4" in records[2]
+    assert records[3].startswith("AFlow run 20260905T120000Z-abc123 -")
+    assert "Elapsed:" in records[3]
+    assert all("\x1b" not in block for block in records)
 
 
 def test_identical_updates_dedupe_but_final_summary_always_emits() -> None:
@@ -95,9 +96,313 @@ def test_identical_updates_dedupe_but_final_summary_always_emits() -> None:
     renderer.stop(state)
 
     records = _records(stream)
-    assert len(records) == 2
-    assert "event=start" in records[0]
-    assert "event=final" in records[1]
+    assert len(records) == 3
+    assert records[0].startswith("AFlow run")
+    assert records[1] == "Preparing run\n  Checkpoint 2 of 5\n  Checkpoint 1: Test"
+    assert records[2].startswith("AFlow run")
+    assert "Elapsed:" in records[2]
+
+
+def test_cp4_transcript_has_one_header_and_identifies_the_running_turn() -> None:
+    stream = io.StringIO()
+    renderer = _renderer(
+        stream,
+        config_max_turns=40,
+        config_plan_path=Path(
+            "/full/path/skills-manager-workflow-settings-cp4-restart-20260909.md"
+        ),
+        original_plan_path=Path(
+            "/full/path/skills-manager-workflow-settings-cp4-restart-20260909.md"
+        ),
+        workflow_name="cumulative_delivery",
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        run_id="20260909t003427z-ea0bff22",
+        run_started_at=_FIXED_NOW,
+    )
+    state.current_team = "MusparkGLM"
+    renderer.start(state)
+
+    state.last_snapshot = PlanSnapshot(
+        "Checkpoint 4: Manager instructions come from live skill Markdown",
+        7,
+        2,
+        False,
+        10,
+        4,
+    )
+    renderer.update(state)
+    state.active_turn = 1
+    state.status_message = "running turn 1: implement_plan"
+    state.turn_history.append(TurnRecord(
+        turn_number=1,
+        step_name="implement_plan",
+        resolved_harness_name="muse",
+        resolved_model_display="muse / muse-spark-1.3-contributor / high",
+        step_role="worker",
+        resolved_selector="muse.spark-1.3-contributor",
+    ))
+    renderer.update(state)
+    renderer.update(state)
+
+    blocks = _records(stream)
+    assert sum(block.startswith("AFlow run ") for block in blocks) == 1
+    assert blocks[0].startswith("AFlow run 20260909t003427z-ea0bff22")
+    assert "Preparing run" in blocks[1]
+    running = blocks[-1]
+    nonblank = [line for line in running.splitlines() if line]
+    assert nonblank[0].endswith("Turn 1 of 40 - Running")
+    assert nonblank[1] == "  Checkpoint 4 of 10"
+    assert nonblank[2] == "  Manager instructions come from live skill Markdown"
+    assert "Team:     MusparkGLM" in running
+    assert "Worker: muse / muse-spark-1.3-contributor / high" in running
+    assert "Step:     implement_plan" in running
+    assert "override_file" not in running
+    assert "clean since start" not in running
+
+
+def test_finalized_turn_keeps_cached_checkpoint_before_next_checkpoint_runs() -> None:
+    stream = io.StringIO()
+    renderer = _renderer(stream, config_max_turns=40)
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(
+            "Checkpoint 4: CP4 worker", 6, 2, False, 10, 4
+        ),
+        run_id="run-cp4",
+        run_started_at=_FIXED_NOW,
+        active_turn=1,
+        status_message="running turn 1",
+    )
+    state.turn_history.append(TurnRecord(
+        turn_number=1,
+        step_name="implement_plan",
+        resolved_harness_name="muse",
+        resolved_model_display="muse / worker",
+        step_role="worker",
+        outcome="running",
+    ))
+    renderer.start(state)
+
+    state.turn_history[0].outcome = "completed"
+    state.turn_history[0].chosen_transition = "implement_plan"
+    state.last_snapshot = PlanSnapshot("Checkpoint 5: CP5 worker", 5, 1, False, 10, 5)
+    state.turns_completed = 1
+    renderer.update(state)
+    state.active_turn = 2
+    state.status_message = "running turn 2"
+    state.turn_history.append(TurnRecord(
+        turn_number=2,
+        step_name="implement_plan",
+        resolved_harness_name="muse",
+        resolved_model_display="muse / worker",
+        step_role="worker",
+        outcome="running",
+    ))
+    renderer.update(state)
+
+    blocks = _records(stream)
+    assert "Checkpoint 4 of 10" in blocks[1]
+    assert "CP4 worker" in blocks[1]
+    assert "Checkpoint 5 of 10" not in blocks[2]
+    assert "Checkpoint 4 of 10" in blocks[2]
+    assert "CP4 worker" in blocks[2]
+    assert "Checkpoint 5 of 10" in blocks[3]
+    assert "CP5 worker" in blocks[3]
+
+
+def test_changed_active_plan_is_visible_at_finalization_before_repair_worker() -> None:
+    stream = io.StringIO()
+    original = Path("/full/path/original-plan.md")
+    repair = Path("/full/path/repair-plan.md")
+    renderer = _renderer(
+        stream,
+        config_plan_path=original,
+        original_plan_path=original,
+        active_plan_path=original,
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot("Checkpoint 1: Repair", 1, 1, False, 2, 1),
+        run_id="repair-run",
+        run_started_at=_FIXED_NOW,
+        active_turn=1,
+        current_team="synthetic",
+    )
+    state.turn_history.append(TurnRecord(
+        turn_number=1,
+        step_name="review",
+        resolved_harness_name="fake",
+        resolved_model_display="fake / worker",
+        step_role="worker",
+        active_plan_path=str(original),
+    ))
+    renderer.start(state)
+
+    state.turn_history[0].outcome = "completed"
+    state.turns_completed = 1
+    renderer.set_context(active_plan_path=repair)
+    renderer.update(state)
+    finalized_blocks = _records(stream)
+    finalized = finalized_blocks[-1]
+    assert f"  Active plan:\n    {repair}" in finalized
+
+    state.active_turn = 2
+    state.turn_history.append(TurnRecord(
+        turn_number=2,
+        step_name="implement",
+        resolved_harness_name="fake",
+        resolved_model_display="fake / worker",
+        step_role="worker",
+        active_plan_path=str(repair),
+    ))
+    renderer.update(state)
+    after_worker = _records(stream)
+    assert sum(str(repair) in block for block in after_worker) == 1
+    block_count = len(after_worker)
+    renderer.update(state)
+    assert len(_records(stream)) == block_count
+
+
+def test_generated_plan_is_visible_during_preparation_and_identical_updates_dedupe(
+    tmp_path: Path,
+) -> None:
+    stream = io.StringIO()
+    original = tmp_path / "original.md"
+    generated = tmp_path.joinpath(
+        *(f"long-segment-{index:02d}" for index in range(20)),
+        "generated.md",
+    )
+    generated.parent.mkdir(parents=True)
+    generated.write_text("# generated\n", encoding="utf-8")
+    renderer = _renderer(
+        stream,
+        config_plan_path=original,
+        original_plan_path=original,
+        active_plan_path=original,
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot(None, 0, 0, False),
+        run_id="preparation-generated",
+        run_started_at=_FIXED_NOW,
+    )
+    renderer.start(state)
+
+    renderer.set_context(new_plan_path=generated)
+    renderer.update(state)
+    blocks = _records(stream)
+    assert f"  Generated plan:\n    {generated}" in blocks[-1]
+    block_count = len(blocks)
+    renderer.update(state)
+    assert len(_records(stream)) == block_count
+
+
+def test_generated_plan_is_visible_at_finalization_and_not_repeated(
+    tmp_path: Path,
+) -> None:
+    stream = io.StringIO()
+    original = tmp_path / "original.md"
+    generated = tmp_path.joinpath(
+        *(f"long-segment-{index:02d}" for index in range(20)),
+        "generated-final.md",
+    )
+    generated.parent.mkdir(parents=True)
+    generated.write_text("# generated\n", encoding="utf-8")
+    renderer = _renderer(
+        stream,
+        config_plan_path=original,
+        original_plan_path=original,
+        active_plan_path=original,
+    )
+    state = ControllerState(
+        last_snapshot=PlanSnapshot("Checkpoint 1: Finalize", 1, 1, False, 2, 1),
+        run_id="finalization-generated",
+        run_started_at=_FIXED_NOW,
+        active_turn=1,
+    )
+    state.turn_history.append(TurnRecord(
+        turn_number=1,
+        step_name="review",
+        resolved_harness_name="fake",
+        resolved_model_display="fake / worker",
+        step_role="worker",
+        active_plan_path=str(original),
+    ))
+    renderer.start(state)
+
+    state.turn_history[0].outcome = "completed"
+    state.turns_completed = 1
+    renderer.set_context(new_plan_path=generated)
+    renderer.update(state)
+    blocks = _records(stream)
+    assert f"  Generated plan:\n    {generated}" in blocks[-1]
+    block_count = len(blocks)
+    renderer.update(state)
+    assert len(_records(stream)) == block_count
+
+
+def test_new_manager_identity_emits_even_when_action_is_unchanged() -> None:
+    stream = io.StringIO()
+    renderer = _renderer(stream)
+    state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
+    state.manager_history.append(ManagerDecisionSummary(
+        decision_number=1,
+        level="lite",
+        trigger="turn_finished",
+        action="continue",
+        reason="same action",
+        artifact_path="manager/decision-001",
+    ))
+    renderer.update(state)
+    state.manager_history.append(ManagerDecisionSummary(
+        decision_number=2,
+        level="lite",
+        trigger="turn_finished",
+        action="continue",
+        reason="same action again",
+        artifact_path="manager/decision-002",
+    ))
+    renderer.update(state)
+    renderer.update(state)
+
+    blocks = _records(stream)
+    assert len(blocks) == 2
+    assert "Manager decision #1: lite/turn_finished/continue" in blocks[0]
+    assert "Manager decision #2: lite/turn_finished/continue" in blocks[1]
+
+
+def test_failed_turn_uses_matching_issue_reason_and_keeps_only_available_logs() -> None:
+    stderr_path = "/full/path/to/turn/stderr.txt"
+    state = ControllerState(
+        last_snapshot=PlanSnapshot("Checkpoint 4: Failure", 1, 1, False, 10, 1),
+        run_id="failure-run",
+        run_started_at=_FIXED_NOW,
+        active_turn=4,
+        status_message="failed",
+    )
+    state.turn_history.append(TurnRecord(
+        turn_number=4,
+        step_name="implement_plan",
+        resolved_harness_name="dsh",
+        resolved_model_display="dsh / ACP",
+        step_role="worker",
+        outcome="harness-failed",
+        stderr_artifact_path=stderr_path,
+    ))
+    state.issue_history.append(IssueRecord(
+        issue_number=1,
+        kind="harness-failed",
+        message="DSH ACP request failed: Usage limit reached for 5 hour.",
+        turn_number=4,
+        stderr_artifact_path=stderr_path,
+    ))
+    stream = io.StringIO()
+    _renderer(stream).stop(state)
+
+    output = stream.getvalue()
+    assert "AFlow run failure-run - Failed" in output
+    assert "Reason: DSH ACP request failed: Usage limit reached for 5 hour." in output
+    assert stderr_path in output
+    assert "stdout:" not in output
 
 
 def test_status_displays_hotplug_history_capability_and_active_selector_without_session_id() -> None:
@@ -145,7 +450,7 @@ def test_record_surfaces_hotplug_evidence_without_session_ids() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert "hotplug applied: codex.low -> codex.high" in record
+    assert "Hotplug transaction #1: applied (codex.low -> codex.high; native session resume)" in record
     assert "private-session" not in record
 
 
@@ -167,10 +472,10 @@ def test_record_surfaces_compact_manager_state() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert "manager=full/lite_escalation/upgrade_next_implementation" in record
-    assert 'manager_notes="pending for implement"' in record
-    assert "manager_upgrade=implement:strong" in record
-    assert "manager_report=manager-report.md" in record
+    assert "Manager decision #2: full/lite_escalation/upgrade_next_implementation" in record
+    assert "Pending manager notes: implement (decision 2)" in record
+    assert "Manager team override: implement -> strong" in record
+    assert "manager-report.md" in record
 
 
 def test_record_surfaces_safe_override_diagnostics() -> None:
@@ -193,10 +498,10 @@ def test_record_surfaces_safe_override_diagnostics() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert "frozen=1234567890ab" in record
-    assert "override_file=present" in record
-    assert 'override_result="rejected: team is incompatible"' in record
-    assert 'override_action="correct overrides.toml and resume"' in record
+    assert "Config fingerprint: 1234567890ab" in record
+    assert "Override file: present" in record
+    assert "Override result: rejected (abc): team is incompatible" in record
+    assert "Override action: correct overrides.toml and resume" in record
     assert "private status note" not in record
 
 
@@ -242,10 +547,11 @@ def test_record_surfaces_literal_repartition_observability() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert 'scope_pressure="[bold red]split safely[/bold red]"' in record
-    assert 'repartition="failed / failed: validate"' in record
-    assert 'split="gen-123 / 2 parts / review_current_partition"' in record
-    assert "split_artifact=manager/candidate.md" in record
+    assert "Scope pressure: [bold red]split safely[/bold red]" in record
+    assert "Repartition: failed" in record
+    assert "Repartition failed stage: validate" in record
+    assert "Partition split: gen-123 / 2 parts / review_current_partition" in record
+    assert "manager/candidate.md" in record
 
 
 def test_turn_record_finalization_fields_appear_in_records() -> None:
@@ -266,12 +572,12 @@ def test_turn_record_finalization_fields_appear_in_records() -> None:
     _renderer(stream).update(state)
 
     record = _records(stream)[0]
-    assert "step=implement" in record
-    assert "role=worker:claude.opus" in record
-    assert 'model="claude / opus"' in record
-    assert "transition=review" in record
-    assert "outcome=completed" in record
-    assert "artifact=.aflow/runs/r/turns/0003/stdout.txt" in record
+    assert "Step:     implement" in record
+    assert "Worker: claude / opus" in record
+    assert "Selector: claude.opus" in record
+    assert "Next:     review" in record
+    assert "Outcome:  completed" in record
+    assert ".aflow/runs/r/turns/0003/stdout.txt" in record
 
 
 def test_failed_turn_final_record_preserves_untruncated_stderr_artifact() -> None:
@@ -293,17 +599,20 @@ def test_failed_turn_final_record_preserves_untruncated_stderr_artifact() -> Non
     renderer.stop(state)
 
     final_record = _records(stream)[-1]
-    assert "event=final" in final_record
-    assert "outcome=harness-failed" in final_record
-    assert f"stderr_artifact={stderr_path}" in final_record
-    assert " artifact=" not in final_record
+    assert final_record.startswith("AFlow run")
+    assert "harness-failed" in final_record
+    assert f"stderr: {stderr_path}" in final_record
+    assert "stdout:" not in final_record
 
 
 def test_control_bytes_flattened_and_unicode_content_remains_readable() -> None:
     state = _basic_state()
-    state.status_message = "running 中文 ✓\nnext\x1b[31mred\x1b[0m line\r\nend"
+    state.status_message = "preparing"
     stream = io.StringIO()
-    _renderer(stream).update(state)
+    renderer = _renderer(stream)
+    renderer.start(state)
+    state.status_message = "running 中文 ✓\nnext\x1b[31mred\x1b[0m line\r\nend"
+    renderer.update(state)
 
     output = stream.getvalue()
     assert "中文 ✓" in output
@@ -314,7 +623,7 @@ def test_control_bytes_flattened_and_unicode_content_remains_readable() -> None:
 
 def test_display_values_bounded_but_artifact_paths_never_truncated() -> None:
     state = _basic_state()
-    state.status_message = "x" * 500
+    state.status_message = "preparing"
     deep_artifact_path = ".aflow/runs/r/" + "deep/" * 40 + "stdout.txt"
     state.turn_history.append(TurnRecord(
         turn_number=1,
@@ -325,14 +634,15 @@ def test_display_values_bounded_but_artifact_paths_never_truncated() -> None:
         stdout_artifact_path=deep_artifact_path,
     ))
     stream = io.StringIO()
-    _renderer(stream).update(state)
+    renderer = _renderer(stream)
+    renderer.start(state)
+    state.status_message = "x" * 500
+    renderer.update(state)
+    renderer.stop(state)
 
-    record = _records(stream)[0]
-    status_value = record.split("status=", 1)[1].split(" step=", 1)[0]
-    assert status_value.startswith("x")
-    assert status_value.endswith("...")
-    assert len(status_value) <= 200
-    assert deep_artifact_path in record
+    output = stream.getvalue()
+    assert "x" * 197 + "..." in output
+    assert deep_artifact_path in output
 
 
 def test_tty_and_non_tty_streams_receive_identical_ordered_output() -> None:
@@ -364,7 +674,7 @@ def test_tty_and_non_tty_streams_receive_identical_ordered_output() -> None:
     tty_text = tty_output.decode("utf-8")
 
     tty_records = [
-        line for line in tty_text.splitlines() if line.startswith("aflow ")
+        block for block in tty_text.replace("\r\n", "\n").strip().split("\n\n") if block
     ]
     assert tty_records == _records(plain)
 
