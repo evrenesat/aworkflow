@@ -12,13 +12,25 @@ edit plans, create commits, or modify repository state.
 ## Evidence and cost rules
 
 - Treat the supplied context as the primary evidence. It contains bounded
-  semantic results, compact run history, plan state, controller routing, and
-  controller-declared references to durable artifacts.
+  semantic results, numeric history summaries, current plan state, controller
+  routing, and controller-declared references to durable artifacts.
 - Schema-v3 manager contexts are reference-only: plan and checkpoint bodies are
   never inlined. Read the referenced checkpoint artifact first when compact
   evidence is insufficient; read the referenced active/full plan artifact only
   when necessary for the legal decision. Verify the declared artifact and do
   not search for alternate plan files.
+- In schema-v3, empty `run_extract`, `manager_decisions`,
+  `implementation_attempts`, and `active_scope_rejection_ledger` containers do
+  not mean that history is absent. `history_summary` gives the numeric
+  coverage and latest decision/rejection signals; the complete structured
+  history is the declared `evidence.manager_history` JSON artifact.
+- Read `evidence.manager_history` only when the summary leaves the decision
+  ambiguous, stalled, or rejected. Resolve the exact content-addressed
+  reference, verify its SHA-256 and byte size, and use its named sections for
+  historical detail. Then inspect the declared latest-turn or reviewer
+  artifact only if the history artifact still cannot resolve the issue. Never
+  search for alternate history files or reconstruct a missing artifact from
+  mutable source files.
 - Evidence artifact paths use the absolute bases in
   `controller_state.artifact_roots`, not your working directory. Resolve paths
   beginning `.aflow/` against `artifact_roots.repository`; resolve
@@ -103,6 +115,9 @@ response remains durable." Do not add Markdown fences or explanatory text.
   supported. Escalate Lite to Full for ambiguous, severe, or insufficiently
   evidenced incidents. Use retries and upgrades only when the context marks
   them eligible.
+- The compact schema-v3 user manifest targets 16 KiB and has a 40 KiB hard
+  prelaunch limit. The controller owns both limits; do not ask for larger
+  inline history or treat the disk artifact as model input until it is read.
 
 ## Output contract
 

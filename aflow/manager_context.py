@@ -38,11 +38,21 @@ MAX_MANAGER_NOTE_SCOPE_IDENTITY_LENGTH = 512
 # hard-limited to 40 KiB before any provider process starts.
 MANAGER_INLINE_CONTEXT_TARGET_BYTES = 16 * 1024
 MANAGER_INLINE_CONTEXT_MAX_BYTES = 40 * 1024
+# Keep the latest human-readable turn summary small enough that current
+# decision facts and immutable references remain the first-class input.
+MANAGER_LATEST_TURN_SUMMARY_MAX_BYTES = 512
 MANAGER_SUMMARY_MAX_CHARS = 2_000
 MANAGER_RUN_EXTRACT_MAX_RECORDS = 12
+MANAGER_HISTORY_ARTIFACT_SCHEMA_VERSION = 1
+MANAGER_HISTORY_RELATIVE_PATH_PATTERN = (
+    ".aflow/runs/{run_id}/evidence/manager-history/{sha256}.json"
+)
 # One shared deterministic truncation marker for every bounded semantic
 # field in schema-v3 contexts (decisions, rejections, diagnostics).
 TRUNCATION_MARKER = "\n[evidence excerpt truncated]"
+REFERENCE_ONLY_SEMANTIC_RESULT = (
+    "Semantic output is referenced by artifact; see the stdout artifact."
+)
 ManagerLevel = Literal["lite", "full"]
 _ALLOWED_SCOPE_DIRECTIVE_RE = re.compile(
     r"^(?:may\s+(?:create(?:\s+(?:or\s+)?modify|/modify)?|modify(?:\s+only)?)|"
@@ -175,6 +185,7 @@ class ManagerContextV3:
     evidence: dict[str, Any]
     plan_content_disclosure: dict[str, str]
     history_disclosure: dict[str, Any] = field(default_factory=dict)
+    history_summary: dict[str, Any] = field(default_factory=dict)
     active_scope_rejection_ledger: tuple[dict[str, Any], ...] = ()
     implementation_attempts: dict[str, Any] | None = None
     manager_decisions: tuple[dict[str, Any], ...] = ()
@@ -445,13 +456,33 @@ def _v3_run_paths(run_dir: Path):
     )
 
 
-def _v3_bounded_text(value: Any) -> str | None:
-    """Bound one schema-v3 semantic field with the shared truncation marker."""
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    """Return a valid-UTF-8 prefix no larger than ``max_bytes``."""
+    if max_bytes <= 0:
+        return ""
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+
+
+def _v3_bounded_text(
+    value: Any,
+    *,
+    max_bytes: int = MANAGER_LATEST_TURN_SUMMARY_MAX_BYTES,
+) -> str | None:
+    """Bound one schema-v3 semantic field by UTF-8 bytes.
+
+    The marker is included in the limit.  Truncating encoded bytes and
+    decoding with ``ignore`` deliberately drops only an incomplete final code
+    point, so every returned string remains valid UTF-8.
+    """
     if not isinstance(value, str):
         return None
-    if len(value) <= MANAGER_SUMMARY_MAX_CHARS:
+    if len(value.encode("utf-8")) <= max_bytes:
         return value
-    return value[:MANAGER_SUMMARY_MAX_CHARS] + TRUNCATION_MARKER
+    marker = TRUNCATION_MARKER
+    marker_bytes = len(marker.encode("utf-8"))
+    if marker_bytes >= max_bytes:
+        return _utf8_prefix(marker, max_bytes)
+    return _utf8_prefix(value, max_bytes - marker_bytes) + marker
 
 
 def _v3_ref_dict(reference: Any) -> dict[str, Any]:
@@ -727,6 +758,129 @@ def _capture_v3_evidence(
         else "unavailable"
     )
     return evidence, disclosure, checkpoint_info
+
+
+def _recorded_manager_history_reference(
+    run_dir: Path,
+    *,
+    boundary: Mapping[str, Any],
+    run_json: Mapping[str, Any],
+    decision_number: int | None,
+) -> Mapping[str, Any] | None:
+    """Find the exact previously recorded history reference, if available."""
+    candidates: list[Any] = [
+        boundary.get("manager_history_reference"),
+        run_json.get("manager_history_reference"),
+    ]
+    for container in (boundary.get("evidence"), run_json.get("evidence")):
+        if isinstance(container, Mapping):
+            candidates.append(container.get("manager_history"))
+
+    # The decision context is the precise durable record for a completed
+    # boundary.  Read only that decision's context; never search arbitrary
+    # history artifacts for a plausible replacement.
+    if isinstance(decision_number, int) and decision_number >= 1:
+        context_path = (
+            run_dir / "manager" / f"decision-{decision_number:03d}" / "context.json"
+        )
+        try:
+            saved = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            saved = None
+        if isinstance(saved, Mapping):
+            saved_evidence = saved.get("evidence")
+            if isinstance(saved_evidence, Mapping):
+                candidates.append(saved_evidence.get("manager_history"))
+
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        reference = candidate.get("reference")
+        if isinstance(reference, Mapping):
+            return reference
+        if all(key in candidate for key in ("kind", "path", "sha256", "byte_size")):
+            return candidate
+    return None
+
+
+def _capture_manager_history_evidence(
+    run_dir: Path,
+    *,
+    capture: bool,
+    boundary: Mapping[str, Any],
+    run_json: Mapping[str, Any],
+    decision_number: int | None,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Store or resolve one immutable structured manager-history artifact."""
+    from .runlog import (
+        evidence_reference,
+        resolve_evidence_artifact,
+        store_evidence_artifact,
+    )
+
+    paths = _v3_run_paths(run_dir)
+    data = json.dumps(
+        dict(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if capture:
+        reference = store_evidence_artifact(
+            paths,
+            kind="manager_history",
+            data=data,
+        )
+        return {
+            "available": True,
+            "reference": _v3_ref_dict(reference),
+        }
+
+    recorded = _recorded_manager_history_reference(
+        run_dir,
+        boundary=boundary,
+        run_json=run_json,
+        decision_number=decision_number,
+    )
+    if recorded is not None:
+        try:
+            resolve_evidence_artifact(paths, recorded)
+        except (OSError, ValueError):
+            return {
+                "available": False,
+                "reason": "the recorded manager history artifact is unavailable or failed validation",
+                "source_run_id": run_dir.name,
+                "artifact_root": str(run_dir.resolve()),
+                "relative_path_pattern": MANAGER_HISTORY_RELATIVE_PATH_PATTERN,
+            }
+        return {
+            "available": True,
+            "reference": _v3_ref_dict(recorded),
+        }
+
+    digest = hashlib.sha256(data).hexdigest()
+    expected = evidence_reference(
+        paths,
+        "manager_history",
+        digest,
+        len(data),
+    )
+    try:
+        resolve_evidence_artifact(paths, expected)
+    except (OSError, ValueError):
+        return {
+            "available": False,
+            "reason": "the manager history artifact is unavailable in read-only mode",
+            "source_run_id": run_dir.name,
+            "artifact_root": str(run_dir.resolve()),
+            "relative_path_pattern": MANAGER_HISTORY_RELATIVE_PATH_PATTERN,
+            "expected_reference": _v3_ref_dict(expected),
+        }
+    return {
+        "available": True,
+        "reference": _v3_ref_dict(expected),
+    }
 
 
 def build_manager_note_scope(
@@ -1057,6 +1211,236 @@ def _v3_workflow_history_records(
         records.append(compact)
     records.sort(key=lambda item: item["turn_number"])
     return records
+
+
+def _full_v3_workflow_history_records(
+    run_dir: Path, turns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build the complete structured turn collection for disk-backed history.
+
+    Only parsed semantic output, bounded controller signals, and durable
+    artifact paths are retained.  Raw stdout/stderr bodies never enter this
+    artifact, and reviewer output remains available through its declared
+    turn-artifact reference.
+    """
+    records = _v3_workflow_history_records(run_dir, turns)
+    for record, turn in zip(records, sorted(turns, key=lambda item: item.get("turn_number", 0))):
+        turn_dir = Path(turn["_turn_dir"])
+        stdout = _read_text(turn_dir / "stdout.txt") or str(turn.get("stdout", ""))
+        stderr = _read_text(turn_dir / "stderr.txt") or str(turn.get("stderr", ""))
+        semantic = extract_semantic_result(stdout)
+        is_reviewer = turn.get("step_role") == "reviewer"
+        record["semantic_summary"] = _v3_reference_safe_semantic_result(
+            semantic, reviewer=is_reviewer
+        )
+        record["semantic_extraction"] = semantic.extraction
+        record["semantic_fallback"] = semantic.fallback
+        signal_evidence = classify_turn_text_signals(
+            stdout,
+            stderr,
+            turn.get("status"),
+            turn.get("returncode"),
+        )
+        record["diagnostics"] = {
+            "signals": sorted({item.name for item in signal_evidence}),
+            "signal_provenance": [asdict(item) for item in signal_evidence],
+        }
+    return records
+
+
+def _history_range(records: list[Mapping[str, Any]], key: str) -> dict[str, int] | None:
+    values = [
+        value
+        for record in records
+        for value in (record.get(key),)
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if not values:
+        return None
+    return {"start": min(values), "end": max(values)}
+
+
+def _attempt_records(attempts: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(attempts, Mapping):
+        return []
+    records = attempts.get("attempts")
+    if not isinstance(records, list):
+        return []
+    return [dict(item) for item in records if isinstance(item, Mapping)]
+
+
+def _history_coverage(
+    *,
+    workflow_records: list[dict[str, Any]],
+    manager_records: list[dict[str, Any]],
+    attempt_records: list[dict[str, Any]],
+    rejection_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "turns": {
+            "count": len(workflow_records),
+            "range": _history_range(workflow_records, "turn_number"),
+        },
+        "decisions": {
+            "count": len(manager_records),
+            "range": _history_range(manager_records, "decision_number"),
+        },
+        "implementation_attempts": {
+            "count": len(attempt_records),
+            "range": _history_range(attempt_records, "turn_number"),
+        },
+        "active_scope_rejections": {
+            "count": len(rejection_records),
+            "range": _history_range(rejection_records, "rejection_number"),
+        },
+    }
+
+
+def _history_summary(
+    *,
+    workflow_records: list[dict[str, Any]],
+    manager_records: list[dict[str, Any]],
+    attempt_records: list[dict[str, Any]],
+    rejection_records: list[dict[str, Any]],
+    history_entry: Mapping[str, Any],
+) -> dict[str, Any]:
+    latest_decision = manager_records[-1] if manager_records else {}
+    latest_rejection = rejection_records[-1] if rejection_records else {}
+    return {
+        "total_turns": len(workflow_records),
+        "total_decisions": len(manager_records),
+        "total_implementation_attempts": len(attempt_records),
+        "total_active_scope_rejections": len(rejection_records),
+        "latest_decision_number": latest_decision.get("decision_number"),
+        "latest_decision_action": latest_decision.get("action"),
+        "latest_rejection_number": latest_rejection.get("rejection_number"),
+        "reference_available": history_entry.get("available") is True,
+        "coverage": _history_coverage(
+            workflow_records=workflow_records,
+            manager_records=manager_records,
+            attempt_records=attempt_records,
+            rejection_records=rejection_records,
+        ),
+    }
+
+
+def _v3_reference_safe_semantic_result(
+    semantic: SemanticTurnOutcome, *, reviewer: bool
+) -> str:
+    """Keep unrecognized structured streams reference-only in full history."""
+    if reviewer:
+        return "Reviewer output is referenced by artifact; see the review stdout artifact."
+    if semantic.fallback:
+        return REFERENCE_ONLY_SEMANTIC_RESULT
+    return semantic.result
+
+
+def _full_v3_latest_turn(
+    finished_turn: Mapping[str, Any],
+    *,
+    finished: Mapping[str, Any],
+    stdout: str,
+    stderr: str,
+) -> dict[str, Any]:
+    """Return detailed current-turn semantics without transcript bodies."""
+    semantic = extract_semantic_result(stdout)
+    is_reviewer = finished.get("step_role") == "reviewer"
+    signal_evidence = classify_turn_text_signals(
+        stdout,
+        stderr,
+        finished.get("status"),
+        finished.get("returncode"),
+    )
+    result = asdict(semantic)
+    result["result"] = _v3_reference_safe_semantic_result(
+        semantic, reviewer=is_reviewer
+    )
+    payload = {
+        key: finished_turn.get(key)
+        for key in (
+            "turn_number", "step_name", "role", "team", "selector", "status",
+            "returncode", "duration_seconds", "error", "snapshot_before",
+            "snapshot_after", "snapshot_changed", "proposed_transition", "recovery",
+            "conditions", "detected_stop", "raw_artifacts",
+        )
+    }
+    payload["error"] = finished.get("error")
+    payload.update({
+        "semantic_result": result,
+        "diagnostics": {
+            "signals": sorted({item.name for item in signal_evidence}),
+            "signal_provenance": [asdict(item) for item in signal_evidence],
+        },
+    })
+    return payload
+
+
+def _manager_history_artifact_payload(
+    *,
+    run_id: str,
+    decision_number: int | None,
+    finalized_turn_number: Any,
+    workflow_records: list[dict[str, Any]],
+    manager_records: list[dict[str, Any]],
+    attempt_records: list[dict[str, Any]],
+    rejection_records: list[dict[str, Any]],
+    latest_turn: Mapping[str, Any],
+    repartition_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the canonical, named-section manager history artifact payload."""
+    run_extract = [*workflow_records, *manager_records]
+    run_extract.sort(key=_combined_history_sort_key)
+    return {
+        "schema_version": MANAGER_HISTORY_ARTIFACT_SCHEMA_VERSION,
+        "source_run_id": run_id,
+        "decision_number": decision_number,
+        "finalized_turn_number": finalized_turn_number,
+        "coverage": _history_coverage(
+            workflow_records=workflow_records,
+            manager_records=manager_records,
+            attempt_records=attempt_records,
+            rejection_records=rejection_records,
+        ),
+        "sections": {
+            "run_extract": run_extract,
+            "manager_decisions": manager_records,
+            "implementation_attempts": attempt_records,
+            "active_scope_rejection_ledger": rejection_records,
+            "latest_turn": dict(latest_turn),
+            "checkpoint_repartitions": repartition_records,
+        },
+    }
+
+
+def _combined_history_sort_key(
+    item: Mapping[str, Any],
+) -> tuple[int, int, bool, int]:
+    """Sort combined history without inventing a turn for legacy decisions."""
+    turn_number = item.get("turn_number")
+    decision_number = item.get("decision_number")
+    if isinstance(turn_number, int) and not isinstance(turn_number, bool):
+        ordering_number = turn_number
+        missing_turn = 0
+    else:
+        # A decision number is only a deterministic placement key here. Keep
+        # the record's explicit ``turn_number`` (including None) untouched.
+        ordering_number = (
+            decision_number
+            if isinstance(decision_number, int) and not isinstance(decision_number, bool)
+            else item.get("number")
+            if isinstance(item.get("number"), int)
+            and not isinstance(item.get("number"), bool)
+            else 0
+        )
+        missing_turn = 1
+    return (
+        missing_turn,
+        ordering_number,
+        item.get("kind") != "workflow_turn",
+        decision_number
+        if isinstance(decision_number, int) and not isinstance(decision_number, bool)
+        else 0,
+    )
 
 
 def _merge_history_ranges(
@@ -1502,9 +1886,11 @@ def build_manager_context(
     # --- Active-scope rejection ledger: ordered, complete rejection records ---
     rejection_history = boundary.get("review_rejection_history")
     active_rejections: list[dict[str, Any]] = []
+    full_active_rejections: list[dict[str, Any]] = []
     if isinstance(rejection_history, list) and active_scope_id:
         for item in rejection_history:
             if isinstance(item, dict) and item.get("scope_id") == active_scope_id:
+                full_active_rejections.append(dict(item))
                 active_rejections.append({
                     "rejection_number": item.get("rejection_number"),
                     "source_run_id": item.get("source_run_id"),
@@ -1540,9 +1926,16 @@ def build_manager_context(
     # --- Implementation attempts for the active scope ---
     boundary_attempts = boundary.get("implementation_attempts")
     scoped_attempts: dict[str, Any] | None = None
+    full_scoped_attempts: dict[str, Any] | None = None
     if isinstance(boundary_attempts, dict) and active_scope_id:
         raw_attempts = boundary_attempts.get(active_scope_id)
         if isinstance(raw_attempts, list):
+            full_scoped_attempts = {
+                "scope_id": active_scope_id,
+                "attempts": [
+                    dict(a) for a in raw_attempts if isinstance(a, Mapping)
+                ],
+            }
             scoped_attempts = {
                 "scope_id": active_scope_id,
                 "attempts": [
@@ -1707,7 +2100,11 @@ def build_manager_context(
         semantic_payload["result"] = (
             "Reviewer output is referenced by artifact; see the review stdout artifact."
         )
-        semantic_payload["fallback"] = False
+    elif semantic_payload.get("fallback") is True:
+        # The shared extractor deliberately retains its legacy fallback value
+        # for callers that need it, but schema-v3 must not copy an unrecognized
+        # JSON/event transcript into either the manifest or disk projection.
+        semantic_payload["result"] = REFERENCE_ONLY_SEMANTIC_RESULT
     else:
         semantic_payload["result"] = _v3_bounded_text(semantic_payload.get("result")) or ""
         semantic_payload["fallback"] = bool(semantic_payload.get("fallback"))
@@ -1740,12 +2137,6 @@ def build_manager_context(
                 if isinstance(finished_turn.get("diagnostics"), Mapping)
                 else None
             ),
-            "stdout_excerpt": (
-                "Reviewer output is referenced by artifact; see the review stdout artifact."
-                if finished.get("step_role") == "reviewer"
-                else _v3_bounded_text(stdout)
-            ),
-            "stderr_excerpt": _v3_bounded_text(stderr),
         },
         "raw_artifacts": finished_turn.get("raw_artifacts"),
     }
@@ -1761,13 +2152,17 @@ def build_manager_context(
         "repository": str(_v3_run_paths(run_dir).repo_root.resolve()),
         "run": str(run_dir.resolve()),
     }
+    if isinstance(v3_controller_state.get("lite_evidence"), str):
+        v3_controller_state["lite_evidence"] = _v3_bounded_text(
+            v3_controller_state["lite_evidence"]
+        )
     boundary_repartition_history = boundary.get("repartition_history")
     if isinstance(boundary_repartition_history, (list, tuple)):
-        v3_controller_state["checkpoint_repartitions"] = [
-            dict(record)
-            for record in boundary_repartition_history
-            if isinstance(record, Mapping)
-        ]
+        # Full repartition history is in the immutable manager-history
+        # artifact.  Keep the old field as an explicit empty compatibility
+        # container while the current repartition evidence below remains
+        # decision-critical.
+        v3_controller_state["checkpoint_repartitions"] = []
     if validated_envelope is not None:
         summary: dict[str, Any] = {
             "available": True,
@@ -1815,84 +2210,72 @@ def build_manager_context(
             key: value for key, value in latest_full_rejection.items()
             if key != "exact_reviewer_output"
         }
-        for key in ("review_summary", "repair_plan_summary"):
-            if key in summary_rejection:
-                summary_rejection[key] = _v3_bounded_text(summary_rejection[key])
+        # Reviewer prose and repair-plan prose are history evidence.  Keep
+        # their durable pointers and structural identifiers inline; the
+        # complete ledger is available from evidence.manager_history.
+        summary_rejection.pop("review_summary", None)
+        summary_rejection.pop("repair_plan_summary", None)
         v3_controller_state["latest_full_rejection"] = summary_rejection
-    v3_ledger = tuple({
-        "rejection_number": row.get("rejection_number"),
-        "source_run_id": row.get("source_run_id"),
-        "review_turn_number": row.get("review_turn_number"),
-        "review_step_name": row.get("review_step_name"),
-        "reviewer_selector": row.get("reviewer_selector"),
-        "checkpoint_index": row.get("checkpoint_index"),
-        "checkpoint_name": row.get("checkpoint_name"),
-        "reviewed_implementation_turn_number": row.get("reviewed_implementation_turn_number"),
-        "reviewed_worker_team": row.get("reviewed_worker_team"),
-        "reviewed_worker_selector": row.get("reviewed_worker_selector"),
-        "review_summary": _v3_bounded_text(row.get("review_summary")),
-        "repair_plan_summary": _v3_bounded_text(row.get("repair_plan_summary")),
-        "review_stdout_artifact_path": row.get("review_stdout_artifact_path"),
-        "repair_plan_path": row.get("repair_plan_path"),
-    } for row in active_rejections)
     v3_manager_history = _manager_history_records(
         run_dir, before_decision_number=decision_number
     )
-    v3_workflow_history = _v3_workflow_history_records(run_dir, turns)
-    retained_manager_history = v3_manager_history[-MANAGER_RUN_EXTRACT_MAX_RECORDS:]
-    recent_workflow_history = v3_workflow_history[-MANAGER_RUN_EXTRACT_MAX_RECORDS:]
-    recent_manager_for_extract = [
-        record
-        for record in retained_manager_history
-        if isinstance(record.get("turn_number"), int)
+    v3_workflow_history = _full_v3_workflow_history_records(run_dir, turns)
+    full_attempt_records = _attempt_records(full_scoped_attempts)
+    repartition_records = [
+        dict(record)
+        for record in (boundary_repartition_history or [])
+        if isinstance(record, Mapping)
     ]
-    v3_run_extract = recent_workflow_history + recent_manager_for_extract
-    v3_run_extract.sort(key=lambda item: (
-        item.get("turn_number", 0),
-        item.get("kind") != "workflow_turn",
-        item.get("decision_number", 0),
-    ))
-    v3_run_extract = v3_run_extract[-MANAGER_RUN_EXTRACT_MAX_RECORDS:]
-    history_disclosure = _v3_history_disclosure(
-        run_dir,
+    full_latest_turn = _full_v3_latest_turn(
+        v3_finished_turn,
+        finished=finished,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    history_payload = _manager_history_artifact_payload(
+        run_id=context.run_id,
+        decision_number=decision_number,
+        finalized_turn_number=finished_turn.get("turn_number"),
         workflow_records=v3_workflow_history,
         manager_records=v3_manager_history,
-        run_extract=v3_run_extract,
-        retained_manager_records=retained_manager_history,
+        attempt_records=full_attempt_records,
+        rejection_records=full_active_rejections,
+        latest_turn=full_latest_turn,
+        repartition_records=repartition_records,
     )
-    v3_manager_decisions = tuple({
-        "decision_number": row.get("decision_number"),
-        "turn_number": row.get("turn_number"),
-        "status": row.get("status"),
-        "level": row.get("level"),
-        "trigger": row.get("trigger"),
-        "action": row.get("action"),
-        "reason": _v3_bounded_text(row.get("reason")),
-        "artifact_path": row.get("artifact_path"),
-    } for row in retained_manager_history)
-    reviewer_turn_numbers = {
-        turn.get("turn_number")
-        for turn in turns
-        if turn.get("step_role") == "reviewer"
+    manager_history_entry = _capture_manager_history_evidence(
+        run_dir,
+        capture=capture_evidence,
+        boundary=boundary,
+        run_json=run_json,
+        decision_number=decision_number,
+        payload=history_payload,
+    )
+    history_summary = _history_summary(
+        workflow_records=v3_workflow_history,
+        manager_records=v3_manager_history,
+        attempt_records=full_attempt_records,
+        rejection_records=full_active_rejections,
+        history_entry=manager_history_entry,
+    )
+    # Keep the prior disclosure field readable for saved v3 consumers, while
+    # making the new projection explicit: all historical rows are in the
+    # named manager-history artifact, not in the inline manifest.
+    history_disclosure = {
+        "reduction_order": [],
+        "reduced_categories": [],
+        "retained_counts": {
+            "run_extract": 0,
+            "run_extract_manager_decisions": 0,
+            "manager_decisions": 0,
+            "workflow_turns": 0,
+            "checkpoint_repartitions": 0,
+            "active_scope_rejection_ledger": 0,
+            "implementation_attempts": 0,
+        },
+        "omitted": [],
+        "storage": "evidence.manager_history",
     }
-    bounded_extract: list[dict[str, Any]] = []
-    for record in v3_run_extract:
-        record = dict(record)
-        if record.get("kind") == "manager_decision":
-            record["semantic_summary"] = _v3_bounded_text(record.get("semantic_summary"))
-        elif record.get("number") in reviewer_turn_numbers:
-            record["semantic_summary"] = (
-                "Reviewer output is referenced by artifact; see the review stdout artifact."
-            )
-        else:
-            record["semantic_summary"] = _v3_bounded_text(record.get("semantic_summary"))
-        bounded_extract.append(record)
-    bounded_extract.sort(key=lambda item: (
-        item.get("turn_number", 0),
-        item.get("kind") != "workflow_turn",
-        item.get("decision_number", 0),
-    ))
-    v3_run_extract = tuple(bounded_extract)
     v3_context = ManagerContextV3(
         schema_version=MANAGER_CONTEXT_SCHEMA_VERSION_V3,
         run_id=context.run_id,
@@ -1900,15 +2283,16 @@ def build_manager_context(
         level=context.level,
         trigger=context.trigger,
         finished_turn=v3_finished_turn,
-        run_extract=v3_run_extract,
+        run_extract=(),
         plan_state=context.plan_state,
         controller_state=v3_controller_state,
-        evidence=evidence,
+        evidence={**evidence, "manager_history": manager_history_entry},
         plan_content_disclosure=plan_content_disclosure,
         history_disclosure=history_disclosure,
-        active_scope_rejection_ledger=v3_ledger,
-        implementation_attempts=scoped_attempts,
-        manager_decisions=v3_manager_decisions,
+        history_summary=history_summary,
+        active_scope_rejection_ledger=(),
+        implementation_attempts={},
+        manager_decisions=(),
         change_surface_evidence=change_surface,
         manager_note_scope=manager_note_scope,
         retry_manager_note_scope=retry_manager_note_scope,

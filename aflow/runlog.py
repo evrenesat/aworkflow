@@ -678,6 +678,7 @@ EVIDENCE_DIRNAME = "evidence"
 EVIDENCE_KIND_DIRNAMES = {
     "plan": "plans",
     "checkpoint": "checkpoints",
+    "manager_history": "manager-history",
 }
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -691,7 +692,7 @@ class EvidenceReference:
     validation but must never create a second exposed path field.
     """
 
-    kind: Literal["plan", "checkpoint"]
+    kind: Literal["plan", "checkpoint", "manager_history"]
     path: str
     sha256: str
     byte_size: int
@@ -716,7 +717,8 @@ def evidence_artifact_path(paths: RunPaths, kind: str, sha256: str) -> Path:
     """Return the digest-addressed destination beneath the run evidence store."""
     if _SHA256_HEX_RE.fullmatch(sha256) is None:
         raise ValueError("evidence artifact digest must be 64 lowercase hex characters")
-    return evidence_artifact_dir(paths, kind) / f"{sha256}.md"
+    suffix = ".json" if kind == "manager_history" else ".md"
+    return evidence_artifact_dir(paths, kind) / f"{sha256}{suffix}"
 
 
 def evidence_reference(
@@ -855,7 +857,7 @@ def store_evidence_artifact(
     """
     digest = hashlib.sha256(data).hexdigest()
     kind_dir = _ensure_evidence_kind_dir(paths, kind)
-    destination = kind_dir / f"{digest}.md"
+    destination = evidence_artifact_path(paths, kind, digest)
     if destination.exists():
         _validate_evidence_destination(paths, kind, destination)
         existing = destination.read_bytes()

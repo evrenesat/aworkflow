@@ -78,31 +78,31 @@ and produce reference-only schema-v3 contexts.
 
 Before a live schema-v3 boundary, the controller captures the exact active
 plan and current checkpoint into the run-local content-addressed evidence
-store (`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md`);
-equal active/original bytes share one artifact and unchanged bytes create no
-new files on later decisions. Historical rebuilds never write evidence and
-disclose content as unavailable when the exact bytes are not already stored.
+store (`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md`) and
+captures the complete structured manager history into
+`evidence/manager-history/<sha256>.json`. Equal active/original bytes share one
+artifact and unchanged bytes create no new files on later decisions. Historical
+rebuilds never write evidence and disclose content as unavailable when the
+exact recorded bytes are not already stored.
 The inline manager manifest carries repository-relative artifact paths,
 SHA-256 hashes, byte sizes, and checkpoint line/byte ranges instead of plan
 bodies, base64 evidence, or reviewer transcripts. Reviewer stdout is
-referenced through its durable turn artifact.
+referenced through its durable turn artifact. Historical rows are represented
+inline only by `history_summary`; the four compatibility collections remain
+empty while their complete details live in the manager-history artifact.
 
 - The exact UTF-8 inline user prompt targets 16 KiB (`MANAGER_INLINE_CONTEXT_TARGET_BYTES`)
   and is hard-limited to 40 KiB (`MANAGER_INLINE_CONTEXT_MAX_BYTES`) before any
-  provider process starts. Exceeding the hard limit fails closed with a fixed
-  error containing total bytes and per-top-level-field byte counts only.
-- Bounded semantic fields (results, reasons, rejection summaries, diagnostic
-  excerpts) are capped at 2,000 characters (`MANAGER_SUMMARY_MAX_CHARS`) with
-  one shared deterministic truncation marker. Schema-v3 manager decisions are
-  selected by decision number and workflow turns by turn number, with explicit
-  fields for both domains. The context retains at most 12 manager decisions and
-  12 mixed run-extract records. Omitted history is disclosed through measured
-  `history_disclosure` descriptors containing the source run, artifact root,
-  existing relative path pattern, omitted count, and merged numeric ranges.
-  When the exact final wire prompt remains over the hard cap, optional history
-  is removed oldest-first: duplicate manager rows in the run extract, older
-  manager decisions, then older workflow turns. Current boundary authority and
-  durable references are never replaced by those historical projections.
+  provider process starts. Optional latest-turn prose is removed if necessary;
+  if required current facts alone exceed the target, the prelaunch boundary
+  fails closed with a fixed error containing total bytes and per-top-level-field
+  byte counts only.
+- The latest human semantic summary and error are each bounded to 512 UTF-8
+  bytes with valid boundaries and one shared truncation marker. The history
+  artifact keeps complete structured collections and explicit coverage ranges.
+  Managers read its declared reference only when the numeric summary is
+  ambiguous, stalled, or rejected, verify the digest and byte size, and never
+  search for alternate or reconstruct missing artifacts.
 - Non-sensitive prompt metrics persist in the manager result:
   `system_prompt_bytes`, `user_prompt_bytes`, `argv_bytes`,
   `referenced_artifact_count`, `referenced_artifact_bytes`. Referenced
@@ -503,10 +503,12 @@ it does not increase `turns_completed`, consume `max_turns`, create a checkpoint
 commit, or trigger same-step caps.
 
 The manager receives a reproducible, versioned context built from durable
-artifacts. Live schema-v3 Lite and Full contexts carry bounded semantic
+artifacts. Live schema-v3 Lite and Full contexts carry bounded current semantic
 results, plan snapshots and structured state, controller/routing counters,
-compact history, bounded diagnostics, and controller-declared evidence
-references. Neither level receives active-plan or checkpoint content inline,
+numeric history summaries, bounded diagnostics, and controller-declared
+evidence references. Complete historical collections are disk-backed and
+named by `evidence.manager_history`; they are not repeated in the inline
+manifest. Neither level receives active-plan or checkpoint content inline,
 prompts, or raw trace bodies; Full may receive richer bounded scope and
 rejection evidence. Full is chosen directly after consecutive unchanged
 executions of the same workflow step, the second reviewer rejection within one

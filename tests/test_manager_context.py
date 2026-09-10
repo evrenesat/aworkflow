@@ -1305,7 +1305,6 @@ from aflow.manager_context import (
     MANAGER_CONTEXT_SCHEMA_VERSION_V3,
     MANAGER_INLINE_CONTEXT_MAX_BYTES,
     MANAGER_INLINE_CONTEXT_TARGET_BYTES,
-    MANAGER_RUN_EXTRACT_MAX_RECORDS,
     TRUNCATION_MARKER,
 )
 
@@ -1366,6 +1365,41 @@ def test_v3_context_is_reference_only_and_within_target_bytes(tmp_path: Path) ->
         "original_plan": "referenced",
         "checkpoint": "referenced",
     }
+    assert context["run_extract"] == []
+    assert context["manager_decisions"] == []
+    assert context["active_scope_rejection_ledger"] == []
+    assert context["implementation_attempts"] == {}
+    history = evidence["manager_history"]
+    assert history["available"] is True
+    assert history["reference"]["kind"] == "manager_history"
+    assert history["reference"]["path"].endswith(".json")
+    history_payload = json.loads(
+        (tmp_path / "repo" / history["reference"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert history_payload["schema_version"] == 1
+    assert history_payload["source_run_id"] == run_dir.name
+    assert history_payload["sections"]["run_extract"]
+    assert history_payload["sections"]["latest_turn"]["semantic_result"][
+        "result"
+    ].startswith("WORKER-SEMANTIC-SENTINEL-77aa")
+    assert context["history_summary"] == {
+        "total_turns": 1,
+        "total_decisions": 0,
+        "total_implementation_attempts": 0,
+        "total_active_scope_rejections": 0,
+        "latest_decision_number": None,
+        "latest_decision_action": None,
+        "latest_rejection_number": None,
+        "reference_available": True,
+        "coverage": {
+            "turns": {"count": 1, "range": {"start": 1, "end": 1}},
+            "decisions": {"count": 0, "range": None},
+            "implementation_attempts": {"count": 0, "range": None},
+            "active_scope_rejections": {"count": 0, "range": None},
+        },
+    }
     # The exact bytes live only in the evidence store.
     plan_artifact = (
         tmp_path / "repo" / ".aflow" / "runs" / "run-1" / "evidence" / "plans"
@@ -1377,6 +1411,162 @@ def test_v3_context_is_reference_only_and_within_target_bytes(tmp_path: Path) ->
     assert summary["schema_version"] == 1
     assert summary["canonical_envelope_sha256"]
     assert "plan_text" not in json.dumps(summary)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "extraction", "expected"),
+    [
+        ("plain final result", "plain_text", "plain final result"),
+        (
+            '{"type":"result","result":"recognized final assistant"}',
+            "structured_stream",
+            "recognized final assistant",
+        ),
+    ],
+)
+def test_v3_full_history_preserves_recognized_and_plain_results(
+    tmp_path: Path, stdout: str, extraction: str, expected: str
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=stdout)
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=boundary,
+        active_plan_content=plan.read_text(encoding="utf-8"),
+        capture_evidence=True,
+    )
+    history_ref = context["evidence"]["manager_history"]["reference"]
+    history_payload = json.loads(
+        (tmp_path / "repo" / history_ref["path"]).read_text(encoding="utf-8")
+    )
+    record = history_payload["sections"]["run_extract"][0]
+    latest = history_payload["sections"]["latest_turn"]
+    assert record["semantic_extraction"] == extraction
+    assert record["semantic_fallback"] is False
+    assert record["semantic_summary"] == expected
+    assert latest["semantic_result"]["extraction"] == extraction
+    assert latest["semantic_result"]["fallback"] is False
+    assert latest["semantic_result"]["result"] == expected
+
+
+def test_v3_full_history_hides_unrecognized_structured_stream(
+    tmp_path: Path,
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    private_session_sentinel = "PRIVATE_SESSION_SENTINEL_7b3a"
+    stdout = json.dumps({
+        "type": "session.started",
+        "session_id": private_session_sentinel,
+        "metadata": {"provider_private": True},
+    })
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=stdout)
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=boundary,
+        active_plan_content=plan.read_text(encoding="utf-8"),
+        capture_evidence=True,
+    )
+    history_ref = context["evidence"]["manager_history"]["reference"]
+    history_payload = json.loads(
+        (tmp_path / "repo" / history_ref["path"]).read_text(encoding="utf-8")
+    )
+    run_extract = history_payload["sections"]["run_extract"]
+    latest = history_payload["sections"]["latest_turn"]
+    assert private_session_sentinel not in json.dumps(run_extract)
+    assert private_session_sentinel not in json.dumps(latest)
+    assert private_session_sentinel not in json.dumps(context)
+    assert run_extract[0]["semantic_extraction"] == (
+        "unrecognized_structured_stream"
+    )
+    assert run_extract[0]["semantic_fallback"] is True
+    assert "referenced by artifact" in run_extract[0]["semantic_summary"]
+    assert latest["semantic_result"]["extraction"] == (
+        "unrecognized_structured_stream"
+    )
+    assert latest["semantic_result"]["fallback"] is True
+    assert "referenced by artifact" in latest["semantic_result"]["result"]
+    assert latest["raw_artifacts"][0]["path"] == "turns/turn-001/stdout.txt"
+    assert latest["raw_artifacts"][0]["byte_size"] == len(stdout.encode("utf-8"))
+
+
+@pytest.mark.parametrize("include_null_finalized_turn", [False, True])
+def test_v3_history_handles_legacy_manager_turn_associations(
+    tmp_path: Path, include_null_finalized_turn: bool
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    manager_result = {
+        "decision_number": 1,
+        "level": "full",
+        "trigger": "post_turn",
+        "status": "accepted",
+        "action": "continue",
+        "reason": "The current implementation can continue.",
+    }
+    if include_null_finalized_turn:
+        manager_result["finalized_turn_number"] = None
+    _write_json(
+        run_dir / "manager" / "decision-001" / "result.json", manager_result
+    )
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    plan_text = plan.read_text(encoding="utf-8")
+
+    live = build_manager_context(
+        run_dir,
+        level="full",
+        decision_number=2,
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=True,
+    )
+    history_ref = live["evidence"]["manager_history"]["reference"]
+    history_path = tmp_path / "repo" / history_ref["path"]
+    history_payload = json.loads(history_path.read_text(encoding="utf-8"))
+    manager_record = history_payload["sections"]["manager_decisions"][0]
+    assert manager_record["decision_number"] == 1
+    assert manager_record["turn_number"] is None
+    assert live["history_summary"]["total_turns"] == 1
+    assert live["history_summary"]["total_decisions"] == 1
+    assert live["history_summary"]["coverage"]["decisions"] == {
+        "count": 1,
+        "range": {"start": 1, "end": 1},
+    }
+    assert [
+        (record["kind"], record.get("turn_number"))
+        for record in history_payload["sections"]["run_extract"]
+    ] == [("workflow_turn", 1), ("manager_decision", None)]
+
+    decision_context = run_dir / "manager" / "decision-002" / "context.json"
+    _write_json(decision_context, live)
+    before = sorted(
+        path.relative_to(run_dir).as_posix()
+        for path in (run_dir / "evidence").rglob("*")
+        if path.is_file()
+    )
+    rebuilt = build_manager_context(
+        run_dir,
+        level="full",
+        decision_number=2,
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=False,
+    )
+    after = sorted(
+        path.relative_to(run_dir).as_posix()
+        for path in (run_dir / "evidence").rglob("*")
+        if path.is_file()
+    )
+    assert rebuilt == live
+    assert after == before
 
 
 def test_v3_evidence_capture_is_idempotent_and_selector3_keeps_v2(tmp_path: Path) -> None:
@@ -1391,13 +1581,16 @@ def test_v3_evidence_capture_is_idempotent_and_selector3_keeps_v2(tmp_path: Path
     )
     evidence_dir = tmp_path / "repo" / ".aflow" / "runs" / "run-1" / "evidence"
     plans_before = sorted((evidence_dir / "plans").iterdir())
+    history_before = sorted((evidence_dir / "manager-history").iterdir())
     second = build_manager_context(
         run_dir, level="full", boundary=boundary,
         active_plan_content=plan_text, capture_evidence=True,
     )
     plans_after = sorted((evidence_dir / "plans").iterdir())
+    history_after = sorted((evidence_dir / "manager-history").iterdir())
     assert second["evidence"] == first["evidence"]
     assert plans_after == plans_before
+    assert history_after == history_before
     # Selector 3 continues to rebuild the exact v2 shape.
     boundary["context_schema_version"] = 3
     v2 = build_manager_context(
@@ -1423,6 +1616,120 @@ def test_v3_without_capture_discloses_unavailable_and_writes_nothing(tmp_path: P
     assert not evidence_store.exists()
     assert context["evidence"]["active_plan"]["available"] is False
     assert context["plan_content_disclosure"]["active_plan"] == "unavailable"
+    assert context["evidence"]["manager_history"]["available"] is False
+    assert not (evidence_store / "manager-history").exists()
+
+
+def test_v3_manager_history_reference_is_read_only_and_tamper_evident(
+    tmp_path: Path,
+) -> None:
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    for number in range(1, 4):
+        _write_turn(
+            run_dir,
+            number,
+            step="implement",
+            role="implementer",
+            stdout=f"semantic result {number} — 日本語🚦",
+        )
+        if number < 3:
+            _write_json(
+                run_dir / "manager" / f"decision-{number:03d}" / "result.json",
+                {
+                    "decision_number": number,
+                    "finalized_turn_number": number,
+                    "level": "full",
+                    "trigger": "post_turn",
+                    "status": "accepted",
+                    "action": "continue",
+                    "reason": f"decision {number}",
+                },
+            )
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+
+    live = build_manager_context(
+        run_dir,
+        level="full",
+        decision_number=3,
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=True,
+    )
+    history_ref = live["evidence"]["manager_history"]["reference"]
+    history_path = tmp_path / "repo" / history_ref["path"]
+    history_text = history_path.read_text(encoding="utf-8")
+    history_payload = json.loads(history_text)
+    assert history_payload["schema_version"] == 1
+    assert history_payload["decision_number"] == 3
+    assert len(history_payload["sections"]["run_extract"]) == 5
+    assert len(history_payload["sections"]["manager_decisions"]) == 2
+    assert history_payload["sections"]["latest_turn"]["semantic_result"][
+        "result"
+    ].endswith("日本語🚦")
+    assert '"stdout":' not in history_text
+    assert '"stderr":' not in history_text
+
+    decision_context = run_dir / "manager" / "decision-003" / "context.json"
+    _write_json(decision_context, live)
+    evidence_files_before = sorted(
+        path.name for path in (run_dir / "evidence" / "manager-history").iterdir()
+    )
+    rebuilt = build_manager_context(
+        run_dir,
+        level="full",
+        decision_number=3,
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=False,
+    )
+    assert rebuilt == live
+    assert sorted(
+        path.name for path in (run_dir / "evidence" / "manager-history").iterdir()
+    ) == evidence_files_before
+
+    history_path.write_bytes(b"tampered history\n")
+    unavailable = build_manager_context(
+        run_dir,
+        level="full",
+        decision_number=3,
+        boundary=boundary,
+        active_plan_content=plan_text,
+        capture_evidence=False,
+    )
+    assert unavailable["evidence"]["manager_history"]["available"] is False
+    assert unavailable["history_summary"]["reference_available"] is False
+    assert history_path.read_bytes() == b"tampered history\n"
+
+
+def test_v3_manager_history_capture_failure_stops_live_context(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from aflow import runlog
+
+    run_dir, plan = _run(tmp_path)
+    plan_text = plan.read_text(encoding="utf-8")
+    _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
+    boundary = dict(_enveloped_boundary(run_dir, plan))
+    boundary["context_schema_version"] = 4
+    original_store = runlog.store_evidence_artifact
+
+    def fail_history_store(paths, *, kind, data):
+        if kind == "manager_history":
+            raise OSError("synthetic manager history storage failure")
+        return original_store(paths, kind=kind, data=data)
+
+    monkeypatch.setattr(runlog, "store_evidence_artifact", fail_history_store)
+    with pytest.raises(OSError, match="synthetic manager history storage failure"):
+        build_manager_context(
+            run_dir,
+            level="full",
+            decision_number=1,
+            boundary=boundary,
+            active_plan_content=plan_text,
+            capture_evidence=True,
+        )
 
 
 @pytest.mark.parametrize("level", ["lite", "full"])
@@ -1463,7 +1770,7 @@ def test_v3_reviewer_finished_turn_references_stdout_artifact(tmp_path: Path, mo
     assert "referenced by artifact" in result
 
 
-def test_v3_run_extract_is_bounded_to_twelve_records(tmp_path: Path) -> None:
+def test_v3_history_artifact_keeps_complete_run_extract(tmp_path: Path) -> None:
     run_dir, plan = _run(tmp_path)
     for number in range(1, 16):
         _write_turn(
@@ -1480,11 +1787,18 @@ def test_v3_run_extract_is_bounded_to_twelve_records(tmp_path: Path) -> None:
         capture_evidence=True,
     )
 
-    assert len(context["run_extract"]) <= MANAGER_RUN_EXTRACT_MAX_RECORDS
-    assert context["run_extract"][-1]["number"] == 15
+    assert context["run_extract"] == []
+    assert context["history_summary"]["total_turns"] == 15
+    history_ref = context["evidence"]["manager_history"]["reference"]
+    history_payload = json.loads(
+        (tmp_path / "repo" / history_ref["path"]).read_text(encoding="utf-8")
+    )
+    run_extract = history_payload["sections"]["run_extract"]
+    assert len(run_extract) == 15
+    assert run_extract[-1]["turn_number"] == 15
 
 
-@pytest.mark.parametrize("history_size", [20, 100, 1_000])
+@pytest.mark.parametrize("history_size", [10, 100, 1_000])
 def test_v3_long_history_is_bounded_with_resolvable_omission_references(
     tmp_path: Path, monkeypatch, history_size: int
 ) -> None:
@@ -1550,53 +1864,33 @@ def test_v3_long_history_is_bounded_with_resolvable_omission_references(
     )
 
     assert context["schema_version"] == MANAGER_CONTEXT_SCHEMA_VERSION_V3
-    manager_decisions = context["manager_decisions"]
-    assert [item["decision_number"] for item in manager_decisions] == list(
-        range(max(1, history_size - MANAGER_RUN_EXTRACT_MAX_RECORDS + 1), history_size + 1)
+    assert context["manager_decisions"] == []
+    assert context["run_extract"] == []
+    assert context["active_scope_rejection_ledger"] == []
+    assert context["implementation_attempts"] == {}
+    assert context["controller_state"]["checkpoint_repartitions"] == []
+    assert context["history_summary"]["total_turns"] == history_size
+    assert context["history_summary"]["total_decisions"] == history_size
+    history_ref = context["evidence"]["manager_history"]["reference"]
+    history_payload = json.loads(
+        (tmp_path / "repo" / history_ref["path"]).read_text(encoding="utf-8")
     )
-    assert context["controller_state"]["checkpoint_repartitions"] == [repartition]
-    assert len(context["run_extract"]) <= MANAGER_RUN_EXTRACT_MAX_RECORDS
-    for record in context["run_extract"]:
-        if record["kind"] == "manager_decision":
-            assert isinstance(record["decision_number"], int)
-            assert isinstance(record["turn_number"], int)
-            assert record["artifact_path"].startswith("manager/decision-")
-        else:
-            assert record["kind"] == "workflow_turn"
-            assert isinstance(record["turn_number"], int)
-            assert record["artifact_path"] == (
-                f"turns/turn-{record['turn_number']:03d}"
-            )
+    assert len(history_payload["sections"]["run_extract"]) == history_size * 2
+    assert len(history_payload["sections"]["manager_decisions"]) == history_size
+    assert history_payload["sections"]["checkpoint_repartitions"] == [repartition]
 
     disclosure = context["history_disclosure"]
     assert disclosure["reduced_categories"] == []
     assert disclosure["reduction_order"] == []
-    assert disclosure["retained_counts"]["manager_decisions"] <= 12
-    descriptors = {
-        item["category"]: item for item in disclosure["omitted"]
-    }
-    assert {"run_extract_manager_decisions", "manager_decisions", "workflow_turns"} <= set(
-        descriptors
-    )
-    for category, descriptor in descriptors.items():
-        assert descriptor["source_run_id"] == run_dir.name
-        assert descriptor["artifact_root"] == str(run_dir.resolve())
-        assert descriptor["omitted_count"] > 0
-        assert descriptor["omitted_ranges"]
-        first_range = descriptor["omitted_ranges"][0]
-        if category == "workflow_turns":
-            referenced = run_dir / "turns" / f"turn-{first_range['start']:03d}"
-        else:
-            referenced = run_dir / "manager" / f"decision-{first_range['start']:03d}"
-        assert referenced.is_dir()
+    assert disclosure["omitted"] == []
 
     _, user_prompt = build_manager_prompts(context)
-    assert len(user_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert len(user_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES
 
 
 def test_v3_bounds_semantic_summaries_with_shared_marker(tmp_path: Path) -> None:
     run_dir, plan = _run(tmp_path)
-    huge_result = "LONG-SEMANTIC-" + ("x" * 5_000)
+    huge_result = "LONG-SEMANTIC-" + ("日本語🚦" * 1_500)
     _write_turn(run_dir, 1, step="implement", role="implementer", stdout=huge_result)
     boundary = dict(_enveloped_boundary(run_dir, plan))
     boundary["context_schema_version"] = 4
@@ -1609,9 +1903,15 @@ def test_v3_bounds_semantic_summaries_with_shared_marker(tmp_path: Path) -> None
 
     result = context["finished_turn"]["semantic_result"]["result"]
     assert TRUNCATION_MARKER in result
-    assert len(result) <= 2_000 + len(TRUNCATION_MARKER)
-    record = context["run_extract"][0]
-    assert record["semantic_summary"] == result
+    assert len(result.encode("utf-8")) <= 512
+    assert context["run_extract"] == []
+    history_ref = context["evidence"]["manager_history"]["reference"]
+    history_payload = json.loads(
+        (tmp_path / "repo" / history_ref["path"]).read_text(encoding="utf-8")
+    )
+    assert history_payload["sections"]["latest_turn"]["semantic_result"][
+        "result"
+    ] == huge_result
 
 
 def test_v3_later_boundary_fixture_preserves_unicode_review_and_repartition_evidence(
@@ -1742,7 +2042,7 @@ def test_v3_later_boundary_fixture_preserves_unicode_review_and_repartition_evid
     )
 
     assert first_prompt == second_prompt
-    assert len(first_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert len(first_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES
     assert projected["trigger"] == "lite_escalation"
     assert projected["finished_turn"]["turn_number"] == 20
     assert projected["controller_state"]["lite_evidence"] == (
@@ -1751,26 +2051,21 @@ def test_v3_later_boundary_fixture_preserves_unicode_review_and_repartition_evid
     assert projected["controller_state"]["active_implementation_scope"][
         "awaiting_review"
     ] is True
-    assert projected["controller_state"]["checkpoint_repartitions"] == [
-        repartition
-    ]
-    assert projected["active_scope_rejection_ledger"][0][
-        "review_stdout_artifact_path"
-    ] == "turns/turn-020/stdout.txt"
-    assert projected["controller_state"]["latest_full_rejection"][
-        "review_summary"
-    ] == "レビュー requires one bounded repair."
-    assert projected["controller_state"]["checkpoint_repartitions"][0][
-        "candidate_artifact_path"
-    ] == long_candidate_path
-    assert len(projected["manager_decisions"]) <= 12
-    assert len(projected["run_extract"]) <= 12
+    assert projected["controller_state"]["checkpoint_repartitions"] == []
+    assert projected["active_scope_rejection_ledger"] == []
+    assert projected["manager_decisions"] == []
+    assert projected["run_extract"] == []
+    assert projected["history_summary"]["total_decisions"] == 20
+    assert projected["history_summary"]["total_active_scope_rejections"] == 1
+    assert "review_summary" not in projected["controller_state"]["latest_full_rejection"]
     disclosure = projected["history_disclosure"]
-    assert disclosure["omitted"]
-    assert any(
-        descriptor["category"] == "manager_decisions"
-        for descriptor in disclosure["omitted"]
+    assert disclosure["omitted"] == []
+    history_ref = projected["evidence"]["manager_history"]["reference"]
+    history_payload = json.loads(
+        (tmp_path / "repo" / history_ref["path"]).read_text(encoding="utf-8")
     )
+    assert history_payload["sections"]["active_scope_rejection_ledger"] == [rejection]
+    assert history_payload["sections"]["checkpoint_repartitions"] == [repartition]
 
 
 def test_v3_decision_twenty_reconstruction_is_read_only_and_byte_stable(

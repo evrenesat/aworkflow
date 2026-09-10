@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-10 — Store manager history outside the live context (Checkpoint 4)
+
+- Added an additive content-addressed JSON evidence kind for complete manager
+  history, including turn/decision coverage, implementation attempts,
+  active-scope rejections, repartition records, and detailed latest-turn
+  semantic diagnostics without embedding raw stdout/stderr bodies.
+- Unrecognized structured-stream fallbacks remain reference-only with truthful
+  extraction metadata, and legacy decisions without turn associations sort
+  deterministically without inventing a turn.
+- Schema-v3 live contexts now retain only current decision facts, numeric
+  `history_summary`, immutable references, and byte-safe latest-turn/error
+  summaries; historical compatibility containers are explicitly empty. Read-only
+  reconstruction reuses exact recorded references and reports missing or
+  tampered artifacts without writing.
+- Updated the bundled manager contract and runtime architecture documentation
+  to distinguish the 16 KiB normal target from the 40 KiB hard prelaunch guard.
+
 ## 2026-09-10 — Integrate readable CLI status output
 
 - Wired the readable status renderer into the real runner lifecycle and

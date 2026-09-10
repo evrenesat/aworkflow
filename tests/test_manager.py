@@ -1529,6 +1529,7 @@ def test_manager_prompt_accepts_40_kib_and_rejects_one_more_utf8_byte() -> None:
 def test_v3_prompt_boundary_uses_exact_final_wire_serialization() -> None:
     from aflow.manager import (
         MANAGER_INLINE_CONTEXT_MAX_BYTES,
+        MANAGER_INLINE_CONTEXT_TARGET_BYTES,
         ManagerInlineContextLimitError,
         manager_prompt_metrics,
     )
@@ -1544,14 +1545,14 @@ def test_v3_prompt_boundary_uses_exact_final_wire_serialization() -> None:
     }
     _, base_prompt = build_manager_prompts(context)
     base_bytes = len(base_prompt.encode("utf-8"))
-    assert base_bytes < MANAGER_INLINE_CONTEXT_MAX_BYTES
-    context["padding"] = "x" * (MANAGER_INLINE_CONTEXT_MAX_BYTES - base_bytes)
+    assert base_bytes < MANAGER_INLINE_CONTEXT_TARGET_BYTES
+    context["padding"] = "x" * (MANAGER_INLINE_CONTEXT_TARGET_BYTES - base_bytes)
 
     system_prompt, prompt = build_manager_prompts(context)
     assert prompt.startswith("MANAGER_RUNTIME_JSON:\n")
     assert prompt.count("\nMANAGER_CONTEXT_JSON:\n") == 1
     assert prompt.endswith("\n")
-    assert len(prompt.encode("utf-8")) == MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert len(prompt.encode("utf-8")) == MANAGER_INLINE_CONTEXT_TARGET_BYTES
     _, decoded_context = _split_manager_user(prompt)
     assert decoded_context == context
 
@@ -1560,13 +1561,13 @@ def test_v3_prompt_boundary_uses_exact_final_wire_serialization() -> None:
         system_prompt=system_prompt,
         user_prompt=prompt,
     )
-    assert metrics["user_prompt_bytes"] == MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert metrics["user_prompt_bytes"] == MANAGER_INLINE_CONTEXT_TARGET_BYTES
 
     over_limit = dict(context)
     over_limit["padding"] += "x"
     with pytest.raises(
         ManagerInlineContextLimitError,
-        match=rf"total_bytes={MANAGER_INLINE_CONTEXT_MAX_BYTES + 1}\b",
+        match=rf"total_bytes={MANAGER_INLINE_CONTEXT_TARGET_BYTES + 1}\b",
     ):
         # The builder rejects the final wire string before the executor can
         # resolve or launch a provider invocation.
@@ -1599,7 +1600,7 @@ def test_prompt_hard_limit_fails_closed_before_provider_start() -> None:
 
 @pytest.mark.parametrize("summary", ["x" * 60, "é" * 60])
 def test_v3_prompt_budget_excludes_pretty_printing_without_losing_evidence(summary) -> None:
-    from aflow.manager import MANAGER_INLINE_CONTEXT_MAX_BYTES
+    from aflow.manager import MANAGER_INLINE_CONTEXT_TARGET_BYTES
 
     context = {
         "schema_version": 3, "level": "lite", "run_id": "run-1",
@@ -1611,15 +1612,17 @@ def test_v3_prompt_budget_excludes_pretty_printing_without_losing_evidence(summa
         ],
     }
     pretty = "MANAGER_CONTEXT_JSON:\n" + json.dumps(context, indent=2, sort_keys=True) + "\n"
-    assert len(pretty.encode("utf-8")) > MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert len(pretty.encode("utf-8")) > MANAGER_INLINE_CONTEXT_TARGET_BYTES
     _, prompt = build_manager_prompts(context)
-    assert len(prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert len(prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES
     _, compact_context = _split_manager_user(prompt)
-    assert compact_context == context
+    assert compact_context["run_extract"]
+    assert len(compact_context["run_extract"]) < len(context["run_extract"])
+    assert all("details" in item for item in compact_context["run_extract"])
 
 
 def test_v3_history_reduction_preserves_current_authority_and_reports_ranges() -> None:
-    from aflow.manager import MANAGER_INLINE_CONTEXT_MAX_BYTES
+    from aflow.manager import MANAGER_INLINE_CONTEXT_TARGET_BYTES
 
     history_text = "historical evidence " + ("x" * 6_000)
     context = {
@@ -1735,20 +1738,27 @@ def test_v3_history_reduction_preserves_current_authority_and_reports_ranges() -
     }
 
     _, prompt = build_manager_prompts(context)
-    assert len(prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+    assert len(prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES
     _, projected = _split_manager_user(prompt)
 
     for key in (
-        "finished_turn",
         "plan_state",
         "controller_state",
         "evidence",
         "plan_content_disclosure",
-        "active_scope_rejection_ledger",
         "manager_note_scope",
         "retry_manager_note_scope",
     ):
         assert projected[key] == context[key]
+    assert projected["finished_turn"]["raw_artifacts"] == context["finished_turn"][
+        "raw_artifacts"
+    ]
+    assert projected["finished_turn"]["semantic_result"] == context["finished_turn"][
+        "semantic_result"
+    ]
+    assert projected["active_scope_rejection_ledger"] == context[
+        "active_scope_rejection_ledger"
+    ]
     assert all(
         item.get("kind") != "manager_decision"
         for item in projected["run_extract"]
@@ -1807,6 +1817,15 @@ def test_v3_prompt_metrics_count_references_without_bodies() -> None:
                     "byte_size": 5120,
                 },
             },
+            "manager_history": {
+                "available": True,
+                "reference": {
+                    "kind": "manager_history",
+                    "path": ".aflow/runs/run-1/evidence/manager-history/cccc.json",
+                    "sha256": "c" * 64,
+                    "byte_size": 2048,
+                },
+            },
         },
     }
     metrics = manager_prompt_metrics(
@@ -1819,8 +1838,8 @@ def test_v3_prompt_metrics_count_references_without_bodies() -> None:
         "system_prompt_bytes": 6,
         "user_prompt_bytes": 4,
         "argv_bytes": 11,
-        "referenced_artifact_count": 2,
-        "referenced_artifact_bytes": 63580 + 5120,
+        "referenced_artifact_count": 3,
+        "referenced_artifact_bytes": 63580 + 5120 + 2048,
     }
     # Metrics are numeric counts only: no prompt text or evidence bodies.
     assert '"system_prompt"' not in json.dumps(metrics)

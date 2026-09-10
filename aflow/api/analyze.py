@@ -129,6 +129,17 @@ def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
                             durable = json.loads(boundary_path.read_text(encoding="utf-8"))
                             if not isinstance(durable, dict):
                                 raise ValueError("manager boundary artifact is not an object")
+                            if (
+                                isinstance(stored, dict)
+                                and stored.get("schema_version") == 3
+                                and "history_summary" not in stored
+                            ):
+                                # Pre-CP4 schema-v3 contexts are already the
+                                # saved, reference-only representation. Keep
+                                # them readable without rewriting their shape;
+                                # new contexts carry history_summary and take
+                                # the deterministic rebuild path below.
+                                return stored
                             boundary = dict(durable["boundary"])
                             if "context_schema_version" not in boundary:
                                 stored_progress = (
@@ -165,7 +176,13 @@ def analyze_runs(request: AnalyzeRequest) -> dict[str, Any]:
                             repartition_history = _validated_repartition_history(
                                 run_dir, boundary,
                             )
-                            if repartition_history is not None:
+                            if (
+                                repartition_history is not None
+                                and not (
+                                    rebuilt.get("schema_version") == 3
+                                    and "history_summary" in rebuilt
+                                )
+                            ):
                                 controller_state = rebuilt.get("controller_state")
                                 if isinstance(controller_state, dict):
                                     controller_state["checkpoint_repartitions"] = (

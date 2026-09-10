@@ -20,6 +20,7 @@ from .config import WorkflowUserConfig
 from .manager_context import (
     MANAGER_CONTEXT_SCHEMA_VERSION_V3,
     MANAGER_INLINE_CONTEXT_MAX_BYTES,
+    MANAGER_INLINE_CONTEXT_TARGET_BYTES,
 )
 from .skill_catalog import is_bundled_skill_name
 from .skill_store import (
@@ -637,6 +638,18 @@ _HISTORY_REDUCTION_DETAILS: dict[str, tuple[str, str]] = {
         "turn_number",
         "turns/turn-{turn_number:03d}",
     ),
+    "active_scope_rejection_ledger": (
+        "review_turn_number",
+        "turns/turn-{review_turn_number:03d}",
+    ),
+    "implementation_attempts": (
+        "turn_number",
+        "turns/turn-{turn_number:03d}",
+    ),
+    "checkpoint_repartitions": (
+        "decision_number",
+        "manager/decision-{decision_number:03d}",
+    ),
 }
 
 
@@ -742,8 +755,16 @@ def _update_history_retained_counts(
     manager_decisions = context.get("manager_decisions")
     controller = context.get("controller_state")
     repartitions = controller.get("checkpoint_repartitions") if isinstance(controller, Mapping) else None
-    run_records = [item for item in run_extract if isinstance(item, Mapping)] if isinstance(run_extract, list) else []
-    manager_records = [item for item in manager_decisions if isinstance(item, Mapping)] if isinstance(manager_decisions, list) else []
+    run_records = [item for item in run_extract if isinstance(item, Mapping)] if isinstance(run_extract, (list, tuple)) else []
+    manager_records = [item for item in manager_decisions if isinstance(item, Mapping)] if isinstance(manager_decisions, (list, tuple)) else []
+    ledger = context.get("active_scope_rejection_ledger")
+    ledger_records = [item for item in ledger if isinstance(item, Mapping)] if isinstance(ledger, (list, tuple)) else []
+    attempts = context.get("implementation_attempts")
+    attempt_records = []
+    if isinstance(attempts, Mapping):
+        raw_attempts = attempts.get("attempts")
+        if isinstance(raw_attempts, (list, tuple)):
+            attempt_records = [item for item in raw_attempts if isinstance(item, Mapping)]
     disclosure["retained_counts"] = {
         "run_extract": len(run_records),
         "run_extract_manager_decisions": sum(
@@ -756,25 +777,66 @@ def _update_history_retained_counts(
         "checkpoint_repartitions": (
             len(repartitions) if isinstance(repartitions, list) else 0
         ),
+        "active_scope_rejection_ledger": len(ledger_records),
+        "implementation_attempts": len(attempt_records),
     }
 
 
 def _reduce_v3_history_for_budget(
     runtime: Mapping[str, Any], context: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    """Remove only optional historical records until the exact wire prompt fits."""
+    """Fit a v3 manifest to the 16 KiB target without dropping authority.
+
+    New contexts already project historical rows into disk-backed evidence.
+    This reducer also keeps saved/pre-projection v3 contexts readable: when a
+    legacy manifest is larger than the target, it removes optional historical
+    rows in a deterministic order and only then drops the optional latest-turn
+    prose.  Current routing, scope, snapshot, budget, and artifact-reference
+    facts remain in the candidate; an irreducibly large candidate is rejected
+    by ``build_manager_prompts`` rather than silently enlarged.
+    """
     initial_prompt = _serialize_manager_user_prompt(runtime, context)
-    if len(initial_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES:
+    if len(initial_prompt.encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES:
         return context
 
-    has_optional_history = any(
+    controller = context.get("controller_state")
+    finished = context.get("finished_turn")
+    finished_semantic = (
+        finished.get("semantic_result")
+        if isinstance(finished, Mapping)
+        else None
+    )
+    has_reducible_content = any(
         isinstance(item, Mapping)
         for item in context.get("run_extract", ())
     ) or any(
         isinstance(item, Mapping)
         for item in context.get("manager_decisions", ())
+    ) or any(
+        isinstance(item, Mapping)
+        for item in context.get("active_scope_rejection_ledger", ())
+    ) or (
+        isinstance(context.get("implementation_attempts"), Mapping)
+        and bool(context["implementation_attempts"].get("attempts"))
+    ) or (
+        isinstance(controller, Mapping)
+        and any(
+            isinstance(item, Mapping)
+            for item in controller.get("checkpoint_repartitions", ())
+        )
+    ) or (
+        isinstance(finished_semantic, Mapping)
+        and isinstance(finished_semantic.get("result"), str)
+        and bool(finished_semantic.get("result"))
+    ) or (
+        isinstance(finished, Mapping)
+        and isinstance(finished.get("error"), str)
+        and bool(finished.get("error"))
     )
-    if not has_optional_history:
+    raw_disclosure = context.get("history_disclosure")
+    if isinstance(raw_disclosure, Mapping) and raw_disclosure.get("omitted"):
+        has_reducible_content = True
+    if not has_reducible_content:
         return context
 
     candidate = deepcopy(dict(context))
@@ -787,7 +849,7 @@ def _reduce_v3_history_for_budget(
     candidate["history_disclosure"] = disclosure
 
     def fits() -> bool:
-        return len(_serialize_manager_user_prompt(runtime, candidate).encode("utf-8")) <= MANAGER_INLINE_CONTEXT_MAX_BYTES
+        return len(_serialize_manager_user_prompt(runtime, candidate).encode("utf-8")) <= MANAGER_INLINE_CONTEXT_TARGET_BYTES
 
     run_extract = [
         dict(item)
@@ -840,7 +902,7 @@ def _reduce_v3_history_for_budget(
         workflow_candidates = [
             (index, item)
             for index, item in enumerate(run_extract)
-            if item.get("kind") == "workflow_turn"
+            if item.get("kind") in {None, "workflow_turn"}
         ]
         workflow_index = min(
             workflow_candidates,
@@ -864,10 +926,101 @@ def _reduce_v3_history_for_budget(
     if fits():
         return candidate
 
-    # The executor-added repartition history is included before this exact
-    # measurement and remains controller-owned boundary history.  If it still
-    # prevents a fit after optional history is removed, the hard guard leaves
-    # the explicit prelaunch failure for the diagnostic checkpoint.
+    ledger = [
+        dict(item)
+        for item in candidate.get("active_scope_rejection_ledger", [])
+        if isinstance(item, Mapping)
+    ]
+    candidate["active_scope_rejection_ledger"] = ledger
+    while ledger and not fits():
+        removed = ledger.pop(0)
+        _record_history_reduction(
+            candidate,
+            disclosure,
+            category="active_scope_rejection_ledger",
+            records=[removed],
+        )
+        _update_history_retained_counts(candidate, disclosure)
+    if fits():
+        return candidate
+
+    attempts_value = candidate.get("implementation_attempts")
+    attempts = [
+        dict(item)
+        for item in attempts_value.get("attempts", [])
+        if isinstance(item, Mapping)
+    ] if isinstance(attempts_value, Mapping) else []
+    if isinstance(attempts_value, Mapping):
+        candidate["implementation_attempts"] = {
+            "scope_id": attempts_value.get("scope_id"),
+            "attempts": attempts,
+        }
+    while attempts and not fits():
+        removed = attempts.pop(0)
+        _record_history_reduction(
+            candidate,
+            disclosure,
+            category="implementation_attempts",
+            records=[removed],
+        )
+        candidate["implementation_attempts"] = {
+            "scope_id": (
+                attempts_value.get("scope_id")
+                if isinstance(attempts_value, Mapping)
+                else None
+            ),
+            "attempts": attempts,
+        }
+        _update_history_retained_counts(candidate, disclosure)
+    if fits():
+        return candidate
+
+    controller = candidate.get("controller_state")
+    repartitions = [
+        dict(item)
+        for item in controller.get("checkpoint_repartitions", [])
+        if isinstance(item, Mapping)
+    ] if isinstance(controller, Mapping) else []
+    if isinstance(controller, dict) and "checkpoint_repartitions" in controller:
+        controller["checkpoint_repartitions"] = repartitions
+    while repartitions and not fits():
+        removed = repartitions.pop(0)
+        _record_history_reduction(
+            candidate,
+            disclosure,
+            category="checkpoint_repartitions",
+            records=[removed],
+        )
+        _update_history_retained_counts(candidate, disclosure)
+    if fits():
+        return candidate
+
+    # A latest semantic result and error are useful, but optional once the
+    # fixed current facts and evidence references have been retained.
+    finished = candidate.get("finished_turn")
+    if isinstance(finished, dict):
+        semantic = finished.get("semantic_result")
+        if isinstance(semantic, dict):
+            semantic.pop("result", None)
+        finished.pop("error", None)
+        diagnostics = finished.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            diagnostics.pop("signal_provenance", None)
+            diagnostics.pop("stdout_excerpt", None)
+            diagnostics.pop("stderr_excerpt", None)
+    if fits():
+        return candidate
+
+    # Old v3 manifests may carry omission descriptors from the pre-artifact
+    # reducer. They are not required current facts and can be discarded from
+    # the prompt candidate after their rows are gone.
+    if isinstance(candidate.get("history_disclosure"), dict):
+        candidate["history_disclosure"].pop("omitted", None)
+    if fits():
+        return candidate
+
+    # No required current field is removed here.  The caller raises a bounded
+    # prelaunch error if this candidate still exceeds the 16 KiB target.
     _update_history_retained_counts(candidate, disclosure)
     return candidate
 
@@ -917,6 +1070,26 @@ def build_manager_prompts(
         else context
     )
     user_prompt = _serialize_manager_user_prompt(runtime, prompt_context)
+    if context.get("schema_version") == MANAGER_CONTEXT_SCHEMA_VERSION_V3:
+        prompt_bytes = len(user_prompt.encode("utf-8"))
+        if prompt_bytes > MANAGER_INLINE_CONTEXT_MAX_BYTES:
+            # Preserve the established 40 KiB diagnostic for the hard guard;
+            # the target-specific error below handles the ordinary bounded
+            # projection case.
+            enforce_manager_inline_context_budget(prompt_context, user_prompt)
+        if prompt_bytes > MANAGER_INLINE_CONTEXT_TARGET_BYTES:
+            field_counts = " ".join(
+                f"{key}={count}"
+                for key, count in _per_field_utf8_byte_counts(prompt_context)
+            )
+            raise ManagerInlineContextLimitError(
+                "manager inline context required current facts exceed the "
+                f"{MANAGER_INLINE_CONTEXT_TARGET_BYTES}-byte target: "
+                f"total_bytes={prompt_bytes}; {field_counts}",
+                context=prompt_context,
+                user_prompt=user_prompt,
+                permitted_bytes=MANAGER_INLINE_CONTEXT_TARGET_BYTES,
+            )
     enforce_manager_inline_context_budget(prompt_context, user_prompt)
     return system_prompt, user_prompt
 
@@ -947,6 +1120,7 @@ class ManagerInlineContextLimitError(ValueError):
         *,
         context: Mapping[str, Any] | None = None,
         user_prompt: str | None = None,
+        permitted_bytes: int | None = None,
     ) -> None:
         super().__init__(message)
         self.context = deepcopy(dict(context)) if context is not None else None
@@ -956,7 +1130,11 @@ class ManagerInlineContextLimitError(ValueError):
             if isinstance(user_prompt, str)
             else None
         )
-        self.permitted_bytes = MANAGER_INLINE_CONTEXT_MAX_BYTES
+        self.permitted_bytes = (
+            permitted_bytes
+            if isinstance(permitted_bytes, int) and permitted_bytes > 0
+            else MANAGER_INLINE_CONTEXT_MAX_BYTES
+        )
         self.field_byte_counts = (
             dict(_per_field_utf8_byte_counts(context))
             if context is not None

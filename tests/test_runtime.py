@@ -11587,6 +11587,8 @@ class LifecycleBootstrapTests(unittest.TestCase):
             )
             workflow_models: list[str] = []
             worker_envelopes: list[tuple[str, tuple[object, ...]]] = []
+            simple_manager_decisions_without_history_read: list[int] = []
+            history_dependent_manager_reads: list[int] = []
             manager_calls = 0
             reviewer_calls = 0
 
@@ -11595,6 +11597,35 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 model = argv[argv.index("--model") + 1]
                 if model.startswith("manager-"):
                     manager_calls += 1
+                    manager_context = json.loads(
+                        _runner_prompt(argv, kwargs).split(
+                            "MANAGER_CONTEXT_JSON:\n", 1
+                        )[1]
+                    )
+                    assert manager_context["schema_version"] == 3
+                    history_reference = manager_context["evidence"][
+                        "manager_history"
+                    ]["reference"]
+                    assert history_reference["kind"] == "manager_history"
+                    if manager_calls == 1:
+                        # A straightforward continuation needs only the
+                        # current manifest; the fake manager does not open
+                        # historical evidence.
+                        simple_manager_decisions_without_history_read.append(
+                            manager_calls
+                        )
+                    elif manager_calls == 2:
+                        # An upgrade after a review rejection can consult the
+                        # exact declared artifact, never an arbitrary file.
+                        history_path = repo_root / history_reference["path"]
+                        history_payload = json.loads(
+                            history_path.read_text(encoding="utf-8")
+                        )
+                        assert history_payload["schema_version"] == 1
+                        assert history_payload["source_run_id"] == next(
+                            (repo_root / ".aflow" / "runs").iterdir()
+                        ).name
+                        history_dependent_manager_reads.append(manager_calls)
                     action = (
                         "upgrade_next_implementation"
                         if manager_calls in {2, 4}
@@ -11712,6 +11743,8 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 (result.run_dir / "manager" / "decision-002" / "result.json").read_text()
             )
             assert manager_calls == 9
+            assert simple_manager_decisions_without_history_read == [1]
+            assert history_dependent_manager_reads == [2]
             assert second_result["level"] == "lite"
             assert second_result["status"] == "accepted"
             assert len(second_result["next_step_notes"]) == 8
@@ -11785,10 +11818,55 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 "high",
             ]
             assert fourth["controller_state"]["active_implementation_scope"]["upgrade_depth"] == 1
+            # Schema-v3 keeps historical rows out of the live manifest while
+            # preserving their complete structured form in one exact artifact.
+            assert fourth["run_extract"] == []
+            assert fourth["manager_decisions"] == []
+            assert fourth["active_scope_rejection_ledger"] == []
+            assert fourth["implementation_attempts"] == {}
+            history_summary = fourth["history_summary"]
+            assert history_summary["total_turns"] == 4
+            assert history_summary["total_decisions"] == 3
+            assert history_summary["total_implementation_attempts"] == 2
+            assert history_summary["total_active_scope_rejections"] == 2
+            assert history_summary["latest_decision_number"] == 3
+            assert history_summary["latest_decision_action"] == "continue"
+            assert history_summary["latest_rejection_number"] == 2
+            assert history_summary["reference_available"] is True
+            assert history_summary["coverage"] == {
+                "turns": {"count": 4, "range": {"start": 1, "end": 4}},
+                "decisions": {"count": 3, "range": {"start": 1, "end": 3}},
+                "implementation_attempts": {
+                    "count": 2,
+                    "range": {"start": 1, "end": 3},
+                },
+                "active_scope_rejections": {
+                    "count": 2,
+                    "range": {"start": 1, "end": 2},
+                },
+            }
+            history_reference = fourth["evidence"]["manager_history"]["reference"]
+            assert history_reference["kind"] == "manager_history"
+            history_payload = json.loads(
+                (repo_root / history_reference["path"]).read_text(encoding="utf-8")
+            )
+            assert history_payload["schema_version"] == 1
+            assert history_payload["source_run_id"] == result.run_dir.name
             assert [
-                rejection["rejection_number"]
-                for rejection in fourth["active_scope_rejection_ledger"]
+                record["turn_number"]
+                for record in history_payload["sections"]["implementation_attempts"]
+            ] == [1, 3]
+            assert [
+                record["rejection_number"]
+                for record in history_payload["sections"][
+                    "active_scope_rejection_ledger"
+                ]
             ] == [1, 2]
+            assert [
+                record["decision_number"]
+                for record in history_payload["sections"]["manager_decisions"]
+            ] == [1, 2, 3]
+            assert history_payload["sections"]["latest_turn"]["turn_number"] == 4
             latest_rejection = fourth["controller_state"]["latest_full_rejection"]
             assert latest_rejection["rejection_number"] == 2
             # Schema-v3 references the reviewer transcript artifact instead of
@@ -11799,14 +11877,6 @@ class LifecycleBootstrapTests(unittest.TestCase):
             ]
             assert stdout_artifact.is_file()
             assert stdout_artifact.read_text() == "synthetic workflow result"
-            assert [
-                attempt["turn_number"]
-                for attempt in fourth["implementation_attempts"]["attempts"]
-            ] == [1, 3]
-            assert [
-                decision["decision_number"]
-                for decision in fourth["manager_decisions"]
-            ] == [1, 2, 3]
             assert "upgrade_next_implementation" not in sixth["controller_state"]["eligible_actions"]
             assert sixth["controller_state"]["eligible_upgrade"]["available"] is False
             assert (

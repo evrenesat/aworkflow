@@ -150,11 +150,12 @@ versioned body fields.
 ### Run-local evidence store and reference-only manager contexts
 
 Each run keeps a content-addressed evidence store at
-`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md`. Every distinct
-plan/checkpoint byte sequence is stored at most once per run; writes are
-idempotent and atomic, and reads fail closed on missing, escaping, symlinked,
-non-regular, or hash-mismatched artifacts. Envelope captures and manager
-contexts reference these files instead of copying bodies:
+`.aflow/runs/<run-id>/evidence/{plans,checkpoints}/<sha256>.md` plus
+`.aflow/runs/<run-id>/evidence/manager-history/<sha256>.json`. Every distinct
+artifact byte sequence is stored at most once per run; writes are idempotent
+and atomic, and reads fail closed on missing, escaping, symlinked, non-regular,
+or hash-mismatched artifacts. Envelope captures and manager contexts reference
+these files instead of copying bodies:
 
 - **Scope-envelope schema v2** is a reference-only metadata manifest: it holds
   scope identities, checkpoint offsets, and `plan_ref`/`checkpoint_ref`
@@ -175,23 +176,25 @@ contexts reference these files instead of copying bodies:
   store (equal active/original bytes share one artifact); the context carries
   repository-relative artifact paths, SHA-256 hashes, byte sizes, checkpoint
   line/byte ranges, and disclosure state. Reviewer stdout is referenced through
-  its durable turn artifact and never copied. Bounded semantic fields share one
-  deterministic truncation marker at 2,000 characters. Manager history is
-  projected by decision number and workflow history by turn number, each with
-  explicit numbering fields; the v3 run extract is capped at the 12 newest
-  projected records and the manager-decision list at the 12 newest decisions.
-  Omitted history is disclosed as bounded descriptors containing the source run,
-  declared artifact root, relative path pattern, omitted count, and merged
-  numeric ranges. The exact prompt serializer measures this disclosure after
-  controller-added repartition history; if needed it removes duplicate manager
-  rows, older manager decisions, and older workflow turns in that order while
-  preserving current boundary authority. Selector 3 still rebuilds schema v2
+  its durable turn artifact and never copied. The latest human semantic summary
+  and inline error are each UTF-8 byte-bounded; the complete structured run
+  extract, manager decisions, implementation attempts, active-scope rejection
+  ledger, repartition history, and detailed latest-turn semantics are captured
+  before projection in one immutable `evidence.manager_history` JSON artifact.
+  Its schema-v1 payload has named sections and explicit turn/decision coverage.
+  The inline v3 containers for those historical collections are empty
+  compatibility containers, with numeric totals, ranges, latest action/rejection
+  identifiers, and reference availability in `history_summary`. Read-only
+  reconstruction resolves the exact recorded reference and never recreates a
+  missing artifact from mutable files. Selector 3 still rebuilds schema v2
   exactly; selectors 1/2 rebuild schema v1 for historical analysis.
 
 Manager prompts inline only the compact manifest. The exact UTF-8 user prompt
 targets 16 KiB and is hard-limited to 40 KiB before any provider process
-starts; an oversized compact manifest fails with a fixed error carrying total
-bytes and per-top-level-field byte counts only. Non-sensitive prompt metrics
+starts. Optional latest-turn prose is removed only if needed; if required
+current facts and references alone exceed the 16 KiB target, the boundary fails
+closed with a fixed error rather than raising the target or inlining more
+history. Non-sensitive prompt metrics
 (`system_prompt_bytes`, `user_prompt_bytes`, `argv_bytes`,
 `referenced_artifact_count`, `referenced_artifact_bytes`) persist in the
 manager result; referenced artifact bytes are evidence the manager may read and
@@ -207,9 +210,11 @@ finished-turn references separately.
 
 Manager adapters must advertise the fail-closed `manager_workspace_read`
 capability (`HarnessAdapter.manager_workspace_read`) to run reference-only
-manager contexts; the manager system prompt instructs reading the checkpoint
-artifact first, the active/full plan only when needed, and never searching for
-alternate plan files. Reasonix one-shot prompts travel on stdin
+manager contexts; the manager system prompt instructs reading the compact
+summary first, then the declared manager-history artifact only for ambiguous,
+stalled, or rejected decisions, followed by a specific turn artifact only when
+needed. Plan/checkpoint artifacts are read only when needed for the legal
+decision, and alternate files are never searched. Reasonix one-shot prompts travel on stdin
 (`prompt_mode="stdin"`), never in argv, so a prompt cannot fail `execve` with
 `E2BIG`; `--print` remains a final-output flag.
 At a clean controller-proposed `END`—a transition without operational failure,

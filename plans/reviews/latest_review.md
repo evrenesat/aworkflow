@@ -1,13 +1,15 @@
-# Checkpoint 3 review
+# Checkpoint 4 review
 
-Target: immediately preceding worker's lifecycle integration and documentation changes against checkpoint 2 approval `c4159eb`, on `codex/aflow-dogfood-20260909`. Original and active plan: `plans/in-progress/readable-cli-status-output-20260909.md`.
+Reviewed the immediately preceding worker repair overlay `plans/in-progress/readable-cli-status-output-20260909-cp01-v01.md` and retained checkpoint 4 implementation against `plans/in-progress/readable-cli-status-output-20260909.md`. Used current-worktree fallback from checkpoint 3 approval `a1ce533`: no checkpoint 4 worker commit existed. Scope: compact manager projections, immutable complete structured history, current control facts, exact prompt budgets, read-only analysis compatibility, bundled instructions, tests and documentation.
 
-Used current-worktree fallback because no checkpoint 3 worker commit existed for this plan. Latest applicable boundary: checkpoint 2 approval, with zero intervening commits before this review. Worker checkbox advancement to checkpoint 4 did not change the review target. Branch matches; original baseline `d8379e5c07b70a827ce13f58e81049b48115d82e` is reachable.
+## Findings
 
-No findings passed the material-code-review admission gate. Reviewed duplicate run-ID removal, early failure identity, finalized/current checkpoint attribution, waiting and owner stop, provider failure and turn-limit output, stdout/observer/durable metadata assertions, and renderer documentation. The retained implementation changes only one production line; no production edits were needed during review.
+Zero material findings. Both previous findings are resolved: unrecognized structured-stream fallback remains reference-only in the history and inline projections while preserving extraction metadata and stdout pointers; combined history sorting retains legacy decisions with absent or null finalized-turn association without a None/integer comparison. Recognized final assistant responses and plain-text semantic results remain complete on disk.
 
-Verification: `uv run pytest -q tests/test_status.py tests/test_harnesses.py tests/test_runtime.py tests/test_cli.py tests/test_library_api.py` passed (568 tests and 185 subtests). `uv run ruff check aflow/status.py aflow/workflow.py` and `git diff --check` passed. Additional synthetic PTY checks at 40, 80, and 120 columns confirmed exact ordered content equality with redirected output after removing renderer-owned SGR. Synthetic providers only.
+## Verification and disposition
 
-Approved checkpoint 3 through reviewer-created commit `cp3 v01 codex/aflow-dogfood-20260909: Approve readable lifecycle integration`. Checkpoint 4 remains unchecked; original plan stays in progress with unchanged baseline. No repair overlay needed. Previous review rotated byte-for-byte unchanged. No public push, global configuration change, service edit, or workflow launch.
+`uv run pytest -q tests/test_manager.py tests/test_manager_context.py tests/test_runtime.py`: 398 passed, 43 subtests passed. `uv run ruff check aflow/manager.py aflow/manager_context.py aflow/runlog.py aflow/api/analyze.py` and `git diff --check` passed. Reviewed synthetic growth, Unicode bounds, exact-reference validation, capture failure, read-only rebuilding, prompt limits and fake-manager routing coverage. No live providers, global configuration, services or public publishing were used.
+
+Approved checkpoint 4 through `cp4 v01 codex/aflow-dogfood-20260909: Approve compact manager history`. Only checkpoint 4 review state advances; checkpoints 1–3 and original baseline remain unchanged. The repair overlay is satisfied, and no new fix plan is needed. This is checkpoint approval, not whole-plan review; no squash or history rewrite.
 
 No material findings
