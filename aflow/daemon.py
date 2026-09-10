@@ -573,8 +573,17 @@ class DaemonService:
         *,
         caller_scope: str = "local",
         idempotency_key: str | None = None,
+        extra_instructions: tuple[str, ...] | None = None,
     ) -> StartRunResult:
         """Launch one validated continuation; the source unit is never restarted."""
+        if extra_instructions is not None:
+            _validate_extra_instructions(extra_instructions)
+        normalized_source_run_id = validate_run_id(source_run_id)
+        requested_extra_digest = (
+            _extra_instructions_digest(extra_instructions)
+            if extra_instructions is not None
+            else None
+        )
         with (
             self._lock,
             self._idempotency_lock("resume", caller_scope, idempotency_key),
@@ -585,18 +594,38 @@ class DaemonService:
                 idempotency_key=idempotency_key,
             )
             if pending is not None:
-                if pending.get("resumed_from_run_id") != validate_run_id(source_run_id):
+                if pending.get("resumed_from_run_id") != normalized_source_run_id:
                     raise DaemonIdempotencyConflict(
                         "resume idempotency key was reused for a different source run"
                     )
+                stored_extra_digest = _record_extra_instructions_digest(pending)
+                provided = pending.get("resume_extra_instructions_provided", False)
+                if not isinstance(provided, bool):
+                    raise DaemonError(
+                        "resume record has an invalid extra-instructions override flag"
+                    )
+                if (
+                    extra_instructions is not None
+                    and (
+                        stored_extra_digest is None
+                        or stored_extra_digest != requested_extra_digest
+                    )
+                ) or (extra_instructions is None and provided):
+                    raise DaemonIdempotencyConflict(
+                        "resume idempotency key was reused for a different request"
+                    )
+                if extra_instructions is not None:
+                    self._transient_extra_instructions[
+                        validate_run_id(str(pending["run_id"]))
+                    ] = extra_instructions
                 return self._recover_resume_record(pending)
-            source = self._application.repository.get_run_status(source_run_id)
+            source = self._application.repository.get_run_status(normalized_source_run_id)
             worker = source.evidence.get("worker")
             if isinstance(worker, Mapping) and not confirmed_inactive(worker):
                 raise DaemonError("source worker activity could not be confirmed inactive")
             if source.ownership != "control_plane":
                 raise DaemonError("legacy runs cannot be resumed by the control plane")
-            unit_name = _unit_name(source_run_id)
+            unit_name = _unit_name(normalized_source_run_id)
             observed = self._application.units.get(unit_name)
             if observed is not None and observed.name != unit_name:
                 raise DaemonError("source workflow unit identity is ambiguous")
@@ -624,15 +653,20 @@ class DaemonService:
                 raise DaemonError(
                     "source run is incomplete, terminal, or lacks safe resume evidence"
                 )
-            bootstrap = self._resume_bootstrap(source_run_id)
+            bootstrap = self._resume_bootstrap(
+                normalized_source_run_id,
+                extra_instructions=extra_instructions or (),
+                extra_instructions_provided=extra_instructions is not None,
+            )
             source_manifest = self._application.repository.get_launch_manifest(
-                source_run_id
+                normalized_source_run_id
             )
             if source_manifest is None:
                 raise DaemonError("source run has no control-plane launch manifest")
-            self._assert_manifest_caller(source_run_id, caller_scope)
+            self._assert_manifest_caller(normalized_source_run_id, caller_scope)
 
             run_id = reserve_run_id(self._config.repo_root)
+            self._transient_extra_instructions[run_id] = bootstrap.extra_instructions
             prepared = PreparedRun(
                 workflow_name=bootstrap.workflow_name,
                 repo_root=self._config.repo_root,
@@ -674,8 +708,12 @@ class DaemonService:
                 prepared=prepared,
                 operation="resume",
                 mode="resume",
-                resumed_from_run_id=source_run_id,
+                resumed_from_run_id=normalized_source_run_id,
                 source_invocation_digest=source_manifest.request_digest,
+                resume_extra_instructions_provided=extra_instructions is not None,
+                resume_extra_instructions_digest=_extra_instructions_digest(
+                    bootstrap.extra_instructions
+                ),
             )
             record["manifest_request_digest"] = normalized_request_digest(manifest)
             self._create_record(record)
@@ -885,6 +923,8 @@ class DaemonService:
         mode: str = "start",
         resumed_from_run_id: str | None = None,
         source_invocation_digest: str | None = None,
+        resume_extra_instructions_provided: bool | None = None,
+        resume_extra_instructions_digest: str | None = None,
     ) -> dict[str, object]:
         record: dict[str, object] = {
             "schema_version": _START_RECORD_SCHEMA_VERSION,
@@ -932,6 +972,18 @@ class DaemonService:
             record["resumed_from_run_id"] = validate_run_id(resumed_from_run_id)
         if source_invocation_digest is not None:
             record["source_invocation_digest"] = source_invocation_digest
+        if resume_extra_instructions_provided is not None:
+            if not isinstance(resume_extra_instructions_provided, bool):
+                raise DaemonError(
+                    "resume record extra-instructions override flag is invalid"
+                )
+            record["resume_extra_instructions_provided"] = (
+                resume_extra_instructions_provided
+            )
+        if resume_extra_instructions_digest is not None:
+            record["resume_extra_instructions_digest"] = (
+                resume_extra_instructions_digest
+            )
         return record
 
     def _advance_start_preparation_locked(
@@ -1166,9 +1218,18 @@ class DaemonService:
         if record.get("operation") != "resume" or record.get("mode") != "resume":
             raise DaemonError("startup record is not a resumable continuation")
         run_id = validate_run_id(str(record["run_id"]))
+        if record.get("state") == "unit_started":
+            return self._existing_start_result(run_id)
+        resume_extra, resume_extra_provided = self._resume_extra_override_for_record(
+            record
+        )
         if prepared is None:
             source_run_id = validate_run_id(str(record["resumed_from_run_id"]))
-            bootstrap = self._resume_bootstrap(source_run_id)
+            bootstrap = self._resume_bootstrap(
+                source_run_id,
+                extra_instructions=resume_extra,
+                extra_instructions_provided=resume_extra_provided,
+            )
             prepared = PreparedRun(
                 workflow_name=bootstrap.workflow_name,
                 repo_root=self._config.repo_root,
@@ -1193,8 +1254,11 @@ class DaemonService:
             )
         else:
             bootstrap = self._resume_bootstrap(
-                validate_run_id(str(record["resumed_from_run_id"]))
+                validate_run_id(str(record["resumed_from_run_id"])),
+                extra_instructions=resume_extra,
+                extra_instructions_provided=resume_extra_provided,
             )
+        self._transient_extra_instructions[run_id] = prepared.extra_instructions
         manifest = self._manifest_for(
             run_id=run_id,
             prepared=prepared,
@@ -1860,7 +1924,34 @@ class DaemonService:
             *instruction_args,
         )
 
-    def _resume_bootstrap(self, source_run_id: str):
+    def _resume_extra_override_for_record(
+        self, record: Mapping[str, object]
+    ) -> tuple[tuple[str, ...], bool]:
+        provided = record.get("resume_extra_instructions_provided", False)
+        if not isinstance(provided, bool):
+            raise DaemonError(
+                "resume record has an invalid extra-instructions override flag"
+            )
+        if not provided:
+            return (), False
+        run_id = validate_run_id(str(record["run_id"]))
+        extra = self._transient_extra_instructions.get(run_id)
+        if extra is not None:
+            _validate_extra_instructions(extra)
+            return extra, True
+        if _record_extra_instructions_digest(record) == _extra_instructions_digest(()):
+            return (), True
+        raise DaemonError(
+            "non-persistent extra instructions are unavailable; submit a new resume request"
+        )
+
+    def _resume_bootstrap(
+        self,
+        source_run_id: str,
+        *,
+        extra_instructions: tuple[str, ...] = (),
+        extra_instructions_provided: bool = False,
+    ):
         from aflow.cli import _bootstrap_resume_invocation
 
         return _bootstrap_resume_invocation(
@@ -1875,8 +1966,8 @@ class DaemonService:
             team_arg=None,
             start_step_arg=None,
             max_turns_arg=None,
-            extra_instructions_arg=(),
-            extra_instructions_provided=False,
+            extra_instructions_arg=extra_instructions,
+            extra_instructions_provided=extra_instructions_provided,
             live_loader=load_workflow_config,
         )
 
@@ -2133,6 +2224,13 @@ def _worker_prepared(
         source_run_id = validate_run_id(str(record["resumed_from_run_id"]))
         from aflow.cli import _bootstrap_resume_invocation
 
+        extra_instructions_provided = record.get(
+            "resume_extra_instructions_provided", False
+        )
+        if not isinstance(extra_instructions_provided, bool):
+            raise DaemonError(
+                "resume record has an invalid extra-instructions override flag"
+            )
         bootstrap = _bootstrap_resume_invocation(
             repo_root=repo_root,
             config_path=config_path,
@@ -2145,8 +2243,8 @@ def _worker_prepared(
             team_arg=None,
             start_step_arg=None,
             max_turns_arg=None,
-            extra_instructions_arg=(),
-            extra_instructions_provided=False,
+            extra_instructions_arg=extra_instructions,
+            extra_instructions_provided=extra_instructions_provided,
             live_loader=load_workflow_config,
         )
         prepared = PreparedRun(
@@ -2414,6 +2512,17 @@ def _extra_instructions_digest(extra_instructions: tuple[str, ...]) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _record_extra_instructions_digest(
+    record: Mapping[str, object],
+) -> str | None:
+    value = record.get("resume_extra_instructions_digest")
+    if value is None:
+        prepared = record.get("prepared")
+        if isinstance(prepared, Mapping):
+            value = prepared.get("extra_instructions_digest")
+    return value if isinstance(value, str) else None
 
 
 def _validate_extra_instructions(extra_instructions: tuple[str, ...]) -> None:

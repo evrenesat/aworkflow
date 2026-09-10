@@ -213,6 +213,12 @@ class StartRunPayload(CanonicalTransportModel):
     dirty_worktree_confirmed: StrictBool = False
 
 
+class ResumeRunPayload(CanonicalTransportModel):
+    """Optional run-wide instruction replacement for an explicit resume."""
+
+    extra_instructions: tuple[str, ...] | None = Field(default=None, max_length=8)
+
+
 class PreflightRunPayload(StartRunPayload):
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=200, ge=1, le=1_000)

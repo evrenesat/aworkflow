@@ -82,6 +82,7 @@ from .models import (
     RunListResponse,
     RunStatusResponse,
     ReadinessResponse,
+    ResumeRunPayload,
     StartResponse,
     StartRunPayload,
     StartRunResponse,
@@ -1301,12 +1302,20 @@ def resume_run(
     project_id: str,
     run_id: str,
     response: Response,
+    payload: ResumeRunPayload | None = None,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=256),
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> StartRunResponse:
     result = StartRunResponse.from_canonical(
-        service.resume(project_id, run_id, idempotency_key=idempotency_key)
+        service.resume(
+            project_id,
+            run_id,
+            extra_instructions=(
+                payload.extra_instructions if payload is not None else None
+            ),
+            idempotency_key=idempotency_key,
+        )
     )
     response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     return result

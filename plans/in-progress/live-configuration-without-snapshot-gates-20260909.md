@@ -18,9 +18,11 @@ Existing uncommitted changes include CLI/daemon resume identity fixes, workflow 
 
 - Plan Branch: `codex/aflow-dogfood-20260909`
 - Pre-Handoff Base HEAD: `576d91e50df6423f5e9a21b9fc5cfa90bdec5dba`
-- Last Reviewed Checkpoint: `cp11 v01` — approved.
+- Last Reviewed Checkpoint: `cp12 v01` — approved.
 
 ### Review Log
+
+- 2026-09-10: Approved `cp12 v01` from the immediately preceding worker worktree against approved CP11 `bb95fef`; worktree fallback, zero intervening implementation commits. Reviewed CLI preservation, daemon/worker instruction inheritance, replacement and clearing, REST/MCP validation, idempotency and predecessor preservation. Required suite plus server MCP: 221 passed, 125 subtests; local daemon/MCP: 33 passed; runtime instruction prompt: 1 passed; source Ruff and diff check passed. No material findings. CP13 remains unchecked; manager 40 KiB hard guard and compact 16 KiB summary retained.
 
 - 2026-09-10: Approved `cp11 v01` from the immediately preceding worker worktree against approved CP10 `89ea22c`; worktree fallback, zero intervening implementation commits. Reviewed selected-step and legacy worker note delivery, both prompt paths, prelaunch retention, durable target reconstruction and consumption, successor non-replay and independent run-wide guidance. Required suite: 305 passed, 43 subtests; focused CLI resume: 4 passed, 10 subtests; source Ruff and diff check passed. No material findings. CP12 remains unchecked; manager 40 KiB hard guard and compact 16 KiB summary retained.
 
@@ -366,7 +368,7 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Blockers:** Conflicting existing note-consumption behavior must be resolved using the stated lifetime rules, not by silently dropping or replaying notes.
 
-### [ ] Checkpoint 12: Allow instruction replacement through remote resume
+### [x] Checkpoint 12: Allow instruction replacement through remote resume
 
 **Goal:** Explicit REST/MCP resume provides the same inherit/replace/clear semantics as the corrected CLI.
 
@@ -376,10 +378,10 @@ All checkpoints require verified internal checkboxes, passing scoped verificatio
 
 **Steps:**
 
-- [ ] Preserve and verify the local CLI fix: omitted `--` text inherits, `-- replacement` replaces, bare `--` clears. Keep predecessor `run.json` and old turn artifacts untouched; the successor records its effective text. Keep automatic fresh-run candidate matching unchanged.
-- [ ] Add optional `extra_instructions` to the existing explicit resume request/service interfaces: omitted or null inherits, a bounded string list replaces, `[]` clears. Reuse existing fresh-launch string/count validation and request-idempotency calculation; carry the choice through daemon bootstrap into the actual worker. Do not compare replacement text against predecessor identity as a rejection condition. Retain workflow/plan/repository ownership checks and current UI omission behavior.
-- [ ] Test inheritance/replacement/clearing through CLI, daemon, HTTP and MCP; assert actual successor instructions and captured prompt, predecessor unchanged, invalid payload rejected and changed replacement text not accepted under an already-used different request's idempotency key.
-- [ ] Update existing resume documentation and assistant reference with the same three-way semantics; distinguish these run-wide instructions from checkpoint 11's one-turn notes.
+- [x] Preserve and verify the local CLI fix: omitted `--` text inherits, `-- replacement` replaces, bare `--` clears. Keep predecessor `run.json` and old turn artifacts untouched; the successor records its effective text. Keep automatic fresh-run candidate matching unchanged.
+- [x] Add optional `extra_instructions` to the existing explicit resume request/service interfaces: omitted or null inherits, a bounded string list replaces, `[]` clears. Reuse existing fresh-launch string/count validation and request-idempotency calculation; carry the choice through daemon bootstrap into the actual worker. Do not compare replacement text against predecessor identity as a rejection condition. Retain workflow/plan/repository ownership checks and current UI omission behavior.
+- [x] Test inheritance/replacement/clearing through CLI, daemon, HTTP and MCP; assert actual successor instructions and captured prompt, predecessor unchanged, invalid payload rejected and changed replacement text not accepted under an already-used different request's idempotency key.
+- [x] Update existing resume documentation and assistant reference with the same three-way semantics; distinguish these run-wide instructions from checkpoint 11's one-turn notes.
 
 **Dependencies:** Checkpoint 2 current-source resume wiring; independent of checkpoint 11 note delivery.
 

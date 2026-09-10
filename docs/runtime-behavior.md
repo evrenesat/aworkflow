@@ -495,6 +495,13 @@ For CLI resume, omitted extra instructions retain the predecessor's text.
 artifacts remain unchanged. Use run-wide instructions for continuing rules,
 not a recovery action that becomes stale after its checkpoint is approved.
 
+Authenticated REST and MCP resume calls use the same three-way choice. An
+omitted field or explicit `null` inherits the predecessor's instructions, a
+bounded string list replaces them, and `[]` clears them for the successor.
+The current UI intentionally omits this optional editor. Resume request
+retries must reuse the same effective instructions with the same idempotency
+key; a changed replacement is rejected without allocating another successor.
+
 `aflow-guard-development-run` remains opt-in supervision for the exact run a
 user explicitly asks it to guard, particularly normal direct-CLI and legacy
 workflows. It is not a second daemon controller, a release-health monitor, or

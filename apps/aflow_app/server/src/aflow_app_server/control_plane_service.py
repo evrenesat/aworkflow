@@ -438,6 +438,7 @@ class ControlPlaneService:
         run_id: str,
         *,
         idempotency_key: str | None,
+        extra_instructions: tuple[str, ...] | None = None,
         caller_scope: str = "rest",
     ) -> StartRunResult:
         with self.project_lock(project_id):
@@ -445,6 +446,7 @@ class ControlPlaneService:
                 run_id,
                 caller_scope=self._caller_scope(project_id, caller_scope),
                 idempotency_key=idempotency_key,
+                extra_instructions=extra_instructions,
             )
 
     def _project(self, project_id: str) -> _ProjectDaemon:

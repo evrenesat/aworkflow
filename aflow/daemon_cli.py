@@ -336,6 +336,7 @@ class LocalControlPlaneService:
         run_id: str,
         *,
         idempotency_key: str | None,
+        extra_instructions: tuple[str, ...] | None = None,
         caller_scope: str = "mcp",
     ) -> StartRunResult:
         self._assert_project(project_id)
@@ -343,6 +344,7 @@ class LocalControlPlaneService:
             run_id,
             caller_scope=self._caller_scope(caller_scope),
             idempotency_key=idempotency_key,
+            extra_instructions=extra_instructions,
         )
 
     def _assert_project(self, project_id: str) -> None:

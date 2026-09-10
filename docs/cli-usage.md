@@ -116,10 +116,11 @@ Eligible prior runs have two resume paths in every supported lifecycle mode:
 Resume resolves and validates the selected run before startup preparation. Its
 `original_plan_path` is authoritative and must be present; `plan_path` is not a
 resume fallback, and the saved plan must still be readable. A caller may repeat
-the plan, workflow, team, start step, max-turns, or extra instructions only
-when the value is compatible with the saved invocation; conflicting values
-fail without creating a new run. Fresh `aflow run` invocations still require a
-plan.
+the plan, workflow, team, start step, or max-turns only when the value is
+compatible with the saved invocation; conflicting values fail without
+creating a new run. Extra instructions use three-way resume semantics: omit
+them to inherit, pass text after `--` to replace them, or pass a bare `--` to
+clear them. Fresh `aflow run` invocations still require a plan.
 
 A remote successor restart is separate from resume. It creates a fresh run
 with normal startup validation and records restarted_from_run_id; the source

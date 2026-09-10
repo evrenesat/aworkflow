@@ -839,8 +839,10 @@ rejected):
   compare-and-swap control; `expected_revision` is required.
 - `owner_stop(project_id, run_id, expected_revision, idempotency_key)` —
   explicit terminal owner stop (destructive; not a generic control flag).
-- `resume_run(project_id, run_id, idempotency_key)` — explicit
-  lineage-linked continuation with a new run id for a stopped run.
+- `resume_run(project_id, run_id, idempotency_key, extra_instructions=None)` —
+  explicit lineage-linked continuation with a new run id for a stopped run.
+  Omitted or `null` instructions inherit; a bounded list replaces them and
+  `[]` clears them for the successor. The predecessor is unchanged.
 
 **Resources:**
 
@@ -876,6 +878,10 @@ userinfo, or literal bearer values; keep every write tool approval-gated.
 - Failed or ambiguous daemon-owned units are reported `needs_attention` and
   are never auto-restarted; explicit `resume_run` creates one linked
   continuation.
+- Resume instruction replacements are run-wide continuation guidance, not
+  checkpoint notes. REST and MCP callers may inherit, replace, or clear them;
+  the UI intentionally keeps the editor omitted. Reusing an idempotency key
+  with different replacement text is rejected.
 - Legacy runs without the control-plane manifest are read-only and reported
   as legacy/interrupted.
 - Loss of the client, MCP connection, or SSH transport has no lifecycle

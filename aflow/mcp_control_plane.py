@@ -564,14 +564,20 @@ def create_control_plane_mcp(
         project_id: str,
         run_id: str,
         idempotency_key: str,
+        extra_instructions: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Create the explicit, lineage-linked continuation for a stopped run."""
+        """Create a continuation, optionally replacing its run-wide instructions."""
         return tool_result(
             lambda: (
                 get_service()
                 .resume(
                     project_id,
                     run_id,
+                    extra_instructions=(
+                        tuple(extra_instructions)
+                        if extra_instructions is not None
+                        else None
+                    ),
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
                 )
@@ -581,6 +587,7 @@ def create_control_plane_mcp(
                 "project_id": project_id,
                 "run_id": run_id,
                 "idempotency_key": idempotency_key,
+                "extra_instructions": extra_instructions,
             },
         )
 

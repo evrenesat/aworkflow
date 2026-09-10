@@ -19,7 +19,9 @@ from test_control_plane_api import (
     PROJECT_ID,
     TOKEN,
     _add_live_control_targets,
+    _answer_pending as _rest_answer_pending,
     _prepared,
+    _start_pending as _rest_start_pending,
     control_client as _control_client_fixture,  # noqa: F401
 )
 
@@ -437,6 +439,122 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
         units.start_calls[-1][1][-1]
         == "--extra-instruction=mcp-runtime-guidance"
     )
+
+
+@pytest.mark.parametrize(
+    ("extra_instructions", "expected"),
+    (
+        ("omitted", ("saved guidance",)),
+        (None, ("saved guidance",)),
+        (["replacement guidance"], ("replacement guidance",)),
+        ([], ()),
+    ),
+)
+def test_mcp_resume_extra_instructions_inherit_replace_and_clear(
+    mcp_client,
+    extra_instructions: object,
+    expected: tuple[str, ...],
+) -> None:
+    client, root, units, monkeypatch = mcp_client
+    pending = _rest_start_pending(client, monkeypatch, ["saved guidance"])
+    started = _rest_answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":["saved guidance"]}'
+    )
+    before = source_path.read_bytes()
+    bootstrap_calls: list[dict[str, object]] = []
+
+    def bootstrap(**kwargs):
+        bootstrap_calls.append(kwargs)
+        provided = kwargs["extra_instructions_provided"]
+        effective = (
+            tuple(kwargs["extra_instructions_arg"])
+            if provided
+            else ("saved guidance",)
+        )
+        return SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="implement",
+            extra_instructions=effective,
+            resume_context=object(),
+        )
+
+    monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", bootstrap)
+    arguments = {
+        "project_id": PROJECT_ID,
+        "run_id": run_id,
+        "idempotency_key": "mcp-resume-instructions",
+    }
+    if extra_instructions != "omitted":
+        arguments["extra_instructions"] = extra_instructions
+    resumed = _mcp_tool(client, "resume_run", arguments)
+    successor_id = resumed["run_id"]
+    assert len(units.start_calls) == 2
+    argv = units.start_calls[-1][1]
+    if expected:
+        assert f"--extra-instruction={expected[0]}" in argv
+    else:
+        assert not any(argument.startswith("--extra-instruction=") for argument in argv)
+    assert bootstrap_calls[0]["extra_instructions_provided"] == (
+        extra_instructions != "omitted" and extra_instructions is not None
+    )
+    assert source_path.read_bytes() == before
+
+    replay = _mcp_tool(client, "resume_run", arguments)
+    assert replay["run_id"] == successor_id
+    changed = dict(arguments)
+    changed["extra_instructions"] = ["different guidance"]
+    conflict = _mcp_request(
+        client,
+        "tools/call",
+        {"name": "resume_run", "arguments": changed},
+    )
+    assert conflict["result"]["isError"] is True
+    assert conflict["result"]["content"][0]["text"] == "idempotency_conflict"
+    assert len(units.start_calls) == 2
+    assert source_path.read_bytes() == before
+
+
+def test_mcp_resume_rejects_invalid_extra_instructions_without_reserving(
+    mcp_client,
+) -> None:
+    client, root, units, monkeypatch = mcp_client
+    pending = _rest_start_pending(client, monkeypatch, ["saved guidance"])
+    started = _rest_answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":["saved guidance"]}'
+    )
+    before = source_path.read_bytes()
+    rejected = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": run_id,
+                "idempotency_key": "mcp-resume-invalid",
+                "extra_instructions": [""],
+            },
+        },
+    )
+    assert rejected["result"]["isError"] is True
+    assert rejected["result"]["content"][0]["text"] == "operation_rejected"
+    assert len(units.start_calls) == 1
+    assert source_path.read_bytes() == before
 
 
 def test_mcp_control_uses_live_targets_and_matches_rest_validation(mcp_client) -> None:

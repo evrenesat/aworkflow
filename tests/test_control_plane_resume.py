@@ -17,7 +17,13 @@ from aflow.config import (
 )
 from aflow.control_plane import InMemoryUnitManager, LaunchManifest, create_launch_manifest, read_events, write_launch_phase
 from aflow.control_plane.repository import RunRepository
-from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError, _worker_prepared
+from aflow.daemon import (
+    AflowDaemon,
+    DaemonConfig,
+    DaemonError,
+    DaemonIdempotencyConflict,
+    _worker_prepared,
+)
 from aflow.run_config_snapshot import SnapshotError
 
 
@@ -182,6 +188,159 @@ def test_resume_creates_one_new_continuation_and_audits_the_source(tmp_path: Pat
     source_events = read_events(source_dir)
     assert [event.event_type for event in source_events].count("resume_requested") == 1
     assert source_dir.joinpath("run.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected"),
+    (
+        (None, ("saved guidance",)),
+        (("replacement guidance",), ("replacement guidance",)),
+        ((), ()),
+    ),
+)
+def test_resume_extra_instructions_inherit_replace_and_clear(
+    tmp_path: Path,
+    monkeypatch,
+    submitted: tuple[str, ...] | None,
+    expected: tuple[str, ...],
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon_for_config(
+        tmp_path, monkeypatch, units, _workflow_config()
+    )
+    source_id = "source-run"
+    create_launch_manifest(
+        request.repo_root,
+        LaunchManifest(
+            run_id=source_id,
+            project_root=str(request.repo_root),
+            plan_path=str(request.plan_path),
+            workflow_name="managed",
+            max_turns=2,
+            extra_instructions=("saved guidance",),
+            idempotency_key="source-key",
+            caller_scope="project:one",
+        ),
+    )
+    source_dir = request.repo_root / ".aflow" / "runs" / source_id
+    source_dir.mkdir()
+    source_dir.joinpath("run.json").write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":null,"extra_instructions":["saved guidance"]}'
+    )
+    write_launch_phase(request.repo_root, source_id, "unit_started")
+    before = source_dir.joinpath("run.json").read_bytes()
+    bootstrap_calls: list[dict[str, object]] = []
+
+    def bootstrap(**kwargs):
+        bootstrap_calls.append(kwargs)
+        provided = kwargs["extra_instructions_provided"]
+        effective = (
+            kwargs["extra_instructions_arg"] if provided else ("saved guidance",)
+        )
+        return SimpleNamespace(
+            workflow_name="managed",
+            repo_root=request.repo_root,
+            plan_path=request.plan_path,
+            config_path=request.config_path,
+            max_turns=2,
+            team=None,
+            start_step="implement",
+            extra_instructions=effective,
+            workflow_config=_workflow_config(),
+            resume_context=object(),
+        )
+
+    monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", bootstrap)
+    result = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-instructions",
+        extra_instructions=submitted,
+    )
+
+    assert result.status == "running"
+    successor_id = result.run_id
+    record = daemon.service._read_record(successor_id)
+    manifest = daemon.application.repository.get_launch_manifest(successor_id)
+    assert manifest is not None
+    worker_prepared, _ = _worker_prepared(
+        record,
+        manifest,
+        request.repo_root,
+        request.config_path,
+        _workflow_config(),
+        extra_instructions=submitted or (),
+    )
+    assert worker_prepared.extra_instructions == expected
+    assert bootstrap_calls[0]["extra_instructions_provided"] == (submitted is not None)
+    assert bootstrap_calls[0]["extra_instructions_arg"] == (submitted or ())
+    argv = units.start_calls[0][1]
+    if expected:
+        assert f"--extra-instruction={expected[0]}" in argv
+    else:
+        assert not any(argument.startswith("--extra-instruction=") for argument in argv)
+    assert source_dir.joinpath("run.json").read_bytes() == before
+    assert "saved guidance" not in (request.repo_root / ".aflow" / "launches" / f"{successor_id}.json").read_text()
+
+
+def test_resume_extra_instructions_reuse_conflicts_without_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    daemon, request = _daemon_for_config(
+        tmp_path, monkeypatch, units, _workflow_config()
+    )
+    source_id = "source-run"
+    create_launch_manifest(
+        request.repo_root,
+        LaunchManifest(
+            run_id=source_id,
+            project_root=str(request.repo_root),
+            plan_path=str(request.plan_path),
+            workflow_name="managed",
+            max_turns=2,
+            idempotency_key="source-key",
+            caller_scope="project:one",
+        ),
+    )
+    source_dir = request.repo_root / ".aflow" / "runs" / source_id
+    source_dir.mkdir()
+    source_dir.joinpath("run.json").write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":null,"extra_instructions":[]}'
+    )
+    write_launch_phase(request.repo_root, source_id, "unit_started")
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=request.plan_path,
+            max_turns=2,
+            team=None,
+            start_step="implement",
+            extra_instructions=kwargs["extra_instructions_arg"],
+            workflow_config=_workflow_config(),
+            resume_context=object(),
+        ),
+    )
+
+    daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-instructions",
+        extra_instructions=("first guidance",),
+    )
+    before_source = source_dir.joinpath("run.json").read_bytes()
+    with pytest.raises(DaemonIdempotencyConflict):
+        daemon.service.resume(
+            source_id,
+            caller_scope="project:one",
+            idempotency_key="resume-instructions",
+            extra_instructions=("different guidance",),
+        )
+    assert len(units.start_calls) == 1
+    assert source_dir.joinpath("run.json").read_bytes() == before_source
 
 
 def test_daemon_rejects_legacy_resume_before_reserving_continuation(

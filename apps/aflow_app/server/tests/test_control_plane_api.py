@@ -34,6 +34,7 @@ from aflow_app_server.models import (
     ContextResponse,
     RunControlPayload,
     RunStatusResponse,
+    ResumeRunPayload,
     StartRunResponse,
     WorktreePreflightResponse,
     canonical_contract_payloads,
@@ -233,7 +234,11 @@ def test_detached_early_worker_failure_is_visible_without_service_restart(contro
     assert not (path.parent.parent / "run.json").exists()
 
 
-def _start_pending(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+def _start_pending(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_instructions: list[str] | None = None,
+) -> dict[str, object]:
     monkeypatch.setattr(
         "aflow.daemon.prepare_startup",
         lambda request: StartupQuestion(
@@ -242,10 +247,16 @@ def _start_pending(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> dict[
             choices=["implement"],
         ),
     )
+    payload: dict[str, object] = {
+        "plan_path": "plans/todo/test-plan.md",
+        "workflow_name": "managed",
+    }
+    if extra_instructions is not None:
+        payload["extra_instructions"] = extra_instructions
     response = client.post(
         f"/api/control-plane/projects/{PROJECT_ID}/runs",
         headers={"Idempotency-Key": "start-1"},
-        json={"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"},
+        json=payload,
     )
     assert response.status_code == 202
     return response.json()
@@ -580,6 +591,7 @@ def test_transport_models_match_canonical_control_plane_models() -> None:
     assert set(RunStatusResponse.model_fields) == set(payloads["run"])
     assert set(StartRunResponse.model_fields) == set(payloads["start"])
     assert set(RunControlPayload.model_fields) == set(payloads["control"])
+    assert set(ResumeRunPayload.model_fields) == {"extra_instructions"}
     assert set(ContextResponse.model_fields) == set(payloads["context"])
     assert set(WorktreePreflightResponse.model_fields) == set(payloads["preflight"])
 
@@ -608,6 +620,7 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
         "CapabilityResponse",
         "RunStatusResponse",
         "StartRunResponse",
+        "ResumeRunPayload",
         "RunControlPayload",
         "ContextResponse",
         "WorktreePreflightResponse",
@@ -759,6 +772,120 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     )
     assert stopped.status_code == 200
     assert stopped.json()["launch_phase"] == "owner_stopped"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    (
+        (None, ("saved guidance",)),
+        ({"extra_instructions": None}, ("saved guidance",)),
+        ({"extra_instructions": ["replacement guidance"]}, ("replacement guidance",)),
+        ({"extra_instructions": []}, ()),
+    ),
+)
+def test_resume_extra_instructions_are_optional_and_idempotent(
+    control_client,
+    payload: dict[str, object] | None,
+    expected: tuple[str, ...],
+) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch, ["saved guidance"])
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":["saved guidance"]}'
+    )
+    before = source_path.read_bytes()
+    bootstrap_calls: list[dict[str, object]] = []
+
+    def bootstrap(**kwargs):
+        bootstrap_calls.append(kwargs)
+        provided = kwargs["extra_instructions_provided"]
+        effective = (
+            tuple(kwargs["extra_instructions_arg"])
+            if provided
+            else ("saved guidance",)
+        )
+        return SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="implement",
+            extra_instructions=effective,
+            resume_context=object(),
+        )
+
+    monkeypatch.setattr("aflow.cli._bootstrap_resume_invocation", bootstrap)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume"
+    headers = {"Idempotency-Key": "resume-instructions"}
+    if payload is None:
+        resumed = client.post(endpoint, headers=headers)
+    else:
+        resumed = client.post(endpoint, headers=headers, json=payload)
+    assert resumed.status_code == 201, resumed.text
+    successor_id = resumed.json()["run_id"]
+    assert len(units.start_calls) == 2
+    argv = units.start_calls[-1][1]
+    if expected:
+        assert f"--extra-instruction={expected[0]}" in argv
+    else:
+        assert not any(argument.startswith("--extra-instruction=") for argument in argv)
+    assert bootstrap_calls[0]["extra_instructions_provided"] == (
+        payload is not None and payload.get("extra_instructions") is not None
+    )
+    record_path = root / ".aflow" / "start-requests" / f"{successor_id}.json"
+    record_text = record_path.read_text()
+    assert "saved guidance" not in record_text
+    assert source_path.read_bytes() == before
+
+    replay = (
+        client.post(endpoint, headers=headers)
+        if payload is None
+        else client.post(endpoint, headers=headers, json=payload)
+    )
+    assert replay.status_code == 200
+    assert replay.json()["run_id"] == successor_id
+    changed = client.post(
+        endpoint,
+        headers=headers,
+        json={"extra_instructions": ["different guidance"]},
+    )
+    assert changed.status_code == 409
+    assert changed.json() == {"detail": {"code": "idempotency_conflict"}}
+    assert len(units.start_calls) == 2
+    assert source_path.read_bytes() == before
+
+
+def test_resume_rejects_invalid_extra_instructions_without_reserving(
+    control_client,
+) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch, ["saved guidance"])
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":["saved guidance"]}'
+    )
+    before = source_path.read_bytes()
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume",
+        headers={"Idempotency-Key": "resume-invalid"},
+        json={"extra_instructions": [""]},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "operation_rejected"}}
+    assert len(units.start_calls) == 1
+    assert source_path.read_bytes() == before
+    assert len(client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()["runs"]) == 1
 
 
 def test_control_admission_uses_live_targets_and_preserves_rejected_state(
