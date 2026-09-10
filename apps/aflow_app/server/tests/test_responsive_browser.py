@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 from urllib.parse import urlsplit
 
 import pytest
@@ -70,6 +72,65 @@ def _seed_responsive_fixture(root: Path) -> None:
         for index in range(40)
     )
     workflows_path.write_text(workflows_path.read_text() + f"\n{workflows}\n")
+
+
+def _register_responsive_worktree(root: Path) -> str:
+    """Create one registered linked checkout for the presentation journey."""
+    from aflow_app_server import main
+
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=responsive-test",
+            "-c",
+            "user.email=responsive-test@example.invalid",
+            "add",
+            "-A",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=responsive-test",
+            "-c",
+            "user.email=responsive-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "responsive fixture base",
+        ),
+        check=True,
+    )
+    child = root.parent / "responsive-worktree"
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(root),
+            "worktree",
+            "add",
+            "-q",
+            str(child),
+            "-b",
+            "feature/responsive-worktree",
+        ),
+        check=True,
+    )
+    for source in (root / ".aflow" / "runs").iterdir():
+        target = child / ".aflow" / "runs" / source.name
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "run.json").write_text((source / "run.json").read_text())
+    registry = main._project_registry
+    assert registry is not None
+    registry.register("responsive-worktree", "Feature worktree", "responsive-worktree")
+    return "responsive-worktree"
 
 
 def _browser(playwright):
@@ -394,6 +455,75 @@ def _create_live_control_fixture(control_client, root: Path, monkeypatch) -> tup
     assert state["status"] == "running"
     assert state["revision"] == 0
     return run_id, state
+
+
+@pytest.mark.parametrize(("width", "height"), VIEWPORTS)
+def test_project_worktree_presentation(control_client, monkeypatch, width: int, height: int):
+    """Exercise one-level disclosure, direct child links, history and context."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    child_id = _register_responsive_worktree(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": width, "height": height})
+            _login(page, url)
+            for theme in ("light", "dark"):
+                _set_theme_preference(page, theme)
+                page.goto(f"{url}/?view=projects")
+                _assert_theme(page, theme)
+                parent = page.get_by_role("button", name=re.compile(r"^Test project"))
+                parent.wait_for()
+                disclosure = page.locator("details.worktree-disclosure")
+                assert disclosure.get_attribute("open") is None
+                _assert_header_and_flow(page)
+
+                summary = page.locator("summary").filter(has_text="Worktrees (1)")
+                summary.focus()
+                summary.press("Enter")
+                child = page.get_by_role("button", name=re.compile(r"^Feature worktree"))
+                child.wait_for()
+                _assert_no_horizontal_overflow(page)
+                _assert_no_unauthorized_scrollers(page)
+
+                child.click()
+                page.wait_for_function(
+                    "child => new URL(location.href).searchParams.get('project') === child",
+                    arg=child_id,
+                )
+                page.get_by_role("button", name="New run", exact=True).wait_for()
+                history_row = page.locator(".run-list-item").filter(has_text="long-plan-39.md").first
+                history_row.wait_for()
+                _assert_document_moves(page)
+                history_row.click()
+                page.locator(".run-detail h3").filter(has_text="long-plan-39.md").wait_for()
+                _assert_header_and_flow(page)
+
+                page.goto(f"{url}/?view=projects")
+                search = page.get_by_role("textbox", name="Search projects and available candidates")
+                search.fill("Feature worktree")
+                child = page.get_by_role("button", name=re.compile(r"^Feature worktree"))
+                child.wait_for()
+
+                page.goto(f"{url}/?project={child_id}&view=projects")
+                selected_child = page.get_by_role("button", name=re.compile(r"^Feature worktree"))
+                selected_child.wait_for()
+                expect(selected_child).to_have_attribute("aria-pressed", "true")
+                _assert_header_and_flow(page)
+
+                page.goto(f"{url}/?view=all-runs")
+                page.get_by_role("heading", name="All runs", exact=True).wait_for()
+                child_global_row = page.get_by_role(
+                    "button",
+                    name=re.compile(r"Test project · Worktree: Feature worktree · Completed"),
+                ).first
+                child_global_row.wait_for()
+                _assert_header_and_flow(page)
+        finally:
+            browser.close()
 
 
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)

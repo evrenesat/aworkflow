@@ -8,6 +8,7 @@ import { PlanPanel } from './components/PlanPanel'
 import { RunDashboard, type PendingSuccessorStart, type RunSelectionChange } from './components/RunDashboard'
 import { HeaderSlotsProvider, type HeaderSlotContribution } from './components/HeaderSlots'
 import { useCompactLayout } from './components/SidebarEditorLayout'
+import { projectContextLabel } from './projectPresentation'
 import * as api from './api'
 import {
   normalizeWorkspaceQuery,
@@ -52,6 +53,7 @@ const readinessGuidance: Record<string, string> = {
 
 interface AppHeaderProps {
   selectedProject: ProjectInfo | null
+  projects: ProjectInfo[]
   view: View
   slots: HeaderSlotContribution
   onSwitchView: (view: View) => void
@@ -59,13 +61,16 @@ interface AppHeaderProps {
   logoutPending: boolean
 }
 
-function AppHeader({ selectedProject, view, slots, onSwitchView, onLogout, logoutPending }: AppHeaderProps) {
+function AppHeader({ selectedProject, projects, view, slots, onSwitchView, onLogout, logoutPending }: AppHeaderProps) {
   const compact = useCompactLayout()
   const [menuOpen, setMenuOpen] = useState(false)
   const menuButtonRef = useRef<HTMLButtonElement>(null)
   const menuId = useId()
   const pageLabel = NAV_ITEMS.find(item => item.view === view)?.label ?? 'Workspace'
   const defaultContext = <span className="header-context-title">{pageLabel}</span>
+  const projectTitle = selectedProject
+    ? `AFlow · ${projectContextLabel(selectedProject, projects)}`
+    : 'AFlow'
 
   useEffect(() => {
     if (!compact) setMenuOpen(false)
@@ -123,16 +128,12 @@ function AppHeader({ selectedProject, view, slots, onSwitchView, onLogout, logou
             onClick={() => setMenuOpen(open => !open)}
           ><span aria-hidden="true">☰</span></button>
           <div className="app-branding app-branding-compact">
-            <h1 className="app-brand-title truncate" title={selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}>
-              {selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}
-            </h1>
+            <h1 className="app-brand-title truncate" title={projectTitle}>{projectTitle}</h1>
             <div className="mobile-page-context">{slots.compactContext ?? slots.context ?? defaultContext}</div>
           </div>
         </> : <>
           <div className="app-branding">
-            <h1 className="app-brand-title truncate" title={selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}>
-              {selectedProject ? `AFlow · ${selectedProject.display_name}` : 'AFlow'}
-          </h1>
+            <h1 className="app-brand-title truncate" title={projectTitle}>{projectTitle}</h1>
         </div>
         <nav className="workspace-global-nav" aria-label="Global navigation">
             {NAV_ITEMS.filter(item => !item.needsProject || selectedProject).map(item => navigationButton(item))}
@@ -599,6 +600,7 @@ export function App() {
     <div className="app-shell">
       <HeaderSlotsProvider renderHeader={(slots) => <AppHeader
         selectedProject={selectedProject}
+        projects={projects}
         view={view}
         slots={slots}
         onSwitchView={switchView}

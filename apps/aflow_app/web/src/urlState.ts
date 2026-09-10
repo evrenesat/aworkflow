@@ -37,9 +37,10 @@ export function parseWorkspaceQuery(search: string): RawWorkspaceQuery {
   }
 }
 
-/** Fills in the concrete workspace state a raw link means: no project is the Projects view, a project without a usable view is Runs; Settings is global. */
+/** Fills in the concrete workspace state a raw link means: an unscoped link is the Projects view, while a supplied project keeps its presentation selection; a project without a usable view is Runs; Settings is global. */
 export function normalizeWorkspaceQuery(raw: RawWorkspaceQuery): WorkspaceQuery {
-  if (raw.view === 'all-runs' || raw.view === 'projects') return { project: null, view: raw.view, run: null }
+  if (raw.view === 'all-runs') return { project: null, view: raw.view, run: null }
+  if (raw.view === 'projects') return { project: raw.project, view: raw.view, run: null }
   if (raw.project === null) return { project: null, view: raw.view === 'settings' ? 'settings' : 'all-runs', run: null }
   return {
     project: raw.project,

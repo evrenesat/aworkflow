@@ -7,6 +7,7 @@ export interface ProjectInfo {
   is_git_root: boolean
   registered_at: string
   readiness: ProjectReadiness
+  parent_project_id?: string | null
 }
 
 export interface ProjectCreateRequest {

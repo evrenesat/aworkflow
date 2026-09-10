@@ -1575,6 +1575,15 @@ input::placeholder, textarea::placeholder {
 .compact-row .row-title { font-weight: 600; overflow-wrap: anywhere; text-align: left; display: flex; align-items: center; gap: var(--spacing-sm); flex-wrap: wrap; }
 .compact-row .row-subtitle { font-size: 0.75rem; overflow-wrap: anywhere; text-align: left; }
 .compact-row:has(.content-button):hover { background: var(--color-surface-hover); border-color: var(--color-primary); }
+.project-parent-main { display: flex; flex: 1 1 auto; flex-direction: column; gap: var(--spacing-sm); min-width: 0; }
+.worktree-disclosure { border-top: 1px solid var(--color-border); min-width: 0; }
+.worktree-disclosure > summary { display: flex; align-items: center; min-height: var(--tap-target); padding-block: var(--spacing-xs); font-size: 0.85rem; font-weight: 600; cursor: pointer; overflow-wrap: anywhere; }
+.worktree-disclosure > summary:focus-visible { outline-offset: -2px; }
+.worktree-list { list-style: none; display: flex; flex-direction: column; gap: var(--spacing-xs); margin: 0; padding: 0 0 0 var(--spacing-md); min-width: 0; }
+.worktree-item { display: flex; align-items: center; gap: var(--spacing-sm); min-width: 0; padding: var(--spacing-xs) 0 var(--spacing-xs) var(--spacing-sm); border-left: 2px solid var(--color-border); }
+.worktree-item.selected { border-left-color: var(--color-primary); }
+.worktree-row { flex: 1 1 auto; min-width: 0; min-height: var(--tap-target); padding: var(--spacing-xs) var(--spacing-sm); }
+.worktree-item .unregister-confirm { width: 100%; }
 
 @media (max-width: 640px) {
   .input, select, textarea { font-size: 16px; }
@@ -1582,6 +1591,10 @@ input::placeholder, textarea::placeholder {
   .config-tabs .btn { scroll-snap-align: start; white-space: nowrap; }
   .compact-row { flex-wrap: wrap; }
   .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
+  .worktree-item { flex-wrap: wrap; }
+  .worktree-item .worktree-row,
+  .worktree-item .compact-row-actions { flex-basis: 100%; }
+  .worktree-item .compact-row-actions { justify-content: flex-end; }
   .profile-editor-row { grid-template-columns: minmax(0, 1fr); }
   .profile-editor-note,
   .profile-editor-new-fields { grid-column: 1; }

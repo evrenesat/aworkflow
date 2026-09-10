@@ -1093,6 +1093,14 @@ managed root. `project_service.py` creates, registers, renames, and safely
 unregisters exact Git roots. Read-only project_discovery.py lists bounded Git
 candidates two levels beneath the managed root; discovery does not grant access
 or write registration. The explicit Add operation remains the enrollment boundary.
+The project read projection may also identify a registered linked worktree's
+registered primary through Git common-directory identity. The web picker uses
+that additive metadata for one-level collapsed presentation only; exact child
+IDs, paths, actions, history and global run enumeration remain independent.
+Ordinary `checkpoint_delivery` launches keep using their internal execution
+checkout without a registration prerequisite. Legacy recovery of an existing
+checkout may require explicit registration before it can be presented beneath
+its registered parent.
 
 `plan_service.py` resolves each project through that registry and addresses
 only direct regular UTF-8 Markdown files under `plans/todo`,
@@ -1144,6 +1152,8 @@ non-ongoing records globally. It refreshes every ten seconds only while visible,
 cancels stale generations, and retains partial snapshots with an error label.
 The browser-local `aflow.recentRunsLimit` preference defaults to 10; it has no
 effect on retention. Exact project/run URLs preserve history navigation.
+The header and global run rows label a child as `Parent · Worktree: Child`
+without moving its run data under the parent API identity.
 
 Named prompts live in `[prompts]`; role/team prompt values are text overrides
 in `[roles.prompts]` and `[teams.<name>.prompts]`. Renames update only schema

@@ -1822,3 +1822,16 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
   (16), WebKit browser journeys (16), and `git diff --check` passed. Physical
   mobile keyboard behavior, live CI, activation, and the coordinator's live
   unsaved-draft smoke remain downstream checks.
+
+## 2026-09-10 — Registered worktree project presentation (Checkpoint 2)
+
+- Grouped only read-projected registered worktrees beneath their registered
+  primary project in a collapsed, keyboard-accessible Worktrees disclosure.
+  Selected and search-matching children reveal automatically; ungroupable
+  registrations remain independent, and child selection/actions retain exact
+  project IDs and paths.
+- Added parent/worktree context to the app header and global run rows without
+  changing URL identity or flattening global run enumeration. Documented the
+  normal internal-checkout launch path and legacy registration recovery.
+- Verification is recorded with the checkpoint handoff after web unit tests,
+  production build, Chromium/WebKit responsive journeys, and `git diff --check`.

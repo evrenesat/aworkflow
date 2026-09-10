@@ -3,6 +3,7 @@ import { fetchGlobalRuns, selectGlobalRuns, useRecentRunsLimit } from '../global
 import type { ProjectInfo, RunStatus } from '../types'
 import { executionDuration, statusLabel } from '../runPresentation'
 import { formatMachineLabel } from '../label'
+import { projectContextLabel } from '../projectPresentation'
 import { useHeaderSlots } from './HeaderSlots'
 
 export function RecentRunsLimit() {
@@ -65,13 +66,16 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
       <h3>{group === 'ongoing' ? 'Ongoing' : group === 'attention' ? 'Needs attention' : `Recent (${selected.recent.length})`}</h3>
       {selected[group].length === 0 && <p className="text-sm text-dim">{group === 'ongoing' ? 'No ongoing runs.' : group === 'attention' ? 'No runs need attention.' : 'No recent runs.'}</p>}
       {selected[group].length > 0 && <ul className="compact-list">
-        {selected[group].map(({ projectId, run }) => <li key={JSON.stringify([projectId, run.run_id])}>
+        {selected[group].map(({ projectId, run }) => {
+          const project = projects.find(candidate => candidate.id === projectId)
+          return <li key={JSON.stringify([projectId, run.run_id])}>
           <button className="card global-run-row" onClick={() => onOpen(projectId, run.run_id)}>
-            <strong>{projects.find(p => p.id === projectId)?.display_name ?? projectId} · {statusLabel(run)}{run.history_state === 'archived' ? ' · Archived' : ''}</strong>
+            <strong>{project ? projectContextLabel(project, projects) : projectId} · {statusLabel(run)}{run.history_state === 'archived' ? ' · Archived' : ''}</strong>
             <span>{run.plan_path ?? run.run_id}</span>
             <span className="text-sm text-dim">{[run.workflow_name ? formatMachineLabel(run.workflow_name) : null, run.team ? formatMachineLabel(run.team) : null, run.current_step ? formatMachineLabel(run.current_step) : null, executionDuration(run, Date.now())].filter(Boolean).join(' · ')}</span>
           </button>
-        </li>)}
+          </li>
+        })}
       </ul>}
     </section>)}
   </div>

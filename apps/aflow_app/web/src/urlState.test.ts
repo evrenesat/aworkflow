@@ -52,6 +52,7 @@ describe('workspace URL state', () => {
     expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?project=alpha&view=overview'))).toEqual({ project: 'alpha', view: 'runs', run: null })
     expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?view=overview'))).toEqual({ project: null, view: 'all-runs', run: null })
     expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?project=alpha&view=new-run'))).toEqual({ project: 'alpha', view: 'new-run', run: null })
+    expect(normalizeWorkspaceQuery(parseWorkspaceQuery('?project=child&view=projects'))).toEqual({ project: 'child', view: 'projects', run: null })
   })
 
   it('serializes in a fixed order and round-trips', () => {

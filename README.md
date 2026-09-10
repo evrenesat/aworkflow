@@ -396,6 +396,15 @@ stop-then-start workflow changes with `restarted_from_run_id` lineage. Provider
 choice stays in normal engine harness profiles; Codex is one optional harness
 adapter. A remote ACP interface is deferred.
 
+The Projects page keeps each registered primary checkout as the project card.
+When the server's read-only Git projection verifies registered linked worktrees,
+they appear in a collapsed Worktrees disclosure with their exact names and
+paths; selecting one keeps its own project and run identity. A normal
+`checkpoint_delivery` launch uses its internal execution checkout without an
+extra registration step. Legacy recovery of an already-existing checkout may
+require registering that checkout first; when its parent is also registered,
+the UI presents it beneath that parent.
+
 Private deployments keep the backend on `127.0.0.1:8765` and publish it to the
 tailnet through Tailscale Serve. After enabling Serve, use
 `tailscale serve status --json` to discover the advertised MagicDNS HTTPS

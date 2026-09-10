@@ -7,6 +7,7 @@ import type {
   ProjectInfo,
 } from '../types'
 import { readinessClass, readinessLabel } from '../readiness'
+import { groupProjectRegistrations, type ProjectGroup } from '../projectPresentation'
 import * as api from '../api'
 import { ProjectCreateForm } from './ProjectCreateForm'
 import { MenuItem, MoreMenu } from './MoreMenu'
@@ -26,6 +27,82 @@ interface ProjectPickerProps {
 function matchesQuery(query: string, ...texts: string[]): boolean {
   if (!query) return true
   return texts.some((text) => text.toLowerCase().includes(query))
+}
+
+function UnregisterConfirmation({
+  project,
+  onConfirm,
+  onCancel,
+}: {
+  project: ProjectInfo
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  return <div className="confirmation unregister-confirm">
+    <span className="text-sm">
+      Remove “{project.display_name}” from the registry? Files, Git history,
+      and plans on disk are preserved; the project can be registered again.
+    </span>
+    <div className="dashboard-actions">
+      <button className="btn btn-danger btn-sm" onClick={onConfirm}>
+        Unregister (keeps files)
+      </button>
+      <button className="btn btn-secondary btn-sm" onClick={onCancel}>
+        Cancel
+      </button>
+    </div>
+  </div>
+}
+
+function ProjectActions({
+  project,
+  confirming,
+  kind,
+  onRequestUnregister,
+  onConfirmUnregister,
+  onCancelUnregister,
+}: {
+  project: ProjectInfo
+  confirming: boolean
+  kind: 'project' | 'worktree'
+  onRequestUnregister: (project: ProjectInfo) => void
+  onConfirmUnregister: (project: ProjectInfo) => void
+  onCancelUnregister: () => void
+}) {
+  if (confirming) {
+    return <UnregisterConfirmation
+      project={project}
+      onConfirm={() => onConfirmUnregister(project)}
+      onCancel={onCancelUnregister}
+    />
+  }
+  return <MoreMenu label={`More actions for ${kind} ${project.display_name}`}>
+    <MenuItem danger onClick={() => onRequestUnregister(project)}>
+      Unregister…
+    </MenuItem>
+  </MoreMenu>
+}
+
+function ProjectRowButton({ project, selected, className, onClick }: {
+  project: ProjectInfo
+  selected: boolean
+  className: string
+  onClick: () => void
+}) {
+  return <button
+    className={className}
+    aria-pressed={selected}
+    title={project.display_name}
+    onClick={onClick}
+  >
+    <span className="row-title">
+      {project.display_name}
+      <span className={readinessClass(project.readiness)}>
+        {readinessLabel(project.readiness)}
+      </span>
+    </span>
+    <span className="row-subtitle text-dim mono">{project.current_path}</span>
+  </button>
 }
 
 /**
@@ -50,6 +127,7 @@ export function ProjectPicker({
   const [discoveryLoading, setDiscoveryLoading] = useState(false)
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
+  const [expandedParentIds, setExpandedParentIds] = useState<Set<string>>(new Set())
   const [addError, setAddError] = useState<string | null>(null)
   const [addingPath, setAddingPath] = useState<string | null>(null)
 
@@ -117,9 +195,7 @@ export function ProjectPicker({
   }
 
   const query = search.trim().toLowerCase()
-  const filteredProjects = projects.filter((project) =>
-    matchesQuery(query, project.display_name, project.current_path),
-  )
+  const projectGroups = groupProjectRegistrations(projects, query, selectedProjectId)
   const allCandidates = (discovery?.candidates ?? []).filter(candidate => candidate.registered_project_id === null)
   const filteredCandidates = allCandidates.filter((candidate) =>
     matchesQuery(query, candidate.display_name, candidate.relative_path),
@@ -198,7 +274,7 @@ export function ProjectPicker({
           </label>}
 
           <h3 className="project-subheading">Added projects</h3>
-          {projects.length > 0 && filteredProjects.length === 0 && (
+          {projects.length > 0 && projectGroups.length === 0 && (
             <div className="card text-dim text-sm">
               No added projects match “{search.trim()}”.
               <div className="dashboard-actions" style={{ marginTop: 'var(--spacing-sm)' }}>
@@ -214,52 +290,104 @@ export function ProjectPicker({
           )}
 
           <ul className="compact-list" role="list" aria-label="Added projects">
-            {filteredProjects.map((project) => {
-              const isSelected = selectedProjectId === project.id
-              const confirming = confirmingUnregisterId === project.id
+            {projectGroups.map((group: ProjectGroup) => {
+              const primary = group.primary
+              const primarySelected = selectedProjectId === primary.id
+              const primaryConfirming = confirmingUnregisterId === primary.id
+              const autoExpanded = group.matchingChildIds.length > 0 || group.selectedChildId !== null
+              const expanded = autoExpanded || expandedParentIds.has(primary.id)
+              const visibleChildren = group.children.filter(child => (
+                !query
+                || group.primaryMatches
+                || group.matchingChildIds.includes(child.id)
+                || child.id === group.selectedChildId
+              ))
               return (
                 <li
-                  key={project.id}
+                  key={primary.id}
                   role="listitem"
-                  className={`compact-row ${isSelected ? 'selected' : ''}`}
+                  className={`compact-row project-parent-row ${primarySelected ? 'selected' : ''}`}
                 >
-                  {confirming ? (
-                    <div className="confirmation unregister-confirm">
-                      <span className="text-sm">
-                        Remove “{project.display_name}” from the registry? Files, Git history,
-                        and plans on disk are preserved; the project can be registered again.
-                      </span>
-                      <div className="dashboard-actions">
-                        <button className="btn btn-danger btn-sm" onClick={() => void handleUnregister(project)}>
-                          Unregister (keeps files)
-                        </button>
-                        <button className="btn btn-secondary btn-sm" onClick={() => setConfirmingUnregisterId(null)}>
-                          Cancel
-                        </button>
-                      </div>
-                    </div>
+                  {primaryConfirming ? (
+                    <ProjectActions
+                      project={primary}
+                      confirming
+                      kind="project"
+                      onRequestUnregister={(project) => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}
+                      onConfirmUnregister={(project) => void handleUnregister(project)}
+                      onCancelUnregister={() => setConfirmingUnregisterId(null)}
+                    />
                   ) : (
                     <>
-                      <button
-                        className="compact-row-main content-button"
-                        aria-pressed={isSelected}
-                        title={project.display_name}
-                        onClick={() => onSelectProject(project)}
-                      >
-                        <span className="row-title">
-                          {project.display_name}
-                          <span className={readinessClass(project.readiness)}>
-                            {readinessLabel(project.readiness)}
-                          </span>
-                        </span>
-                        <span className="row-subtitle text-dim mono">{project.current_path}</span>
-                      </button>
+                      <div className="project-parent-main">
+                        <ProjectRowButton
+                          project={primary}
+                          selected={primarySelected}
+                          className="compact-row-main content-button"
+                          onClick={() => onSelectProject(primary)}
+                        />
+                        {group.children.length > 0 && <details
+                          className="worktree-disclosure"
+                          open={expanded}
+                          onToggle={(event) => {
+                            const nextOpen = event.currentTarget.open
+                            setExpandedParentIds(current => {
+                              const next = new Set(current)
+                              if (nextOpen) next.add(primary.id)
+                              else next.delete(primary.id)
+                              return next
+                            })
+                          }}
+                        >
+                          <summary>Worktrees ({group.children.length})</summary>
+                          <ul className="worktree-list" role="list" aria-label={`Worktrees for ${primary.display_name}`}>
+                            {visibleChildren.map(child => {
+                              const childSelected = selectedProjectId === child.id
+                              const childConfirming = confirmingUnregisterId === child.id
+                              return <li
+                                key={child.id}
+                                role="listitem"
+                                className={`worktree-item ${childSelected ? 'selected' : ''}`}
+                              >
+                                {childConfirming ? <ProjectActions
+                                    project={child}
+                                    confirming
+                                    kind="worktree"
+                                    onRequestUnregister={(project) => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}
+                                    onConfirmUnregister={(project) => void handleUnregister(project)}
+                                    onCancelUnregister={() => setConfirmingUnregisterId(null)}
+                                  /> : <>
+                                    <ProjectRowButton
+                                      project={child}
+                                      selected={childSelected}
+                                      className="worktree-row content-button"
+                                      onClick={() => onSelectProject(child)}
+                                    />
+                                    <div className="compact-row-actions">
+                                      <ProjectActions
+                                        project={child}
+                                        confirming={false}
+                                        kind="worktree"
+                                        onRequestUnregister={(project) => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}
+                                        onConfirmUnregister={(project) => void handleUnregister(project)}
+                                        onCancelUnregister={() => setConfirmingUnregisterId(null)}
+                                      />
+                                    </div>
+                                  </>}
+                              </li>
+                            })}
+                          </ul>
+                        </details>}
+                      </div>
                       <div className="compact-row-actions">
-                        <MoreMenu label={`More actions for project ${project.display_name}`}>
-                          <MenuItem danger onClick={() => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}>
-                            Unregister…
-                          </MenuItem>
-                        </MoreMenu>
+                        <ProjectActions
+                          project={primary}
+                          confirming={false}
+                          kind="project"
+                          onRequestUnregister={(project) => { setUnregisterError(null); setConfirmingUnregisterId(project.id) }}
+                          onConfirmUnregister={(project) => void handleUnregister(project)}
+                          onCancelUnregister={() => setConfirmingUnregisterId(null)}
+                        />
                       </div>
                     </>
                   )}
