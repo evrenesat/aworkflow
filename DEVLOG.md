@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-11 — Isolate pending-review fixture Git state
+
+- The pending-review fixture now commits a narrow `.aflow/` ignore and binds
+  Git's local excludes file to an empty fixture-owned file, so its clean
+  worktree proof does not depend on `/root/.gitignore` or another host global.
+- Its commit helper also records the generated plan-backup body and provenance
+  sidecar rather than hiding them with a broad ignore.
+- The scoped module passed with `GIT_CONFIG_GLOBAL=/dev/null`; changed
+  worktrees and relocated review evidence retain their existing rejection and
+  mapping checks. Production validation is unchanged.
+
 ## 2026-09-11 — Synchronize startup inspection readiness (Checkpoint 1)
 
 - Controlled deferred component coverage established the readiness race: the
@@ -19,6 +30,7 @@
   prior CI log demonstrated the ordering failure; it did not establish a
   platform-specific cause. Evidence is retained under the invocation-owned
   `/root/code/evidence/aflow-dogfood-20260909/startup-preflight-review-20260911/`.
+
 
 ## 2026-09-11 — Keep recovery browser screenshots portable
 

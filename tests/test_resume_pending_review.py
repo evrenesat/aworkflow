@@ -106,8 +106,11 @@ def _git(root: Path, *args: str) -> str:
 
 
 def _commit_plan(root: Path, message: str) -> None:
+    paths = ["aflow.toml", "plan.md", ".gitignore"]
+    if (root / "plans" / "backups").is_dir():
+        paths.append("plans/backups")
     subprocess.run(
-        ("git", "add", "aflow.toml", "plan.md"),
+        ("git", "add", "--", *paths),
         cwd=root,
         check=True,
         capture_output=True,
@@ -137,6 +140,19 @@ def _file_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def _isolate_fixture_git_ignores(root: Path) -> None:
+    """Keep runtime state ignored without inheriting the host's Git ignores."""
+    (root / ".gitignore").write_text(".aflow/\n", encoding="utf-8")
+    excludes_file = root / ".git" / "fixture-global-excludes"
+    excludes_file.write_text("", encoding="utf-8")
+    subprocess.run(
+        ("git", "config", "--local", "core.excludesFile", str(excludes_file)),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
 class _BlockAfterWorkers(NoOpHarnessPreflightProbe):
     def __init__(self) -> None:
         self.calls = 0
@@ -150,6 +166,7 @@ class _BlockAfterWorkers(NoOpHarnessPreflightProbe):
 def pending_review_run(tmp_path: Path) -> dict[str, object]:
     root = tmp_path / "repo"
     _make_git_repo(root)
+    _isolate_fixture_git_ignores(root)
     (root / "aflow.toml").write_text("", encoding="utf-8")
     plan = root / "plan.md"
     plan.write_text(_INITIAL_PLAN, encoding="utf-8")
