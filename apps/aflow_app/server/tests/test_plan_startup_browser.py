@@ -170,7 +170,7 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
             _choose_workflow(page)
             _acknowledge_dirty_worktree_if_needed(page)
             page.get_by_role("button", name="Start run", exact=True).click()
-            page.locator(".run-detail h3").filter(has_text="numbered-ready.md").wait_for()
+            assert page.locator(".run-detail h3").inner_text() == "Numbered ready"
             assert len(units.start_calls) == 1
             assert numbered_path.read_text(encoding="utf-8") == numbered
 
@@ -219,7 +219,7 @@ def test_chromium_preserves_ready_state_and_retries_a_corrected_plan(
             _choose_workflow(page)
             _acknowledge_dirty_worktree_if_needed(page)
             page.get_by_role("button", name="Start run", exact=True).click()
-            page.locator(".run-detail h3").filter(has_text="duplicate-ready.md").wait_for()
+            assert page.locator(".run-detail h3").inner_text() == "Duplicate ready"
             assert len(units.start_calls) == 2
             assert len(_run_ids(root)) == len(before_rejection) + 1
             assert duplicate_path.read_text(encoding="utf-8") == corrected

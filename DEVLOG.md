@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-11 — Align readable run-title browser contracts (Checkpoint 1)
+
+- Preserved the shipped readable run presentation while updating browser
+  contracts to select fixture records by exact run ID and assert the readable
+  detail title separately from the technical ID and URL. Corrected only stale
+  filename-as-heading expectations, including the startup-plan browser cases.
+- Strengthened All runs navigation coverage for exact project/status/title/ID
+  rows and retained the existing draft, payload, revision, geometry, viewport,
+  focus, scroll, and action assertions. Chromium/WebKit evidence is retained
+  under `/root/code/evidence/aflow-dogfood-20260909/readable-run-browser-review-20260911/`.
+
 ## 2026-09-11 — Simplify New Run and verify browser journeys (Checkpoint 3)
 
 - Kept Plan, Workflow, and Team as labelled launch choices with resolved

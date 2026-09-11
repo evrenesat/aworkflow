@@ -8,6 +8,7 @@ from test_responsive_browser import (
     _assert_document_moves,
     _assert_header_and_flow,
     _assert_last_action_hit_test,
+    _assert_run_detail,
     _browser,
     _compact,
     _assert_theme,
@@ -89,15 +90,21 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             # run detail while retaining the canonical URL identity.
             page.set_viewport_size({'width': 390, 'height': 844})
             page.goto(f'{url}/?view=all-runs')
+            all_run = page.get_by_role(
+                'button',
+                name='Test project · Completed · History 000 · history-000',
+                exact=True,
+            )
+            all_run.wait_for()
             for attempt in range(2):
-                page.get_by_role('button', name='Test project · Completed', exact=False).first.click()
+                all_run.click()
                 page.wait_for_function("new URL(location.href).searchParams.get('project') === 'test-project' && new URL(location.href).searchParams.get('view') === 'runs'")
                 selected_id = page.evaluate("() => new URL(location.href).searchParams.get('run')")
-                assert selected_id
+                assert selected_id == 'history-000'
                 detail = page.locator('.sidebar-editor-detail')
                 detail.wait_for(state='visible')
                 assert not page.locator('.sidebar-editor-navigation').is_visible()
-                assert detail.locator('.run-detail h3').is_visible()
+                _assert_run_detail(page, 'History 000', 'history-000')
                 page.get_by_role('button', name='← Back to Run history', exact=True).click()
                 page.locator('.sidebar-editor-navigation').wait_for(state='visible')
                 assert page.evaluate("() => new URL(location.href).searchParams.get('run')") == selected_id
@@ -114,10 +121,11 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             page.wait_for_function("new URL(location.href).searchParams.get('run') !== null")
             detail = page.locator('.sidebar-editor-detail')
             assert not detail.is_visible()
-            row = nav.get_by_role('button', name='history-069.md', exact=False)
+            row = nav.locator("[data-sidebar-editor-item='history-069']")
             row.scroll_into_view_if_needed()
             before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
             item_id = row.get_attribute('data-sidebar-editor-item')
+            assert item_id == 'history-069'
             row.click()
             detail.wait_for(state='visible')
             assert not nav.is_visible()
@@ -141,12 +149,13 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         nav.wait_for(state='visible')
                     page.get_by_role('button', name='Load more runs', exact=True).click()
                     page.wait_for_function("document.querySelectorAll('.run-list-item').length === 130")
-                    row = nav.get_by_role('button', name='history-069.md', exact=False)
+                    row = nav.locator("[data-sidebar-editor-item='history-069']")
                     row.scroll_into_view_if_needed()
                     before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                     item_id = row.get_attribute('data-sidebar-editor-item')
+                    assert item_id == 'history-069'
                     row.click()
-                    page.locator('.run-detail h3').filter(has_text='History 069').wait_for()
+                    _assert_run_detail(page, 'History 069', 'history-069')
                     metrics = document_metrics(page)
                     assert metrics['detailHeight'] > 0, metrics
                     assert metrics['detailContent'] <= metrics['detailHeight'] + 1, metrics
@@ -192,15 +201,16 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                             'before': before_list_scroll, 'after': after_back_scroll, 'target': restored_target,
                         }
                         assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
-                    nav.get_by_role('button', name='history-068.md', exact=False).click()
-                    if compact:
-                        page.locator('.run-detail h3').filter(has_text='History 068').wait_for()
+                    second_row = nav.locator("[data-sidebar-editor-item='history-068']")
+                    assert second_row.get_attribute('data-sidebar-editor-item') == 'history-068'
+                    second_row.click()
+                    _assert_run_detail(page, 'History 068', 'history-068')
                     assert document_metrics(page)['detailScroll'] == 0
                     page.go_back()
-                    page.locator('.run-detail h3').filter(has_text='History 069').wait_for()
+                    _assert_run_detail(page, 'History 069', 'history-069')
                     assert document_metrics(page)['detailScroll'] == 0
                     page.reload()
-                    page.locator('.run-detail h3').filter(has_text='History 069').wait_for()
+                    _assert_run_detail(page, 'History 069', 'history-069')
             page.get_by_role('button', name='More run actions').click()
             page.get_by_role('menuitem', name='Archive', exact=True).click()
             page.get_by_role('button', name='Restore', exact=True).wait_for()
@@ -319,7 +329,7 @@ def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tm
                     page.get_by_label('Run history', exact=True).select_option('all')
                     exact_row.wait_for()
                     exact_row.click()
-                    page.locator('.run-detail h3').filter(has_text='Journey ready').wait_for()
+                    _assert_run_detail(page, 'Journey ready', run_id)
                     page.wait_for_function(
                         "new URL(location.href).searchParams.get('project') === 'test-project' && "
                         f"new URL(location.href).searchParams.get('run') === '{run_id}'"
@@ -635,9 +645,15 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
             page.unroute(f'**/api/control-plane/projects/{PROJECT_ID}/runs', launch_route)
             page.get_by_role('button', name='Menu', exact=True).click()
             page.get_by_role('menuitem', name='All runs', exact=True).click()
-            page.get_by_role('button', name='Test project · Completed', exact=False).wait_for()
+            exact_global_row = page.get_by_role(
+                'button',
+                name='Test project · Completed · Ready cp5 · global-cp5',
+                exact=True,
+            )
+            exact_global_row.wait_for()
             assert_compact_geometry(page, 844, 390)
-            page.get_by_role('button', name='Test project · Completed', exact=False).first.click()
+            exact_global_row.click()
+            _assert_run_detail(page, 'Ready cp5', 'global-cp5')
             page.get_by_role('button', name='← Back to Run history', exact=True).wait_for()
             page.get_by_role('button', name='← Back to Run history', exact=True).click()
             page.locator('.sidebar-editor-navigation').wait_for()

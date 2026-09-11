@@ -27,6 +27,11 @@ VIEWPORTS = (
     pytest.param(390, 420, id="phone-short"),
 )
 
+RESPONSIVE_FIXTURE_RUN_ID = "responsive-run-39"
+RESPONSIVE_FIXTURE_PLAN_PATH = "plans/todo/long-plan-39.md"
+RESPONSIVE_FIXTURE_TITLE = "Long plan 39"
+RESPONSIVE_GLOBAL_RUN_ID = "responsive-run-00"
+RESPONSIVE_GLOBAL_TITLE = "Long plan 00"
 LONG_LABEL = "route-" + "x" * 120
 LONG_TEXT = "# Responsive fixture\n\n" + ("A long document line for ordinary document flow. " * 420) + "\n"
 
@@ -358,6 +363,17 @@ def _wait_for_loaded_plan_rows(page: Page) -> None:
     }""")
 
 
+def _assert_run_detail(page: Page, expected_title: str, expected_run_id: str) -> None:
+    """Assert readable presentation separately from the exact run identity."""
+    detail = page.locator(".run-detail:visible").first
+    detail.wait_for()
+    assert detail.locator("h3").inner_text() == expected_title
+    assert detail.get_by_title("Copy run ID", exact=True).inner_text() == expected_run_id
+    assert page.evaluate(
+        "() => new URL(location.href).searchParams.get('run')"
+    ) == expected_run_id
+
+
 def _visible_dashboard(page: Page):
     dashboard = page.locator(".dashboard-host:not([hidden])").first
     dashboard.wait_for()
@@ -495,11 +511,14 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
                     arg=child_id,
                 )
                 page.get_by_role("button", name="New run", exact=True).wait_for()
-                history_row = page.locator(".run-list-item").filter(has_text="long-plan-39.md").first
+                history_row = page.locator(
+                    f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                )
                 history_row.wait_for()
+                expect(history_row).to_contain_text(RESPONSIVE_FIXTURE_PLAN_PATH)
                 _assert_document_moves(page)
                 history_row.click()
-                page.locator(".run-detail h3").filter(has_text="long-plan-39.md").wait_for()
+                _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
                 _assert_header_and_flow(page)
 
                 page.goto(f"{url}/?view=projects")
@@ -518,8 +537,11 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
                 page.get_by_role("heading", name="All runs", exact=True).wait_for()
                 child_global_row = page.get_by_role(
                     "button",
-                    name=re.compile(r"Test project · Worktree: Feature worktree · Completed"),
-                ).first
+                    name=re.compile(
+                        rf"^Test project · Worktree: Feature worktree · Completed · "
+                        rf"{re.escape(RESPONSIVE_GLOBAL_TITLE)} · {re.escape(RESPONSIVE_GLOBAL_RUN_ID)}$"
+                    ),
+                )
                 child_global_row.wait_for()
                 _assert_header_and_flow(page)
         finally:
@@ -587,10 +609,13 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
             assert page.locator(".run-list-item").count() >= 40
             _assert_header_and_flow(page)
             _assert_document_moves(page)
-            run_row = page.locator(".run-list-item").filter(has_text="long-plan-39.md").first
+            run_row = page.locator(
+                f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+            )
             run_row.scroll_into_view_if_needed()
+            expect(run_row).to_contain_text(RESPONSIVE_FIXTURE_PLAN_PATH)
             run_row.click()
-            page.locator(".run-detail h3").filter(has_text="long-plan-39.md").wait_for()
+            _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
             detail_box = page.locator(".sidebar-editor-detail").bounding_box()
             assert detail_box and detail_box["height"] > 0
             _assert_header_and_flow(page)
@@ -601,10 +626,16 @@ def test_responsive_route_matrix(control_client, monkeypatch, width: int, height
 
             _open_destination(page, "All runs")
             page.get_by_role("heading", name="All runs", exact=True).wait_for()
-            all_run = page.get_by_role("button", name="Test project · Completed", exact=False).first
+            all_run = page.get_by_role(
+                "button",
+                name=re.compile(
+                    rf"^Test project · Completed · {re.escape(RESPONSIVE_GLOBAL_TITLE)} · "
+                    rf"{re.escape(RESPONSIVE_GLOBAL_RUN_ID)}$"
+                ),
+            )
             all_run.wait_for()
             all_run.click()
-            page.locator(".run-detail h3").filter(has_text="long-plan").wait_for()
+            _assert_run_detail(page, RESPONSIVE_GLOBAL_TITLE, RESPONSIVE_GLOBAL_RUN_ID)
             _assert_header_and_flow(page)
             if _compact(page):
                 page.get_by_role("button", name="← Back to Run history", exact=True).click()
@@ -785,11 +816,13 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
                                     profile_field.fill("responsive-profile-model")
                     else:
                         page.get_by_role("button", name="New run", exact=True).wait_for()
-                        row = page.locator(".run-list-item").filter(has_text="long-plan-39.md").first
+                        row = page.locator(
+                            f".run-list-item[data-sidebar-editor-item='{RESPONSIVE_FIXTURE_RUN_ID}']"
+                        )
                         row.wait_for()
                         if detail:
                             row.click()
-                            page.locator(".run-detail h3").filter(has_text="long-plan-39.md").wait_for()
+                            _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
                     image = tmp_path / f"responsive-{theme}-{name}.png"
                     page.screenshot(path=str(image), full_page=True)
                     print("RESPONSIVE_SCREENSHOT", image)
