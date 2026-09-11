@@ -1156,6 +1156,141 @@ describe('RunDashboard', () => {
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
   })
 
+  it('recovers a failed project discovery through Refresh', async () => {
+    const discoveryError = 'project discovery temporarily offline'
+    const retryProjects = deferred<Array<typeof project>>()
+    vi.mocked(api.listControlPlaneProjects)
+      .mockRejectedValueOnce(new Error(discoveryError))
+      .mockImplementationOnce(() => retryProjects.promise)
+    renderDashboard()
+
+    await screen.findByText(discoveryError)
+    const refresh = screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement
+    expect(refresh.disabled).toBe(false)
+    expect(api.listControlPlaneProjects).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(refresh)
+    await waitFor(() => expect(api.listControlPlaneProjects).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('button', { name: 'run-owned', exact: true })).toBeNull()
+
+    await act(async () => {
+      retryProjects.resolve([project])
+      await retryProjects.promise
+    })
+    await screen.findByRole('button', { name: 'run-owned', exact: true })
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Refresh', exact: true }) as HTMLButtonElement).disabled).toBe(false))
+    expect(screen.queryByText(discoveryError)).toBeNull()
+    expect(screen.getByRole('button', { name: 'run-owned', exact: true })).toBeDefined()
+  })
+
+  it('keeps a rejected action visible when a project discovery retry fails', async () => {
+    const actionError = 'control action remains pending review'
+    vi.mocked(api.controlControlPlaneRun).mockRejectedValueOnce(
+      new ApiError(422, actionError, 'invalid_control'),
+    )
+    const view = renderDashboard()
+
+    await waitForControlAdmission()
+    const maxTurns = screen.getByLabelText('Control max turns') as HTMLInputElement
+    fireEvent.change(maxTurns, { target: { value: '9' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save run settings' }))
+    await screen.findByText(actionError)
+
+    view.rerender(dashboardNode({ visible: false }))
+    const initialDiscoveryError = 'discovery retry temporarily offline'
+    const repeatedDiscoveryError = 'discovery retry still offline'
+    vi.mocked(api.listControlPlaneProjects)
+      .mockRejectedValueOnce(new Error(initialDiscoveryError))
+      .mockRejectedValueOnce(new Error(repeatedDiscoveryError))
+    view.rerender(dashboardNode({ visible: true }))
+
+    await screen.findByText(initialDiscoveryError)
+    expect(screen.getByText(actionError)).toBeDefined()
+    expect(api.listControlPlaneProjects).toHaveBeenCalledTimes(2)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh', exact: true }))
+    await waitFor(() => expect(api.listControlPlaneProjects).toHaveBeenCalledTimes(3))
+    await screen.findByText(repeatedDiscoveryError)
+    expect(screen.getByText(actionError)).toBeDefined()
+  })
+
+  it('keeps a rejected control draft through a late passive snapshot refresh', async () => {
+    let emit: ((events: api.RunEvent[]) => void) | null = null
+    vi.mocked(api.subscribeToRunEvents).mockImplementation((subscription) => {
+      emit = subscription.onEvents
+      return () => {}
+    })
+    const acceptedRun = { ...ownedRun, revision: 2, max_turns: 12 }
+    const passiveRefresh = deferred<typeof acceptedRun>()
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(ownedRun)
+    const rejection = 'responsive fixture rejected this control draft'
+    vi.mocked(api.controlControlPlaneRun)
+      .mockResolvedValueOnce({ revision: 2, changed: true, owner_stop: false, run: acceptedRun })
+      .mockRejectedValueOnce(new ApiError(422, rejection, 'invalid_control'))
+      .mockResolvedValueOnce({ revision: 3, changed: true, owner_stop: false, run: { ...acceptedRun, revision: 3, max_turns: 13 } })
+    renderDashboard()
+
+    await waitForControlAdmission()
+    const maxTurns = screen.getByLabelText('Control max turns') as HTMLInputElement
+    const save = screen.getByRole('button', { name: 'Save run settings' })
+    fireEvent.change(maxTurns, { target: { value: '12' } })
+    fireEvent.click(save)
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledTimes(1))
+    await screen.findByText(/Safe controls recorded at revision 2/)
+    expect(api.controlControlPlaneRun).toHaveBeenNthCalledWith(
+      1,
+      'control-project',
+      'run-owned',
+      { expected_revision: 1, max_turns: 12 },
+      expect.stringMatching(/^control-/),
+    )
+
+    vi.mocked(api.getControlPlaneRun).mockImplementationOnce(() => passiveRefresh.promise)
+    if (!emit) throw new Error('subscription hook was not registered')
+    act(() => {
+      emit!([{ sequence: 2, event_type: 'status_changed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
+    })
+    fireEvent.change(maxTurns, { target: { value: '13' } })
+    fireEvent.click(save)
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledTimes(2))
+    await screen.findByText(rejection)
+    expect(api.controlControlPlaneRun).toHaveBeenNthCalledWith(
+      2,
+      'control-project',
+      'run-owned',
+      { expected_revision: 2, max_turns: 13 },
+      expect.stringMatching(/^control-/),
+    )
+
+    await waitFor(() => expect(api.getControlPlaneRun.mock.calls.length).toBeGreaterThan(1))
+    await act(async () => {
+      passiveRefresh.resolve(acceptedRun)
+      await passiveRefresh.promise
+    })
+    expect(screen.getByText(rejection)).toBeDefined()
+    expect(maxTurns.value).toBe('13')
+    expect(screen.getByRole('button', { name: 'run-owned' })).toBeDefined()
+
+    const readFailure = 'passive snapshot temporarily unavailable'
+    vi.mocked(api.getControlPlaneRun).mockRejectedValueOnce(new Error(readFailure))
+    act(() => {
+      emit!([{ sequence: 3, event_type: 'status_changed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:03:00Z' }])
+    })
+    await screen.findByText(readFailure)
+    expect(screen.getByText(rejection)).toBeDefined()
+
+    vi.mocked(api.getControlPlaneRun).mockResolvedValueOnce(acceptedRun)
+    act(() => {
+      emit!([{ sequence: 4, event_type: 'status_changed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:04:00Z' }])
+    })
+    await waitFor(() => expect(screen.queryByText(readFailure)).toBeNull())
+    expect(screen.getByText(rejection)).toBeDefined()
+
+    fireEvent.click(save)
+    await screen.findByText(/Safe controls recorded at revision 3/)
+    expect(screen.queryByText(rejection)).toBeNull()
+  })
+
   it('does not let an older selected-run read replace an acknowledged control revision', async () => {
     const staleRun = { ...ownedRun, revision: 0, team: 'base', max_turns: 8 }
     const acknowledgedRun = { ...ownedRun, revision: 1, team: 'full', max_turns: 12 }

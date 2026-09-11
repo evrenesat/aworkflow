@@ -759,7 +759,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [projectReadError, setProjectReadError] = useState<string | null>(null)
+  const [dashboardReadError, setDashboardReadError] = useState<string | null>(null)
+  const [selectedRunReadError, setSelectedRunReadError] = useState<string | null>(null)
   const [streamNotice, setStreamNotice] = useState<string | null>(null)
   const [feedback, setFeedback] = useState<string | null>(null)
   const [handoffError, setHandoffError] = useState<string | null>(null)
@@ -919,6 +922,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   useEffect(() => {
     if (requestedRunId === requestedRunRef.current) return
     requestedRunRef.current = requestedRunId
+    setActionError(null)
+    setFailedRequestId(null)
     if (requestedRunId !== null) {
       copyRequestRef.current += 1
       setMissingRunId(null)
@@ -973,12 +978,13 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           api.getControlPlaneReadiness(),
         ])
         if (!active) return
+        setProjectReadError(null)
         setReadiness(readinessState)
         const availableHere = available.some((project) => project.project_id === projectId)
         setProjectAvailable(availableHere)
         if (availableHere) await loadDashboard(projectId, () => active)
       } catch (loadError) {
-        if (active) setError(errorMessage(loadError, 'Failed to load control-plane projects'))
+        if (active) setProjectReadError(errorMessage(loadError, 'Failed to load control-plane projects'))
       } finally {
         if (active) setLoading(false)
       }
@@ -1031,6 +1037,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setStatusUpdatedAt(null)
     setContextUpdatedAt(null)
     setContextError(null)
+    setSelectedRunReadError(null)
     contextRequestRef.current += 1
     diagnosticsLoadedForRef.current = null
     previousStreamStateRef.current = 'stopped'
@@ -1118,7 +1125,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
     try {
       setRefreshing(true)
-      setError(null)
       const [nextReadiness, nextCapabilities, nextPlans, page] = await Promise.all([
         api.getControlPlaneReadiness(),
         api.getControlPlaneCapabilities(nextProjectId),
@@ -1126,6 +1132,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         reloadHistory(),
       ])
       if (!isActive()) return
+      setDashboardReadError(null)
       setReadiness(nextReadiness)
       setCapabilities(nextCapabilities)
       setPlans(nextPlans)
@@ -1180,7 +1187,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     } catch (loadError) {
       if (!isActive()) return
       // Preserve the last daemon snapshot: a connection failure is not a run transition.
-      setError(`${errorMessage(loadError, 'Failed to refresh runs')}. Existing run data remains visible.`)
+      setDashboardReadError(`${errorMessage(loadError, 'Failed to refresh runs')}. Existing run data remains visible.`)
     } finally {
       if (isActive()) setRefreshing(false)
     }
@@ -1202,24 +1209,27 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       ])
       if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
       if (deletedRef.current.has(runId)) return
+      setSelectedRunReadError(null)
       setRuns((current) => upsertRun(current, run))
       setStatusUpdatedAt(new Date().toISOString())
       setEvents((current) => mergeEvents(current, tail))
     } catch (loadError) {
       if (!isActive() || selectedRunRef.current !== runId || requestNumber !== snapshotRequestRef.current) return
       if (loadError instanceof ApiError && loadError.status === 410) {
+        setSelectedRunReadError(null)
         markDeleted(runId)
         return
       }
       if (loadError instanceof ApiError && loadError.status === 404) {
         // A linked run that does not exist selects no substitute: the Runs
         // view keeps its list and New run offer, and the URL drops the id.
+        setSelectedRunReadError(null)
         setMissingRunId(runId)
         setSelectedRunId(null)
         onRunSelectionChangeRef.current?.({ runId: null, userInitiated: false, missingRunId: runId })
         return
       }
-      setError(errorMessage(loadError, 'Failed to load run details'))
+      setSelectedRunReadError(errorMessage(loadError, 'Failed to load run details'))
     }
   }
 
@@ -1232,7 +1242,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }, [projectId, selectedRunId, visible])
   async function refreshPage() {
     if (!visible || !projectId) return
-    if (projectAvailable === false) { setRefreshNonce(nonce => nonce + 1); return }
+    if (projectAvailable !== true) { setRefreshNonce(nonce => nonce + 1); return }
     if (pageRefreshRef.current) return pageRefreshRef.current
     const epoch = refreshEpochRef.current
     const active = () => epoch === refreshEpochRef.current
@@ -1274,7 +1284,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const identity = JSON.stringify([projectId, runId, action])
     const pending = historyIntents.current.get(identity) ?? { action, revision: selectedRun.history_revision ?? 0, key: requestKey('history'), acknowledged: acknowledgeActive }
     historyIntents.current.set(identity, pending)
-    setBusyAction('history'); setError(null)
+    setBusyAction('history'); clearActionFeedback()
     try {
       const result = await api.changeRunHistory(projectId, runId, action, pending.revision, pending.key, pending.acknowledged)
       historyIntents.current.delete(identity)
@@ -1287,7 +1297,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         historyIntents.current.delete(identity)
         await loadSelectedRun(projectId, runId)
       }
-      setError(`${errorMessage(reason, 'History update failed')}. Your action is still pending; retry after reviewing the current record.`)
+      setActionError(`${errorMessage(reason, 'History update failed')}. Your action is still pending; retry after reviewing the current record.`)
     } finally { setBusyAction(null) }
   }
   useEffect(() => { if (projectAvailable) void loadDashboard(projectId) }, [historyFilter]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -1296,11 +1306,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     copyRequestRef.current += 1
   }
 
+  function clearActionFeedback() {
+    setActionError(null)
+    setFailedRequestId(null)
+  }
+
   function selectRun(runId: string) {
     setNavigationVersion(value => value + 1)
     setHistoryConfirm(null)
     setMissingRunId(null)
     invalidateCopyFeedback()
+    clearActionFeedback()
     setSelectedRunId(runId)
     onRunSelectionChangeRef.current?.({ runId, userInitiated: true })
   }
@@ -1427,16 +1443,15 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const intent = { project_id: projectId, ...startRequest }
     try {
       setBusyAction('start')
-      setError(null)
+      clearActionFeedback()
       setFeedback(null)
       // A new admission attempt owns its own failure link. A prior reserved
       // request must not remain attached to a later rejection without a run ID.
-      setFailedRequestId(null)
       const response = await api.startControlPlaneRun(projectId, startRequest, getPendingWriteKey('start', intent))
       clearPendingWriteKey('start', intent)
       await handleStartResponse(response, 'Start request')
     } catch (startError) {
-      setError(errorMessage(startError, 'Failed to start run'))
+      setActionError(errorMessage(startError, 'Failed to start run'))
       if (startError instanceof ApiError && typeof startError.detail.run_id === 'string') {
         setFailedRequestId(startError.detail.run_id)
         clearPendingWriteKey('start', intent)
@@ -1459,7 +1474,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     if (!response.result) return
     const result = response.result
     if (result.status === 'needs_attention') {
-      setError(result.reason ?? 'Startup did not complete; the original error was not recorded.')
+      setActionError(result.reason ?? 'Startup did not complete; the original error was not recorded.')
       setFailedRequestId(result.run_id)
       await loadDashboard(projectId)
       return
@@ -1490,7 +1505,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
     try {
       setBusyAction('startup-answer')
-      setError(null)
+      clearActionFeedback()
       const response = await api.answerStartupQuestion(
         projectId,
         startupQuestion.question_id,
@@ -1500,7 +1515,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       clearPendingWriteKey('startup-answer', intent)
       await handleStartResponse(response, 'Startup answer')
     } catch (answerError) {
-      setError(errorMessage(answerError, 'Failed to answer startup question'))
+      setActionError(errorMessage(answerError, 'Failed to answer startup question'))
       if (answerError instanceof ApiError && answerError.code === 'startup_failed' && typeof answerError.detail.run_id === 'string') {
         setFailedRequestId(answerError.detail.run_id)
         setStartupQuestion(null)
@@ -1513,6 +1528,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   async function handleControl() {
     if (!projectId || !selectedRun) return
+    clearActionFeedback()
     const effectiveMaxTurns = typeof controlOverride?.max_turns === 'number'
       ? controlOverride.max_turns
       : selectedRun.max_turns
@@ -1549,7 +1565,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
     try {
       setBusyAction('control')
-      setError(null)
       const response = await api.controlControlPlaneRun(projectId, selectedRun.run_id, request, getPendingWriteKey('control', intent))
       clearPendingWriteKey('control', intent)
       setRuns((current) => upsertRun(current, response.run))
@@ -1565,7 +1580,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       } else if (apiErrorCode(controlError) === 'restart_required') {
         setFeedback('The server requires a restart for that change. Use the guided workflow restart below.')
       } else {
-        setError(errorMessage(controlError, 'Failed to apply controls'))
+        setActionError(errorMessage(controlError, 'Failed to apply controls'))
       }
     } finally {
       setBusyAction(null)
@@ -1574,6 +1589,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   async function handleOwnerStop() {
     if (!projectId || !selectedRun) return
+    clearActionFeedback()
     const intent = {
       project_id: projectId,
       run_id: selectedRun.run_id,
@@ -1581,7 +1597,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
     try {
       setBusyAction('owner-stop')
-      setError(null)
       const stopped = await api.ownerStopControlPlaneRun(
         projectId,
         selectedRun.run_id,
@@ -1593,7 +1608,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       setFeedback(`Owner stop recorded for ${stopped.run_id}.`)
       setConfirmOwnerStop(false)
     } catch (stopError) {
-      setError(errorMessage(stopError, 'Failed to stop run'))
+      setActionError(errorMessage(stopError, 'Failed to stop run'))
     } finally {
       setBusyAction(null)
     }
@@ -1625,11 +1640,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   async function retryPendingSuccessorStart() {
     if (!pendingSuccessorStart || pendingSuccessorStart.projectId !== projectId) return
+    clearActionFeedback()
     const { projectId: successorProjectId, request, idempotencyKey } = pendingSuccessorStart
     try {
       setRestartPhase('starting')
       setRestartNotice('Retrying the exact successor request with its original idempotency key. The source will not be stopped again.')
-      setError(null)
       const response = await api.startControlPlaneRun(successorProjectId, request, idempotencyKey)
       clearPendingWriteKey('start', { project_id: successorProjectId, ...request })
       setPendingSuccessorStart(null)
@@ -1642,7 +1657,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         setPendingSuccessorStart(null)
         setRestartPhase('failed')
         setRestartNotice(`Successor start was rejected: ${errorMessage(restartError, 'start rejected')}. Correct the draft before trying a new attempt.`)
-        if (restartError instanceof ApiError && typeof restartError.detail.run_id === 'string') { setFailedRequestId(restartError.detail.run_id); setError(restartError.message) }
+        if (restartError instanceof ApiError && typeof restartError.detail.run_id === 'string') { setFailedRequestId(restartError.detail.run_id); setActionError(restartError.message) }
       } else {
         setRestartPhase('unknown')
         setRestartNotice(`Successor outcome remains unknown: ${errorMessage(restartError, 'response was lost')}. Retry only the frozen successor request after reconciliation; the source will not be stopped again.`)
@@ -1652,6 +1667,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   async function handleConfirmedRestart() {
     if (!restartDraftReady || !projectId || !restartSource || pendingSuccessorStart) return
+    clearActionFeedback()
     const sourceRunId = restartSource.run_id
     const startRequest = startRequestFromDraft(sourceRunId, dirtyWorktreeConfirmed)
     const stopIntent = {
@@ -1663,7 +1679,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     try {
       setRestartPhase('stopping')
       setRestartNotice(null)
-      setError(null)
       setFeedback(null)
       const canonicalSource = restartPhase === 'failed'
         ? await api.getControlPlaneRun(projectId, sourceRunId) : restartSource
@@ -1704,7 +1719,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           setPendingSuccessorStart(null)
           setRestartPhase('failed')
           setRestartNotice(`Successor start was rejected: ${errorMessage(restartError, 'start rejected')}. Correct the draft before trying a new attempt.`)
-          if (restartError instanceof ApiError && typeof restartError.detail.run_id === 'string') { setFailedRequestId(restartError.detail.run_id); setError(restartError.message) }
+          if (restartError instanceof ApiError && typeof restartError.detail.run_id === 'string') { setFailedRequestId(restartError.detail.run_id); setActionError(restartError.message) }
         } else {
           setRestartPhase('unknown')
           setRestartNotice(`Successor outcome is unknown: ${errorMessage(restartError, 'response was lost')}. The exact successor request is frozen; reconcile or retry it with the same idempotency key. The source will not be stopped again.`)
@@ -1723,11 +1738,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   async function handleResume() {
     if (!projectId || !selectedRun) return
+    clearActionFeedback()
     const sourceRun = selectedRun.run_id
     const intent = { project_id: projectId, source_run_id: sourceRun }
     try {
       setBusyAction('resume')
-      setError(null)
       const continuation = await api.resumeControlPlaneRun(projectId, sourceRun, getPendingWriteKey('resume', intent))
       clearPendingWriteKey('resume', intent)
       setFeedback(continuation.created
@@ -1740,7 +1755,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       // Passive URL update: the dashboard link now identifies the continuation.
       onRunSelectionChangeRef.current?.({ runId: continuation.run_id, userInitiated: false })
     } catch (resumeError) {
-      setError(errorMessage(resumeError, 'Failed to resume run'))
+      setActionError(errorMessage(resumeError, 'Failed to resume run'))
     } finally {
       setBusyAction(null)
     }
@@ -2240,7 +2255,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
       {copyState === 'copied' && <div className="success-message" role="status">Link copied to the clipboard.</div>}
       {copyState === 'failed' && <div className="notice" role="status">Clipboard access failed — copy the address from the browser address bar instead.</div>}
-      {error && <div className="error-message" role="alert">{error}{failedRequestId && <button className="btn btn-secondary btn-sm" onClick={() => { setLocalPage('runs'); onRunStarted?.(failedRequestId); selectRun(failedRequestId) }}>View failed request</button>}</div>}
+      {projectReadError && <div className="error-message" role="alert">{projectReadError}</div>}
+      {dashboardReadError && <div className="error-message" role="alert">{dashboardReadError}</div>}
+      {selectedRunReadError && <div className="error-message" role="alert">{selectedRunReadError}</div>}
+      {actionError && <div className="error-message" role="alert">{actionError}{failedRequestId && <button className="btn btn-secondary btn-sm" onClick={() => { setLocalPage('runs'); onRunStarted?.(failedRequestId); selectRun(failedRequestId) }}>View failed request</button>}</div>}
       {feedback && <div className="success-message">{feedback}</div>}
       {handoffError && <div className="error-message" role="alert">{handoffError}</div>}
       {restartNotice && <div className="notice" role="status">{restartNotice}</div>}

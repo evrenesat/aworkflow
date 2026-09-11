@@ -266,16 +266,7 @@ def _assert_header_and_flow(page: Page) -> None:
 
 
 def _assert_last_action_hit_test(page: Page) -> None:
-    last = page.locator("button:visible").last
-    last.scroll_into_view_if_needed()
-    box = last.bounding_box()
-    assert box and 0 <= box["y"] < page.viewport_size["height"]
-    assert box["x"] >= 0 and box["x"] + box["width"] <= page.viewport_size["width"]
-    hit = page.evaluate("""({x, y}) => {
-        const target = document.elementFromPoint(x, y);
-        return Boolean(target && (target.closest('button') || target.closest('[role="button"]')));
-    }""", {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2})
-    assert hit, box
+    _assert_action_hit_test(page, page.locator("button:visible").last)
 
 
 def _assert_document_moves(page: Page) -> None:
@@ -394,15 +385,24 @@ def _choose_combobox(dashboard, label: str, query: str, option_text: str) -> Non
 
 
 def _assert_action_hit_test(page: Page, action) -> None:
+    """Check the actionable target and its hit identity from one DOM snapshot."""
     action.scroll_into_view_if_needed()
-    box = action.bounding_box()
-    assert box and 0 <= box["y"] < page.viewport_size["height"], box
+    action.click(trial=True)
+    observation = action.evaluate("""element => {
+        const rect = element.getBoundingClientRect()
+        const x = rect.left + rect.width / 2
+        const y = rect.top + rect.height / 2
+        const hit = document.elementFromPoint(x, y)
+        return {
+            box: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+            is_target: hit === element || Boolean(hit && element.contains(hit)),
+        }
+    }""")
+    box = observation["box"]
+    assert box and box["width"] > 0 and box["height"] > 0, box
+    assert 0 <= box["y"] < page.viewport_size["height"], box
     assert box["x"] >= 0 and box["x"] + box["width"] <= page.viewport_size["width"], box
-    hit = page.evaluate("""({x, y}) => {
-        const target = document.elementFromPoint(x, y)
-        return Boolean(target && (target.closest('button') || target.closest('[role="button"]')))
-    }""", {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2})
-    assert hit, box
+    assert observation["is_target"], box
 
 
 def _create_live_control_fixture(control_client, root: Path, monkeypatch) -> tuple[str, dict[str, object]]:

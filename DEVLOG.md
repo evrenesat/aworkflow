@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-09-11 — Preserve action feedback and recover passive read failures
+
+- HISTORY: CI evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-36c7b483-failed.log` showed a rejected control alert disappearing during a later passive snapshot refresh and a landscape hit test using coordinates measured before its DOM query.
+- `RunDashboard` keeps project discovery, dashboard reads, selected-run reads, and mutation/action feedback in separate local state. Guarded successful current responses clear only their own read error; passive SSE/poll refreshes preserve rejected control feedback and its draft. Intentional actions and explicit selection clear stale action feedback and failed-start links.
+- Refresh retries failed or unresolved discovery through the existing guarded discovery effect. Deferred recovery and repeated-failure regressions verify that only successful discovery clears its error and rejected action feedback remains visible.
+- The controlled regression uses deferred subscription refresh delivery: an accepted max-turns 12 control is followed by rejected draft 13, a late snapshot, an independent refresh failure and recovery, and an explicit retry. It preserves the exact `expected_revision` 1/2 payloads and draft 13. The new browser helper waits for real actionability with `trial=True` and checks bounds plus exact target/descendant hit identity in one DOM observation.
+- Reviewer verification passed: focused dashboard suite (94 tests), full web suite (341 tests across 22 files), production build, and the exact `phone-landscape` plus `phone-live-controls` cases in Chromium (2 passed) and WebKit (2 passed), with isolated browser-test homes and ports. `git diff --check` passed. Private source/output is retained in `/root/code/evidence/aflow-dogfood-20260909/passive-refresh-review-v02-20260911/`.
+- HISTORY: The controlled late-refresh regression fails against the unchanged pre-handoff base at the missing rejection alert. The earlier discovery-recovery proof remains in `/root/code/evidence/aflow-dogfood-20260909/passive-refresh-review-20260911/`. The full macOS timing failure was not locally reproduced; physical mobile keyboard behavior remains unverified.
+
 ## 2026-09-11 — Truthful repair progress and historical authority compatibility
 
 - Added read-only original-checkpoint progress to REST/MCP context and the run
