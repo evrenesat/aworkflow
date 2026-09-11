@@ -8671,6 +8671,8 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 plan_path,
                 _VALID_GIT_TRACKING_PLAN.replace('`base`', f'`{committed_head}`'),
             )
+            source_plan_bytes = plan_path.read_bytes()
+            source_plan_text = source_plan_bytes.decode('utf-8')
             base_wf = _make_worktree_no_merge_wf_config(worktree_root=str(worktree_root))
             wf_config = WorkflowUserConfig(
                 aflow=AflowSection(worktree_root=str(worktree_root)),
@@ -8685,8 +8687,20 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
                 call_count[0] += 1
                 cwd = Path(kwargs['cwd'])
                 exec_plan = cwd / plan_path.relative_to(repo_root)
+                rc, feature_branch, _ = _run_git_in_test(
+                    ['branch', '--show-current'], cwd=cwd
+                )
+                assert rc == 0
+                assert feature_branch != 'main'
+                expected_text = source_plan_text.replace(
+                    '- Plan Branch: `main`',
+                    f'- Plan Branch: `{feature_branch}`',
+                    1,
+                )
+                assert plan_path.read_text(encoding='utf-8') == expected_text
                 text = exec_plan.read_text(encoding='utf-8')
-                assert '- Plan Branch: `main`' not in text
+                assert text == expected_text
+                assert f'- Plan Branch: `{feature_branch}`' in text
                 updated = text.replace('### [ ] Checkpoint 1: First', '### [x] Checkpoint 1: First')
                 updated = updated.replace('- [ ] step one', '- [x] step one')
                 _write_plan(exec_plan, updated)
@@ -8700,6 +8714,124 @@ class WorkflowLifecycleRuntimeTests(unittest.TestCase):
             )
 
             assert call_count[0] == 1
+            assert (repo_root / 'plans' / 'backups' / 'plan.md').read_bytes() == source_plan_bytes
+
+    def test_worktree_preserves_unrelated_pristine_plan_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plans' / 'in-progress' / 'plan.md'
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_force_commit_file(repo_root, plan_path)
+            rc, committed_head, _ = _run_git_in_test(['rev-parse', 'HEAD'], cwd=repo_root)
+            assert rc == 0
+            source_plan_text = _VALID_GIT_TRACKING_PLAN.replace(
+                '- Plan Branch: `main`',
+                '- Plan Branch: `review/source`',
+                1,
+            ).replace('`base`', f'`{committed_head}`')
+            _write_plan(plan_path, source_plan_text)
+            source_plan_bytes = source_plan_text.encode('utf-8')
+            wf_config = _make_worktree_no_merge_wf_config(
+                worktree_root=str(worktree_root),
+            )
+            call_count: list[int] = [0]
+
+            def runner(argv, **kwargs):
+                call_count[0] += 1
+                cwd = Path(kwargs['cwd'])
+                exec_plan = cwd / plan_path.relative_to(repo_root)
+                rc, feature_branch, _ = _run_git_in_test(
+                    ['branch', '--show-current'], cwd=cwd
+                )
+                assert rc == 0
+                assert feature_branch != 'main'
+                assert plan_path.read_text(encoding='utf-8') == source_plan_text
+                assert exec_plan.read_text(encoding='utf-8') == source_plan_text
+                updated = source_plan_text.replace(
+                    '### [ ] Checkpoint 1: First',
+                    '### [x] Checkpoint 1: First',
+                ).replace('- [ ] step one', '- [x] step one')
+                _write_plan(exec_plan, updated)
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config,
+                'wt_wf',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert call_count[0] == 1
+            assert (repo_root / 'plans' / 'backups' / 'plan.md').read_bytes() == source_plan_bytes
+
+    def test_worktree_preserves_started_plan_branch_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            worktree_root = root / 'worktrees'
+            worktree_root.mkdir()
+            plan_path = repo_root / 'plans' / 'in-progress' / 'plan.md'
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_plan(plan_path, _VALID_PLAN)
+            _git_force_commit_file(repo_root, plan_path)
+            rc, committed_head, _ = _run_git_in_test(['rev-parse', 'HEAD'], cwd=repo_root)
+            assert rc == 0
+            source_plan_text = _VALID_GIT_TRACKING_PLAN.replace(
+                '`base`', f'`{committed_head}`', 1
+            ).replace(
+                '### [ ] Checkpoint 1: First\n- [ ] step one',
+                '### [x] Checkpoint 1: First\n- [x] step one\n\n'
+                '### [ ] Checkpoint 2: Next\n- [ ] step two',
+                1,
+            )
+            _write_plan(plan_path, source_plan_text)
+            source_plan_bytes = source_plan_text.encode('utf-8')
+            wf_config = _make_worktree_no_merge_wf_config(
+                worktree_root=str(worktree_root),
+            )
+            call_count: list[int] = [0]
+
+            def runner(argv, **kwargs):
+                call_count[0] += 1
+                cwd = Path(kwargs['cwd'])
+                exec_plan = cwd / plan_path.relative_to(repo_root)
+                rc, feature_branch, _ = _run_git_in_test(
+                    ['branch', '--show-current'], cwd=cwd
+                )
+                assert rc == 0
+                assert feature_branch != 'main'
+                assert plan_path.read_text(encoding='utf-8') == source_plan_text
+                assert exec_plan.read_text(encoding='utf-8') == source_plan_text
+                updated = source_plan_text.replace(
+                    '### [ ] Checkpoint 2: Next',
+                    '### [x] Checkpoint 2: Next',
+                ).replace('- [ ] step two', '- [x] step two')
+                _write_plan(exec_plan, updated)
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=2),
+                wf_config,
+                'wt_wf',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert call_count[0] == 1
+            assert (repo_root / 'plans' / 'backups' / 'plan.md').read_bytes() == source_plan_bytes
 
     def test_worktree_startup_ignores_failed_aflow_run_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

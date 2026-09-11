@@ -1,5 +1,27 @@
 # DEVLOG
 
+## 2026-09-11 — Bind pristine copied plans to managed worktree branches
+
+- Restored the narrow initial managed-worktree rebinding path for pristine
+  plans whose recorded branch is blank or exactly the known lifecycle source
+  branch. Resume paths and unrelated established or started-plan identities
+  remain authoritative.
+- Focused lifecycle coverage now verifies exact feature-branch metadata before
+  the first harness, source/backup byte preservation, and negative identity
+  cases. Full cross-platform verification remains CI-owned.
+- Focused node IDs in `tests/test_runtime.py`:
+  `WorkflowLifecycleRuntimeTests.test_worktree_accepts_tracked_modified_original_plan`,
+  `WorkflowLifecycleRuntimeTests.test_worktree_preserves_unrelated_pristine_plan_branch`,
+  `WorkflowLifecycleRuntimeTests.test_worktree_preserves_started_plan_branch_identity`,
+  `WorkflowLifecycleRuntimeTests.test_worktree_rewrites_plan_branch_to_feature_branch_before_turn`,
+  `WorkflowLifecycleRuntimeTests.test_preflight_worktree_refreshes_primary_and_execution_plan_before_first_turn`,
+  `WorkflowPreflightTests.test_existing_git_tracking_section_is_not_reinserted`,
+  `WorkflowPreflightTests.test_review_workflow_accepts_numbered_blank_git_tracking_before_run_reservation`,
+  `WorkflowPreflightTests.test_valid_git_tracking_identity_is_authoritative_on_in_place_start`,
+  `WorkflowPreflightTests.test_preflight_blocks_started_handoff_base_head_mismatch`, and
+  `WorkflowPreflightTests.test_preflight_blocks_started_handoff_with_empty_base_head`.
+  All 10 passed; `uv run ruff check aflow` and `git diff --check` also passed.
+
 ## 2026-09-11 — Complete startup metadata and bound neutral recovery (issue 9)
 
 - Normalize missing or blank Git Tracking support fields for pristine review

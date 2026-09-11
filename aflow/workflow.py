@@ -3949,6 +3949,7 @@ def _sync_startup_plan_metadata_for_execution(
     exec_ctx: ExecutionContext | None,
     *,
     startup_base_head_refresh_sha: str | None,
+    allow_pristine_worktree_branch_rebind: bool = False,
 ) -> None:
     if exec_ctx is None and startup_base_head_refresh_sha is None:
         return
@@ -3965,10 +3966,27 @@ def _sync_startup_plan_metadata_for_execution(
     try:
         if exec_ctx is not None:
             metadata_before_branch_sync = parse_git_tracking_metadata(updated)
-            if (
+            should_sync_branch = (
                 metadata_before_branch_sync is not None
                 and metadata_before_branch_sync.plan_branch == ""
+            )
+            if (
+                allow_pristine_worktree_branch_rebind
+                and exec_ctx.worktree_path is not None
+                and metadata_before_branch_sync is not None
+                and metadata_before_branch_sync.plan_branch
+                in ("", exec_ctx.main_branch)
+                and metadata_before_branch_sync.pre_handoff_base_head is not None
             ):
+                current_plan = parse_plan_text(
+                    updated,
+                    source_path=original_plan_path,
+                )
+                should_sync_branch = is_handoff_pristine_for_base_refresh(
+                    metadata_before_branch_sync,
+                    current_plan.sections,
+                )
+            if should_sync_branch:
                 updated = rewrite_git_tracking_field(
                     updated,
                     "Plan Branch",
@@ -3993,7 +4011,7 @@ def _sync_startup_plan_metadata_for_execution(
                 raise WorkflowError(
                     "startup metadata sync did not update Pre-Handoff Base HEAD in the original plan"
                 )
-    except ValueError as exc:
+    except (PlanParseError, ValueError) as exc:
         raise WorkflowError(str(exc)) from exc
 
     if updated != text:
@@ -8147,6 +8165,7 @@ def run_workflow(
                 startup_base_head_refresh_sha=(
                     effective_startup_base_head_refresh_sha if should_refresh_pre_handoff_base_head else None
                 ),
+                allow_pristine_worktree_branch_rebind=True,
             )
             if deferred_git_tracking_base_head:
                 try:
