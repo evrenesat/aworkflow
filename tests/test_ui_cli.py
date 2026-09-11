@@ -309,6 +309,7 @@ class TestBackgroundLifecycle:
             "resume_run",
             "read_plan",
             "create_plan",
+            "create_plan_from_run",
             "update_plan",
             "promote_plan",
             "list_plan_documents",

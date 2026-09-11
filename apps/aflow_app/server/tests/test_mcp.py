@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aflow.api.models import StartupQuestion, StartupQuestionKind
+from aflow.control_plane import ContextBundle, RunStatus
 from aflow_app_server.main import app
 from test_control_plane_api import (
     PROJECT_ID,
@@ -59,6 +60,7 @@ CORE_TOOL_NAMES = {
 AUTHORING_TOOL_NAMES = {
     "read_plan",
     "create_plan",
+    "create_plan_from_run",
     "update_plan",
     "promote_plan",
     "list_plan_documents",
@@ -100,7 +102,7 @@ def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> N
     web_tool_by_name = {tool.name: tool.to_mcp_tool() for tool in web_tools}
     assert web_tool_by_name["read_plan"].annotations.readOnlyHint is True
     assert web_tool_by_name["list_plan_documents"].annotations.idempotentHint is True
-    for name in ("create_plan", "update_plan", "promote_plan"):
+    for name in ("create_plan", "create_plan_from_run", "update_plan", "promote_plan"):
         assert web_tool_by_name[name].annotations.readOnlyHint is False
         assert web_tool_by_name[name].annotations.idempotentHint is False
     shared_resources = asyncio.run(shared.list_resource_templates())
@@ -1365,6 +1367,55 @@ def test_mcp_plan_authoring_uses_default_template_and_safe_errors(mcp_client) ->
     )
     assert invalid_status["result"]["isError"] is True
     assert "document-body-secret.md" not in invalid_status["result"]["content"][0]["text"]
+
+
+def test_mcp_create_plan_from_run_matches_authenticated_composition(mcp_client) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = mcp_client
+    control = main._control_plane_service
+    assert control is not None
+    run_status = RunStatus(
+        run_id="mcp-failed-run",
+        status="failed",
+        reason="worker failed while implementing",
+        workflow_name="managed",
+        current_step="implement",
+        team="worker-team",
+        unit_name="aflow-run-mcp-failed-run.service",
+        worker_exit={"stage": "worker", "reason": "bounded diagnostic", "exit_code": 17},
+    )
+    context = ContextBundle(
+        run_id="mcp-failed-run",
+        level="lite",
+        data={"worker": {"stderr": "quoted worker diagnostic"}},
+    )
+    monkeypatch.setattr(control, "run_status", lambda _project, _run: run_status)
+    monkeypatch.setattr(
+        control,
+        "context",
+        lambda _project, _run, *, level, full_scope: context,
+    )
+    source_config = root / ".aflow" / "config.toml"
+    source_config.parent.mkdir(parents=True, exist_ok=True)
+    source_config.write_text("unchanged = true\n", encoding="utf-8")
+    before = source_config.read_bytes()
+
+    created = _mcp_tool(
+        client,
+        "create_plan_from_run",
+        {"project_id": PROJECT_ID, "run_id": "mcp-failed-run"},
+    )
+    assert created["name"] == "followup-mcp-failed-run.md"
+    assert created["status"] == "todo"
+    assert "Cause: `Unknown`" in created["content"]
+    assert source_config.read_bytes() == before
+    assert units.start_calls == []
+    assert _mcp_tool_error(
+        client,
+        "create_plan_from_run",
+        {"project_id": PROJECT_ID, "run_id": "mcp-failed-run"},
+    ) == "plan_exists"
 
 
 def test_mcp_start_normalizes_blank_git_tracking_before_launch(mcp_client) -> None:

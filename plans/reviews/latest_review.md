@@ -231,6 +231,95 @@ Verify one commit after base and clean tracked state. Publication, exact-SHA
 CI and live activation remain controller/coordinator delivery steps, not
 claimed by this local approval.
 
+---
+
+# Issue 10 — Cumulative review v01: rejected
+
+Reviewed unchanged base `e224689f08986fdd0f96c0ceae60158f5b8b590c` through HEAD `1e1b83f19a93c791723ea73586abc51487cc3e12`: **2 new / 2 total commits**, CP1 v01 `0f945b7b` and CP2 v01 `1e1b83f1`, all 20 changed files across composition, REST/MCP, UI navigation, tests and documentation. No previous issue-10 findings or fix overlays existed. Material finding gate and proportionate-fix discipline applied; full original-plan range reviewed.
+
+- F1 P1/high: `plan_service.py:128-131` ignores indented closing tilde fences, allowing copied log headings/instructions outside quotation; markdown-it reproduction confirms.
+- F2 P2/high: `RunDashboard.tsx:1536-1537` skips busy-state cleanup after run selection invalidates a pending creation response, leaving creation/recovery controls disabled; deferred-promise regression fails.
+- F3 P2/high: `plan_service.py:144-152` labels current/unfinalized turns or current_step as finalized when no finalized evidence exists; canonical-shaped probe confirms.
+- F4 P2/high: `plan_service.py:168-173` reads flat diagnostics instead of canonical nested receipt fields, dropping available failure detail; canonical-shaped probe confirms.
+
+All findings, commit references, minimal corrections, exact tests and acceptance criteria are in the single non-checkpoint overlay `plans/in-progress/issue-10-evidence-to-plan-20260909-cp01-v01.md`. No implementation changes, squash, DEVLOG compaction, publication or approval. Original plan and base remain in place.
+
+Verification: `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_plan_store.py -k 'from_run' --basetemp /root/code/evidence/aflow-dogfood-20260909/issue10-review-20260911/reviewer-server` passed 6 tests (24 deselected). Extended stale-response assertion failed as expected, one test / 104 skipped. Composer probe confirms all three evidence defects. `git diff --check e224689 HEAD` passed. Reused worker CP1 server/MCP/auth/discovery and CP2 142-component-test/build/Chromium/WebKit successful result records from the parent repository's run directory; those checks cover happy paths but do not contradict the reproduced defects. No full suites run. External evidence is under the supplied issue10 review directory. Temporary probe removed from the worktree and only reviewer-created uv lock noise restored; reviewed implementation blobs preserved.
+
+Material fixes required
+
+---
+
+# Issue 10 — Cumulative review v02: approved
+
+Unchanged Pre-Handoff Base HEAD: `e224689f08986fdd0f96c0ceae60158f5b8b590c`.
+Reviewed HEAD: `7ee675b71fc52f2782aa6b8cc29ac44396ba4f29`.
+Branch: `aflow-issue-10-evidence-to-plan-20260909-20260911-162131`.
+Coverage: **1 new / 3 total commits**, CP1 v01 `0f945b7b`, CP2 v01
+`1e1b83f1`, and follow-up CP1 v02 `7ee675b7`. Read the active fix overlay
+and prior findings first, then reviewed all 20 changed files cumulatively
+from the original base, including canonical receipt/context, ownership,
+PlanService lifecycle and UI navigation contracts. No incremental-only review.
+
+## Previous findings
+
+- F1 resolved: outer fences account for 0–3-space-indented tilde runs.
+  Independent CommonMark rendering verifies copied headings remain quoted;
+  the AFlow parser retains one unchecked checkpoint with three unchecked steps.
+- F2 resolved: pending-operation cleanup has separate ownership from selected-run
+  response relevance. Both stale success and rejection release the busy state,
+  suppress stale navigation/errors and permit the next submission.
+- F3 resolved: finalized labels use only last_finished_turn. Missing context and
+  unfinished first turns stay explicit; current-step evidence is unfinalized.
+- F4 resolved: allowed canonical nested diagnostic, worker_error and wrapper_error
+  prose is included with redaction, safe fences and the total 4 KiB evidence bound.
+
+No unresolved prior findings and no new material findings under the admission
+gate, exclusions and proportionate-fix discipline. The original two checkpoints
+pass cumulative review. Creation uses the existing template and PlanService,
+canonical authenticated reads and exact source links; promotion and launch
+remain explicit. No controller or global configuration changes are introduced.
+
+## Verification
+
+Independent checks at reviewed HEAD:
+
+```sh
+uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_plan_store.py -k from_run --basetemp /root/code/evidence/aflow-dogfood-20260909/issue10-review-20260911/review-v02-server
+npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx src/components/PlanPanel.test.tsx src/api.test.ts
+git diff --check e224689 HEAD
+```
+
+13 server tests and 143 affected component/API tests passed. A separate
+markdown-it probe checked all four indentation cases and parser state;
+`review-v02-markdown.txt` records the results. Existing Starlette deprecation
+warning only. No full suites run; CI owns them.
+
+Reused successful worker CP1 v02 evidence for the 3 MCP/auth tests, production
+build and exact follow-up browser journey in Chromium and WebKit (one pass each).
+Their code remains unchanged. Exact commands, exit codes and results extracted
+from parent run turn-004/transport.stdout are retained in
+`review-v02-retained-evidence.json`. Inspected the retained Chromium editor
+screenshot: readable source-plan editing, Ready state and explicit Run menu.
+Browser assertions cover source links, save/promote, unchanged source bytes and
+no launch until Start run. Prior CP1 core/web discovery evidence remains valid.
+Evidence root: `/root/code/evidence/aflow-dogfood-20260909/issue10-review-20260911/`.
+
+## Approval finalization
+
+Squash all three handoff commits onto the unchanged original base. Include this
+already-tracked reviewer record (including prior review progress) and one compact
+Issue 10 DEVLOG entry. Preserve every other reviewed implementation blob.
+Archive the superseded fix overlay externally and remove it; create no new fix
+plan and force-add no private files. Preserve the ignored original plan for
+engine finalization, recording the final approved SHA there after commit creation.
+Verify exactly one final commit after base and no dirty tracked files.
+Reviewer-generated uv lock metadata noise was restored to reviewed HEAD.
+
+Publication configuration is origin/main. Publication, exact-SHA CI and live
+activation remain controller/coordinator delivery gates; this local approval
+does not claim deployment. Preserve the active execution worktree and lineage.
+
 No material findings
 
 

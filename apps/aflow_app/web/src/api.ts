@@ -317,6 +317,17 @@ export async function createProjectPlan(
   })
 }
 
+export async function createProjectPlanFromRun(
+  projectId: string,
+  runId: string,
+  name?: string,
+): Promise<PlanDocument> {
+  return fetchJson<PlanDocument>(`${API_BASE}/projects/${encodeURIComponent(projectId)}/plans/from-run`, {
+    method: 'POST',
+    body: JSON.stringify({ run_id: runId, ...(name === undefined ? {} : { name }) }),
+  })
+}
+
 function planPath(projectId: string, status: PlanStatus, name: string): string {
   return `${API_BASE}/projects/${encodeURIComponent(projectId)}/plans/${status}/${encodeURIComponent(name)}`
 }

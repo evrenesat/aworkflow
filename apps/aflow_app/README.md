@@ -23,6 +23,15 @@ resume; plan edits remain project-scoped. Project registration and skill
 installation remain separate browser actions. HTTP disconnects and UI
 shutdown do not signal independently owned workflow workers.
 
+For a failed or attention-needed run, the equivalent follow-up sequence is
+`get_run` → `get_run_context` → `create_plan_from_run` → `read_plan` →
+`update_plan` → `promote_plan` → `preflight_run` → `start_run`. The created
+Markdown is editable, bounded evidence rather than an automatic diagnosis or
+approval. Automatic adaptation, scoring, rollback, and closure of the broad
+older issue are outside this small evidence-to-plan change; the browser's
+Create follow-up draft action also never launches until the existing explicit
+Run action is used.
+
 For an active owned run, the dashboard's **Stop after current turn** action and
 MCP `control_run(..., owner_stop=true)` save the existing revisioned boundary
 intent. The current worker or reviewer call may finish before the canonical run

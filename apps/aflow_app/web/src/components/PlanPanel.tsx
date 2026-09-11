@@ -12,6 +12,9 @@ interface PlanPanelProps {
   /** Reports unsaved text so the shell can guard navigation. */
   onDirtyChange: (dirty: boolean) => void
   onOpenRunDashboard: (planPath: string) => void
+  /** Opens the exact draft path handed off by another workspace surface. */
+  initialPlanPath?: string | null
+  onInitialPlanHandled?: () => void
 }
 
 interface ConflictState {
@@ -76,7 +79,7 @@ const READY_START_GUIDANCE = 'Ready is a plan lifecycle state; startup checks ru
  * preserved on every network or conflict failure; the server copy is only
  * reloaded after an explicit confirmation.
  */
-export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPanelProps) {
+export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard, initialPlanPath = null, onInitialPlanHandled = () => {} }: PlanPanelProps) {
   const [plans, setPlans] = useState<PlanDocument[]>([])
   const [selected, setSelected] = useState<PlanDocument | null>(null)
   const [content, setContent] = useState('')
@@ -87,6 +90,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   const [conflict, setConflict] = useState<ConflictState | null>(null)
   const [confirmReload, setConfirmReload] = useState(false)
   const [confirmClose, setConfirmClose] = useState(false)
+  const [pendingOpenPlan, setPendingOpenPlan] = useState<PlanDocument | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [history, setHistory] = useState<BackupHistoryState>({ page: null, loading: false, error: null })
   const planLoadRequest = useRef(0)
@@ -94,9 +98,12 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   const projectIdRef = useRef(project.id)
   const selectedRef = useRef<PlanDocument | null>(selected)
   const selectedIdentityRef = useRef<string | null>(null)
+  const initialPlanHandledRef = useRef<string | null>(null)
+  const initialPlanCallbackRef = useRef(onInitialPlanHandled)
   projectIdRef.current = project.id
   selectedRef.current = selected
   selectedIdentityRef.current = selected ? planIdentity(project.id, selected) : null
+  initialPlanCallbackRef.current = onInitialPlanHandled
   const dirty = selected !== null && content !== savedContent
 
   function resetBackupHistory() {
@@ -157,6 +164,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
     setConflict(null)
     setConfirmReload(false)
     setConfirmClose(false)
+    setPendingOpenPlan(null)
+    initialPlanHandledRef.current = null
     resetBackupHistory()
     void refresh()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -191,6 +200,34 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
       setError(err instanceof Error ? err.message : 'Failed to load plan')
     }
   }
+
+  function openRequestedPlan(plan: PlanDocument) {
+    const identity = JSON.stringify([project.id, plan.path])
+    if (selected && dirty && planIdentity(project.id, selected) !== planIdentity(project.id, plan)) {
+      initialPlanHandledRef.current = identity
+      setPendingOpenPlan(plan)
+      setConfirmClose(true)
+      initialPlanCallbackRef.current()
+      return
+    }
+    initialPlanHandledRef.current = identity
+    void openPlan(plan)
+    initialPlanCallbackRef.current()
+  }
+
+  useEffect(() => {
+    if (!initialPlanPath) {
+      initialPlanHandledRef.current = null
+      return
+    }
+    const identity = JSON.stringify([project.id, initialPlanPath])
+    if (initialPlanHandledRef.current === identity) return
+    const match = plans.find((plan) => plan.path === initialPlanPath)
+    if (match) openRequestedPlan(match)
+    // A successful list refresh will rerun this effect if the exact path is
+    // not present yet. Do not clear the request on a transient list failure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPlanPath, plans, project.id])
 
   async function createPlan() {
     const name = newName.trim()
@@ -285,6 +322,8 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
         setSavedContent('')
         setConflict(null)
         setConfirmReload(false)
+        setPendingOpenPlan(null)
+        initialPlanHandledRef.current = null
         resetBackupHistory()
         setError(`Plan ${selected.name} is no longer present in the project lifecycle.`)
         await refresh()
@@ -314,7 +353,15 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
     setConflict(null)
     setConfirmReload(false)
     setConfirmClose(false)
+    setPendingOpenPlan(null)
     resetBackupHistory()
+  }
+
+  function discardAndOpenPendingPlan() {
+    const next = pendingOpenPlan
+    setPendingOpenPlan(null)
+    closePlan()
+    if (next) void openPlan(next)
   }
 
   const runnable = selected !== null && selected.status === 'in_progress' && !dirty
@@ -380,10 +427,10 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
         )}
         {confirmClose && (
           <div className="error-message" role="alertdialog" aria-label="Unsaved plan edits">
-            <p>Your unsaved plan edits will be lost. Save the plan or discard the edits to return to all plans.</p>
+            <p>Your unsaved plan edits will be lost. Save the plan or discard the edits to {pendingOpenPlan ? 'open the requested plan' : 'return to all plans'}.</p>
             <div className="dashboard-actions">
-              <button className="btn btn-danger btn-sm" onClick={closePlan}>Discard edits</button>
-              <button className="btn btn-secondary btn-sm" onClick={() => setConfirmClose(false)}>Keep editing</button>
+              <button className="btn btn-danger btn-sm" onClick={discardAndOpenPendingPlan}>Discard edits</button>
+              <button className="btn btn-secondary btn-sm" onClick={() => { setPendingOpenPlan(null); setConfirmClose(false) }}>Keep editing</button>
             </div>
           </div>
         )}

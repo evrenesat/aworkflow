@@ -75,6 +75,8 @@ interface RunDashboardProps {
   onPendingSuccessorStartChange?: (pending: PendingSuccessorStart | null) => void
   /** Opens Settings for the same project when launch prerequisites are missing. */
   onOpenSettings?: () => void
+  /** Opens a newly created follow-up draft in the project Plans view. */
+  onOpenPlan?: (planPath: string) => void
 }
 
 /**
@@ -837,6 +839,26 @@ function apiErrorCode(error: unknown): string | null {
   return null
 }
 
+function followupDraftErrorMessage(error: unknown, name: string): string {
+  const code = apiErrorCode(error)
+  if (code === 'plan_exists' || (error instanceof ApiError && error.status === 409)) {
+    return `A draft named ${name} already exists. Choose a different filename and try again.`
+  }
+  if (code === 'operation_forbidden' || (error instanceof ApiError && error.status === 403)) {
+    return `You do not have permission to create ${name} in this project. Check the project access and try again.`
+  }
+  if (code === 'run_not_found' || code === 'run_deleted' || (error instanceof ApiError && error.status === 404)) {
+    return `The selected source run is no longer available. Refresh the run details before creating a follow-up draft.`
+  }
+  if (code === 'control_plane_unavailable' || (error instanceof ApiError && error.status >= 500)) {
+    return `The selected run evidence is temporarily unavailable. Refresh the run details and try again; no new filename was chosen.`
+  }
+  if (code === 'operation_rejected' || (error instanceof ApiError && error.status === 422)) {
+    return `The filename ${name} was rejected. Correct it and try again.`
+  }
+  return `Could not create ${name}: ${errorMessage(error, 'the selected run evidence could not be read')}. Correct the filename or refresh the run, then try again.`
+}
+
 
 type RestartPhase = 'confirming' | 'stopping' | 'waiting' | 'starting' | 'failed' | 'unknown'
 
@@ -864,7 +886,7 @@ function configuredWorkflowSteps(
   return []
 }
 
-export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, explicitRunNavigation, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings }: RunDashboardProps) {
+export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, onRunStarted, projectId, requestedRunId = null, explicitRunNavigation, onRunSelectionChange, initialPlanPath, onInitialPlanHandled, restartPollIntervalMs, pendingSuccessorStart: suppliedPendingSuccessor, onPendingSuccessorStartChange, onOpenSettings, onOpenPlan }: RunDashboardProps) {
   const [projectAvailable, setProjectAvailable] = useState<boolean | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
@@ -899,6 +921,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [refreshing, setRefreshing] = useState(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [followupDraft, setFollowupDraft] = useState<{ runId: string; name: string } | null>(null)
+  const [followupError, setFollowupError] = useState<string | null>(null)
   const [projectReadError, setProjectReadError] = useState<string | null>(null)
   const [dashboardReadError, setDashboardReadError] = useState<string | null>(null)
   const [selectedRunReadError, setSelectedRunReadError] = useState<string | null>(null)
@@ -955,6 +979,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const missingRunRef = useRef<string | null>(null)
   const snapshotRequestRef = useRef(0)
   const contextRequestRef = useRef(0)
+  const followupRequestRef = useRef(0)
+  const followupBusyRequestRef = useRef<number | null>(null)
   const requestAbortRef = useRef(new AbortController())
   const contextAbortRef = useRef(new AbortController())
   const preflightRequestRef = useRef(0)
@@ -981,6 +1007,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     () => runs.find((run) => run.run_id === selectedRunId) ?? null,
     [runs, selectedRunId],
   )
+
+  useEffect(() => {
+    followupRequestRef.current += 1
+    setFollowupDraft(null)
+    setFollowupError(null)
+  }, [projectId, selectedRunId])
 
   useEffect(() => {
     if (!visible || !selectedRunId) return
@@ -1474,8 +1506,41 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setMissingRunId(null)
     invalidateCopyFeedback()
     clearActionFeedback()
+    setFollowupError(null)
     setSelectedRunId(runId)
     onRunSelectionChangeRef.current?.({ runId, userInitiated: true })
+  }
+
+  async function createFollowupDraft() {
+    if (!projectId || !selectedRun || !['failed', 'needs_attention'].includes(selectedRun.status) || busyAction !== null) return
+    const runId = selectedRun.run_id
+    const name = (followupDraft?.runId === runId ? followupDraft.name : `followup-${runId}.md`).trim()
+    if (!name) {
+      setFollowupError('Enter a draft filename before creating the follow-up.')
+      return
+    }
+    const request = ++followupRequestRef.current
+    followupBusyRequestRef.current = request
+    setFollowupError(null)
+    setBusyAction('followup')
+    try {
+      const created = await api.createProjectPlanFromRun(projectId, runId, name)
+      if (request !== followupRequestRef.current || selectedRunRef.current !== runId) return
+      if (created.project_id !== projectId || !created.path) {
+        setFollowupError('The server returned a draft for a different project. Refresh the run details before trying again.')
+        return
+      }
+      setFeedback(`${created.path} is ready as editable planning work. The source run was not changed and no run was started.`)
+      onOpenPlan?.(created.path)
+    } catch (reason) {
+      if (request !== followupRequestRef.current || selectedRunRef.current !== runId) return
+      setFollowupError(followupDraftErrorMessage(reason, name))
+    } finally {
+      if (followupBusyRequestRef.current === request) {
+        followupBusyRequestRef.current = null
+        setBusyAction(current => current === 'followup' ? null : current)
+      }
+    }
   }
 
   /** Copy only project/run identities confirmed by the server, never ambient URL data. */
@@ -2298,6 +2363,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   )
   const lastExecuted = lastExecutedEvidence(events, context)
   const selectedRunIssue = selectedRun ? runIssue(selectedRun) : null
+  const canCreateFollowup = Boolean(
+    selectedRun && ['failed', 'needs_attention'].includes(selectedRun.status),
+  )
+  const followupName = selectedRun
+    ? followupDraft?.runId === selectedRun.run_id
+      ? followupDraft.name
+      : `followup-${selectedRun.run_id}.md`
+    : ''
   const recoveryProvenance = recoveryProvenanceFromEvents(events)
   const recoveryWorkerEvidence = recoveryWorkerEvidenceFromRun(selectedRun)
   const recoveryWorkerEvidenceMatches = Boolean(
@@ -2757,6 +2830,33 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>)}
                   {canRestart && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
                   {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
+                </div>
+              </section>}
+              {canCreateFollowup && <section className="dashboard-section followup-draft-action" aria-label="Create follow-up draft">
+                <div className="section-heading">
+                  <div>
+                    <h4>Create follow-up draft</h4>
+                    <span className="text-xs text-dim">Editable planning work from this run's bounded evidence</span>
+                  </div>
+                </div>
+                <p>
+                  Proposed filename: <span className="mono">{followupName}</span>. Creating this draft does not change the source run or start a workflow; it opens the editable plan in Plans.
+                </p>
+                <label className="dashboard-field">
+                  <span>Draft filename</span>
+                  <input
+                    className="input mono"
+                    aria-label="Follow-up draft filename"
+                    value={followupName}
+                    disabled={busyAction !== null}
+                    onChange={(event) => setFollowupDraft({ runId: selectedRun.run_id, name: event.target.value })}
+                  />
+                </label>
+                {followupError && <div className="error-message" role="alert">{followupError}</div>}
+                <div className="dashboard-actions">
+                  <button className="btn btn-primary" disabled={busyAction !== null} onClick={() => void createFollowupDraft()}>
+                    {busyAction === 'followup' ? 'Creating draft…' : 'Create follow-up draft'}
+                  </button>
                 </div>
               </section>}
               {canRecover && <section className="dashboard-section recovery-action" aria-label="Durable provider recovery">

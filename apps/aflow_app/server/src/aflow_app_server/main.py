@@ -98,6 +98,7 @@ from .models import (
     WorktreePreflightResponse,
 )
 from .plan_service import (
+    PlanAlreadyExists,
     PlanProjectNotFound,
     PlanRevisionConflict,
     PlanService,
@@ -681,6 +682,7 @@ async def renew_browser_session(request: Request, call_next):
 
 
 app.dependency_overrides[plan_routes_module._get_plan_service] = get_plan_service
+app.dependency_overrides[plan_routes_module._get_control_plane_service] = get_control_plane_service
 app.include_router(plan_routes_module.router, dependencies=[Depends(verify_token)])
 app.router.routes.append(_MCPMount("/mcp", app=mcp_http_app, name="mcp"))
 
@@ -857,6 +859,11 @@ async def plan_revision_conflict_handler(
         "revision_conflict",
         current_revision=exc.current_revision,
     )
+
+
+@app.exception_handler(PlanAlreadyExists)
+async def plan_already_exists_handler(_: Request, __: PlanAlreadyExists) -> JSONResponse:
+    return _error_response(status.HTTP_409_CONFLICT, "plan_exists")
 
 
 @app.exception_handler(GuidedConfigError)

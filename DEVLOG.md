@@ -36,6 +36,34 @@
   Chromium and WebKit. Evidence remains under
   `/root/code/evidence/aflow-dogfood-20260909/ci-stop-header-review-20260911/`.
 
+## 2026-09-11 — Run evidence follow-up drafting (Issue 10)
+
+- Added the failed/attention-needed Run details action that shows the proposed
+  `followup-<run-id>.md` filename, preserves corrected names after collision or
+  permission/unavailable errors, blocks duplicate submissions, and opens the
+  exact returned draft in Plans without changing the source run or launching.
+- Preserved selected-run response guards, the App navigation guard, and
+  PlanPanel's unsaved-edit confirmation while adding the existing MCP sequence:
+  `get_run` → `get_run_context` → `create_plan_from_run` → `read_plan` →
+  `update_plan` → `promote_plan` → `preflight_run` → `start_run`.
+- Automatic adaptation, scoring, rollback, and broad issue closure are not part
+  of this simplified evidence-to-plan scope. Focused component/API tests and
+  the disposable browser journey cover source-link inspection, completion
+  criteria editing, promotion, source-byte preservation, and launch only after
+  the explicit Run action; Chromium and WebKit evidence is retained under the
+  issue-10 review artifact directory.
+- Kept copied evidence inside its quoted Markdown fence even with valid
+  1–3-space-indented tilde closers, reported only canonical finalized turns,
+  and labeled current-step data as unfinalized. Canonical nested receipt
+  diagnostics now remain available with the existing redaction and 4 KiB
+  bound.
+- Follow-up creation now releases only its own busy state after a stale
+  success or failure, preserving stale-response suppression while allowing
+  the next draft action. Focused verification passed: 13 `from_run` tests, 3
+  MCP/auth contract tests, 143 web component/API tests, the web build, and
+  the follow-up browser journey in Chromium and WebKit. Evidence is retained
+  under `/root/code/evidence/aflow-dogfood-20260909/issue10-review-20260911/`.
+
 ## 2026-09-11 — Stop and recovery integration
 
 - Preserve both reviewed stop-after-turn controls and cumulative failure recovery.

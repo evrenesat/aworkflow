@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from fastmcp import FastMCP
 
 from aflow.mcp_control_plane import MCPToolResult
 
-from .plan_service import PlanService, PlanStatus
+from .plan_service import PlanService, PlanServiceError, PlanStatus
 
 
 _READ_ANNOTATIONS = {
@@ -25,12 +26,14 @@ _NON_IDEMPOTENT_WRITE_ANNOTATIONS = {
 }
 
 PlanServiceGetter = Callable[[], PlanService]
+ControlPlaneServiceGetter = Callable[[], Any]
 
 
 def register_plan_authoring_tools(
     mcp: FastMCP,
     get_plan_service: PlanServiceGetter,
     tool_result: MCPToolResult,
+    get_control_plane_service: ControlPlaneServiceGetter | None = None,
 ) -> None:
     """Register browser-parity plan tools on the web MCP registry only."""
 
@@ -60,6 +63,34 @@ def register_plan_authoring_tools(
         return tool_result(
             lambda: get_plan_service().create(project_id, name, content).to_dict(),
             {"project_id": project_id, "name": name, "content": content},
+        )
+
+    @mcp.tool(
+        title="Create an AFlow follow-up draft from run evidence",
+        annotations=_NON_IDEMPOTENT_WRITE_ANNOTATIONS,
+        tags={"write", "plans", "approval-required"},
+    )
+    def create_plan_from_run(
+        project_id: str,
+        run_id: str,
+        name: str | None = None,
+    ) -> dict[str, object]:
+        """Create an editable todo draft from a failed or attention-needed run."""
+        def create() -> dict[str, object]:
+            if get_control_plane_service is None:
+                raise PlanServiceError("control-plane service is unavailable")
+            control_plane = get_control_plane_service()
+            return get_plan_service().create_plan_from_run(
+                project_id,
+                run_id,
+                name,
+                run_status_reader=control_plane.run_status,
+                run_context_reader=control_plane.context,
+            ).to_dict()
+
+        return tool_result(
+            create,
+            {"project_id": project_id, "run_id": run_id, "name": name},
         )
 
     @mcp.tool(
@@ -140,4 +171,8 @@ def register_plan_authoring_tools(
         )
 
 
-__all__ = ["PlanServiceGetter", "register_plan_authoring_tools"]
+__all__ = [
+    "ControlPlaneServiceGetter",
+    "PlanServiceGetter",
+    "register_plan_authoring_tools",
+]

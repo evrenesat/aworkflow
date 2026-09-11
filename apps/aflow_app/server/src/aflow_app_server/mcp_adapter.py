@@ -69,7 +69,12 @@ def create_control_plane_mcp(
 
         def register_web_tools(mcp: FastMCP, tool_result: MCPToolResult) -> None:
             if get_plan_service is not None:
-                register_plan_authoring_tools(mcp, get_plan_service, tool_result)
+                register_plan_authoring_tools(
+                    mcp,
+                    get_plan_service,
+                    tool_result,
+                    get_service,
+                )
             if get_global_config_service is not None:
                 register_global_config_tools(
                     mcp, get_global_config_service, tool_result

@@ -190,6 +190,7 @@ export function App() {
   const [planDirty, setPlanDirty] = useState(false)
   const [pendingAction, setPendingAction] = useState<{ description: string; run: () => void; onCancel?: () => void } | null>(null)
   const [runDashboardPlanPath, setRunDashboardPlanPath] = useState<string | null>(null)
+  const [planPanelPath, setPlanPanelPath] = useState<string | null>(null)
   const [pendingSuccessorStart, setPendingSuccessorStart] = useState<PendingSuccessorStart | null>(null)
   const alertRef = useRef<HTMLElement | null>(null)
   const setAlertRef = useCallback((element: HTMLElement | null) => {
@@ -402,6 +403,7 @@ export function App() {
     setPlanDirty(false)
     setPendingAction(null)
     setRunDashboardPlanPath(null)
+    setPlanPanelPath(null)
     setPendingSuccessorStart(null)
   }
 
@@ -458,12 +460,16 @@ export function App() {
   function switchView(next: View) {
     if (next === query.view) return
     if (NAV_ITEMS.find((item) => item.view === next)?.needsProject && !selectedProject) return
-    requestGuarded(`leave the editor for ${next}`, () => applyQuery({ ...queryRef.current, ...(next === 'all-runs' || next === 'projects' ? { project: null } : {}), view: next, run: null }, 'push'))
+    requestGuarded(`leave the editor for ${next}`, () => {
+      if (next !== 'plans') setPlanPanelPath(null)
+      applyQuery({ ...queryRef.current, ...(next === 'all-runs' || next === 'projects' ? { project: null } : {}), view: next, run: null }, 'push')
+    })
   }
 
   function openProject(project: ProjectInfo) {
     requestGuarded(`open ${project.display_name} with unsaved edits`, () => {
       setRunDashboardPlanPath(null)
+      setPlanPanelPath(null)
       applyQuery({ project: project.id, view: 'runs', run: null }, 'push')
     })
   }
@@ -524,8 +530,17 @@ export function App() {
 
   function handleOpenRunDashboard(planPath: string) {
     requestGuarded('leave the plan editor for the run dashboard', () => {
+      setPlanPanelPath(null)
       setRunDashboardPlanPath(planPath)
       applyQuery({ ...queryRef.current, view: 'new-run', run: null }, 'push')
+    })
+  }
+
+  function handleOpenPlan(planPath: string) {
+    requestGuarded('open the follow-up draft in Plans', () => {
+      setRunDashboardPlanPath(null)
+      setPlanPanelPath(planPath)
+      applyQuery({ ...queryRef.current, view: 'plans', run: null }, 'push')
     })
   }
 
@@ -706,6 +721,8 @@ export function App() {
               project={selectedProject}
               onDirtyChange={handlePlanDirty}
               onOpenRunDashboard={handleOpenRunDashboard}
+              initialPlanPath={planPanelPath}
+              onInitialPlanHandled={() => setPlanPanelPath(null)}
             />
           </div>
         )}
@@ -734,6 +751,7 @@ export function App() {
               onRunSelectionChange={change => { if (queryRef.current.project === id) handleRunSelectionChange(change) }}
               initialPlanPath={query.project === id ? runDashboardPlanPath : null}
               onInitialPlanHandled={() => setRunDashboardPlanPath(null)}
+              onOpenPlan={planPath => { if (queryRef.current.project === id) handleOpenPlan(planPath) }}
               pendingSuccessorStart={pendingSuccessorStart}
               onPendingSuccessorStartChange={setPendingSuccessorStart}
               onOpenSettings={() => switchView('settings')}

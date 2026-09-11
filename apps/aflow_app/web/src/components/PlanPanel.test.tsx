@@ -148,6 +148,53 @@ describe('PlanPanel', () => {
     await waitFor(() => expect(api.listProjectPlans).toHaveBeenCalledTimes(2))
   })
 
+  it('opens an exact handed-off draft and keeps the unsaved navigation guard', async () => {
+    const handedOff: PlanDocument = {
+      project_id: 'alpha', name: 'followup-run-7.md', path: 'plans/todo/followup-run-7.md',
+      status: 'todo', revision: 'd'.repeat(64), size_bytes: 24,
+    }
+    const laterPlan: PlanDocument = {
+      project_id: 'alpha', name: 'later.md', path: 'plans/todo/later.md',
+      status: 'todo', revision: 'e'.repeat(64), size_bytes: 16,
+    }
+    const onInitialPlanHandled = vi.fn()
+    vi.mocked(api.listProjectPlans).mockResolvedValue([handedOff, laterPlan])
+    vi.mocked(api.readProjectPlan).mockImplementation(async (_projectId, _status, name) => ({
+      ...(name === handedOff.name ? handedOff : laterPlan),
+      content: name === handedOff.name ? '# Follow-up evidence\n' : '# Later\n',
+    }))
+    const view = render(
+      <PlanPanel
+        project={project}
+        onDirtyChange={vi.fn()}
+        onOpenRunDashboard={vi.fn()}
+        initialPlanPath={handedOff.path}
+        onInitialPlanHandled={onInitialPlanHandled}
+      />,
+    )
+
+    await screen.findByLabelText('Plan content')
+    expect(api.readProjectPlan).toHaveBeenCalledWith('alpha', 'todo', handedOff.name)
+    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Follow-up evidence\n')
+    expect(onInitialPlanHandled).toHaveBeenCalledTimes(1)
+
+    fireEvent.change(screen.getByLabelText('Plan content'), { target: { value: '# Keep this local\n' } })
+    view.rerender(
+      <PlanPanel
+        project={project}
+        onDirtyChange={vi.fn()}
+        onOpenRunDashboard={vi.fn()}
+        initialPlanPath={laterPlan.path}
+        onInitialPlanHandled={onInitialPlanHandled}
+      />,
+    )
+    await screen.findByRole('alertdialog', { name: 'Unsaved plan edits' })
+    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Keep this local\n')
+    fireEvent.click(screen.getByRole('button', { name: 'Discard edits', exact: true }))
+    await waitFor(() => expect(api.readProjectPlan).toHaveBeenLastCalledWith('alpha', 'todo', laterPlan.name))
+    expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Later\n')
+  })
+
   it('saves edits with the expected revision and refreshes lifecycle status', async () => {
     const updated: PlanDocument = { ...todoPlan, revision: 'c'.repeat(64) }
     vi.mocked(api.updateProjectPlan).mockResolvedValue(updated)

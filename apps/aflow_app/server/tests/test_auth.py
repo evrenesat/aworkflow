@@ -95,6 +95,7 @@ def test_every_control_plane_operation_rejects_an_unauthenticated_request(auth_c
         ("get", "/api/control-plane/projects", None),
         ("get", "/api/control-plane/projects/example/capabilities", None),
         ("get", "/api/control-plane/projects/example/plans", None),
+        ("post", "/api/projects/example/plans/from-run", {"run_id": "sample"}),
         ("get", "/api/control-plane/projects/example/runs", None),
         ("post", "/api/control-plane/projects/example/runs", {"plan_path": "plans/todo/a.md"}),
         ("get", "/api/control-plane/projects/example/runs/sample", None),

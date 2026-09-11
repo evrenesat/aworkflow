@@ -272,6 +272,7 @@ authenticated MCP connection:
 - `patch_global_config` — apply typed actions or an exact document edit with an expected revision; the pair is validated and committed atomically.
 - `read_plan` — read one revisioned Markdown plan document.
 - `create_plan` — create a bounded draft in `plans/todo`.
+- `create_plan_from_run` — create a bounded editable follow-up draft from the exact failed or attention-needed run evidence.
 - `update_plan` — compare-and-swap one plan document.
 - `promote_plan` — move a plan through `todo` → `in_progress` → `done` with its revision.
 - `list_plan_documents` — list plan documents with their status and revisions; use `list_plans` for lifecycle metadata used by run control.
@@ -287,11 +288,16 @@ read-only and reports bounded dirty-path pages before a launch; `start_run`
 preserves the existing startup-question flow.
 
 A typical authored launch is: discover the tools, read global settings, apply
-a typed settings patch with its current revision, create and update a draft,
-promote it, then use `list_plan_documents` and `list_plans` before calling
+a typed settings patch with its current revision, then either call
+`create_plan` or read the exact failed/attention-needed run with `get_run` and
+`get_run_context` before calling `create_plan_from_run`. Read the draft, update
+its completion criteria with the returned revision, promote it, and use
+`list_plan_documents`, `preflight_run`, and `list_plans` before calling
 `start_run`. If a browser or another MCP client changes a document first,
 reread it and retry with the returned revision; the server never silently
-retries stale writes. Global settings affect all registered projects at their
+retries stale writes. Follow-up drafting is bounded evidence-to-plan support:
+automatic adaptation, scoring, rollback, and issue-tracker closure are not
+part of this change. Global settings affect all registered projects at their
 next safe boundary or resume. A run's launch snapshot is diagnostic
 provenance, not an execution configuration gate.
 Project registration and skill installation remain separate existing browser

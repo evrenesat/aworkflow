@@ -7,6 +7,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, ConfigDict
 
+from .control_plane_service import ControlPlaneService
 from .plan_service import PlanService
 
 router = APIRouter(prefix="/api/projects/{project_id}/plans", tags=["plans"])
@@ -19,6 +20,12 @@ class PlanCreatePayload(StrictModel):
     name: str
     content: str | None = None
 
+
+class PlanFromRunPayload(StrictModel):
+    run_id: str
+    name: str | None = None
+
+
 class PlanUpdatePayload(StrictModel):
     content: str
     expected_revision: str
@@ -29,6 +36,11 @@ class PlanPromotePayload(StrictModel):
 
 def _get_plan_service() -> PlanService:
     raise RuntimeError("plan service dependency was not configured")
+
+
+def _get_control_plane_service() -> ControlPlaneService:
+    raise RuntimeError("control-plane service dependency was not configured")
+
 
 @router.get("")
 def list_plans(
@@ -45,6 +57,23 @@ def create_plan(
     service: PlanService = Depends(_get_plan_service),
 ) -> dict[str, object]:
     return service.create(project_id, payload.name, payload.content).to_dict()
+
+
+@router.post("/from-run", status_code=status.HTTP_201_CREATED)
+def create_plan_from_run(
+    project_id: str,
+    payload: PlanFromRunPayload,
+    service: PlanService = Depends(_get_plan_service),
+    control_plane: ControlPlaneService = Depends(_get_control_plane_service),
+) -> dict[str, object]:
+    return service.create_plan_from_run(
+        project_id,
+        payload.run_id,
+        payload.name,
+        run_status_reader=control_plane.run_status,
+        run_context_reader=control_plane.context,
+    ).to_dict()
+
 
 @router.get("/{plan_status}/{name}")
 def read_plan(

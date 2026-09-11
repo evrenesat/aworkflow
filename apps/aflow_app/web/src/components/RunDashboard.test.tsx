@@ -15,7 +15,7 @@ vi.mock('../api', async () => {
     listControlPlaneProjects: vi.fn(), getControlPlaneReadiness: vi.fn(), getControlPlaneCapabilities: vi.fn(), listControlPlanePlans: vi.fn(),
     listControlPlaneRuns: vi.fn(), getControlPlaneRun: vi.fn(), listRunEvents: vi.fn(), getRunContext: vi.fn(),
     startControlPlaneRun: vi.fn(), answerStartupQuestion: vi.fn(), preflightControlPlaneRun: vi.fn(), controlControlPlaneRun: vi.fn(),
-    changeRunHistory: vi.fn(), ownerStopControlPlaneRun: vi.fn(), resumeControlPlaneRun: vi.fn(), subscribeToRunEvents: vi.fn(),
+    changeRunHistory: vi.fn(), ownerStopControlPlaneRun: vi.fn(), resumeControlPlaneRun: vi.fn(), createProjectPlanFromRun: vi.fn(), subscribeToRunEvents: vi.fn(),
   }
 })
 
@@ -152,6 +152,7 @@ function renderDashboard(options: {
   onInitialPlanHandled?: () => void
   requestedRunId?: string | null
   onRunSelectionChange?: (change: RunSelectionChange) => void
+  onOpenPlan?: (planPath: string) => void
 } = {}) {
   return render(
     <RunDashboard
@@ -160,6 +161,7 @@ function renderDashboard(options: {
       onRunSelectionChange={options.onRunSelectionChange}
       initialPlanPath={options.initialPlanPath ?? null}
       onInitialPlanHandled={options.onInitialPlanHandled ?? vi.fn()}
+      onOpenPlan={options.onOpenPlan}
       restartPollIntervalMs={options.restartPollIntervalMs}
       onOpenSettings={vi.fn()}
     />,
@@ -178,6 +180,7 @@ function dashboardNode(options: { requestedRunId?: string | null; visible?: bool
       visible={options.visible ?? true}
       initialPlanPath={null}
       onInitialPlanHandled={vi.fn()}
+      onOpenPlan={vi.fn()}
       onOpenSettings={vi.fn()}
     />
   )
@@ -233,8 +236,12 @@ function openAdvanced() {
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
-  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
-  return { promise, resolve }
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 type ResumeComparisonSetup = 'accepted-baseline' | 'pending'
@@ -1912,6 +1919,113 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(screen.getByText(/Replay returned continuation run-continuation from source run run-needs-attention; no duplicate was created/)).toBeDefined())
     // The URL is updated to the returned continuation run.
     await waitFor(() => expect(onRunSelectionChange).toHaveBeenCalledWith({ runId: 'run-continuation', userInitiated: false }))
+  })
+
+  it('creates one editable follow-up draft for the selected failed run and opens its exact path', async () => {
+    const failed = {
+      ...ownedRun,
+      run_id: 'run-failed',
+      status: 'failed',
+      activity: 'inactive' as const,
+      launch_phase: 'failed',
+      reason: 'worker stopped before the checkpoint boundary',
+    }
+    const created = {
+      project_id: project.project_id,
+      name: 'corrected-followup.md',
+      path: 'plans/todo/corrected-followup.md',
+      status: 'todo' as const,
+      revision: 'c'.repeat(64),
+      size_bytes: 20,
+    }
+    const pending = deferred<typeof created>()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [failed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(failed)
+    vi.mocked(api.createProjectPlanFromRun).mockReturnValue(pending.promise)
+    const onOpenPlan = vi.fn()
+    renderDashboard({ onOpenPlan })
+
+    const button = await screen.findByRole('button', { name: 'Create follow-up draft', exact: true })
+    const filename = screen.getByLabelText('Follow-up draft filename') as HTMLInputElement
+    expect(filename.value).toBe('followup-run-failed.md')
+    fireEvent.change(filename, { target: { value: created.name } })
+    fireEvent.click(button)
+    await waitFor(() => expect(api.createProjectPlanFromRun).toHaveBeenCalledTimes(1))
+    expect(api.createProjectPlanFromRun).toHaveBeenCalledWith(project.project_id, failed.run_id, created.name)
+    expect(button).toHaveProperty('disabled', true)
+    fireEvent.click(button)
+    expect(api.createProjectPlanFromRun).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      pending.resolve(created)
+      await pending.promise
+    })
+    await waitFor(() => expect(onOpenPlan).toHaveBeenCalledWith(created.path))
+  })
+
+  it('keeps a corrected follow-up filename after a collision and maps the error to an action', async () => {
+    const failed = { ...ownedRun, run_id: 'run-collision', status: 'failed', activity: 'inactive' as const, launch_phase: 'failed' }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [failed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(failed)
+    vi.mocked(api.createProjectPlanFromRun).mockRejectedValue(new ApiError(409, 'plan_exists', 'plan_exists'))
+    renderDashboard()
+
+    await screen.findByRole('button', { name: 'Create follow-up draft', exact: true })
+    const filename = screen.getByLabelText('Follow-up draft filename') as HTMLInputElement
+    fireEvent.change(filename, { target: { value: 'existing-followup.md' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create follow-up draft', exact: true }))
+
+    await screen.findByText('A draft named existing-followup.md already exists. Choose a different filename and try again.', { exact: true })
+    expect(filename.value).toBe('existing-followup.md')
+  })
+
+  it.each(['resolution', 'rejection'] as const)('releases follow-up busy state after stale %s', async outcome => {
+    const first = { ...ownedRun, run_id: 'run-first', status: 'failed', activity: 'inactive' as const, launch_phase: 'failed' }
+    const second = { ...ownedRun, run_id: 'run-second', status: 'failed', activity: 'inactive' as const, launch_phase: 'failed' }
+    const firstCreated = {
+      project_id: project.project_id,
+      name: 'followup-run-first.md',
+      path: 'plans/todo/followup-run-first.md',
+      status: 'todo' as const,
+      revision: 'd'.repeat(64),
+      size_bytes: 20,
+    }
+    const secondCreated = {
+      ...firstCreated,
+      name: 'followup-run-second.md',
+      path: 'plans/todo/followup-run-second.md',
+      revision: 'e'.repeat(64),
+    }
+    const pending = deferred<typeof firstCreated>()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [first, second], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === first.run_id ? first : second)
+    vi.mocked(api.createProjectPlanFromRun)
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce(secondCreated)
+    const onOpenPlan = vi.fn()
+    renderDashboard({ onOpenPlan })
+
+    await screen.findByRole('button', { name: 'Create follow-up draft', exact: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Create follow-up draft', exact: true }))
+    await waitFor(() => expect(api.createProjectPlanFromRun).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: /run-second/ }))
+    await act(async () => {
+      if (outcome === 'resolution') {
+        pending.resolve(firstCreated)
+        await pending.promise
+      } else {
+        pending.reject(new ApiError(503, 'control_plane_unavailable', 'control plane unavailable'))
+        await pending.promise.catch(() => undefined)
+      }
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Create follow-up draft', exact: true })).toHaveProperty('disabled', false)
+      expect(screen.getByRole('button', { name: 'New run', exact: true })).toHaveProperty('disabled', false)
+    })
+    expect(onOpenPlan).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Create follow-up draft', exact: true }))
+    await waitFor(() => expect(api.createProjectPlanFromRun).toHaveBeenCalledTimes(2))
+    expect(api.createProjectPlanFromRun).toHaveBeenLastCalledWith(project.project_id, second.run_id, 'followup-run-second.md')
   })
 
   it('keeps ordinary Resume primary and submits explicit durable recovery to a selected worker', async () => {

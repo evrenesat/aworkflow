@@ -195,6 +195,13 @@ describe('workflow control API client', () => {
     await api.createProjectPlan('project-1', { name: 'demo.md', content: '# Plan' })
     expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans', expect.objectContaining({ method: 'POST' }))
 
+    mockOkJson({ project_id: 'project-1', name: 'followup-run-1.md', path: 'plans/todo/followup-run-1.md', status: 'todo', revision: 'f'.repeat(64), size_bytes: 12 }, 201)
+    await api.createProjectPlanFromRun('project-1', 'run-1', 'followup-run-1.md')
+    expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/from-run', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ run_id: 'run-1', name: 'followup-run-1.md' }),
+    }))
+
     mockOkJson({ project_id: 'project-1', name: 'demo.md', path: 'plans/todo/demo.md', status: 'todo', revision: 'b'.repeat(64), size_bytes: 9 })
     await api.updateProjectPlan('project-1', 'todo', 'demo.md', { content: '# Updated', expected_revision: 'a'.repeat(64) })
     expect(global.fetch).toHaveBeenLastCalledWith('/api/projects/project-1/plans/todo/demo.md', expect.objectContaining({ method: 'PUT' }))
