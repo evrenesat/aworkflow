@@ -208,6 +208,10 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     assert tool_by_name["preflight_run"]["annotations"]["readOnlyHint"] is True
     assert tool_by_name["start_run"]["annotations"]["readOnlyHint"] is False
     assert tool_by_name["owner_stop"]["annotations"]["destructiveHint"] is True
+    assert "safe boundary" in tool_by_name["control_run"]["description"]
+    assert "does" in tool_by_name["control_run"]["description"]
+    assert "interrupt" in tool_by_name["control_run"]["description"]
+    assert "Immediately" in tool_by_name["owner_stop"]["description"]
 
     resources = _mcp_request(client, "resources/templates/list")["result"]["resourceTemplates"]
     assert {resource["uriTemplate"] for resource in resources} == {
@@ -1402,6 +1406,48 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
         headers={"Authorization": f"Bearer {TOKEN}"},
     ).json()
 
+    boundary = _mcp_tool(
+        client,
+        "control_run",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 1,
+            "owner_stop": True,
+            "idempotency_key": "mcp-boundary-stop-1",
+        },
+    )
+    assert boundary["revision"] == 2
+    assert boundary["owner_stop"] is True
+    assert boundary["run"]["status"] in {"running", "launch_started"}
+    assert units.stop_calls == []
+    assert _mcp_tool(
+        client,
+        "control_run",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 1,
+            "owner_stop": True,
+            "idempotency_key": "mcp-boundary-stop-1",
+        },
+    ) == boundary
+    assert boundary["run"] == client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ).json()
+    assert _mcp_tool_error(
+        client,
+        "control_run",
+        {
+            "project_id": PROJECT_ID,
+            "run_id": run_id,
+            "expected_revision": 1,
+            "owner_stop": True,
+            "idempotency_key": "mcp-boundary-stop-stale",
+        },
+    ) == "revision_conflict"
+
     units.stop(f"aflow-run-{run_id}.service")
     (root / ".aflow" / "runs" / run_id / "run.json").write_text(
         '{"status":"running","workflow_name":"managed","team":null,'
@@ -1467,6 +1513,7 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
         },
     )
     assert stopped["launch_phase"] == "owner_stopped"
+    assert units.stop_calls[-1] == f"aflow-run-{resumed_id}.service"
 
     monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
     successor = _mcp_tool(

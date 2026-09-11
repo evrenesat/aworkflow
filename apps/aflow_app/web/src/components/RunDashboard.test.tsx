@@ -1365,6 +1365,87 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(screen.getByText(/revision 2\. The engine applies them at the next safe boundary/)).toBeDefined())
   })
 
+  it('requests a boundary stop through revisioned control and keeps the immediate stop separate', async () => {
+    const pending = {
+      ...ownedRun,
+      revision: 2,
+      evidence: {
+        ...ownedRun.evidence,
+        overrides: { state: 'pending', revision: 2, owner_stop: true },
+      },
+    }
+    vi.mocked(api.controlControlPlaneRun).mockResolvedValue({
+      revision: 2,
+      changed: true,
+      owner_stop: true,
+      run: pending,
+    })
+    renderDashboard()
+
+    const boundary = await screen.findByRole('button', { name: 'Stop after current turn', exact: true })
+    fireEvent.click(boundary)
+    await waitFor(() => expect(api.controlControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      'run-owned',
+      { expected_revision: 1, owner_stop: true },
+      expect.stringMatching(/^boundary-stop-/),
+    ))
+    await screen.findByText(/Stop after current turn requested for run-owned/)
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    await screen.findByText(/Stop requested — finishing current turn/)
+    expect(screen.getByRole('button', { name: 'Stop now…', exact: true })).toBeDefined()
+  })
+
+  it('shows a saved boundary-stop intent after a fresh run read and leaves terminal runs without stop controls', async () => {
+    const pending = {
+      ...ownedRun,
+      evidence: {
+        ...ownedRun.evidence,
+        overrides: { state: 'pending', revision: 1, owner_stop: true },
+      },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [pending], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(pending)
+    const rendered = renderDashboard()
+    await screen.findByText(/Stop requested — finishing current turn/)
+    expect(screen.getByRole('button', { name: 'Stop now…', exact: true })).toBeDefined()
+
+    rendered.unmount()
+    const stopped = { ...pending, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [stopped], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(stopped)
+    renderDashboard()
+    await screen.findAllByText('Stopped')
+    expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop now…', exact: true })).toBeNull()
+  })
+
+  it('refreshes a stale boundary-stop revision without retrying the write', async () => {
+    vi.mocked(api.controlControlPlaneRun).mockRejectedValue(
+      new ApiError(409, 'revision changed', 'revision_conflict'),
+    )
+    renderDashboard()
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop after current turn', exact: true }))
+    await screen.findByText(/stop request was not retried/)
+    expect(api.controlControlPlaneRun).toHaveBeenCalledTimes(1)
+    expect(api.getControlPlaneRun.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('keeps Stop now on the immediate endpoint and confirms its terminal response', async () => {
+    const stopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue(stopped)
+    renderDashboard()
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop now…', exact: true }))
+    await screen.findByText(/interrupts the active worker\/reviewer call/)
+    fireEvent.click(screen.getByRole('button', { name: 'Stop now', exact: true }))
+    await waitFor(() => expect(api.ownerStopControlPlaneRun).toHaveBeenCalledWith(
+      'control-project', 'run-owned', 1, expect.stringMatching(/^owner-stop-/),
+    ))
+    await screen.findByText(/Stop now recorded for run-owned/)
+    expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()
+  })
+
   it('disambiguates colliding live role controls and sends the exact raw role key', async () => {
     const collidingCapabilities = {
       ...capabilities,
@@ -1545,6 +1626,8 @@ describe('RunDashboard', () => {
 
     await screen.findAllByText('Stopped')
     expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop now…', exact: true })).toBeNull()
     rendered.unmount()
 
     const completed = { ...ownedRun, status: 'completed', launch_phase: 'completed' }
@@ -1553,6 +1636,8 @@ describe('RunDashboard', () => {
     renderDashboard()
     await screen.findAllByText('Completed')
     expect(screen.queryByRole('button', { name: /Change workflow/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop now…', exact: true })).toBeNull()
     expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
     expect(api.startControlPlaneRun).not.toHaveBeenCalled()
   })
@@ -2771,7 +2856,8 @@ describe('RunDashboard', () => {
     renderDashboard()
     await screen.findByText('Adjust run')
     expect(screen.getAllByText('Waiting for valid override').length).toBe(2)
-    expect(screen.getByRole('button', { name: 'Owner stop…' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Stop after current turn', exact: true })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Stop now…', exact: true })).toBeDefined()
     expect(screen.queryByText(/running for/)).toBeNull()
   })
 

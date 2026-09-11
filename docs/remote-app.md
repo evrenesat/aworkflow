@@ -64,6 +64,16 @@ Safe live controls:
 
 - Max turns, team, and per-role agent selectors are offered only where capabilities admit them as safe; team and selector values are selects limited to capability-admitted values, never free text.
 - Applications send the expected revision and an idempotency key. The UI reports a control as recorded only after the returned canonical revision, explains that the engine applies it at the next safe boundary between turns, and refreshes from the returned status. A stale revision keeps every local edit in place and re-reads the canonical revision for retry; a `restart_required` reply directs the user to the guided restart instead.
+- Active owned runs expose **Stop after current turn** beside the secondary
+  **Stop now** action. The former sends the existing revisioned
+  `owner_stop=true` control intent and remains visibly pending while the
+  current worker/reviewer call finishes; it never calls the unit-stop endpoint
+  or implies checkpoint approval. The latter keeps the existing immediate
+  owner-stop endpoint and interrupts the exact active unit after confirmation.
+- REST `PATCH .../control` and MCP `control_run(..., owner_stop=true)` share the
+  same boundary intent and idempotency behavior. Fresh run reads include the
+  bounded pending owner-stop projection; only canonical finalized status and
+  ownership render a stopped run.
 
 Guided workflow change (restart):
 

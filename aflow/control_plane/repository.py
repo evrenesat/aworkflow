@@ -466,6 +466,7 @@ class RunRepository:
             "state": state, "revision": request.revision,
             "max_turns": request.max_turns, "team": request.team,
             "role_selectors": request.role_selectors,
+            "owner_stop": request.owner_stop,
         })
 
     def _parse_manifest(self, path: Path) -> LaunchManifest:

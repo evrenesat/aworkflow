@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -11,13 +14,23 @@ from aflow.api.models import PreparedRun, StartupRequest
 from aflow.config import (
     AflowSection,
     GoTransition,
+    HarnessProfileConfig,
     TeamConfig,
     WorkflowConfig,
+    WorkflowHarnessConfig,
     WorkflowStepConfig,
     WorkflowUserConfig,
     load_workflow_config,
 )
-from aflow.control_plane import InMemoryUnitManager, LaunchManifest, create_launch_manifest, read_events, write_launch_phase
+from aflow.control_plane import (
+    InMemoryUnitManager,
+    LaunchManifest,
+    RunControlRequest,
+    compare_and_swap_overrides,
+    create_launch_manifest,
+    read_events,
+    write_launch_phase,
+)
 from aflow.control_plane.repository import RunRepository
 from aflow.daemon import (
     AflowDaemon,
@@ -139,6 +152,212 @@ def _daemon_for_config(
         max_turns=None,
         team=None,
     )
+
+
+def test_daemon_resume_preview_and_start_reviews_complete_owner_stopped_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete worker snapshot still admits its pending reviewer only."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    plan_path = repo_root / "plan.md"
+    plan_path.write_text(
+        "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n",
+        encoding="utf-8",
+    )
+    config_path = repo_root / "aflow.toml"
+    config_path.write_text("# focused daemon resume fixture\n", encoding="utf-8")
+    environment_file = repo_root / "aflowd.env"
+    environment_file.write_text("AFLOWD_MODE=test\n", encoding="utf-8")
+    executable = repo_root / "release" / "bin" / "aflow"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    workflow_config = WorkflowUserConfig(
+        roles={"worker": "codex.high", "reviewer": "codex.high"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"high": HarnessProfileConfig(model="high-model")}
+            )
+        },
+        workflows={
+            "live": WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("implement",),
+                        go=(GoTransition(to="review"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("review",),
+                        go=(GoTransition(to="END"),),
+                    ),
+                },
+                first_step="implement",
+            )
+        },
+        prompts={
+            "implement": "Implement the checkpoint.",
+            "review": "Review the completed worker turn.",
+        },
+    )
+    monkeypatch.setattr(
+        "aflow.daemon.load_workflow_config",
+        lambda _path: workflow_config,
+    )
+
+    source_id = "complete-owner-stop-source"
+    entered = Event()
+    release = Event()
+
+    def source_worker(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        entered.set()
+        assert release.wait(timeout=5), "fake worker did not receive its release"
+        plan_path.write_text(
+            "# Plan\n\n"
+            "### [x] Checkpoint 1: First\n"
+            "- [x] step\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            run_workflow,
+            ControllerConfig(
+                repo_root=repo_root,
+                plan_path=plan_path,
+                max_turns=3,
+                reserved_run_id=source_id,
+                idempotency_key="source-key",
+                caller_scope="project:one",
+            ),
+            workflow_config,
+            "live",
+            config_dir=repo_root,
+            snapshot_config=False,
+            runner=source_worker,
+        )
+        assert entered.wait(timeout=5), "fake worker did not start"
+        requested = compare_and_swap_overrides(
+            repo_root,
+            source_id,
+            RunControlRequest(expected_revision=0, owner_stop=True),
+        )
+        assert requested.owner_stop is True
+        assert not future.done()
+        release.set()
+        source = future.result(timeout=5)
+
+    assert source.status == "owner_stopped"
+    source_run_json = (source.run_dir / "run.json").read_bytes()
+    source_turn_result = (
+        source.run_dir / "turns" / "turn-001" / "result.json"
+    ).read_bytes()
+    source_metadata = json.loads(source_run_json)
+    assert source_metadata["last_snapshot"]["is_complete"] is True
+    source_scope = source_metadata["active_implementation_scope"]
+    assert isinstance(source_scope, dict)
+    scope_id = source_scope["scope_id"]
+    envelope_path = source.run_dir / source_scope["envelope_artifact_path"]
+    envelope_bytes = envelope_path.read_bytes()
+
+    units = InMemoryUnitManager()
+    daemon = AflowDaemon(
+        DaemonConfig(
+            repo_root=repo_root,
+            config_path=config_path,
+            aflow_executable=executable,
+            environment_file=environment_file,
+            release_identity="release-test",
+            stop_timeout_seconds=0,
+        ),
+        units=units,
+    )
+    daemon.start()
+
+    preview = daemon.service.run_status(source_id)
+    assert preview.status == "owner_stopped"
+    assert preview.evidence["can_resume"] is True
+
+    continuation = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-key",
+    )
+    assert continuation.run_id != source_id
+    assert len(units.start_calls) == 1
+    assert units.stop_calls == []
+    record = daemon.service._read_record(continuation.run_id)
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    prepared, resume_context = _worker_prepared(
+        record,
+        manifest,
+        repo_root,
+        config_path,
+        workflow_config,
+    )
+    assert prepared.start_step == "implement"
+    assert resume_context is not None
+    assert resume_context.interrupted_step_name == "review"
+    assert resume_context.active_implementation_scope is not None
+    assert resume_context.active_implementation_scope.scope_id == scope_id
+    assert resume_context.scope_envelope_bytes == envelope_bytes
+    assert resume_context.scope_evidence_artifact_bytes
+    assert all(
+        (source.run_dir / relative_path).read_bytes() == artifact_bytes
+        for relative_path, artifact_bytes in resume_context.scope_evidence_artifact_bytes.items()
+    )
+
+    reviewer_invocations: list[str] = []
+
+    def reviewer(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        reviewer_invocations.append(str(kwargs.get("input", "")))
+        return subprocess.CompletedProcess(argv, 0, "review output\n", "")
+
+    continuation_result = run_workflow(
+        ControllerConfig(
+            repo_root=repo_root,
+            plan_path=prepared.plan_path,
+            max_turns=prepared.max_turns,
+            team=prepared.team,
+            extra_instructions=prepared.extra_instructions,
+            start_step=prepared.start_step,
+            reserved_run_id=prepared.reserved_run_id,
+            idempotency_key=prepared.idempotency_key,
+            caller_scope=prepared.caller_scope,
+            team_explicit=prepared.team_explicit,
+            max_turns_explicit=prepared.max_turns_explicit,
+            start_step_explicit=prepared.start_step_explicit,
+        ),
+        workflow_config,
+        "live",
+        config_dir=repo_root,
+        snapshot_config=False,
+        runner=reviewer,
+        resume=resume_context,
+        allow_existing_launch_manifest=True,
+    )
+
+    assert continuation_result.status == "completed"
+    assert len(reviewer_invocations) == 1
+    continuation_turn = json.loads(
+        (
+            continuation_result.run_dir / "turns" / "turn-001" / "result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert continuation_turn["step_name"] == "review"
+    assert continuation_turn["step_role"] == "reviewer"
+    assert (source.run_dir / "run.json").read_bytes() == source_run_json
+    assert (
+        source.run_dir / "turns" / "turn-001" / "result.json"
+    ).read_bytes() == source_turn_result
 
 
 @pytest.mark.parametrize("source_phase", ("unit_started", "launch_started"))

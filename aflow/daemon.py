@@ -803,6 +803,7 @@ class DaemonService:
                     "interrupted",
                     "needs_attention",
                     "waiting_for_valid_override",
+                    "owner_stopped",
                 }:
                     raise DaemonError(
                         "source run is incomplete, terminal, or lacks safe resume evidence"
@@ -923,7 +924,15 @@ class DaemonService:
         from .control_plane.run_activity import project_activity
         status = self._application.repository.get_run_status(run_id)
         if status.status == "owner_stopped":
-            return project_activity(status)
+            return project_activity(
+                replace(
+                    status,
+                    evidence={
+                        **status.evidence,
+                        "can_resume": self._can_resume(status),
+                    },
+                )
+            )
         if status.ownership != "control_plane":
             return project_activity(status)
         status = replace(status, evidence={**status.evidence, "can_resume": self._can_resume(status)})
@@ -975,7 +984,13 @@ class DaemonService:
         worker = status.evidence.get("worker")
         if isinstance(worker, Mapping) and not confirmed_inactive(worker):
             return False
-        if status.status not in {"failed", "interrupted", "needs_attention", "waiting_for_valid_override"}:
+        if status.status not in {
+            "failed",
+            "interrupted",
+            "needs_attention",
+            "waiting_for_valid_override",
+            "owner_stopped",
+        }:
             return False
         if status.launch_phase in {None, "manifest_only", "launch_requested"}:
             return False

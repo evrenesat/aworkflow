@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from threading import Event, Thread
 from urllib.parse import urlsplit
 
 import pytest
@@ -1207,6 +1208,238 @@ def test_responsive_live_controls_and_restart(
             assert successor_requests[1] == successor_requests[0]
         finally:
             browser.close()
+
+
+def test_stop_after_current_turn_delayed_worker_journey(control_client, monkeypatch):
+    """Exercise a persisted boundary stop through the real controller and UI."""
+    from aflow.api.runner import execute_workflow as canonical_execute_workflow
+    from aflow.control_plane import read_events
+    from aflow.control_plane.units import UnitState
+    from aflow.daemon import worker_main
+
+    client, root, units, _ = control_client
+    config_path = root.parent / "global" / "aflow.toml"
+    config_path.write_text(
+        """
+[aflow]
+default_workflow = "managed"
+
+[harness.codex.profiles.test]
+model = "test"
+
+[roles]
+worker = "codex.test"
+reviewer = "codex.test"
+
+[prompts]
+implement = "Implement the checkpoint."
+review = "Review the completed worker turn."
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    config_path.with_name("workflows.toml").write_text(
+        """
+[workflow.managed.steps.implement]
+role = "worker"
+prompts = ["implement"]
+go = [{ to = "review" }]
+
+[workflow.managed.steps.review]
+role = "reviewer"
+prompts = ["review"]
+go = [{ to = "END" }]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    plan_path = root / "plans" / "in-progress" / "graceful-stop-plan.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(
+        "# Graceful stop fixture\n\n"
+        "### [ ] Checkpoint 1: Review the worker\n"
+        "- [ ] Preserve the pending review\n",
+        encoding="utf-8",
+    )
+
+    entered = Event()
+    release = Event()
+    worker_done = Event()
+    invocations: list[dict[str, object]] = []
+    worker_errors: list[BaseException] = []
+    worker_codes: list[int] = []
+    worker_threads: list[Thread] = []
+
+    def fake_runner(argv, **kwargs):
+        prompt = str(kwargs.get("input", ""))
+        invocations.append({"argv": tuple(argv), "prompt": prompt})
+        entered.set()
+        if not release.wait(timeout=15):
+            raise AssertionError("fake provider was not released")
+        return subprocess.CompletedProcess(argv, 0, "worker completed\n", "")
+
+    def execute_with_fake_provider(prepared, **kwargs):
+        return canonical_execute_workflow(
+            prepared,
+            runner=fake_runner,
+            **kwargs,
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    monkeypatch.setattr("aflow.daemon.execute_workflow", execute_with_fake_provider)
+    original_start = units.start
+
+    def start_and_run_worker(name, argv, **kwargs):
+        started = original_start(name, argv, **kwargs)
+        run_id = name.removeprefix("aflow-run-").removesuffix(".service")
+
+        def run_worker() -> None:
+            try:
+                worker_codes.append(
+                    worker_main(
+                        repo_root=root,
+                        config_path=config_path,
+                        run_id=run_id,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                worker_errors.append(exc)
+            finally:
+                units.units[name] = UnitState(
+                    name=name,
+                    active_state="inactive",
+                    sub_state="dead",
+                    result="success" if not worker_errors else "failed",
+                )
+                worker_done.set()
+
+        thread = Thread(
+            target=run_worker,
+            name=f"responsive-worker-{run_id}",
+            daemon=True,
+        )
+        worker_threads.append(thread)
+        thread.start()
+        return started
+
+    monkeypatch.setattr(units, "start", start_and_run_worker)
+    try:
+        started = client.post(
+            f"/api/control-plane/projects/{PROJECT_ID}/runs",
+            headers={"Idempotency-Key": "responsive-real-boundary-start"},
+            json={
+                "plan_path": "plans/in-progress/graceful-stop-plan.md",
+                "workflow_name": "managed",
+                "max_turns": 3,
+                "dirty_worktree_confirmed": True,
+            },
+        )
+        assert started.status_code == 201, started.text
+        run_id = started.json()["result"]["run_id"]
+        run_path = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+        assert entered.wait(timeout=10), "fake provider did not start"
+        initial = client.get(run_path)
+        assert initial.status_code == 200, initial.text
+        assert initial.json()["status"] == "running"
+        assert initial.json()["activity"] == "active"
+        assert units.stop_calls == []
+
+        dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+        monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+        with live_server() as url, sync_playwright() as playwright:
+            browser = _browser(playwright)
+            try:
+                page = browser.new_page(viewport={"width": 1280, "height": 720})
+                _login(page, url)
+                _ensure_project(page)
+                run_url = f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}"
+                page.goto(run_url)
+                dashboard = _visible_dashboard(page)
+                boundary = dashboard.get_by_role(
+                    "button", name="Stop after current turn", exact=True
+                )
+                boundary.wait_for()
+                boundary.click()
+                page.get_by_text(
+                    "Stop requested — finishing current turn", exact=False
+                ).wait_for()
+                assert page.get_by_text("Running", exact=True).count() > 0
+                assert page.get_by_role("button", name="Stop now…", exact=True).count() == 1
+
+                persisted = client.get(run_path)
+                assert persisted.status_code == 200, persisted.text
+                persisted_payload = persisted.json()
+                assert persisted_payload["status"] == "running"
+                assert persisted_payload["activity"] == "active"
+                assert persisted_payload["revision"] == 1
+                assert persisted_payload["evidence"]["overrides"]["owner_stop"] is True
+                assert persisted_payload["evidence"]["overrides"]["state"] == "pending"
+                assert units.stop_calls == []
+                assert len(invocations) == 1
+
+                # A fresh browser read must retain the pending intent before
+                # the provider is released.
+                page.goto(f"{url}/?project={PROJECT_ID}&view=projects")
+                page.get_by_role("button", name="Test project", exact=False).first.wait_for()
+                page.goto(run_url)
+                dashboard = _visible_dashboard(page)
+                page.get_by_text(
+                    "Stop requested — finishing current turn", exact=False
+                ).wait_for()
+                assert page.get_by_text("Running", exact=True).count() > 0
+                assert dashboard.get_by_role(
+                    "button", name="Stop now…", exact=True
+                ).count() == 1
+
+                release.set()
+                assert worker_done.wait(timeout=15), "controller did not finalize"
+                for thread in worker_threads:
+                    thread.join(timeout=2)
+                assert worker_errors == []
+                assert worker_codes == [0]
+
+                run_dir = root / ".aflow" / "runs" / run_id
+                metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+                turn_result = json.loads(
+                    (run_dir / "turns" / "turn-001" / "result.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert metadata["status"] == "owner_stopped"
+                assert metadata["active_implementation_scope"]["awaiting_review"] is True
+                assert turn_result["status"] == "completed"
+                assert turn_result["step_role"] == "worker"
+                assert turn_result["chosen_transition"] == "review"
+                assert "worker completed" in (
+                    run_dir / "turns" / "turn-001" / "stdout.txt"
+                ).read_text(encoding="utf-8")
+                assert len(invocations) == 1
+                assert read_events(run_dir)[-1].event_type == "owner_stopped"
+                assert units.stop_calls == []
+
+                refreshed = client.get(run_path)
+                assert refreshed.status_code == 200, refreshed.text
+                assert refreshed.json()["status"] == "owner_stopped"
+                assert refreshed.json()["launch_phase"] == "owner_stopped"
+                page.get_by_role("button", name="More", exact=True).click()
+                page.get_by_role("menuitem", name="Refresh", exact=True).click()
+                page.get_by_label("Run details").get_by_text(
+                    "Stopped", exact=True
+                ).wait_for()
+                assert page.get_by_role(
+                    "button", name="Stop after current turn", exact=True
+                ).count() == 0
+                assert page.get_by_role(
+                    "button", name="Stop now…", exact=True
+                ).count() == 0
+            finally:
+                browser.close()
+    finally:
+        release.set()
+        for thread in worker_threads:
+            thread.join(timeout=5)
+        assert worker_errors == []
 
 
 def test_durable_recovery_ui_journey(control_client, monkeypatch):

@@ -1477,6 +1477,14 @@ def _bootstrap_resume_invocation(
 
     effective_extra = extra_instructions_arg if extra_instructions_provided else saved_extra
 
+    has_owner_stopped_pending_review = (
+        _owner_stopped_review_step(
+            run_dir,
+            prev_run,
+            workflow_steps=workflow_spec.steps,
+        )
+        is not None
+    )
     mismatch_reason = _resume_candidate_mismatch_reason(
         prev_run,
         workflow_spec,
@@ -1491,6 +1499,8 @@ def _bootstrap_resume_invocation(
         allow_start_step_override=start_step_override,
         allow_max_turns_override=max_turns_override,
         allow_extra_instructions_override=extra_instructions_provided,
+        allow_owner_stopped=has_owner_stopped_pending_review,
+        allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
     )
@@ -1557,6 +1567,8 @@ def _resume_candidate_mismatch_reason(
     allow_extra_instructions_override: bool = False,
     allow_start_step_override: bool = False,
     allow_max_turns_override: bool = False,
+    allow_owner_stopped: bool = False,
+    allow_owner_stopped_pending_review: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
 ) -> str | None:
@@ -1596,10 +1608,14 @@ def _resume_candidate_mismatch_reason(
             return "it has no recorded worktree path"
 
     status = prev_run.get("status")
-    if status not in ("failed", "running", "waiting_for_valid_override"):
+    allowed_statuses = ("failed", "running", "waiting_for_valid_override")
+    if allow_owner_stopped:
+        allowed_statuses = (*allowed_statuses, "owner_stopped")
+    if status not in allowed_statuses:
         return (
             f"its status is '{status}', not 'failed', 'running', or "
             "'waiting_for_valid_override'"
+            + (" or 'owner_stopped'" if allow_owner_stopped else "")
         )
 
     last_snapshot = prev_run.get("last_snapshot")
@@ -1609,6 +1625,7 @@ def _resume_candidate_mismatch_reason(
         and last_snapshot.get("is_complete") is True
         and not terminal_integration_only
         and not terminal_completion_only
+        and not allow_owner_stopped_pending_review
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
     ):
         return "its last saved plan snapshot was already complete"
@@ -1707,13 +1724,74 @@ def _prompt_resume(
     return response in ("", "y", "yes")
 
 
+def _owner_stopped_review_step(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
+) -> str | None:
+    """Recover the configured reviewer after a finalized worker boundary stop."""
+    if (
+        prev_run.get("status") != "owner_stopped"
+        or prev_run.get("end_reason") != "owner_stopped"
+        or prev_run.get("pending_boundary_decision") is not None
+    ):
+        return None
+    current_step_name = prev_run.get("current_step_name")
+    if not isinstance(current_step_name, str) or not current_step_name.strip():
+        return None
+    scope = prev_run.get("active_implementation_scope")
+    if not isinstance(scope, Mapping) or scope.get("awaiting_review") is not True:
+        return None
+    if workflow_steps is not None:
+        step = workflow_steps.get(current_step_name)
+        if step is None or getattr(step, "role", None) != "reviewer":
+            return None
+
+    turns_completed = prev_run.get("turns_completed")
+    active_turn = prev_run.get("active_turn")
+    if (
+        not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed < 1
+        or active_turn != turns_completed
+    ):
+        return None
+    result_path = run_dir / "turns" / f"turn-{turns_completed:03d}" / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("status") != "completed"
+        or result.get("turn_number") != turns_completed
+        or result.get("step_role") != "worker"
+        or not isinstance(result.get("step_name"), str)
+        or not result.get("step_name")
+        or result.get("chosen_transition") != current_step_name
+        or result.get("returncode") != 0
+        or not isinstance(result.get("snapshot_after"), Mapping)
+    ):
+        return None
+    return current_step_name
+
+
 def _interrupted_resume_step(
     run_dir: Path,
     prev_run: Mapping[str, object],
+    *,
+    workflow_steps: Mapping[str, object] | None = None,
 ) -> str | None:
     """Return the workflow step whose durable turn never finalized."""
     status = prev_run.get("status")
     current_step_name = prev_run.get("current_step_name")
+    if status == "owner_stopped":
+        return _owner_stopped_review_step(
+            run_dir,
+            prev_run,
+            workflow_steps=workflow_steps,
+        )
     if status == "failed" and prev_run.get("failure_kind") == "environment_preflight":
         preflight = prev_run.get("environment_preflight")
         if not isinstance(preflight, Mapping):
@@ -2299,7 +2377,11 @@ def _reconstruct_resume_context(
                     (terminal_integration_only or terminal_completion_only)
                     and isinstance(prev_run.get("current_step_name"), str)
                 )
-                else _interrupted_resume_step(run_dir, prev_run)
+                else _interrupted_resume_step(
+                    run_dir,
+                    prev_run,
+                    workflow_steps=workflow_steps,
+                )
             )
         ),
         pending_finalized_turn=pending_finalized_turn,
@@ -2425,6 +2507,14 @@ def _detect_resume_candidate(
                 raise
             return None
 
+    has_owner_stopped_pending_review = (
+        _owner_stopped_review_step(
+            run_dir,
+            prev_run,
+            workflow_steps=getattr(workflow_config, "steps", None),
+        )
+        is not None
+    )
     reason = _resume_candidate_mismatch_reason(
         prev_run,
         workflow_config,
@@ -2442,6 +2532,8 @@ def _detect_resume_candidate(
         allow_extra_instructions_override=resume_bootstrap is not None,
         allow_start_step_override=allow_start_step_override,
         allow_max_turns_override=allow_max_turns_override,
+        allow_owner_stopped=has_owner_stopped_pending_review,
+        allow_owner_stopped_pending_review=has_owner_stopped_pending_review,
         team_explicit=team_explicit,
         max_turns_explicit=max_turns_explicit,
     )

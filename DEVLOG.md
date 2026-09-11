@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-11 — Expose graceful stop and preserve pending review
+
+- Exposed the existing revisioned owner_stop intent through REST, MCP and
+  Stop after current turn. Saved intent remains visibly pending until the
+  current worker/reviewer call finalizes; Stop now retains exact-unit
+  interruption. Neither action implies checkpoint approval.
+- Ordinary continuation restores the validated pending reviewer and scope,
+  including when the worker completed the final checkpoint. Complete plans
+  without pending-review evidence remain rejected; replacement recovery
+  remains separate.
+- Real delayed-provider Chromium/WebKit journeys verify pending refresh,
+  finalized evidence and no unit stop or next invocation. Focused runtime,
+  daemon, transport and dashboard checks verify continuation, concurrency and
+  terminal controls; production build passed. CI owns full suites.
+
 ## 2026-09-11 — Recover explicitly with a replacement worker (issue 36)
 
 - Added durable-evidence recovery to canonical resume, REST, MCP, and the
