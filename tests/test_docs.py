@@ -63,7 +63,11 @@ class SkillDocsTests(unittest.TestCase):
         assert (skill_root / 'scripts' / 'aflow_guard_snapshot.py').exists()
         assert (skill_root / 'scripts' / 'aflow_guard_issue.py').exists()
         assert (skill_root / 'scripts' / 'aflow_guard_recovery.py').exists()
-        assert not (skill_root / 'scripts' / 'aflow_guard_report.py').exists()
+        assert (skill_root / 'scripts' / 'aflow_guard_report_input.py').exists()
+        assert (skill_root / 'scripts' / 'aflow_guard_report.py').exists()
+        assert (skill_root / 'references' / 'report-input.md').exists()
+        assert (skill_root / 'scripts' / 'assets' / 'DejaVuSans.ttf').exists()
+        assert (skill_root / 'scripts' / 'assets' / 'DejaVuSans-Bold.ttf').exists()
         assert not (skill_root / 'references' / 'reporting-and-email.md').exists()
 
         text = (skill_root / 'SKILL.md').read_text(encoding='utf-8')

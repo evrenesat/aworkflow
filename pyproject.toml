@@ -25,6 +25,7 @@ Issues = "https://github.com/evrenesat/aworkflow/issues"
 
 [dependency-groups]
 dev = [
+    "pillow>=11.0.0",
     "pytest>=8.0.0",
     "ruff==0.16.5",
     "playwright>=1.49.0",

@@ -1,4 +1,4 @@
 interface:
   display_name: "Observe AFlow Run"
-  short_description: "Observe legacy, local-daemon, and aflowd runs"
-  default_prompt: "Use $aflow-guard-development-run to resolve this run's legacy, local-daemon, or aflowd ownership, then monitor it every 30 minutes through the matching read-only surface. Stay silent while healthy, never fix or steer it, report each anomaly once, audit the terminal result, and then stop."
+  short_description: "Observe runs with bounded deterministic A4 reports"
+  default_prompt: "Use $aflow-guard-development-run for one exact pinned run; stay read-only, keep healthy ticks silent, and produce the bounded PNG/JSON report only for an explicit :vr request."

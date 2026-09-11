@@ -24,3 +24,6 @@ def test_guard_guidance_uses_ownership_matched_observation_contract() -> None:
     assert "Never add a CLI or tmux controller to a server-owned run." in skill
     assert "Deployment is the sole post-launch mutation and is allowed only when the user" in skill
     assert "explicitly authorized it for this run and the terminal audit passed." in skill
+    assert "scripts/aflow_guard_report_input.py" in skill
+    assert "unavailable evidence stays unknown" in skill
+    assert "guard never\nauthorizes a relaunch or other recovery" in skill

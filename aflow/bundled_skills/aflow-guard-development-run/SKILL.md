@@ -227,6 +227,98 @@ For a new anomaly, inspect only:
 Do not inspect Git history, old turns, complete transcripts, previous scheduled
 task history, or repeated unchanged evidence.
 
+## Build a bounded diagnostic report input
+
+When an explicit report is requested, read `references/report-input.md` and
+run `scripts/aflow_guard_report_input.py` against one ownership-matched
+observation. For `legacy`, that is the bounded snapshot. For `ui-server` or
+`aflowd`, capture the unmodified schema-1 JSON returned by one authenticated
+`get_run`, record its UTC response time, and invoke:
+
+```bash
+python3 <skill-dir>/scripts/aflow_guard_report_input.py \
+  --canonical-observation <absolute-external-directory>/get-run.json \
+  --repo <guarded-repo> \
+  --run-id <run-id> \
+  --ownership-mode <ui-server|aflowd> \
+  --observed-at <UTC-ISO-8601-response-time> \
+  --output <absolute-external-directory>/guard-report-input.json
+```
+
+The canonical response itself has no repository or observation timestamp; the
+pinned command arguments bind those facts without changing the response. The
+helper produces only the versioned, bounded JSON input for the deterministic
+renderer: identity, current status/activity/ownership, available checkpoint
+and finalized-turn facts, worker routing, and diagnosis fields.
+Healthy observations remain silent. A new orphan is limited to the documented
+identity- and time-matched cause ladder; unavailable evidence stays unknown,
+provider completion remains a duplicate-operation risk, and the guard never
+authorizes a relaunch or other recovery.
+
+## Produce an explicit `:vr` report
+
+Treat `:vr` as an explicit, report-only request for the exact run already pinned
+by this guard. Never resolve “latest” or accept a repository, run ID, or
+ownership mode different from the pinned values. The request does not authorize
+recovery, notification, issue creation, email, provider access, or any write to
+the guarded repository. It also does not route through generic visualization or
+image-generation tools.
+
+For a `legacy` run, take one read-only snapshot and keep every intermediate and
+final artifact in an absolute directory outside the guarded repository. Use the
+existing external guard-state path when one is already configured; `--no-write`
+is mandatory and `--mark-notified` is forbidden for a report:
+
+```bash
+python3 <skill-dir>/scripts/aflow_guard_snapshot.py \
+  --repo <guarded-repo> \
+  --run-id <run-id> \
+  --state-file <external-guard-state-file> \
+  --no-write > <absolute-external-directory>/guard-snapshot.json
+
+python3 <skill-dir>/scripts/aflow_guard_report_input.py \
+  --snapshot <absolute-external-directory>/guard-snapshot.json \
+  --repo <guarded-repo> \
+  --run-id <run-id> \
+  --output <absolute-external-directory>/guard-report-input.json
+
+uv run --script <skill-dir>/scripts/aflow_guard_report.py \
+  --input <absolute-external-directory>/guard-report-input.json \
+  --output-dir <absolute-external-directory>
+```
+
+The report-input builder is mandatory: it validates the pinned identity and
+bounded schema before the renderer accepts the input. For `ui-server` or
+`aflowd`, use one authenticated `get_run` through the advertised MCP endpoint
+and its canonical ownership-matched observation instead of the legacy process
+snapshot, then pass that validated observation through the same builder and
+renderer. Never substitute process inspection for server ownership or add a
+controller to obtain a report.
+
+Return the generated PNG inline using its exact absolute external path. The
+normalized JSON is an optional evidence link:
+
+```markdown
+![AFlow guard report](/absolute/external/path/guard-report.png)
+
+[Normalized report JSON](/absolute/external/path/guard-report.json)
+```
+
+The renderer produces only the bounded deterministic A4 PNG and normalized
+JSON. Do not create HTML or PDF, send email, write guarded artifacts, or start
+recovery as part of `:vr`.
+
+### Diagnose a new anomaly before owner action
+
+For a new anomaly fingerprint, produce one bounded diagnostic report before
+requesting owner action. Separate confirmed facts from likely or unknown cause;
+use `unknown` when evidence does not directly support a cause, and show the
+missing or contradictory evidence. State the exact decision the owner must make
+and preserve duplicate-operation risk when provider completion is unknown. The
+guard may say to inspect the exact recorded operation and choose an action, but
+must never recommend a blind relaunch. Healthy scheduled ticks remain silent,
+and an unchanged fingerprint receives no second report or owner request.
+
 ## Report an AFlow engine defect
 
 Distinguish a project implementation/test failure from an AFlow controller,

@@ -100,6 +100,22 @@ Configuration is split across two TOML files: `aflow.toml` contains harness
 profiles, roles, teams, prompts, and controller settings. `workflows.toml`
 contains workflow graphs and lifecycle defaults.
 
+## Read-only guard reports
+
+The bundled `aflow-guard-development-run` skill treats an explicit `:vr`
+request as a report for the already pinned run. It takes one
+ownership-matched, read-only observation, runs
+`aflow_guard_report_input.py`, and then runs the bundled Pillow renderer through
+`uv run --script aflow_guard_report.py`. The renderer writes only a deterministic
+1240×1754 A4 `guard-report.png` and its normalized `guard-report.json`.
+
+Keep snapshots, inputs, and reports in an absolute directory outside the guarded
+repository. Healthy scheduled observations stay silent; `:vr` does not authorize
+recovery, notifications, email, provider access, or generic visualization/image
+generation. UI-server and `aflowd` runs use their authenticated canonical MCP
+`get_run` observation, with pinned repository/run/ownership metadata and a
+captured response time, rather than legacy process inspection.
+
 ## Run a plan
 
 ```bash

@@ -18,6 +18,8 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 3
 MAX_HISTORY = 32
+MAX_RESULT_BYTES = 64 * 1024
+_ACTIVE_TURN_STATUSES = frozenset({"starting", "running", "active", "in_progress"})
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
 )
@@ -50,47 +52,130 @@ def _compact_run(run: dict[str, Any]) -> dict[str, Any]:
         last = {}
     plan_value = run.get("plan_path") or run.get("original_plan_path")
     plan_name = Path(plan_value).name if isinstance(plan_value, str) else None
+    current_step = (
+        run.get("current_step_name")
+        or run.get("current_step")
+        or last.get("current_step")
+    )
+    checkpoint_index = last.get("current_checkpoint_index")
+    checkpoint_name = last.get("current_checkpoint_name")
+    checkpoint_total = last.get("total_checkpoint_count")
+    if not isinstance(checkpoint_index, int) or isinstance(checkpoint_index, bool) or checkpoint_index < 1:
+        checkpoint_index = None
+    if not isinstance(checkpoint_name, str) or not checkpoint_name.strip():
+        checkpoint_name = None
+    if not isinstance(checkpoint_total, int) or isinstance(checkpoint_total, bool) or checkpoint_total < 1:
+        checkpoint_total = None
+    checkpoint = (
+        {"index": checkpoint_index, "name": checkpoint_name}
+        if checkpoint_index is not None or checkpoint_name is not None
+        else None
+    )
+    progress_availability = (
+        "available"
+        if checkpoint_total is not None
+        else "partial"
+        if checkpoint is not None
+        else "unavailable"
+    )
     return {
         "status": run.get("status"),
         "turns_completed": run.get("turns_completed"),
-        "current_step": run.get("current_step") or last.get("current_step"),
+        "current_step": current_step,
+        "active_turn": run.get("active_turn"),
         "is_complete": last.get("is_complete"),
         "plan_name": plan_name,
         "resumed_from_run_id": run.get("resumed_from_run_id"),
         "workflow_name": run.get("workflow_name"),
         "team": run.get("team"),
+        "progress": {
+            "availability": progress_availability,
+            "checkpoint": checkpoint,
+            "total": checkpoint_total,
+            "complete": (
+                last.get("is_complete")
+                if isinstance(last.get("is_complete"), bool)
+                else None
+            ),
+        },
     }
 
 
 def _compact_result(path: Path) -> dict[str, Any] | None:
     try:
-        value = _read_json(path)
         stat = path.stat()
+        if (
+            path.is_symlink()
+            or path.parent.is_symlink()
+            or stat.st_size > MAX_RESULT_BYTES
+        ):
+            return None
+        value = _read_json(path)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
+    status = value.get("status")
+    normalized_status = (
+        status.strip().casefold() if isinstance(status, str) and status.strip() else None
+    )
+    finished_at = value.get("finished_at")
+    if (
+        normalized_status is None
+        or normalized_status in _ACTIVE_TURN_STATUSES
+        or not isinstance(finished_at, str)
+        or not finished_at.strip()
+    ):
+        return None
+    try:
+        parsed_finished_at = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed_finished_at.tzinfo is None:
+        return None
+    turn_number = value.get("turn_number")
+    if not isinstance(turn_number, int) or isinstance(turn_number, bool) or turn_number < 1:
+        turn_number = None
     return {
         "name": path.parent.name,
+        "turn_number": turn_number,
+        "finished_at": finished_at,
+        "finalized": True,
         "mtime_epoch": int(stat.st_mtime),
-        "status": value.get("status"),
+        "status": status,
         "verdict": value.get("verdict"),
         "role": value.get("role"),
         "step": value.get("step") or value.get("step_name"),
+        "selector": value.get("selector"),
+        "model": value.get("model"),
+        "effort": value.get("effort"),
     }
 
 
 def _latest_result(run_dir: Path) -> dict[str, Any] | None:
-    candidates: list[tuple[float, Path]] = []
+    candidates: list[tuple[int, float, str, dict[str, Any]]] = []
+    turns_dir = run_dir / "turns"
     try:
-        for path in run_dir.glob("**/result.json"):
+        if turns_dir.is_symlink() or not turns_dir.is_dir():
+            return None
+        for path in turns_dir.glob("*/result.json"):
             try:
-                candidates.append((path.stat().st_mtime, path))
+                compact = _compact_result(path)
+                if compact is None:
+                    continue
+                turn_number = compact.get("turn_number")
+                if not isinstance(turn_number, int):
+                    match = re.fullmatch(r"turn-(\d+)", path.parent.name)
+                    turn_number = int(match.group(1)) if match else 0
+                compact["path"] = path.relative_to(run_dir).as_posix()
+                candidates.append(
+                    (turn_number, path.stat().st_mtime, path.as_posix(), compact)
+                )
             except OSError:
                 continue
     except OSError:
         return None
     if not candidates:
         return None
-    return _compact_result(max(candidates, key=lambda item: item[0])[1])
+    return max(candidates, key=lambda item: item[:3])[3]
 
 
 def _list_processes() -> list[ProcessRecord]:
@@ -265,6 +350,21 @@ def _classify(
     return "invalid_state", "report_and_pause"
 
 
+def _legacy_activity(status: object, classification: str) -> str:
+    if classification in {"active_progress", "active_waiting_child", "active_waiting"}:
+        return "active"
+    if classification in {
+        "orphaned_controller",
+        "terminal_success",
+        "terminal_failed",
+        "terminal_incomplete",
+    }:
+        return "inactive"
+    if status in {"running", "completed", "failed"}:
+        return "unknown"
+    return "unavailable"
+
+
 def _fingerprint(
     run_id: str,
     run: dict[str, Any],
@@ -402,6 +502,9 @@ def collect_snapshot(
         "state_file": str(state_path),
         "classification": classification,
         "recommended_action": action,
+        "ownership": "legacy",
+        "activity": _legacy_activity(run.get("status"), classification),
+        "observation_surface": "legacy_process_snapshot",
         "fingerprint": fingerprint,
         "changed_since_previous": changed,
         "unchanged_intervals": unchanged,

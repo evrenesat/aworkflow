@@ -798,7 +798,11 @@ def test_include_optional_links_supporting_resources_through_the_link(
     assert (guard / "agents" / "openai.yaml").is_file()
     assert (guard / "scripts" / "aflow_guard_issue.py").is_file()
     assert (guard / "scripts" / "aflow_guard_recovery.py").is_file()
-    assert not (guard / "scripts" / "aflow_guard_report.py").exists()
+    assert (guard / "scripts" / "aflow_guard_report_input.py").is_file()
+    assert (guard / "scripts" / "aflow_guard_report.py").is_file()
+    assert (guard / "references" / "report-input.md").is_file()
+    assert (guard / "scripts" / "assets" / "DejaVuSans.ttf").is_file()
+    assert (guard / "scripts" / "assets" / "DejaVuSans-Bold.ttf").is_file()
     assert not (guard / "references" / "reporting-and-email.md").exists()
 
 

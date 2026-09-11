@@ -474,3 +474,43 @@ def test_cli_exposes_tmux_and_no_recovery_options() -> None:
     assert "--screen-session" not in help_text
     assert "--mark-recovery-attempt" not in help_text
     assert "--replacement-successor-run-id" not in help_text
+
+
+def test_latest_result_ignores_a_newer_starting_turn(tmp_path: Path) -> None:
+    helper = _helper_module()
+    repo = tmp_path / "repo"
+    run_id = "20260811T120000Z-abcd1234"
+    _write_run(repo, run_id, status="running", complete=False)
+    run_dir = repo / ".aflow" / "runs" / run_id
+    finalized = run_dir / "turns" / "turn-001" / "result.json"
+    finalized.parent.mkdir(parents=True)
+    finalized.write_text(
+        json.dumps(
+            {
+                "turn_number": 1,
+                "status": "completed",
+                "finished_at": "2026-08-11T12:00:05+00:00",
+                "step_name": "implement",
+            }
+        ),
+        encoding="utf-8",
+    )
+    starting = run_dir / "turns" / "turn-002" / "result.json"
+    starting.parent.mkdir()
+    starting.write_text(
+        json.dumps(
+            {
+                "turn_number": 2,
+                "status": "starting",
+                "started_at": "2026-08-11T12:01:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = helper._latest_result(run_dir)
+
+    assert result is not None
+    assert result["turn_number"] == 1
+    assert result["status"] == "completed"
+    assert result["finalized"] is True

@@ -557,7 +557,7 @@ def test_real_bundled_package_refresh_keeps_edits_and_idempotence(
     assert repeat.changed is False
 
 
-def test_real_guard_refresh_contains_recovery_helper_without_stale_bundle_files(
+def test_real_guard_refresh_contains_report_bundle_without_stale_bundle_files(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "skills"
@@ -568,5 +568,9 @@ def test_real_guard_refresh_contains_recovery_helper_without_stale_bundle_files(
     assert result.status == "initialized"
     guard = root / "aflow-guard-development-run"
     assert (guard / "scripts" / "aflow_guard_recovery.py").is_file()
-    assert not (guard / "scripts" / "aflow_guard_report.py").exists()
+    assert (guard / "scripts" / "aflow_guard_report_input.py").is_file()
+    assert (guard / "scripts" / "aflow_guard_report.py").is_file()
+    assert (guard / "references" / "report-input.md").is_file()
+    assert (guard / "scripts" / "assets" / "DejaVuSans.ttf").is_file()
+    assert (guard / "scripts" / "assets" / "DejaVuSans-Bold.ttf").is_file()
     assert not (guard / "references" / "reporting-and-email.md").exists()

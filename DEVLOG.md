@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-11 — Deterministic read-only guard reports (issue 4)
+
+- Added bounded, ownership-matched canonical/legacy report inputs and a bundled
+  Pillow renderer for deterministic external A4 PNG/JSON reports. Explicit `:vr`
+  routing preserves silent healthy ticks and grants no recovery authority.
+- Preserve finalized-turn evidence, unknown cause and duplicate-operation risk;
+  canonical startup/input/override states name the required owner action.
+- Bundled fonts, visible truncation and separated fields keep reports readable.
+  Install/refresh checks preserve edited skill trees. Focused tests and visual
+  checks passed; full suites and activation remain delivery-gate responsibilities.
+
 ## 2026-09-11 — Separate pending user acceptance from checkpoint gates (Issue 39)
 
 - Bundled `aflow-plan` guidance now keeps executable checkpoint task lists to
