@@ -1,5 +1,22 @@
 # DEVLOG
 
+## 2026-09-11 — Separate pending user acceptance from checkpoint gates (Issue 39)
+
+- Bundled `aflow-plan` guidance now keeps executable checkpoint task lists to
+  agent-owned implementation and verification. Owner-only physical or mobile
+  checks live under a top-level `## User Acceptance Pending` handoff section
+  with an owner, prerequisites, exact action, expected result, and pending
+  status.
+- Execution and review guidance reports implementation delivery separately from
+  user acceptance. Pending user checks do not trigger worker retries or reject
+  implementation review, while implementation defects, required automated
+  failures, and explicit release or approval gates remain blocking.
+- The existing parser boundary remains unchanged; the representative plan
+  probe confirms that a completed automated checkpoint parses complete while
+  the ordinary-bullet manual section remains byte-for-byte pending. Bundled
+  delivery is verified through the isolated skill-install test; no canonical
+  account-local skill store was refreshed.
+
 ## 2026-09-11 — Render truthful All runs loading (Issue 40, Checkpoint 1)
 
 - All runs now waits for the current registry/project/history identity before

@@ -20,6 +20,7 @@ Use this skill only for the final review pass of work produced under a aflow pla
 - If the full accumulated work is acceptable, approve and squash once at the whole-plan level.
 - If the full accumulated work is not acceptable, do not squash. Create a focused non-checkpoint fix plan for the failed checkpoints or behaviors instead of a whole-plan redo.
 - If the implementation is behaviorally correct, this review turn owns all approval-grade git/tracking chores needed for squash approval.
+- Treat a top-level `## User Acceptance Pending` section as a separate owner handoff. Pending items alone do not reject the implementation or trigger another worker pass; preserve explicit release or approval gates, report acceptance as pending, and never claim full acceptance without user evidence.
 - Treat `aflow` as the canonical spelling.
 - Compact `DEVLOG.md` to one handoff entry only when a squash actually happens and multiple handoff entries exist.
 

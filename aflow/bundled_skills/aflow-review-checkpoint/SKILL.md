@@ -26,6 +26,7 @@ Use this skill only for checkpoint-scoped review of work produced under an aflow
 - If the checkpoint looks correct, approve that checkpoint and advance the original plan's review state.
 - If the checkpoint is not acceptable, do not approve it. Create a focused non-checkpoint fix plan for the failed checkpoint or behaviors instead of a whole-plan redo.
 - If the checkpoint implementation is correct, this review turn owns the checkpoint commit and any reviewer-owned plan bookkeeping needed to approve it.
+- Treat a top-level `## User Acceptance Pending` section after the checkpoints as a separate owner handoff. Pending items alone are not grounds to reject a checkpoint or request another worker pass; reject for implementation defects, failed required automated gates, or explicit release or approval gates. Report implementation and acceptance separately and never claim full acceptance without user evidence.
 - Treat `aflow` as the canonical spelling.
 
 ## Core Rule

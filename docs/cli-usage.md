@@ -318,7 +318,7 @@ after conditional transitions.
 
 ## Plan Format
 
-`aflow` reads a Markdown plan from disk and derives progress from checkpoint headings plus unchecked task items inside each checkpoint.
+`aflow` reads a Markdown plan from disk and derives progress from checkpoint headings plus unchecked task items inside each checkpoint. User-owned acceptance is a separate handoff and is not executable checkpoint work.
 
 ```md
 # Plan
@@ -330,6 +330,19 @@ after conditional transitions.
 ### [ ] Checkpoint 2: Update Docs
 - [ ] document the final behavior
 ```
+
+After all checkpoint sections, keep owner-only checks under a top-level heading
+with ordinary bullets rather than task-list checkboxes:
+
+```md
+## User Acceptance Pending
+
+- Owner: product owner; prerequisites: reviewed implementation is available on a physical/mobile device; action: open the changed screen and exercise the named flow; expected result: the documented behavior works; status: pending until evidence is recorded.
+```
+
+Only checkpoint task items determine implementation progress. A final handoff
+reports implementation delivery and user acceptance separately; pending user
+checks remain actionable and are never described as passed without evidence.
 
 Parser rules:
 

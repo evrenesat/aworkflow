@@ -20,6 +20,7 @@ Create a generic, self-contained implementation plan organized into durable chec
 - Use absolute paths only for external artifacts explicitly supplied by the user or environment and not mirrored in the repository.
 - Keep the original handoff plan as the durable progress ledger.
 - Use `aflow` as the canonical spelling.
+- Keep executable checkpoint task lists limited to agent-owned implementation and verification. Put genuinely user-owned checks after all checkpoint sections under a top-level `## User Acceptance Pending` heading, using prose or ordinary bullets rather than task-list syntax.
 
 ## Planning Workflow
 
@@ -60,7 +61,7 @@ Keep the content concise. Omit repetition, background already captured elsewhere
 
 ## Output Contract
 
-- Use Markdown task lists (`- [ ]`) for checkpoints and meaningful internal steps.
+- Use Markdown task lists (`- [ ]`) for checkpoints and meaningful agent-owned implementation or verification steps only.
 - Define project-level and checkpoint-level completion as observable behavior.
 - Make each checkpoint independently implementable and verifiable.
 - State exact behavior, interfaces, defaults, precedence, validation, error handling, and preserved compatibility where relevant.
@@ -69,6 +70,9 @@ Keep the content concise. Omit repetition, background already captured elsewhere
 - Express behavioral acceptance tests as inputs and observable outcomes, not only test commands.
 - Map every important requirement to at least one concrete verification method.
 - Keep progress durable: checkboxes must represent verified work rather than activity.
+- If owner-only checks remain, append a top-level `## User Acceptance Pending` section after `Checkpoints`. Use prose or ordinary bullets, and name the owner, prerequisites, exact action, expected result, and pending status for each item.
+- Define `Done Means` as implementation delivery and user acceptance reported separately. Pending user checks alone do not fail implementation or review or trigger a worker retry; implementation defects, required automated failures, and explicit release or approval gates still block the applicable outcome.
+- Final handoffs must list pending user checks and never claim full acceptance without evidence; do not invent or waive an explicit user-required gate.
 - Include only the minimal `Git Tracking` fields shown below; the runtime populates them.
 
 For new plans, use the exact unnumbered level-two heading `## Git Tracking` with the
@@ -132,7 +136,21 @@ Use this checkpoint skeleton:
 - Stop and report if unrelated dirty files make change ownership ambiguous.
 ```
 
+When owner-only checks remain, append this after the last checkpoint section:
+
+```markdown
+## User Acceptance Pending
+
+- Owner: product owner; prerequisites: reviewed implementation is available on a physical/mobile device; action: open the changed screen and exercise the named flow; expected result: the documented behavior works; status: pending until the owner records evidence.
+```
+
 ## Global Guidance
+
+### Done Means
+
+- Implementation delivery is complete only when every required checkpoint step and automated gate passes.
+- User acceptance is complete only after the named owner supplies evidence for the listed checks. Pending owner-only checks do not block implementation or review, but defects, failed automated gates, and explicit release or approval gates remain blocking.
+- Final handoffs report both statuses and list pending actions; never claim full acceptance without evidence.
 
 ### Critical Invariants
 

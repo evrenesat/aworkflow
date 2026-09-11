@@ -25,6 +25,7 @@ The plan file is the source of truth. Do not rely on chat memory when the plan, 
 - For checkpointed plans, after implementation and checkpoint-level verification pass, validate each step in the target checkpoint one by one against the actual code, tests, and observable behavior before checking it off.
 - Do not check off a step just because the checkpoint appears complete overall. Each step must be explicitly confirmed.
 - Do not mark a checkpoint complete before every step in that checkpoint has been individually validated and checked off, and the required verification still passes.
+- Treat a top-level `## User Acceptance Pending` section after the checkpoints as handoff information, not executable work. Do not check it off or retry the worker for pending owner-only checks; implementation defects and required automated verification failures remain blocking.
 - Do not create checkpoint commits, final approval commits, squash commits, or review-bookkeeping commits. Reviewer workflows own all commit creation and approval-grade git bookkeeping.
 - Do not hide verified checkpoint work behind stale plan state or ambiguous git state.
 - Stop after the target checkpoint is implemented and verified, even if the original plan still has more unchecked checkpoints.

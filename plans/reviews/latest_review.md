@@ -1,71 +1,38 @@
-# Issue 40 — All runs loading cumulative approval
+# Issue 39 — Cumulative squash approval
 
-Original/active plan: `plans/in-progress/issue-40-all-runs-loading-20260911.md`.
-Branch: `aflow-issue-40-all-runs-loading-20260911-20260911-144836`.
-Unchanged Pre-Handoff Base HEAD: `7ffe5c6a5b3d51ab042e623e927d9e69a864bca6`.
-Reviewed HEAD: `fddca378970f1f34171c436e426f8fa3f28efe37`.
-Coverage: **1 new / 1 total commit**, `cp1 v01`, all of checkpoint 1 and the
-complete base-to-HEAD implementation. No prior findings or fix overlays belong
-to this handoff; the former latest record concerns other plans.
+Original/active plan: `plans/in-progress/issue-39-manual-acceptance-handoff-20260911.md`.
+Branch: `aflow-issue-39-manual-acceptance-handoff-20260911-20260911-151803`.
+Unchanged Pre-Handoff Base HEAD: `db97b15b32802b59dc8badeb8a6498494ceb9e62`.
+Reviewed HEAD: `59679819fe1e0edcdb58a9cf0593cf220dfd8200`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all checkpoint 1 requirements and all nine changed files. No previous findings or fix overlays belong to this handoff; the prior latest review concerns issue 40.
 
 ## Findings
 
-No material findings under the admission gate, exclusions and proportionate-fix
-discipline. Reviewed all five changed files, the global fetch/selection helpers,
-registry owner in App, scoped guidance and UI acceptance requirements.
-Initial registry and run requests suppress premature empty groups and counts;
-completion is keyed to sorted project IDs and history. Abort guards, hidden-page
-suspension, existing polling cadence, exact row identity, search and history
-selection remain intact. Failure exits initial loading; partial success and
-ordinary refresh retain rows. A visible CSS spinner, status text, aria-busy and
-reduced-motion static presentation satisfy the requested loading behavior.
-No production startup readiness or stop/recovery controls changed.
+No material findings under the finding admission gate, exclusions, and proportionate-fix discipline. Bundled planning guidance separates agent-owned tasks from ordinary-bullet owner acceptance under a level-two heading after checkpoints. Execution/review guidance prevents retries for pending owner-only checks while preserving implementation defects, required automated verification and explicit approval/release gates. Handoffs must report both statuses and require owner evidence before claiming acceptance. README, CLI documentation and the single DEVLOG entry agree. Parser, controller and account-local skills are unchanged.
 
-## Verification
+## Verification evidence
 
-Independent focused verification on the reviewed HEAD:
+Reused successful completed command evidence from the parent repository's `.aflow/runs/20260911t151803z-d3ccdf43/turns/turn-001/transport.stdout` and completed `result.json`; relevant implementation files did not change after these checks:
 
 ```sh
-npm --prefix apps/aflow_app/web test -- --run src/components/GlobalRunOverview.test.tsx src/globalRuns.test.ts
-# 16 passed across 2 files
-git diff --check 7ffe5c6a5b3d51ab042e623e927d9e69a864bca6 HEAD
-# passed
+uv run pytest -q tests/test_skill_install.py::test_manual_destination_links_default_skills_into_the_store
+# 1 passed, exit 0
+uv run pytest -q tests/test_plan.py::PlanParserTests::test_parser_global_section_after_last_checkpoint_does_not_affect_completion tests/test_plan.py::PlanParserTests::test_parser_non_checkpoint_heading_ends_step_counting
+# 2 passed, exit 0
+uv run pytest -q tests/test_docs.py::SkillDocsTests::test_plan_skill_uses_semantic_checkpoint_shaping_without_hard_stop tests/test_docs.py::SkillDocsTests::test_bundled_skills_keep_plan_worker_facing_and_commit_ownership_in_execution_roles
+# 2 passed, exit 0
+git diff --check db97b15b32802b59dc8badeb8a6498494ceb9e62 HEAD
+# independently passed
 ```
 
-Reused final successful command-completion evidence from the parent repository's
-`.aflow/runs/20260911t144835z-9d933c6f/turns/turn-001/transport.stdout`
-and completed `result.json`. Final implementation was unchanged after these checks:
+Inspected existing parser boundary regressions and isolated installation assertions, including packaged aflow-plan byte equality. No duplicate parser regression is needed. Worker probe is retained at `/root/code/evidence/aflow-dogfood-20260909/issue39-review-20260911/representative-parse-probe.txt`. An independent `uv run python` probe, retained as `reviewer-parser-probe.txt` in the same external root, uses an exact automated test command and physical phone Settings acceptance actions. It confirms incomplete before, complete after checking only the automated checkpoint/task, byte-identical pending manual text, and rejection of a checked checkpoint with an unchecked automated step. The probe checks parsing, not physical-device acceptance. No full suites run; CI owns those. Evidence paths occur only in invocation-owned artifacts, never portable test code.
 
-```sh
-npm --prefix apps/aflow_app/web run build
-# exit 0; tsc and Vite passed
-AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py::test_global_run_overview_loading_journey --basetemp=/root/code/evidence/aflow-dogfood-20260909/issue40-review-20260911/chromium-final2
-# exit 0; 1 passed in 4.32s
-AFLOW_TEST_BROWSER=webkit uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py::test_global_run_overview_loading_journey --basetemp=/root/code/evidence/aflow-dogfood-20260909/issue40-review-20260911/webkit-final2
-# exit 0; 1 passed in 4.79s
-```
+## Disposition and handoff
 
-Browser checks deterministically hold registry, initial runs and refresh responses;
-assert animation and reduced-motion computed styles; verify populated, empty and
-error outcomes. Independently inspected retained Chromium desktop loading and
-WebKit phone refresh screenshots: status is visible, desktop pending has no empty
-claims, and phone refresh preserves readable usable rows with compact headers.
-Evidence stays in invocation-owned temp roots; portable test code uses tmp_path.
-No full suite was run; CI owns full suites. Physical phone hardware was not tested.
+Approved for one unpublished accumulated commit after the unchanged base, including this already-tracked reviewer record. Preserve all nine reviewed implementation blobs. DEVLOG already contains one issue-39 entry. No fix plan is needed and no stale issue-39 fix plans exist. Preserve the ignored original plan for engine finalization and record the final approved SHA there after committing. Finalization checks require one commit after base, unchanged reviewed blobs, and clean tracked state.
 
-## Disposition and finalization
+Publication, exact-SHA CI, live activation and Settings refresh/install remain engine/coordinator delivery work. After reviewed deployment, the coordinator must use current Settings to refresh/install the bundled skill while preserving owner edits; verify the effective aflow-plan guidance includes User Acceptance Pending. Account-local skills were not changed by this review. Owner-only checks in generated plans remain pending until their named owner records actual evidence; the retained phone scenario is an example, not a claimed pass.
 
-Approve for one unpublished accumulated commit after the unchanged base, including
-this tracked review record. Preserve the five reviewed implementation/DEVLOG blobs.
-DEVLOG has one handoff entry, so no compaction is needed. No new fix plan is needed
-and no stale issue-40 fix plan exists. Preserve the ignored original plan for engine
-finalization and record the final approved SHA there after creating the commit.
-Verify exactly one final commit, no changed implementation blobs and clean tracked
-Git state. Publication, exact-SHA CI and live activation remain subsequent engine/
-coordinator delivery gates. Preserve concurrent startup and stop/recovery work at
-integration.
-
-Prior review rotated byte-for-byte to `plans/reviews/260911_1507.md`; no ignored private
-archive, plan or evidence is force-added.
+Prior latest review rotated byte-for-byte to `plans/reviews/260911_1531.md`. No ignored private archive, plan or evidence is force-added.
 
 No material findings

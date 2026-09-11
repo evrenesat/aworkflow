@@ -299,7 +299,10 @@ A minimal plan has checkpoint headings and task items:
 ```
 
 The plan file is the source of truth for progress. A checkpoint is complete only
-when its heading and all tasks in that section are checked.
+when its heading and all tasks in that section are checked. User-owned manual
+acceptance belongs in a separate top-level `## User Acceptance Pending` section
+after the checkpoints, remains pending until evidence is supplied, and does not
+change implementation completion.
 
 On the first launch of a pristine plan, review workflows automatically add the
 minimal controller-owned `## Git Tracking` section before the first checkpoint.

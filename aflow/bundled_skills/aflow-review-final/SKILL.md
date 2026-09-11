@@ -20,6 +20,7 @@ Use this skill only for the final review pass of work produced under an aflow pl
 - If the full accumulated work is acceptable, approve the completed handoff without squashing or rewriting history.
 - If the full accumulated work is not acceptable, do not squash. Create a focused non-checkpoint follow-up fix plan for the failed checkpoints or behaviors.
 - If the implementation is behaviorally correct, this review turn owns all approval-grade git/tracking chores needed for final approval.
+- Treat a top-level `## User Acceptance Pending` section as a separate owner handoff. Pending items alone do not reject the implementation or trigger another worker pass; preserve explicit release or approval gates, report acceptance as pending, and never claim full acceptance without user evidence.
 - Treat `aflow` as the canonical spelling.
 
 ## Core Rule
