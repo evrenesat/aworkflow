@@ -167,6 +167,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
               <div className="dashboard-field">
                 <Combobox
                   label="Run plan"
+                  visibleLabel="Plan"
                   value={startPlanPath}
                   onChange={setStartPlanPath}
                   options={planOptions}
@@ -181,6 +182,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 <div className="dashboard-field">
                   <Combobox
                     label="Run workflow"
+                    visibleLabel="Workflow"
                     value={startWorkflow}
                     onChange={changeStartWorkflow}
                     options={workflowOptions}
@@ -196,6 +198,7 @@ export function NewRunPage({ startPlanPath, setStartPlanPath, planOptions, planB
                 <div className="dashboard-field">
                   <Combobox
                     label="Run team"
+                    visibleLabel="Team"
                     value={startTeam}
                     onChange={setStartTeam}
                     options={teamOptions}

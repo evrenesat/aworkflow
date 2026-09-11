@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import * as api from './api'
-import { statusLabel } from './runPresentation'
+import { runPlanDisplayName, runPlanPath, statusLabel } from './runPresentation'
 import type { RunStatus } from './types'
 
 export const RECENT_LIMIT_KEY = 'aflow.recentRunsLimit'
@@ -29,6 +29,29 @@ export function useRecentRunsLimit(): [number, (value: number) => void] {
 }
 
 export interface GlobalRun { projectId: string; run: RunStatus }
+
+/** Match every loaded, presentation-relevant field without changing records. */
+export function matchesGlobalRun(row: GlobalRun, query: string, projectLabel = ''): boolean {
+  const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
+  if (terms.length === 0) return true
+  const { run } = row
+  const planPath = runPlanPath(run)
+  const searchable = [
+    projectLabel,
+    row.projectId,
+    runPlanDisplayName(planPath, run.run_id),
+    planPath,
+    run.run_id,
+    statusLabel(run),
+    run.workflow_name,
+    run.team,
+    run.current_step,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .join(' ')
+    .toLocaleLowerCase()
+  return terms.every(term => searchable.includes(term))
+}
+
 export function isOngoing(run: RunStatus): boolean {
   if (['Completed', 'Failed', 'Could not start', 'Stopped', 'Interrupted', 'Needs attention'].includes(statusLabel(run))) return false
   return run.activity === 'active' || run.evidence.unit_active === true || ['paused', 'waiting_for_input', 'waiting_for_valid_override', 'awaiting_startup_answer'].includes(run.status)

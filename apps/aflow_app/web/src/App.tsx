@@ -128,12 +128,12 @@ function AppHeader({ selectedProject, projects, view, slots, onSwitchView, onLog
             onClick={() => setMenuOpen(open => !open)}
           ><span aria-hidden="true">☰</span></button>
           <div className="app-branding app-branding-compact">
-            <h1 className="app-brand-title truncate" title={projectTitle}>{projectTitle}</h1>
+            <h1 className="app-brand-title truncate" title={projectTitle} aria-label={projectTitle}>{projectTitle}</h1>
             <div className="mobile-page-context">{slots.compactContext ?? slots.context ?? defaultContext}</div>
           </div>
         </> : <>
           <div className="app-branding">
-            <h1 className="app-brand-title truncate" title={projectTitle}>{projectTitle}</h1>
+            <h1 className="app-brand-title truncate" title={projectTitle} aria-label={projectTitle}>{projectTitle}</h1>
         </div>
         <nav className="workspace-global-nav" aria-label="Global navigation">
             {NAV_ITEMS.filter(item => !item.needsProject || selectedProject).map(item => navigationButton(item))}

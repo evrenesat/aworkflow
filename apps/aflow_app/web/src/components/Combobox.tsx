@@ -1,8 +1,10 @@
-import { useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 
 interface ComboboxProps {
   /** Visible control label. */
   label: string
+  /** Optional shorter label shown next to the control while keeping `label` accessible. */
+  visibleLabel?: string
   value: string
   onChange: (value: string) => void
   /** Closed suggestion list; always labeled as suggestions, never as the full set. */
@@ -37,6 +39,7 @@ interface ComboboxProps {
  */
 export function Combobox({
   label,
+  visibleLabel,
   value,
   onChange,
   options,
@@ -57,6 +60,12 @@ export function Combobox({
   const [text, setText] = useState<string | null>(null)
   const [activeIndex, setActiveIndex] = useState(-1)
   const [listPlacement, setListPlacement] = useState<'below' | 'above'>('below')
+  const previousValueRef = useRef(value)
+
+  useEffect(() => {
+    if (previousValueRef.current && !value && text) setText(null)
+    previousValueRef.current = value
+  }, [text, value])
 
   const labelForOption = optionLabel ?? ((option: string) => option)
   const visibleLabels = options.map(labelForOption)
@@ -126,7 +135,7 @@ export function Combobox({
 
   return (
     <div className="combobox">
-      <label className="text-xs text-dim" htmlFor={id}>{label}</label>
+      <label className="text-xs text-dim" htmlFor={id}>{visibleLabel ?? label}</label>
       <div className="combobox-control">
         <input
           id={id}

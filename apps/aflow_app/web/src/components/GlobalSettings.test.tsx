@@ -263,6 +263,66 @@ describe('GlobalSettings', () => {
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'worker', effort: 'new-effort' }] }))
     expect(api.saveSettings).not.toHaveBeenCalled()
   })
+  it('keeps a selected raw profile identity when Combobox Enter is consumed', async () => {
+    const profileResponse: ProjectConfigFormResponse = {
+      ...response,
+      choices: { ...response.choices!, profiles: { codex: ['worker', 'luna_max'] } },
+      suggestions: {
+        ...response.suggestions,
+        profiles: [...response.suggestions.profiles, { harness: 'codex', profile: 'luna_max', model: 'luna-model', effort: 'high' }],
+      },
+    }
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(profileResponse)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'codex' } })
+    const name = screen.getByLabelText('New profile name')
+    fireEvent.change(name, { target: { value: 'luna' } })
+    fireEvent.keyDown(name, { key: 'ArrowDown' })
+    fireEvent.keyDown(name, { key: 'Enter' })
+
+    expect(screen.getByLabelText('Model codex.luna_max')).toBeTruthy()
+    expect(screen.queryByText('codex.luna', { exact: true })).toBeNull()
+    expect(screen.queryByText('codex.luna_max', { exact: true })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add profile' }))
+    expect(screen.getByText('codex.luna_max', { exact: true })).toBeTruthy()
+    expect(screen.queryByText('codex.luna', { exact: true })).toBeNull()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({
+      expected_revision: config.revision,
+      actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'luna_max' }],
+    }))
+  })
+  it('applies duplicate validation to the raw profile selected from a partial query', async () => {
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue(response)
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'codex' } })
+    const name = screen.getByLabelText('New profile name')
+    fireEvent.change(name, { target: { value: 'work' } })
+    fireEvent.keyDown(name, { key: 'ArrowDown' })
+    fireEvent.keyDown(name, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: 'Add profile' }))
+
+    expect(screen.getByRole('alert').textContent).toContain('already exists')
+    expect(screen.queryByText('codex.work', { exact: true })).toBeNull()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
+  it('uses the raw draft value for an unhandled profile Enter', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'codex' } })
+    const name = screen.getByLabelText('New profile name')
+    fireEvent.change(name, { target: { value: 'direct_profile' } })
+    fireEvent.blur(name)
+    fireEvent.keyDown(name, { key: 'Enter' })
+
+    expect(screen.getByText('codex.direct_profile', { exact: true })).toBeTruthy()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+  })
   it('drops reverted edits and preserves prompt and server drafts across tabs', async () => {
     render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
     const effort = await screen.findByLabelText('Effort codex.worker')
@@ -299,6 +359,73 @@ describe('GlobalSettings', () => {
     fireEvent.change(screen.getByLabelText('Effort codex.brand-new'), { target: { value: 'new-effort' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
     await waitFor(() => expect(api.patchGlobalConfig).toHaveBeenCalledWith({ expected_revision: config.revision, actions: [{ type: 'upsert_profile', harness: 'codex', profile: 'brand-new', model: 'new-model', effort: 'new-effort' }] }))
+  })
+
+  it('retains profile edits across tab and Advanced TOML navigation', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    const model = await screen.findByLabelText('Model codex.worker')
+    fireEvent.change(model, { target: { value: 'draft-model' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'General', exact: true }))
+    expect((screen.getByLabelText('Bind host') as HTMLInputElement).value).toBe('localhost')
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced TOML', exact: true }))
+    await screen.findByLabelText('aflow.toml contents')
+    fireEvent.click(screen.getByRole('button', { name: 'Guided settings', exact: true }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Agents & Roles', exact: true }))
+    expect((screen.getByLabelText('Model codex.worker') as HTMLInputElement).value).toBe('draft-model')
+  })
+
+  it('adds profiles and roles by button or Enter while rejecting invalid and duplicate names', async () => {
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    await screen.findByLabelText('Effort codex.worker')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add profile' }))
+    expect(screen.getByRole('alert').textContent).toContain('harness and profile name')
+
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'codex' } })
+    fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'brand-new' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add profile' }))
+    expect(screen.getByText('codex.brand-new')).toBeTruthy()
+    expect(api.patchGlobalConfig).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'codex' } })
+    fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'brand-new' } })
+    fireEvent.keyDown(screen.getByLabelText('New profile name'), { key: 'Enter' })
+    // The first Enter commits the Combobox value; the second is the explicit
+    // parent action and therefore reaches duplicate validation.
+    fireEvent.keyDown(screen.getByLabelText('New profile name'), { key: 'Enter' })
+    expect(screen.getByRole('alert').textContent).toContain('already exists')
+
+    fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'second-profile' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add profile' }))
+
+    const roleName = screen.getByLabelText('New role name')
+    fireEvent.keyDown(roleName, { key: 'Enter' })
+    expect(screen.getByRole('alert').textContent).toContain('role name and profile selector')
+    fireEvent.change(roleName, { target: { value: 'worker' } })
+    fireEvent.change(screen.getByLabelText('New role profile'), { target: { value: 'codex.worker' } })
+    fireEvent.keyDown(roleName, { key: 'Enter' })
+    expect(screen.getByRole('alert').textContent).toContain('already exists')
+    fireEvent.change(roleName, { target: { value: 'reviewer' } })
+    fireEvent.keyDown(roleName, { key: 'Enter' })
+    expect(screen.getByLabelText('Role Reviewer')).toBeTruthy()
+  })
+
+  it('keeps profile and role drafts after a failed configuration save', async () => {
+    vi.mocked(api.patchGlobalConfig).mockRejectedValueOnce(new Error('conflict'))
+    render(<GlobalSettings onDirtyChange={() => {}} onSaved={() => {}} />)
+    fireEvent.change(await screen.findByLabelText('Effort codex.worker'), { target: { value: 'draft-effort' } })
+    fireEvent.change(screen.getByLabelText('Harness'), { target: { value: 'codex' } })
+    fireEvent.change(screen.getByLabelText('New profile name'), { target: { value: 'failed-profile' } })
+    fireEvent.change(screen.getByLabelText('Model codex.failed-profile'), { target: { value: 'failed-model' } })
+    fireEvent.change(screen.getByLabelText('New role name'), { target: { value: 'failed-role' } })
+    fireEvent.change(screen.getByLabelText('New role profile'), { target: { value: 'codex.worker' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save all changes' }))
+    await screen.findByText(/conflict.*Your remaining edits are retained/)
+    expect((screen.getByLabelText('Effort codex.worker') as HTMLInputElement).value).toBe('draft-effort')
+    expect((screen.getByLabelText('New profile name') as HTMLInputElement).value).toBe('failed-profile')
+    expect((screen.getByLabelText('Model codex.failed-profile') as HTMLInputElement).value).toBe('failed-model')
+    expect((screen.getByLabelText('New role name') as HTMLInputElement).value).toBe('failed-role')
+    expect((screen.getByLabelText('New role profile') as HTMLInputElement).value).toBe('codex.worker')
   })
 
   it('includes an in-progress prompt rename in Save and preserves it across tabs', async () => {

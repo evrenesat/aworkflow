@@ -1,9 +1,21 @@
 """Real run navigation uses disposable history records, never workflow launches."""
 import json
 from pathlib import Path
+import re
 from playwright.sync_api import expect, sync_playwright
 from test_control_plane_api import control_client, live_server, TOKEN, PROJECT_ID  # noqa: F401
-from test_responsive_browser import _browser
+from test_responsive_browser import (
+    _assert_document_moves,
+    _assert_header_and_flow,
+    _assert_last_action_hit_test,
+    _browser,
+    _compact,
+    _assert_theme,
+    _login,
+    _register_responsive_worktree,
+    _select_settings_section,
+    _set_theme_preference,
+)
 from test_settings_browser import document_metrics
 
 
@@ -134,7 +146,7 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                     before_list_scroll = page.evaluate('() => document.scrollingElement.scrollTop')
                     item_id = row.get_attribute('data-sidebar-editor-item')
                     row.click()
-                    page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
+                    page.locator('.run-detail h3').filter(has_text='History 069').wait_for()
                     metrics = document_metrics(page)
                     assert metrics['detailHeight'] > 0, metrics
                     assert metrics['detailContent'] <= metrics['detailHeight'] + 1, metrics
@@ -182,13 +194,13 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
                         assert page.evaluate('() => document.activeElement?.dataset.sidebarEditorItem') == item_id
                     nav.get_by_role('button', name='history-068.md', exact=False).click()
                     if compact:
-                        page.locator('.run-detail h3').filter(has_text='history-068.md').wait_for()
+                        page.locator('.run-detail h3').filter(has_text='History 068').wait_for()
                     assert document_metrics(page)['detailScroll'] == 0
                     page.go_back()
-                    page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
+                    page.locator('.run-detail h3').filter(has_text='History 069').wait_for()
                     assert document_metrics(page)['detailScroll'] == 0
                     page.reload()
-                    page.locator('.run-detail h3').filter(has_text='history-069.md').wait_for()
+                    page.locator('.run-detail h3').filter(has_text='History 069').wait_for()
             page.get_by_role('button', name='More run actions').click()
             page.get_by_role('menuitem', name='Archive', exact=True).click()
             page.get_by_role('button', name='Restore', exact=True).wait_for()
@@ -209,6 +221,208 @@ def test_run_navigation_scroll_selection_and_history(control_client, monkeypatch
             page.get_by_role('heading', name='Deleted record').wait_for()
             page.reload()
             page.get_by_role('heading', name='Deleted record').wait_for()
+        finally:
+            browser.close()
+
+
+def test_complete_navigation_and_launch_journeys(control_client, monkeypatch, tmp_path):
+    """Exercise the launch handoff and shell journeys in both compact modes."""
+    _, root, _, _ = control_client
+    ready_path = root / 'plans' / 'in-progress' / 'journey-ready.md'
+    ready_path.parent.mkdir(parents=True, exist_ok=True)
+    ready_path.write_text('# Journey ready\n\n### [ ] Checkpoint 1: Browser fixture\n- [ ] verify\n')
+    run_id = 'journey-navigation-run'
+    run_dir = root / '.aflow' / 'runs' / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / 'run.json').write_text(json.dumps({
+        'status': 'completed',
+        'plan_path': 'plans/in-progress/journey-ready.md',
+        'workflow_name': 'managed',
+        'team': 'base',
+        'max_turns': 5,
+    }))
+
+    # Keep the fixture's exact global pair disposable while exposing a real
+    # default team, upgrade chain, and reviewer for the launch preview.
+    config_path = root.parent / 'global' / 'aflow.toml'
+    config_text = config_path.read_text()
+    config_text = config_text.replace(
+        '[roles]\nworker = "codex.test"',
+        '[roles]\nworker = "codex.test"\nreviewer = "codex.test"',
+    )
+    config_text += (
+        '\n[teams.base]\n'
+        'upgrade_to = "explicit"\n'
+        '\n[teams.base.roles]\n'
+        'worker = "codex.test"\n'
+        'reviewer = "codex.test"\n'
+        '\n[teams.explicit.roles]\n'
+        'worker = "codex.test"\n'
+        'reviewer = "codex.test"\n'
+    )
+    config_path.write_text(config_text)
+    workflows_path = config_path.with_name('workflows.toml')
+    workflow_text = workflows_path.read_text().replace(
+        '[workflow.managed.steps.implement]',
+        '[workflow.managed]\nteam = "base"\n\n[workflow.managed.steps.implement]',
+    )
+    workflows_path.write_text(workflow_text)
+
+    # A linked worktree makes the long selected-context assertion use the
+    # same registry projection as the shipped Projects UI.
+    from aflow_app_server import main
+
+    worktree_id = _register_responsive_worktree(root)
+    assert main._project_registry is not None
+    parent_name = 'AFlow long parent context'
+    worktree_name = 'Doublangu worktree with a long selected context'
+    assert main._project_registry.rename(PROJECT_ID, parent_name) is not None
+    assert main._project_registry.rename(worktree_id, worktree_name) is not None
+
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+
+    def assert_document_contract(page):
+        metrics = page.evaluate('''() => ({
+            viewportWidth: innerWidth,
+            documentWidth: document.documentElement.scrollWidth,
+            viewportHeight: innerHeight,
+            documentHeight: document.scrollingElement?.scrollHeight ?? 0,
+            scrollTop: document.scrollingElement?.scrollTop ?? 0,
+        })''')
+        assert metrics['documentWidth'] <= metrics['viewportWidth'] + 1, metrics
+        assert metrics['documentHeight'] >= metrics['viewportHeight'], metrics
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = None
+        try:
+            for theme in ('light', 'dark'):
+                for width, height in ((1440, 900), (390, 844)):
+                    if page is not None:
+                        page.close()
+                    page = browser.new_page(viewport={'width': width, 'height': height})
+                    _login(page, url)
+                    _set_theme_preference(page, theme)
+                    page.goto(f'{url}/?view=all-runs')
+                    _assert_theme(page, theme)
+                    page.get_by_role('heading', name='All runs', exact=True).wait_for()
+                    page.get_by_label('Search loaded runs', exact=True).fill(run_id)
+                    exact_row = page.get_by_role(
+                        'button',
+                        name=re.compile(
+                            rf'^{re.escape(parent_name)} · Completed · Journey ready · {re.escape(run_id)}$'
+                        ),
+                    )
+                    exact_row.wait_for()
+                    page.get_by_label('Search loaded runs', exact=True).fill('')
+                    page.get_by_label('Run history', exact=True).select_option('all')
+                    exact_row.wait_for()
+                    exact_row.click()
+                    page.locator('.run-detail h3').filter(has_text='Journey ready').wait_for()
+                    page.wait_for_function(
+                        "new URL(location.href).searchParams.get('project') === 'test-project' && "
+                        f"new URL(location.href).searchParams.get('run') === '{run_id}'"
+                    )
+                    if _compact(page):
+                        page.get_by_role('button', name='← Back to Run history', exact=True).click()
+                        page.locator('.sidebar-editor-navigation').wait_for()
+                    else:
+                        page.go_back()
+                        page.get_by_role('heading', name='All runs', exact=True).wait_for()
+                    _assert_header_and_flow(page)
+                    assert_document_contract(page)
+
+                    # Plans → Run this plan preserves the exact Ready path,
+                    # resolves the workflow's default team, and accepts a
+                    # keyboard-selected explicit team without changing IDs.
+                    page.goto(f'{url}/?project={PROJECT_ID}&view=plans')
+                    page.get_by_role('button', name='journey-ready.md', exact=False).first.click()
+                    page.get_by_role('button', name='More', exact=True).click()
+                    page.get_by_role('menuitem', name='Run this plan', exact=True).click()
+                    plan_input = page.get_by_label('Run plan', exact=True)
+                    plan_input.wait_for()
+                    expect(plan_input).to_have_value('plans/in-progress/journey-ready.md')
+                    workflow_input = page.get_by_label('Run workflow', exact=True)
+                    expect(workflow_input).to_have_value('Managed')
+                    team_input = page.get_by_label('Run team', exact=True)
+                    expect(team_input).to_have_value('Base')
+                    team_input.focus()
+                    team_input.press('ArrowDown')
+                    team_input.press('Enter')
+                    expect(team_input).to_be_focused()
+                    team_input.fill('explicit')
+                    team_input.press('ArrowDown')
+                    team_input.press('Enter')
+                    expect(team_input).to_have_value('Explicit')
+                    details = page.locator('details.launch-preview-details')
+                    expect(details).to_be_visible()
+                    expect(details).not_to_have_attribute('open', '')
+                    page.screenshot(path=str(tmp_path / f'cp3-{theme}-{width}x{height}-launch-summary.png'), full_page=True)
+                    print('CP3_SCREENSHOT', tmp_path / f'cp3-{theme}-{width}x{height}-launch-summary.png')
+                    details.locator('summary').first.focus()
+                    details.locator('summary').first.press('Enter')
+                    expect(details).to_have_attribute('open', '')
+                    expect(details.locator('table').first).to_be_visible()
+                    advanced = page.get_by_role('button', name='Advanced options', exact=True)
+                    advanced.focus()
+                    advanced.press('Enter')
+                    expect(page.get_by_label('Run start step', exact=True)).to_be_visible()
+                    expect(page.get_by_role('button', name='Start run', exact=True)).to_be_visible()
+                    _assert_last_action_hit_test(page)
+                    _assert_document_moves(page)
+                    _assert_header_and_flow(page)
+                    assert_document_contract(page)
+
+                    # Settings edit → section change → save → reload retains
+                    # the committed server draft through the shared owner.
+                    page.goto(f'{url}/?project={PROJECT_ID}&view=settings')
+                    page.get_by_role('heading', name='Settings', exact=True).wait_for()
+                    _select_settings_section(page, 'Agents & Roles')
+                    model = page.get_by_label('Model codex.test', exact=True)
+                    model.wait_for()
+                    next_model = f'browser-model-{theme}-{width}'
+                    model.fill(next_model)
+                    model.press('Tab')
+                    save = page.locator('.app-header-row-two').get_by_role('button', name='Save all changes', exact=True)
+                    save.click()
+                    page.get_by_text('Workflow settings saved; new runs use the saved configuration', exact=False).wait_for()
+                    _select_settings_section(page, 'General')
+                    _select_settings_section(page, 'Agents & Roles')
+                    expect(page.get_by_label('Model codex.test', exact=True)).to_have_value(next_model)
+                    page.get_by_role('button', name='More', exact=True).click()
+                    page.get_by_role('menuitem', name='Reload server settings', exact=True).click()
+                    expect(page.get_by_label('Model codex.test', exact=True)).to_have_value(next_model)
+                    _assert_header_and_flow(page)
+                    assert_document_contract(page)
+
+                    # The selected worktree context remains exact while the
+                    # ordinary mobile Projects label stays one readable line.
+                    page.goto(f'{url}/?view=projects')
+                    parent = page.get_by_role('button', name=re.compile(rf'^{re.escape(parent_name)}'))
+                    parent.wait_for()
+                    page.locator('summary').filter(has_text='Worktrees (1)').click()
+                    child = page.get_by_role('button', name=re.compile(rf'^{re.escape(worktree_name)}'))
+                    child.wait_for()
+                    child.click()
+                    page.wait_for_function(
+                        f"new URL(location.href).searchParams.get('project') === '{worktree_id}'"
+                    )
+                    page.goto(f'{url}/?project={worktree_id}&view=projects')
+                    page.get_by_role('button', name=re.compile(rf'^{re.escape(worktree_name)}')).wait_for()
+                    brand = page.locator('.app-brand-title')
+                    expect(brand).to_have_attribute('aria-label', f'AFlow · {parent_name} · Worktree: {worktree_name}')
+                    if _compact(page):
+                        page_context = page.locator('.mobile-page-context .header-context-title')
+                        page_context.wait_for(state='visible')
+                        expect(page_context).to_have_text('Projects')
+                        context_box = page_context.bounding_box()
+                        assert context_box and context_box['height'] <= 32, context_box
+                    context_image = tmp_path / f'cp3-{theme}-{width}x{height}-project-context.png'
+                    page.screenshot(path=str(context_image), full_page=True)
+                    print('CP3_SCREENSHOT', context_image)
+                    _assert_header_and_flow(page)
+                    assert_document_contract(page)
         finally:
             browser.close()
 
@@ -388,6 +602,9 @@ def test_remaining_journeys_keep_compact_actions_and_drafts_reachable(control_cl
                 (button) => button.textContent?.trim() === 'Start run' && !button.disabled
             )""")
             assert page.get_by_role('button', name='Start run', exact=True).is_enabled()
+            launch_details = page.locator('details.launch-preview-details')
+            launch_details.locator('summary').first.press('Enter')
+            expect(launch_details).to_have_attribute('open', '')
             page.locator('.responsive-data-table caption').first.wait_for()
             assert_preview_captions_fill_tables(page)
             assert_compact_geometry(page, 320, 568)

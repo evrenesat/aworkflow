@@ -70,7 +70,9 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [newProfile, setNewProfile] = useState({ harness: '', profile: '', model: '', effort: '' })
+  const [newProfileError, setNewProfileError] = useState<string | null>(null)
   const [newRole, setNewRole] = useState({ role: '', selector: '' })
+  const [newRoleError, setNewRoleError] = useState<string | null>(null)
   const [newTeamName, setNewTeamName] = useState('')
   const [newTeamError, setNewTeamError] = useState<string | null>(null)
   const [pendingFocusTeam, setPendingFocusTeam] = useState<string | null>(null)
@@ -185,7 +187,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     setDeletedPrompts([])
     // Bumping the epoch invalidates stale skill reads/saves as well as config loads.
     epochRef.current += 1
-    setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
+    setPassword(''); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
     setPendingNames({}); setRawEdited(false); setError(null); setNotice(null); setProjectionError(null)
     setTexts(['', '']); setSnapshot(null); setProjection(null); setBaseline(null); setDraft(null)
     setServer(null); setServerText(''); setServerDraft({ bind_host: '', bind_port: '', managed_projects_root: '' })
@@ -271,18 +273,35 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     if (!draft) return
     const value = clone(draft); update(value); setDraft(value)
   }
+
+  function validateNewProfile(value = newProfile, current = draft): string | null {
+    const profile = String(value.profile ?? '').trim()
+    if (!value.harness || !profile) return 'Enter a harness and profile name.'
+    if (!current) return 'Profiles are still loading.'
+    if (current.harnesses[value.harness]?.[profile]) return 'That profile already exists; edit its fields above.'
+    return null
+  }
+
+  function validateNewRole(value = newRole, current = draft): string | null {
+    const role = String(value.role ?? '').trim()
+    if (!role || !String(value.selector ?? '').trim()) return 'Enter a role name and profile selector.'
+    if (!current) return 'Roles are still loading.'
+    if (role in current.roles) return 'That role already exists.'
+    return null
+  }
+
   function candidate() {
     if (!draft || !baseline) return { form: draft, actions: [] as GuidedConfigAction[] }
     const value = clone(draft)
     if (Object.values(newProfile).some(Boolean)) {
-      if (!newProfile.harness || !newProfile.profile) throw new Error('New profile needs a harness and profile name.')
-      if (value.harnesses[newProfile.harness]?.[newProfile.profile]) throw new Error('That profile already exists; edit its fields above.')
-      ;(value.harnesses[newProfile.harness] ??= {})[newProfile.profile] = { model: newProfile.model || null, effort: newProfile.effort || null }
+      const validation = validateNewProfile(newProfile, value)
+      if (validation) throw new Error(validation)
+      ;(value.harnesses[newProfile.harness] ??= {})[String(newProfile.profile ?? '').trim()] = { model: newProfile.model || null, effort: newProfile.effort || null }
     }
     if (newRole.role || newRole.selector) {
-      if (!newRole.role || !newRole.selector) throw new Error('New role needs a name and profile selector.')
-      if (newRole.role in value.roles) throw new Error('That role already exists.')
-      value.roles[newRole.role] = newRole.selector
+      const validation = validateNewRole(newRole, value)
+      if (validation) throw new Error(validation)
+      value.roles[String(newRole.role ?? '').trim()] = String(newRole.selector ?? '').trim()
     }
     const compared = clone(baseline)
     const renameActions: GuidedConfigAction[] = []
@@ -297,6 +316,33 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     }
     return { form: value, actions: [...renameActions, ...settingsActions(compared, value)] }
   }
+
+  function addProfile(profileOverride?: string) {
+    const value = profileOverride === undefined ? newProfile : { ...newProfile, profile: profileOverride }
+    const validation = validateNewProfile(value)
+    setNewProfileError(validation)
+    if (validation || !draft) return
+    const profile = String(value.profile ?? '').trim()
+    const harness = value.harness
+    change(next => {
+      const profiles = next.harnesses[harness] ??= {}
+      profiles[profile] = {
+        model: value.model || null,
+        effort: value.effort || null,
+      }
+    })
+    setNewProfile({ harness: '', profile: '', model: '', effort: '' })
+  }
+
+  function addRole() {
+    const validation = validateNewRole()
+    setNewRoleError(validation)
+    if (validation || !draft) return
+    const role = String(newRole.role ?? '').trim()
+    change(value => { value.roles[role] = String(newRole.selector ?? '').trim() })
+    setNewRole({ role: '', selector: '' })
+  }
+
   async function previewActions(operations: GuidedConfigAction[]) {
     if (!snapshot) throw new Error('Workflow settings have not loaded.')
     let result: ProjectConfigFormResponse | null = null
@@ -358,7 +404,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         setTexts([pair.aflow_toml, pair.workflows_toml])
         if (rawEdited) {
           setDraft(next.form); setBaseline(next.form); setPendingNames({})
-          setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
+          setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
         }
       } else if (advanced && rawEdited) {
         const form = await api.postGlobalConfigForm({ aflow_toml: texts[0], workflows_toml: texts[1] })
@@ -482,7 +528,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
         // Acknowledged writes are cleared even if a later projection or server write fails.
         if (selectedPrompt.startsWith('named:') && pendingNames[selectedPrompt.slice(6)]) setSelectedPrompt(`named:${pendingNames[selectedPrompt.slice(6)]}`)
         configSaved = true; setDeletedPrompts([]); setSnapshot(saved); setTexts([saved.aflow_toml, saved.workflows_toml]); setBaseline(candidate().form); setDraft(candidate().form); setPendingNames({}); setRawEdited(false)
-        setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
+        setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null)
         onSaved(saved)
         await acceptConfig(saved, epochRef.current)
         if (epochRef.current !== epoch) return
@@ -530,8 +576,8 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     const suggestions = projection?.suggestions.profiles.filter(p => p.harness === harness) ?? []
     const adapter = projection?.suggestions.harnesses.find(h => h.name === harness)
     return harness === 'zcode' ? <p className="profile-editor-note">Model and effort are configured in ZCode.</p> : <>
-      <div className="profile-editor-field"><Combobox label={`Model ${harness}.${profile}`} value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} /></div>
-      {adapter?.supports_effort && <div className="profile-editor-field"><Combobox label={`Effort ${harness}.${profile}`} value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></div>}
+      <div className="profile-editor-field"><Combobox label={`Model ${harness}.${profile}`} visibleLabel="Model" value={model} allowCustom options={[...new Set(suggestions.flatMap(p => p.model ? [p.model] : []))]} onChange={value => update('model', value)} /></div>
+      {adapter?.supports_effort && <div className="profile-editor-field"><Combobox label={`Effort ${harness}.${profile}`} visibleLabel="Effort" value={effort} allowCustom options={[...new Set(suggestions.flatMap(p => p.effort ? [p.effort] : []))]} onChange={value => update('effort', value)} /></div>}
     </>
   }
   const headerCompact = useSettingsHeaderCompact()
@@ -564,7 +610,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     {!hosted && <>
       <div className="section-heading"><h2>Settings</h2><button className="btn btn-secondary btn-sm" disabled={busy || !snapshot} onClick={() => void toggleAdvanced()}>{advanced ? 'Guided settings' : 'Advanced TOML'}</button></div>
       {!changelogReadOnly && <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => { if (!dirty || window.confirm('Discard unsaved settings and reload?')) void discardAndReload() }}>Reload server settings</button>}
-      <div className="settings-toolbar">
+      <div className="settings-fallback-controls">
         {sectionNavigation}
         {dirty && <span className="text-xs text-dim">Unsaved changes</span>}
         {!changelogReadOnly && <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={() => void save()}>{busy ? 'Working…' : 'Save all changes'}</button>}
@@ -574,7 +620,7 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
     {notice && <p className="success-message" role="status">{notice}</p>}
     {projectionError && <div className="error-message" role="alert">The guided settings view is unavailable: {projectionError} <button className="btn btn-secondary btn-sm" onClick={() => void retryProjection()} disabled={busy || !snapshot}>Retry</button> The saved documents stay editable under Advanced TOML.</div>}
     <fieldset disabled={busy} className="settings-body" id="settings-domain-panel" role={advanced ? 'region' : 'tabpanel'} aria-label={advanced ? 'Advanced TOML editor' : undefined} aria-labelledby={advanced ? undefined : `settings-tab-${tabs.indexOf(tab)}`}>
-    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewRole({ role: '', selector: '' }); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) }; setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
+    {advanced ? <div className="settings-fields">{texts.map((text, index) => <div className="text-editor-field" key={index}><span className="text-editor-label">{index ? 'workflows.toml' : 'aflow.toml'}</span><TextEditor className="mono config-textarea" aria-label={index ? 'workflows.toml contents' : 'aflow.toml contents'} value={text} onChange={e => { const next: [string, string] = [...texts]; next[index] = e.target.value; setTexts(next); if (!rawEdited) { const form = candidate().form; setBaseline(form); setDraft(form); setPendingNames({}); setNewProfile({ harness: '', profile: '', model: '', effort: '' }); setNewProfileError(null); setNewRole({ role: '', selector: '' }); setNewRoleError(null); setNewTeamName(''); setNewTeamError(null); setPendingFocusTeam(null) } setRawEdited(true) }} /></div>)}</div> : <><div className="settings-retained-skills" hidden={tab !== 'Skills'} aria-hidden={tab !== 'Skills' || undefined}><SkillsSettings
       skills={skills}
       loadError={skillsError}
       selected={effectiveSkill}
@@ -611,9 +657,33 @@ export function GlobalSettings({ onDirtyChange, onSaved }: { onDirtyChange: (dir
           <div className="profile-editor-name"><span className="text-xs text-dim">Profile</span><strong className="mono">{harness}.{profile}</strong></div>
           {profileFields(harness, profile, value.model ?? '', value.effort ?? '', (field, text) => change(next => { next.harnesses[harness][profile][field] = text || null }))}
         </div>))}
-        <div className="card profile-editor-row profile-editor-new"><h4 className="profile-editor-name">New profile</h4><label className="profile-editor-field">Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' })}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label><div className="profile-editor-field"><Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => setNewProfile({ ...newProfile, profile })} /></div>{newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => setNewProfile({ ...newProfile, [field]: text }))}</div>}</div>
+        <div className="card profile-editor-row profile-editor-new">
+          <h4 className="profile-editor-name">New profile</h4>
+          <label className="profile-editor-field">Harness<select className="input" aria-label="Harness" value={newProfile.harness} onChange={e => { setNewProfile({ ...newProfile, harness: e.target.value, model: '', effort: '' }); setNewProfileError(null) }}><option value="">Choose harness</option>{projection?.suggestions.harnesses.map(h => <option key={h.name}>{h.name}</option>)}</select></label>
+          <div className="profile-editor-field" onKeyDown={event => {
+            if (event.key !== 'Enter' || event.defaultPrevented) return
+            const target = event.target
+            if (!(target instanceof HTMLInputElement) || target.getAttribute('aria-label') !== 'New profile name') return
+            event.preventDefault()
+            addProfile()
+          }}>
+            <Combobox label="New profile name" value={newProfile.profile} allowCustom options={projection?.suggestions.profiles.filter(p => p.harness === newProfile.harness).map(p => p.profile) ?? []} optionLabel={formatMachineLabel} onChange={profile => { setNewProfile({ ...newProfile, profile }); setNewProfileError(null) }} />
+          </div>
+          {newProfile.harness && <div className="profile-editor-new-fields">{profileFields(newProfile.harness, newProfile.profile, newProfile.model, newProfile.effort, (field, text) => { setNewProfile({ ...newProfile, [field]: text }); setNewProfileError(null) })}</div>}
+          <div className="profile-editor-actions"><button type="button" className="btn btn-secondary" onClick={() => addProfile()}>Add profile</button>{newProfileError && <span role="alert" className="text-sm add-team-error">{newProfileError}</span>}</div>
+        </div>
         <h3>Global roles</h3>{Object.entries(draft.roles).map(([role, selector]) => <Combobox key={role} label={`Role ${formatMachineChoice(role, Object.keys(draft.roles))}`} value={selector} options={selectors} onChange={value => change(next => { next.roles[role] = value })} />)}
-        <div className="settings-fields"><label>New role name<input className="input" value={newRole.role} onChange={e => setNewRole({ ...newRole, role: e.target.value })} /></label><Combobox label="New role profile" value={newRole.selector} options={selectors} allowCustom onChange={selector => setNewRole({ ...newRole, selector })} /></div>
+        <div className="settings-fields" onKeyDown={event => {
+          if (event.key !== 'Enter' || event.defaultPrevented) return
+          const target = event.target
+          if (!(target instanceof HTMLInputElement) || target.getAttribute('aria-label') !== 'New role name') return
+          event.preventDefault()
+          addRole()
+        }}>
+          <label>New role name<input className="input" aria-label="New role name" value={newRole.role} onChange={e => { setNewRole({ ...newRole, role: e.target.value }); setNewRoleError(null) }} /></label>
+          <Combobox label="New role profile" value={newRole.selector} options={selectors} allowCustom onChange={selector => { setNewRole({ ...newRole, selector }); setNewRoleError(null) }} />
+          <span className="inline-action"><button type="button" className="btn btn-secondary" onClick={addRole}>Add role</button>{newRoleError && <span role="alert" className="text-sm add-team-error">{newRoleError}</span>}</span>
+        </div>
       </>}
       {tab === 'Teams' && <SidebarEditorLayout selection={selectedTeam || teamNames[0] || null} navigationVersion={navigationVersion} listLabel="Teams" navigation={<div>
         <div className="add-team-form">

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { fetchGlobalRuns, isOngoing, selectGlobalRuns, validRecentLimit } from './globalRuns'
+import { fetchGlobalRuns, isOngoing, matchesGlobalRun, selectGlobalRuns, validRecentLimit } from './globalRuns'
 import * as api from './api'
 import type { RunStatus } from './types'
 vi.mock('./api', () => ({ listControlPlaneRuns: vi.fn() }))
@@ -43,4 +43,12 @@ it('keeps unresolved records outside Recent and hides archived/deleted records b
   expect(result.attention).toHaveLength(3)
   expect(result.recent.map(row => row.run.run_id)).toEqual(['done'])
   expect(selectGlobalRuns(rows, 10, 'archived').recent.map(row => row.run.run_id)).toEqual(['archive'])
+})
+
+it('searches loaded run identities and readable labels without changing the source rows', () => {
+  const row = { projectId: 'project-a', run: { ...run('run-exact'), plan_path: 'plans/clear-run-ui.md', workflow_name: 'managed', team: 'full', current_step: 'review' } }
+  expect(matchesGlobalRun(row, 'clear review', 'AFlow project')).toBe(true)
+  expect(matchesGlobalRun(row, 'run-exact', 'AFlow project')).toBe(true)
+  expect(matchesGlobalRun(row, 'other', 'AFlow project')).toBe(false)
+  expect(row.run.plan_path).toBe('plans/clear-run-ui.md')
 })

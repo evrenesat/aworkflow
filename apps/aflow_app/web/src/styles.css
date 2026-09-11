@@ -322,6 +322,43 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-sm);
 }
 
+.run-scan-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--spacing-sm) var(--spacing-md);
+  margin: 0;
+  padding: var(--spacing-sm);
+  background: var(--color-surface-hover);
+  border-radius: var(--radius-md);
+}
+
+.run-scan-summary div { min-width: 0; }
+.run-scan-summary dt { color: var(--color-text-dim); font-size: 0.75rem; }
+.run-scan-summary dd { margin: var(--spacing-xs) 0 0; overflow-wrap: anywhere; }
+
+.run-issue-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm);
+  border-left: 3px solid var(--color-primary);
+  background: var(--color-surface-hover);
+}
+
+.run-issue-summary > div:first-child { min-width: 0; }
+.run-issue-summary p { margin-top: var(--spacing-xs); }
+.run-issue-failure { border-left-color: var(--color-error); }
+.run-issue-summary .dashboard-actions { justify-content: flex-start; flex-shrink: 0; }
+
+.run-report summary {
+  min-height: var(--tap-target);
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+}
+
 .run-progress-strip {
   display: flex;
   flex-wrap: wrap;
@@ -591,6 +628,11 @@ input::placeholder, textarea::placeholder {
 .app-branding-compact {
   flex: 1 1 auto;
   gap: var(--spacing-sm);
+  min-width: 0;
+}
+
+.app-branding-compact .app-brand-title {
+  flex: 1 1 auto;
 }
 
 .app-brand-title {
@@ -632,7 +674,19 @@ input::placeholder, textarea::placeholder {
 .mobile-page-context {
   display: none;
   min-width: 0;
-  overflow-wrap: anywhere;
+  max-width: 45%;
+  flex: 0 0 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-page-context .header-context-title {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: inherit;
+  overflow-wrap: normal;
 }
 
 .header-slot-context {
@@ -1339,6 +1393,72 @@ input::placeholder, textarea::placeholder {
   overflow-wrap: anywhere;
 }
 
+.launch-role-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--spacing-md);
+}
+
+.run-role-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--spacing-sm) var(--spacing-md);
+  margin: 0;
+}
+
+.run-role-summary div { min-width: 0; }
+.run-role-summary dt { color: var(--color-text-dim); font-size: 0.75rem; }
+.run-role-summary dd { margin: var(--spacing-xs) 0 0; overflow-wrap: anywhere; }
+
+.upgrade-chain-compact {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.upgrade-chain-compact li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--spacing-xs);
+  min-width: 0;
+}
+
+.upgrade-chain-compact li:not(:last-child)::after {
+  content: '→';
+  color: var(--color-text-dim);
+  margin-inline-start: var(--spacing-xs);
+}
+
+.launch-preview-details {
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--spacing-xs);
+}
+
+.launch-preview-details > summary {
+  display: flex;
+  align-items: center;
+  min-height: var(--tap-target);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.launch-preview-details > summary:focus-visible {
+  outline-offset: -2px;
+}
+
+.launch-preview-details-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  padding-top: var(--spacing-sm);
+}
+
 :root[data-theme="dark"] {
   color-scheme: dark;
   --color-bg: #10141C;
@@ -1380,6 +1500,12 @@ input::placeholder, textarea::placeholder {
 .settings-fields label { display: flex; flex-direction: column; gap: var(--spacing-xs); }
 .settings-body { border: 0; padding: 0; min-width: 0; }
 .global-run-row { width: 100%; display: flex; flex-direction: column; gap: var(--spacing-xs); text-align: left; color: var(--color-text); cursor: pointer; overflow-wrap: anywhere; }
+.global-run-row-heading { display: flex; align-items: center; gap: var(--spacing-sm); flex-wrap: wrap; min-width: 0; }
+.global-run-row-title { flex: 1 1 12rem; min-width: 0; }
+.global-run-row-project { color: var(--color-text-dim); }
+.run-search-field { display: flex; flex-direction: column; gap: var(--spacing-xs); max-width: 34rem; }
+.run-list-context { display: flex; align-items: center; gap: var(--spacing-sm); flex-wrap: wrap; min-width: 0; }
+.run-list-title { flex: 1 1 10rem; min-width: 0; overflow-wrap: anywhere; }
 .global-settings textarea { min-width: 0; width: 100%; }
 
 .changelog-settings {
@@ -1489,10 +1615,11 @@ input::placeholder, textarea::placeholder {
 .profile-editor-row {
   display: grid;
   grid-template-columns: minmax(12rem, 0.8fr) minmax(0, 1fr) minmax(0, 1fr);
-  align-items: start;
-  gap: var(--spacing-md);
+  align-items: center;
+  gap: var(--spacing-sm) var(--spacing-md);
   min-width: 0;
-  margin-block: var(--spacing-md);
+  margin-block: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
 }
 
 .profile-editor-name,
@@ -1511,6 +1638,14 @@ input::placeholder, textarea::placeholder {
   flex-direction: column;
   gap: var(--spacing-xs);
   overflow-wrap: anywhere;
+}
+
+.profile-editor-actions {
+  grid-column: 2 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
 }
 
 .profile-editor-note {
@@ -1559,12 +1694,12 @@ input::placeholder, textarea::placeholder {
 .more-menu [role='menu'] { position: absolute; right: 0; top: calc(100% + 2px); z-index: 20; display: flex; flex-direction: column; min-width: 190px; padding: var(--spacing-xs); background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-md); box-shadow: 0 4px 14px color-mix(in srgb, var(--color-text) 18%, transparent); }
 .prompt-usage-list { margin: 0; padding-left: var(--spacing-lg); display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
 
-/* Sticky Settings toolbar keeps tabs and Save reachable during long scrolls. */
-/* Its containing block must span all fields, not shrink to the scroll viewport. */
+/* Settings' hosted header owns navigation and Save. The direct-render fallback
+   stays in ordinary document flow for isolated component use. */
 .global-settings { flex: 0 0 auto; }
-.settings-toolbar { position: sticky; top: 0; z-index: 15; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: max(var(--spacing-sm), env(safe-area-inset-top)) 0 var(--spacing-sm); margin: 0; background: var(--color-bg); border-bottom: 1px solid var(--color-border); scroll-margin-top: 0; }
-.settings-toolbar .config-tabs { flex: 1 1 auto; min-width: 0; }
-.settings-body .settings-fields, .settings-body label, .settings-body input, .settings-body textarea, .settings-body select, .settings-body .card { scroll-margin-top: 4.5rem; }
+.settings-fallback-controls { display: flex; align-items: center; justify-content: space-between; gap: var(--spacing-sm); padding: var(--spacing-sm) 0; margin: 0; }
+.settings-fallback-controls .config-tabs { flex: 1 1 auto; min-width: 0; }
+.settings-body .settings-fields, .settings-body label, .settings-body input, .settings-body textarea, .settings-body select, .settings-body .card { scroll-margin-top: 0; }
 
 /* Compact project and run rows. */
 .compact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--spacing-sm); }
@@ -1587,8 +1722,8 @@ input::placeholder, textarea::placeholder {
 
 @media (max-width: 640px) {
   .input, select, textarea { font-size: 16px; }
-  .config-tabs { flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x proximity; }
-  .config-tabs .btn { scroll-snap-align: start; white-space: nowrap; }
+  .config-tabs { flex-wrap: wrap; overflow: visible; scroll-snap-type: none; }
+  .config-tabs .btn { white-space: normal; }
   .compact-row { flex-wrap: wrap; }
   .compact-row-actions { flex-basis: 100%; justify-content: flex-end; }
   .worktree-item { flex-wrap: wrap; }
@@ -1597,7 +1732,8 @@ input::placeholder, textarea::placeholder {
   .worktree-item .compact-row-actions { justify-content: flex-end; }
   .profile-editor-row { grid-template-columns: minmax(0, 1fr); }
   .profile-editor-note,
-  .profile-editor-new-fields { grid-column: 1; }
+  .profile-editor-new-fields,
+  .profile-editor-actions { grid-column: 1; }
   .profile-editor-new-fields { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -1807,7 +1943,6 @@ input::placeholder, textarea::placeholder {
 }
 
 @media (max-height: 599px) {
-  /* Short viewports cannot reserve reliable space for a sticky action row. */
+  /* The shared header's second row is static on short viewports. */
   .app-header-row-two { position: static; }
-  .settings-toolbar { position: static; }
 }

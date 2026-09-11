@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-11 — Simplify New Run and verify browser journeys (Checkpoint 3)
+
+- Kept Plan, Workflow, and Team as labelled launch choices with resolved
+  defaults; added concise worker-upgrade and reviewer summaries and moved
+  verbose membership/step tables under keyboard-accessible Details. Pending
+  configuration now says Loading configuration instead of implying a default.
+- Extended disposable Chromium/WebKit journeys at 1440×900 and 390×844 in
+  light/dark modes for exact run back navigation, history search/filter,
+  Ready-plan launch/default and explicit team selection, settings edit/tab/save/
+  reload, long mobile Projects context, document scrolling, focus, and
+  overflow. Screenshots were inspected; physical mobile keyboard remains
+  unverified.
+
 ## 2026-09-11 — Preserve action feedback and recover passive read failures
 
 - HISTORY: CI evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-36c7b483-failed.log` showed a rejected control alert disappearing during a later passive snapshot refresh and a landscape hit test using coordinates measured before its DOM query.

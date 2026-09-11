@@ -55,10 +55,15 @@ Run history uses `POST .../runs/{run_id}/archive`, `POST .../restore`, and
 plus `acknowledge_active: true` when hiding active work. Lists accept
 `history=visible|archived|all`; deleted external reads return HTTP 410.
 
-Runs and the Teams, Workflows, Prompts, and Skills editors have independent
-scrolling menus. Settings keeps one shared draft and save action. Advanced TOML
-replaces all guided tabs until switching back; Connection settings TOML stays in
-General. Clear effort text to unset it, then Save all changes.
+The shell uses two compact header rows on desktop and a Menu/current-page/action
+header on compact screens. Runs, Plans, and Settings use document scrolling;
+compact lists open one detail surface with a labelled Back action. Settings
+keeps one shared draft and save action. New Run keeps Plan, Workflow, and Team
+choices visible, summarizes worker upgrades and reviewer assignment, and puts
+verbose role and executable-step tables under a keyboard-accessible Details
+disclosure. Advanced TOML replaces all guided tabs until switching back;
+Connection settings TOML stays in General. Clear effort text to unset it, then
+Save all changes.
 
 The Skills tab (between Prompts and General) edits bundled `SKILL.md` files
 with per-skill drafts that survive skill, tab, and Advanced TOML navigation.

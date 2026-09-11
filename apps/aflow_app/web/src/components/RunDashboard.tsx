@@ -23,7 +23,7 @@ import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
 import { useHeaderSlots } from './HeaderSlots'
-import { statusLabel, executionDuration } from '../runPresentation'
+import { runPlanDisplayName, runPlanPath, statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
 
@@ -233,6 +233,12 @@ function timestamp(value: unknown): string {
   if (typeof value !== 'string') return 'Not reported'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+function conciseRunText(value: unknown, limit = 240): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  const text = value.trim().replace(/\s+/g, ' ')
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
 }
 
 function textEvidence(run: RunStatus, key: string): string {
@@ -501,6 +507,55 @@ interface LastExecutedEvidence {
   model: string | null
 }
 
+interface RunIssue {
+  kind: 'failure' | 'attention'
+  cause: string
+}
+
+function runIssue(run: RunStatus): RunIssue | null {
+  const label = statusLabel(run)
+  const failure = run.status === 'failed' || label === 'Failed' || label === 'Could not start'
+  if (!failure && label !== 'Needs attention') return null
+
+  const startupFailure = contextObject(run.evidence.startup_failure)
+  const cause = conciseRunText(run.reason)
+    ?? conciseRunText(run.worker_exit?.reason)
+    ?? conciseRunText(startupFailure?.message)
+  if (cause) return { kind: failure ? 'failure' : 'attention', cause }
+
+  if (run.worker_exit) {
+    const phase = run.worker_exit.stage === 'wrapper_spawn'
+      ? 'Worker could not be spawned'
+      : run.evidence.has_run_metadata ? 'Worker exited' : 'Worker exited during startup'
+    const code = run.worker_exit.exit_code === null ? '' : ` (code ${run.worker_exit.exit_code})`
+    return { kind: failure ? 'failure' : 'attention', cause: `${phase}${code}. The original worker error was not retained.` }
+  }
+
+  return {
+    kind: failure ? 'failure' : 'attention',
+    cause: failure ? 'The run failed without a readable recorded cause.' : 'Review is needed; no short reason was recorded.',
+  }
+}
+
+function runActorSummary(lastExecuted: LastExecutedEvidence | null): string {
+  if (!lastExecuted) return 'Not reported'
+  const rawRole = lastExecuted.role?.trim() ?? ''
+  const role = rawRole.toLowerCase() === 'worker'
+    ? 'Worker'
+    : rawRole.toLowerCase() === 'reviewer'
+      ? 'Reviewer'
+      : rawRole ? formatMachineLabel(rawRole) : 'Role not reported'
+  const detail = [lastExecuted.selector, lastExecuted.model].filter((value): value is string => Boolean(value)).join(' · ')
+  return detail ? `${role} · ${detail}` : role
+}
+
+function runTimingSummary(run: RunStatus, elapsed: string | null): string {
+  if (elapsed) return `${run.status === 'running' ? 'Running for' : 'Duration'} ${elapsed}`
+  if (run.ended_at) return `Completed ${timestamp(run.ended_at)}`
+  if (run.started_at) return `Started ${timestamp(run.started_at)}; duration not reported`
+  return 'Not reported'
+}
+
 function lastExecutedEvidence(
   events: RunEvent[],
   context: RunContext | null,
@@ -751,6 +806,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [events, setEvents] = useState<RunEvent[]>([])
   const [context, setContext] = useState<RunContext | null>(null)
   const [rawOpen, setRawOpen] = useState(false)
+  const [reportOpen, setReportOpen] = useState(false)
   const [contextBusy, setContextBusy] = useState(false)
   const [contextError, setContextError] = useState<string | null>(null)
   const [statusUpdatedAt, setStatusUpdatedAt] = useState<string | null>(null)
@@ -939,6 +995,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }, [projectId, selectedRunId])
 
   useEffect(() => {
+    setReportOpen(false)
+  }, [selectedRunId])
+
+  useEffect(() => {
     clearPendingWriteKeys()
   }, [projectId, clearPendingWriteKeys])
 
@@ -1105,6 +1165,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     const requestedHistory = historyFilter
     const scope = JSON.stringify([nextProjectId, requestedHistory])
     if (loadedHistory.current.scope !== scope) loadedHistory.current = { scope, pages: 1 }
+    // Do not present an old projection as a newly resolved default while the
+    // refresh is reading the committed pair again.
+    setCommitted(null)
+    setCommittedError(null)
     const pageCount = loadedHistory.current.pages
     const request = ++historyRequest.current
     const callerActive = isActive
@@ -1774,6 +1838,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   // Effective launch values, resolved only from the committed projection plus
   // canonical capabilities.  An unresolved value is never labeled a default.
   const committedForm = committed?.form ?? null
+  const configurationDisplay = committedError
+    ? 'Configuration unavailable'
+    : 'Loading configuration…'
   const effectiveWorkflow = startWorkflow.trim() || (committedForm?.default_workflow ?? '').trim()
   const effectiveWorkflowSource = startWorkflow.trim()
     ? 'your selection'
@@ -1833,19 +1900,31 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   // name with a Default indicator; the open list offers an explicit default row.
   const workflowResolvedDisplay = startWorkflow.trim()
     ? null
-    : committedForm?.default_workflow ? formatMachineChoice(committedForm.default_workflow, workflowOptions) : 'No default workflow configured'
+    : committed === null ? configurationDisplay : committedForm?.default_workflow ? formatMachineChoice(committedForm.default_workflow, workflowOptions) : 'No default workflow configured'
   const workflowResolvedBadge = !startWorkflow.trim() && committedForm?.default_workflow ? 'Default' : undefined
   const workflowDefaultOption = {
     value: '',
-    label: committedForm?.default_workflow ? `Use default (${formatMachineChoice(committedForm.default_workflow, workflowOptions)})` : 'Use default',
-    hint: committedForm?.default_workflow ? 'the global default workflow applies' : 'no global default workflow is configured',
+    label: committed === null
+      ? configurationDisplay
+      : committedForm?.default_workflow ? `Use default (${formatMachineChoice(committedForm.default_workflow, workflowOptions)})` : 'Use default',
+    hint: committed === null
+      ? 'wait for committed configuration to resolve the default'
+      : committedForm?.default_workflow ? 'the global default workflow applies' : 'no global default workflow is configured',
   }
-  const teamResolvedDisplay = startTeam.trim() ? null : (workflowDefaultTeam ? formatMachineChoice(workflowDefaultTeam, teamOptions) : 'No team — global roles')
+  const teamResolvedDisplay = startTeam.trim()
+    ? null
+    : committed === null
+      ? configurationDisplay
+      : (workflowDefaultTeam ? formatMachineChoice(workflowDefaultTeam, teamOptions) : 'No team — global roles')
   const teamResolvedBadge = !startTeam.trim() && workflowDefaultTeam ? 'Default' : undefined
   const teamDefaultOption = {
     value: '',
-    label: workflowDefaultTeam ? `Use default (${formatMachineChoice(workflowDefaultTeam, teamOptions)})` : 'Use default (no team)',
-    hint: workflowDefaultTeam ? 'the workflow default team applies' : 'global role assignments apply',
+    label: committed === null
+      ? configurationDisplay
+      : workflowDefaultTeam ? `Use default (${formatMachineChoice(workflowDefaultTeam, teamOptions)})` : 'Use default (no team)',
+    hint: committed === null
+      ? 'wait for committed configuration to resolve the default'
+      : workflowDefaultTeam ? 'the workflow default team applies' : 'global role assignments apply',
   }
   // Launch admission offers only saved Ready (in progress) plans: Draft and
   // Done records are never selectable, so their paths are never submitted.
@@ -2006,20 +2085,34 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       ? textEvidence(selectedRun, 'plan_path')
       : planPathFromContext(context))
     : 'Not reported'
-  // The header names the plan file; the full relative path stays under
-  // Technical details.
-  const selectedPlanFileName = selectedPlanPath !== 'Not reported'
-    ? selectedPlanPath.split('/').pop() || selectedPlanPath
+  // The header names the plan; the full path stays under Technical details.
+  const selectedPlanFileName = selectedRun
+    ? runPlanDisplayName(selectedPlanPath === 'Not reported' ? null : selectedPlanPath, selectedRun.run_id)
     : 'Not reported'
   const roleChoices = capabilities?.roles ?? []
   const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string> } | null
   const lastExecuted = lastExecutedEvidence(events, context)
+  const selectedRunIssue = selectedRun ? runIssue(selectedRun) : null
+  const selectedRunTiming = selectedRun ? runTimingSummary(selectedRun, elapsed) : 'Not reported'
 
   const workflowRoleList = stepRoleMap ? [...new Set(Object.values(stepRoleMap))].sort() : []
   const otherConfiguredRoles = committedForm
     ? Object.keys(committedForm.roles).filter((role) => !workflowRoleList.includes(role)).sort()
     : []
   const upgradeChain = effectiveTeam ? capabilities?.team_upgrade_chains?.[effectiveTeam] ?? null : null
+  const workerUpgradeStages = upgradeChain?.map((team) => {
+    const teamRoles = committedForm?.teams?.[team]?.roles ?? {}
+    const worker = resolveStepRole('worker', teamRoles, committedForm?.roles ?? {})
+    return {
+      team,
+      worker,
+      modelEffort: worker.selector ? selectorModelEffortText(worker.selector, committedForm) : '',
+    }
+  }) ?? []
+  const reviewerResolution = resolveStepRole('reviewer', effectiveTeamRoles, committedForm?.roles ?? {})
+  const reviewerModelEffort = reviewerResolution.selector
+    ? selectorModelEffortText(reviewerResolution.selector, committedForm)
+    : ''
 
   function membershipRow(role: string, teamRoles: Record<string, string>, teamName: string | null) {
     const resolution = resolveStepRole(role, teamRoles, committedForm?.roles ?? {})
@@ -2048,18 +2141,70 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </div>
                 <dl className="run-preview-list">
                   <div><dt>Plan</dt><dd className="mono">{startPlanPath.trim() || <span className="text-dim">Not chosen</span>}</dd></div>
-                  <div><dt>Workflow</dt><dd>{effectiveWorkflow
+                  <div><dt>Workflow</dt><dd>{!startWorkflow.trim() && committed === null
+                    ? <span className="text-dim">{configurationDisplay}</span>
+                    : effectiveWorkflow
                     ? <><span className="mono">{formatMachineLabel(effectiveWorkflow)}</span> — {effectiveWorkflowSource}</>
                     : <span className="text-dim">No default workflow configured — choose a workflow or set a global default in Settings</span>}</dd></div>
                   <div><dt>Max turns</dt><dd>{startMaxTurnsProblem !== null
                     ? <><span className="mono">{startMaxTurns.trim()}</span> — invalid override: correct the Max turns field</>
+                    : !startMaxTurns.trim() && committed === null
+                      ? <span className="text-dim">{configurationDisplay}</span>
                     : effectiveMaxTurns !== null
                       ? <><span className="mono">{effectiveMaxTurns}</span> — {effectiveMaxTurnsSource}</>
                       : <span className="text-dim">{effectiveMaxTurnsSource}</span>}</dd></div>
-                  <div><dt>Team</dt><dd>{effectiveTeam
+                  <div><dt>Team</dt><dd>{!startTeam.trim() && committed === null
+                    ? <span className="text-dim">{configurationDisplay}</span>
+                    : effectiveTeam
                     ? <><span className="mono">{formatMachineLabel(effectiveTeam)}</span> — {effectiveTeamSource}</>
                     : <span className="text-dim">{effectiveTeamSource}</span>}</dd></div>
                 </dl>
+                <div className="launch-role-summary">
+                  <div className="section-heading">
+                    <h4>Roles at launch</h4>
+                    <span className="text-xs text-dim">the selected team and committed role assignments</span>
+                  </div>
+                  <dl className="run-role-summary">
+                    <div>
+                      <dt>Worker upgrade chain</dt>
+                      <dd>
+                        {committed === null ? (
+                          <span className="text-dim">{configurationDisplay}</span>
+                        ) : workerUpgradeStages.length > 0 ? (
+                          <ol className="upgrade-chain upgrade-chain-compact">
+                            {workerUpgradeStages.map((stage) => (
+                              <li key={stage.team}>
+                                <span className="mono">{formatMachineLabel(stage.team)}</span>
+                                <span className="text-sm"> — {stage.worker.selector
+                                  ? <><span className="mono">{stage.worker.selector}</span>{stage.modelEffort ? <> · {stage.modelEffort}</> : null}</>
+                                  : <span className="text-dim">worker not assigned</span>}</span>
+                              </li>
+                            ))}
+                          </ol>
+                        ) : effectiveTeam ? (
+                          <span className="text-dim">No configured worker upgrade chain for <span className="mono">{formatMachineLabel(effectiveTeam)}</span>.</span>
+                        ) : (
+                          <span className="text-dim">No team selected; global role assignments apply.</span>
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Reviewer</dt>
+                      <dd>
+                        {committed === null ? (
+                          <span className="text-dim">{configurationDisplay}</span>
+                        ) : reviewerResolution.selector ? (
+                          <><span className="mono">{reviewerResolution.selector}</span>{reviewerModelEffort ? <> · {reviewerModelEffort}</> : <span className="text-dim"> · model/effort not reported</span>}</>
+                        ) : (
+                          <span className="text-dim">Not assigned in the selected team or global roles.</span>
+                        )}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+                <details className="launch-preview-details">
+                  <summary>Details</summary>
+                  <div className="launch-preview-details-body">
                 {workflowRoleList.length > 0 && (
                   <div>
                     <h4>Team members</h4>
@@ -2164,6 +2309,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     )}
                   </div>
                 )}
+                  </div>
+                </details>
               </section>
 
   )
@@ -2315,17 +2462,26 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           <section className="card run-list" aria-label="Project runs">
             <div className="section-heading"><h3>Project runs</h3><span className="text-xs text-dim">{listedRuns.length} recorded</span></div>
             {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
-            {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => (
-              <button data-sidebar-editor-item={run.run_id} className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`} key={run.run_id} onClick={() => selectRun(run.run_id)}>
-                <span>{run.plan_path?.split('/').pop() ?? run.run_id}</span>
-                <span className="status-pill">{statusLabel(run)}</span>
+            {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => {
+              const exactPath = runPlanPath(run)
+              const displayName = runPlanDisplayName(exactPath, run.run_id)
+              const status = statusLabel(run)
+              return <button
+                data-sidebar-editor-item={run.run_id}
+                className={`content-button run-list-item ${selectedRunId === run.run_id ? 'selected' : ''}`}
+                aria-label={`${run.run_id} ${status} · ${displayName} · ${exactPath ?? 'Plan not reported'}`}
+                key={run.run_id}
+                onClick={() => selectRun(run.run_id)}
+              >
+                <span className="run-list-context"><strong className="run-list-title">{displayName}</strong><span className="status-pill">{status}</span></span>
                 <span className="text-xs text-dim">
                   {run.restarted_from_run_id ? '↻ successor · ' : ''}
                   {formatMachineLabel(run.workflow_name ?? '')}{run.current_step ? ` · ${formatMachineLabel(run.current_step)}` : ''}
                   {run.skipped_steps.length > 0 ? ` · ${run.skipped_steps.length} skipped` : ''}
                 </span>
+                <span className="text-xs text-dim mono">Plan: {exactPath ?? 'Not reported'} · Run: {run.run_id}</span>
               </button>
-            ))}
+            })}
             {nextRunCursor && <button className="btn btn-secondary" disabled={refreshing} onClick={() => void loadMoreRuns()}>Load more runs</button>}
           </section>}>
 
@@ -2351,15 +2507,17 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <button className="btn btn-danger" disabled={busyAction === 'history' || (selectedRun.activity === 'active' && !acknowledgeActive)} onClick={() => void mutateHistory(historyConfirm)}>Confirm {historyConfirm}</button>
                   <button className="btn btn-secondary" onClick={() => setHistoryConfirm(null)}>Cancel</button>
                 </div>}
+                <dl className="run-scan-summary">
+                  <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
+                  <div><dt>Checkpoint / review scope</dt><dd>{checkpoints ? checkpointProgressText(checkpoints) : 'Not reported'}</dd></div>
+                  <div><dt>Worker / reviewer</dt><dd>{runActorSummary(lastExecuted)}</dd></div>
+                  <div><dt>Elapsed / completion</dt><dd>{selectedRunTiming}</dd></div>
+                </dl>
                 <dl className="run-progress-strip">
                   {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
                   {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
                   <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
-                  {lastExecuted && <div><dt>Last executed</dt><dd>
-                    {lastExecuted.role ? formatMachineLabel(lastExecuted.role) : 'Role not reported'}
-                    {lastExecuted.model ? <> · {lastExecuted.model}</> : null}
-                    {lastExecuted.turnNumber !== null ? <> · turn {lastExecuted.turnNumber}</> : null}
-                  </dd></div>}
+                  {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
                   {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
                     : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
                   {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
@@ -2368,18 +2526,36 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               {selectedRun.ownership === 'legacy' && <div className="notice">Legacy execution record. Workflow controls are unavailable; history controls remain available.</div>}
               {selectedRun.evidence.no_agent_started === true && selectedRun.status !== 'running' && <p>No agent started.</p>}
               {streamState === 'reconnecting' && <div className="notice">Updates are stale. Use Refresh to retry.</div>}
-              {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
+              {selectedRunIssue && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
+                <div>
+                  <strong>{selectedRunIssue.kind === 'failure' ? 'Failure' : 'Needs attention'}</strong>
+                  <p>{selectedRunIssue.cause}</p>
+                </div>
+                <div className="dashboard-actions">
+                  {canResume && (!confirmResume
+                    ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button>
+                    : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>)}
+                  {canRestart && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
+                  {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
+                </div>
+              </section>}
+              {!selectedRunIssue && selectedRun.reason && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
 
 
-              {(checkpoints || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section">
+              {(checkpoints?.repairing || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section">
                 <h4>Latest progress</h4>
-                {checkpoints && <p>{checkpointProgressText(checkpoints)}</p>}
                 {checkpoints?.repairing && <p><strong>Repairing</strong>{checkpoints.overlayFileName ? <> · {checkpoints.overlayFileName}</> : null}</p>}
                 {outcome?.decision && <p>{outcome.decision}</p>}
                 {outcome?.currentTurn && <p>Current turn: {outcome.currentTurn}</p>}
                 {outcome?.finishedTurn && <p>Last finished turn: {outcome.finishedTurn}</p>}
                 {outcome?.finishedSummary && <p>Last finished summary: {outcome.finishedSummary}</p>}
-                {outcome?.resultText && <pre className="dashboard-payload">{outcome.resultText}</pre>}
+                {outcome?.resultText && <>
+                  <p><span className="text-sm text-dim">Latest report:</span> <span>{conciseRunText(outcome.resultText)}</span></p>
+                  <details className="run-report" open={reportOpen}>
+                    <summary onClick={event => { event.preventDefault(); setReportOpen(open => !open) }}>Open report</summary>
+                    {reportOpen && <pre className="dashboard-payload">{outcome.resultText}</pre>}
+                  </details>
+                </>}
               </section>}
 
               {savedOverrides && <details className="dashboard-section" open><summary>Run changes</summary>
@@ -2429,12 +2605,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <>
                   {!confirmOwnerStop ? <button className="btn btn-danger" disabled={restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Owner stop…</button> : <div className="confirmation"><span>Confirm owner stop for {selectedRun.run_id}. This control is recorded by the server.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Confirm stop</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
                 </>}
-                {canResume && <>
+                {!selectedRunIssue && canResume && <>
                   {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
                 </>}
               </section>
 
-              {canRestart && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
+              {canRestart && !selectedRunIssue && <button className="btn btn-secondary" onClick={openRestart}>Restart with changes</button>}
               {!canResume && selectedRun.evidence.no_agent_started === true && <p className="text-sm">No execution state is available to Resume.</p>}
               {!canRestart && restartAdmission?.reason && <p className="text-sm">Restart unavailable: {restartAdmission.reason}</p>}
 
@@ -2488,11 +2664,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                       {selectedRun.worker_exit && <>
                         <p>{selectedRun.worker_exit.stage === 'wrapper_spawn' ? 'Worker could not be spawned' : !selectedRun.evidence.has_run_metadata ? 'Worker exited during startup' : 'Worker exited'}{selectedRun.worker_exit.exit_code !== null ? ` (code ${selectedRun.worker_exit.exit_code})` : ''}</p>
                         <p>Failure stage: {selectedRun.worker_exit.stage}</p>
-                        {selectedRun.worker_exit.reason && <p>{selectedRun.worker_exit.reason}</p>}
+                        {selectedRun.worker_exit.reason && <p>{conciseRunText(selectedRun.worker_exit.reason)}</p>}
                         {selectedRun.worker_exit.exited_at && <p>Worker exit: {timestamp(selectedRun.worker_exit.exited_at)}</p>}
                         {selectedRun.worker_exit.diagnostic_unavailable && <p>Original worker error was not retained.</p>}
                       </>}
-                      {!selectedRun.worker_exit && selectedRun.reason && <p>{selectedRun.reason}</p>}
+                      {!selectedRun.worker_exit && selectedRun.reason && <p>{conciseRunText(selectedRun.reason)}</p>}
                       <p>{[selectedRun.plan_path, selectedRun.workflow_name ? formatMachineLabel(selectedRun.workflow_name) : null, selectedRun.team ? formatMachineLabel(selectedRun.team) : null, selectedRun.current_step ? formatMachineLabel(selectedRun.current_step) : null].filter(Boolean).join(' · ')}</p>
                       {events.length > 0 && <p>Last event: {formatMachineLabel(events[events.length - 1].event_type)} · {timestamp(events[events.length - 1].timestamp)}</p>}
                       <p>{selectedRun.evidence.can_resume === true ? 'Saved continuation is available.' : 'Resume is unavailable: no admitted saved continuation.'} {selectedRun.status === 'failed' ? 'Restart with options checks eligibility before creating a fresh run.' : ''}</p>

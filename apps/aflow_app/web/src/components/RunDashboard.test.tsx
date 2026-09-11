@@ -589,7 +589,7 @@ describe('RunDashboard', () => {
     expect(screen.getByText(/running for /)).toBeDefined()
     // The progress header names the plan file from canonical run evidence;
     // the demo-2 context fallback above stays under Diagnostics.
-    expect(screen.getByRole('heading', { name: 'demo.md' })).toBeDefined()
+    expect(screen.getByRole('heading', { name: 'Demo' })).toBeDefined()
   })
 
   it('renders verified repair progress and separates current from last finished turns', async () => {
@@ -2078,6 +2078,15 @@ describe('RunDashboard', () => {
     expect(preview).toContain('Managed — global default')
     expect(preview).toContain('12 — global default')
     expect(preview).toContain('Base — workflow default (Base)')
+    expect(preview).toContain('Worker upgrade chain')
+    expect(preview).toContain('Reviewer')
+    const launchDetails = screen.getByText('Details').closest('details')
+    expect(launchDetails?.hasAttribute('open')).toBe(false)
+    fireEvent.click(launchDetails?.querySelector('summary') as HTMLElement)
+    // jsdom does not toggle the native disclosure on every supported
+    // version, so mirror the browser's open state before querying its table.
+    launchDetails?.setAttribute('open', '')
+    expect(launchDetails?.hasAttribute('open')).toBe(true)
 
     // Each executable step resolves exactly its own declared role — the other
     // configured roles are never repeated under a step.

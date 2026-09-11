@@ -378,6 +378,24 @@ describe('App workspace shell', () => {
     expect(screen.queryByText('Choose a project first')).toBeNull()
   })
 
+  it('keeps compact page context separate from the full project identity', async () => {
+    const media = mockMatchMedia(true)
+    try {
+      setUrl('/?project=alpha&view=projects')
+      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      render(<App />)
+      await screen.findByRole('heading', { name: 'Projects', exact: true })
+      const identity = screen.getByRole('heading', { name: 'AFlow · Alpha Project', exact: true })
+      expect(identity.getAttribute('title')).toBe('AFlow · Alpha Project')
+      expect(identity.getAttribute('aria-label')).toBe('AFlow · Alpha Project')
+      const compactContext = document.querySelector('.mobile-page-context')
+      expect(compactContext?.textContent?.trim()).toBe('Projects')
+      expect(compactContext?.querySelector('.header-context-title')).toBeTruthy()
+    } finally {
+      media.restore()
+    }
+  })
+
   it('keeps compact navigation and secondary Settings actions accessible in flow', async () => {
     const media = mockMatchMedia(true)
     try {
@@ -949,19 +967,19 @@ describe('App workspace shell', () => {
       vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === 'run-other' ? other : dashboardRun)
       render(<App />)
       await screen.findByRole('heading', { name: 'Runs' })
-      await screen.findByRole('heading', { name: 'demo.md' })
+      await screen.findByRole('heading', { name: 'Demo' })
       expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
 
       setUrl('/?project=alpha&view=runs&run=run-other')
       window.dispatchEvent(new PopStateEvent('popstate'))
       await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenCalledWith('alpha', 'run-other', expect.objectContaining({ signal: expect.any(AbortSignal) })))
-      await screen.findByRole('heading', { name: 'other.md' })
+      await screen.findByRole('heading', { name: 'Other' })
       expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
 
       setUrl('/?project=alpha&view=runs&run=run-9')
       window.dispatchEvent(new PopStateEvent('popstate'))
       await waitFor(() => expect(api.getControlPlaneRun).toHaveBeenLastCalledWith('alpha', 'run-9', expect.objectContaining({ signal: expect.any(AbortSignal) })))
-      await screen.findByRole('heading', { name: 'demo.md' })
+      await screen.findByRole('heading', { name: 'Demo' })
       expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
     } finally {
       media.restore()
@@ -981,7 +999,7 @@ describe('App workspace shell', () => {
         const row = await screen.findByRole('button', { name: /Alpha Project.*run-9/ })
         fireEvent.click(row)
         await waitFor(() => expect(push).toHaveBeenLastCalledWith(null, '', '/?project=alpha&view=runs&run=run-9'))
-        await screen.findByRole('heading', { name: 'demo.md' })
+        await screen.findByRole('heading', { name: 'Demo' })
         expect((document.querySelector('.sidebar-editor-navigation') as HTMLElement).hidden).toBe(true)
         expect((document.querySelector('.sidebar-editor-detail') as HTMLElement).hidden).toBe(false)
       }
@@ -1044,7 +1062,7 @@ describe('App workspace shell', () => {
     expect(await screen.findByText(/is not recorded for this project/)).toBeDefined()
     await waitFor(() => expect(replace).toHaveBeenCalledWith(null, '', '/?project=alpha&view=runs'))
     // No other run was selected in place of the missing link target.
-    expect(screen.queryByRole('heading', { name: 'demo.md' })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Demo' })).toBeNull()
   })
 
   it('pushes run selection into the URL and restores the prior run on browser back', async () => {

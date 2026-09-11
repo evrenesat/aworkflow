@@ -79,6 +79,83 @@ def launch_test_browser(playwright):
     return browser_type.launch(**launch)
 
 
+def test_profile_combobox_enter_preserves_raw_identity(control_client, tmp_path, monkeypatch):
+    """A partial profile search must save the selected raw profile name."""
+    from aflow_app_server import config as config_module, main
+
+    _, root, _, _ = control_client
+    home = tmp_path / 'profile-home'
+    home.mkdir()
+    browser_cache = Path.home() / 'Library' / 'Caches' if sys.platform == 'darwin' else Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache')))
+    monkeypatch.setenv('PLAYWRIGHT_BROWSERS_PATH', os.environ.get('PLAYWRIGHT_BROWSERS_PATH', str(browser_cache / 'ms-playwright')))
+    monkeypatch.setenv('HOME', str(home))
+    config_dir = root.parent / 'global'
+    config_path = config_dir / 'aflow.toml'
+    monkeypatch.setattr(main, 'global_config_dir', lambda: config_dir)
+    monkeypatch.setattr(config_module, 'global_config_dir', lambda: config_dir)
+    dist = Path(__file__).resolve().parents[2] / 'web' / 'dist'
+    monkeypatch.setenv('AFLOW_APP_WEB_DIST', str(dist))
+    evidence_root = Path('.aflow/review-clear-run-settings/r1')
+    evidence_root.mkdir(parents=True, exist_ok=True)
+
+    def add_raw_profile_suggestion(route):
+        response = route.fetch()
+        payload = response.json()
+        suggestions = payload['suggestions']
+        suggestions['profiles'] = [
+            item for item in suggestions['profiles']
+            if not (item['harness'] == 'codex' and item['profile'] == 'luna-max')
+        ]
+        suggestions['profiles'].append({
+            'harness': 'codex',
+            'profile': 'luna_max',
+            'model': 'luna-model',
+            'effort': 'high',
+        })
+        route.fulfill(response=response, json=payload)
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = launch_test_browser(playwright)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 900})
+            page.route('**/api/config/form', add_raw_profile_suggestion)
+            page.goto(url)
+            page.get_by_placeholder('Auth token').fill(TOKEN)
+            page.get_by_role('button', name='Login', exact=True).click()
+            page.get_by_role('button', name='Settings', exact=True).click()
+            select_settings_section(page, 'Agents & Roles')
+
+            page.get_by_label('Harness', exact=True).select_option('codex')
+            profile = page.get_by_label('New profile name', exact=True)
+            profile.fill('luna')
+            profile.press('ArrowDown')
+            profile.press('Enter')
+            assert profile.input_value() == 'Luna max'
+            assert page.get_by_text('codex.luna', exact=True).count() == 0
+            assert page.get_by_text('codex.luna_max', exact=True).count() == 0
+
+            page.get_by_role('button', name='Add profile', exact=True).click()
+            page.get_by_text('codex.luna_max', exact=True).wait_for()
+            assert page.get_by_text('codex.luna', exact=True).count() == 0
+            assert '[harness.codex.profiles.luna_max]' not in config_path.read_text()
+
+            browser_name = os.environ.get('AFLOW_TEST_BROWSER', 'chromium').strip().lower()
+            for theme in ('light', 'dark'):
+                select_settings_section(page, 'General')
+                page.get_by_label('Color theme').select_option(theme)
+                select_settings_section(page, 'Agents & Roles')
+                page.get_by_text('codex.luna_max', exact=True).wait_for()
+                page.screenshot(path=str(evidence_root / f'profile-selection-{browser_name}-{theme}-1280x900.png'))
+
+            page.get_by_role('button', name='Save all changes', exact=True).click()
+            page.get_by_text('Workflow settings saved; new runs use the saved configuration', exact=False).wait_for()
+            saved = config_path.read_text()
+            assert '[harness.codex.profiles.luna_max]' in saved
+            assert '[harness.codex.profiles.luna]' not in saved
+        finally:
+            browser.close()
+
+
 def test_changelog_settings_responsive_journey(control_client, tmp_path, monkeypatch):
     """Exercise the release view and draft ownership in real browsers."""
     _, root, _, _ = control_client

@@ -3,6 +3,26 @@ import { formatMachineLabel } from './label'
 
 export const terminalStatuses = new Set(['completed', 'done', 'failed', 'owner_stopped', 'interrupted'])
 
+/**
+ * Return the short, user-facing name for a run's plan without changing the
+ * exact path kept in the run identity or technical details.
+ */
+export function runPlanDisplayName(planPath: string | null | undefined, runId: string): string {
+  const suppliedPath = typeof planPath === 'string' ? planPath.trim() : ''
+  const basename = suppliedPath.split(/[\\/]+/).pop()?.trim() ?? ''
+  const withoutMarkdown = basename.replace(/\.md$/i, '').trim()
+  const readable = withoutMarkdown.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!readable) return runId
+  return readable.charAt(0).toUpperCase() + readable.slice(1)
+}
+
+/** Resolve the exact plan path from the current run contract or its evidence. */
+export function runPlanPath(run: RunStatus): string | null {
+  if (typeof run.plan_path === 'string' && run.plan_path.trim()) return run.plan_path
+  const evidencePath = run.evidence.plan_path
+  return typeof evidencePath === 'string' && evidencePath.trim() ? evidencePath : null
+}
+
 export function statusLabel(run: RunStatus): string {
   if (run.status === 'failed' && run.worker_exit && !run.evidence.has_run_metadata) return 'Could not start'
   if (run.status_reason_code === 'startup_failed') return 'Could not start'
