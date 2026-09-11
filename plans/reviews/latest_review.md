@@ -480,3 +480,53 @@ The test invocation's incidental server uv.lock refresh was restored to reviewed
 Publication, integration with current main, exact-SHA CI, live activation and physical-device acceptance remain downstream and unclaimed. Preserve loading, recovery/pending-review/startup guards and concurrent stop-after-turn controls during integration.
 
 No material findings
+
+
+---
+
+# Integrated refresh delivery repair — cumulative approval, 2026-09-11
+
+Original/active plan: `plans/in-progress/visual-progress-refresh-delivery-20260911.md`.
+Unchanged Pre-Handoff Base HEAD: `f0ceacc4749d9a8490b81cec3177247ce5952fd6`.
+Reviewed HEAD: `1d6ae9368b8cd42cf1ff86c63acbbc974fabaae4`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all original checkpoint requirements
+and both changed files. Branch matches plan tracking. No prior findings or fix
+overlays belong to this repair; the integrated visual feature is the approved base.
+
+No material findings under the admission gate, exclusions and proportionate-fix
+discipline. Exact Stop now… and Stop after current turn assertions replace only
+the obsolete Owner stop… lookup. Full diagnostics, selected checkpoint and
+Restart with changes assertions survive. Existing boundary and immediate cases
+retain distinct endpoints, revision/idempotency requests and immediate confirmation.
+Production controls and source failure lineage `20260911t154751z-382a2f5f` are unchanged.
+
+## Verification evidence
+
+Reused inspected completed worker evidence from
+`/root/code/agent_flow/.aflow/runs/20260911t231826z-021934df/turns/turn-001/transport.stdout`
+(item_40, exit 0) and successful result.json. The supplied worktree-relative
+artifact is absent; the controller-root receipt records DONE=true and zero
+unchecked checkpoints. The tested patch matches reviewed HEAD.
+
+```sh
+npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx -t 'inspects selected checkpoint history while preserving full diagnostics on refresh|requests a boundary stop through revisioned control and keeps the immediate stop separate|keeps Stop now on the immediate endpoint and confirms its terminal response'
+git diff --check f0ceacc4749d9a8490b81cec3177247ce5952fd6 HEAD
+```
+
+All three named cases passed; 106 filtered, 109 total. Initial missing Vitest
+was resolved with npm ci before this successful run. Independent cumulative
+whitespace check passed. No full suite, build or browser repeat; retained approved
+product evidence remains applicable to this test-only change. No private paths
+were added to portable test code.
+
+## Approval finalization
+
+Approve one unpublished final handoff commit after the unchanged base, including
+this tracked review record. Preserve both reviewed implementation blobs and the
+single repair DEVLOG entry. No fix plan is needed or created. Keep the ignored
+original plan in place for engine finalization and record final approved SHA
+there after committing. Verify exactly one final commit and clean tracked state.
+Publication, exact-SHA CI and live activation remain downstream engine/coordinator
+gates and are not claimed by this review. Preserve concurrent family work.
+
+No material findings

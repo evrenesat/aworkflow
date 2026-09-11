@@ -1,5 +1,17 @@
 # DEVLOG
 
+## 2026-09-11 — Repair integrated refresh stop-control acceptance
+
+- Updated the checkpoint-history refresh assertion to retain full diagnostics,
+  selected checkpoint and restart coverage while asserting the delivered
+  `Stop now…` and `Stop after current turn` controls. The focused RunDashboard
+  filter passed all 3 selected cases: `inspects selected checkpoint history
+  while preserving full diagnostics on refresh`, `requests a boundary stop
+  through revisioned control and keeps the immediate stop separate`, and `keeps
+  Stop now on the immediate endpoint and confirms its terminal response`; 106
+  cases were filtered and `git diff --check` passed. No production behavior
+  changed; publication, CI and live activation remain downstream gates.
+
 ## 2026-09-11 — Visual run progress and checkpoint history
 
 - Added bounded, read-only canonical progress shared by repository/status,

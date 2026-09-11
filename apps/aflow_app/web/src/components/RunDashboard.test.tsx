@@ -2924,7 +2924,8 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(vi.mocked(api.getRunContext).mock.calls.filter(call => call[2] === 'full').length).toBeGreaterThan(fullCallsBeforeRefresh))
     expect(screen.getByText(/full-marker/)).toBeDefined()
     expect(screen.getAllByRole('heading', { name: 'Checkpoint 4: Reviewed' }).length).toBeGreaterThan(0)
-    expect(screen.getByRole('button', { name: 'Owner stop…' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Stop now…', exact: true })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Stop after current turn', exact: true })).toBeDefined()
     expect(screen.getByRole('button', { name: 'Restart with changes' })).toBeDefined()
   })
 
