@@ -1058,9 +1058,16 @@ conventions as the editing tabs.
 
 REST plus SSE is the canonical remote interface, and authenticated MCP is an
 HTTP adapter mounted by the same UI server at `/mcp` and `/mcp/`. Both use the
-same `ControlPlaneService`, project registry, and lifecycle domain services. A
-remote ACP interface is deferred; no standalone MCP listener or stdio transport
-is maintained. Codex is an optional engine harness, and the web app has no
+same `ControlPlaneService`, project registry, and lifecycle domain services.
+The web adapter composes one small authoring registrar over the existing
+`PlanService` and `GlobalConfigService`: plan tools stay project-scoped, while
+the settings tools expose only the global `aflow.toml`/`workflows.toml` pair.
+Both settings transports use the shared response conversion and the service's
+revisioned pair lock, final validation, rollback, no-op, and audit rules;
+MCP writes are attributed to the `mcp` audit scope. There are no arbitrary
+file tools or a second service/store/server composition. A remote ACP
+interface is deferred; no standalone MCP listener or stdio transport is
+maintained. Codex is an optional engine harness, and the web app has no
 provider-specific client.
 
 All projects read the one global workflow pair (`~/.config/aflow/aflow.toml`

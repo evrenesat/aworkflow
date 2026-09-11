@@ -14,9 +14,13 @@ session cookie, URL credentials, or credentials in tool arguments. The
 [secret-free client template](server/aflow-control-plane.mcp.example.toml)
 uses an environment-backed token.
 
-The registry retains all 14 control-plane tools and three resource templates;
-the root [MCP documentation](../../README.md#use-mcp-through-the-ui-server)
-lists their purposes and write/idempotency rules. HTTP disconnects and UI
+The registry retains all 14 control-plane tools, adds the web authoring tools
+for global settings and revisioned Markdown plans, and exposes three resource
+templates. The root [MCP documentation](../../README.md#use-mcp-through-the-ui-server)
+lists their exact scope and mutation annotations. Global settings are shared
+by all registered projects and take effect at the next safe boundary or
+resume; plan edits remain project-scoped. Project registration and skill
+installation remain separate browser actions. HTTP disconnects and UI
 shutdown do not signal independently owned workflow workers.
 
 ## Run history and settings

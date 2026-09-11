@@ -1,21 +1,21 @@
-# CLI startup diagnostic acceptance — cumulative squash review
+# Web MCP authoring cumulative review
 
-Original and active plan: `plans/in-progress/cli-startup-diagnostic-acceptance-20260911.md`.
+Approved the complete handoff. No findings passed the material-code-review admission gate; aflow-review-squash governs approval and bookkeeping.
 
-HISTORY: Reviewed unchanged Pre-Handoff Base HEAD `1ae095cfa42db2e26303ba2244534d4f57e493cd` through worker HEAD `cd76cd224ab58430ccf5fc3d92446078182cf32a`: 1 new commit, 1 total commit, covering `cp1 v01` and every original-plan requirement. No prior findings or follow-up plans exist for this handoff. The preceding latest review belongs to accepted issue37 work and is archived unchanged.
+HISTORY: Reviewed base `1ae095cfa42db2e26303ba2244534d4f57e493cd` through head `57b303b808bcd15fa8ce05107d502973b4481995`: three new and three total commits, `cp1 v01` (`7a89385`), `cp2 v01` (`eea0387`), `cp3 v01` (`57b303b`). No prior findings or follow-up plans belong to this handoff. Previous latest review was for issue37 and is archived byte-for-byte.
 
-The complete implementation changes one stderr assertion in `tests/test_cli.py` plus one concise DEVLOG entry. The assertion matches the approved `PLAN_RECOVERY_SAFE_MESSAGE`. Non-TTY stdin/stdout, failure-on-input, exit 1, explicit interactive-confirmation text, isolated cwd/HOME, and neighboring durable recovery wording remain intact. Production files and accepted base history are unchanged. No candidates passed the material finding admission gate.
+Original and active plan: `plans/in-progress/web-mcp-authoring-20260909.md`; all three checkpoints and steps complete. Worker turn-003/result.json was read from the mapped parent repository run artifact root. All review writes use this execution worktree.
 
-Independent verification:
-- `uv run pytest -q tests/test_cli.py -k test_cli_requires_tty_for_startup_recovery`: 1 passed, 156 deselected in 0.23s.
-- `uv run pytest -q tests/test_cli.py`: 157 passed, 129 subtests passed in 5.80s.
+Reviewed the entire base-to-head production/test/documentation diff: web registrar composition, PlanService typed errors and path/revision checks, typed global payload discovery, shared serializer, atomic pair validation and audit attribution, authenticated HTTP authoring/launch and cross-transport stale-write tests. Existing lifecycle registration, reserved startup errors, browser routes, and shared services are preserved. No main.py import cycle or parallel service/store/server is introduced. No production code was edited during review. Concurrent issue35 combined integration remains coordinator-owned.
+
+Verification:
+- `npm --prefix apps/aflow_app/web run build`: passed, 59 modules, before server tests.
+- With disposable HOME, `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests`: 300 passed; 26 browser tests could not find Chromium under the temporary HOME.
+- With disposable HOME and `PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright`, `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests --lf --tb=short`: 26 passed. All 326 tests therefore passed across these runs; three dependency deprecation warnings. Fixtures isolate settings/projects/ports and control worker launch.
+- `uv run ruff check aflow apps/aflow_app/server/src/aflow_app_server`: passed.
 - `git diff --check`: passed.
-- Full base-to-worker diff inspected; implementation scope is exactly `tests/test_cli.py` and `DEVLOG.md`.
+- `rg --files tests | rg mcp`: no core MCP modules found. Core registry compatibility is covered by server test_mcp.py.
 
-HISTORY: Worker evidence `.aflow/runs/20260911t000948z-66ebf1d3/turns/turn-001/result.json` was read from the parent repository artifact root because it is absent from this execution worktree; it confirms completion and matching verification evidence.
-
-Disposition: approved for feature-only final squash to one commit after the unchanged base. Review artifact rotation is reviewer bookkeeping. The original ignored plan remains in place for engine finalization and records the final commit receipt. There are no stale fix plans to remove and only one handoff DEVLOG entry, so no compaction is needed. Publication, exact-SHA CI, and live activation remain engine/coordinator responsibilities and are not claimed here.
-
-Refs evrenesat/aworkflow#37
+Approve feature-only squash of all three commits after the unchanged base, preserving reviewed implementation and adding review artifacts. One handoff DEVLOG entry exists, so no compaction is needed. No fix plan is created. Final squash identity/count and implementation preservation checks are recorded in the original plan after squash. Engine owns the original lifecycle move; coordinator owns publication, exact-SHA CI, deployment, and actual live MCP acceptance. None of those delivery gates is claimed here.
 
 No material findings

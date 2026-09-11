@@ -37,6 +37,10 @@ from aflow.daemon import (
 
 
 ControlPlaneServiceGetter = Callable[[], Any]
+MCPToolResult = Callable[
+    [Callable[[], Any], Mapping[str, object] | None], Any
+]
+MCPToolRegistrar = Callable[[FastMCP, MCPToolResult], None]
 
 _READ_TOOL_ANNOTATIONS = {
     "readOnlyHint": True,
@@ -99,11 +103,11 @@ def _public_error_detail(
 
 
 def _tool_result(
-    operation: Callable[[], dict[str, Any]],
+    operation: Callable[[], Any],
     arguments: Mapping[str, object] | None = None,
     *,
     extra_error_codes: Mapping[type[Exception], str] | None = None,
-) -> dict[str, Any]:
+) -> Any:
     try:
         _reject_credential_arguments(arguments or {})
         return operation()
@@ -177,22 +181,25 @@ def create_control_plane_mcp(
     get_service: ControlPlaneServiceGetter,
     *,
     extra_error_codes: Mapping[type[Exception], str] | None = None,
+    register_tools: MCPToolRegistrar | None = None,
 ) -> FastMCP:
     """Create the stateless MCP registry over one shared service instance.
 
     ``extra_error_codes`` lets a hosting application map its own exception
-    types to the stable public error-code vocabulary.
+    types to the stable public error-code vocabulary. ``register_tools`` is a
+    narrow composition hook for transport-specific tools; lifecycle tools stay
+    reusable without importing the hosting application.
     """
     def tool_result(
-        operation: Callable[[], dict[str, Any]],
+        operation: Callable[[], Any],
         arguments: Mapping[str, object] | None = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         return _tool_result(operation, arguments, extra_error_codes=extra_error_codes)
 
     def resource_result(
-        operation: Callable[[], dict[str, Any]],
+        operation: Callable[[], Any],
         arguments: Mapping[str, object] | None = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         return _resource_result(operation, arguments, extra_error_codes=extra_error_codes)
 
     mcp = FastMCP(
@@ -254,7 +261,11 @@ def create_control_plane_mcp(
         limit: int = 100,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        """List bounded plan metadata for an allowlisted project."""
+        """List bounded lifecycle metadata for an allowlisted project.
+
+        This is the run-control view of plans. The web registry's
+        ``list_plan_documents`` tool lists revisioned Markdown documents.
+        """
         return tool_result(
             lambda: {
                 "plans": [
@@ -658,6 +669,9 @@ def create_control_plane_mcp(
             ),
             {"project_id": project_id, "run_id": run_id},
         )
+
+    if register_tools is not None:
+        register_tools(mcp, tool_result)
 
     return mcp
 

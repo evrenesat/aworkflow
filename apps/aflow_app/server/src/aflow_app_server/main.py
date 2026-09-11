@@ -53,12 +53,12 @@ from .control_plane_service import (
 )
 from .global_config_service import GlobalConfigService
 from .models import GlobalConfigPatchPayload, CanonicalTransportModel
+from .config_response import config_response, config_validation_response
 from .guided_config import GuidedConfigError, guided_form_response
 from .mcp_adapter import create_control_plane_mcp
 from .models import (
     BuildStarterAction,
     CapabilityResponse,
-    ConfigValidationIssueModel,
     ConfigValidationModel,
     ContextResponse,
     ControlResponse,
@@ -98,10 +98,8 @@ from .plan_service import (
 )
 import aflow_app_server.plan_routes as plan_routes_module
 from .project_config_service import (
-    ConfigValidationReport,
     ProjectConfigError,
     ProjectConfigRevisionConflict,
-    ProjectConfigSnapshot,
 )
 from .project_discovery import ProjectDiscoveryUnavailable, discover_projects
 from .project_registry import (
@@ -510,7 +508,11 @@ def _build_uvicorn_log_config() -> dict[str, Any]:
     return log_config
 
 
-mcp_server = create_control_plane_mcp(get_control_plane_service)
+mcp_server = create_control_plane_mcp(
+    get_control_plane_service,
+    get_plan_service=get_plan_service,
+    get_global_config_service=get_global_config_service,
+)
 mcp_http_app = mcp_server.http_app(path="/", json_response=True, stateless_http=True)
 
 
@@ -1464,35 +1466,6 @@ def update_project(
     return project
 
 
-# Global configuration endpoints.  Exactly two workflow documents are
-# addressable; no route, payload, or response field can name a third file.
-def _config_validation_response(report: ConfigValidationReport) -> ConfigValidationModel:
-    return ConfigValidationModel(
-        state=report.state,  # type: ignore[arg-type]
-        issues=tuple(
-            ConfigValidationIssueModel(
-                document=issue.document, line=issue.line, message=issue.message
-            )
-            for issue in report.issues
-        ),
-        placeholders=report.placeholders,
-        workflows=report.workflows,
-        teams=report.teams,
-        roles=report.roles,
-    )
-
-
-def _config_response(snapshot: ProjectConfigSnapshot) -> ProjectConfigResponse:
-    return ProjectConfigResponse(
-        project_id=snapshot.project_id,
-        revision=snapshot.revision,
-        documents=snapshot.documents,
-        aflow_toml=snapshot.aflow_toml,
-        workflows_toml=snapshot.workflows_toml,
-        validation=_config_validation_response(snapshot.validation),
-    )
-
-
 @app.get(
     "/api/config",
     response_model=ProjectConfigResponse,
@@ -1508,7 +1481,7 @@ def get_global_config(
     projects, including existing runs; diagnostic snapshots do not control
     execution.
     """
-    return _config_response(service.read())
+    return config_response(service.read())
 
 
 @app.patch("/api/config", response_model=ProjectConfigResponse, tags=["settings"])
@@ -1517,7 +1490,7 @@ def patch_global_config(
     _: str = Depends(verify_token),
     service: GlobalConfigService = Depends(get_global_config_service),
 ) -> ProjectConfigResponse:
-    return _config_response(service.patch(payload))
+    return config_response(service.patch(payload))
 
 
 @app.put(
@@ -1531,7 +1504,7 @@ def save_global_config(
     service: GlobalConfigService = Depends(get_global_config_service),
 ) -> ProjectConfigResponse:
     """Validate and atomically commit both documents as one revisioned pair."""
-    return _config_response(
+    return config_response(
         service.save(
             payload.aflow_toml,
             payload.workflows_toml,
@@ -1552,7 +1525,7 @@ def validate_global_config(
     service: GlobalConfigService = Depends(get_global_config_service),
 ) -> ConfigValidationModel:
     """Validate a candidate pair through the production loader without saving."""
-    return _config_validation_response(
+    return config_validation_response(
         service.validate_candidate(payload.aflow_toml, payload.workflows_toml)
     )
 

@@ -106,7 +106,9 @@ class GlobalConfigService:
             )
             return snapshot
 
-    def patch(self, payload) -> ProjectConfigSnapshot:
+    def patch(self, payload, *, caller_scope: str = "rest") -> ProjectConfigSnapshot:
+        if caller_scope not in {"rest", "mcp"}:
+            raise ValueError("unsupported configuration transport scope")
         from .guided_config import apply_action_batch
 
         with self._lock, configuration_pair_lock(self._config_dir):
@@ -125,10 +127,10 @@ class GlobalConfigService:
                 saved = self._save_locked(*texts, current.revision, revisions)
             except Exception as exc:
                 _append_audit_line(self._audit_path, project_id="global", outcome=_failure_outcome(exc),
-                                   old_revision=revisions["old"], new_revision=revisions["new"], caller_scope="rest")
+                                   old_revision=revisions["old"], new_revision=revisions["new"], caller_scope=caller_scope)
                 raise
             _append_audit_line(self._audit_path, project_id="global", outcome="saved",
-                               old_revision=revisions["old"], new_revision=revisions["new"], caller_scope="rest")
+                               old_revision=revisions["old"], new_revision=revisions["new"], caller_scope=caller_scope)
             return saved
 
     def _save_locked(

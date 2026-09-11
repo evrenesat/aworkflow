@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,43 @@ def test_noop_does_not_replace_files(service):
     before = path.stat()
     patch(service, documents={'aflow.toml': AFLOW})
     assert path.stat().st_ino == before.st_ino
+
+
+def test_patch_audit_scope_is_explicit_and_defaults_to_rest(service):
+    result = service.patch(
+        GlobalConfigPatchPayload(
+            expected_revision=service.read().revision,
+            actions=[
+                dict(
+                    type="upsert_profile",
+                    harness="codex",
+                    profile="mcp",
+                    model="mcp-model",
+                )
+            ],
+        ),
+        caller_scope="mcp",
+    )
+    record = json.loads((service.config_dir / "audit.jsonl").read_text().splitlines()[-1])
+    assert result.revision == record["new_revision"]
+    assert record["caller_scope"] == "mcp"
+    assert record["outcome"] == "saved"
+
+    service.patch(
+        GlobalConfigPatchPayload(
+            expected_revision=result.revision,
+            actions=[
+                dict(
+                    type="upsert_profile",
+                    harness="codex",
+                    profile="rest",
+                    model="rest-model",
+                )
+            ],
+        )
+    )
+    record = json.loads((service.config_dir / "audit.jsonl").read_text().splitlines()[-1])
+    assert record["caller_scope"] == "rest"
 
 
 def test_custom_profile_role_and_team_and_prompt_move(service):

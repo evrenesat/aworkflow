@@ -215,7 +215,7 @@ arguments, or browser cookies; MCP is header-only. The [secret-free client
 template](apps/aflow_app/server/aflow-control-plane.mcp.example.toml) uses an
 environment-backed token and approves write tools.
 
-The shared registry exposes these 14 tools:
+The shared lifecycle registry exposes these 14 tools:
 
 - `get_capabilities` — list capabilities for every allowlisted project.
 - `list_projects` — list registered projects.
@@ -232,12 +232,36 @@ The shared registry exposes these 14 tools:
 - `owner_stop` — request an owner stop for a run.
 - `resume_run` — create an idempotent continuation of a run.
 
+The UI-server registry also exposes these web authoring tools over the same
+authenticated MCP connection:
+
+- `get_global_config` — read the one `aflow.toml`/`workflows.toml` pair shared by all registered projects.
+- `patch_global_config` — apply typed actions or an exact document edit with an expected revision; the pair is validated and committed atomically.
+- `read_plan` — read one revisioned Markdown plan document.
+- `create_plan` — create a bounded draft in `plans/todo`.
+- `update_plan` — compare-and-swap one plan document.
+- `promote_plan` — move a plan through `todo` → `in_progress` → `done` with its revision.
+- `list_plan_documents` — list plan documents with their status and revisions; use `list_plans` for lifecycle metadata used by run control.
+
 Three read-only resource templates expose project capabilities, run state, and
-lite run context. Write tools require client approval and an idempotency key;
-`control_run` and `owner_stop` also require the expected run revision. Reusing
-an idempotency key returns the original result, while a changed request is
-rejected. `preflight_run` is read-only and reports bounded dirty-path pages
-before a launch; `start_run` preserves the existing startup-question flow.
+lite run context. Lifecycle writes require client approval and use their
+existing idempotency/revision contracts. Authoring writes require approval and
+use the plan or global-pair expected revision where applicable; reads are
+read-only/idempotent, while create, update, promote, and settings patch are
+non-idempotent mutations. Reusing a lifecycle idempotency key returns the
+original result, while a changed request is rejected. `preflight_run` is
+read-only and reports bounded dirty-path pages before a launch; `start_run`
+preserves the existing startup-question flow.
+
+A typical authored launch is: discover the tools, read global settings, apply
+a typed settings patch with its current revision, create and update a draft,
+promote it, then use `list_plan_documents` and `list_plans` before calling
+`start_run`. If a browser or another MCP client changes a document first,
+reread it and retry with the returned revision; the server never silently
+retries stale writes. Global settings affect all registered projects at their
+next safe boundary or resume, while each run keeps its own launch snapshot.
+Project registration and skill installation remain separate existing browser
+actions; they are not implied MCP authoring operations.
 
 HTTP connection loss, UI restart, and `aflow ui --stop` do not stop workflow
 workers. Network reachability follows the server's existing bind and private

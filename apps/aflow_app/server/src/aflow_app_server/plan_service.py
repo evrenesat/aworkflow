@@ -27,6 +27,18 @@ class PlanProjectNotFound(PlanServiceError):
     """The requested project is absent from the canonical registry."""
 
 
+class PlanNotFound(PlanServiceError):
+    """The requested plan document does not exist."""
+
+
+class PlanInvalid(PlanServiceError):
+    """The requested plan path, content, or filesystem entry is unsafe."""
+
+
+class PlanAlreadyExists(PlanServiceError):
+    """The requested create or promotion target is already present."""
+
+
 class PlanRevisionConflict(PlanServiceError):
     """The caller edited an outdated plan revision."""
     def __init__(self, current_revision: str) -> None:
@@ -110,7 +122,7 @@ class PlanService:
             root = self._root(project_id)
             path = self._plan_path(root, "todo", name, create_dir=True)
             if path.exists() or path.is_symlink():
-                raise PlanServiceError("plan already exists")
+                raise PlanAlreadyExists("plan already exists")
             self._atomic_write(path, data, replace=False)
             return self._document(project_id, "todo", name, data, include_content=True)
 
@@ -129,7 +141,7 @@ class PlanService:
         self._validate_revision(expected_revision)
         target_status = _NEXT_STATUS.get(status_value)
         if target_status is None:
-            raise PlanServiceError("done plans cannot be promoted")
+            raise PlanInvalid("done plans cannot be promoted")
         target_name = target_name or name
         with self._project_lock(project_id):
             root = self._root(project_id)
@@ -138,7 +150,7 @@ class PlanService:
             self._require_revision(current, expected_revision)
             target = self._plan_path(root, target_status, target_name, create_dir=True)
             if target.exists() or target.is_symlink():
-                raise PlanServiceError("promotion target already exists")
+                raise PlanAlreadyExists("promotion target already exists")
             moved = False
             try:
                 os.replace(source, target)
@@ -159,73 +171,73 @@ class PlanService:
         try:
             _, root = self._registry.resolve(project_id)
         except ProjectRegistryError as exc:
-            raise PlanServiceError("project is not registered") from exc
+            raise PlanProjectNotFound("project is not registered") from exc
         return root
 
     def _status_dir(self, root: Path, status_value: PlanStatus, *, create: bool) -> Path | None:
-        if status_value not in _STATUS_DIRS:
-            raise PlanServiceError("plan status is invalid")
+        if not isinstance(status_value, str) or status_value not in _STATUS_DIRS:
+            raise PlanInvalid("plan status is invalid")
         plans = root / "plans"
         directory = plans / _STATUS_DIRS[status_value]
         for candidate in (plans, directory):
             if candidate.is_symlink():
-                raise PlanServiceError("plan directory must not be a symlink")
+                raise PlanInvalid("plan directory must not be a symlink")
         if create:
             try:
                 plans.mkdir(exist_ok=True)
                 directory.mkdir(exist_ok=True)
             except OSError as exc:
-                raise PlanServiceError("plan directory is unavailable") from exc
+                raise PlanInvalid("plan directory is unavailable") from exc
         if not directory.exists():
             return None
         if not directory.is_dir():
-            raise PlanServiceError("plan directory must be a directory")
+            raise PlanInvalid("plan directory must be a directory")
         try:
             directory.resolve(strict=True).relative_to(root.resolve(strict=True))
         except (OSError, ValueError) as exc:
-            raise PlanServiceError("plan directory is outside the project") from exc
+            raise PlanInvalid("plan directory is outside the project") from exc
         return directory
 
     def _plan_path(self, root: Path, status_value: PlanStatus, name: str, *, create_dir: bool) -> Path:
         self._validate_name(name)
         directory = self._status_dir(root, status_value, create=create_dir)
         if directory is None:
-            raise PlanServiceError("plan not found")
+            raise PlanNotFound("plan not found")
         return directory / name
 
     @staticmethod
     def _validate_name(name: str) -> None:
         if not isinstance(name, str) or _PLAN_NAME_RE.fullmatch(name) is None:
-            raise PlanServiceError("plan name must be a Markdown filename")
+            raise PlanInvalid("plan name must be a Markdown filename")
         if name in {".md", "..md"} or "/" in name or "\\" in name or "\x00" in name:
-            raise PlanServiceError("plan name must be a Markdown filename")
+            raise PlanInvalid("plan name must be a Markdown filename")
 
     def _validate_content(self, content: str) -> bytes:
         if not isinstance(content, str) or "\x00" in content:
-            raise PlanServiceError("plan content must be UTF-8 text")
+            raise PlanInvalid("plan content must be UTF-8 text")
         data = content.encode("utf-8")
         if len(data) > self._max_plan_bytes:
-            raise PlanServiceError("plan content exceeds the size limit")
+            raise PlanInvalid("plan content exceeds the size limit")
         return data
 
     def _read_regular(self, path: Path) -> bytes:
         try:
             metadata = path.lstat()
         except FileNotFoundError as exc:
-            raise PlanServiceError("plan not found") from exc
+            raise PlanNotFound("plan not found") from exc
         except OSError as exc:
             raise PlanServiceError("plan is unavailable") from exc
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or path.is_symlink():
-            raise PlanServiceError("plan must be a regular file")
+            raise PlanInvalid("plan must be a regular file")
         if metadata.st_size > self._max_plan_bytes:
-            raise PlanServiceError("plan content exceeds the size limit")
+            raise PlanInvalid("plan content exceeds the size limit")
         try:
             data = path.read_bytes()
             data.decode("utf-8")
         except (OSError, UnicodeError) as exc:
-            raise PlanServiceError("plan content is unavailable") from exc
+            raise PlanInvalid("plan content is unavailable") from exc
         if len(data) > self._max_plan_bytes:
-            raise PlanServiceError("plan content exceeds the size limit")
+            raise PlanInvalid("plan content exceeds the size limit")
         return data
 
     def _atomic_write(self, path: Path, data: bytes, *, replace: bool) -> None:
@@ -236,7 +248,7 @@ class PlanService:
                 handle.flush()
                 os.fsync(handle.fileno())
             if not replace and (path.exists() or path.is_symlink()):
-                raise PlanServiceError("plan already exists")
+                raise PlanAlreadyExists("plan already exists")
             os.replace(temporary, path)
             self._fsync_directory(path.parent)
         except PlanServiceError:

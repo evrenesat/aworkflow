@@ -32,7 +32,7 @@ MCP_HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
 }
-EXPECTED_TOOL_NAMES = {
+CORE_TOOL_NAMES = {
     "get_capabilities",
     "list_projects",
     "get_project_capabilities",
@@ -48,6 +48,16 @@ EXPECTED_TOOL_NAMES = {
     "owner_stop",
     "resume_run",
 }
+AUTHORING_TOOL_NAMES = {
+    "read_plan",
+    "create_plan",
+    "update_plan",
+    "promote_plan",
+    "list_plan_documents",
+    "get_global_config",
+    "patch_global_config",
+}
+EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES | AUTHORING_TOOL_NAMES
 
 
 def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> None:
@@ -56,14 +66,35 @@ def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> N
 
     shared = create_shared_mcp(lambda: None)
     fastapi = create_fastapi_mcp(lambda: None)
+    web = create_fastapi_mcp(
+        lambda: None,
+        get_plan_service=lambda: None,
+        get_global_config_service=lambda: None,
+    )
     shared_tools = asyncio.run(shared.list_tools())
     fastapi_tools = asyncio.run(fastapi.list_tools())
-    assert {tool.name for tool in shared_tools} == EXPECTED_TOOL_NAMES
+    web_tools = asyncio.run(web.list_tools())
+    assert {tool.name for tool in shared_tools} == CORE_TOOL_NAMES
+    assert {tool.name for tool in fastapi_tools} == CORE_TOOL_NAMES
+    assert {tool.name for tool in web_tools} == EXPECTED_TOOL_NAMES
     assert {
         tool.name: tool.to_mcp_tool().model_dump(mode="json") for tool in shared_tools
     } == {
         tool.name: tool.to_mcp_tool().model_dump(mode="json") for tool in fastapi_tools
     }
+    assert {
+        tool.name: tool.to_mcp_tool().model_dump(mode="json")
+        for tool in web_tools
+        if tool.name in CORE_TOOL_NAMES
+    } == {
+        tool.name: tool.to_mcp_tool().model_dump(mode="json") for tool in shared_tools
+    }
+    web_tool_by_name = {tool.name: tool.to_mcp_tool() for tool in web_tools}
+    assert web_tool_by_name["read_plan"].annotations.readOnlyHint is True
+    assert web_tool_by_name["list_plan_documents"].annotations.idempotentHint is True
+    for name in ("create_plan", "update_plan", "promote_plan"):
+        assert web_tool_by_name[name].annotations.readOnlyHint is False
+        assert web_tool_by_name[name].annotations.idempotentHint is False
     shared_resources = asyncio.run(shared.list_resource_templates())
     fastapi_resources = asyncio.run(fastapi.list_resource_templates())
     assert {
@@ -77,6 +108,7 @@ def test_shared_and_fastapi_mcp_registries_have_identical_public_contract() -> N
 @pytest.fixture
 def mcp_client(_control_client_fixture, monkeypatch: pytest.MonkeyPatch):  # noqa: F811
     """Run the mounted MCP transport with the daemon fixture from REST tests."""
+    from aflow_app_server import config as config_module
     from aflow_app_server import main
 
     _, root, units, _ = _control_client_fixture
@@ -84,9 +116,13 @@ def mcp_client(_control_client_fixture, monkeypatch: pytest.MonkeyPatch):  # noq
     control_service = main._control_plane_service
     assert config is not None
     assert control_service is not None
-    test_config = replace(config)
+    test_config = replace(
+        config,
+        config_audit_path=root.parent / "config_audit.jsonl",
+    )
     monkeypatch.setattr(main.ServerConfig, "from_env", classmethod(lambda _cls: test_config))
     monkeypatch.setattr(main, "ControlPlaneService", lambda _projects: control_service)
+    monkeypatch.setattr(config_module, "global_config_dir", lambda: root.parent / "global")
 
     with TestClient(app) as client:
         client.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -114,7 +150,7 @@ def _mcp_tool(
     client: TestClient,
     name: str,
     arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> Any:
     response = _mcp_request(
         client,
         "tools/call",
@@ -127,6 +163,22 @@ def _mcp_tool(
     if structured is not None:
         return structured
     return json.loads(result["content"][0]["text"])
+
+
+def _mcp_tool_error(
+    client: TestClient,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+) -> str:
+    response = _mcp_request(
+        client,
+        "tools/call",
+        {"name": name, "arguments": arguments or {}},
+    )
+    assert "error" not in response
+    result = response["result"]
+    assert result.get("isError") is True
+    return result["content"][0]["text"]
 
 
 def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) -> None:
@@ -278,6 +330,515 @@ def test_mcp_trailing_slash_mount_supports_discovery_resource_read_and_header_au
     )
     assert unauthorized.status_code == 401
     assert unauthorized.json() == {"detail": {"code": "unauthorized"}}
+
+
+def test_mcp_global_config_discovery_and_snapshot_match_rest(mcp_client) -> None:
+    client, _, _, _ = mcp_client
+    browser = client.get("/api/config")
+    assert browser.status_code == 200
+
+    tools = _mcp_request(client, "tools/list")["result"]["tools"]
+    tool_by_name = {tool["name"]: tool for tool in tools}
+    patch_tool = tool_by_name["patch_global_config"]
+    payload_schema = patch_tool["inputSchema"]["properties"]["payload"]
+    assert payload_schema["additionalProperties"] is False
+    assert set(payload_schema["properties"]) == {
+        "expected_revision",
+        "actions",
+        "documents",
+    }
+    documents_schema = payload_schema["properties"]["documents"]["anyOf"][0]
+    assert documents_schema["propertyNames"]["enum"] == [
+        "aflow.toml",
+        "workflows.toml",
+    ]
+    assert patch_tool["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+    assert tool_by_name["get_global_config"]["annotations"]["readOnlyHint"] is True
+    assert "all registered projects" in tool_by_name["get_global_config"]["description"]
+    assert "safe boundary" in tool_by_name["get_global_config"]["description"]
+
+    snapshot = _mcp_tool(client, "get_global_config")
+    assert snapshot == browser.json()
+    assert set(snapshot) == {
+        "project_id",
+        "revision",
+        "documents",
+        "aflow_toml",
+        "workflows_toml",
+        "validation",
+    }
+    assert snapshot["documents"] == ["aflow.toml", "workflows.toml"]
+    assert "auth_token" not in json.dumps(snapshot)
+    assert "server.toml" not in json.dumps(snapshot)
+
+
+def test_mcp_global_config_uses_atomic_typed_patch_and_cross_transport_cas(
+    mcp_client,
+) -> None:
+    client, root, _, _ = mcp_client
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    before = _mcp_tool(client, "get_global_config")
+    typed = _mcp_tool(
+        client,
+        "patch_global_config",
+        {
+            "payload": {
+                "expected_revision": before["revision"],
+                "actions": [
+                    {
+                        "type": "upsert_profile",
+                        "harness": "codex",
+                        "profile": "mcp-team",
+                        "model": "mcp-model",
+                        "effort": "medium",
+                    },
+                    {"type": "add_team", "team": "mcp-team"},
+                    {
+                        "type": "set_team_role",
+                        "team": "mcp-team",
+                        "role": "worker",
+                        "selector": "codex.mcp-team",
+                    },
+                ],
+            }
+        },
+    )
+    assert typed["revision"] != before["revision"]
+    assert 'model = "mcp-model"' in typed["aflow_toml"]
+    assert "mcp-team" in typed["aflow_toml"]
+    assert client.get("/api/config", headers=headers).json() == typed
+
+    audit_path = root.parent / "config_audit.jsonl"
+    audit_records = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert audit_records[-1]["caller_scope"] == "mcp"
+    assert audit_records[-1]["outcome"] == "saved"
+
+    exact_aflow = typed["aflow_toml"].replace(
+        'model = "mcp-model"', 'model = "mcp-model-exact"'
+    )
+    exact = _mcp_tool(
+        client,
+        "patch_global_config",
+        {
+            "payload": {
+                "expected_revision": typed["revision"],
+                "documents": {"aflow.toml": exact_aflow},
+            }
+        },
+    )
+    assert exact["aflow_toml"] == exact_aflow
+    assert exact["workflows_toml"] == typed["workflows_toml"]
+    assert client.get("/api/config", headers=headers).json() == exact
+
+    audit_before_noop = audit_path.read_text()
+    noop = _mcp_tool(
+        client,
+        "patch_global_config",
+        {
+            "payload": {
+                "expected_revision": exact["revision"],
+                "documents": {"aflow.toml": exact["aflow_toml"]},
+            }
+        },
+    )
+    assert noop == exact
+    assert audit_path.read_text() == audit_before_noop
+
+    browser_aflow = exact["aflow_toml"].replace(
+        'model = "mcp-model-exact"', 'model = "browser-model"'
+    )
+    browser = client.patch(
+        "/api/config",
+        headers=headers,
+        json={
+            "expected_revision": exact["revision"],
+            "documents": {"aflow.toml": browser_aflow},
+        },
+    )
+    assert browser.status_code == 200, browser.text
+    stale = _mcp_tool_error(
+        client,
+        "patch_global_config",
+        {
+            "payload": {
+                "expected_revision": exact["revision"],
+                "documents": {"aflow.toml": exact["aflow_toml"]},
+            }
+        },
+    )
+    assert stale == "revision_conflict"
+    assert client.get("/api/config", headers=headers).json() == browser.json()
+
+
+def test_mcp_global_config_rejects_invalid_pairs_and_unscoped_documents(
+    mcp_client,
+) -> None:
+    client, _, _, _ = mcp_client
+    current = _mcp_tool(client, "get_global_config")
+
+    invalid = _mcp_tool_error(
+        client,
+        "patch_global_config",
+        {
+            "payload": {
+                "expected_revision": current["revision"],
+                "documents": {"workflows.toml": "[invalid"},
+            }
+        },
+    )
+    assert invalid == "operation_rejected"
+    assert _mcp_tool(client, "get_global_config") == current
+
+    mixed = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "patch_global_config",
+            "arguments": {
+                "payload": {
+                    "expected_revision": current["revision"],
+                    "actions": [
+                        {
+                            "type": "set_max_turns",
+                            "value": 5,
+                        }
+                    ],
+                    "documents": {"aflow.toml": current["aflow_toml"]},
+                }
+            },
+        },
+    )
+    assert mixed["result"]["isError"] is True
+
+    extra_document = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "patch_global_config",
+            "arguments": {
+                "payload": {
+                    "expected_revision": current["revision"],
+                    "documents": {
+                        "server.toml": "server-secret",
+                    },
+                }
+            },
+        },
+    )
+    assert extra_document["result"]["isError"] is True
+    assert _mcp_tool(client, "get_global_config") == current
+
+
+def test_mcp_authored_journey_reaches_existing_launch_service(mcp_client) -> None:
+    client, root, units, monkeypatch = mcp_client
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    discovered = _mcp_request(client, "tools/list")["result"]["tools"]
+    assert {tool["name"] for tool in discovered} == EXPECTED_TOOL_NAMES
+
+    settings = _mcp_tool(client, "get_global_config")
+    team = "mcp-journey"
+    edited_settings = _mcp_tool(
+        client,
+        "patch_global_config",
+        {
+            "payload": {
+                "expected_revision": settings["revision"],
+                "actions": [
+                    {"type": "add_team", "team": team},
+                    {
+                        "type": "set_team_role",
+                        "team": team,
+                        "role": "worker",
+                        "selector": "codex.test",
+                    },
+                ],
+            }
+        },
+    )
+    assert client.get("/api/config", headers=headers).json() == edited_settings
+
+    name = "mcp-journey.md"
+    draft = "# MCP journey\n\n### [ ] Checkpoint 1: Journey\n- [ ] launch\n"
+    created = _mcp_tool(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": name, "content": draft},
+    )
+    assert client.get(
+        f"/api/projects/{PROJECT_ID}/plans/todo/{name}", headers=headers
+    ).json() == created
+    assert _mcp_tool(
+        client,
+        "read_plan",
+        {"project_id": PROJECT_ID, "plan_status": "todo", "name": name},
+    ) == created
+
+    updated_content = draft.replace(
+        "- [ ] launch", "- [x] launch\n\nSelected team: mcp-journey"
+    )
+    updated = _mcp_tool(
+        client,
+        "update_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "todo",
+            "name": name,
+            "content": updated_content,
+            "expected_revision": created["revision"],
+        },
+    )
+    assert client.get(
+        f"/api/projects/{PROJECT_ID}/plans/todo/{name}", headers=headers
+    ).json() == updated
+
+    promoted = _mcp_tool(
+        client,
+        "promote_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "todo",
+            "name": name,
+            "expected_revision": updated["revision"],
+        },
+    )
+    assert client.get(
+        f"/api/projects/{PROJECT_ID}/plans/in_progress/{name}", headers=headers
+    ).json() == promoted
+
+    document_list = _mcp_tool(
+        client,
+        "list_plan_documents",
+        {"project_id": PROJECT_ID, "plan_status": "in_progress"},
+    )
+    assert document_list["plans"] == [
+        {
+            key: promoted[key]
+            for key in ("project_id", "name", "path", "status", "revision", "size_bytes")
+        }
+    ]
+    lifecycle_list = _mcp_tool(client, "list_plans", {"project_id": PROJECT_ID})
+    assert any(
+        plan["path"] == promoted["path"] and plan["status"] == "in_progress"
+        for plan in lifecycle_list["plans"]
+    )
+
+    observed: dict[str, object] = {}
+
+    def prepare(request):
+        observed["request"] = request
+        return _prepared(request)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", prepare)
+    started = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": promoted["path"],
+            "workflow_name": "managed",
+            "team": team,
+            "start_step": "implement",
+            "idempotency_key": "mcp-authored-journey",
+        },
+    )
+    assert started["result"]["status"] == "running"
+    request = observed["request"]
+    assert request.plan_path == root / promoted["path"]
+    assert request.workflow_name == "managed"
+    assert request.team == team
+    assert units.start_calls
+    run = _mcp_tool(
+        client,
+        "get_run",
+        {"project_id": PROJECT_ID, "run_id": started["result"]["run_id"]},
+    )
+    assert run["plan_path"] == str(root / promoted["path"])
+    assert run["team"] == team
+
+
+def test_mcp_plan_authoring_matches_rest_and_preserves_stale_bytes(mcp_client) -> None:
+    client, root, _, _ = mcp_client
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    plans_path = f"/api/projects/{PROJECT_ID}/plans"
+    name = "mcp-authoring.md"
+
+    created = _mcp_tool(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": name, "content": "# MCP draft\n"},
+    )
+    browser_read = client.get(f"{plans_path}/todo/{name}", headers=headers)
+    assert browser_read.status_code == 200
+    assert browser_read.json() == created
+    assert _mcp_tool(
+        client,
+        "read_plan",
+        {"project_id": PROJECT_ID, "plan_status": "todo", "name": name},
+    ) == browser_read.json()
+
+    browser_update = client.put(
+        f"{plans_path}/todo/{name}",
+        headers=headers,
+        json={
+            "content": "# Browser edit\n",
+            "expected_revision": created["revision"],
+        },
+    )
+    assert browser_update.status_code == 200
+    browser_document = browser_update.json()
+
+    stale = _mcp_tool_error(
+        client,
+        "update_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "todo",
+            "name": name,
+            "content": "# Stale MCP edit\n",
+            "expected_revision": created["revision"],
+        },
+    )
+    assert stale == "revision_conflict"
+    assert client.get(f"{plans_path}/todo/{name}", headers=headers).json() == browser_document
+    assert (root / "plans" / "todo" / name).read_text(encoding="utf-8") == "# Browser edit\n"
+
+    updated = _mcp_tool(
+        client,
+        "update_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "todo",
+            "name": name,
+            "content": "# MCP replacement\n",
+            "expected_revision": browser_document["revision"],
+        },
+    )
+    assert client.get(f"{plans_path}/todo/{name}", headers=headers).json() == updated
+
+    documents = _mcp_tool(
+        client,
+        "list_plan_documents",
+        {"project_id": PROJECT_ID, "plan_status": "todo"},
+    )
+    browser_documents = client.get(
+        plans_path,
+        params={"status": "todo"},
+        headers=headers,
+    )
+    assert browser_documents.status_code == 200
+    assert documents == {"plans": browser_documents.json()}
+
+    promoted = _mcp_tool(
+        client,
+        "promote_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "todo",
+            "name": name,
+            "expected_revision": updated["revision"],
+        },
+    )
+    promoted_from_browser = client.get(
+        f"{plans_path}/in_progress/{name}",
+        headers=headers,
+    )
+    assert promoted_from_browser.status_code == 200
+    assert promoted_from_browser.json() == promoted
+
+
+def test_mcp_plan_authoring_uses_default_template_and_safe_errors(mcp_client) -> None:
+    from importlib.resources import files as resource_files
+
+    client, root, _, _ = mcp_client
+    template = resource_files("aflow").joinpath("templates/draft-plan.md").read_text(
+        encoding="utf-8"
+    )
+    created = _mcp_tool(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": "template.md", "content": None},
+    )
+    assert created["content"] == template
+
+    assert _mcp_tool_error(
+        client,
+        "read_plan",
+        {"project_id": PROJECT_ID, "plan_status": "todo", "name": "missing.md"},
+    ) == "plan_not_found"
+    assert _mcp_tool_error(
+        client,
+        "read_plan",
+        {"project_id": "not-registered", "plan_status": "todo", "name": "x.md"},
+    ) == "project_not_found"
+    assert _mcp_tool_error(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": "../escape.md", "content": "x"},
+    ) == "invalid_plan"
+    assert _mcp_tool_error(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": "nul.md", "content": "bad\x00text"},
+    ) == "invalid_plan"
+    document_body = "document-body-secret"
+    invalid_content = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "create_plan",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "name": "invalid-body.md",
+                "content": f"{document_body}\x00",
+            },
+        },
+    )
+    assert invalid_content["result"]["isError"] is True
+    assert invalid_content["result"]["content"][0]["text"] == "invalid_plan"
+    assert document_body not in json.dumps(invalid_content)
+
+    duplicate_name = "duplicate.md"
+    _mcp_tool(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": duplicate_name, "content": "first"},
+    )
+    assert _mcp_tool_error(
+        client,
+        "create_plan",
+        {"project_id": PROJECT_ID, "name": duplicate_name, "content": "second"},
+    ) == "plan_exists"
+
+    outside = root / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    linked = root / "plans" / "todo" / "linked.md"
+    linked.symlink_to(outside)
+    assert _mcp_tool_error(
+        client,
+        "read_plan",
+        {"project_id": PROJECT_ID, "plan_status": "todo", "name": "linked.md"},
+    ) == "invalid_plan"
+
+    invalid_status = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "read_plan",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "plan_status": "unsafe",
+                "name": "document-body-secret.md",
+            },
+        },
+    )
+    assert invalid_status["result"]["isError"] is True
+    assert "document-body-secret.md" not in invalid_status["result"]["content"][0]["text"]
 
 
 def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client) -> None:
