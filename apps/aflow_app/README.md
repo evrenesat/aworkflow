@@ -23,6 +23,13 @@ resume; plan edits remain project-scoped. Project registration and skill
 installation remain separate browser actions. HTTP disconnects and UI
 shutdown do not signal independently owned workflow workers.
 
+For an active owned run, the dashboard's **Stop after current turn** action and
+MCP `control_run(..., owner_stop=true)` save the existing revisioned boundary
+intent. The current worker or reviewer call may finish before the canonical run
+becomes `owner_stopped`; the intent never invokes the unit-stop endpoint and
+does not approve a checkpoint. **Stop now** and MCP `owner_stop` remain the
+separate immediate, interrupting action.
+
 ## Run history and settings
 
 All runs and project Runs offer Visible, Archived, and All history filters.

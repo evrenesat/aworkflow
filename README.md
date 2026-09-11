@@ -259,8 +259,9 @@ The shared lifecycle registry exposes these 14 tools:
 - `preflight_run` — inspect launch dirtiness without allocating a run.
 - `start_run` — reserve and start a run, or return its startup question.
 - `answer_startup` — answer a pending startup question.
-- `control_run` — apply a revision-checked run control.
-- `owner_stop` — request an owner stop for a run.
+- `control_run` — apply a revision-checked run control; `owner_stop=true`
+  requests the existing stop-after-current-turn boundary intent.
+- `owner_stop` — immediately interrupt the exact active unit and stop a run.
 - `resume_run` — create an idempotent continuation of a run.
 
 The UI-server registry also exposes these web authoring tools over the same

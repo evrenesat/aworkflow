@@ -1266,11 +1266,6 @@ def control_run(
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> ControlResponse:
-    if payload.owner_stop:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={"code": "owner_stop_endpoint_required"},
-        )
     result, run = service.control(
         project_id, run_id, payload.to_canonical(), idempotency_key=idempotency_key
     )

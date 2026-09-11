@@ -838,10 +838,14 @@ rejected):
 - `answer_startup(project_id, question_id, answer, idempotency_key)` — submit
   one authenticated answer for a pending startup question.
 - `control_run(project_id, run_id, expected_revision, idempotency_key,
-  max_turns=None, team=None, role_selectors=None, unsafe_changes=None)` —
-  compare-and-swap control; `expected_revision` is required.
+  max_turns=None, team=None, role_selectors=None, unsafe_changes=None,
+  owner_stop=None)` — compare-and-swap control; `expected_revision` is
+  required. Set `owner_stop=true` to request stopping after the current
+  worker/reviewer call reaches the existing safe boundary; it does not
+  interrupt the active unit or imply checkpoint approval.
 - `owner_stop(project_id, run_id, expected_revision, idempotency_key)` —
-  explicit terminal owner stop (destructive; not a generic control flag).
+  explicit immediate terminal owner stop (destructive; it interrupts the
+  exact active unit and is separate from the `control_run` boundary intent).
 - `resume_run(project_id, run_id, idempotency_key, extra_instructions=None)` —
   explicit lineage-linked continuation with a new run id for a stopped run.
   Omitted or `null` instructions inherit; a bounded list replaces them and

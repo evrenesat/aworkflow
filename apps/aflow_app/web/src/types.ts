@@ -534,6 +534,7 @@ export interface StartRunResponse {
 export interface RunControlRequest {
   expected_revision: number
   max_turns?: number
+  owner_stop?: boolean
   team?: string
   role_selectors?: Record<string, string>
 }

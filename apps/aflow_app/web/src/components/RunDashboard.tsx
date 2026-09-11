@@ -1747,25 +1747,76 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   async function handleOwnerStop() {
     if (!projectId || !selectedRun) return
     clearActionFeedback()
+    const runId = selectedRun.run_id
     const intent = {
       project_id: projectId,
-      run_id: selectedRun.run_id,
+      run_id: runId,
       expected_revision: selectedRun.revision,
     }
     try {
       setBusyAction('owner-stop')
       const stopped = await api.ownerStopControlPlaneRun(
         projectId,
-        selectedRun.run_id,
+        runId,
         selectedRun.revision,
         getPendingWriteKey('owner-stop', intent),
       )
       clearPendingWriteKey('owner-stop', intent)
+      if (selectedRunRef.current !== runId) return
       setRuns((current) => upsertRun(current, stopped))
-      setFeedback(`Owner stop recorded for ${stopped.run_id}.`)
+      setFeedback(`Stop now recorded for ${stopped.run_id}.`)
       setConfirmOwnerStop(false)
     } catch (stopError) {
-      setActionError(errorMessage(stopError, 'Failed to stop run'))
+      if (apiErrorCode(stopError) === 'revision_conflict') {
+        await refreshSelectedRun()
+        if (selectedRunRef.current === runId) {
+          setFeedback('Another operator changed this run. Stop now was not retried; review the refreshed revision and try again.')
+        }
+      } else {
+        setActionError(errorMessage(stopError, 'Failed to stop run'))
+      }
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleBoundaryStop() {
+    if (!projectId || !selectedRun || !selectedRunHasLiveControls) return
+    clearActionFeedback()
+    const runId = selectedRun.run_id
+    const request: Parameters<typeof api.controlControlPlaneRun>[2] = {
+      expected_revision: selectedRun.revision,
+      owner_stop: true,
+    }
+    const intent = {
+      project_id: projectId,
+      run_id: runId,
+      expected_revision: request.expected_revision,
+      owner_stop: true,
+    }
+    try {
+      setBusyAction('boundary-stop')
+      const response = await api.controlControlPlaneRun(
+        projectId,
+        runId,
+        request,
+        getPendingWriteKey('boundary-stop', intent),
+      )
+      clearPendingWriteKey('boundary-stop', intent)
+      if (selectedRunRef.current !== runId) return
+      setRuns((current) => upsertRun(current, response.run))
+      setFeedback(response.changed
+        ? `Stop after current turn requested for ${runId}. The current worker/reviewer call may finish at the existing boundary; no checkpoint approval is implied.`
+        : `Stop after current turn was already requested for ${runId}.`)
+    } catch (stopError) {
+      if (apiErrorCode(stopError) === 'revision_conflict') {
+        await refreshSelectedRun()
+        if (selectedRunRef.current === runId) {
+          setFeedback('Another operator changed this run. The stop request was not retried; review the refreshed revision and try again.')
+        }
+      } else {
+        setActionError(errorMessage(stopError, 'Failed to request stop after the current turn'))
+      }
     } finally {
       setBusyAction(null)
     }
@@ -2239,7 +2290,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     ? runPlanDisplayName(selectedPlanPath === 'Not reported' ? null : selectedPlanPath, selectedRun.run_id)
     : 'Not reported'
   const roleChoices = capabilities?.roles ?? []
-  const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string> } | null
+  const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string>; owner_stop?: boolean } | null
+  const pendingBoundaryStop = Boolean(
+    selectedRunHasLiveControls
+    && savedOverrides?.state === 'pending'
+    && savedOverrides.owner_stop === true,
+  )
   const lastExecuted = lastExecutedEvidence(events, context)
   const selectedRunIssue = selectedRun ? runIssue(selectedRun) : null
   const recoveryProvenance = recoveryProvenanceFromEvents(events)
@@ -2687,6 +2743,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                 </dl>
               </div>
               {selectedRun.ownership === 'legacy' && <div className="notice">Legacy execution record. Workflow controls are unavailable; history controls remain available.</div>}
+              {pendingBoundaryStop && <div className="notice" role="status">Stop requested — finishing current turn. The current worker/reviewer call may finish before the run becomes Stopped; this does not approve the checkpoint.</div>}
               {selectedRun.evidence.no_agent_started === true && selectedRun.status !== 'running' && <p>No agent started.</p>}
               {streamState === 'reconnecting' && <div className="notice">Updates are stale. Use Refresh to retry.</div>}
               {selectedRunIssue && <section className={`run-issue-summary run-issue-${selectedRunIssue.kind}`} role={selectedRunIssue.kind === 'failure' ? 'alert' : undefined}>
@@ -2826,7 +2883,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
               <section className="dashboard-section dashboard-actions">
                 {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <>
-                  {!confirmOwnerStop ? <button className="btn btn-danger" disabled={restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Owner stop…</button> : <div className="confirmation"><span>Confirm owner stop for {selectedRun.run_id}. This control is recorded by the server.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Confirm stop</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
+                  {!pendingBoundaryStop && <button className="btn btn-primary" disabled={busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Stop after current turn</button>}
+                  <p className="text-sm text-dim">The current worker or reviewer call can finish at the next safe boundary. Stopping does not approve the checkpoint.</p>
+                  {!confirmOwnerStop ? <button className="btn btn-secondary" disabled={busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button> : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
                 </>}
                 {!selectedRunIssue && canResume && <>
                   {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}

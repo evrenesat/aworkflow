@@ -8010,11 +8010,23 @@ def run_workflow(
     )
     banner.update(state)
 
+    resume_review_step = (
+        wf.steps.get(resume.interrupted_step_name)
+        if resume is not None and resume.interrupted_step_name is not None
+        else None
+    )
+    pending_review_resume = (
+        resume is not None
+        and resume.active_implementation_scope is not None
+        and resume.active_implementation_scope.awaiting_review
+        and resume_review_step is not None
+        and resume_review_step.role == "reviewer"
+    )
     done = original_snapshot.is_complete
     terminal_integration_only = bool(
         resume is not None and resume.terminal_integration_only
     )
-    if done and not terminal_integration_only and not terminal_completion_resume and not (
+    if done and not terminal_integration_only and not terminal_completion_resume and not pending_review_resume and not (
         resume is not None
         and (
             resume.pending_finalized_turn is not None

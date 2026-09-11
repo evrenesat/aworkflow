@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-11 — Stop and recovery integration
+
+- Preserve both reviewed stop-after-turn controls and cumulative failure recovery.
+  Validated owner-stopped reviewer boundaries bypass failed-run-only recovery
+  classification, including when a worker advances to the next checkpoint.
+- Combined resume checks, focused dashboard tests and browser stop/recovery
+  journeys verify the integration; exact-revision CI still gates deployment.
+
 ## 2026-09-11 — Deterministic read-only guard reports (issue 4)
 
 - Added bounded, ownership-matched canonical/legacy report inputs and a bundled
@@ -93,6 +101,22 @@
   and WebKit evidence is selected through separate `--basetemp` invocations.
 - Built the unchanged production bundle once because this checkout had no
   existing `web/dist`; no production behavior or recovery assertions changed.
+
+
+## 2026-09-11 — Expose graceful stop and preserve pending review
+
+- Exposed the existing revisioned owner_stop intent through REST, MCP and
+  Stop after current turn. Saved intent remains visibly pending until the
+  current worker/reviewer call finalizes; Stop now retains exact-unit
+  interruption. Neither action implies checkpoint approval.
+- Ordinary continuation restores the validated pending reviewer and scope,
+  including when the worker completed the final checkpoint. Complete plans
+  without pending-review evidence remain rejected; replacement recovery
+  remains separate.
+- Real delayed-provider Chromium/WebKit journeys verify pending refresh,
+  finalized evidence and no unit stop or next invocation. Focused runtime,
+  daemon, transport and dashboard checks verify continuation, concurrency and
+  terminal controls; production build passed. CI owns full suites.
 
 ## 2026-09-11 — Recover explicitly with a replacement worker (issue 36)
 

@@ -1000,9 +1000,49 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     )
     assert stale.status_code == 409
     assert stale.json() == {"detail": {"code": "revision_conflict", "current_revision": 1}}
+
+    boundary = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "control-boundary-stop-1"},
+        json={"expected_revision": 1, "owner_stop": True},
+    )
+    assert boundary.status_code == 200, boundary.text
+    assert boundary.json()["revision"] == 2
+    assert boundary.json()["owner_stop"] is True
+    assert boundary.json()["run"]["status"] in {"running", "launch_started"}
+    assert units.stop_calls == []
+    boundary_replay = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "control-boundary-stop-1"},
+        json={"expected_revision": 1, "owner_stop": True},
+    )
+    assert boundary_replay.status_code == 200
+    assert boundary_replay.json() == boundary.json()
+    boundary_stale = client.patch(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
+        headers={"Idempotency-Key": "control-boundary-stop-stale"},
+        json={"expected_revision": 1, "owner_stop": True},
+    )
+    assert boundary_stale.status_code == 409
+    assert boundary_stale.json() == {"detail": {"code": "revision_conflict", "current_revision": 2}}
+    fresh_boundary = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}"
+    )
+    assert fresh_boundary.status_code == 200
+    fresh_boundary_payload = fresh_boundary.json()
+    assert fresh_boundary_payload["status"] in {"running", "launch_started"}
+    assert fresh_boundary_payload["activity"] == "active"
+    assert fresh_boundary_payload["evidence"]["overrides"] == {
+        "state": "pending",
+        "revision": 2,
+        "max_turns": 3,
+        "team": None,
+        "role_selectors": {},
+        "owner_stop": True,
+    }
     unsafe = client.patch(
         f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/control",
-        json={"expected_revision": 1, "unsafe_changes": {"workflow": "other"}},
+        json={"expected_revision": 2, "unsafe_changes": {"workflow": "other"}},
     )
     assert unsafe.status_code == 409
     assert unsafe.json()["detail"]["code"] == "restart_required"
@@ -1059,6 +1099,17 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     )
     assert stopped.status_code == 200
     assert stopped.json()["launch_phase"] == "owner_stopped"
+    assert units.stop_calls[-1] == f"aflow-run-{resumed_id}.service"
+    stop_call_count = len(units.stop_calls)
+    stopped_replay = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{resumed_id}/owner-stop",
+        headers={"Idempotency-Key": "stop-1"},
+        json={"expected_revision": 0},
+    )
+    assert stopped_replay.status_code == 200
+    assert stopped_replay.json()["status"] == "owner_stopped"
+    assert stopped_replay.json()["launch_phase"] == "owner_stopped"
+    assert len(units.stop_calls) == stop_call_count
 
 
 def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_client) -> None:

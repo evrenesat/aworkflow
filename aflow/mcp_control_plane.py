@@ -535,8 +535,15 @@ def create_control_plane_mcp(
         team: str | None = None,
         role_selectors: Mapping[str, str] | None = None,
         unsafe_changes: Mapping[str, object] | None = None,
+        owner_stop: bool | None = None,
     ) -> dict[str, Any]:
-        """Apply one compare-and-swap safe control request to a run."""
+        """Apply one revisioned control request to a run.
+
+        Set ``owner_stop`` to true to request stopping after the current
+        worker/reviewer call reaches the existing safe boundary. This does
+        not interrupt the active unit or imply checkpoint approval; use the
+        separate ``owner_stop`` tool for an immediate terminal stop.
+        """
         return tool_result(
             lambda: _control_response(
                 get_service().control(
@@ -548,6 +555,7 @@ def create_control_plane_mcp(
                         team=team,
                         role_selectors=role_selectors or {},
                         unsafe_changes=unsafe_changes or {},
+                        owner_stop=owner_stop,
                     ),
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
@@ -562,11 +570,12 @@ def create_control_plane_mcp(
                 "team": team,
                 "role_selectors": role_selectors or {},
                 "unsafe_changes": unsafe_changes or {},
+                "owner_stop": owner_stop,
             },
         )
 
     @mcp.tool(
-        title="Stop an AFlow run as owner",
+        title="Stop an AFlow run immediately as owner",
         annotations=_OWNER_STOP_TOOL_ANNOTATIONS,
         tags={"write", "approval-required"},
     )
@@ -576,7 +585,11 @@ def create_control_plane_mcp(
         expected_revision: int,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        """Request a terminal owner stop for one run."""
+        """Immediately stop the exact active unit and finalize the run.
+
+        This interrupts the active worker/reviewer call and is separate from
+        ``control_run(owner_stop=true)``. Neither action approves a checkpoint.
+        """
         return tool_result(
             lambda: (
                 get_service()

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
+import subprocess
+from threading import Event
 
 import pytest
 
@@ -22,8 +25,11 @@ from aflow.control_plane import (
     read_events,
 )
 from aflow.control_plane.persistence import PersistenceError
-from aflow.run_state import load_override_request
-from aflow.run_state import ControllerConfig
+from aflow.cli import _bootstrap_resume_invocation
+from aflow.run_state import (
+    ControllerConfig,
+    load_override_request,
+)
 from aflow.workflow import WorkflowError, run_workflow
 
 
@@ -178,6 +184,290 @@ def test_owner_stop_terminalizes_at_the_existing_pre_turn_boundary(
     metadata = (result.run_dir / "run.json").read_text()
     assert '"status": "owner_stopped"' in metadata
     assert read_events(result.run_dir)[-1].event_type == "owner_stopped"
+
+
+def test_owner_stop_waits_for_a_blocked_turn_and_never_launches_the_next_one(
+    tmp_path: Path,
+) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step\n")
+    config = WorkflowUserConfig(
+        roles={"worker": "codex.high"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"high": HarnessProfileConfig(model="high-model")}
+            )
+        },
+        workflows={
+            "live": WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement"),),
+                    )
+                },
+                first_step="implement",
+            )
+        },
+        prompts={"p": "Work."},
+    )
+    entered = Event()
+    release = Event()
+    invocations: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        invocations.append(argv)
+        entered.set()
+        assert release.wait(timeout=5), "fake worker did not receive its release"
+        return subprocess.CompletedProcess(argv, 0, "turn finished\n", "")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            run_workflow,
+            ControllerConfig(
+                repo_root=tmp_path,
+                plan_path=plan,
+                max_turns=3,
+                reserved_run_id="delayed-owner-stop-1",
+            ),
+            config,
+            "live",
+            config_dir=tmp_path,
+            snapshot_config=False,
+            runner=runner,
+        )
+        assert entered.wait(timeout=5), "fake worker did not start"
+        run_dir = tmp_path / ".aflow" / "runs" / "delayed-owner-stop-1"
+        active_metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert active_metadata["status"] == "running"
+
+        requested = compare_and_swap_overrides(
+            tmp_path,
+            run_dir.name,
+            RunControlRequest(expected_revision=0, owner_stop=True),
+        )
+        assert requested.owner_stop is True
+        # Saving the intent does not terminalize a live turn or invoke a stop.
+        still_active = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        assert still_active["status"] == "running"
+        assert not future.done()
+
+        release.set()
+        result = future.result(timeout=5)
+
+    assert result.status == "owner_stopped"
+    assert len(invocations) == 1
+    terminal_metadata = json.loads((result.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert terminal_metadata["status"] == "owner_stopped"
+    turn_result = json.loads(
+        (result.run_dir / "turns" / "turn-001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert turn_result["status"] == "completed"
+    assert read_events(result.run_dir)[-1].event_type == "owner_stopped"
+
+
+def test_graceful_stop_resume_reviews_finalized_worker_before_new_implementation(
+    tmp_path: Path,
+) -> None:
+    _run_graceful_stop_resume(
+        tmp_path,
+        complete_worker=False,
+    )
+
+
+def test_graceful_stop_resume_reviews_finalized_complete_worker_before_new_implementation(
+    tmp_path: Path,
+) -> None:
+    _run_graceful_stop_resume(
+        tmp_path,
+        complete_worker=True,
+    )
+
+
+def _run_graceful_stop_resume(
+    tmp_path: Path,
+    *,
+    complete_worker: bool,
+) -> None:
+    plan = tmp_path / "plan.md"
+    plan.write_text(
+        "# Plan\n\n"
+        "### [ ] Checkpoint 1: First\n"
+        "- [ ] step\n",
+        encoding="utf-8",
+    )
+    config = WorkflowUserConfig(
+        roles={"worker": "codex.high", "reviewer": "codex.high"},
+        harnesses={
+            "codex": WorkflowHarnessConfig(
+                profiles={"high": HarnessProfileConfig(model="high-model")}
+            )
+        },
+        workflows={
+            "live": WorkflowConfig(
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("implement",),
+                        go=(GoTransition(to="review"),),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("review",),
+                        go=(GoTransition(to="END"),),
+                    ),
+                },
+                first_step="implement",
+            )
+        },
+        prompts={
+            "implement": "Implement the checkpoint.",
+            "review": "Review the completed worker turn.",
+        },
+    )
+    entered = Event()
+    release = Event()
+    source_invocations: list[str] = []
+
+    def delayed_worker(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        source_invocations.append(str(kwargs.get("input", "")))
+        entered.set()
+        assert release.wait(timeout=5), "fake worker did not receive its release"
+        if complete_worker:
+            plan.write_text(
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: First\n"
+                "- [x] step\n",
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(argv, 0, "worker output\n", "")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            run_workflow,
+            ControllerConfig(
+                repo_root=tmp_path,
+                plan_path=plan,
+                max_turns=3,
+                reserved_run_id="graceful-stop-source",
+            ),
+            config,
+            "live",
+            config_dir=tmp_path,
+            snapshot_config=False,
+            runner=delayed_worker,
+        )
+        assert entered.wait(timeout=5), "fake worker did not start"
+        source_dir = tmp_path / ".aflow" / "runs" / "graceful-stop-source"
+        requested = compare_and_swap_overrides(
+            tmp_path,
+            source_dir.name,
+            RunControlRequest(expected_revision=0, owner_stop=True),
+        )
+        assert requested.owner_stop is True
+        assert not future.done()
+        release.set()
+        source = future.result(timeout=5)
+
+    assert source.status == "owner_stopped"
+    assert len(source_invocations) == 1
+    source_metadata = json.loads(
+        (source.run_dir / "run.json").read_text(encoding="utf-8")
+    )
+    assert source_metadata["status"] == "owner_stopped"
+    if complete_worker:
+        assert source_metadata["last_snapshot"]["is_complete"] is True
+    assert source_metadata["active_implementation_scope"]["awaiting_review"] is True
+    source_turn = json.loads(
+        (source.run_dir / "turns" / "turn-001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert source_turn["step_role"] == "worker"
+    assert source_turn["chosen_transition"] == "review"
+    assert "worker output" in (
+        source.run_dir / "turns" / "turn-001" / "stdout.txt"
+    ).read_text(encoding="utf-8")
+
+    config_path = tmp_path / "aflow.toml"
+    config_path.write_text("# focused resume fixture\n", encoding="utf-8")
+    resume_bootstrap = _bootstrap_resume_invocation(
+        repo_root=tmp_path,
+        config_path=config_path,
+        default_config_path=config_path,
+        config_path_is_explicit=True,
+        workflow_config=config,
+        requested_run_id=source.run_dir.name,
+        workflow_arg=None,
+        plan_file_arg=None,
+        team_arg=None,
+        start_step_arg=None,
+        max_turns_arg=None,
+        extra_instructions_arg=(),
+        extra_instructions_provided=False,
+        live_loader=lambda _path: config,
+    )
+    resume_context = resume_bootstrap.resume_context
+    assert resume_context.interrupted_step_name == "review"
+    assert resume_context.active_implementation_scope is not None
+    resumed_invocations: list[str] = []
+    resumed_scope_ids: list[str] = []
+
+    def resumed_provider(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        resumed_invocations.append(str(kwargs.get("input", "")))
+        resumed_metadata = json.loads(
+            (
+                tmp_path
+                / ".aflow"
+                / "runs"
+                / "graceful-stop-continuation"
+                / "run.json"
+            ).read_text(encoding="utf-8")
+        )
+        resumed_scope_ids.append(
+            resumed_metadata["active_implementation_scope"]["scope_id"]
+        )
+        plan.write_text(
+            "# Plan\n\n"
+            "### [x] Checkpoint 1: First\n"
+            "- [x] step\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "review output\n", "")
+
+    continuation = run_workflow(
+        ControllerConfig(
+            repo_root=tmp_path,
+            plan_path=plan,
+            max_turns=1,
+            reserved_run_id="graceful-stop-continuation",
+        ),
+        config,
+        "live",
+        config_dir=tmp_path,
+        snapshot_config=False,
+        runner=resumed_provider,
+        resume=resume_context,
+    )
+
+    assert continuation.run_dir != source.run_dir
+    assert len(resumed_invocations) == 1
+    continuation_metadata = json.loads(
+        (continuation.run_dir / "run.json").read_text(encoding="utf-8")
+    )
+    assert continuation_metadata["resumed_from_run_id"] == source.run_dir.name
+    assert resumed_scope_ids == [resume_context.active_implementation_scope.scope_id]
+    continuation_turn = json.loads(
+        (continuation.run_dir / "turns" / "turn-001" / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert continuation_turn["step_name"] == "review"
+    assert continuation_turn["step_role"] == "reviewer"
+    assert source_turn["step_name"] == "implement"
 
 
 def test_reserved_run_id_collision_fails_before_launch_artifacts(tmp_path: Path) -> None:
