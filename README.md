@@ -39,6 +39,21 @@ execution gate.
 4. AFlow re-reads the plan, records the turn, and follows the next matching
    transition.
 
+## Plan backup history
+
+Workflow snapshots retain their existing backup names, bytes, and
+byte-identical deduplication. Atomic provenance records keep exact capture
+paths, events, run/turn references, follow-up origins, and lifecycle moves.
+Service-created drafts receive a fresh current identity when a filename is
+reused, so shared backup bytes do not transfer another plan's Ready baseline.
+The read-only history view reports baseline status for the selected plan and
+keeps temporary follow-up evidence attached to its original plan through
+successful moves. Each displayed event uses that plan's own capture reference
+or explicit Ready-promotion metadata; missing historical timing stays
+unavailable instead of borrowing another body's first capture. Missing or
+conflicting metadata remains unknown; restoration and reset are not part of
+this interface.
+
 Configuration is read as a consistent `aflow.toml`/`workflows.toml` pair at
 reservation, startup, resume, and each safe turn boundary. A saved explicit
 team, max-turns value, or start step keeps that choice; omitted defaults follow

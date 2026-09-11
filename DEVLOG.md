@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-11 — Explain plan backup provenance (issue34)
+
+- Preserve existing backup bytes/names and byte-identical deduplication while
+  recording atomic capture metadata, exact source/original associations and
+  available run/turn identity. Service and controller lifecycle moves retain
+  selected-owner evidence, including cleaned-up follow-ups.
+- Capture the initial Ready baseline at supported draft promotion with exact
+  revision checks and rollback. Fresh plan identities isolate reused paths and
+  shared bodies; legacy or unavailable provenance never invents a baseline.
+- Expose authenticated paginated backup history in Plans with readable labels,
+  owner-specific capture details and editor draft preservation. Restore/reset
+  and automatic deletion remain deferred.
+- Verified focused helper, lifecycle, service, daemon and MCP regressions,
+  component/build checks and isolated Chromium/WebKit backup journeys.
+
 ## 2026-09-11 — Await exact selected run identity in browser helper
 
 - `_assert_run_detail` now retries the exact readable heading and Copy run ID

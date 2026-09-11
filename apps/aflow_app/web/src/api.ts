@@ -1,5 +1,6 @@
 import type {
   ConfigValidation,
+  PlanBackupPage,
   PlanDocument,
   PlanStatus,
   ProjectConfig,
@@ -321,6 +322,15 @@ function planPath(projectId: string, status: PlanStatus, name: string): string {
 
 export async function readProjectPlan(projectId: string, status: PlanStatus, name: string): Promise<PlanDocument> {
   return fetchJson<PlanDocument>(planPath(projectId, status, name))
+}
+
+export async function listProjectPlanBackups(
+  projectId: string,
+  status: PlanStatus,
+  name: string,
+  options: { offset?: number; limit?: number } = {},
+): Promise<PlanBackupPage> {
+  return fetchJson<PlanBackupPage>(`${planPath(projectId, status, name)}/backups${buildQuery(options)}`)
 }
 
 export async function updateProjectPlan(

@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { PlanDocument, ProjectInfo } from '../types'
+import type { PlanBackupPage, PlanBackupSummary, PlanDocument, ProjectInfo } from '../types'
 import { PlanPanel } from './PlanPanel'
 
 vi.mock('../api', async () => {
@@ -14,6 +14,7 @@ vi.mock('../api', async () => {
     readProjectPlan: vi.fn(),
     updateProjectPlan: vi.fn(),
     promoteProjectPlan: vi.fn(),
+    listProjectPlanBackups: vi.fn(),
   }
 })
 
@@ -39,6 +40,34 @@ async function openPlan(plan: PlanDocument, content: string) {
   vi.mocked(api.readProjectPlan).mockResolvedValue({ ...plan, content })
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(plan.name) }))
   await screen.findByLabelText('Plan content')
+}
+
+function backupSummary(filename: string, overrides: Partial<PlanBackupSummary> = {}): PlanBackupSummary {
+  return {
+    backup_filename: filename,
+    kind: 'snapshot',
+    baseline_status: 'unknown',
+    capture_event: 'startup_preparation',
+    timestamp: '2026-09-11T10:00:00Z',
+    run_id: null,
+    turn_number: null,
+    content_sha256: `${filename}-hash`,
+    ...overrides,
+  }
+}
+
+function backupPage(
+  backups: PlanBackupSummary[],
+  options: Partial<PlanBackupPage> = {},
+): PlanBackupPage {
+  return {
+    backups,
+    offset: 0,
+    limit: 50,
+    next_offset: null,
+    total_items: backups.length,
+    ...options,
+  }
 }
 
 describe('PlanPanel', () => {
@@ -202,5 +231,105 @@ describe('PlanPanel', () => {
     ))
     await screen.findByText(promoted.path)
     await waitFor(() => expect(api.listProjectPlans).toHaveBeenCalledTimes(2))
+  })
+
+  it('loads readable backup labels without changing an unsaved draft', async () => {
+    const baseline = backupSummary('plan-a.md', {
+      baseline_status: 'known',
+      capture_event: 'ready_promotion',
+    })
+    const snapshot = backupSummary('plan-a.md.1', {
+      capture_event: 'startup_preparation',
+    })
+    const followUp = backupSummary('plan-a.md.2', {
+      kind: 'follow_up',
+      capture_event: 'before_followup_turn',
+      run_id: 'run-7',
+      turn_number: 3,
+    })
+    const unknown = backupSummary('legacy.md', {
+      kind: 'unclassified',
+      baseline_status: 'unknown',
+      capture_event: null,
+      timestamp: null,
+    })
+    vi.mocked(api.listProjectPlanBackups).mockResolvedValue(
+      backupPage([baseline, snapshot, followUp, unknown]),
+    )
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await openPlan(todoPlan, '# Original\n')
+    const editor = screen.getByLabelText('Plan content') as HTMLTextAreaElement
+    fireEvent.change(editor, { target: { value: '# Keep my draft\n' } })
+
+    const summary = screen.getByText('Backup history', { exact: true })
+    expect(summary.closest('details')?.hasAttribute('open')).toBe(false)
+    fireEvent.click(summary)
+    await screen.findByText('Baseline', { exact: true })
+
+    expect(api.listProjectPlanBackups).toHaveBeenCalledWith('alpha', 'todo', 'plan-a.md', {
+      offset: 0,
+      limit: 50,
+    })
+    expect(screen.getByText('Initial Ready baseline', { exact: true })).toBeDefined()
+    expect(screen.getByText('Snapshot', { exact: true })).toBeDefined()
+    expect(screen.getByText('Follow-up', { exact: true })).toBeDefined()
+    expect(screen.getByText('Unknown origin', { exact: true })).toBeDefined()
+    expect(screen.getByText('Captured plan snapshot', { exact: true })).toBeDefined()
+    expect(screen.queryByText('Later snapshot; original baseline is unknown', { exact: true })).toBeNull()
+    expect(screen.getByText('run-7', { exact: true })).toBeDefined()
+    expect(editor.value).toBe('# Keep my draft\n')
+    expect(screen.queryByRole('button', { name: /reset/i })).toBeNull()
+  })
+
+  it('paginates backup history and keeps the editor draft intact', async () => {
+    const baseline = backupSummary('plan-a.md', { baseline_status: 'known', capture_event: 'ready_promotion' })
+    const followUp = backupSummary('plan-a.md.1', { kind: 'follow_up' })
+    vi.mocked(api.listProjectPlanBackups)
+      .mockResolvedValueOnce(backupPage([baseline], { next_offset: 1, total_items: 2 }))
+      .mockResolvedValueOnce(backupPage([followUp], { offset: 1, total_items: 2 }))
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await openPlan(todoPlan, '# Original\n')
+    const editor = screen.getByLabelText('Plan content') as HTMLTextAreaElement
+    fireEvent.change(editor, { target: { value: '# Preserve through pages\n' } })
+    fireEvent.click(screen.getByText('Backup history', { exact: true }))
+    await screen.findByText('Baseline', { exact: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+    await screen.findByText('Follow-up', { exact: true })
+    expect(screen.getByRole('button', { name: 'Previous' })).toBeDefined()
+    expect(screen.getByText('Showing 2–2 of 2', { exact: true })).toBeDefined()
+    expect(api.listProjectPlanBackups).toHaveBeenLastCalledWith('alpha', 'todo', 'plan-a.md', {
+      offset: 1,
+      limit: 50,
+    })
+    expect(editor.value).toBe('# Preserve through pages\n')
+  })
+
+  it('reports unavailable history and ignores stale source-plan responses', async () => {
+    vi.mocked(api.listProjectPlanBackups).mockRejectedValueOnce(new Error('history service unavailable'))
+    render(<PlanPanel project={project} onDirtyChange={vi.fn()} onOpenRunDashboard={vi.fn()} />)
+    await openPlan(todoPlan, '# Draft\n')
+    fireEvent.click(screen.getByText('Backup history', { exact: true }))
+    await screen.findByText('Backup history unavailable: history service unavailable', { exact: true })
+    expect(screen.queryByRole('button', { name: /reset/i })).toBeNull()
+
+    let resolveStale!: (page: PlanBackupPage) => void
+    vi.mocked(api.listProjectPlanBackups).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveStale = resolve
+    }))
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans', exact: true }))
+    await openPlan(inProgressPlan, '# Ready\n')
+    fireEvent.click(screen.getByText('Backup history', { exact: true }))
+    await waitFor(() => expect(api.listProjectPlanBackups).toHaveBeenLastCalledWith('alpha', 'in_progress', 'plan-b.md', {
+      offset: 0,
+      limit: 50,
+    }))
+
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Plans', exact: true }))
+    await openPlan(todoPlan, '# Fresh source\n')
+    resolveStale(backupPage([backupSummary('stale.md', { baseline_status: 'known' })]))
+    await waitFor(() => expect((screen.getByLabelText('Plan content') as HTMLTextAreaElement).value).toBe('# Fresh source\n'))
+    expect(screen.queryByText('stale.md', { exact: true })).toBeNull()
+    expect(screen.getByText('Backup history', { exact: true }).closest('details')?.hasAttribute('open')).toBe(false)
   })
 })

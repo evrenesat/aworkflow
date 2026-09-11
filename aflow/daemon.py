@@ -946,7 +946,12 @@ class DaemonService:
                     return
             repo_state = probe_repo_state(self._config.repo_root)
             needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
-            _backup_original_plan(self._config.repo_root, request.plan_path)
+            _backup_original_plan(
+                self._config.repo_root,
+                request.plan_path,
+                event="startup_preparation",
+            )
+            parsed_plan = load_plan(request.plan_path)
             _prepare_required_git_tracking_before_allocation(
                 repo_root=self._config.repo_root,
                 original_plan_path=request.plan_path,

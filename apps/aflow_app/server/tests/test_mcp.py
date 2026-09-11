@@ -878,6 +878,13 @@ def test_mcp_plan_authoring_matches_rest_and_preserves_stale_bytes(mcp_client) -
     )
     assert promoted_from_browser.status_code == 200
     assert promoted_from_browser.json() == promoted
+    history = client.get(
+        f"{plans_path}/in_progress/{name}/backups",
+        headers=headers,
+    )
+    assert history.status_code == 200
+    assert history.json()["backups"][0]["baseline_status"] == "known"
+    assert history.json()["backups"][0]["capture_event"] == "ready_promotion"
 
 
 def test_mcp_plan_authoring_uses_default_template_and_safe_errors(mcp_client) -> None:

@@ -309,6 +309,28 @@ export interface PlanDocument {
   content?: string
 }
 
+export type PlanBackupKind = 'snapshot' | 'follow_up'
+export type PlanBackupBaselineStatus = 'known' | 'unknown'
+
+export interface PlanBackupSummary {
+  backup_filename: string
+  kind: PlanBackupKind | string
+  baseline_status: PlanBackupBaselineStatus | string
+  capture_event: string | null
+  timestamp: string | null
+  run_id: string | null
+  turn_number: number | null
+  content_sha256: string | null
+}
+
+export interface PlanBackupPage {
+  backups: PlanBackupSummary[]
+  offset: number
+  limit: number
+  next_offset: number | null
+  total_items: number
+}
+
 /** Versioned REST views returned by the daemon-backed control plane. */
 export interface WorkflowCapability {
   declared_steps: string[]

@@ -91,6 +91,39 @@ captured plan state and lack that marker retain their recorded evidence and
 disclosure, including legitimately unavailable checkpoint evidence; direct
 contexts and marked captures continue using the corrected original authority.
 
+## Plan backup provenance
+
+The workflow backup bodies under `plans/backups/` retain their established
+names, bytes, and byte-identical deduplication. `plan_backups.py` adds one
+atomic JSON sidecar per body under `.provenance/` and a small atomic current
+owner index under `.provenance/.owners/`. Valid body records contain the
+capture kind, exact source path, capture event, timestamp, hash, available
+run/turn identity, and explicit lifecycle aliases. Capture references may carry
+the exact plan identity and capture timestamp that produced them, plus the
+original-plan identity for follow-ups; ordinary content deduplication never
+turns a new source path into a lifecycle alias or transfers baseline authority.
+Service-created drafts receive a fresh identity even when a vacated filename is
+reused. A newly promoted draft gets its exact pre-promotion bytes marked as the
+known initial Ready baseline only after the service has moved that identity
+successfully. Follow-up records retain their exact original-plan identity so
+history remains visible after temporary source cleanup and later Done moves.
+REST and the shared MCP authoring path keep their expected-revision checks, and
+controller-owned moves append destination aliases only after a successful move.
+
+The authenticated plan-history route is read-only and returns bounded summary
+pages for the exact registered project and current lifecycle path. Missing,
+corrupt, hash-mismatched, conflicting, or incomplete provenance is not used to
+associate a body or claim a baseline; same-basename paths in another checkout
+remain unrelated. Baseline status is projected for the selected current owner,
+so reused bytes can be shown without making an unrelated plan a baseline owner.
+When an externally authored plan first enters service ownership, only
+unowned, exact source/original evidence without conflicting identity history is
+bound to it; ambiguous evidence remains unassociated. Displayed event, run,
+turn, and timestamp details come from the selected owner's reference or its
+Ready-promotion record, with unavailable historical detail left null.
+Existing and changed evidence is retained, repeated capture references are
+deduplicated, and restore/reset is deliberately deferred.
+
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
 selected editor IDs across guided/raw mode changes, and retains the single
 Skills presentation instance behind native `hidden` semantics across Settings

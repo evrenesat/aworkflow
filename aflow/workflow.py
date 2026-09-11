@@ -101,6 +101,15 @@ from .plan import (
     plan_step_checklist_is_complete,
     rewrite_git_tracking_field,
 )
+from .plan_backups import (
+    bind_unowned_plan_history,
+    ensure_plan_identity,
+    move_plan_identity,
+    plan_identity_for_path,
+    prepare_backup_directory,
+    record_backup_provenance,
+    record_plan_lifecycle_move,
+)
 from .recovery import (
     build_recovery_evidence,
     build_recovery_context,
@@ -4139,11 +4148,24 @@ def _backup_plan_copy(
     base_name: str,
     suffix: str,
     subject: str,
+    kind: str,
+    original_plan_path: Path | None,
+    event: str,
+    run_id: str | None,
+    turn_number: int | None,
 ) -> Path:
     if not source_path.is_file():
         raise WorkflowError(f"{subject} file does not exist: {source_path}")
+    if source_path.is_symlink():
+        raise WorkflowError(f"{subject} file must not be a symlink: {source_path}")
 
-    backup_dir = repo_root / "plans" / "backups"
+    try:
+        backup_dir = prepare_backup_directory(repo_root)
+    except OSError as exc:
+        raise WorkflowError(
+            f"failed to back up {subject} {source_path} into "
+            f"{repo_root / 'plans' / 'backups'}: {exc}"
+        ) from exc
     base_backup_path = backup_dir / f"{base_name}{suffix}"
     version_pattern = re.compile(
         rf"^{re.escape(base_name)}_v(\d+){re.escape(suffix)}$"
@@ -4152,21 +4174,36 @@ def _backup_plan_copy(
     highest_version = 1
 
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-
+        if base_backup_path.is_symlink():
+            raise OSError(f"backup body must not be a symlink: {base_backup_path}")
         if base_backup_path.is_file():
             if _same_file_contents(
                 source_path,
                 base_backup_path,
                 source_identity=source_identity,
             ):
+                record_backup_provenance(
+                    repo_root,
+                    base_backup_path,
+                    kind=kind,
+                    source_plan_path=source_path,
+                    original_plan_path=original_plan_path,
+                    event=event,
+                    run_id=run_id,
+                    turn_number=turn_number,
+                    historical_origin_known=False,
+                )
                 return base_backup_path
 
         for child in backup_dir.iterdir():
-            if not child.is_file() or child == base_backup_path:
+            if child == base_backup_path:
                 continue
             match = version_pattern.match(child.name)
             if match is None:
+                continue
+            if child.is_symlink():
+                raise OSError(f"backup body must not be a symlink: {child}")
+            if not child.is_file():
                 continue
             highest_version = max(highest_version, int(match.group(1)))
             if _same_file_contents(
@@ -4174,6 +4211,17 @@ def _backup_plan_copy(
                 child,
                 source_identity=source_identity,
             ):
+                record_backup_provenance(
+                    repo_root,
+                    child,
+                    kind=kind,
+                    source_plan_path=source_path,
+                    original_plan_path=original_plan_path,
+                    event=event,
+                    run_id=run_id,
+                    turn_number=turn_number,
+                    historical_origin_known=False,
+                )
                 return child
 
         if not base_backup_path.exists():
@@ -4181,11 +4229,29 @@ def _backup_plan_copy(
         else:
             version = max(highest_version, 1) + 1
             target_path = backup_dir / f"{base_name}_v{version:02d}{suffix}"
+            if target_path.is_symlink():
+                raise OSError(f"backup body must not be a symlink: {target_path}")
             while target_path.exists():
+                if target_path.is_symlink():
+                    raise OSError(f"backup body must not be a symlink: {target_path}")
                 version += 1
                 target_path = backup_dir / f"{base_name}_v{version:02d}{suffix}"
 
+        if target_path.is_symlink():
+            raise OSError(f"backup body must not be a symlink: {target_path}")
+
         shutil.copyfile(source_path, target_path)
+        record_backup_provenance(
+            repo_root,
+            target_path,
+            kind=kind,
+            source_plan_path=source_path,
+            original_plan_path=original_plan_path,
+            event=event,
+            run_id=run_id,
+            turn_number=turn_number,
+            historical_origin_known=True,
+        )
         return target_path
     except OSError as exc:
         raise WorkflowError(
@@ -4193,7 +4259,14 @@ def _backup_plan_copy(
         ) from exc
 
 
-def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
+def _backup_original_plan(
+    repo_root: Path,
+    original_plan_path: Path,
+    *,
+    event: str = "workflow_start",
+    run_id: str | None = None,
+    turn_number: int | None = None,
+) -> Path:
     if not original_plan_path.is_file():
         raise WorkflowError(f"original plan file does not exist: {original_plan_path}")
 
@@ -4204,6 +4277,11 @@ def _backup_original_plan(repo_root: Path, original_plan_path: Path) -> Path:
         base_name=base_name,
         suffix=suffix,
         subject="original plan",
+        kind="snapshot",
+        original_plan_path=None,
+        event=event,
+        run_id=run_id,
+        turn_number=turn_number,
     )
 
 
@@ -4213,6 +4291,9 @@ def _backup_active_followup_plan(
     active_plan_path: Path,
     *,
     source_path: Path | None = None,
+    event: str = "before_followup_turn",
+    run_id: str | None = None,
+    turn_number: int | None = None,
 ) -> Path | None:
     """Back up a non-original active plan before its harness turn runs.
 
@@ -4234,6 +4315,11 @@ def _backup_active_followup_plan(
         base_name=base_name,
         suffix=suffix,
         subject="active follow-up plan",
+        kind="follow_up",
+        original_plan_path=original_plan_path,
+        event=event,
+        run_id=run_id,
+        turn_number=turn_number,
     )
 
 
@@ -4245,6 +4331,55 @@ def _done_plan_path(repo_root: Path, plan_path: Path) -> Path | None:
     except ValueError:
         return None
     return plans_root / "done" / relative_plan_path
+
+
+def _prepare_controller_plan_provenance(
+    repo_root: Path,
+    source_plan_path: Path,
+    destination_plan_path: Path,
+) -> None:
+    """Prepare one safe owner before a controller-completed plan move."""
+    existing_source_owner = plan_identity_for_path(repo_root, source_plan_path)
+    if existing_source_owner is not None:
+        return
+    if plan_identity_for_path(repo_root, destination_plan_path) is not None:
+        return
+    try:
+        source_owner = ensure_plan_identity(repo_root, source_plan_path)
+        bind_unowned_plan_history(
+            repo_root,
+            source_plan_path,
+            plan_identity_id=source_owner,
+        )
+    except OSError:
+        # Controller completion has historically kept the file move best-effort
+        # when provenance metadata is unavailable.
+        pass
+
+
+def _record_controller_plan_move(
+    repo_root: Path,
+    *,
+    source_plan_path: Path,
+    destination_plan_path: Path,
+) -> None:
+    try:
+        record_plan_lifecycle_move(
+            repo_root,
+            source_plan_path=source_plan_path,
+            destination_plan_path=destination_plan_path,
+        )
+    except OSError:
+        # Keep the existing best-effort controller boundary, but retain a
+        # prepared owner when the alias sidecar itself cannot be updated.
+        try:
+            move_plan_identity(
+                repo_root,
+                source_plan_path=source_plan_path,
+                destination_plan_path=destination_plan_path,
+            )
+        except OSError:
+            pass
 
 
 def move_completed_plan_to_done(repo_root: Path, plan_path: Path) -> Path:
@@ -4259,18 +4394,38 @@ def move_completed_plan_to_done(repo_root: Path, plan_path: Path) -> Path:
     done_plan_path.parent.mkdir(parents=True, exist_ok=True)
     if done_plan_path.exists():
         if done_plan_path.is_file() and _same_file_contents(plan_path, done_plan_path):
+            _prepare_controller_plan_provenance(
+                repo_root,
+                plan_path,
+                done_plan_path,
+            )
             plan_path.unlink()
+            _record_controller_plan_move(
+                repo_root,
+                source_plan_path=plan_path,
+                destination_plan_path=done_plan_path,
+            )
             return done_plan_path
         raise WorkflowError(
             f"done plan path already exists: {done_plan_path}"
         )
 
+    _prepare_controller_plan_provenance(
+        repo_root,
+        plan_path,
+        done_plan_path,
+    )
     try:
         shutil.move(str(plan_path), str(done_plan_path))
     except OSError as exc:
         raise WorkflowError(
             f"failed to move completed plan {plan_path} to {done_plan_path}: {exc}"
         ) from exc
+    _record_controller_plan_move(
+        repo_root,
+        source_plan_path=plan_path,
+        destination_plan_path=done_plan_path,
+    )
     return done_plan_path
 
 
@@ -7079,7 +7234,12 @@ def run_workflow(
 
     try:
         if not terminal_completion_after_move:
-            _backup_original_plan(config.repo_root, original_plan_path)
+            _backup_original_plan(
+                config.repo_root,
+                original_plan_path,
+                event=("resume_start" if resume is not None else "workflow_start"),
+                run_id=config.reserved_run_id,
+            )
         if parsed_plan is None:
             if terminal_completion_plan_path is None:
                 raise WorkflowError(
@@ -11768,6 +11928,9 @@ def run_workflow(
                     original_plan_path,
                     active_plan_path,
                     source_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    event="before_followup_turn",
+                    run_id=run_paths.run_dir.name,
+                    turn_number=turn_number,
                 )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":
@@ -12098,6 +12261,9 @@ def run_workflow(
                     original_plan_path,
                     active_plan_path,
                     source_path=_exec_plan_path(active_plan_path, exec_ctx),
+                    event="before_followup_turn",
+                    run_id=run_paths.run_dir.name,
+                    turn_number=turn_number,
                 )
             except WorkflowError as exc:
                 if exc.failure_kind == "environment_preflight":

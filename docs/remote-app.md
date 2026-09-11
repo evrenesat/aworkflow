@@ -37,7 +37,7 @@ Settings view: guided widgets are the default. A project with no configuration o
 
 Advanced TOML exposes the same two documents, not a second configuration source. Use it for uncommon workflow graphs and prompts. Validate checks without saving. Both save actions commit the pair with the current revision. Errors and stale-revision conflicts preserve the draft; reload requires explicit discard. Unsaved navigation is guarded, and a successful ready save can continue to Plans.
 
-Plans view: Draft, Ready and Done correspond to plans/todo, plans/in-progress and plans/done. Create and edit Markdown, Save, then Move to Ready when it is ready to run. Run this plan opens Runs with that exact Ready plan selected. Draft and Done plans cannot launch. Failed saves preserve text, and promotion never silently overwrites a destination.
+Plans view: Draft, Ready and Done correspond to plans/todo, plans/in-progress and plans/done. Create and edit Markdown, Save, then Move to Ready when it is ready to run. Run this plan opens Runs with that exact Ready plan selected. Draft and Done plans cannot launch. Failed saves preserve text, and promotion never silently overwrites a destination. The first supported promotion preserves the exact draft as the known Ready baseline; a read-only Backup history route exposes bounded provenance summaries without restoring or deleting evidence.
 
 Runs shows history and selected-run details, with a prominent New run action opening a separate project-scoped page (`view=new-run`). Cancel returns to Runs; successful creation opens the exact returned run. Creation and startup-answer request identities survive navigation. The newest returned run is selected only when no run is already selected or requested. Plan, workflow, team and start-step widgets show available choices. The launch preview uses the saved configuration and resolves each step's role and profile, including team overrides. Missing choices and invalid turn limits explain why Start run is unavailable. Run settings distinguish pending changes from applied values; low-level unit, revision, ownership and raw context/event information is under Diagnostics.
 
@@ -181,6 +181,7 @@ including the password.
 - `GET /api/projects/{project_id}/plans/{status}/{name}`
 - `PUT /api/projects/{project_id}/plans/{status}/{name}`
 - `POST /api/projects/{project_id}/plans/{status}/{name}/promote`
+- `GET /api/projects/{project_id}/plans/{status}/{name}/backups`
 
 `status` is `todo`, `in_progress`, or `done`; filesystem directories remain `todo`, `in-progress`, and `done`. Creation starts in `todo`. Promotion follows `todo → in_progress → done`. Updates and promotion require the current SHA-256 revision. Each file is UTF-8 Markdown at most 256 KiB. Unsafe names, nesting, links, non-regular files, stale revisions, and occupied move targets are rejected without changing the source bytes.
 
@@ -209,7 +210,8 @@ An active source still follows stop/confirm-inactive before launch. Failed
 inactive sources require no artificial owner-stop. A new attempt retains plan
 progress and freezes current committed settings; it never restores backups.
 Extra instructions that were not durably retained must be re-entered explicitly.
-Reset Plan and backup management remain deferred to issue #34.
+Reset Plan and backup restoration remain deferred to issue #34; existing and
+changed backup evidence is retained and identical bodies remain deduplicated.
 
 The default All runs view includes every ongoing run plus the latest N other
 runs across all registered projects. N defaults to 10 and is saved only under

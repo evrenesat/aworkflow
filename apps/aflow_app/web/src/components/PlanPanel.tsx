@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { PlanDocument, ProjectInfo } from '../types'
+import type { PlanBackupPage, PlanBackupSummary, PlanDocument, ProjectInfo } from '../types'
+import { formatMachineLabel } from '../label'
 import { MenuItem, MoreMenu } from './MoreMenu'
 import { useHeaderSlots } from './HeaderSlots'
 import { TextEditor } from './TextEditor'
@@ -17,8 +18,36 @@ interface ConflictState {
   currentRevision: string
 }
 
+interface BackupHistoryState {
+  page: PlanBackupPage | null
+  loading: boolean
+  error: string | null
+}
+
 function shortRevision(revision: string): string {
   return revision.slice(0, 12)
+}
+
+function planIdentity(projectId: string, plan: PlanDocument): string {
+  return JSON.stringify([projectId, plan.status, plan.name, plan.path])
+}
+
+function backupOriginLabel(summary: PlanBackupSummary): string {
+  if (summary.kind === 'follow_up') return 'Follow-up'
+  if (summary.kind === 'snapshot' && summary.baseline_status === 'known') return 'Baseline'
+  if (summary.kind === 'snapshot') return 'Snapshot'
+  return 'Unknown origin'
+}
+
+function backupOriginDescription(summary: PlanBackupSummary, label: string): string {
+  if (label === 'Baseline') return 'Initial Ready baseline'
+  if (label === 'Snapshot' && summary.baseline_status === 'unknown') return 'Captured plan snapshot'
+  if (label === 'Follow-up') return 'Follow-up evidence'
+  return 'Provenance is unavailable for this backup'
+}
+
+function backupEventLabel(event: string | null): string {
+  return typeof event === 'string' && event.trim() ? formatMachineLabel(event) : 'Unavailable'
 }
 
 /** Lifecycle sections always render in canonical order with runnable guidance. */
@@ -58,7 +87,52 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   const [conflict, setConflict] = useState<ConflictState | null>(null)
   const [confirmReload, setConfirmReload] = useState(false)
   const [confirmClose, setConfirmClose] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [history, setHistory] = useState<BackupHistoryState>({ page: null, loading: false, error: null })
+  const planLoadRequest = useRef(0)
+  const historyRequest = useRef(0)
+  const projectIdRef = useRef(project.id)
+  const selectedRef = useRef<PlanDocument | null>(selected)
+  const selectedIdentityRef = useRef<string | null>(null)
+  projectIdRef.current = project.id
+  selectedRef.current = selected
+  selectedIdentityRef.current = selected ? planIdentity(project.id, selected) : null
   const dirty = selected !== null && content !== savedContent
+
+  function resetBackupHistory() {
+    historyRequest.current += 1
+    setHistoryOpen(false)
+    setHistory({ page: null, loading: false, error: null })
+  }
+
+  function isCurrentPlan(expectedProjectId: string, expectedIdentity: string): boolean {
+    return projectIdRef.current === expectedProjectId
+      && selectedRef.current?.project_id === expectedProjectId
+      && selectedIdentityRef.current === expectedIdentity
+  }
+
+  async function loadBackupHistory(plan: PlanDocument, offset = 0) {
+    const expectedProjectId = project.id
+    const expectedIdentity = planIdentity(expectedProjectId, plan)
+    if (!isCurrentPlan(expectedProjectId, expectedIdentity)) return
+    const request = ++historyRequest.current
+    setHistory((current) => ({ ...current, loading: true, error: null }))
+    try {
+      const page = await api.listProjectPlanBackups(expectedProjectId, plan.status, plan.name, {
+        offset,
+        limit: 50,
+      })
+      if (request !== historyRequest.current || !isCurrentPlan(expectedProjectId, expectedIdentity)) return
+      setHistory({ page, loading: false, error: null })
+    } catch (err) {
+      if (request !== historyRequest.current || !isCurrentPlan(expectedProjectId, expectedIdentity)) return
+      setHistory((current) => ({
+        ...current,
+        loading: false,
+        error: err instanceof Error ? err.message : 'Failed to load backup history',
+      }))
+    }
+  }
 
   useEffect(() => {
     onDirtyChange(dirty)
@@ -76,12 +150,14 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   }, [dirty])
 
   useEffect(() => {
+    planLoadRequest.current += 1
     setSelected(null)
     setContent('')
     setSavedContent('')
     setConflict(null)
     setConfirmReload(false)
     setConfirmClose(false)
+    resetBackupHistory()
     void refresh()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.id])
@@ -96,11 +172,17 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   }
 
   async function openPlan(plan: PlanDocument) {
+    const expectedProjectId = project.id
+    const expectedIdentity = planIdentity(expectedProjectId, plan)
+    const request = ++planLoadRequest.current
+    resetBackupHistory()
     try {
       setError(null)
       setConflict(null)
       setConfirmReload(false)
-      const loaded = await api.readProjectPlan(project.id, plan.status, plan.name)
+      const loaded = await api.readProjectPlan(expectedProjectId, plan.status, plan.name)
+      if (request !== planLoadRequest.current || projectIdRef.current !== expectedProjectId) return
+      if (loaded.project_id !== expectedProjectId || planIdentity(expectedProjectId, loaded) !== expectedIdentity) return
       setSelected(loaded)
       const loadedContent = loaded.content ?? ''
       setContent(loadedContent)
@@ -171,6 +253,7 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
       setSavedContent(promotedContent)
       setConflict(null)
       setConfirmReload(false)
+      resetBackupHistory()
       await refresh()
     } catch (err) {
       if (err instanceof ApiError && err.code === 'revision_conflict') {
@@ -187,28 +270,35 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
 
   async function reloadFromServer() {
     if (!selected) return
+    const expectedProjectId = project.id
+    const expectedIdentity = planIdentity(expectedProjectId, selected)
+    const request = ++planLoadRequest.current
     try {
       setBusy(true)
       setError(null)
-      const listed = await api.listProjectPlans(project.id)
-      const match = listed.find((plan) => plan.name === selected.name)
+      const listed = await api.listProjectPlans(expectedProjectId)
+      if (request !== planLoadRequest.current || !isCurrentPlan(expectedProjectId, expectedIdentity)) return
+      const match = listed.find((plan) => plan.path === selected.path)
       if (!match) {
         setSelected(null)
         setContent('')
         setSavedContent('')
         setConflict(null)
         setConfirmReload(false)
+        resetBackupHistory()
         setError(`Plan ${selected.name} is no longer present in the project lifecycle.`)
         await refresh()
         return
       }
-      const loaded = await api.readProjectPlan(project.id, match.status, match.name)
+      const loaded = await api.readProjectPlan(expectedProjectId, match.status, match.name)
+      if (request !== planLoadRequest.current || !isCurrentPlan(expectedProjectId, expectedIdentity)) return
       setSelected(loaded)
       const loadedContent = loaded.content ?? ''
       setContent(loadedContent)
       setSavedContent(loadedContent)
       setConflict(null)
       setConfirmReload(false)
+      resetBackupHistory()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to reload the plan')
     } finally {
@@ -217,12 +307,14 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
   }
 
   function closePlan() {
+    planLoadRequest.current += 1
     setSelected(null)
     setContent('')
     setSavedContent('')
     setConflict(null)
     setConfirmReload(false)
     setConfirmClose(false)
+    resetBackupHistory()
   }
 
   const runnable = selected !== null && selected.status === 'in_progress' && !dirty
@@ -301,6 +393,79 @@ export function PlanPanel({ project, onDirtyChange, onOpenRunDashboard }: PlanPa
           value={content}
           onChange={(event) => setContent(event.target.value)}
         />
+        <details
+          className="plan-backup-history"
+          open={historyOpen}
+        >
+          <summary onClick={(event) => {
+            event.preventDefault()
+            const open = !historyOpen
+            setHistoryOpen(open)
+            if (open && selected) void loadBackupHistory(selected)
+          }}>Backup history</summary>
+          <div className="plan-backup-history-body">
+            <p className="text-sm text-dim">
+              Read-only provenance for preserved backup bytes. Unknown original baselines cannot be safely reset;
+              restore/reset behavior is deferred.
+            </p>
+            {history.loading && <p className="text-sm text-dim" role="status">Loading backup history…</p>}
+            {history.error && <div className="notice" role="alert">Backup history unavailable: {history.error}</div>}
+            {history.page && history.page.backups.length === 0 && !history.loading && !history.error && (
+              <p className="text-sm text-dim">No validated backup history is available for this plan.</p>
+            )}
+            {history.page && history.page.backups.length > 0 && (
+              <>
+                <ol className="plan-backup-history-list">
+                  {history.page.backups.map((backup) => {
+                    const label = backupOriginLabel(backup)
+                    return (
+                      <li className="plan-backup-history-entry" key={`${backup.backup_filename}:${backup.content_sha256 ?? 'unknown'}`}>
+                        <div className="plan-backup-history-heading">
+                          <span className="status-pill">{label}</span>
+                          <strong className="mono text-sm">{backup.backup_filename}</strong>
+                        </div>
+                        <p className="text-sm text-dim">{backupOriginDescription(backup, label)}</p>
+                        <dl className="plan-backup-history-meta">
+                          <div><dt>Event</dt><dd>{backupEventLabel(backup.capture_event)}</dd></div>
+                          <div><dt>Run</dt><dd className="mono">{backup.run_id ?? 'Not allocated'}</dd></div>
+                          <div><dt>Turn</dt><dd>{backup.turn_number ?? 'Not recorded'}</dd></div>
+                          <div><dt>Captured</dt><dd className="mono">{backup.timestamp ?? 'Unavailable'}</dd></div>
+                        </dl>
+                      </li>
+                    )
+                  })}
+                </ol>
+                <div className="plan-backup-history-pagination">
+                  <span className="text-xs text-dim">
+                    Showing {history.page.offset + 1}–{Math.min(history.page.offset + history.page.backups.length, history.page.total_items)} of {history.page.total_items}
+                  </span>
+                  <div className="plan-editor-actions">
+                    {history.page.offset > 0 && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={history.loading}
+                        onClick={() => void loadBackupHistory(selected, Math.max(history.page!.offset - history.page!.limit, 0))}
+                      >
+                        Previous
+                      </button>
+                    )}
+                    {history.page.next_offset !== null && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={history.loading}
+                        onClick={() => void loadBackupHistory(selected, history.page!.next_offset!)}
+                      >
+                        Next
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </details>
         {!hosted && <div className="plan-editor-actions">
           <button className="btn btn-primary" onClick={() => void savePlan()} disabled={busy}>Save</button>
           {selected.status !== 'done' && (

@@ -55,6 +55,25 @@ def read_plan(
 ) -> dict[str, object]:
     return service.read(project_id, plan_status, name).to_dict()
 
+
+@router.get("/{plan_status}/{name}/backups")
+def list_plan_backups(
+    project_id: str,
+    plan_status: PlanStatusValue,
+    name: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    service: PlanService = Depends(_get_plan_service),
+) -> dict[str, object]:
+    """Read bounded provenance summaries for the exact authorized plan."""
+    return service.list_backups(
+        project_id,
+        plan_status,
+        name,
+        offset=offset,
+        limit=limit,
+    )
+
 @router.put("/{plan_status}/{name}")
 def update_plan(
     project_id: str,

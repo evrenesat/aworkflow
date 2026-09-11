@@ -83,6 +83,14 @@ def _write_plan(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _backup_body_names(backup_dir: Path) -> list[str]:
+    return sorted(
+        child.name
+        for child in backup_dir.iterdir()
+        if child.name != ".provenance"
+    )
+
+
 def _write_config(home_dir: Path, text: str) -> Path:
     config_path = home_dir / ".config" / "aflow" / "aflow.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)

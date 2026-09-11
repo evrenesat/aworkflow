@@ -109,4 +109,19 @@ The server requires Python 3.11 or newer and binds to `127.0.0.1:8765` by defaul
 
 Plan editing is limited to regular UTF-8 Markdown files beneath `plans/todo`, `plans/in-progress`, and `plans/done`. Updates and lifecycle moves use SHA-256 expected revisions. Creating a draft without content (or with explicit null) starts from the packaged checkpoint skeleton in `aflow/templates/draft-plan.md` — one open checkpoint with implementation/verification tasks and blank Git Tracking fields to edit; any explicit string, including empty text, is kept byte-for-byte. The skeleton adds no readiness validator and never blocks saving, promotion, or launch.
 
+The first supported `todo` → `in_progress` promotion preserves the exact draft
+bytes as the known initial Ready baseline. Existing and changed backup bodies
+remain in `plans/backups/`; their small atomic JSON provenance sidecars live in
+`plans/backups/.provenance/` and record exact lifecycle path aliases, capture
+events, timestamps, hashes, and available run/turn identity. The read-only
+`GET /api/projects/{project_id}/plans/{status}/{name}/backups` route returns
+bounded pages (50 by default, 200 maximum) for the exact current plan path.
+Identical bodies and repeated capture references are deduplicated, nothing is
+automatically deleted, and restore/reset behavior remains explicitly deferred.
+In the Plans editor, expand the collapsed Backup history disclosure to see
+Baseline (the initial Ready capture), later Snapshot, Follow-up, or Unknown
+origin labels with capture details and bounded pages. History is read-only:
+unknown original baselines cannot be safely reset, and restore/reset remains a
+future scope.
+
 Skills settings (`/api/skills`) list exactly the bundled skill registry with revision, edit, and link state. Saving edits only the account-local canonical `SKILL.md` (`~/.config/aflow/skills/<name>/`) and never installs; reinstalling via `POST /api/skills/install` runs the same default installer as `aflow install-skills --yes` (optional skills excluded). After upgrading the server package, restart it before reinstalling so refresh reads the new bundled resources.

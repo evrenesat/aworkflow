@@ -12,6 +12,19 @@ import stat
 from threading import RLock
 from typing import Literal
 
+from aflow.plan_backups import (
+    backup_reference_for_plan,
+    baseline_status_for_plan,
+    backup_provenance_for_plan,
+    bind_unowned_plan_history,
+    create_plan_identity,
+    ensure_plan_identity,
+    mark_ready_baseline,
+    plan_identity_for_path,
+    record_plan_lifecycle_move,
+    revert_plan_lifecycle_move,
+)
+
 from .project_registry import ProjectRegistry, ProjectRegistryError
 
 PlanStatus = Literal["todo", "in_progress", "done"]
@@ -114,6 +127,70 @@ class PlanService:
             data = self._read_regular(path)
             return self._document(project_id, status_value, name, data, include_content=True)
 
+    def list_backups(
+        self,
+        project_id: str,
+        status_value: PlanStatus,
+        name: str,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        """Return bounded provenance summaries for one current plan path."""
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > 200
+        ):
+            raise PlanInvalid("backup pagination is invalid")
+        with self._project_lock(project_id):
+            root = self._root(project_id)
+            path = self._plan_path(root, status_value, name, create_dir=False)
+            self._read_regular(path)
+            records = backup_provenance_for_plan(root, path)
+            summaries: list[dict[str, object]] = []
+            for backup_path, record in records:
+                baseline_status = baseline_status_for_plan(root, path, record)
+                reference = backup_reference_for_plan(root, path, record)
+                summaries.append(
+                    {
+                        "backup_filename": backup_path.name,
+                        "kind": record.get("kind"),
+                        "baseline_status": baseline_status,
+                        "capture_event": (
+                            reference.get("event") if reference is not None else None
+                        ),
+                        "timestamp": (
+                            reference.get("timestamp")
+                            if reference is not None
+                            else None
+                        ),
+                        "run_id": (
+                            reference.get("run_id") if reference is not None else None
+                        ),
+                        "turn_number": (
+                            reference.get("turn_number")
+                            if reference is not None
+                            else None
+                        ),
+                        "content_sha256": record.get("content_sha256"),
+                    }
+                )
+            total_items = len(summaries)
+            page = summaries[offset : offset + limit]
+            next_offset = offset + limit if offset + limit < total_items else None
+            return {
+                "backups": page,
+                "offset": offset,
+                "limit": limit,
+                "next_offset": next_offset,
+                "total_items": total_items,
+            }
+
     def create(self, project_id: str, name: str, content: str | None = None) -> PlanDocument:
         if content is None:
             content = _load_draft_template()
@@ -124,6 +201,17 @@ class PlanService:
             if path.exists() or path.is_symlink():
                 raise PlanAlreadyExists("plan already exists")
             self._atomic_write(path, data, replace=False)
+            try:
+                create_plan_identity(root, path)
+            except OSError as exc:
+                try:
+                    path.unlink()
+                    self._fsync_directory(path.parent)
+                except OSError as rollback_exc:
+                    raise PlanServiceError(
+                        "plan identity rollback failed"
+                    ) from rollback_exc
+                raise PlanServiceError("plan identity unavailable") from exc
             return self._document(project_id, "todo", name, data, include_content=True)
 
     def update(self, project_id: str, status_value: PlanStatus, name: str, content: str, expected_revision: str) -> PlanDocument:
@@ -151,6 +239,32 @@ class PlanService:
             target = self._plan_path(root, target_status, target_name, create_dir=True)
             if target.exists() or target.is_symlink():
                 raise PlanAlreadyExists("promotion target already exists")
+            existing_source_identity = plan_identity_for_path(root, source)
+            try:
+                source_identity_id = ensure_plan_identity(root, source)
+                if existing_source_identity is None:
+                    bind_unowned_plan_history(
+                        root,
+                        source,
+                        plan_identity_id=source_identity_id,
+                    )
+            except OSError as exc:
+                raise PlanServiceError("plan promotion failed") from exc
+            source_identity = self._file_identity(source, current)
+            baseline_backup: Path | None = None
+            if status_value == "todo":
+                try:
+                    from aflow.workflow import _backup_original_plan
+
+                    baseline_backup = _backup_original_plan(
+                        root,
+                        source,
+                        event="ready_promotion",
+                    )
+                    if baseline_backup.read_bytes() != current:
+                        raise PlanServiceError("captured baseline bytes changed")
+                except Exception as exc:
+                    raise PlanServiceError("plan baseline capture failed") from exc
             moved = False
             try:
                 os.replace(source, target)
@@ -158,12 +272,44 @@ class PlanService:
                 self._fsync_directory(target.parent)
                 if source.parent != target.parent:
                     self._fsync_directory(source.parent)
+                try:
+                    if self._read_regular(target) != current:
+                        raise OSError("promoted plan bytes changed")
+                except PlanServiceError as exc:
+                    raise OSError("promoted plan is not unchanged") from exc
+                if baseline_backup is not None:
+                    mark_ready_baseline(
+                        root,
+                        baseline_backup,
+                        source_plan_path=source,
+                        destination_plan_path=target,
+                    )
+                record_plan_lifecycle_move(
+                    root,
+                    source_plan_path=source,
+                    destination_plan_path=target,
+                )
             except OSError as exc:
                 if moved:
+                    metadata_rollback_error: OSError | None = None
                     try:
-                        os.replace(target, source)
-                    except OSError:
-                        pass
+                        revert_plan_lifecycle_move(
+                            root,
+                            source_plan_path=source,
+                            destination_plan_path=target,
+                            baseline_backup_path=baseline_backup,
+                        )
+                    except OSError as rollback_exc:
+                        metadata_rollback_error = rollback_exc
+                    self._rollback_promote(
+                        source,
+                        target,
+                        source_identity,
+                    )
+                    if metadata_rollback_error is not None:
+                        raise PlanServiceError(
+                            "plan promotion metadata rollback failed"
+                        ) from metadata_rollback_error
                 raise PlanServiceError("plan promotion failed") from exc
             return self._document(project_id, target_status, target_name, current, include_content=True)
 
@@ -239,6 +385,33 @@ class PlanService:
         if len(data) > self._max_plan_bytes:
             raise PlanInvalid("plan content exceeds the size limit")
         return data
+
+    def _file_identity(self, path: Path, data: bytes) -> tuple[int, int, int, str]:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise PlanServiceError("plan identity is unavailable") from exc
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            len(data),
+            self._revision(data),
+        )
+
+    def _rollback_promote(
+        self,
+        source: Path,
+        target: Path,
+        source_identity: tuple[int, int, int, str],
+    ) -> None:
+        try:
+            os.replace(target, source)
+            self._fsync_directory(source.parent)
+            restored = self._read_regular(source)
+            if self._file_identity(source, restored) != source_identity:
+                raise OSError("restored source identity does not match")
+        except (OSError, PlanServiceError) as exc:
+            raise PlanServiceError("plan promotion rollback failed") from exc
 
     def _atomic_write(self, path: Path, data: bytes, *, replace: bool) -> None:
         temporary = path.parent / f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"

@@ -1784,6 +1784,68 @@ input::placeholder, textarea::placeholder {
 .plan-editor-header > * { min-width: 0; overflow-wrap: anywhere; }
 .plan-editor-textarea { min-height: 360px; resize: vertical; width: 100%; }
 
+.plan-backup-history {
+  min-width: 0;
+  padding: 0 var(--spacing-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.plan-backup-history > summary {
+  min-height: var(--tap-target);
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.plan-backup-history > summary:focus-visible { outline-offset: -2px; }
+.plan-backup-history-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  padding-bottom: var(--spacing-sm);
+}
+.plan-backup-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  margin: 0;
+  padding-left: 1.4rem;
+}
+.plan-backup-history-entry {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.plan-backup-history-entry > p { margin: var(--spacing-xs) 0; }
+.plan-backup-history-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-sm);
+  min-width: 0;
+}
+.plan-backup-history-meta {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--spacing-xs) var(--spacing-sm);
+  min-width: 0;
+  margin: 0;
+}
+.plan-backup-history-meta > div { display: contents; }
+.plan-backup-history-meta dt { color: var(--color-text-dim); }
+.plan-backup-history-meta dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.plan-backup-history-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+  min-width: 0;
+}
+
 .skill-install-disclosure {
   display: flex;
   flex-direction: column;
