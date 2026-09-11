@@ -2112,12 +2112,20 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     restartSource?.run_id ?? null,
   ])
   const preflightRequestIdentity = JSON.stringify([projectId, preflightRequest])
+  // React renders once before the request effect runs. Treat an old state
+  // identity as pending during that render so a previous inspection cannot
+  // authorize the newly selected launch.
+  const displayedWorktreePreflight: WorktreePreflightState = !preflightEligible
+    ? { status: 'idle', result: null, error: null, identity: preflightRequestIdentity }
+    : worktreePreflight.identity === preflightRequestIdentity
+      ? worktreePreflight
+      : { status: 'loading', result: null, error: null, identity: preflightRequestIdentity }
   const worktreeLaunchBlocked = preflightEligible && (
-    worktreePreflight.status !== 'ready'
-    || worktreePreflight.result === null
-    || worktreePreflight.error !== null
-    || worktreePreflight.result.blockers.length > 0
-    || ((worktreePreflight.result.requires_confirmation || dirtyStartupQuestion) && !dirtyWorktreeConfirmed)
+    displayedWorktreePreflight.status !== 'ready'
+    || displayedWorktreePreflight.result === null
+    || displayedWorktreePreflight.error !== null
+    || displayedWorktreePreflight.result.blockers.length > 0
+    || ((displayedWorktreePreflight.result.requires_confirmation || dirtyStartupQuestion) && !dirtyWorktreeConfirmed)
   )
   const startDisabled = !projectAvailable
     || !startPlanPath
@@ -2155,7 +2163,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     setWorktreePreflight((current) => ({
       status: 'loading',
       identity,
-      result: append || current.identity === identity ? current.result : null,
+      result: append && current.identity === identity ? current.result : null,
       error: null,
     }))
     try {
@@ -2471,9 +2479,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   )
   const worktreePreflightPanel = (
     <WorktreePreflightPanel
-      status={worktreePreflight.status}
-      result={worktreePreflight.result}
-      error={worktreePreflight.error}
+      status={displayedWorktreePreflight.status}
+      result={displayedWorktreePreflight.result}
+      error={displayedWorktreePreflight.error}
       dirtyWorktreeConfirmed={dirtyWorktreeConfirmed}
       onDirtyWorktreeConfirmedChange={setDirtyWorktreeConfirmed}
       onRefresh={() => void refreshPreflight()}

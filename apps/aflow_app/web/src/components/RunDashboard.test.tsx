@@ -917,6 +917,88 @@ describe('RunDashboard', () => {
     expect(screen.getByText('other.ts')).toBeDefined()
   })
 
+  it('waits for the current inspection across default-to-explicit selection and refresh', async () => {
+    const defaultInspection = deferred<WorktreePreflight>()
+    const explicitInspection = deferred<WorktreePreflight>()
+    const refreshInspection = deferred<WorktreePreflight>()
+    let explicitRequestCount = 0
+    vi.mocked(api.postGlobalConfigForm).mockResolvedValue({
+      ...emptyProjection,
+      form: { ...emptyProjection.form, default_workflow: 'managed' },
+    })
+    vi.mocked(api.preflightControlPlaneRun).mockImplementation((_projectId, request) => {
+      if (request.workflow_name === 'managed') {
+        explicitRequestCount += 1
+        return (explicitRequestCount === 1 ? explicitInspection : refreshInspection).promise
+      }
+      return defaultInspection.promise
+    })
+    vi.mocked(api.startControlPlaneRun).mockResolvedValue({
+      result: { run_id: 'run-started', created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null },
+      startup_question: null,
+    })
+    renderDashboard()
+
+    await openNewRun()
+    choose('Run plan', 'plans/in-progress/demo.md')
+    await waitFor(() => {
+      expect(api.preflightControlPlaneRun).toHaveBeenCalledTimes(1)
+      expect(api.preflightControlPlaneRun.mock.calls[0][1]).not.toHaveProperty('workflow_name')
+    })
+
+    choose('Run workflow', 'managed')
+    await waitFor(() => expect(api.preflightControlPlaneRun).toHaveBeenCalledTimes(2))
+    const panel = () => screen.getByRole('region', { name: 'Working tree preflight' })
+    expect((screen.getByLabelText('Run workflow') as HTMLInputElement).value).toBe('Managed')
+    expect(panel().getAttribute('data-preflight-status')).toBe('loading')
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+
+    explicitInspection.resolve(preflightResult({
+      dirty: true,
+      requires_confirmation: true,
+      total_items: 1,
+      items: [{ path: 'current.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+    }))
+    await screen.findByText('current.ts')
+    const confirmation = screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement
+    fireEvent.click(confirmation)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull())
+
+    await act(async () => {
+      defaultInspection.resolve(preflightResult({
+        dirty: true,
+        requires_confirmation: true,
+        total_items: 1,
+        items: [{ path: 'stale-default.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+      }))
+      await defaultInspection.promise
+    })
+    expect(screen.queryByText('stale-default.ts')).toBeNull()
+    expect(screen.getByText('current.ts')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh worktree inspection' }))
+    await waitFor(() => expect(api.preflightControlPlaneRun).toHaveBeenCalledTimes(3))
+    expect(panel().getAttribute('data-preflight-status')).toBe('loading')
+    expect(screen.queryByRole('checkbox', { name: 'Continue despite uncommitted changes' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).not.toBeNull()
+
+    refreshInspection.resolve(preflightResult({
+      dirty: true,
+      requires_confirmation: true,
+      total_items: 1,
+      items: [{ path: 'refreshed.ts', index_status: ' ', worktree_status: 'M', original_path: null }],
+    }))
+    await screen.findByText('refreshed.ts')
+    expect((screen.getByRole('checkbox', { name: 'Continue despite uncommitted changes' }) as HTMLInputElement).checked).toBe(true)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Start run' }).getAttribute('disabled')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    await waitFor(() => expect(api.startControlPlaneRun).toHaveBeenCalledWith(
+      'control-project',
+      expect.objectContaining({ workflow_name: 'managed', dirty_worktree_confirmed: true }),
+      expect.any(String),
+    ))
+  })
+
   it('preserves acknowledgment through unrelated edits but resets it for a new launch selection', async () => {
     vi.mocked(api.preflightControlPlaneRun).mockResolvedValue(preflightResult({
       dirty: true,

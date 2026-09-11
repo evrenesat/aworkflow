@@ -82,8 +82,7 @@ def _acknowledge_dirty_worktree_if_needed(page) -> None:
         """() => {
             const panel = document.querySelector('.worktree-preflight')
             if (!panel) return false
-            return Boolean(panel.querySelector('input[type="checkbox"]'))
-                || panel.textContent?.includes('No uncommitted changes detected.')
+            return panel.dataset.preflightStatus === 'ready'
         }"""
     )
     confirmation = page.get_by_role(

@@ -38,10 +38,15 @@ function worktreeItemDescription(item: WorktreeStatusItem): string {
 }
 
 export function WorktreePreflightPanel({ status, result, error, dirtyWorktreeConfirmed, onDirtyWorktreeConfirmedChange, onRefresh, onLoadMore, dirtyQuestionMessage }: WorktreePreflightPanelProps) {
-  const acknowledgmentRequired = Boolean(result?.requires_confirmation || dirtyQuestionMessage)
-  const canShowResult = result !== null && status !== 'idle'
+  const acknowledgmentRequired = status === 'ready' && Boolean(result?.requires_confirmation || dirtyQuestionMessage)
+  const canShowResult = result !== null && status !== 'idle' && status !== 'error'
   return (
-    <section className="dashboard-section worktree-preflight" aria-label="Working tree preflight">
+    <section
+      className="dashboard-section worktree-preflight"
+      aria-label="Working tree preflight"
+      aria-busy={status === 'loading'}
+      data-preflight-status={status}
+    >
       <div className="section-heading">
         <h4>Working tree before start</h4>
         <button type="button" className="btn btn-secondary btn-sm" onClick={onRefresh} disabled={status === 'loading'}>

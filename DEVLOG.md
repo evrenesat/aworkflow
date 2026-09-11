@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-09-11 — Synchronize startup inspection readiness (Checkpoint 1)
+
+- Controlled deferred component coverage established the readiness race: the
+  global Managed default launches one inspection, explicit Managed launches a
+  new identity, and an old result cannot replace the selected request. A
+  same-identity refresh now keeps Start blocked and removes the actionable
+  dirty acknowledgment until the current result completes; the acknowledgment
+  remains available for the refreshed dirty result.
+- The preflight panel exposes bounded loading/ready/error state, and launch
+  admission compares the stored inspection identity with the current request
+  before authorizing Start. Pagination merging, unrelated draft edits,
+  launch-time server recheck, startup questions, and stale-response rejection
+  remain unchanged. The browser helper waits for explicit ready state rather
+  than inferring readiness from a checkbox or clean text.
+- Verification: focused RunDashboard filter passed (12 tests), production
+  build passed, and the exact Chromium Ready/correction journey passed. The
+  prior CI log demonstrated the ordering failure; it did not establish a
+  platform-specific cause. Evidence is retained under the invocation-owned
+  `/root/code/evidence/aflow-dogfood-20260909/startup-preflight-review-20260911/`.
+
 ## 2026-09-11 — Keep recovery browser screenshots portable
 
 - `test_durable_recovery_ui_journey` now writes its unchanged screenshot and
