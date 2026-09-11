@@ -19,9 +19,12 @@ from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
 from aflow.control_plane import (
     CapabilitySet,
     ContextBundle,
+    LaunchManifest,
     RunControlRequest,
     RunStatus,
     StartRunResult,
+    create_launch_manifest,
+    write_launch_phase,
 )
 from aflow.control_plane.persistence import append_run_event
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
@@ -45,6 +48,7 @@ from aflow_app_server.project_registry import (
 )
 from aflow_app_server.global_config_service import GlobalConfigService
 from aflow_app_server.plan_service import PlanService
+from aflow.run_state import ResumeContext
 
 
 TOKEN = "control-plane-test-token"
@@ -196,6 +200,142 @@ def _prepared(request) -> PreparedRun:
         extra_instructions=request.extra_instructions,
         start_step=("implement" if request.start_step in {None, "1"} else request.start_step),
     )
+
+
+def _recovery_payload(selector: str = "codex.test") -> dict[str, str]:
+    return {"mode": "durable_evidence", "worker_selector": selector}
+
+
+def _unresolved_recovery_runtime(
+    target_run_id: str,
+    *,
+    malformed: bool = False,
+    operation_state: str = "in_flight",
+) -> dict[str, object]:
+    if malformed:
+        return {"operation_state": "in_flight"}
+    return {
+        "schema_version": 1,
+        "mode": "durable_evidence",
+        "source_run_id": "older-source",
+        "target_run_id": target_run_id,
+        "source_selector": "codex.test",
+        "target_selector": "codex.test",
+        "intent_digest": "a" * 64,
+        "brief_sha256": "b" * 64,
+        "source_session_context_transferred": False,
+        "consumed": operation_state == "consumed",
+        "operation_state": operation_state,
+    }
+
+
+_DEFAULT_RECOVERY_WORKER_EVIDENCE = object()
+
+
+def _seed_recovery_source(
+    control_service: ControlPlaneService,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_status: str = "failed",
+    worker_evidence: dict[str, object] | None | object = _DEFAULT_RECOVERY_WORKER_EVIDENCE,
+    source_id: str = "recovery-source",
+) -> tuple[str, Path, object]:
+    """Install one no-unit source with the exact evidence used by recovery admission."""
+    daemon = control_service._project(PROJECT_ID).daemon
+    plan_path = root / "plans" / "todo" / "test-plan.md"
+    source_dir = root / ".aflow" / "runs" / source_id
+    create_launch_manifest(
+        root,
+        LaunchManifest(
+            run_id=source_id,
+            project_root=str(root),
+            plan_path=str(plan_path.resolve()),
+            workflow_name="managed",
+            max_turns=3,
+            start_step="implement",
+            idempotency_key=f"{source_id}-key",
+            caller_scope=f"bearer:{PROJECT_ID}",
+        ),
+    )
+    source_dir.mkdir(parents=True)
+    source_payload = {
+        "status": source_status,
+        "workflow_name": "managed",
+        "role_selectors": {"worker": "codex.test"},
+    }
+    (source_dir / "run.json").write_text(
+        json.dumps(source_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    phase = "owner_stopped" if source_status == "owner_stopped" else source_status
+    write_launch_phase(root, source_id, phase)
+    if source_status == "owner_stopped":
+        append_run_event(source_dir, "owner_stopped", {"source": "test"})
+    source_worker = (
+        {"active": False, "exit_code": 17}
+        if worker_evidence is _DEFAULT_RECOVERY_WORKER_EVIDENCE
+        else worker_evidence
+    )
+    source = RunStatus(
+        run_id=source_id,
+        status=source_status,
+        launch_phase=phase,
+        ownership="control_plane",
+        plan_path=str(plan_path.resolve()),
+        workflow_name="managed",
+        max_turns=3,
+        selected_start_step="implement",
+        unit_name=f"aflow-run-{source_id}.service",
+        evidence={
+            "controller_terminal": source_status != "owner_stopped",
+            "worker": source_worker,
+        },
+    )
+    repository = daemon.application.repository
+    original_get_status = repository.get_run_status
+
+    def get_status(run_id: str):
+        return source if run_id == source_id else original_get_status(run_id)
+
+    monkeypatch.setattr(repository, "get_run_status", get_status)
+    bootstrap = SimpleNamespace(
+        workflow_name="managed",
+        repo_root=root,
+        plan_path=plan_path,
+        config_path=daemon._config.config_path,
+        max_turns=3,
+        team=None,
+        start_step="implement",
+        extra_instructions=(),
+        workflow_config=daemon.service._workflow_config,
+        resume_context=ResumeContext(
+            resumed_from_run_id=source_id,
+            feature_branch=None,
+            worktree_path=None,
+            main_branch=None,
+            setup=(),
+            teardown=(),
+            active_plan_path=plan_path,
+        ),
+        run_json=source_payload,
+    )
+
+    def resume_bootstrap(*_args, extra_instructions=(), **_kwargs):
+        values = vars(bootstrap).copy()
+        values["extra_instructions"] = tuple(extra_instructions)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(daemon.service, "_resume_bootstrap", resume_bootstrap)
+    return source_id, source_dir, daemon
+
+
+def _source_artifact_bytes(source_dir: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(source_dir).as_posix(): path.read_bytes()
+        for path in sorted(source_dir.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_detached_early_worker_failure_is_visible_without_service_restart(control_client):
@@ -735,7 +875,7 @@ def test_transport_models_match_canonical_control_plane_models() -> None:
     assert set(RunStatusResponse.model_fields) == set(payloads["run"])
     assert set(StartRunResponse.model_fields) == set(payloads["start"])
     assert set(RunControlPayload.model_fields) == set(payloads["control"])
-    assert set(ResumeRunPayload.model_fields) == {"extra_instructions"}
+    assert set(ResumeRunPayload.model_fields) == {"extra_instructions", "recovery"}
     assert set(ContextResponse.model_fields) == set(payloads["context"])
     assert set(WorktreePreflightResponse.model_fields) == set(payloads["preflight"])
 
@@ -769,6 +909,9 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
         "ContextResponse",
         "WorktreePreflightResponse",
     }.issubset(schema["components"]["schemas"])
+    resume_schema = schema["components"]["schemas"]["ResumeRunPayload"]
+    assert {"extra_instructions", "recovery"} == set(resume_schema["properties"])
+    assert "durable-evidence" in resume_schema["properties"]["recovery"]["description"]
 
 
 def test_deprecated_execution_routes_are_not_registered() -> None:
@@ -1029,6 +1172,178 @@ def test_resume_rejects_invalid_extra_instructions_without_reserving(
     assert response.json() == {"detail": {"code": "operation_rejected"}}
     assert len(units.start_calls) == 1
     assert source_path.read_bytes() == before
+    assert len(client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()["runs"]) == 1
+
+
+def test_rest_durable_recovery_preserves_lineage_and_safe_admission_errors(
+    control_client,
+) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = control_client
+    service = main._control_plane_service
+    assert service is not None
+    source_id, source_dir, daemon = _seed_recovery_source(
+        service, root, monkeypatch
+    )
+    before = _source_artifact_bytes(source_dir)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume"
+    payload = {
+        "extra_instructions": ["transport recovery guidance"],
+        "recovery": _recovery_payload(),
+    }
+    headers = {"Idempotency-Key": "rest-recovery-1"}
+
+    resumed = client.post(endpoint, headers=headers, json=payload)
+    assert resumed.status_code == 201, resumed.text
+    successor = resumed.json()
+    successor_id = successor["run_id"]
+    assert successor_id != source_id
+    assert len(units.start_calls) == 1
+    assert _source_artifact_bytes(source_dir) == before
+
+    successor_events = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{successor_id}/events"
+    )
+    assert successor_events.status_code == 200
+    recovery_events = [
+        event
+        for event in successor_events.json()["events"]
+        if event["event_type"] == "recovery_requested"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["data"]["source_run_id"] == source_id
+    assert recovery_events[0]["data"]["target_selector"] == "codex.test"
+
+    replay = client.post(endpoint, headers=headers, json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["run_id"] == successor_id
+    assert replay.json()["created"] is False
+    assert len(units.start_calls) == 1
+
+    changed_target = client.post(
+        endpoint,
+        headers=headers,
+        json={"recovery": _recovery_payload("codex.other")},
+    )
+    assert changed_target.status_code == 409
+    assert changed_target.json() == {"detail": {"code": "idempotency_conflict"}}
+    assert len(units.start_calls) == 1
+
+    for invalid_recovery in (
+        {"mode": "automatic", "worker_selector": "codex.test"},
+        {
+            "mode": "durable_evidence",
+            "worker_selector": "codex.test",
+            "run_state_path": "/tmp/run.json",
+            "provider_session_id": "source-session",
+        },
+    ):
+        rejected = client.post(
+            endpoint,
+            headers={"Idempotency-Key": f"rest-invalid-{len(invalid_recovery)}"},
+            json={"recovery": invalid_recovery},
+        )
+        assert rejected.status_code == 422
+        detail = rejected.json()["detail"]
+        assert detail["code"] == "recovery_target_invalid"
+        assert "target worker selector" in detail["message"]
+    assert len(units.start_calls) == 1
+    assert _source_artifact_bytes(source_dir) == before
+    assert daemon.service._read_record(successor_id)["recovery"] == _recovery_payload()
+
+    wrong_project = client.post(
+        endpoint.replace(PROJECT_ID, "not-allowed"),
+        headers={"Idempotency-Key": "rest-wrong-project"},
+        json={"recovery": _recovery_payload()},
+    )
+    assert wrong_project.status_code == 404
+    assert wrong_project.json() == {"detail": {"code": "project_not_found"}}
+    assert len(units.start_calls) == 1
+
+
+def test_rest_durable_recovery_rejects_active_source_without_starting_a_unit(
+    control_client,
+) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = control_client
+    service = main._control_plane_service
+    assert service is not None
+    source_id, source_dir, _daemon = _seed_recovery_source(
+        service,
+        root,
+        monkeypatch,
+        worker_evidence={"active": True},
+        source_id="active-recovery-source",
+    )
+    before = _source_artifact_bytes(source_dir)
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume",
+        headers={"Idempotency-Key": "rest-active-recovery"},
+        json={"recovery": _recovery_payload()},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "recovery_source_activity"
+    assert "source activity" in rejected.json()["detail"]["message"]
+    assert units.start_calls == []
+    assert _source_artifact_bytes(source_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("operation_state", "malformed"),
+    (("in_flight", False), ("pending", False), ("in_flight", True)),
+    ids=("in-flight", "pending", "malformed"),
+)
+def test_rest_ordinary_resume_rejects_unresolved_recovery_runtime(
+    control_client,
+    operation_state: str,
+    malformed: bool,
+) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = control_client
+    service = main._control_plane_service
+    assert service is not None
+    source_id, source_dir, _daemon = _seed_recovery_source(
+        service,
+        root,
+        monkeypatch,
+        source_id=(
+            "ordinary-inflight-recovery-source"
+            if not malformed
+            else "ordinary-malformed-recovery-source"
+        ),
+    )
+    source_payload = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
+    source_payload["recovery_runtime"] = _unresolved_recovery_runtime(
+        source_id,
+        malformed=malformed,
+        operation_state=operation_state,
+    )
+    source_dir.joinpath("run.json").write_text(
+        json.dumps(source_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    before = _source_artifact_bytes(source_dir)
+    rejected = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume",
+        headers={"Idempotency-Key": f"ordinary-unresolved-{malformed}"},
+        json={},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json() == {
+        "detail": {
+            "code": "recovery_operation_unresolved",
+            "message": (
+                "Durable recovery has unknown liveness or prior turn evidence; "
+                "reconcile the operation before retrying."
+            ),
+        }
+    }
+    assert units.start_calls == []
+    assert _source_artifact_bytes(source_dir) == before
     assert len(client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs").json()["runs"]) == 1
 
 

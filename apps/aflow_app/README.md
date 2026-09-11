@@ -42,6 +42,17 @@ the dashboard says Progress unavailable instead of displaying a zero total.
 Current turns and the last finalized turn are separate, so a starting turn is
 never presented as finished.
 
+Ordinary Resume remains the primary action for a normal continuation. For a
+failed, interrupted, or owner-stopped run with confirmed inactive ownership,
+Recover with another worker is the explicit alternative: choose a worker from
+the current settings, and the server submits `mode = durable_evidence` to
+create a distinct successor. The saved plan, exact worktree, scope, results,
+and recorded evidence remain the source of truth; private context from the old
+provider session is unavailable, so inspect the successor's Diagnostics link
+and evidence before continuing. An active or uncertain source is rejected,
+with the source selection and recovery draft preserved; there is no silent
+fallback to ordinary resume or automatic worker failover.
+
 REST context reads and MCP `get_run_context` use the same authenticated,
 read-only context bundle, including this progress projection. The server
 regression fixture and the built dashboard journey exercise that parity in

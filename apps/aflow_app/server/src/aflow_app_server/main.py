@@ -36,7 +36,13 @@ from aflow.control_plane import (
 )
 from aflow.control_plane.persistence import PersistenceError
 from aflow.control_plane.run_history import DeletedRunError
-from aflow.daemon import DaemonAuthorizationError, DaemonError, DaemonIdempotencyConflict, DaemonStartupError
+from aflow.daemon import (
+    DaemonAuthorizationError,
+    DaemonError,
+    DaemonIdempotencyConflict,
+    DaemonStartupError,
+    DurableRecoveryRejection,
+)
 
 from .browser_session import (
     SESSION_COOKIE_NAME,
@@ -859,6 +865,17 @@ async def operation_forbidden_handler(_: Request, __: Exception) -> JSONResponse
     return _error_response(status.HTTP_403_FORBIDDEN, "operation_forbidden")
 
 
+@app.exception_handler(DurableRecoveryRejection)
+async def durable_recovery_rejection_handler(
+    _: Request, exception: DurableRecoveryRejection
+) -> JSONResponse:
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        exception.code,
+        message=str(exception),
+    )
+
+
 @app.exception_handler(RunIdentityError)
 @app.exception_handler(PersistenceError)
 @app.exception_handler(DaemonError)
@@ -1302,6 +1319,13 @@ def resume_run(
     _: str = Depends(verify_token),
     service: ControlPlaneService = Depends(get_control_plane_service),
 ) -> StartRunResponse:
+    """Create a normal successor or an explicit durable-evidence replacement.
+
+    A recovery object selects a configured replacement worker with
+    ``mode='durable_evidence'``. The source must be confirmed inactive; the
+    replacement receives a fresh provider session and a bounded reference to
+    durable evidence, not hidden source-session context.
+    """
     result = StartRunResponse.from_canonical(
         service.resume(
             project_id,
@@ -1309,6 +1333,7 @@ def resume_run(
             extra_instructions=(
                 payload.extra_instructions if payload is not None else None
             ),
+            recovery=payload.recovery if payload is not None else None,
             idempotency_key=idempotency_key,
         )
     )

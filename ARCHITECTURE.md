@@ -1022,6 +1022,8 @@ aflow/
   manager_context.py   # versioned Lite/Full manager context
   hotplug.py           # live worker selector transactions
   recovery.py          # harness failure classification and recovery
+  recovery_request.py  # explicit durable-evidence continuation request
+  recovery_runtime.py  # shared persisted recovery-operation validation
   scope_pressure.py    # structural scope-pressure signal parsing
   stop_marker.py       # explicit AFLOW_STOP parsing
   control_plane/       # shared daemon application, persistence, and units
@@ -1029,6 +1031,7 @@ aflow/
     capabilities.py    # versioned capability descriptions
     models.py          # launch, run, event, and context models
     persistence.py     # atomic manifests, events, and revisions
+    recovery.py        # versioned successor recovery intent artifacts
     run_progress.py    # read-only observer plan/turn projection
     reconciliation.py  # durable state and unit reconciliation
     repository.py      # allowlisted repository/plan operations
@@ -1322,6 +1325,58 @@ provider result must match the recorded operation/idempotency identity,
 selector, and session contract before restoring the target mapping/session.
 Broad analysis exposes stages, relative artifact paths, hashes, and operation
 presence only.
+
+For the first session-capable replacement worker, the controller validates and
+installs the returned `HarnessSessionRefV1` before atomically writing the
+`consumed` recovery marker through `RunMetadataWriter`. A crash before that
+single snapshot leaves the prior `in_flight` marker durable; a consumed
+snapshot therefore always carries the exact replacement session needed for a
+later ordinary continuation. The no-session adapter path retains its existing
+consumption behavior.
+
+### Explicit durable-evidence recovery admission
+
+`DaemonService.resume` accepts an optional canonical recovery object only when
+the owner explicitly selects `mode = durable_evidence` and a configured
+`worker_selector`. Recovery admits only a control-plane run whose failed,
+interrupted, or owner-stopped state has confirmed inactive worker evidence and
+readable exact plan, lifecycle, worktree, and scope state. Schema-v2 scope
+artifacts are content-addressed Markdown inputs to one normalized workspace
+fingerprint; admission and worker preparation use the same set while still
+checking every recorded artifact digest. Target validation uses current
+settings without consulting either provider. A malformed or unresolved
+persisted recovery operation is rejected before successor reservation, during
+canonical resume reconstruction, and on prelaunch replay. Ordinary resume
+rejects a canonical pending or in-flight marker, because accepting pending
+state would discard the durable evidence brief and first-operation guard; a
+valid consumed marker remains resumable. An exact already-started idempotent
+replay returns its existing result before this source check. Pending state
+remains valid only while the initial explicit recovery target is being
+prepared and reviewed before its first worker.
+
+The successor owns the additive versioned `recovery/recovery-intent.json` and
+its `recovery_requested` event. They bind the source run and launch artifacts,
+selectors, workspace fingerprint, exact scope references, and
+`source_session_context_transferred = false`. The predecessor is not rewritten
+for this mode, and the recovery object participates in resume idempotency.
+Worker-session consumption of this intent remains a later explicit-recovery
+step; ordinary resume cannot reinterpret an unconsumed marker as a normal run,
+and live hotplug retains its existing safeguards. The shared runtime validator
+lives below the CLI/daemon boundary so canonical CLI
+reconstruction, daemon admission, startup-record replay, and worker
+preparation cannot silently drop the operation guard; absent metadata remains
+backward compatible.
+
+The remote dashboard keeps ordinary Resume as the primary control and exposes
+Recover with another worker only after the server reports an eligible inactive
+source. The worker selector comes from current configuration, and the request
+explicitly uses durable-evidence mode. Run details distinguish a recovery that
+was requested, a replacement operation that started, and a provider session
+that was actually recorded for the exact successor and selector; a controller
+unit alone is not session evidence. Admission failures use bounded safe reason
+codes over REST and MCP, leave the source and recovery draft unchanged, and
+never infer a provider, silently fall back to ordinary resume, or transfer
+private provider-session context.
 
 ```text
 browser -> canonical planning routes -> project authorization -> planning service

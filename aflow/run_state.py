@@ -712,6 +712,41 @@ class PendingFinalizedTurn:
     snapshot_before: PlanSnapshot | None = None
 
 
+RecoveryOperationState = Literal["pending", "in_flight", "consumed"]
+
+
+@dataclass(frozen=True)
+class RecoverySessionContext:
+    """Bounded runtime evidence for one durable-evidence replacement turn."""
+
+    # The control-plane RecoveryIntent is kept opaque here to avoid importing
+    # the control-plane package into run_state (which would create an import
+    # cycle).  The daemon validates it before constructing this context.
+    intent: Any
+    brief: str
+    intent_digest: str
+    consumed: bool = False
+    operation_state: RecoveryOperationState = "pending"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.brief, str) or not self.brief.strip():
+            raise ValueError("recovery brief must be a non-empty string")
+        if len(self.brief.encode("utf-8")) > 16 * 1024:
+            raise ValueError("recovery brief exceeds its size limit")
+        if (
+            not isinstance(self.intent_digest, str)
+            or len(self.intent_digest) != 64
+            or any(char not in "0123456789abcdef" for char in self.intent_digest)
+        ):
+            raise ValueError("recovery intent digest is invalid")
+        if self.operation_state not in {"pending", "in_flight", "consumed"}:
+            raise ValueError("recovery operation state is invalid")
+        if not isinstance(self.consumed, bool):
+            raise ValueError("recovery consumed state is invalid")
+        if self.consumed != (self.operation_state == "consumed"):
+            raise ValueError("recovery consumed state does not match operation state")
+
+
 @dataclass(frozen=True)
 class ResumeContext:
     resumed_from_run_id: str
@@ -784,6 +819,7 @@ class ResumeContext:
     resume_relocation: Mapping[str, object] | None = None
     resumed_from_team: str | None = None
     resume_team_override: str | None = None
+    recovery_context: RecoverySessionContext | None = None
 
 
 @dataclass
@@ -885,6 +921,9 @@ class ControllerState:
     active_role_sessions: tuple[HarnessSessionRefV1, ...] = ()
     hotplug_transaction_number: int = 0
     hotplug_history: list[HotplugTransactionV1] = field(default_factory=list)
+    recovery_context: RecoverySessionContext | None = None
+    recovery_consumed: bool = False
+    recovery_operation_state: RecoveryOperationState | None = None
     effective_max_turns: int | None = None
     pending_override_notes: tuple[str, ...] = ()
     # Explicit override notes target this step; ``None`` preserves the legacy

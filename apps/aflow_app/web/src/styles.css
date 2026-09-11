@@ -352,6 +352,20 @@ input::placeholder, textarea::placeholder {
 .run-issue-failure { border-left-color: var(--color-error); }
 .run-issue-summary .dashboard-actions { justify-content: flex-start; flex-shrink: 0; }
 
+.recovery-action,
+.recovery-provenance {
+  border-left: 3px solid var(--color-primary);
+}
+
+.recovery-provenance p {
+  overflow-wrap: anywhere;
+}
+
+.recovery-action > p,
+.recovery-provenance > p {
+  max-width: 72rem;
+}
+
 .run-report summary {
   min-height: var(--tap-target);
   display: flex;
@@ -1952,6 +1966,7 @@ input::placeholder, textarea::placeholder {
   .sidebar-editor-layout {
     display: flex;
     flex-direction: column;
+    align-items: stretch;
   }
 
   .sidebar-editor-navigation {

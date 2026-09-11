@@ -23,6 +23,7 @@ from .models import (
     ContextBundle,
     LaunchManifest,
     PreparedRun,
+    RecoveryRequest,
     RunControlRequest,
     RunEvent,
     RunStatus,
@@ -45,6 +46,7 @@ from .startup import (
 
 __all__ = [
     "PreparedRun",
+    "RecoveryRequest",
     "AnalyzeRequest",
     "CapabilitySet",
     "ContextBundle",

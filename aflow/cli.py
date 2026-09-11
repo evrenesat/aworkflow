@@ -109,6 +109,10 @@ from .workflow import (
 from .repartition import derive_generation_id
 from .runlog import load_run_json
 from .analyzer import resolve_run_id
+from .recovery_runtime import (
+    RecoveryRuntimeValidationError,
+    validate_recovery_runtime,
+)
 from .status import BannerRenderer, WorkflowGraphSource, build_workflow_show
 
 RUN_HELP = """\
@@ -2026,6 +2030,18 @@ def _reconstruct_resume_context(
 ) -> ResumeContext | None:
     """Decode all durable resume state from one already-loaded run payload."""
     run_id = resolved_run_id.name
+    raw_recovery_runtime = prev_run.get("recovery_runtime")
+    if raw_recovery_runtime is not None:
+        try:
+            validate_recovery_runtime(
+                raw_recovery_runtime,
+                expected_target_run_id=run_id,
+                allow_pending=False,
+            )
+        except RecoveryRuntimeValidationError as exc:
+            raise ValueError(
+                f"error: run '{run_id}' has an unresolved recovery operation: {exc}"
+            ) from exc
     raw_feature_branch = prev_run.get("feature_branch")
     raw_worktree_path = prev_run.get("worktree_path")
     raw_main_branch = prev_run.get("main_branch")

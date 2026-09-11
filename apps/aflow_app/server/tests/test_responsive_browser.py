@@ -14,7 +14,12 @@ from playwright.sync_api import Page, expect, sync_playwright
 
 from aflow.control_plane.persistence import append_run_event
 from test_control_plane_api import PROJECT_ID, TOKEN, control_client, live_server  # noqa: F401
-from test_control_plane_api import _add_live_control_targets, _prepared
+from test_control_plane_api import (
+    _add_live_control_targets,
+    _prepared,
+    _seed_recovery_source,
+    _source_artifact_bytes,
+)
 
 
 VIEWPORTS = (
@@ -1202,3 +1207,475 @@ def test_responsive_live_controls_and_restart(
             assert successor_requests[1] == successor_requests[0]
         finally:
             browser.close()
+
+
+def test_durable_recovery_ui_journey(control_client, monkeypatch):
+    """Drive replacement recovery through the real controller with fake providers."""
+    from dataclasses import replace
+    import hashlib
+
+    from aflow.api.runner import execute_workflow as canonical_execute_workflow
+    from aflow.control_plane.units import UnitState
+    from aflow.daemon import worker_main
+    from aflow.harnesses.base import HarnessInvocation
+    from aflow.harnesses.muse import MuseAdapter
+    from aflow.harnesses.session import SessionCapabilities, SessionRequest, SessionResult
+    from aflow.plan import PlanSnapshot
+    from aflow.repartition import EvidenceArtifactReferenceV2, create_envelope_v2, write_envelope_atomic
+    from aflow.run_state import (
+        ActiveImplementationScope,
+        ControllerConfig,
+        ControllerState,
+        ExecutionContext,
+    )
+    from aflow.runlog import (
+        RunMetadataWriter,
+        RunPaths,
+        capture_checkpoint_evidence,
+        capture_plan_evidence,
+    )
+    from aflow.workflow import load_scope_evidence_for_resume
+    from aflow_app_server import main
+    from test_control_plane_api import _commit_fixture_repository
+
+    _, root, units, _ = control_client
+    service = main._control_plane_service
+    assert service is not None
+    plan_path = root / "plans" / "todo" / "test-plan.md"
+    plan_text = """# Durable recovery fixture
+
+### [x] Checkpoint 1: Setup
+- [x] preserve setup
+
+### [x] Checkpoint 2: Evidence
+- [x] preserve evidence
+
+### [x] Checkpoint 3: Review
+- [x] preserve review boundary
+
+### [ ] Checkpoint 4: Replacement
+- [ ] continue from durable evidence
+"""
+    plan_path.write_text(plan_text, encoding="utf-8")
+    config_path = root.parent / "global" / "aflow.toml"
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[harness.dsh.profiles.source]\n"
+            'model = "unavailable-source"\n'
+            "\n[harness.muse.profiles.replacement]\n"
+            'model = "replacement-worker"\n'
+            "\n[teams.recovery.roles]\n"
+            'worker = "muse.replacement"\n'
+        )
+
+    # Establish the disposable main branch and a real Git-registered managed
+    # worktree before the source run or its recovery evidence is created.
+    # The repository-level test gitignore intentionally hides plans; this
+    # fixture explicitly tracks its runnable plan so the managed worktree has
+    # the same input that recovery binds.
+    subprocess.run(
+        ("git", "-C", str(root), "add", "-f", str(plan_path)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_fixture_repository(root)
+    subprocess.run(("git", "-C", str(root), "branch", "-M", "main"), check=True)
+    feature_branch = "feature/issue36-browser-recovery"
+    worktree = root.parent / "issue36-browser-recovery-worktree"
+    subprocess.run(
+        (
+            "git", "-C", str(root), "worktree", "add", "-q", "-b",
+            feature_branch, str(worktree), "main",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    daemon = service._project(PROJECT_ID).daemon
+    real_resume_bootstrap = daemon.service._resume_bootstrap
+    source_id, source_dir, daemon = _seed_recovery_source(
+        service,
+        root,
+        monkeypatch,
+        source_id="browser-recovery-source",
+    )
+    monkeypatch.setattr(daemon.service, "_resume_bootstrap", real_resume_bootstrap)
+
+    # Replace the fixture's compact source metadata with a canonical failed
+    # run containing the schema-v2 scope envelope and exact Markdown evidence.
+    source_paths = RunPaths(
+        repo_root=root,
+        runs_root=root / ".aflow" / "runs",
+        run_dir=source_dir,
+        turns_dir=source_dir / "turns",
+        manager_dir=source_dir / "manager",
+        run_json=source_dir / "run.json",
+    )
+    plan_ref = capture_plan_evidence(source_paths, plan_text)
+    checkpoint_text = "### [ ] Checkpoint 4: Replacement\n- [ ] continue from durable evidence\n"
+    checkpoint_ref = capture_checkpoint_evidence(source_paths, checkpoint_text)
+    envelope = create_envelope_v2(
+        scope_id="test-plan.md::checkpoint-4::Replacement",
+        original_plan_path=plan_path,
+        plan_text=plan_text,
+        checkpoint_index=4,
+        repo_root=root,
+        plan_ref=EvidenceArtifactReferenceV2(
+            kind=plan_ref.kind,
+            path=plan_ref.path,
+            sha256=plan_ref.sha256,
+            byte_size=plan_ref.byte_size,
+        ),
+        checkpoint_ref=EvidenceArtifactReferenceV2(
+            kind=checkpoint_ref.kind,
+            path=checkpoint_ref.path,
+            sha256=checkpoint_ref.sha256,
+            byte_size=checkpoint_ref.byte_size,
+        ),
+    )
+    envelope_path = write_envelope_atomic(
+        envelope, source_dir / "scopes" / envelope.scope_digest
+    )
+    envelope_bytes = envelope_path.read_bytes()
+    scope = ActiveImplementationScope(
+        scope_id=envelope.scope_id,
+        original_plan_path=str(plan_path),
+        checkpoint_index=4,
+        checkpoint_name=envelope.checkpoint_name,
+        opened_turn_number=1,
+        envelope_artifact_path=envelope_path.relative_to(source_dir).as_posix(),
+        envelope_artifact_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
+        envelope_canonical_sha256=envelope.canonical_envelope_sha256,
+    )
+    scope_artifacts = load_scope_evidence_for_resume(
+        source_dir, scope, envelope_bytes
+    )
+    source_state = ControllerState(
+        last_snapshot=PlanSnapshot(
+            current_checkpoint_name="Checkpoint 4: Replacement",
+            unchecked_checkpoint_count=1,
+            current_checkpoint_unchecked_step_count=1,
+            is_complete=False,
+            total_checkpoint_count=4,
+            current_checkpoint_index=4,
+        ),
+        run_id=source_id,
+        selected_start_step="implement",
+        effective_max_turns=3,
+        role_selectors={"worker": "dsh.source"},
+        active_implementation_scope=scope,
+    )
+    source_config = ControllerConfig(
+        repo_root=root,
+        plan_path=plan_path,
+        max_turns=3,
+        keep_runs=20,
+        start_step="implement",
+    )
+    source_execution = ExecutionContext(
+        primary_repo_root=root,
+        execution_repo_root=worktree,
+        main_branch="main",
+        feature_branch=feature_branch,
+        worktree_path=worktree,
+        setup=("worktree", "branch"),
+        teardown=(),
+    )
+    (source_dir / "run.json").unlink()
+    RunMetadataWriter(
+        paths=source_paths,
+        config=source_config,
+        state=source_state,
+        workflow_name="managed",
+    ).write(
+        status="failed",
+        execution_context=source_execution,
+        original_plan_path=plan_path,
+        active_plan_path=plan_path,
+        current_step_name="implement",
+    )
+    source_before = _source_artifact_bytes(source_dir)
+
+    # Admission uses the same complete source context as the real worker
+    # reconstruction, including the registered worktree and v2 artifacts.
+    base_resume_bootstrap = real_resume_bootstrap
+
+    def browser_resume_bootstrap(*args, **kwargs):
+        bootstrap = base_resume_bootstrap(*args, **kwargs)
+        context = replace(
+            bootstrap.resume_context,
+            feature_branch=feature_branch,
+            worktree_path=worktree,
+            main_branch="main",
+            setup=("worktree", "branch"),
+            teardown=(),
+            active_plan_path=plan_path,
+            active_implementation_scope=scope,
+            scope_envelope_bytes=envelope_bytes,
+            scope_envelope_source_path=str(envelope_path),
+            scope_evidence_artifact_bytes=scope_artifacts,
+        )
+        return replace(bootstrap, resume_context=context)
+
+    monkeypatch.setattr(daemon.service, "_resume_bootstrap", browser_resume_bootstrap)
+
+    class FakeTargetDriver:
+        capabilities = SessionCapabilities(
+            session_identity=True,
+            followup_turn=True,
+            resume_with_model=True,
+            idempotent_turn_start=True,
+        )
+
+        def __init__(self) -> None:
+            self.requests: list[SessionRequest] = []
+
+        def build_invocation(self, request: SessionRequest) -> HarnessInvocation:
+            self.requests.append(request)
+            effective = f"{request.system_prompt}\n\n{request.user_prompt}"
+            return HarnessInvocation(
+                label="fake-muse",
+                argv=("fake-muse",),
+                env={},
+                prompt_mode="stdin",
+                system_prompt=request.system_prompt,
+                user_prompt=request.user_prompt,
+                effective_prompt=effective,
+                stdin_text=effective,
+            )
+
+        def parse_result(
+            self, request: SessionRequest, stdout: str, *, returncode: int = 0
+        ) -> SessionResult:
+            assert returncode == 0
+            return SessionResult(
+                session_id="browser-target-session",
+                selector=request.selector,
+                model=request.model,
+                effort=request.effort,
+                final_output=stdout,
+                provider_operation_id="browser-target-operation",
+                idempotency_key=request.idempotency_key,
+                capabilities=self.capabilities,
+            )
+
+    class NeverSourceDriver:
+        capabilities = FakeTargetDriver.capabilities
+
+        def build_invocation(self, request: SessionRequest) -> HarnessInvocation:
+            raise AssertionError(f"source provider was called: {request.selector}")
+
+        def parse_result(
+            self, request: SessionRequest, stdout: str, *, returncode: int = 0
+        ) -> SessionResult:
+            raise AssertionError(f"source provider returned: {request.selector}")
+
+    target_driver = FakeTargetDriver()
+    source_driver = NeverSourceDriver()
+    runner_calls: list[tuple[list[str], str]] = []
+    completed_plan = plan_text.replace(
+        "### [ ] Checkpoint 4: Replacement\n- [ ] continue from durable evidence",
+        "### [x] Checkpoint 4: Replacement\n- [x] continue from durable evidence",
+    )
+
+    def fake_runner(argv, **kwargs):
+        cwd = Path(str(kwargs["cwd"]))
+        runner_calls.append((list(argv), str(cwd)))
+        execution_plan = cwd / plan_path.relative_to(root)
+        execution_plan.write_text(completed_plan, encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "DONE\n", "")
+
+    def execute_with_fake_providers(prepared, **kwargs):
+        return canonical_execute_workflow(
+            prepared,
+            adapter=MuseAdapter(),
+            runner=fake_runner,
+            session_driver=target_driver,
+            source_session_driver=source_driver,
+            **kwargs,
+        )
+
+    # The browser acceptance is local-only; do not let inherited repository
+    # publication settings contact a remote while the fake worker runs.
+    monkeypatch.setattr("aflow.workflow.publish_completed_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("aflow.daemon.execute_workflow", execute_with_fake_providers)
+    source_unit_name = f"aflow-run-{source_id}.service"
+    units.units[source_unit_name] = UnitState(
+        name=source_unit_name,
+        active_state="inactive",
+        sub_state="dead",
+    )
+
+    original_start = units.start
+
+    def start_and_run_worker(name, argv, **kwargs):
+        started = original_start(name, argv, **kwargs)
+        run_id = name.removeprefix("aflow-run-").removesuffix(".service")
+        assert worker_main(repo_root=root, config_path=config_path, run_id=run_id) == 0
+        units.units[name] = UnitState(
+            name=name,
+            active_state="inactive",
+            sub_state="dead",
+            result="success",
+        )
+        return started
+
+    monkeypatch.setattr(units, "start", start_and_run_worker)
+
+    repository = service._project(PROJECT_ID).daemon.application.repository
+    original_status = repository.get_run_status
+    source_active = False
+
+    def source_status(run_id: str):
+        status = original_status(run_id)
+        if run_id != source_id:
+            return status
+        return replace(
+            status,
+            activity="active" if source_active else "inactive",
+            status_reason_code="execution_active" if source_active else "controller_failed",
+            evidence={
+                **status.evidence,
+                "unit_active": source_active,
+                "unit_observation": "observed",
+                "worker": {"active": True} if source_active else status.evidence.get("worker"),
+            },
+        )
+
+    monkeypatch.setattr(repository, "get_run_status", source_status)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    evidence_root = Path(
+        "/root/code/evidence/aflow-dogfood-20260909/issue36-review-20260911"
+    )
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+
+    try:
+        with live_server() as url, sync_playwright() as playwright:
+            browser = _browser(playwright)
+            try:
+                page = browser.new_page(viewport={"width": 390, "height": 844})
+                _login(page, url)
+                page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={source_id}")
+                dashboard = _visible_dashboard(page)
+                dashboard.locator(".run-detail h3").wait_for()
+                page.get_by_role("button", name="Resume as new run…", exact=True).wait_for()
+                recovery_button = page.get_by_role(
+                    "button", name="Recover with another worker…", exact=True
+                )
+                recovery_button.wait_for()
+                expect(recovery_button).to_have_class(re.compile(r"btn-secondary"))
+                recovery_button.click()
+                _choose_combobox(
+                    dashboard,
+                    "Recovery worker",
+                    "muse.replacement",
+                    "muse.replacement",
+                )
+                dashboard.get_by_text(
+                    re.compile(r"Submission mode: durable_evidence"),
+                ).wait_for()
+                assert "private context from the old provider session is unavailable" in dashboard.inner_text().lower()
+                submit = dashboard.get_by_role(
+                    "button", name="Recover with selected worker", exact=True
+                )
+                assert dashboard.get_by_label("Recovery worker", exact=True).input_value() == "muse.replacement"
+                _assert_action_hit_test(page, submit)
+
+                # The source changes after the draft was opened. The actual
+                # structured REST rejection must preserve the selected worker.
+                source_active = True
+                submit.click()
+                dashboard.get_by_text(
+                    re.compile(r"Recovery was rejected:.*source activity"),
+                    exact=False,
+                ).wait_for()
+                assert dashboard.get_by_label("Recovery worker", exact=True).input_value() == "muse.replacement"
+                assert len(units.start_calls) == 0
+                source_active = False
+
+                submit = dashboard.get_by_role(
+                    "button", name="Recover with selected worker", exact=True
+                )
+                submit.click()
+                page.wait_for_timeout(1000)
+                dashboard.get_by_role(
+                    "heading", name="Replacement worker started", exact=True
+                ).wait_for()
+                successor_id = dashboard.get_by_title("Copy run ID", exact=True).inner_text()
+                assert successor_id != source_id
+                page.wait_for_function(
+                    "expected => new URL(location.href).searchParams.get('run') === expected",
+                    arg=successor_id,
+                )
+                detail_text = dashboard.inner_text()
+                assert "Source run" in detail_text
+                assert "dsh.source" in detail_text
+                assert "muse.replacement" in detail_text
+                assert "recovery/recovery-intent.json" in detail_text
+                assert f"worktree:{worktree.resolve()}" in detail_text
+                assert "private context from the old provider session was unavailable" in detail_text.lower()
+                assert dashboard.get_by_role(
+                    "link", name=re.compile(r"open the recorded event and artifact details"),
+                ).is_visible()
+                assert len(units.start_calls) == 1
+                assert units.start_calls[0][0] == f"aflow-run-{successor_id}.service"
+                assert units.start_calls[0][0] != source_unit_name
+                assert runner_calls == [(["fake-muse"], str(worktree))]
+                assert len(target_driver.requests) == 1
+                assert target_driver.requests[0].selector == "muse.replacement"
+                assert target_driver.requests[0].session_id is None
+                assert source_driver.capabilities.session_identity
+                assert "no source session ID" in target_driver.requests[0].user_prompt
+                assert _source_artifact_bytes(source_dir) == source_before
+                assert (worktree / plan_path.relative_to(root)).read_text(encoding="utf-8") == completed_plan
+
+                successor_payload = json.loads(
+                    (root / ".aflow" / "runs" / successor_id / "run.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert successor_payload["recovery_runtime"]["operation_state"] == "consumed"
+                assert successor_payload["active_role_sessions"][0]["selector"] == "muse.replacement"
+                assert successor_payload["active_role_sessions"][0]["session_id"] == "browser-target-session"
+
+                page.reload()
+                dashboard = _visible_dashboard(page)
+                dashboard.get_by_role(
+                    "heading", name="Replacement worker started", exact=True
+                ).wait_for()
+                dashboard.get_by_text("All 4 checkpoints complete", exact=True).wait_for()
+                _assert_header_and_flow(page)
+                screenshot = evidence_root / f"issue36-recovery-{browser_name}-390x844.png"
+                page.screenshot(path=str(screenshot), full_page=True)
+                print("ISSUE36_RECOVERY_SCREENSHOT", screenshot)
+
+                source_active = True
+                units.units[source_unit_name] = UnitState(
+                    name=source_unit_name,
+                    active_state="active",
+                    sub_state="running",
+                )
+                page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={source_id}")
+                active_dashboard = _visible_dashboard(page)
+                active_dashboard.locator(".run-detail h3").wait_for()
+                page.get_by_text(re.compile(r"Restart unavailable:"), exact=False).wait_for()
+                assert page.get_by_role(
+                    "button", name="Recover with another worker…", exact=True
+                ).count() == 0
+                assert len(units.start_calls) == 1
+                assert _source_artifact_bytes(source_dir) == source_before
+                _assert_header_and_flow(page)
+            finally:
+                browser.close()
+    finally:
+        if worktree.exists():
+            subprocess.run(
+                ("git", "-C", str(root), "worktree", "remove", "--force", str(worktree)),
+                check=True,
+                capture_output=True,
+                text=True,
+            )

@@ -33,6 +33,7 @@ from aflow.daemon import (
     DaemonError,
     DaemonIdempotencyConflict,
     DaemonStartupError,
+    DurableRecoveryRejection,
 )
 
 
@@ -72,6 +73,8 @@ def _public_error_code(
             return code
     if isinstance(exc, DaemonStartupError) and exc.code != "startup_failed":
         return exc.code
+    if isinstance(exc, DurableRecoveryRejection):
+        return exc.code
     if isinstance(exc, ControlValidationError):
         return exc.code
     if isinstance(exc, RepositoryNotFoundError):
@@ -99,6 +102,12 @@ def _public_error_detail(
         if exc.run_id is not None:
             detail["run_id"] = exc.run_id
         return json.dumps(detail, separators=(",", ":"), sort_keys=True)
+    if isinstance(exc, DurableRecoveryRejection):
+        return json.dumps(
+            {"code": code, "message": str(exc)},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     return code
 
 
@@ -598,8 +607,16 @@ def create_control_plane_mcp(
         run_id: str,
         idempotency_key: str,
         extra_instructions: list[str] | None = None,
+        recovery: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
-        """Create a continuation, optionally replacing its run-wide instructions."""
+        """Create a continuation or explicit durable-evidence replacement.
+
+        Omit ``recovery`` for an ordinary resume. To recover with another
+        worker, pass exactly ``{"mode": "durable_evidence", "worker_selector":
+        "<configured selector>"}``. The source must be confirmed inactive;
+        the replacement starts a fresh provider session and receives bounded
+        durable evidence because hidden source-session context is unavailable.
+        """
         return tool_result(
             lambda: (
                 get_service()
@@ -611,6 +628,7 @@ def create_control_plane_mcp(
                         if extra_instructions is not None
                         else None
                     ),
+                    recovery=recovery,
                     idempotency_key=_bounded_idempotency_key(idempotency_key),
                     caller_scope="mcp",
                 )
@@ -621,6 +639,7 @@ def create_control_plane_mcp(
                 "run_id": run_id,
                 "idempotency_key": idempotency_key,
                 "extra_instructions": extra_instructions,
+                "recovery": recovery,
             },
         )
 

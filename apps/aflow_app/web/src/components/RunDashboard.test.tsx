@@ -1733,6 +1733,142 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(onRunSelectionChange).toHaveBeenCalledWith({ runId: 'run-continuation', userInitiated: false }))
   })
 
+  it('keeps ordinary Resume primary and submits explicit durable recovery to a selected worker', async () => {
+    const source = {
+      ...ownedRun,
+      run_id: 'recovery-source',
+      status: 'failed',
+      activity: 'inactive' as const,
+      launch_phase: 'failed',
+      reason: 'The original provider session is unavailable.',
+      evidence: { ...ownedRun.evidence, can_resume: true },
+    }
+    const successor = {
+      ...ownedRun,
+      run_id: 'recovery-successor',
+      status: 'running',
+      activity: 'active' as const,
+      launch_phase: 'unit_started',
+      evidence: {
+        ...ownedRun.evidence,
+        unit_active: true,
+        recovery_worker: {
+          schema_version: 1,
+          target_run_id: 'recovery-successor',
+          target_selector: 'harness/impl-b',
+          operation_state: 'consumed',
+          operation_started: true,
+          session_started: true,
+          session_status: 'active',
+        },
+      },
+    }
+    vi.mocked(api.listControlPlaneRuns)
+      .mockResolvedValueOnce({ runs: [source], next_cursor: null, schema_version: 1 })
+      .mockResolvedValue({ runs: [source, successor], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === source.run_id ? source : successor)
+    vi.mocked(api.getRestartOptions).mockImplementation(async (_projectId, runId) => runId === source.run_id
+      ? { eligible: true, reason: null, requires_stop: false, run_id: source.run_id, extra_instructions_unavailable: false, options: { plan_path: source.plan_path ?? 'plans/in-progress/demo.md' } }
+      : null as never)
+    vi.mocked(api.listRunEvents).mockImplementation(async (_projectId, runId) => runId === successor.run_id
+      ? [{ sequence: 1, event_type: 'recovery_requested', data: {
+        mode: 'durable_evidence', source_run_id: source.run_id, target_run_id: successor.run_id,
+        source_selector: 'harness/impl-a', target_selector: 'harness/impl-b',
+        artifact_path: 'recovery/recovery-intent.json', evidence: ['scope:checkpoint-4'],
+        source_session_context_transferred: false,
+      }, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }]
+      : [{ sequence: 1, event_type: 'run_started', data: {}, schema_version: 1, timestamp: '2024-01-01T00:00:00Z' }])
+    vi.mocked(api.resumeControlPlaneRun).mockResolvedValue({ run_id: successor.run_id, created: true, status: 'running', schema_version: 1, manifest_path: null, reason: null, restarted_from_run_id: null })
+    const onRunSelectionChange = vi.fn()
+    renderDashboard({ requestedRunId: source.run_id, onRunSelectionChange })
+
+    await screen.findByRole('button', { name: /Resume as new run/ })
+    const recoveryButton = await screen.findByRole('button', { name: 'Recover with another worker…' })
+    expect(recoveryButton.className).toContain('btn-secondary')
+    fireEvent.click(recoveryButton)
+    const selector = await screen.findByLabelText('Recovery worker') as HTMLInputElement
+    fireEvent.focus(selector)
+    fireEvent.change(selector, { target: { value: 'harness/impl-b' } })
+    fireEvent.click(await screen.findByRole('option', { name: /harness\/impl-b/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Recover with selected worker' }))
+
+    await waitFor(() => expect(api.resumeControlPlaneRun).toHaveBeenCalledWith(
+      'control-project', source.run_id, expect.stringMatching(/^recovery-/),
+      { recovery: { mode: 'durable_evidence', worker_selector: 'harness/impl-b' } },
+    ))
+    await screen.findByText('Replacement worker started')
+    expect(screen.getByText('Source run')).toBeDefined()
+    expect(screen.getByText(source.run_id)).toBeDefined()
+    expect(screen.getAllByText('harness/impl-b').length).toBeGreaterThan(0)
+    expect(screen.getByText(/private context from the old provider session was unavailable/i)).toBeDefined()
+    expect(screen.getByRole('link', { name: /open the recorded event and artifact details/i })).toBeDefined()
+    await waitFor(() => expect(onRunSelectionChange).toHaveBeenCalledWith({ runId: successor.run_id, userInitiated: false }))
+  })
+
+  it('keeps the recovery draft and source selected when admission rejects the replacement', async () => {
+    const source = {
+      ...ownedRun,
+      run_id: 'recovery-rejected-source',
+      status: 'failed',
+      activity: 'inactive' as const,
+      launch_phase: 'failed',
+      evidence: { ...ownedRun.evidence, can_resume: true },
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [source], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(source)
+    vi.mocked(api.getRestartOptions).mockResolvedValue({ eligible: true, reason: null, requires_stop: false, run_id: source.run_id, extra_instructions_unavailable: false, options: { plan_path: source.plan_path ?? 'plans/in-progress/demo.md' } })
+    vi.mocked(api.resumeControlPlaneRun).mockRejectedValue(new ApiError(
+      422,
+      'Durable recovery requires confirmed inactive source ownership; source activity is unknown or active.',
+      'recovery_source_activity',
+      {
+        code: 'recovery_source_activity',
+        message: 'Durable recovery requires confirmed inactive source ownership; source activity is unknown or active.',
+      },
+    ))
+    renderDashboard({ requestedRunId: source.run_id })
+
+    await screen.findByRole('button', { name: 'Resume as new run…' })
+    fireEvent.click(await screen.findByRole('button', { name: 'Recover with another worker…' }))
+    const selector = await screen.findByLabelText('Recovery worker') as HTMLInputElement
+    fireEvent.focus(selector)
+    fireEvent.change(selector, { target: { value: 'harness/impl-b' } })
+    fireEvent.click(await screen.findByRole('option', { name: /harness\/impl-b/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Recover with selected worker' }))
+
+    await screen.findByText('Recovery was rejected: Durable recovery requires confirmed inactive source ownership; source activity is unknown or active.')
+    expect(screen.getByTitle('Copy run ID').textContent).toBe(source.run_id)
+    expect((screen.getByLabelText('Recovery worker') as HTMLInputElement).value).toBe('harness/impl-b')
+    expect(screen.getByRole('button', { name: 'Recover with selected worker' })).toBeDefined()
+    expect(api.resumeControlPlaneRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not offer replacement recovery for an active source', async () => {
+    const active = {
+      ...ownedRun,
+      run_id: 'active-recovery-source',
+      status: 'failed',
+      activity: 'active' as const,
+      launch_phase: 'launch_started',
+      reason: 'The source operation is still active.',
+    }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [active], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(active)
+    vi.mocked(api.getRestartOptions).mockResolvedValue({
+      eligible: false,
+      reason: 'source worker activity is active or unknown',
+      requires_stop: true,
+      run_id: active.run_id,
+      extra_instructions_unavailable: false,
+      options: { plan_path: active.plan_path ?? 'plans/in-progress/demo.md' },
+    })
+    renderDashboard({ requestedRunId: active.run_id })
+
+    await screen.findByText(/Restart unavailable: source worker activity is active or unknown/)
+    expect(screen.queryByRole('button', { name: /Recover with another worker/ })).toBeNull()
+    expect(api.resumeControlPlaneRun).not.toHaveBeenCalled()
+  })
+
   it('reuses a resume key after an uncertain failure', async () => {
     const attentionRun = { ...ownedRun, run_id: 'run-needs-attention', status: 'needs_attention', revision: 3, evidence: { ...ownedRun.evidence, can_resume: true } }
     const listReady = deferred<{ runs: (typeof attentionRun)[]; next_cursor: null; schema_version: number }>()

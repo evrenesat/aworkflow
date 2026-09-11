@@ -214,9 +214,17 @@ class StartRunPayload(CanonicalTransportModel):
 
 
 class ResumeRunPayload(CanonicalTransportModel):
-    """Optional run-wide instruction replacement for an explicit resume."""
+    """Optional instruction replacement or explicit durable recovery request."""
 
     extra_instructions: tuple[str, ...] | None = Field(default=None, max_length=8)
+    recovery: Mapping[str, object] | None = Field(
+        default=None,
+        description=(
+            "Explicit durable-evidence recovery: mode must be "
+            "'durable_evidence' and worker_selector must name a configured "
+            "replacement worker."
+        ),
+    )
 
 
 class PreflightRunPayload(StartRunPayload):

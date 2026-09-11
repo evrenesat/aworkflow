@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from aflow.config import WorkflowConfig
+from aflow.recovery_request import RecoveryRequest
 from aflow.run_state import RetryContext
 
 
@@ -142,6 +143,7 @@ __all__ = [
     "AnalyzeRequest",
     "StartupContext",
     "PreparedRun",
+    "RecoveryRequest",
     "CapabilitySet",
     "ContextBundle",
     "LaunchManifest",

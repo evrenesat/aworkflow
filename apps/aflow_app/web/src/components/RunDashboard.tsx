@@ -6,6 +6,8 @@ import type {
   ControlPlaneReadiness,
   GuidedFormProjection,
   GuidedProfileSummary,
+  RecoveryRequest,
+  RecoveryWorkerEvidence,
   RunProgressAvailability,
   RunProgressReason,
   RunProgressTurn,
@@ -22,6 +24,7 @@ import * as api from '../api'
 import { SidebarEditorLayout } from './SidebarEditorLayout'
 import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
+import { Combobox } from './Combobox'
 import { useHeaderSlots } from './HeaderSlots'
 import { runPlanDisplayName, runPlanPath, statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
@@ -35,6 +38,7 @@ const CONFIRM_QUESTION_KINDS = new Set(['confirm_recovery', 'confirm_worktree_di
 const MAX_EXTRA_INSTRUCTION_ITEMS = 8
 const MAX_EXTRA_INSTRUCTION_LENGTH = 512
 const MAX_EXTRA_INSTRUCTIONS_TOTAL = 4_096
+const DURABLE_RECOVERY_STATUSES = new Set(['failed', 'interrupted', 'owner_stopped'])
 
 /** A run-selection report used to keep the public URL truthful. */
 export interface RunSelectionChange {
@@ -512,6 +516,85 @@ interface RunIssue {
   cause: string
 }
 
+interface RecoveryProvenance {
+  mode: 'durable_evidence'
+  sourceRunId: string
+  targetRunId: string
+  sourceSelector: string
+  targetSelector: string
+  artifactPath: string | null
+  evidenceReferences: string[]
+  sourceSessionContextTransferred: boolean | null
+}
+
+function recoveryWorkerEvidenceFromRun(
+  run: RunStatus | null,
+): RecoveryWorkerEvidence | null {
+  const value = run?.evidence.recovery_worker
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const evidence = value as Record<string, unknown>
+  const sessionStatus = evidence.session_status
+  if (
+    evidence.schema_version !== 1
+    || typeof evidence.target_run_id !== 'string'
+    || typeof evidence.target_selector !== 'string'
+    || !evidence.target_run_id.trim()
+    || !evidence.target_selector.trim()
+    || !['pending', 'in_flight', 'consumed'].includes(String(evidence.operation_state))
+    || typeof evidence.operation_started !== 'boolean'
+    || typeof evidence.session_started !== 'boolean'
+    || (evidence.session_started && !evidence.operation_started)
+    || (sessionStatus !== null && !['active', 'handed_over', 'closed'].includes(String(sessionStatus)))
+  ) return null
+  return {
+    schema_version: 1,
+    target_run_id: evidence.target_run_id,
+    target_selector: evidence.target_selector,
+    operation_state: evidence.operation_state as RecoveryWorkerEvidence['operation_state'],
+    operation_started: evidence.operation_started,
+    session_started: evidence.session_started,
+    session_status: sessionStatus as RecoveryWorkerEvidence['session_status'],
+  }
+}
+
+function recoveryProvenanceFromEvents(events: RunEvent[]): RecoveryProvenance | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.event_type !== 'recovery_requested') continue
+    const data = event.data
+    if (data.mode !== 'durable_evidence') continue
+    const requiredText = (value: unknown): string | null => (
+      typeof value === 'string' && value.trim() ? value.trim().slice(0, 240) : null
+    )
+    const sourceRunId = requiredText(data.source_run_id)
+    const targetRunId = requiredText(data.target_run_id)
+    const sourceSelector = requiredText(data.source_selector)
+    const targetSelector = requiredText(data.target_selector)
+    if (!sourceRunId || !targetRunId || !sourceSelector || !targetSelector) continue
+    const evidenceReferences = Array.isArray(data.evidence)
+      ? data.evidence.map((value): string | null => {
+        if (typeof value === 'string') return value
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+        const path = (value as Record<string, unknown>).path
+        return typeof path === 'string' ? path : null
+      }).filter((value): value is string => value !== null).slice(0, 12)
+      : []
+    return {
+      mode: 'durable_evidence',
+      sourceRunId,
+      targetRunId,
+      sourceSelector,
+      targetSelector,
+      artifactPath: requiredText(data.artifact_path),
+      evidenceReferences,
+      sourceSessionContextTransferred: data.source_session_context_transferred === false
+        ? false
+        : data.source_session_context_transferred === true ? true : null,
+    }
+  }
+  return null
+}
+
 function runIssue(run: RunStatus): RunIssue | null {
   const label = statusLabel(run)
   const failure = run.status === 'failed' || label === 'Failed' || label === 'Could not start'
@@ -841,6 +924,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const [roleSelectors, setRoleSelectors] = useState<Record<string, string>>({})
   const [confirmOwnerStop, setConfirmOwnerStop] = useState(false)
   const [confirmResume, setConfirmResume] = useState(false)
+  const [recoveryOpen, setRecoveryOpen] = useState(false)
+  const [recoverySelector, setRecoverySelector] = useState('')
   const [restartPhase, setRestartPhase] = useState<RestartPhase | null>(null)
   const [restartSource, setRestartSource] = useState<RunStatus | null>(null)
   const [restartAdmission, setRestartAdmission] = useState<api.RestartOptions | null>(null)
@@ -996,6 +1081,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
   useEffect(() => {
     setReportOpen(false)
+  }, [selectedRunId])
+
+  // Recovery is a draft on the selected source. Only a different source run
+  // should clear it; status/detail refreshes for the same run must preserve
+  // the owner's open form and selected replacement worker.
+  useEffect(() => {
+    setRecoveryOpen(false)
+    setRecoverySelector('')
   }, [selectedRunId])
 
   useEffect(() => {
@@ -1825,9 +1918,57 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     }
   }
 
+  async function handleRecovery() {
+    const workerSelector = recoverySelector.trim()
+    if (!projectId || !selectedRun || !canRecover || !workerSelector) return
+    const sourceRun = selectedRun.run_id
+    const recovery: RecoveryRequest = {
+      mode: 'durable_evidence',
+      worker_selector: workerSelector,
+    }
+    const request = { recovery }
+    const intent = { project_id: projectId, source_run_id: sourceRun, recovery }
+    try {
+      setBusyAction('recovery')
+      clearActionFeedback()
+      const continuation = await api.resumeControlPlaneRun(
+        projectId,
+        sourceRun,
+        getPendingWriteKey('recovery', intent),
+        request,
+      )
+      clearPendingWriteKey('recovery', intent)
+      setFeedback(continuation.created
+        ? `Recovery successor ${continuation.run_id} was created from source run ${sourceRun}. Its replacement start is shown in the successor details; the source remains separate.`
+        : `Recovery replay returned successor ${continuation.run_id} from source run ${sourceRun}; no duplicate was created. Its replacement start is shown in the successor details.`)
+      setRecoveryOpen(false)
+      setRecoverySelector('')
+      setMissingRunId(null)
+      await loadDashboard(projectId)
+      setSelectedRunId(continuation.run_id)
+      onRunSelectionChangeRef.current?.({ runId: continuation.run_id, userInitiated: false })
+    } catch (recoveryError) {
+      // Keep the selected source and recovery draft intact. In particular, an
+      // admission rejection must never fall back to ordinary Resume.
+      setActionError(`Recovery was rejected: ${errorMessage(recoveryError, 'the source was not admitted for replacement')}`)
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
   const canMutate = selectedRun?.ownership === 'control_plane'
   const canResume = canMutate && selectedRun?.evidence.can_resume === true
   const canRestart = canMutate && (restartAdmission?.eligible === true || (selectedRunHasLiveControls && hasSafeControl('owner_stop')))
+  const recoveryWorkerOptions = [...new Set(capabilities?.admitted_role_selectors?.worker ?? [])].sort()
+  const canRecover = Boolean(
+    canMutate
+    && restartAdmission?.eligible === true
+    && selectedRun
+    && DURABLE_RECOVERY_STATUSES.has(selectedRun.status)
+    && selectedRun.activity !== 'active'
+    && selectedRun.activity !== 'unknown'
+    && recoveryWorkerOptions.length > 0,
+  )
   const startMaxTurnsProblem = maxTurnsProblem(startMaxTurns)
   const restartDraftWorkflow = startWorkflow.trim()
   const restartInProgress = restartPhase === 'stopping' || restartPhase === 'waiting' || restartPhase === 'starting'
@@ -2093,6 +2234,20 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const savedOverrides = selectedRun?.evidence.overrides as { state?: string; revision?: number; max_turns?: number; team?: string; role_selectors?: Record<string, string> } | null
   const lastExecuted = lastExecutedEvidence(events, context)
   const selectedRunIssue = selectedRun ? runIssue(selectedRun) : null
+  const recoveryProvenance = recoveryProvenanceFromEvents(events)
+  const recoveryWorkerEvidence = recoveryWorkerEvidenceFromRun(selectedRun)
+  const recoveryWorkerEvidenceMatches = Boolean(
+    recoveryProvenance
+    && selectedRun?.run_id === recoveryProvenance.targetRunId
+    && recoveryWorkerEvidence?.target_run_id === recoveryProvenance.targetRunId
+    && recoveryWorkerEvidence.target_selector === recoveryProvenance.targetSelector
+  )
+  const recoveryWorkerSessionStarted = Boolean(
+    recoveryWorkerEvidenceMatches && recoveryWorkerEvidence?.session_started,
+  )
+  const recoveryReplacementStarted = Boolean(
+    recoveryWorkerEvidenceMatches && recoveryWorkerEvidence?.operation_started,
+  )
   const selectedRunTiming = selectedRun ? runTimingSummary(selectedRun, elapsed) : 'Not reported'
 
   const workflowRoleList = stepRoleMap ? [...new Set(Object.values(stepRoleMap))].sort() : []
@@ -2539,6 +2694,38 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {!canResume && !canRestart && <span className="text-sm text-dim">Open Diagnostics for the recorded details.</span>}
                 </div>
               </section>}
+              {canRecover && <section className="dashboard-section recovery-action" aria-label="Durable provider recovery">
+                <div className="section-heading">
+                  <div>
+                    <h4>Recover with another worker</h4>
+                    <span className="text-xs text-dim">Secondary action for a confirmed inactive source</span>
+                  </div>
+                  {recoveryOpen && <span className="status-pill">Explicit durable evidence</span>}
+                </div>
+                <p>Use this when the original provider session is unavailable. The replacement uses the saved plan, worktree, and durable results; private context from the old provider session is unavailable.</p>
+                {!recoveryOpen
+                  ? <button className="btn btn-secondary" disabled={busyAction !== null || restartInProgress} onClick={() => setRecoveryOpen(true)}>Recover with another worker…</button>
+                  : <>
+                    <div className="dashboard-form-grid">
+                      <Combobox
+                        label="Recovery worker"
+                        visibleLabel="Replacement worker"
+                        value={recoverySelector}
+                        onChange={setRecoverySelector}
+                        options={recoveryWorkerOptions}
+                        optionLabel={(selector) => formatMachineChoice(selector, recoveryWorkerOptions)}
+                        optionBadges={Object.fromEntries(recoveryWorkerOptions.map((selector) => [selector, 'configured current setting']))}
+                        placeholder="Choose a configured replacement worker"
+                        disabled={busyAction === 'recovery' || restartInProgress}
+                      />
+                    </div>
+                    <p className="text-xs text-dim">Submission mode: <span className="mono">durable_evidence</span>. This creates a distinct successor and never retries the source provider session.</p>
+                    <div className="dashboard-actions">
+                      <button className="btn btn-secondary" disabled={!recoverySelector.trim() || busyAction === 'recovery' || restartInProgress} onClick={() => void handleRecovery()}>{busyAction === 'recovery' ? 'Recovering…' : 'Recover with selected worker'}</button>
+                      <button className="btn btn-secondary" disabled={busyAction === 'recovery'} onClick={() => setRecoveryOpen(false)}>Cancel</button>
+                    </div>
+                  </>}
+              </section>}
               {!selectedRunIssue && selectedRun.reason && <div className="notice">{conciseRunText(selectedRun.reason) ?? 'A run reason was recorded.'}</div>}
 
 
@@ -2556,6 +2743,34 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                     {reportOpen && <pre className="dashboard-payload">{outcome.resultText}</pre>}
                   </details>
                 </>}
+              </section>}
+
+              {recoveryProvenance && <section className="dashboard-section recovery-provenance" id="recovery-evidence">
+                <div className="section-heading">
+                  <h4>{recoveryWorkerSessionStarted
+                    ? 'Replacement worker started'
+                    : recoveryReplacementStarted
+                      ? 'Replacement worker operation started'
+                      : 'Recovery requested'}</h4>
+                  <span className="status-pill">{recoveryProvenance.mode}</span>
+                </div>
+                <p>{recoveryWorkerSessionStarted
+                  ? `A fresh replacement provider session is recorded for the selected worker${recoveryWorkerEvidence?.session_status ? ` (session state: ${recoveryWorkerEvidence.session_status}).` : '.'}`
+                  : recoveryReplacementStarted
+                    ? 'The replacement worker operation started, but no provider session identity was recorded.'
+                    : 'The recovery intent is recorded, but a replacement start has not been confirmed yet.'}</p>
+                <dl className="run-metadata">
+                  <div><dt>Source run</dt><dd className="mono">{recoveryProvenance.sourceRunId}</dd></div>
+                  <div><dt>Source worker</dt><dd className="mono">{recoveryProvenance.sourceSelector}</dd></div>
+                  <div><dt>Replacement run</dt><dd className="mono">{recoveryProvenance.targetRunId}</dd></div>
+                  <div><dt>Replacement worker</dt><dd className="mono">{recoveryProvenance.targetSelector}</dd></div>
+                </dl>
+                <p>
+                  Recovery evidence: <a href={`#${technicalId}`} onClick={() => setTechnicalOpen(true)}>open the recorded event and artifact details in Diagnostics</a>
+                  {recoveryProvenance.artifactPath && <> · <span className="mono">{recoveryProvenance.artifactPath}</span></>}
+                </p>
+                {recoveryProvenance.evidenceReferences.length > 0 && <p className="text-xs text-dim">Saved evidence references: {recoveryProvenance.evidenceReferences.join(' · ')}</p>}
+                {recoveryProvenance.sourceSessionContextTransferred === false && <p className="notice">Private context from the old provider session was unavailable and was not transferred.</p>}
               </section>}
 
               {savedOverrides && <details className="dashboard-section" open><summary>Run changes</summary>

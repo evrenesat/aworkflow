@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping, NoReturn
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, NoReturn
 
 if TYPE_CHECKING:
     from aflow.api.events import ExecutionEvent, ExecutionObserver
@@ -121,7 +121,7 @@ from .recovery import (
     TeamLeadRecoveryDecision,
     TeamLeadRecoveryDecisionError,
 )
-from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
+from .run_state import ActiveImplementationScope, CheckpointRepartitionRecord, ControllerConfig, ControllerRunResult, ControllerState, ExecutionContext, FinalizedTurnBoundary, FrozenRunIdentity, HarnessRecoveryAction, HarnessRecoveryContext, ImplementationAttempt, IssueRecord, ManagerDecisionSummary, OverrideResult, PendingBoundaryDecision, PendingFinalizedTurn, PendingManagerNotes, PendingRepartitionV1, PendingTeamOverride, RecoverySessionContext, RetryContext, ResumeContext, ReviewRejectionRecord, TurnRecord, WorkflowEndReason, format_harness_model_display, load_override_request, merge_accepted_override_choices
 from .control_plane.validation import ControlValidationError, validate_override_targets
 from .hotplug import (
     HarnessSessionRefV1, HotplugTransactionV1, bounded_hotplug_history,
@@ -3920,6 +3920,22 @@ def _append_checkpoint_review_context(
     return "\n\n".join((prompt, context)) if context else prompt
 
 
+def _append_durable_recovery_context(
+    prompt: str,
+    *,
+    step_role: str,
+    recovery_context: RecoverySessionContext | None,
+) -> str:
+    """Deliver the replacement brief exactly once to the first worker turn."""
+    if (
+        step_role != "worker"
+        or recovery_context is None
+        or recovery_context.consumed
+    ):
+        return prompt
+    return "\n\n".join((prompt, recovery_context.brief))
+
+
 def _rewrite_plan_branch_text(text: str, branch_name: str) -> str:
     return _PLAN_BRANCH_LINE_RE.sub(
         lambda match: f"{match.group(1)}{branch_name}{match.group(3)}",
@@ -7406,6 +7422,11 @@ def run_workflow(
         or resume.resume_team_override is not None
     ):
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.recovery_context is not None:
+        # The successor intent references exact source artifacts. Keep that
+        # lineage available for a later target restart; the first brief still
+        # remains self-contained and never carries provider-private context.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
     if terminal_completion_resume and resume is not None:
         preserved_resume_run_ids.update(terminal_delivery_lineage)
     if (
@@ -7564,6 +7585,10 @@ def run_workflow(
         state.pending_override_target_step = resume.pending_override_target_step
         state.override_source_run_dir = resume.override_source_run_dir
         state.override_file_present = resume.override_file_present
+        if resume.recovery_context is not None:
+            state.recovery_context = resume.recovery_context
+            state.recovery_consumed = resume.recovery_context.consumed
+            state.recovery_operation_state = resume.recovery_context.operation_state
         transactions = [
             item for item in (state.current_hotplug_transaction, state.pending_hotplug_transaction)
             if item is not None
@@ -7705,6 +7730,55 @@ def run_workflow(
                     active_plan_path=active_plan_path,
                 )
                 raise WorkflowError(state.status_message, run_dir=run_paths.run_dir)
+        if state.recovery_context is not None:
+            if state.recovery_operation_state == "in_flight":
+                raise WorkflowError(
+                    "recovery target operation has unknown liveness; refusing duplicate launch",
+                    run_dir=run_paths.run_dir,
+                )
+            intent = state.recovery_context.intent
+            target_selector = getattr(intent, "target_selector", None)
+            if not isinstance(target_selector, str) or not target_selector.strip():
+                raise WorkflowError("recovery target intent has no worker selector")
+            if state.current_hotplug_transaction is not None or state.pending_hotplug_transaction is not None:
+                unresolved = [
+                    item
+                    for item in (
+                        state.current_hotplug_transaction,
+                        state.pending_hotplug_transaction,
+                    )
+                    if item is not None and item.stage not in {"applied", "failed"}
+                ]
+                if unresolved:
+                    raise WorkflowError(
+                        "durable recovery cannot proceed with ambiguous provider operation state",
+                        run_dir=run_paths.run_dir,
+                    )
+                for transaction in transactions:
+                    if not any(
+                        item.transaction_id == transaction.transaction_id
+                        for item in state.hotplug_history
+                    ):
+                        state.hotplug_history = list(
+                            bounded_hotplug_history(
+                                [*state.hotplug_history, transaction]
+                            )
+                        )
+                state.current_hotplug_transaction = None
+                state.pending_hotplug_transaction = None
+            # A durable-evidence replacement never inherits a source worker
+            # session, including when source and target use the same harness.
+            state.role_selectors["worker"] = target_selector
+            if state.recovery_consumed:
+                state.active_role_sessions = tuple(
+                    item
+                    for item in state.active_role_sessions
+                    if item.role != "worker" or item.selector == target_selector
+                )
+            else:
+                state.active_role_sessions = tuple(
+                    item for item in state.active_role_sessions if item.role != "worker"
+                )
     state.status_message = "initializing"
     state.selected_start_step = config.start_step
     state.startup_recovery_used = startup_retry is not None
@@ -11587,6 +11661,30 @@ def run_workflow(
             None,
         )
 
+    def _persist_recovery_operation_state(
+        operation_state: Literal["in_flight", "consumed"],
+    ) -> None:
+        """Persist the one-shot replacement boundary before/after the provider."""
+        if state.recovery_context is None:
+            return
+        consumed = operation_state == "consumed"
+        state.recovery_context = replace(
+            state.recovery_context,
+            consumed=consumed,
+            operation_state=operation_state,
+        )
+        state.recovery_consumed = consumed
+        state.recovery_operation_state = operation_state
+        run_metadata.write(
+            status="running",
+            last_snapshot=state.last_snapshot,
+            turns_completed=state.turns_completed,
+            original_plan_path=original_plan_path,
+            current_step_name=current_step_name,
+            active_plan_path=active_plan_path,
+            new_plan_path=new_plan_path,
+        )
+
     turn_number = 1
     while True:
         try:
@@ -11651,6 +11749,14 @@ def run_workflow(
         turn_session_request: SessionRequest | None = None
         owned_session_result = None
         cross_handover_prompt = ""
+        recovery_first_worker = (
+            state.recovery_context is not None
+            and not state.recovery_consumed
+            and (
+                current_step_name in wf.steps
+                and wf.steps[current_step_name].role == "worker"
+            )
+        )
         if retry_ctx is not None:
             state.status_message = (
                 f"running turn {turn_number}: step {current_step_name} "
@@ -11782,6 +11888,11 @@ def run_workflow(
                         else None
                     ),
                 )
+                user_prompt = _append_durable_recovery_context(
+                    user_prompt,
+                    step_role=step.role,
+                    recovery_context=state.recovery_context,
+                )
                 if config.extra_instructions:
                     extra_text = " ".join(config.extra_instructions).strip()
                     user_prompt = "\n\n".join((user_prompt, extra_text))
@@ -11809,6 +11920,7 @@ def run_workflow(
                     (runner is None or session_driver is not None)
                     and
                     step.role == "worker"
+                    and not recovery_first_worker
                     and transaction is not None
                     and transaction.target_selector == selector
                     and transaction.source_harness != transaction.target_harness
@@ -11848,6 +11960,7 @@ def run_workflow(
                     (runner is None or session_driver is not None)
                     and
                     step.role == "worker"
+                    and not recovery_first_worker
                     and transaction is not None
                     and transaction.target_selector == selector
                     and transaction.source_harness == resolved.harness_name
@@ -11862,10 +11975,14 @@ def run_workflow(
                     )
                 if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
                     transaction = state.current_hotplug_transaction
-                    previous_session = _find_previous_worker_session(
-                        selector=selector,
-                        resolved=resolved,
-                        transaction=transaction,
+                    previous_session = (
+                        None
+                        if recovery_first_worker
+                        else _find_previous_worker_session(
+                            selector=selector,
+                            resolved=resolved,
+                            transaction=transaction,
+                        )
                     )
                     turn_session_request = SessionRequest(
                         repo_root=execution_repo_root,
@@ -11881,7 +11998,9 @@ def run_workflow(
                             else None
                         ),
                         idempotency_key=(
-                            transaction.transaction_id
+                            state.recovery_context.intent_digest
+                            if recovery_first_worker and state.recovery_context is not None
+                            else transaction.transaction_id
                             if transaction is not None
                             and transaction.source_harness != transaction.target_harness
                             else None
@@ -11890,6 +12009,7 @@ def run_workflow(
                     transaction = state.current_hotplug_transaction
                     if (
                         transaction is not None
+                        and not recovery_first_worker
                         and transaction.target_selector == selector
                         and transaction.source_harness == resolved.harness_name
                         and transaction.target_harness == resolved.harness_name
@@ -12117,6 +12237,11 @@ def run_workflow(
                         else None
                     ),
                 )
+                user_prompt = _append_durable_recovery_context(
+                    user_prompt,
+                    step_role=step.role,
+                    recovery_context=state.recovery_context,
+                )
 
                 if config.extra_instructions:
                     extra_text = " ".join(config.extra_instructions).strip()
@@ -12144,6 +12269,7 @@ def run_workflow(
                 transaction = state.current_hotplug_transaction
                 if (
                     step.role == "worker"
+                    and not recovery_first_worker
                     and transaction is not None
                     and transaction.target_selector == selector
                     and transaction.source_harness != transaction.target_harness
@@ -12181,6 +12307,7 @@ def run_workflow(
                     user_prompt += cross_handover_prompt
                 if (
                     step.role == "worker"
+                    and not recovery_first_worker
                     and transaction is not None
                     and transaction.target_selector == selector
                     and transaction.source_harness == resolved.harness_name
@@ -12195,10 +12322,14 @@ def run_workflow(
                     )
                 if turn_session_driver is not None and (runner is None or session_driver is not None) and step.role == "worker":
                     transaction = state.current_hotplug_transaction
-                    previous_session = _find_previous_worker_session(
-                        selector=selector,
-                        resolved=resolved,
-                        transaction=transaction,
+                    previous_session = (
+                        None
+                        if recovery_first_worker
+                        else _find_previous_worker_session(
+                            selector=selector,
+                            resolved=resolved,
+                            transaction=transaction,
+                        )
                     )
                     turn_session_request = SessionRequest(
                         repo_root=execution_repo_root,
@@ -12214,7 +12345,9 @@ def run_workflow(
                             else None
                         ),
                         idempotency_key=(
-                            transaction.transaction_id
+                            state.recovery_context.intent_digest
+                            if recovery_first_worker and state.recovery_context is not None
+                            else transaction.transaction_id
                             if transaction is not None
                             and transaction.source_harness != transaction.target_harness
                             else None
@@ -12223,6 +12356,7 @@ def run_workflow(
                     transaction = state.current_hotplug_transaction
                     if (
                         transaction is not None
+                        and not recovery_first_worker
                         and transaction.target_selector == selector
                         and transaction.source_harness == resolved.harness_name
                         and transaction.target_harness == resolved.harness_name
@@ -12297,6 +12431,11 @@ def run_workflow(
             invocation=invocation,
             snapshot_before=snapshot_before,
         )
+        if recovery_first_worker:
+            # The marker is written after turn artifacts are prepared but
+            # before any provider call.  A later restart therefore rejects an
+            # operation whose liveness cannot be proven.
+            _persist_recovery_operation_state("in_flight")
         completed: subprocess.CompletedProcess[str] | None = None
         semantic_stdout: str | None = None
         post_snapshot: PlanSnapshot | None = None
@@ -12404,6 +12543,9 @@ def run_workflow(
 
             assert completed is not None
 
+            if recovery_first_worker and turn_session_request is None:
+                _persist_recovery_operation_state("consumed")
+
             if turn_session_request is not None and turn_session_driver is not None:
                 try:
                     raw_transport_stdout = completed.stdout
@@ -12443,14 +12585,21 @@ def run_workflow(
                         item for item in state.active_role_sessions
                         if item.role != step.role
                     ) + (session_ref,)
-                    run_metadata.write(
-                        status="running",
-                        last_snapshot=state.last_snapshot,
-                        original_plan_path=original_plan_path,
-                        current_step_name=current_step_name,
-                        active_plan_path=active_plan_path,
-                        new_plan_path=new_plan_path,
-                    )
+                    if recovery_first_worker:
+                        # Persist the consumed marker and validated replacement
+                        # session in one atomic run.json snapshot. A crash
+                        # before this write leaves the prior in-flight marker
+                        # durable, so resume cannot silently start unguarded.
+                        _persist_recovery_operation_state("consumed")
+                    else:
+                        run_metadata.write(
+                            status="running",
+                            last_snapshot=state.last_snapshot,
+                            original_plan_path=original_plan_path,
+                            current_step_name=current_step_name,
+                            active_plan_path=active_plan_path,
+                            new_plan_path=new_plan_path,
+                        )
                     (turn_dir / "transport.stdout").write_text(
                         raw_transport_stdout, encoding="utf-8"
                     )
@@ -12687,23 +12836,29 @@ def run_workflow(
             state.pending_retry = None
 
             try:
-                recovery_scheduled = _handle_harness_recovery(
-                    turn_number=turn_number,
-                    step_name=current_step_name,
-                    step=step,
-                    step_path=step_path,
-                    active_team_name=active_team_name,
-                    selector=selector,
-                    resolved=resolved,
-                    invocation=invocation,
-                    turn_dir=turn_dir,
-                    started_at=turn_started_at,
-                    snapshot_before=snapshot_before,
-                    snapshot_after=post_snapshot,
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    returncode=completed.returncode,
-                )
+                if state.recovery_context is not None:
+                    # Explicit durable recovery is a one-shot, provider-neutral
+                    # replacement. Never route a target failure through the
+                    # legacy retry or backup-team failover policy.
+                    recovery_scheduled = False
+                else:
+                    recovery_scheduled = _handle_harness_recovery(
+                        turn_number=turn_number,
+                        step_name=current_step_name,
+                        step=step,
+                        step_path=step_path,
+                        active_team_name=active_team_name,
+                        selector=selector,
+                        resolved=resolved,
+                        invocation=invocation,
+                        turn_dir=turn_dir,
+                        started_at=turn_started_at,
+                        snapshot_before=snapshot_before,
+                        snapshot_after=post_snapshot,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                    )
             except Exception as exc:
                 _raise_unexpected_started_turn_failure(
                     exc,

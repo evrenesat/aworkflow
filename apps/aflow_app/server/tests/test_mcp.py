@@ -23,7 +23,11 @@ from test_control_plane_api import (
     _answer_pending as _rest_answer_pending,
     _commit_fixture_repository,
     _prepared,
+    _recovery_payload,
+    _unresolved_recovery_runtime,
+    _seed_recovery_source,
     _seed_issue35_progress_fixture,
+    _source_artifact_bytes,
     _start_pending as _rest_start_pending,
     control_client as _control_client_fixture,  # noqa: F401
 )
@@ -299,6 +303,262 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     assert token_resource.status_code == 400
     assert token_resource.json() == {"detail": {"code": "token_payload_rejected"}}
     assert "super-secret-token" not in token_resource.text
+
+
+def test_mcp_durable_recovery_matches_rest_and_discovery(mcp_client) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = mcp_client
+    service = main._control_plane_service
+    assert service is not None
+    source_id, source_dir, _daemon = _seed_recovery_source(
+        service, root, monkeypatch
+    )
+    before = _source_artifact_bytes(source_dir)
+
+    tools = _mcp_request(client, "tools/list")["result"]["tools"]
+    resume_tool = next(tool for tool in tools if tool["name"] == "resume_run")
+    assert "recovery" in resume_tool["inputSchema"]["properties"]
+    assert "fresh provider session" in resume_tool["description"]
+    assert "confirmed inactive" in resume_tool["description"]
+
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume"
+    arguments = {
+        "project_id": PROJECT_ID,
+        "run_id": source_id,
+        "idempotency_key": "transport-recovery-1",
+        "extra_instructions": ["transport recovery guidance"],
+        "recovery": _recovery_payload(),
+    }
+    rest = client.post(
+        endpoint,
+        headers={"Idempotency-Key": arguments["idempotency_key"]},
+        json={
+            "extra_instructions": arguments["extra_instructions"],
+            "recovery": arguments["recovery"],
+        },
+    )
+    assert rest.status_code == 201, rest.text
+    successor_id = rest.json()["run_id"]
+    assert successor_id != source_id
+    assert units.start_calls and len(units.start_calls) == 1
+
+    mcp_replay = _mcp_tool(client, "resume_run", arguments)
+    assert mcp_replay["run_id"] == successor_id
+    assert mcp_replay["status"] == rest.json()["status"]
+    assert mcp_replay["created"] is False
+
+    rest_events = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{successor_id}/events"
+    )
+    assert rest_events.status_code == 200
+    mcp_events = _mcp_tool(
+        client,
+        "get_run_events",
+        {"project_id": PROJECT_ID, "run_id": successor_id},
+    )
+    assert mcp_events == rest_events.json()
+    assert any(
+        event["event_type"] == "recovery_requested"
+        and event["data"]["source_run_id"] == source_id
+        and event["data"]["target_selector"] == "codex.test"
+        for event in mcp_events["events"]
+    )
+
+    changed_target = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                **arguments,
+                "recovery": _recovery_payload("codex.other"),
+            },
+        },
+    )
+    assert changed_target["result"]["isError"] is True
+    assert changed_target["result"]["content"][0]["text"] == "idempotency_conflict"
+
+    invalid_recovery = {
+        "mode": "durable_evidence",
+        "worker_selector": "codex.test",
+        "run_state_path": "/tmp/run.json",
+        "provider_session_id": "source-session",
+    }
+    rest_invalid = client.post(
+        endpoint,
+        headers={"Idempotency-Key": "transport-invalid-1"},
+        json={"recovery": invalid_recovery},
+    )
+    assert rest_invalid.status_code == 422
+    rest_detail = rest_invalid.json()["detail"]
+    assert rest_detail["code"] == "recovery_target_invalid"
+    assert "target worker selector" in rest_detail["message"]
+    mcp_invalid = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": source_id,
+                "idempotency_key": "transport-invalid-2",
+                "recovery": invalid_recovery,
+            },
+        },
+    )
+    assert mcp_invalid["result"]["isError"] is True
+    mcp_detail = json.loads(mcp_invalid["result"]["content"][0]["text"])
+    assert mcp_detail == rest_detail
+
+    wrong_rest = client.post(
+        endpoint.replace(PROJECT_ID, "not-allowed"),
+        headers={"Idempotency-Key": "transport-wrong-project-rest"},
+        json={"recovery": _recovery_payload()},
+    )
+    assert wrong_rest.status_code == 404
+    assert wrong_rest.json() == {"detail": {"code": "project_not_found"}}
+    wrong_mcp = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                "project_id": "not-allowed",
+                "run_id": source_id,
+                "idempotency_key": "transport-wrong-project-mcp",
+                "recovery": _recovery_payload(),
+            },
+        },
+    )
+    assert wrong_mcp["result"]["isError"] is True
+    assert wrong_mcp["result"]["content"][0]["text"] == "project_not_found"
+
+    unauthenticated = client.post(
+        "/mcp",
+        headers={**MCP_HEADERS, "Authorization": ""},
+        json={"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}},
+    )
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json() == {"detail": {"code": "unauthorized"}}
+    assert len(units.start_calls) == 1
+    assert _source_artifact_bytes(source_dir) == before
+
+
+@pytest.mark.parametrize(
+    "worker_evidence",
+    ({"active": True}, None),
+    ids=("active-source", "unknown-source"),
+)
+def test_mcp_and_rest_recovery_reject_active_or_unknown_source(
+    mcp_client,
+    worker_evidence,
+) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = mcp_client
+    service = main._control_plane_service
+    assert service is not None
+    source_id, source_dir, _daemon = _seed_recovery_source(
+        service,
+        root,
+        monkeypatch,
+        source_id=f"{worker_evidence is None and 'unknown' or 'active'}-recovery-source",
+        worker_evidence=worker_evidence,
+    )
+    before = _source_artifact_bytes(source_dir)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume"
+    rest = client.post(
+        endpoint,
+        headers={"Idempotency-Key": "recovery-admission-rest"},
+        json={"recovery": _recovery_payload()},
+    )
+    assert rest.status_code == 422
+    rest_detail = rest.json()["detail"]
+    assert rest_detail["code"] == "recovery_source_activity"
+    assert "source activity" in rest_detail["message"]
+
+    mcp = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": source_id,
+                "idempotency_key": "recovery-admission-mcp",
+                "recovery": _recovery_payload(),
+            },
+        },
+    )
+    assert mcp["result"]["isError"] is True
+    assert json.loads(mcp["result"]["content"][0]["text"]) == rest_detail
+    assert units.start_calls == []
+    assert _source_artifact_bytes(source_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("operation_state", "malformed"),
+    (("in_flight", False), ("pending", False), ("in_flight", True)),
+    ids=("in-flight", "pending", "malformed"),
+)
+def test_mcp_and_rest_ordinary_resume_reject_unresolved_recovery_runtime(
+    mcp_client,
+    operation_state: str,
+    malformed: bool,
+) -> None:
+    from aflow_app_server import main
+
+    client, root, units, monkeypatch = mcp_client
+    service = main._control_plane_service
+    assert service is not None
+    source_id, source_dir, _daemon = _seed_recovery_source(
+        service,
+        root,
+        monkeypatch,
+        source_id=(
+            "mcp-ordinary-inflight-recovery-source"
+            if not malformed
+            else "mcp-ordinary-malformed-recovery-source"
+        ),
+    )
+    source_payload = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
+    source_payload["recovery_runtime"] = _unresolved_recovery_runtime(
+        source_id,
+        malformed=malformed,
+        operation_state=operation_state,
+    )
+    source_dir.joinpath("run.json").write_text(
+        json.dumps(source_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    before = _source_artifact_bytes(source_dir)
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{source_id}/resume"
+    rest = client.post(
+        endpoint,
+        headers={"Idempotency-Key": f"mcp-ordinary-rest-{malformed}"},
+        json={},
+    )
+    assert rest.status_code == 422
+    rest_detail = rest.json()["detail"]
+    assert rest_detail["code"] == "recovery_operation_unresolved"
+
+    mcp = _mcp_request(
+        client,
+        "tools/call",
+        {
+            "name": "resume_run",
+            "arguments": {
+                "project_id": PROJECT_ID,
+                "run_id": source_id,
+                "idempotency_key": f"mcp-ordinary-mcp-{malformed}",
+            },
+        },
+    )
+    assert mcp["result"]["isError"] is True
+    assert json.loads(mcp["result"]["content"][0]["text"]) == rest_detail
+    assert units.start_calls == []
+    assert _source_artifact_bytes(source_dir) == before
 
 
 def test_mcp_run_context_progress_matches_authenticated_rest(mcp_client) -> None:

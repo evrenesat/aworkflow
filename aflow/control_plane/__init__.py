@@ -18,6 +18,18 @@ from .models import (
     WorkflowCapability,
 )
 from .application import ControlPlaneApplication, compose_control_plane
+from .recovery import (
+    DurableEvidenceRecoveryRequest,
+    RecoveryEvidenceReference,
+    RecoveryIntent,
+    RecoveryPersistenceError,
+    RecoveryRequest,
+    RecoveryValidationError,
+    persist_recovery_intent,
+    read_recovery_intent,
+    recovery_artifact_digest,
+    recovery_intent_digest,
+)
 from .capabilities import CapabilityError, CapabilityService
 from .validation import ControlValidationError, validate_override_targets
 from .persistence import (
@@ -78,6 +90,16 @@ __all__ = [
     "WorkflowCapability",
     "ControlPlaneApplication",
     "compose_control_plane",
+    "DurableEvidenceRecoveryRequest",
+    "RecoveryEvidenceReference",
+    "RecoveryIntent",
+    "RecoveryPersistenceError",
+    "RecoveryRequest",
+    "RecoveryValidationError",
+    "persist_recovery_intent",
+    "read_recovery_intent",
+    "recovery_artifact_digest",
+    "recovery_intent_digest",
     "CapabilityError",
     "CapabilityService",
     "ControlValidationError",

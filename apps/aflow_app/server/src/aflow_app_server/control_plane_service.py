@@ -22,6 +22,7 @@ from aflow.control_plane import (
     ControlWriteResult,
     PlanRecord,
     ProjectRecord,
+    RecoveryRequest,
     RunControlRequest,
     RunEvent,
     RunPage,
@@ -438,6 +439,7 @@ class ControlPlaneService:
         *,
         idempotency_key: str | None,
         extra_instructions: tuple[str, ...] | None = None,
+        recovery: Mapping[str, object] | RecoveryRequest | None = None,
         caller_scope: str = "rest",
     ) -> StartRunResult:
         with self.project_lock(project_id):
@@ -446,6 +448,7 @@ class ControlPlaneService:
                 caller_scope=self._caller_scope(project_id, caller_scope),
                 idempotency_key=idempotency_key,
                 extra_instructions=extra_instructions,
+                recovery=recovery,
             )
 
     def _project(self, project_id: str) -> _ProjectDaemon:

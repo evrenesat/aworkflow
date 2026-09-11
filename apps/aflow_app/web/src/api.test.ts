@@ -215,6 +215,51 @@ describe('workflow control API client', () => {
     expect(window.localStorage.length).toBe(0); expect(window.sessionStorage.length).toBe(0)
   })
 
+  it('keeps ordinary resume bodyless and posts explicit durable recovery mode', async () => {
+    api.setAuthToken('test-token')
+    mockOkJson({ run_id: 'ordinary-successor', created: true, status: 'running', schema_version: 1 })
+    await api.resumeControlPlaneRun('control-project', 'source-run', 'ordinary-key')
+    const ordinaryOptions = vi.mocked(global.fetch).mock.calls.at(-1)![1] as RequestInit
+    expect(ordinaryOptions.body).toBeUndefined()
+
+    mockOkJson({ run_id: 'recovery-successor', created: true, status: 'running', schema_version: 1 })
+    await api.resumeControlPlaneRun('control-project', 'source-run', 'recovery-key', {
+      recovery: { mode: 'durable_evidence', worker_selector: 'muse.replacement' },
+    })
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      '/api/control-plane/projects/control-project/runs/source-run/resume',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ recovery: { mode: 'durable_evidence', worker_selector: 'muse.replacement' } }),
+        headers: expect.objectContaining({ 'Idempotency-Key': 'recovery-key' }),
+      }),
+    )
+  })
+
+  it('parses the bounded actionable durable-recovery rejection envelope', async () => {
+    const detail = {
+      code: 'recovery_source_activity',
+      message: 'Durable recovery requires confirmed inactive source ownership; source activity is unknown or active.',
+    }
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      text: async () => JSON.stringify({ detail }),
+    } as Response)
+
+    await expect(api.resumeControlPlaneRun(
+      'control-project',
+      'source-run',
+      'recovery-key',
+      { recovery: { mode: 'durable_evidence', worker_selector: 'muse.replacement' } },
+    )).rejects.toMatchObject({
+      status: 422,
+      code: detail.code,
+      message: detail.message,
+      detail,
+    })
+  })
+
   it('posts a paged read-only worktree preflight without an idempotency key', async () => {
     mockOkJson({
       checkout_path: '/workspace/project', execution_mode: 'same_checkout', dirty: true,

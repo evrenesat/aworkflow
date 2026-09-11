@@ -1,5 +1,27 @@
 # DEVLOG
 
+## 2026-09-11 — Recover explicitly with a replacement worker (issue 36)
+
+- Added durable-evidence recovery to canonical resume, REST, MCP, and the
+  dashboard. The owner selects a current configured worker; ordinary Resume
+  remains primary. The replacement starts fresh without source inference or
+  private session context, preserving exact worktree, checkpoints, pending
+  review and successor lineage.
+- Successor-owned intent and events bind exact evidence hashes. Admission and
+  worker preparation share fingerprint inputs and reject active, unknown or
+  unresolved operations. Ordinary continuation rejects unconsumed recovery;
+  the first session-capable result persists consumption and its exact session
+  together, protecting both sides of the crash boundary.
+- The dashboard retains rejected drafts and distinguishes requested recovery,
+  worker operation start and recorded session identity. REST/MCP expose bounded
+  actionable errors. Existing backup wrapper interfaces remain compatible.
+- Cumulative review resolved F1–F6. Independent final checks passed: 40 recovery
+  tests, 3 affected session tests, Ruff and whitespace validation. Retained
+  REST/MCP, web component/API, production build and Chromium/WebKit fake-provider
+  journeys remain valid; full suites belong to CI. No live provider calls or
+  historical-run mutations were used. Private evidence remains under
+  /root/code/evidence/aflow-dogfood-20260909/issue36-review-20260911/.
+
 ## 2026-09-11 — Preserve Unicode JSONL record boundaries (Checkpoint 1)
 
 - Changed shared session extraction, canonical session parsing, and Reasonix

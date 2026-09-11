@@ -19,6 +19,7 @@ from .api import (
     ExecutionEventType,
     ExecutionObserver,
     PreparedRun,
+    RecoveryRequest,
     PLAN_ADMISSION_ERROR_CODE,
     PLAN_ADMISSION_SAFE_MESSAGE,
     PlanAdmissionError,
@@ -42,6 +43,7 @@ from .api import (
 
 __all__ = [
     "PreparedRun",
+    "RecoveryRequest",
     "PlanAdmissionError",
     "PLAN_ADMISSION_ERROR_CODE",
     "PLAN_ADMISSION_SAFE_MESSAGE",

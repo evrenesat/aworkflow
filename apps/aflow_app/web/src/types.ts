@@ -413,6 +413,16 @@ export interface RunStatus {
   evidence: Record<string, unknown>
 }
 
+export interface RecoveryWorkerEvidence {
+  schema_version: 1
+  target_run_id: string
+  target_selector: string
+  operation_state: 'pending' | 'in_flight' | 'consumed'
+  operation_started: boolean
+  session_started: boolean
+  session_status: 'active' | 'handed_over' | 'closed' | null
+}
+
 export interface RunPage {
   runs: RunStatus[]
   next_cursor: string | null
@@ -491,6 +501,18 @@ export interface StartRunResult {
   manifest_path: string | null
   reason: string | null
   restarted_from_run_id: string | null
+}
+
+/** Explicit replacement-worker recovery; omitted means ordinary resume. */
+export interface RecoveryRequest {
+  mode: 'durable_evidence'
+  worker_selector: string
+}
+
+/** Optional body for the existing project-scoped resume route. */
+export interface ResumeRunRequest {
+  extra_instructions?: string[] | null
+  recovery?: RecoveryRequest | null
 }
 
 export interface StartRunRequest {

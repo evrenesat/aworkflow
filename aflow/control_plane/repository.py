@@ -10,6 +10,7 @@ import re
 from typing import Any, Mapping
 
 from aflow.run_state import load_override_request
+from aflow.recovery_runtime import RECOVERY_OPERATION_STATES, RECOVERY_RUNTIME_FIELDS
 
 from .models import (
     CONTROL_PLANE_SCHEMA_VERSION,
@@ -32,6 +33,7 @@ _PLAN_DIRECTORIES = (
     ("in-progress", "in_progress"),
     ("done", "done"),
 )
+_RECOVERY_SESSION_STATUSES = frozenset({"active", "handed_over", "closed"})
 
 
 class RepositoryError(PersistenceError):
@@ -50,6 +52,80 @@ def _bounded_limit(limit: int) -> int:
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE:
         raise RepositoryError(f"limit must be between 1 and {MAX_PAGE_SIZE}")
     return limit
+
+
+def _recovery_worker_evidence(
+    metadata: Mapping[str, Any], run_id: str
+) -> dict[str, object] | None:
+    """Project exact persisted replacement-worker evidence without secrets."""
+    runtime = metadata.get("recovery_runtime")
+    if not isinstance(runtime, Mapping) or set(runtime) != RECOVERY_RUNTIME_FIELDS:
+        return None
+    if (
+        runtime.get("schema_version") != 1
+        or runtime.get("mode") != "durable_evidence"
+        or runtime.get("target_run_id") != run_id
+        or runtime.get("source_session_context_transferred") is not False
+    ):
+        return None
+    source_run_id = runtime.get("source_run_id")
+    source_selector = runtime.get("source_selector")
+    target_selector = runtime.get("target_selector")
+    intent_digest = runtime.get("intent_digest")
+    brief_sha256 = runtime.get("brief_sha256")
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in (source_run_id, source_selector, target_selector)
+    ):
+        return None
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in (intent_digest, brief_sha256)
+    ):
+        return None
+    operation_state = runtime.get("operation_state")
+    consumed = runtime.get("consumed")
+    if (
+        operation_state not in RECOVERY_OPERATION_STATES
+        or not isinstance(consumed, bool)
+        or consumed != (operation_state == "consumed")
+        or "." not in source_selector
+        or "." not in target_selector
+    ):
+        return None
+
+    session_started = False
+    session_status: str | None = None
+    sessions = metadata.get("active_role_sessions")
+    if isinstance(sessions, list):
+        for session in sessions:
+            if not isinstance(session, Mapping):
+                continue
+            if session.get("role") != "worker" or session.get("selector") != target_selector:
+                continue
+            status = session.get("status")
+            session_id = session.get("session_id")
+            if (
+                isinstance(session_id, str)
+                and bool(session_id.strip())
+                and status in _RECOVERY_SESSION_STATUSES
+            ):
+                session_started = True
+                session_status = status
+                break
+
+    return {
+        "schema_version": 1,
+        "target_run_id": run_id,
+        "target_selector": target_selector,
+        "operation_state": operation_state,
+        "operation_started": operation_state in {"in_flight", "consumed"},
+        "session_started": session_started,
+        "session_status": session_status,
+    }
 
 
 class RunRepository:
@@ -191,6 +267,7 @@ class RunRepository:
             "completed", "failed", "interrupted", "owner_stopped"
         } else None
         from .worker_diagnostics import project_worker_status
+        recovery_worker = _recovery_worker_evidence(metadata, valid)
 
         result = RunStatus(
             run_id=valid,
@@ -223,6 +300,7 @@ class RunRepository:
                 "startup_failure": failure,
                 "no_agent_started": status != "running" and not metadata and phase in {None, "manifest_only"},
                 "overrides": self._override_summary(run_dir, metadata),
+                **({"recovery_worker": recovery_worker} if recovery_worker is not None else {}),
             },
         )
         return project_activity(project_worker_status(result, self.repo_root) if Path(manifest.project_root).resolve() == self.repo_root else result)

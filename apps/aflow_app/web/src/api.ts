@@ -12,6 +12,7 @@ import type {
   ProjectCreateResult,
   ProjectDiscovery,
   ProjectInfo,
+  ResumeRunRequest,
   ControlPlaneCapabilities,
   ControlPlanePlan,
   ControlPlaneProject,
@@ -515,10 +516,18 @@ export async function resumeControlPlaneRun(
   projectId: string,
   runId: string,
   idempotencyKey: string,
+  request?: ResumeRunRequest,
 ): Promise<StartRunResult> {
+  const options: RequestInit = {
+    method: 'POST',
+    headers: withIdempotency(undefined, idempotencyKey),
+  }
+  // Keep the legacy ordinary-resume request bodyless. The canonical route
+  // treats an omitted body as the existing handover/resume behavior.
+  if (request !== undefined) options.body = JSON.stringify(request)
   return fetchJson<StartRunResult>(
     `${controlProjectPath(projectId)}/runs/${encodeURIComponent(runId)}/resume`,
-    { method: 'POST', headers: withIdempotency(undefined, idempotencyKey) },
+    options,
   )
 }
 

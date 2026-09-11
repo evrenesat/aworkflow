@@ -1516,6 +1516,47 @@ class RunMetadataWriter:
             durable_state = ControllerState(last_snapshot=PlanSnapshot(None, 0, 0, False))
         payload.update(manager_state_payload(durable_state))
         payload.update(hotplug_state_payload(durable_state))
+        recovery_context = durable_state.recovery_context
+        if recovery_context is not None:
+            intent_to_dict = getattr(recovery_context.intent, "to_dict", None)
+            if not callable(intent_to_dict):
+                raise ValueError("recovery runtime intent is not serializable")
+            intent_payload = intent_to_dict()
+            if not isinstance(intent_payload, Mapping):
+                raise ValueError("recovery runtime intent must be a mapping")
+            operation_state = (
+                durable_state.recovery_operation_state
+                or recovery_context.operation_state
+            )
+            consumed = (
+                durable_state.recovery_consumed
+                if durable_state.recovery_operation_state is not None
+                else recovery_context.consumed
+            )
+            if operation_state not in {"pending", "in_flight", "consumed"}:
+                raise ValueError("recovery runtime operation state is invalid")
+            if consumed != (operation_state == "consumed"):
+                raise ValueError("recovery runtime consumed state is inconsistent")
+            payload["recovery_runtime"] = {
+                "schema_version": 1,
+                "mode": intent_payload.get("mode"),
+                "source_run_id": intent_payload.get("source_run_id"),
+                "target_run_id": intent_payload.get("target_run_id"),
+                "source_selector": intent_payload.get("source_selector"),
+                "target_selector": intent_payload.get("target_selector"),
+                "intent_digest": recovery_context.intent_digest,
+                "brief_sha256": hashlib.sha256(
+                    recovery_context.brief.encode("utf-8")
+                ).hexdigest(),
+                "source_session_context_transferred": False,
+                "consumed": consumed,
+                "operation_state": operation_state,
+            }
+        elif isinstance(previous.get("recovery_runtime"), Mapping):
+            # A restart of an already-consumed replacement must retain its
+            # provenance even though the fresh ResumeContext no longer carries
+            # the one-shot brief.
+            payload["recovery_runtime"] = previous["recovery_runtime"]
         if end_reason is not None:
             payload["end_reason"] = end_reason
         if failure_reason is not None:

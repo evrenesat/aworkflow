@@ -7,6 +7,7 @@ terminal connection.  The workflow controller remains the authority for its
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 import fcntl
@@ -21,7 +22,7 @@ import sys
 import tempfile
 from threading import Event, RLock
 import time
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, NoReturn
 
 from aflow.api.models import (
     PreparedRun,
@@ -50,6 +51,11 @@ from aflow.run_config_snapshot import (
 from aflow.control_plane import (
     ControlConflictError,
     ControlPlaneApplication,
+    RecoveryEvidenceReference,
+    RecoveryIntent,
+    RecoveryPersistenceError,
+    RecoveryRequest,
+    RecoveryValidationError,
     LaunchManifest,
     ReconciliationResult,
     RunControlRequest,
@@ -61,6 +67,11 @@ from aflow.control_plane import (
     append_run_event,
     compose_control_plane,
     create_launch_manifest,
+    persist_recovery_intent,
+    read_events,
+    read_recovery_intent,
+    recovery_intent_digest,
+    recovery_artifact_digest,
     reserve_run_id,
     validate_run_id,
     write_launch_phase,
@@ -72,6 +83,12 @@ from aflow.control_plane.persistence import (
 )
 from aflow.control_plane.units import UnitManager, UnitState
 from aflow.git_status import WorktreePreflight
+from aflow.harnesses import ADAPTERS
+from aflow.hotplug import workspace_fingerprint
+from aflow.recovery_runtime import (
+    RecoveryRuntimeValidationError,
+    validate_recovery_runtime,
+)
 
 
 _START_RECORD_SCHEMA_VERSION = 1
@@ -87,6 +104,82 @@ _logger = logging.getLogger(__name__)
 
 class DaemonError(RuntimeError):
     """The daemon cannot safely carry out a lifecycle operation."""
+
+
+_RECOVERY_REJECTION_MESSAGES = {
+    "recovery_source_state": (
+        "Durable recovery requires a failed, interrupted, or owner-stopped "
+        "source with exact terminal evidence."
+    ),
+    "recovery_source_activity": (
+        "Durable recovery requires confirmed inactive source ownership; "
+        "source activity is unknown or active."
+    ),
+    "recovery_operation_unresolved": (
+        "Durable recovery has unknown liveness or prior turn evidence; "
+        "reconcile the operation before retrying."
+    ),
+    "recovery_target_invalid": (
+        "The explicitly selected durable-recovery target worker selector is "
+        "not configured in the current settings."
+    ),
+    "recovery_evidence_unavailable": (
+        "Durable recovery evidence bytes changed or are unavailable; "
+        "refresh the source run before retrying."
+    ),
+}
+
+
+class DurableRecoveryRejection(DaemonError):
+    """A safe, actionable rejection of an explicit recovery admission."""
+
+    def __init__(self, code: str) -> None:
+        try:
+            message = _RECOVERY_REJECTION_MESSAGES[code]
+        except KeyError as exc:
+            raise ValueError("unknown durable recovery rejection code") from exc
+        self.code = code
+        super().__init__(message)
+
+
+def _reject_recovery(code: str) -> NoReturn:
+    raise DurableRecoveryRejection(code)
+
+
+def _recovery_fingerprint_plan_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
+    """Normalize the exact Markdown evidence inputs used by both boundaries."""
+    normalized: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        candidate = Path(path).resolve()
+        if candidate.suffix.lower() != ".md" or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return tuple(normalized)
+
+
+def _validate_recovery_runtime_shape(
+    raw_runtime: object,
+    *,
+    expected_source_run_id: str | None = None,
+    expected_target_run_id: str | None = None,
+    expected_intent: RecoveryIntent | None = None,
+    expected_intent_digest: str | None = None,
+    allow_pending: bool = True,
+) -> tuple[str, bool]:
+    """Validate the shared marker and retain the daemon's typed error contract."""
+    try:
+        return validate_recovery_runtime(
+            raw_runtime,
+            expected_source_run_id=expected_source_run_id,
+            expected_target_run_id=expected_target_run_id,
+            expected_intent=expected_intent,
+            expected_intent_digest=expected_intent_digest,
+            allow_pending=allow_pending,
+        )
+    except RecoveryRuntimeValidationError as exc:
+        raise DurableRecoveryRejection("recovery_operation_unresolved") from exc
 
 
 class DaemonStartupError(DaemonError):
@@ -609,10 +702,17 @@ class DaemonService:
         caller_scope: str = "local",
         idempotency_key: str | None = None,
         extra_instructions: tuple[str, ...] | None = None,
+        recovery: Mapping[str, object] | RecoveryRequest | None = None,
     ) -> StartRunResult:
         """Launch one validated continuation; the source unit is never restarted."""
         if extra_instructions is not None:
             _validate_extra_instructions(extra_instructions)
+        try:
+            normalized_recovery = RecoveryRequest.from_value(recovery)
+        except RecoveryValidationError as exc:
+            if recovery is not None:
+                raise DurableRecoveryRejection("recovery_target_invalid") from exc
+            raise DaemonError(str(exc)) from exc
         normalized_source_run_id = validate_run_id(source_run_id)
         requested_extra_digest = (
             _extra_instructions_digest(extra_instructions)
@@ -632,6 +732,18 @@ class DaemonService:
                 if pending.get("resumed_from_run_id") != normalized_source_run_id:
                     raise DaemonIdempotencyConflict(
                         "resume idempotency key was reused for a different source run"
+                    )
+                try:
+                    stored_recovery = RecoveryRequest.from_value(
+                        pending.get("recovery")
+                    )
+                except RecoveryValidationError as exc:
+                    raise DaemonError(
+                        "resume record has an invalid recovery request"
+                    ) from exc
+                if stored_recovery != normalized_recovery:
+                    raise DaemonIdempotencyConflict(
+                        "resume idempotency key was reused for a different recovery request"
                     )
                 stored_extra_digest = _record_extra_instructions_digest(pending)
                 provided = pending.get("resume_extra_instructions_provided", False)
@@ -655,39 +767,53 @@ class DaemonService:
                     ] = extra_instructions
                 return self._recover_resume_record(pending)
             source = self._application.repository.get_run_status(normalized_source_run_id)
-            worker = source.evidence.get("worker")
-            if isinstance(worker, Mapping) and not confirmed_inactive(worker):
-                raise DaemonError("source worker activity could not be confirmed inactive")
-            if source.ownership != "control_plane":
-                raise DaemonError("legacy runs cannot be resumed by the control plane")
-            unit_name = _unit_name(normalized_source_run_id)
-            observed = self._application.units.get(unit_name)
-            if observed is not None and observed.name != unit_name:
-                raise DaemonError("source workflow unit identity is ambiguous")
-            if observed is not None and observed.is_active:
-                raise DaemonError("an active workflow unit cannot be resumed")
-            if source.launch_phase in {"manifest_only", "launch_requested"}:
-                raise DaemonError(
-                    "source run has an incomplete or ambiguous launch attempt"
+            _validate_persisted_recovery_runtime(
+                self._application.repository.run_directory(normalized_source_run_id),
+                expected_run_id=normalized_source_run_id,
+                allow_pending=False,
+                missing_ok=True,
+            )
+            if normalized_recovery is None:
+                worker = source.evidence.get("worker")
+                if isinstance(worker, Mapping) and not confirmed_inactive(worker):
+                    raise DaemonError("source worker activity could not be confirmed inactive")
+                if source.ownership != "control_plane":
+                    raise DaemonError("legacy runs cannot be resumed by the control plane")
+                unit_name = _unit_name(normalized_source_run_id)
+                observed = self._application.units.get(unit_name)
+                if observed is not None and observed.name != unit_name:
+                    raise DaemonError("source workflow unit identity is ambiguous")
+                if observed is not None and observed.is_active:
+                    raise DaemonError("an active workflow unit cannot be resumed")
+                if source.launch_phase in {"manifest_only", "launch_requested"}:
+                    raise DaemonError(
+                        "source run has an incomplete or ambiguous launch attempt"
+                    )
+                if (
+                    source.launch_phase == "launch_started"
+                    and source.status != "needs_attention"
+                    and not source.evidence.get("controller_terminal")
+                ):
+                    raise DaemonError(
+                        "a killed launched run must be reconciled before explicit resume"
+                    )
+                if source.status not in {
+                    "running",
+                    "failed",
+                    "interrupted",
+                    "needs_attention",
+                    "waiting_for_valid_override",
+                }:
+                    raise DaemonError(
+                        "source run is incomplete, terminal, or lacks safe resume evidence"
+                    )
+            else:
+                self._admit_recovery_source(
+                    normalized_source_run_id,
+                    source,
                 )
-            if (
-                source.launch_phase == "launch_started"
-                and source.status != "needs_attention"
-                and not source.evidence.get("controller_terminal")
-            ):
-                raise DaemonError(
-                    "a killed launched run must be reconciled before explicit resume"
-                )
-            if source.status not in {
-                "running",
-                "failed",
-                "interrupted",
-                "needs_attention",
-                "waiting_for_valid_override",
-            }:
-                raise DaemonError(
-                    "source run is incomplete, terminal, or lacks safe resume evidence"
-                )
+                self._refresh_workflow_config()
+                self._validate_recovery_target(normalized_recovery)
             bootstrap = self._resume_bootstrap(
                 normalized_source_run_id,
                 extra_instructions=extra_instructions or (),
@@ -733,6 +859,19 @@ class DaemonService:
             )
             request_digest = normalized_request_digest(manifest)
 
+            recovery_intent = (
+                self._build_recovery_intent(
+                    source_run_id=normalized_source_run_id,
+                    target_run_id=run_id,
+                    source=source,
+                    source_manifest=source_manifest,
+                    bootstrap=bootstrap,
+                    target_request=normalized_recovery,
+                )
+                if normalized_recovery is not None
+                else None
+            )
+
             record = self._new_start_record(
                 run_id=run_id,
                 request=None,
@@ -749,10 +888,35 @@ class DaemonService:
                 resume_extra_instructions_digest=_extra_instructions_digest(
                     bootstrap.extra_instructions
                 ),
+                recovery=normalized_recovery,
             )
             record["manifest_request_digest"] = normalized_request_digest(manifest)
+            if recovery_intent is not None:
+                record["recovery_intent_digest"] = recovery_intent_digest(
+                    recovery_intent
+                )
+
+                # The launch manifest is immutable and must exist before the
+                # successor directory is created.  The intent itself is
+                # published by the replay-safe recovery path below, after the
+                # startup record has an identity that can be retried.
+                try:
+                    create_launch_manifest(self._config.repo_root, manifest)
+                except (ValueError, RunIdentityConflict) as exc:
+                    raise DaemonError(
+                        f"cannot reserve recovery launch intent: {exc}"
+                    ) from exc
+                successor_dir = self._application.repository.run_directory(run_id)
+                if successor_dir.exists() and not successor_dir.is_dir():
+                    raise DaemonError("recovery successor run directory is unsafe")
+                successor_dir.mkdir(parents=True, exist_ok=False)
             self._create_record(record)
-            return self._recover_resume_record(record, prepared=prepared, created=True)
+            return self._recover_resume_record(
+                record,
+                prepared=prepared,
+                created=True,
+                recovery_intent=recovery_intent,
+            )
 
     def run_status(self, run_id: str) -> RunStatus:
         """Project a persisted startup question into canonical run status."""
@@ -1044,6 +1208,7 @@ class DaemonService:
         source_invocation_digest: str | None = None,
         resume_extra_instructions_provided: bool | None = None,
         resume_extra_instructions_digest: str | None = None,
+        recovery: RecoveryRequest | None = None,
     ) -> dict[str, object]:
         record: dict[str, object] = {
             "schema_version": _START_RECORD_SCHEMA_VERSION,
@@ -1103,6 +1268,8 @@ class DaemonService:
             record["resume_extra_instructions_digest"] = (
                 resume_extra_instructions_digest
             )
+        if recovery is not None:
+            record["recovery"] = recovery.to_dict()
         return record
 
     def _advance_start_preparation_locked(
@@ -1337,6 +1504,7 @@ class DaemonService:
         *,
         prepared: PreparedRun | None = None,
         created: bool = False,
+        recovery_intent: RecoveryIntent | None = None,
     ) -> StartRunResult:
         run_id = validate_run_id(str(record["run_id"]))
         with self._startup_record_lock(run_id):
@@ -1344,6 +1512,7 @@ class DaemonService:
                 self._read_record(run_id),
                 prepared=prepared,
                 created=created,
+                recovery_intent=recovery_intent,
             )
 
     def _recover_resume_record_locked(
@@ -1352,6 +1521,7 @@ class DaemonService:
         *,
         prepared: PreparedRun | None = None,
         created: bool = False,
+        recovery_intent: RecoveryIntent | None = None,
     ) -> StartRunResult:
         """Finish only the manifest-only gap belonging to one resume record."""
         if record.get("operation") != "resume" or record.get("mode") != "resume":
@@ -1359,11 +1529,25 @@ class DaemonService:
         run_id = validate_run_id(str(record["run_id"]))
         if record.get("state") == "unit_started":
             return self._existing_start_result(run_id)
+        source_run_id = validate_run_id(str(record["resumed_from_run_id"]))
+        recovery_request = _recovery_request_from_record(record)
+        source: RunStatus | None = None
+        if recovery_request is None:
+            _validate_persisted_recovery_runtime(
+                self._application.repository.run_directory(source_run_id),
+                expected_run_id=source_run_id,
+                allow_pending=False,
+                missing_ok=True,
+            )
+        else:
+            source = self._application.repository.get_run_status(source_run_id)
+            self._admit_recovery_source(source_run_id, source)
+            self._refresh_workflow_config()
+            self._validate_recovery_target(recovery_request)
         resume_extra, resume_extra_provided = self._resume_extra_override_for_record(
             record
         )
         if prepared is None:
-            source_run_id = validate_run_id(str(record["resumed_from_run_id"]))
             bootstrap = self._resume_bootstrap(
                 source_run_id,
                 extra_instructions=resume_extra,
@@ -1397,6 +1581,32 @@ class DaemonService:
                 extra_instructions=resume_extra,
                 extra_instructions_provided=resume_extra_provided,
             )
+        if recovery_request is not None:
+            if source is None:
+                raise DaemonError("recovery source state disappeared during replay")
+            if recovery_intent is None:
+                source_manifest = self._application.repository.get_launch_manifest(
+                    source_run_id
+                )
+                if source_manifest is None:
+                    raise DaemonError(
+                        "source run has no control-plane launch manifest"
+                    )
+                recovery_intent = self._build_recovery_intent(
+                    source_run_id=source_run_id,
+                    target_run_id=run_id,
+                    source=source,
+                    source_manifest=source_manifest,
+                    bootstrap=bootstrap,
+                    target_request=recovery_request,
+                )
+            expected_intent_digest = record.get("recovery_intent_digest")
+            if expected_intent_digest is not None and (
+                expected_intent_digest != recovery_intent_digest(recovery_intent)
+            ):
+                raise DaemonError(
+                    "recovery record no longer matches its immutable evidence intent"
+                )
         self._transient_extra_instructions[run_id] = prepared.extra_instructions
         manifest = self._manifest_for(
             run_id=run_id,
@@ -1434,7 +1644,12 @@ class DaemonService:
                 )
         self._assert_manifest_accepts_prepared(persisted_manifest, record, prepared)
         mutable = dict(record)
-        if not mutable.get("source_audited"):
+        if recovery_request is not None:
+            mutable = self._persist_recovery_provenance(
+                mutable,
+                recovery_intent,
+            )
+        elif not mutable.get("source_audited"):
             source_run_id = validate_run_id(str(mutable["resumed_from_run_id"]))
             append_run_event(
                 self._application.repository.run_directory(source_run_id),
@@ -1447,6 +1662,312 @@ class DaemonService:
             mutable["source_audited"] = True
             self._write_record(mutable)
         return self._launch_prepared_locked(mutable, prepared, created=created)
+
+    def _admit_recovery_source(
+        self,
+        source_run_id: str,
+        source: RunStatus,
+    ) -> None:
+        """Fail closed unless durable evidence proves a recoverable source."""
+        if source.ownership != "control_plane":
+            _reject_recovery("recovery_source_state")
+        if source.status not in {"failed", "interrupted", "owner_stopped"}:
+            _reject_recovery("recovery_source_state")
+        worker = source.evidence.get("worker")
+        if not isinstance(worker, Mapping) or not confirmed_inactive(worker):
+            _reject_recovery("recovery_source_activity")
+
+        unit_name = _unit_name(source_run_id)
+        observed = self._application.units.get(unit_name)
+        if observed is not None and observed.name != unit_name:
+            _reject_recovery("recovery_source_activity")
+        if observed is not None and observed.is_active:
+            _reject_recovery("recovery_source_activity")
+        if source.evidence.get("unit_observation") in {
+            "identity_mismatch",
+            "unavailable",
+        }:
+            _reject_recovery("recovery_source_activity")
+
+        if source.status == "owner_stopped":
+            if source.launch_phase != "owner_stopped":
+                _reject_recovery("recovery_source_state")
+        else:
+            if source.launch_phase in {None, "manifest_only", "launch_requested"}:
+                _reject_recovery("recovery_source_state")
+            if (
+                source.launch_phase not in {"failed", "interrupted"}
+                and source.evidence.get("controller_terminal") is not True
+            ):
+                _reject_recovery("recovery_source_state")
+            if (
+                source.launch_phase == "launch_started"
+                and source.evidence.get("controller_terminal") is not True
+            ):
+                _reject_recovery("recovery_source_state")
+
+        try:
+            source_dir = self._application.repository.run_directory(source_run_id)
+        except (ValueError, OSError) as exc:
+            raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+        _validate_persisted_recovery_runtime(
+            source_dir,
+            expected_run_id=source_run_id,
+            allow_pending=False,
+            missing_ok=False,
+        )
+        if source.status == "owner_stopped" and not any(
+            event.event_type == "owner_stopped"
+            for event in read_events(source_dir, limit=1_000)
+        ):
+            _reject_recovery("recovery_source_state")
+
+    def _validate_recovery_target(self, request: RecoveryRequest) -> None:
+        """Validate only the explicitly selected current target profile."""
+        harness, separator, _profile = request.worker_selector.partition(".")
+        if not separator or harness not in ADAPTERS:
+            _reject_recovery("recovery_target_invalid")
+        from aflow.workflow import WorkflowError, resolve_profile
+
+        try:
+            resolve_profile(
+                request.worker_selector,
+                self._workflow_config,
+                step_path="resume.recovery.worker",
+            )
+        except (WorkflowError, KeyError, TypeError, ValueError) as exc:
+            raise DurableRecoveryRejection("recovery_target_invalid") from exc
+
+    def _build_recovery_intent(
+        self,
+        *,
+        source_run_id: str,
+        target_run_id: str,
+        source: RunStatus,
+        source_manifest: LaunchManifest,
+        bootstrap: Any,
+        target_request: RecoveryRequest | None,
+    ) -> RecoveryIntent:
+        """Bind exact source evidence without consulting a provider."""
+        if target_request is None:
+            _reject_recovery("recovery_target_invalid")
+
+        from aflow.run_state import ResumeContext
+        from aflow.workflow import WorkflowError, _validate_branch_resume_context, _validate_worktree_resume_context
+
+        context = getattr(bootstrap, "resume_context", None)
+        if not isinstance(context, ResumeContext):
+            _reject_recovery("recovery_evidence_unavailable")
+
+        repo_root = self._config.repo_root.resolve()
+        if Path(source_manifest.project_root).resolve() != repo_root:
+            _reject_recovery("recovery_evidence_unavailable")
+        if source_manifest.intended_unit not in {None, _unit_name(source_run_id)}:
+            _reject_recovery("recovery_evidence_unavailable")
+        source_dir = self._application.repository.run_directory(source_run_id)
+        evidence: list[RecoveryEvidenceReference] = []
+        evidence_file_paths: list[Path] = []
+
+        def add_file(
+            path: Path,
+            *,
+            expected: bytes | None = None,
+        ) -> None:
+            requested = Path(path)
+            if requested.is_symlink():
+                _reject_recovery("recovery_evidence_unavailable")
+            try:
+                resolved = requested.resolve(strict=True)
+                resolved.relative_to(repo_root)
+                data = resolved.read_bytes()
+            except (OSError, ValueError) as exc:
+                raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+            if not resolved.is_file():
+                _reject_recovery("recovery_evidence_unavailable")
+            if expected is not None and data != expected:
+                _reject_recovery("recovery_evidence_unavailable")
+            relative = resolved.relative_to(repo_root).as_posix()
+            reference = RecoveryEvidenceReference(
+                path=relative,
+                sha256=hashlib.sha256(data).hexdigest(),
+                size=len(data),
+            )
+            for existing in evidence:
+                if existing.path == reference.path:
+                    if existing != reference:
+                        _reject_recovery("recovery_evidence_unavailable")
+                    return
+            evidence.append(reference)
+            evidence_file_paths.append(resolved)
+
+        source_run_json = source_dir / "run.json"
+        add_file(source_run_json)
+        add_file(
+            self._config.repo_root
+            / ".aflow"
+            / "launches"
+            / f"{validate_run_id(source_run_id)}.json"
+        )
+
+        plan_path = Path(getattr(bootstrap, "plan_path", ""))
+        add_file(plan_path)
+        active_plan_path = context.active_plan_path
+        if active_plan_path is not None:
+            add_file(Path(active_plan_path))
+
+        setup = tuple(context.setup)
+        if any(item not in {"branch", "worktree"} for item in setup):
+            _reject_recovery("recovery_evidence_unavailable")
+        if "worktree" in setup:
+            try:
+                _validate_worktree_resume_context(repo_root, context)
+            except (WorkflowError, OSError, ValueError) as exc:
+                raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+            execution_root = context.worktree_path
+        elif "branch" in setup:
+            try:
+                _validate_branch_resume_context(repo_root, context)
+            except (WorkflowError, OSError, ValueError) as exc:
+                raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+            execution_root = repo_root
+        else:
+            execution_root = repo_root
+        if execution_root is None or not Path(execution_root).is_dir():
+            _reject_recovery("recovery_evidence_unavailable")
+
+        for transaction in (
+            context.current_hotplug_transaction,
+            context.pending_hotplug_transaction,
+        ):
+            if transaction is not None and transaction.stage not in {"applied", "failed"}:
+                _reject_recovery("recovery_operation_unresolved")
+
+        scope = context.active_implementation_scope
+        if scope is not None:
+            envelope_bytes = context.scope_envelope_bytes
+            envelope_path = context.scope_envelope_source_path
+            if not isinstance(envelope_bytes, bytes) or not envelope_bytes:
+                _reject_recovery("recovery_evidence_unavailable")
+            if not isinstance(envelope_path, str) or not envelope_path.strip():
+                _reject_recovery("recovery_evidence_unavailable")
+            try:
+                Path(envelope_path).resolve(strict=True).relative_to(source_dir.resolve())
+            except (OSError, ValueError) as exc:
+                raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+            add_file(Path(envelope_path), expected=envelope_bytes)
+            for relative_path, artifact_bytes in context.scope_evidence_artifact_bytes.items():
+                if not isinstance(relative_path, str) or not isinstance(artifact_bytes, bytes):
+                    _reject_recovery("recovery_evidence_unavailable")
+                candidate = (source_dir / relative_path).resolve()
+                try:
+                    candidate.relative_to(source_dir.resolve())
+                except ValueError as exc:
+                    raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+                add_file(candidate, expected=artifact_bytes)
+            for relative_path, artifact_bytes in context.repartition_artifact_bytes.items():
+                if not isinstance(relative_path, str) or not isinstance(artifact_bytes, bytes):
+                    _reject_recovery("recovery_evidence_unavailable")
+                candidate = (source_dir / relative_path).resolve()
+                try:
+                    candidate.relative_to(source_dir.resolve())
+                except ValueError as exc:
+                    raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+                add_file(candidate, expected=artifact_bytes)
+
+        fingerprint = workspace_fingerprint(
+            Path(execution_root),
+            _recovery_fingerprint_plan_paths(evidence_file_paths),
+        )
+        fingerprint_digest = fingerprint.get("sha256")
+        if not isinstance(fingerprint_digest, str) or len(fingerprint_digest) != 64:
+            _reject_recovery("recovery_evidence_unavailable")
+        workspace_path = Path(execution_root).resolve()
+        evidence.append(
+            RecoveryEvidenceReference(
+                path=f"worktree:{workspace_path}",
+                sha256=fingerprint_digest,
+                kind="workspace",
+            )
+        )
+
+        source_selector, selector_path = _source_worker_selector(
+            source=source,
+            run_json_path=source_run_json,
+            # Read the source authority directly.  A bootstrap object is
+            # useful for continuation state, but must not be able to smuggle
+            # selector evidence from another run into this artifact.
+            run_json=None,
+            context=context,
+            source_dir=source_dir,
+        )
+        if "." not in source_selector:
+            _reject_recovery("recovery_evidence_unavailable")
+        if selector_path is not None:
+            add_file(selector_path)
+
+        try:
+            return RecoveryIntent(
+                source_run_id=validate_run_id(source_run_id),
+                target_run_id=validate_run_id(target_run_id),
+                source_selector=source_selector,
+                target_selector=target_request.worker_selector,
+                evidence=tuple(evidence),
+                source_session_context_transferred=False,
+            )
+        except RecoveryValidationError as exc:
+            raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+
+    def _persist_recovery_provenance(
+        self,
+        record: Mapping[str, object],
+        intent: RecoveryIntent | None,
+    ) -> dict[str, object]:
+        """Publish successor artifact and event exactly once."""
+        if intent is None:
+            raise DaemonError("recovery provenance is missing its intent")
+        run_id = validate_run_id(str(record["run_id"]))
+        run_dir = self._application.repository.run_directory(run_id)
+        try:
+            artifact_path, artifact_sha256 = persist_recovery_intent(run_dir, intent)
+        except RecoveryPersistenceError as exc:
+            raise DaemonError(str(exc)) from exc
+
+        mutable = dict(record)
+        for field_name, expected in (
+            ("recovery_artifact_path", artifact_path),
+            ("recovery_artifact_sha256", artifact_sha256),
+        ):
+            existing = mutable.get(field_name)
+            if existing is not None and existing != expected:
+                raise DaemonError("recovery record does not match its durable artifact")
+            mutable[field_name] = expected
+
+        event_payload = {
+            "schema_version": intent.schema_version,
+            "mode": intent.mode,
+            "source_run_id": intent.source_run_id,
+            "target_run_id": intent.target_run_id,
+            "source_selector": intent.source_selector,
+            "target_selector": intent.target_selector,
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha256,
+            "evidence": [item.to_dict() for item in intent.evidence],
+            "source_session_context_transferred": False,
+        }
+        existing_events = read_events(run_dir, limit=1_000)
+        recovery_events = [
+            event for event in existing_events if event.event_type == "recovery_requested"
+        ]
+        if recovery_events:
+            if any(event.data != event_payload for event in recovery_events):
+                raise DaemonError(
+                    "successor recovery event does not match its durable intent"
+                )
+        else:
+            append_run_event(run_dir, "recovery_requested", event_payload)
+        mutable["recovery_event_recorded"] = True
+        self._write_record(mutable)
+        return mutable
 
     def _initial_manifest_for(
         self,
@@ -2360,6 +2881,591 @@ def worker_main(
     return 0
 
 
+def _recovery_file_reference_path(repo_root: Path, reference: RecoveryEvidenceReference) -> Path:
+    """Resolve one successor evidence reference without following unsafe paths."""
+    relative = Path(reference.path)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        _reject_recovery("recovery_evidence_unavailable")
+    if any(part in {"", "."} for part in relative.parts):
+        _reject_recovery("recovery_evidence_unavailable")
+    candidate = repo_root / relative
+    if candidate.is_symlink():
+        _reject_recovery("recovery_evidence_unavailable")
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(repo_root.resolve())
+        data = resolved.read_bytes()
+    except (OSError, ValueError) as exc:
+        raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+    if not resolved.is_file():
+        _reject_recovery("recovery_evidence_unavailable")
+    if len(data) != reference.size or hashlib.sha256(data).hexdigest() != reference.sha256:
+        _reject_recovery("recovery_evidence_unavailable")
+    return resolved
+
+
+def _validate_recovery_evidence_for_worker(
+    repo_root: Path,
+    intent: RecoveryIntent,
+) -> tuple[tuple[Path, ...], dict[str, object]]:
+    """Recheck the immutable evidence immediately before target launch."""
+    file_paths: list[Path] = []
+    workspace_reference: RecoveryEvidenceReference | None = None
+    for reference in intent.evidence:
+        if reference.kind == "file":
+            file_paths.append(_recovery_file_reference_path(repo_root, reference))
+        elif workspace_reference is None:
+            workspace_reference = reference
+        else:
+            _reject_recovery("recovery_evidence_unavailable")
+    if workspace_reference is None or not workspace_reference.path.startswith("worktree:"):
+        _reject_recovery("recovery_evidence_unavailable")
+    workspace_text = workspace_reference.path.removeprefix("worktree:")
+    if not workspace_text.strip():
+        _reject_recovery("recovery_evidence_unavailable")
+    workspace = Path(workspace_text)
+    if workspace.is_symlink() or not workspace.is_dir():
+        _reject_recovery("recovery_evidence_unavailable")
+    plan_paths = _recovery_fingerprint_plan_paths(file_paths)
+    observed = workspace_fingerprint(workspace, plan_paths)
+    if observed.get("sha256") != workspace_reference.sha256:
+        _reject_recovery("recovery_evidence_unavailable")
+    if workspace_reference.size != 0:
+        _reject_recovery("recovery_evidence_unavailable")
+    return tuple(file_paths), {
+        "workspace": workspace,
+        "workspace_fingerprint": observed,
+    }
+
+
+def _read_recovery_target_runtime(
+    target_dir: Path,
+    *,
+    intent: RecoveryIntent,
+    intent_digest: str,
+) -> tuple[dict[str, object] | None, str, bool]:
+    """Read target operation state and reject an ambiguous prior invocation."""
+
+    def reject_unmarked_turns() -> None:
+        turn_root = target_dir / "turns"
+        if turn_root.is_symlink():
+            _reject_recovery("recovery_evidence_unavailable")
+        if not turn_root.exists():
+            return
+        if not turn_root.is_dir():
+            _reject_recovery("recovery_evidence_unavailable")
+        for turn_path in sorted(turn_root.glob("turn-*")):
+            if turn_path.is_symlink() or not turn_path.is_dir():
+                _reject_recovery("recovery_evidence_unavailable")
+            _reject_recovery("recovery_operation_unresolved")
+
+    run_json_path = target_dir / "run.json"
+    if run_json_path.is_symlink():
+        _reject_recovery("recovery_evidence_unavailable")
+    if not run_json_path.exists():
+        reject_unmarked_turns()
+        return None, "pending", False
+    if not run_json_path.is_file():
+        _reject_recovery("recovery_evidence_unavailable")
+    try:
+        payload = json.loads(run_json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+    if not isinstance(payload, Mapping):
+        _reject_recovery("recovery_evidence_unavailable")
+    raw_runtime = payload.get("recovery_runtime")
+    if raw_runtime is None:
+        reject_unmarked_turns()
+        return dict(payload), "pending", False
+    if not isinstance(raw_runtime, Mapping):
+        _reject_recovery("recovery_operation_unresolved")
+    operation_state, consumed = _validate_recovery_runtime_shape(
+        raw_runtime,
+        expected_intent=intent,
+        expected_intent_digest=intent_digest,
+    )
+    if operation_state == "pending":
+        # The marker is written immediately before the provider call. A turn
+        # directory alongside a pending marker means that boundary was not
+        # durably reconciled, so launching again could duplicate the target.
+        reject_unmarked_turns()
+    return dict(payload), operation_state, consumed
+
+
+def _validate_persisted_recovery_runtime(
+    run_dir: Path,
+    *,
+    expected_run_id: str,
+    allow_pending: bool,
+    missing_ok: bool,
+) -> tuple[str, bool] | None:
+    """Validate one source marker without requiring recovery request metadata."""
+    if run_dir.is_symlink():
+        _reject_recovery("recovery_evidence_unavailable")
+    if not run_dir.exists():
+        if missing_ok:
+            return None
+        _reject_recovery("recovery_evidence_unavailable")
+    if not run_dir.is_dir():
+        _reject_recovery("recovery_evidence_unavailable")
+    run_json = run_dir / "run.json"
+    if run_json.is_symlink():
+        _reject_recovery("recovery_evidence_unavailable")
+    if not run_json.exists():
+        if missing_ok:
+            return None
+        _reject_recovery("recovery_evidence_unavailable")
+    if not run_json.is_file():
+        _reject_recovery("recovery_evidence_unavailable")
+    try:
+        payload = json.loads(run_json.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise DurableRecoveryRejection("recovery_evidence_unavailable") from exc
+    if not isinstance(payload, Mapping):
+        _reject_recovery("recovery_evidence_unavailable")
+    raw_runtime = payload.get("recovery_runtime")
+    if raw_runtime is None:
+        return None
+    return _validate_recovery_runtime_shape(
+        raw_runtime,
+        expected_target_run_id=expected_run_id,
+        allow_pending=allow_pending,
+    )
+
+
+def _recovery_structural_turn(source_dir: Path) -> tuple[dict[str, object] | None, Path | None]:
+    """Return only routing facts from the latest finalized source turn."""
+    turns_root = source_dir / "turns"
+    if turns_root.is_symlink() or not turns_root.is_dir():
+        return None, None
+    for turn_dir in reversed(sorted(turns_root.glob("turn-*"))):
+        if turn_dir.is_symlink() or not turn_dir.is_dir():
+            continue
+        result_path = turn_dir / "result.json"
+        if result_path.is_symlink() or not result_path.is_file():
+            continue
+        try:
+            raw = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(raw, Mapping) or raw.get("status") in {"starting", "running"}:
+            continue
+        keys = (
+            "turn_number",
+            "step_name",
+            "step_role",
+            "selector",
+            "status",
+            "returncode",
+        )
+        return (
+            {key: raw[key] for key in keys if key in raw},
+            result_path,
+        )
+    return None, None
+
+
+def _build_durable_recovery_brief(
+    *,
+    repo_root: Path,
+    source_dir: Path,
+    source_run_json: Mapping[str, object],
+    intent: RecoveryIntent,
+    context: Any,
+    plan_path: Path,
+    evidence_paths: tuple[Path, ...],
+    workspace_evidence: Mapping[str, object],
+) -> str:
+    """Build a compact, reference-only prompt for the replacement worker."""
+    from aflow.control_plane.models import bounded_redacted
+    from aflow.manager_context import build_manager_context
+    from aflow.plan import load_plan_tolerant
+
+    root = repo_root.resolve()
+
+    def compact(value: object, *, byte_limit: int = 4096) -> str:
+        encoded = json.dumps(
+            bounded_redacted(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        if len(encoded.encode("utf-8")) <= byte_limit:
+            return encoded
+        return json.dumps(
+            {
+                "summary": (
+                    "compact summary omitted because it exceeded its bound; "
+                    "consult the referenced durable artifacts"
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def display(path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(root))
+        except (OSError, ValueError):
+            return str(path)
+
+    active_plan = context.active_plan_path or plan_path
+    plan_summaries: list[dict[str, object]] = []
+    for label, path in (("original", plan_path), ("active", Path(active_plan))):
+        if any(item["label"] == label for item in plan_summaries):
+            continue
+        try:
+            tolerant = load_plan_tolerant(path)
+            snapshot = tolerant.parsed_plan.snapshot.to_dict()
+            checkpoints = [
+                {
+                    "name": section.name,
+                    "checked": section.heading_checked,
+                    "unchecked_steps": section.unchecked_step_count,
+                    "checked_steps": section.checked_step_count,
+                }
+                for section in tolerant.parsed_plan.sections
+            ]
+            plan_summaries.append(
+                {
+                    "label": label,
+                    "path": str(path),
+                    "snapshot": snapshot,
+                    "checkpoints": checkpoints,
+                    "parse_recovery": tolerant.parse_error is not None,
+                }
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            plan_summaries.append(
+                {"label": label, "path": str(path), "unavailable": type(exc).__name__}
+            )
+
+    scope = context.active_implementation_scope
+    if scope is None:
+        scope_summary: object = "No open implementation scope was durably recorded."
+    else:
+        scope_summary = {
+            key: getattr(scope, key)
+            for key in (
+                "scope_id",
+                "original_plan_path",
+                "checkpoint_index",
+                "checkpoint_name",
+                "opened_turn_number",
+                "awaiting_review",
+                "carried_reviewer_rejection_count",
+                "current_partition_id",
+            )
+        }
+    pending = context.pending_finalized_turn
+    pending_summary: object = (
+        {
+            "turn_number": pending.turn_number,
+            "step_name": pending.step_name,
+            "step_role": pending.step_role,
+            "selector": pending.selector,
+            "active_plan_path": str(pending.active_plan_path),
+        }
+        if pending is not None
+        else "No pending finalized interstep boundary was recorded."
+    )
+    latest_turn, latest_result_path = _recovery_structural_turn(source_dir)
+    if latest_turn is None:
+        outcome_summary: object = (
+            "No finalized worker/reviewer turn artifact was available; consult the "
+            "referenced run metadata and artifacts."
+        )
+    else:
+        outcome_summary = latest_turn
+        if latest_result_path is not None:
+            outcome_summary = {
+                **latest_turn,
+                "result_artifact": display(latest_result_path),
+            }
+    source_state = {
+        key: source_run_json[key]
+        for key in ("status", "current_step_name", "turns_completed", "active_turn")
+        if key in source_run_json
+    }
+
+    compact_context: object = "Existing compact evidence summary unavailable."
+    if latest_turn is not None:
+        try:
+            manager_context = build_manager_context(
+                source_dir,
+                level="lite",
+                trigger="durable_recovery",
+            )
+            plan_state = manager_context.get("plan_state")
+            controller_state = manager_context.get("controller_state")
+            compact_context = {
+                "plan_state": plan_state if isinstance(plan_state, Mapping) else {},
+                "controller_state": (
+                    {
+                        key: controller_state[key]
+                        for key in (
+                            "turns_completed",
+                            "current_step_name",
+                            "active_implementation_scope",
+                            "pending_finalized_turn",
+                        )
+                        if isinstance(controller_state, Mapping) and key in controller_state
+                    }
+                    if isinstance(controller_state, Mapping)
+                    else {}
+                ),
+            }
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+            pass
+
+    fingerprint = workspace_evidence.get("workspace_fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        fingerprint = {}
+    pending_review = bool(
+        scope is not None and scope.awaiting_review
+    ) or pending is not None
+    def bounded_evidence_lines(byte_limit: int = 4096) -> list[str]:
+        selected: list[str] = []
+        used = 0
+        omitted = 0
+        for reference in intent.evidence:
+            line = (
+                f"- {reference.kind}: {reference.path} "
+                f"(sha256={reference.sha256}, size={reference.size})"
+            )
+            line_size = len(line.encode("utf-8"))
+            separator_size = 1 if selected else 0
+            if used + separator_size + line_size > byte_limit:
+                omitted += 1
+                continue
+            selected.append(line)
+            used += separator_size + line_size
+        if omitted:
+            omission = (
+                f"- {omitted} additional evidence reference(s) omitted from this "
+                "bounded brief; the immutable intent contains the complete list."
+            )
+            omission_size = len(omission.encode("utf-8"))
+            while selected and used + 1 + omission_size > byte_limit:
+                removed = selected.pop()
+                used -= len(removed.encode("utf-8")) + (1 if selected else 0)
+            if used + (1 if selected else 0) + omission_size <= byte_limit:
+                selected.append(omission)
+        return selected
+
+    evidence_lines = bounded_evidence_lines()
+    lines = [
+        "## Durable provider-recovery evidence",
+        f"Mode: {intent.mode}; source run: {intent.source_run_id}; replacement run: {intent.target_run_id}.",
+        f"Source worker selector: {intent.source_selector}.",
+        f"Explicit replacement worker selector: {intent.target_selector}.",
+        "Start a fresh replacement session: no source session ID and no source handover inference.",
+        "Hidden source-session context is unavailable; source_session_context_transferred=false.",
+        "Missing durable evidence: provider-private session state, transcripts, secrets, and unreferenced context are unavailable.",
+        f"Original/active plans: {compact(plan_summaries, byte_limit=4096)}",
+        f"Open implementation scope: {compact(scope_summary, byte_limit=2048)}",
+        f"Pending review or finalized boundary: {compact({'pending_review': pending_review, 'boundary': pending_summary}, byte_limit=2048)}",
+        f"Last finalized worker/reviewer outcome: {compact(outcome_summary, byte_limit=2048)}",
+        f"Source durable state: {compact(source_state, byte_limit=1024)}",
+        f"Rechecked exact file evidence references: {len(evidence_paths)}.",
+        f"Exact execution worktree: {workspace_evidence.get('workspace', '<unavailable>')}",
+        f"Exact worktree HEAD: {fingerprint.get('head', '<unavailable>')}",
+        f"Worktree dirty: {'yes' if fingerprint.get('status') else 'no'}.",
+        f"Existing compact evidence summary: {compact(compact_context, byte_limit=3072)}",
+        "Fuller durable artifacts (references only; read when needed):",
+        *evidence_lines,
+        "Do not reconstruct omitted provider context or infer a checkpoint/selector from current configuration.",
+    ]
+    brief = "\n".join(lines)
+    if len(brief.encode("utf-8")) > 16 * 1024:
+        lines = [
+            lines[0],
+            lines[1],
+            lines[2],
+            lines[3],
+            lines[4],
+            lines[5],
+            lines[6],
+            "Original/active plans: bounded structural summary unavailable; use exact plan evidence references.",
+            "Open implementation scope: bounded structural summary unavailable; use exact run evidence references.",
+            "Pending review or finalized boundary: bounded structural summary unavailable; use exact run evidence references.",
+            "Last finalized worker/reviewer outcome: bounded structural summary unavailable; use exact run evidence references.",
+            "Source durable state: bounded structural summary unavailable; use exact run evidence references.",
+            lines[11],
+            lines[12],
+            lines[13],
+            lines[14],
+            lines[15],
+            "Existing compact evidence summary: bounded structural summary unavailable; use exact run evidence references.",
+            lines[17],
+            *bounded_evidence_lines(4096),
+            lines[-1],
+        ]
+        brief = "\n".join(lines)
+    if len(brief.encode("utf-8")) > 16 * 1024:
+        raise DaemonError("durable recovery brief exceeds its size limit")
+    return brief
+
+
+def _prepare_recovery_resume_context(
+    *,
+    record: Mapping[str, object],
+    repo_root: Path,
+    run_id: str,
+    workflow_config: WorkflowUserConfig,
+    bootstrap: Any,
+) -> Any:
+    """Bind a recovery request to a fresh, bounded replacement session."""
+    recovery_request = _recovery_request_from_record(record)
+    if recovery_request is None:
+        source_run_id = validate_run_id(str(record.get("resumed_from_run_id")))
+        _validate_persisted_recovery_runtime(
+            repo_root.resolve() / ".aflow" / "runs" / source_run_id,
+            expected_run_id=source_run_id,
+            allow_pending=False,
+            missing_ok=True,
+        )
+        return bootstrap.resume_context
+    from dataclasses import replace as dataclass_replace
+    from aflow.run_state import (
+        RecoverySessionContext,
+        ResumeContext,
+        hotplug_resume_fields,
+    )
+    from aflow.workflow import resolve_profile
+
+    context = getattr(bootstrap, "resume_context", None)
+    if not isinstance(context, ResumeContext):
+        raise DaemonError("durable-evidence recovery lacks exact resume context")
+    source_run_id = validate_run_id(str(record.get("resumed_from_run_id")))
+    target_run_id = validate_run_id(run_id)
+    target_dir = repo_root.resolve() / ".aflow" / "runs" / target_run_id
+    if target_dir.is_symlink() or not target_dir.is_dir():
+        raise DaemonError("recovery target run directory is missing or unsafe")
+    try:
+        target_dir.resolve().relative_to((repo_root / ".aflow" / "runs").resolve())
+    except (OSError, ValueError) as exc:
+        raise DaemonError("recovery target run directory is outside the runs root") from exc
+    try:
+        resolve_profile(
+            recovery_request.worker_selector,
+            workflow_config,
+            step_path="resume.recovery.worker",
+        )
+    except Exception as exc:
+        raise DaemonError("durable-evidence recovery target worker selector is not configured") from exc
+
+    try:
+        intent = read_recovery_intent(target_dir)
+    except RecoveryPersistenceError as exc:
+        raise DaemonError(f"durable recovery intent is unavailable: {exc}") from exc
+    if (
+        intent.source_run_id != source_run_id
+        or intent.target_run_id != target_run_id
+        or intent.target_selector != recovery_request.worker_selector
+        or intent.source_session_context_transferred is not False
+    ):
+        raise DaemonError("durable recovery intent does not match the launch record")
+    intent_digest = recovery_intent_digest(intent)
+    if record.get("recovery_intent_digest") != intent_digest:
+        raise DaemonError("recovery record does not match its immutable intent")
+    artifact_path = target_dir / "recovery" / "recovery-intent.json"
+    if artifact_path.is_symlink() or not artifact_path.is_file():
+        raise DaemonError("durable recovery intent artifact is missing or unsafe")
+    try:
+        artifact_bytes = artifact_path.read_bytes()
+    except OSError as exc:
+        raise DaemonError("durable recovery intent artifact cannot be read") from exc
+    if hashlib.sha256(artifact_bytes).hexdigest() != recovery_artifact_digest(intent):
+        raise DaemonError("durable recovery intent artifact bytes changed")
+    if record.get("recovery_artifact_path") != "recovery/recovery-intent.json":
+        raise DaemonError("recovery record has an invalid intent artifact path")
+    if record.get("recovery_artifact_sha256") != hashlib.sha256(artifact_bytes).hexdigest():
+        raise DaemonError("recovery record does not match its intent artifact")
+
+    evidence_paths, workspace_evidence = _validate_recovery_evidence_for_worker(
+        repo_root.resolve(), intent
+    )
+    source_dir = repo_root.resolve() / ".aflow" / "runs" / source_run_id
+    source_run_json_path = source_dir / "run.json"
+    if source_run_json_path.is_symlink() or not source_run_json_path.is_file():
+        raise DaemonError("source run metadata evidence is missing or unsafe")
+    try:
+        source_run_json = json.loads(source_run_json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise DaemonError("source run metadata evidence is unreadable") from exc
+    if not isinstance(source_run_json, Mapping):
+        raise DaemonError("source run metadata evidence is not an object")
+    brief = _build_durable_recovery_brief(
+        repo_root=repo_root,
+        source_dir=source_dir,
+        source_run_json=source_run_json,
+        intent=intent,
+        context=context,
+        plan_path=Path(getattr(bootstrap, "plan_path", repo_root / "plan.md")),
+        evidence_paths=evidence_paths,
+        workspace_evidence=workspace_evidence,
+    )
+    target_payload, operation_state, consumed = _read_recovery_target_runtime(
+        target_dir,
+        intent=intent,
+        intent_digest=intent_digest,
+    )
+    if target_payload is not None:
+        raw_runtime = target_payload.get("recovery_runtime")
+        if isinstance(raw_runtime, Mapping):
+            expected_brief_sha256 = hashlib.sha256(
+                brief.encode("utf-8")
+            ).hexdigest()
+            if raw_runtime.get("brief_sha256") != expected_brief_sha256:
+                raise DaemonError(
+                    "recovery target runtime state does not match its recovery brief"
+                )
+    if operation_state == "consumed" and target_payload is not None:
+        try:
+            context = dataclass_replace(context, **hotplug_resume_fields(target_payload))
+            from aflow.cli import _reconstruct_resume_context
+
+            target_workflow = workflow_config.workflows.get(
+                getattr(bootstrap, "workflow_name", "")
+            )
+            target_context = _reconstruct_resume_context(
+                resolved_run_id=target_dir,
+                run_dir=target_dir,
+                prev_run=target_payload,
+                plan_path=Path(getattr(bootstrap, "plan_path", repo_root / "plan.md")),
+                frozen_run_identity=context.frozen_run_identity,
+                reset_scope=False,
+                require_resume=True,
+                workflow_steps=(
+                    target_workflow.steps if target_workflow is not None else None
+                ),
+                effective_max_turns=(
+                    target_payload.get("effective_max_turns")
+                    if isinstance(target_payload.get("effective_max_turns"), int)
+                    and not isinstance(target_payload.get("effective_max_turns"), bool)
+                    else None
+                ),
+            )
+            if target_context is not None:
+                context = dataclass_replace(
+                    target_context,
+                    resumed_from_run_id=source_run_id,
+                )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise DaemonError(
+                "consumed recovery target has invalid persisted session state"
+            ) from exc
+    recovery_context = RecoverySessionContext(
+        intent=intent,
+        brief=brief,
+        intent_digest=intent_digest,
+        consumed=consumed,
+        operation_state=operation_state,
+    )
+    return dataclass_replace(context, recovery_context=recovery_context)
+
+
 def _worker_prepared(
     record: Mapping[str, object],
     manifest: LaunchManifest,
@@ -2423,7 +3529,14 @@ def _worker_prepared(
         )
         workflow_config = getattr(bootstrap, "workflow_config", workflow_config)
         _validate_worker_selection(prepared, workflow_config)
-        return prepared, bootstrap.resume_context
+        resume_context = _prepare_recovery_resume_context(
+            record=record,
+            repo_root=repo_root,
+            run_id=run_id,
+            workflow_config=workflow_config,
+            bootstrap=bootstrap,
+        )
+        return prepared, resume_context
     payload = record.get("prepared")
     if not isinstance(payload, Mapping):
         raise DaemonError("daemon worker start record has no prepared request")
@@ -2638,6 +3751,114 @@ def _record_extra_instructions_digest(
         if isinstance(prepared, Mapping):
             value = prepared.get("extra_instructions_digest")
     return value if isinstance(value, str) else None
+
+
+def _recovery_request_from_record(
+    record: Mapping[str, object],
+) -> RecoveryRequest | None:
+    try:
+        return RecoveryRequest.from_value(record.get("recovery"))
+    except RecoveryValidationError as exc:
+        raise DaemonError("startup record has an invalid recovery request") from exc
+
+
+def _source_worker_selector(
+    *,
+    source: RunStatus,
+    run_json_path: Path,
+    run_json: Mapping[str, object] | None,
+    context: Any,
+    source_dir: Path,
+) -> tuple[str, Path | None]:
+    """Return an explicitly recorded source selector, never a config default."""
+    if run_json is None:
+        try:
+            raw = json.loads(run_json_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise DaemonError("source run metadata is not readable JSON") from exc
+        run_json = raw if isinstance(raw, Mapping) else None
+    if run_json is None:
+        raise DaemonError("source run metadata is not a JSON object")
+
+    candidates: set[str] = set()
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value and value == value.strip():
+            candidates.add(value)
+
+    status_evidence = source.evidence
+    for key in ("source_selector", "worker_selector"):
+        add(status_evidence.get(key))
+    worker_evidence = status_evidence.get("worker")
+    if isinstance(worker_evidence, Mapping):
+        add(worker_evidence.get("selector"))
+
+    context_selectors = getattr(context, "role_selectors", {})
+    if isinstance(context_selectors, Mapping):
+        add(context_selectors.get("worker"))
+    raw_selectors = run_json.get("role_selectors")
+    if isinstance(raw_selectors, Mapping):
+        add(raw_selectors.get("worker"))
+    for key in ("source_selector", "worker_selector"):
+        add(run_json.get(key))
+
+    def active_session_selectors(value: object) -> tuple[str, ...]:
+        if not isinstance(value, (list, tuple)):
+            return ()
+        values: list[str] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                if item.get("role") == "worker" and item.get("status") == "active":
+                    selector = item.get("selector")
+                    if isinstance(selector, str) and selector:
+                        values.append(selector)
+            else:
+                if (
+                    getattr(item, "role", None) == "worker"
+                    and getattr(item, "status", None) == "active"
+                ):
+                    selector = getattr(item, "selector", None)
+                    if isinstance(selector, str) and selector:
+                        values.append(selector)
+        return tuple(values)
+
+    for selector in active_session_selectors(
+        getattr(context, "active_role_sessions", ())
+    ):
+        add(selector)
+    for selector in active_session_selectors(run_json.get("active_role_sessions")):
+        add(selector)
+
+    if len(candidates) > 1:
+        raise DaemonError(
+            "source worker selector evidence is conflicting; no selector was inferred"
+        )
+    if candidates:
+        return next(iter(candidates)), run_json_path
+
+    # A finalized worker result is an exact source artifact fallback.  It is
+    # only used when no current durable selector field exists; configuration
+    # defaults are intentionally never consulted.
+    result_paths = sorted(
+        source_dir.glob("turns/*/result.json"),
+        key=lambda path: path.as_posix(),
+        reverse=True,
+    )
+    for result_path in result_paths:
+        try:
+            if result_path.is_symlink() or result_path.stat().st_size > 1_048_576:
+                continue
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("step_role") == "worker"
+            and isinstance(payload.get("selector"), str)
+            and payload["selector"]
+        ):
+            return payload["selector"], result_path
+    raise DaemonError("source worker selector evidence is unavailable")
 
 
 def _validate_extra_instructions(extra_instructions: tuple[str, ...]) -> None:
