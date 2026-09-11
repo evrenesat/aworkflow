@@ -1,5 +1,13 @@
 # DEVLOG
 
+## 2026-09-11 — Keep recovery browser screenshots portable
+
+- `test_durable_recovery_ui_journey` now writes its unchanged screenshot and
+  printed artifact reference beneath pytest's `tmp_path`; retained Chromium
+  and WebKit evidence is selected through separate `--basetemp` invocations.
+- Built the unchanged production bundle once because this checkout had no
+  existing `web/dist`; no production behavior or recovery assertions changed.
+
 ## 2026-09-11 — Recover explicitly with a replacement worker (issue 36)
 
 - Added durable-evidence recovery to canonical resume, REST, MCP, and the

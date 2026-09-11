@@ -1209,7 +1209,7 @@ def test_responsive_live_controls_and_restart(
             browser.close()
 
 
-def test_durable_recovery_ui_journey(control_client, monkeypatch):
+def test_durable_recovery_ui_journey(control_client, monkeypatch, tmp_path):
     """Drive replacement recovery through the real controller with fake providers."""
     from dataclasses import replace
     import hashlib
@@ -1547,9 +1547,7 @@ def test_durable_recovery_ui_journey(control_client, monkeypatch):
     monkeypatch.setattr(repository, "get_run_status", source_status)
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
-    evidence_root = Path(
-        "/root/code/evidence/aflow-dogfood-20260909/issue36-review-20260911"
-    )
+    evidence_root = tmp_path / "issue36-recovery"
     evidence_root.mkdir(parents=True, exist_ok=True)
     browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
 
