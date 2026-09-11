@@ -197,6 +197,12 @@ function mockMatchMedia(initialMatches: boolean) {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 /** Opens an added project from its compact row (the row itself is the open control). */
 async function openAddedProject(name: RegExp) {
   const list = await screen.findByRole('list', { name: 'Added projects' })
@@ -382,13 +388,18 @@ describe('App workspace shell', () => {
     const media = mockMatchMedia(true)
     try {
       setUrl('/?project=alpha&view=projects')
-      vi.mocked(api.listProjects).mockResolvedValue([readyProject])
+      const projects = deferred<Array<typeof readyProject>>()
+      vi.mocked(api.listProjects).mockImplementationOnce(() => projects.promise)
       render(<App />)
-      await screen.findByRole('heading', { name: 'Projects', exact: true })
-      const identity = screen.getByRole('heading', { name: 'AFlow · Alpha Project', exact: true })
+      await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(1))
+      const compactContext = document.querySelector('.mobile-page-context')
+      expect(screen.getByRole('heading', { name: 'Projects', exact: true })).toBeDefined()
+      expect(compactContext?.textContent?.trim()).toBe('Projects')
+
+      projects.resolve([readyProject])
+      const identity = await screen.findByRole('heading', { name: 'AFlow · Alpha Project', exact: true })
       expect(identity.getAttribute('title')).toBe('AFlow · Alpha Project')
       expect(identity.getAttribute('aria-label')).toBe('AFlow · Alpha Project')
-      const compactContext = document.querySelector('.mobile-page-context')
       expect(compactContext?.textContent?.trim()).toBe('Projects')
       expect(compactContext?.querySelector('.header-context-title')).toBeTruthy()
     } finally {

@@ -1485,7 +1485,7 @@ go = [{ to = "END" }]
                     "Stop requested — finishing current turn", exact=False
                 ).wait_for()
                 assert page.get_by_text("Running", exact=True).count() > 0
-                assert page.get_by_role("button", name="Stop now…", exact=True).count() == 1
+                expect(page.get_by_role("button", name="Stop now…", exact=True)).to_have_count(1)
 
                 persisted = client.get(run_path)
                 assert persisted.status_code == 200, persisted.text
@@ -1498,19 +1498,58 @@ go = [{ to = "END" }]
                 assert units.stop_calls == []
                 assert len(invocations) == 1
 
-                # A fresh browser read must retain the pending intent before
-                # the provider is released.
-                page.goto(f"{url}/?project={PROJECT_ID}&view=projects")
-                page.get_by_role("button", name="Test project", exact=False).first.wait_for()
-                page.goto(run_url)
-                dashboard = _visible_dashboard(page)
-                page.get_by_text(
-                    "Stop requested — finishing current turn", exact=False
-                ).wait_for()
-                assert page.get_by_text("Running", exact=True).count() > 0
-                assert dashboard.get_by_role(
-                    "button", name="Stop now…", exact=True
-                ).count() == 1
+                # The pending intent comes from the selected run detail. Stop
+                # now additionally requires the admitted safe owner_stop
+                # capability, so hold its first response on a fresh read.
+                capabilities_api = f"**/api/control-plane/projects/{PROJECT_ID}/capabilities"
+                with live_server() as fresh_url:
+                    held_capabilities = []
+                    gate = {"enabled": False}
+                    fresh_context = browser.new_context(
+                        viewport={"width": 1280, "height": 720},
+                    )
+                    fresh_page = fresh_context.new_page()
+
+                    def hold_first_admitted_controls(route):
+                        if gate["enabled"] and route.request.method == "GET" and not held_capabilities:
+                            held_capabilities.append(route)
+                        else:
+                            route.continue_()
+
+                    def release_held_capabilities():
+                        while held_capabilities:
+                            held_capabilities.pop(0).continue_()
+
+                    fresh_page.route(capabilities_api, hold_first_admitted_controls)
+                    try:
+                        _login(fresh_page, fresh_url)
+                        gate["enabled"] = True
+                        # Keep the provider held while the capability response
+                        # gates the exact immediate-stop control.
+                        fresh_run_url = f"{fresh_url}/?project={PROJECT_ID}&view=runs&run={run_id}"
+                        with fresh_page.expect_request(capabilities_api, timeout=10_000):
+                            fresh_page.goto(fresh_run_url)
+                            fresh_dashboard = _visible_dashboard(fresh_page)
+                        expect(fresh_page.get_by_text("Loading runs…", exact=True)).to_be_visible()
+                        expect(fresh_dashboard.get_by_role(
+                            "button", name="Stop now…", exact=True
+                        )).to_have_count(0)
+                        assert len(held_capabilities) == 1, "admitted capabilities response was not held"
+
+                        gate["enabled"] = False
+                        release_held_capabilities()
+                        fresh_page.get_by_text(
+                            "Stop requested — finishing current turn", exact=False
+                        ).wait_for()
+                        assert fresh_page.get_by_text("Running", exact=True).count() > 0
+                        expect(fresh_dashboard.get_by_role(
+                            "button", name="Stop now…", exact=True
+                        )).to_have_count(1)
+                    finally:
+                        gate["enabled"] = False
+                        release_held_capabilities()
+                        fresh_page.unroute(capabilities_api, hold_first_admitted_controls)
+                        fresh_context.close()
 
                 release.set()
                 assert worker_done.wait(timeout=15), "controller did not finalize"

@@ -181,3 +181,52 @@ Publication, exact-SHA CI, live activation and Settings refresh/install remain e
 Prior latest review rotated byte-for-byte to `plans/reviews/260911_1531.md`. No ignored private archive, plan or evidence is force-added.
 
 No material findings
+
+
+---
+
+# CI stop/header readiness — cumulative approval, 2026-09-11
+
+Base: `0114ea130b1a771d9710d5ddf6bc69e57b816565` (unchanged).
+Reviewed HEAD: `65301b446775e7936a23297a979033ed49d6eb20`.
+Branch: `aflow-ci-stop-header-readiness-20260911-20260911-163044`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the complete original checkpoint
+and all three changed files. No prior findings or fix overlays for this handoff.
+
+No material findings under the admission gate, exclusions and proportionate-fix
+discipline. App registry resolution is explicitly deferred; compact Projects
+context is checked before resolution and exact full identity/title/ARIA after.
+The browser holds capabilities on a fresh navigation, checks Loading runs and
+zero exact Stop now controls, then releases and awaits exactly one control
+before releasing the real fake-provider hold. Gate/context/server/provider
+cleanup and status/revision/override/one-worker/no-stop/pending-review evidence
+remain intact. Exact role/name selectors and count-one assertions still reject
+missing/wrong controls or identities; no permanent negative product mutation.
+Production and concurrent stop/recovery/progress interfaces are unchanged.
+
+Inspected loadDashboard Promise.all and safe owner_stop admission: holding
+capabilities blocks overall loading, not merely the control beside an already
+visible pending notice. The controlled check establishes a real prerequisite,
+not the precise historical macOS scheduling cause. Bounded original CI failure
+excerpts confirm the immediate Stop now count and synchronous identity query.
+
+Verification: reused completed final worker evidence from
+`/root/code/agent_flow/.aflow/runs/20260911t163044z-b46b9a97/turns/turn-001/transport.stdout`
+and its completed result.json (the supplied worktree-relative path is absent).
+Final staged diff matches reviewed source; no source edits followed final tests.
+
+- `npm --prefix apps/aflow_app/web test -- --run src/App.test.tsx -t 'keeps compact page context separate'`: 1 passed, 51 filtered out.
+- `npm --prefix apps/aflow_app/web run build`: passed; production sources unchanged since build.
+- `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py::test_stop_after_current_turn_delayed_worker_journey --basetemp=/root/code/evidence/aflow-dogfood-20260909/ci-stop-header-review-20260911/chromium`: 1 passed, 6.31s.
+- Same exact node with `AFLOW_TEST_BROWSER=webkit` and `/webkit` basetemp: 1 passed, 7.74s.
+- Independent `git diff --check 0114ea1 HEAD`: passed. Full suites remain CI-owned; no timeout inflation.
+
+Approve one unpublished accumulated commit including this tracked reviewer
+record. Preserve all three implementation blobs and the single handoff DEVLOG
+entry. No fix plan exists or is needed. Leave ignored original plan in place
+for engine finalization and record final approved SHA there after committing.
+Verify one commit after base and clean tracked state. Publication, exact-SHA
+CI and live activation remain controller/coordinator delivery steps, not
+claimed by this local approval.
+
+No material findings

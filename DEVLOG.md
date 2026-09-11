@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-09-11 — Stabilize stop and compact-header readiness checks
+
+- The compact-header test now holds `listProjects` with a deferred response,
+  proving the `Projects` context is available before registry identity resolves
+  and awaiting the exact full project heading before its title/ARIA checks.
+- The delayed stop journey now holds the admitted capabilities response on a
+  fresh browser read, proves the exact `Stop now…` control is absent while that
+  prerequisite is unresolved, then releases it and waits for exactly one
+  control before releasing the fake provider. Existing status, pending-review,
+  no-stop, and owner-stopped assertions remain unchanged.
+- Controlled probes identify the admitted safe `owner_stop` capability as the
+  additional Stop now prerequisite; the historical macOS request-order cause
+  remains unproven. No production behavior or timeout changed; cross-browser
+  coverage remains.
+- Focused App test, web build, and the exact delayed-worker journey passed in
+  Chromium and WebKit. Evidence remains under
+  `/root/code/evidence/aflow-dogfood-20260909/ci-stop-header-review-20260911/`.
+
 ## 2026-09-11 — Stop and recovery integration
 
 - Preserve both reviewed stop-after-turn controls and cumulative failure recovery.
