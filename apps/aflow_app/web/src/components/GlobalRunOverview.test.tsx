@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
-import type { ProjectInfo, RunStatus } from '../types'
+import type { ProjectInfo, RunProgressSummary, RunStatus } from '../types'
 import { GlobalRunOverview } from './GlobalRunOverview'
 
 vi.mock('../api', async () => {
@@ -55,6 +55,19 @@ function deferred<T>() {
 
 function page(runs: RunStatus[]) {
   return { runs, next_cursor: null, schema_version: 1 }
+}
+
+function canonicalProgress(overrides: Partial<RunProgressSummary> = {}): RunProgressSummary {
+  const known = (value: number) => ({ value, coverage: 'complete' as const })
+  return {
+    schema_version: 1, availability: 'complete', observed_at: '2026-09-11T12:00:00Z', evidence_at: '2026-09-11T11:59:00Z',
+    reason_codes: [], original_plan_identity: 'canonical-plan', original_plan_display_name: 'canonical-plan.md', original_plan_path: '/srv/plans/canonical-plan.md',
+    total_checkpoints: known(11), approved_checkpoints: known(4), recorded_complete_checkpoints: known(4),
+    current_checkpoint_id: 'cp-5', current_checkpoint_ordinal: 5, current_checkpoint_title: 'Checkpoint 5: Active',
+    activity: 'active', phase: 'implementing', run_status: 'running', current_executor: null, last_executor: null,
+    worker_attempts: known(2), repair_passes: known(0), reviews: known(1), runtime_retries: known(0), applied_upgrades: known(0),
+    ...overrides,
+  }
 }
 
 describe('GlobalRunOverview project context', () => {
@@ -246,5 +259,26 @@ describe('GlobalRunOverview project context', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /child-run-same-name/ }))
     expect(onOpen).toHaveBeenCalledWith('child', 'child-run-same-name')
+  })
+
+  it('shows canonical compact progress while retaining exact project and run navigation', async () => {
+    const onOpen = vi.fn()
+    const run = makeRun('canonical-run', {
+      plan_path: null,
+      progress: canonicalProgress(),
+      status: 'running',
+      activity: 'active',
+      started_at: '2026-09-11T11:00:00Z',
+    })
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue(page([run]))
+
+    render(<GlobalRunOverview projects={[primary]} onOpen={onOpen} />)
+
+    expect(await screen.findByText('4 / 11 approved')).toBeTruthy()
+    expect(screen.getByText(/Implementing CP5 of 11/)).toBeTruthy()
+    expect(screen.getByText('Plan: /srv/plans/canonical-plan.md · Run: canonical-run')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /canonical-run/ }))
+    expect(onOpen).toHaveBeenCalledWith('primary', 'canonical-run')
+    expect(api.listControlPlaneRuns).toHaveBeenCalledTimes(1)
   })
 })

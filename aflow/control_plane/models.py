@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
+RUN_PROGRESS_SCHEMA_VERSION = 1
 MAX_SERIALIZED_TEXT = 4_096
 MAX_SERIALIZED_ITEMS = 128
 WORKTREE_PREFLIGHT_DEFAULT_LIMIT = 200
@@ -99,6 +100,260 @@ def bounded_redacted(value: Any, *, depth: int = 0) -> Any:
     return bounded_redacted(str(value), depth=depth + 1)
 
 
+ProgressAvailability = Literal[
+    "complete", "partial", "unavailable", "not_applicable"
+]
+ProgressCoverage = Literal["complete", "partial", "unavailable"]
+ProgressCheckpointStatus = Literal[
+    "pending",
+    "implementing",
+    "reviewing",
+    "repairing",
+    "approved",
+    "recorded_complete",
+    "blocked",
+    "unknown",
+]
+ProgressDeliveryStatus = Literal[
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "unknown",
+    "not_applicable",
+]
+ProgressChangeStatus = Literal["applied", "pending", "failed", "unknown"]
+
+
+def _progress_safe(value: Any, *, key: str | None = None, depth: int = 0) -> Any:
+    """Serialize progress without inheriting the smaller generic item cap.
+
+    Progress detail deliberately has a larger, independently bounded history
+    window than generic control-plane responses.  It still applies the same
+    secret-field rule and never serializes arbitrary objects or raw artifacts.
+    """
+    if depth > 8:
+        return "[truncated: nesting limit]"
+    if key is not None and any(part in key.lower() for part in _SECRET_FIELD_PARTS):
+        return "[redacted]"
+    if isinstance(value, Enum):
+        return _progress_safe(value.value, key=key, depth=depth + 1)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value if len(value) <= 4_096 else value[:4_096] + "[truncated]"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for index, (child_key, child) in enumerate(value.items()):
+            if index >= 512:
+                result["_truncated"] = "mapping item limit"
+                break
+            name = str(child_key)
+            result[name] = _progress_safe(child, key=name, depth=depth + 1)
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        result = [
+            _progress_safe(item, depth=depth + 1)
+            for item in items[:500]
+        ]
+        if len(items) > 500:
+            result.append("[truncated: item limit]")
+        return result
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _progress_safe(str(value), key=key, depth=depth + 1)
+
+
+@dataclass(frozen=True)
+class RunProgressCount:
+    """A count whose value is explicitly qualified by evidence coverage."""
+
+    value: int | None = None
+    coverage: ProgressCoverage = "unavailable"
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressExecutor:
+    """The actual invocation identity recorded at a worker/reviewer boundary."""
+
+    role: str | None = None
+    team: str | None = None
+    selector: str | None = None
+    harness: str | None = None
+    model: str | None = None
+    model_display: str | None = None
+    effort: str | None = None
+    source_run_id: str | None = None
+    invocation_id: str | None = None
+    turn_number: int | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressCheckpoint:
+    """One original-plan checkpoint and its evidence-qualified counters."""
+
+    checkpoint_id: str | None
+    ordinal: int | None = None
+    title: str | None = None
+    status: ProgressCheckpointStatus = "unknown"
+    awaiting_review: bool = False
+    worker_attempts: RunProgressCount = field(default_factory=RunProgressCount)
+    repair_passes: RunProgressCount = field(default_factory=RunProgressCount)
+    reviews: RunProgressCount = field(default_factory=RunProgressCount)
+    runtime_retries: RunProgressCount = field(default_factory=RunProgressCount)
+    applied_upgrades: RunProgressCount = field(default_factory=RunProgressCount)
+    recorded_at: str | None = None
+    duration_seconds: float | None = None
+    scope_id: str | None = None
+    generation_id: str | None = None
+    parent_checkpoint_id: str | None = None
+    source_run_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressEvent:
+    """A safe, ordered history item; prompt and transcript bodies are excluded."""
+
+    event_id: str
+    checkpoint_id: str | None = None
+    scope_id: str | None = None
+    source_run_id: str | None = None
+    turn_number: int | None = None
+    decision_number: int | None = None
+    kind: str = "unknown"
+    outcome: str | None = None
+    executor: RunProgressExecutor | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+    reason: str | None = None
+    source_reference: Mapping[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressChange:
+    """An applied or pending team/profile change, kept separate from counts."""
+
+    change_id: str
+    status: ProgressChangeStatus = "unknown"
+    kind: str = "configuration_change"
+    roles: tuple[str, ...] = ()
+    old_team: str | None = None
+    new_team: str | None = None
+    old_selector: str | None = None
+    new_selector: str | None = None
+    old_model: str | None = None
+    new_model: str | None = None
+    old_effort: str | None = None
+    new_effort: str | None = None
+    turn_number: int | None = None
+    checkpoint_id: str | None = None
+    generation_id: str | None = None
+    reason: str | None = None
+    recorded_at: str | None = None
+    source_reference: Mapping[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressDeliveryStage:
+    """One evidence-backed publication stage."""
+
+    stage: str
+    status: ProgressDeliveryStatus = "unknown"
+    recorded_at: str | None = None
+    reason: str | None = None
+    source_reference: Mapping[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressTruncation:
+    """Bounded-read accounting exposed so omitted history is never silent."""
+
+    evidence_bytes: int = 0
+    records_read: int = 0
+    checkpoints_read: int = 0
+    events_read: int = 0
+    omitted_records: int = 0
+    omitted_checkpoints: int = 0
+    notices: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressSummary:
+    """Canonical summary projection shared by list and detail consumers."""
+
+    schema_version: int = RUN_PROGRESS_SCHEMA_VERSION
+    availability: ProgressAvailability = "unavailable"
+    observed_at: str | None = None
+    evidence_at: str | None = None
+    reason_codes: tuple[str, ...] = ()
+    original_plan_identity: str | None = None
+    original_plan_display_name: str | None = None
+    original_plan_path: str | None = None
+    total_checkpoints: RunProgressCount = field(default_factory=RunProgressCount)
+    approved_checkpoints: RunProgressCount = field(default_factory=RunProgressCount)
+    recorded_complete_checkpoints: RunProgressCount = field(default_factory=RunProgressCount)
+    checkpoint_states: Mapping[str, ProgressCheckpointStatus] = field(default_factory=dict)
+    current_checkpoint_id: str | None = None
+    current_checkpoint_ordinal: int | None = None
+    current_checkpoint_title: str | None = None
+    activity: str | None = None
+    phase: str | None = None
+    run_status: str | None = None
+    current_executor: RunProgressExecutor | None = None
+    last_executor: RunProgressExecutor | None = None
+    worker_attempts: RunProgressCount = field(default_factory=RunProgressCount)
+    repair_passes: RunProgressCount = field(default_factory=RunProgressCount)
+    reviews: RunProgressCount = field(default_factory=RunProgressCount)
+    runtime_retries: RunProgressCount = field(default_factory=RunProgressCount)
+    applied_upgrades: RunProgressCount = field(default_factory=RunProgressCount)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class RunProgressDetail(RunProgressSummary):
+    """Canonical summary plus bounded checkpoint and evidence history."""
+
+    checkpoints: tuple[RunProgressCheckpoint, ...] = ()
+    events: tuple[RunProgressEvent, ...] = ()
+    applied_changes: tuple[RunProgressChange, ...] = ()
+    pending_changes: tuple[RunProgressChange, ...] = ()
+    delivery: tuple[RunProgressDeliveryStage, ...] = ()
+    truncation: RunProgressTruncation = field(default_factory=RunProgressTruncation)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _progress_safe(asdict(self))
+
+
 @dataclass(frozen=True)
 class WorkflowCapability:
     """Ordered workflow choices safe to expose before a launch."""
@@ -161,6 +416,7 @@ class RunStatus:
     restarted_from_run_id: str | None = None
     worker_exit: Mapping[str, Any] | None = None
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    progress: RunProgressSummary | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return bounded_redacted(asdict(self))
@@ -204,7 +460,31 @@ class ContextBundle:
     schema_version: int = CONTROL_PLANE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return bounded_redacted(asdict(self))
+        # The generic control-plane serializer intentionally caps lists at 128
+        # items.  Progress detail has its own, larger bounded history window,
+        # so preserve that typed projection instead of silently turning a
+        # valid detail payload into an invalid/truncated shape.
+        data: dict[str, Any] = {}
+        for index, (key, value) in enumerate(self.data.items()):
+            if index >= MAX_SERIALIZED_ITEMS:
+                data["_truncated"] = "mapping item limit"
+                break
+            name = str(key)
+            if name == "progress":
+                if isinstance(value, (RunProgressSummary, RunProgressDetail)):
+                    data[name] = value.to_dict()
+                elif isinstance(value, Mapping):
+                    data[name] = _progress_safe(value)
+                else:
+                    data[name] = bounded_redacted(value)
+            else:
+                data[name] = bounded_redacted(value)
+        return {
+            "run_id": self.run_id,
+            "level": self.level,
+            "data": data,
+            "schema_version": self.schema_version,
+        }
 
 
 @dataclass(frozen=True)

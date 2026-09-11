@@ -15,7 +15,7 @@ from aflow.config import ConfigError, WorkflowUserConfig
 from aflow.live_config import load_live_config
 from aflow.run_state import OverrideRequest, load_override_request
 
-from .models import ContextBundle, RunControlRequest, StartupQuestionRecord
+from .models import ContextBundle, RunControlRequest, RunStatus, StartupQuestionRecord
 from .persistence import (
     ControlConflictError,
     ControlWriteResult,
@@ -248,13 +248,22 @@ class ContextService:
         *,
         level: Literal["lite", "full"] = "lite",
         full_scope: bool = False,
+        status: RunStatus | None = None,
     ) -> ContextBundle:
-        status = self._repository.get_run_status(run_id)
+        if status is None:
+            status = self._repository.get_run_status(run_id)
+        elif status.run_id != run_id:
+            raise ValueError("context status does not belong to the requested run")
         action = "context:full" if level == "full" else "context:lite"
         if self._authorizer is not None and self._authorizer(action, status) is False:
             raise ServiceAuthorizationError(f"not authorized for {action}")
         return build_context_bundle(
-            self._repository.run_directory(run_id), level=level, full_scope=full_scope
+            self._repository.run_directory(run_id),
+            level=level,
+            full_scope=full_scope,
+            progress_activity=status.activity,
+            progress_phase=status.launch_phase,
+            progress_run_status=status.status,
         )
 
 

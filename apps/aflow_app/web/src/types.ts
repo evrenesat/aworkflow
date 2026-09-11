@@ -411,6 +411,8 @@ export interface RunStatus {
   skipped_steps: string[]
   restarted_from_run_id: string | null
   evidence: Record<string, unknown>
+  /** Additive canonical progress; absent/null remains valid for legacy runs. */
+  progress?: RunProgressSummary | null
 }
 
 export interface RecoveryWorkerEvidence {
@@ -469,10 +471,161 @@ export interface RunProgress {
   current_turn: RunProgressTurn | null
 }
 
+export type CanonicalRunProgressAvailability = 'complete' | 'partial' | 'unavailable' | 'not_applicable'
+export type RunProgressCoverage = 'complete' | 'partial' | 'unavailable'
+export type CanonicalRunProgressCheckpointStatus =
+  | 'pending'
+  | 'implementing'
+  | 'reviewing'
+  | 'repairing'
+  | 'approved'
+  | 'recorded_complete'
+  | 'blocked'
+  | 'unknown'
+export type RunProgressDeliveryStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'not_applicable'
+export type RunProgressChangeStatus = 'applied' | 'pending' | 'failed' | 'unknown'
+
+export interface RunProgressCount {
+  value: number | null
+  coverage: RunProgressCoverage
+}
+
+export interface RunProgressExecutor {
+  role: string | null
+  team: string | null
+  selector: string | null
+  harness: string | null
+  model: string | null
+  model_display: string | null
+  effort: string | null
+  source_run_id: string | null
+  invocation_id: string | null
+  turn_number: number | null
+  started_at: string | null
+  ended_at: string | null
+  duration_seconds: number | null
+}
+
+export interface RunProgressDetailCheckpoint {
+  checkpoint_id: string | null
+  ordinal: number | null
+  title: string | null
+  status: CanonicalRunProgressCheckpointStatus
+  awaiting_review: boolean
+  worker_attempts: RunProgressCount
+  repair_passes: RunProgressCount
+  reviews: RunProgressCount
+  runtime_retries: RunProgressCount
+  applied_upgrades: RunProgressCount
+  recorded_at: string | null
+  duration_seconds: number | null
+  scope_id: string | null
+  generation_id: string | null
+  parent_checkpoint_id: string | null
+  source_run_id: string | null
+}
+
+export interface RunProgressDetailEvent {
+  event_id: string
+  checkpoint_id: string | null
+  scope_id: string | null
+  source_run_id: string | null
+  turn_number: number | null
+  decision_number: number | null
+  kind: string
+  outcome: string | null
+  executor: RunProgressExecutor | null
+  started_at: string | null
+  ended_at: string | null
+  duration_seconds: number | null
+  reason: string | null
+  source_reference: Record<string, unknown> | null
+}
+
+export interface RunProgressChange {
+  change_id: string
+  status: RunProgressChangeStatus
+  kind: string
+  roles: string[]
+  old_team: string | null
+  new_team: string | null
+  old_selector: string | null
+  new_selector: string | null
+  old_model: string | null
+  new_model: string | null
+  old_effort: string | null
+  new_effort: string | null
+  turn_number: number | null
+  checkpoint_id: string | null
+  generation_id: string | null
+  reason: string | null
+  recorded_at: string | null
+  source_reference: Record<string, unknown> | null
+}
+
+export interface RunProgressDeliveryStage {
+  stage: string
+  status: RunProgressDeliveryStatus
+  recorded_at: string | null
+  reason: string | null
+  source_reference: Record<string, unknown> | null
+}
+
+export interface RunProgressTruncation {
+  evidence_bytes: number
+  records_read: number
+  checkpoints_read: number
+  events_read: number
+  omitted_records: number
+  omitted_checkpoints: number
+  notices: string[]
+}
+
+export interface RunProgressSummary {
+  schema_version: number
+  availability: CanonicalRunProgressAvailability
+  observed_at: string | null
+  evidence_at: string | null
+  reason_codes: string[]
+  original_plan_identity: string | null
+  original_plan_display_name: string | null
+  original_plan_path: string | null
+  total_checkpoints: RunProgressCount
+  approved_checkpoints: RunProgressCount
+  recorded_complete_checkpoints: RunProgressCount
+  checkpoint_states?: Record<string, CanonicalRunProgressCheckpointStatus>
+  current_checkpoint_id: string | null
+  current_checkpoint_ordinal: number | null
+  current_checkpoint_title: string | null
+  activity: string | null
+  phase: string | null
+  run_status: string | null
+  current_executor: RunProgressExecutor | null
+  last_executor: RunProgressExecutor | null
+  worker_attempts: RunProgressCount
+  repair_passes: RunProgressCount
+  reviews: RunProgressCount
+  runtime_retries: RunProgressCount
+  applied_upgrades: RunProgressCount
+}
+
+export interface RunProgressDetail extends RunProgressSummary {
+  checkpoints: RunProgressDetailCheckpoint[]
+  events: RunProgressDetailEvent[]
+  applied_changes: RunProgressChange[]
+  pending_changes: RunProgressChange[]
+  delivery: RunProgressDeliveryStage[]
+  truncation: RunProgressTruncation
+}
+
+export interface RunContextData extends Record<string, unknown> {
+  progress?: RunProgressDetail | null
+}
+
 export interface RunContext {
   run_id: string
   level: 'lite' | 'full'
-  data: Record<string, unknown>
+  data: RunContextData
   schema_version: number
 }
 

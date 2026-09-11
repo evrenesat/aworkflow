@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import * as api from './api'
-import { runPlanDisplayName, runPlanPath, statusLabel } from './runPresentation'
+import { runPlanDisplayNameForRun, runPlanPath, statusLabel } from './runPresentation'
 import type { RunStatus } from './types'
 
 export const RECENT_LIMIT_KEY = 'aflow.recentRunsLimit'
@@ -39,7 +39,7 @@ export function matchesGlobalRun(row: GlobalRun, query: string, projectLabel = '
   const searchable = [
     projectLabel,
     row.projectId,
-    runPlanDisplayName(planPath, run.run_id),
+    runPlanDisplayNameForRun(run),
     planPath,
     run.run_id,
     statusLabel(run),

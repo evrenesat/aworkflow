@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-09-11 — Visual run progress and checkpoint history
+
+- Added bounded, read-only canonical progress shared by repository/status,
+  REST/MCP and selected Lite/Full context. List summaries carry no history
+  arrays; detail retains original checkpoint lineage, evidence-qualified
+  counts, historical executor identity, applied/pending changes and truthful
+  delivery stages without changing controller or manager authority.
+- Added compact global/project progress and responsive checkpoint timelines,
+  preserving selection and Back navigation. Follow-up fixes retain stable
+  identities, review/repartition lineage, unknown history and exact retry
+  roles; proven retry completion references link to matching invocations.
+- Cumulative review covered all five checkpoints and eighteen fix versions.
+  Focused progress, transport, component, build and lint checks passed, as did
+  exact Chromium/WebKit history journeys. Retained viewport/theme evidence
+  covers the unchanged layout; CI owns full suites.
+- Publication, exact-SHA CI, live activation and physical mobile keyboard /
+  browser-toolbar checks remain separate downstream verification.
+
 ## 2026-09-11 — Wrap finalized run-summary prose on narrow screens
 
 - Added the focused boundary `.run-detail .dashboard-section > p { overflow-wrap: anywhere; }`. This keeps the complete finalized summary visible without changing stored evidence, native input scrolling, or the explicitly scrollable raw report.

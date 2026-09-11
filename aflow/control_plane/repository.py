@@ -26,6 +26,7 @@ from .run_activity import project_activity, preparation_active, valid_startup_qu
 
 
 MAX_PAGE_SIZE = 1_000
+MAX_READ_ARTIFACT_BYTES = 8 * 1024 * 1024
 _LEGACY_DIRECT_RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 _PLAN_DIRECTORIES = (
     ("drafts", "draft"),
@@ -186,6 +187,44 @@ class RunRepository:
             raise RepositoryError("launch manifest may not be a symlink")
         return self._parse_manifest(path)
 
+    @staticmethod
+    def _with_progress(
+        status: RunStatus,
+        run_dir: Path,
+        metadata: Mapping[str, Any],
+    ) -> RunStatus:
+        """Attach optional progress without making status reads fragile."""
+        from .run_progress import project_run_progress_summary
+
+        try:
+            progress = project_run_progress_summary(
+                run_dir,
+                metadata=metadata,
+                activity=status.activity,
+                phase=status.launch_phase,
+                run_status=status.status,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # Progress is an additive observer projection.  Malformed or
+            # concurrently changing optional evidence must not hide the
+            # authoritative status or remove another project's row.
+            return status
+        return replace(status, progress=progress)
+
+    def with_progress(self, status: RunStatus) -> RunStatus:
+        """Refresh the additive projection after another read adds evidence."""
+        valid, is_legacy_identity = self._readable_run_id(status.run_id)
+        run_dir = (
+            self._contained_path(".aflow", "runs", valid)
+            if is_legacy_identity
+            else self.run_directory(valid)
+        )
+        try:
+            metadata = self._read_run_metadata(run_dir) if run_dir.is_dir() else {}
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return status
+        return self._with_progress(status, run_dir, metadata)
+
     def get_run_status(self, run_id: str) -> RunStatus:
         valid, is_legacy_identity = self._readable_run_id(run_id)
         run_dir = (
@@ -204,7 +243,7 @@ class RunRepository:
         if manifest is None:
             # Legacy state has no immutable launch evidence.  Even a stale
             # ``running`` record must never be interpreted as a live process.
-            return project_activity(RunStatus(
+            result = project_activity(RunStatus(
                 run_id=valid,
                 status=metadata.get("status") if metadata.get("status") in {"completed", "failed", "interrupted"} else "needs_attention",
                 ownership="legacy",
@@ -218,6 +257,7 @@ class RunRepository:
                 started_at=_optional_text(metadata.get("run_started_at")),
                 evidence={"recorded_status": metadata.get("status")},
             ))
+            return self._with_progress(result, run_dir, metadata)
 
         phase_data = self._launch_state(valid)
         phase = _optional_text(phase_data.get("phase"))
@@ -303,7 +343,12 @@ class RunRepository:
                 **({"recovery_worker": recovery_worker} if recovery_worker is not None else {}),
             },
         )
-        return project_activity(project_worker_status(result, self.repo_root) if Path(manifest.project_root).resolve() == self.repo_root else result)
+        projected = project_activity(
+            project_worker_status(result, self.repo_root)
+            if Path(manifest.project_root).resolve() == self.repo_root
+            else result
+        )
+        return self._with_progress(projected, run_dir, metadata)
 
     def _startup_record(self, run_id: str) -> Mapping[str, Any]:
         path = self._contained_path(".aflow", "start-requests", f"{run_id}.json")
@@ -377,6 +422,75 @@ class RunRepository:
     def run_directory(self, run_id: str) -> Path:
         valid = validate_run_id(run_id)
         return self._contained_path(".aflow", "runs", valid)
+
+    def read_run_metadata(self, run_id: str) -> Mapping[str, Any]:
+        """Read one run metadata object without normalizing or rewriting it."""
+        valid, is_legacy_identity = self._readable_run_id(run_id)
+        run_dir = (
+            self._contained_path(".aflow", "runs", valid)
+            if is_legacy_identity
+            else self.run_directory(valid)
+        )
+        if not run_dir.is_dir():
+            raise RepositoryNotFoundError(f"run '{valid}' does not exist")
+        path = run_dir / "run.json"
+        if path.is_symlink():
+            raise RepositoryError("run metadata may not be a symlink")
+        try:
+            if path.stat().st_size > MAX_READ_ARTIFACT_BYTES:
+                raise RepositorySchemaError("run metadata exceeds the bounded read limit")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except RepositorySchemaError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RepositorySchemaError("run metadata is unreadable") from exc
+        if not isinstance(payload, Mapping):
+            raise RepositorySchemaError("run metadata is not an object")
+        return dict(payload)
+
+    def read_run_artifact(
+        self, run_id: str, relative_path: str, *, max_bytes: int = MAX_READ_ARTIFACT_BYTES
+    ) -> bytes:
+        """Read one contained run-relative artifact with a strict byte bound."""
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path.strip()
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+        ):
+            raise RepositoryError("run artifact path must be a contained relative path")
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not 1 <= max_bytes <= MAX_READ_ARTIFACT_BYTES
+        ):
+            raise RepositoryError("max_bytes exceeds the bounded run artifact read limit")
+        valid, is_legacy_identity = self._readable_run_id(run_id)
+        run_dir = (
+            self._contained_path(".aflow", "runs", valid)
+            if is_legacy_identity
+            else self.run_directory(valid)
+        )
+        if not run_dir.is_dir():
+            raise RepositoryNotFoundError(f"run '{valid}' does not exist")
+        relative = Path(relative_path)
+        current = run_dir
+        for component in relative.parts:
+            current = current / component
+            if current.is_symlink():
+                raise RepositoryError("run artifact path may not contain symlinks")
+        try:
+            resolved = current.resolve(strict=True)
+            resolved.relative_to(run_dir.resolve(strict=True))
+            if not resolved.is_file():
+                raise RepositoryNotFoundError(f"run artifact '{relative_path}' does not exist")
+            if resolved.stat().st_size > max_bytes:
+                raise RepositorySchemaError("run artifact exceeds the bounded read limit")
+            return resolved.read_bytes()
+        except (RepositoryError, RepositoryNotFoundError, RepositorySchemaError):
+            raise
+        except (OSError, ValueError) as exc:
+            raise RepositoryError("run artifact is outside the run directory") from exc
 
     def _run_ids(self) -> list[str]:
         ids: set[str] = set()

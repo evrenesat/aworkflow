@@ -433,3 +433,50 @@ Publication, exact-SHA CI and live activation remain controller/coordinator
 steps and are not claimed by this local review.
 
 No material findings
+
+---
+
+# Cumulative visual progress review — v19
+
+Approved for engine-managed integration under material-code-review and aflow-review-squash. No material findings.
+
+## Reviewed range
+
+- Unchanged Pre-Handoff Base HEAD: `0290a03de7c3ed760422db0f3dba77a60a82be87`.
+- Reviewed implementation HEAD: `5565ac752e852b01cc9b239957cf7a32c79b3cfd`.
+- One new commit since `280b08924617891bcef9e2413485936dfbacd292`; 23 total handoff commits.
+- Covers CP1–CP5 v01 plus cp01 v01–v18, cumulatively from the original base, not merely the latest fix.
+- Scope reviewed: contained bounded evidence reads/cache; lineage, approval, counts, executor and change identities; canonical/REST/MCP serialization; global/project summaries; selected checkpoint timeline, refresh and responsive navigation; delivery honesty and documentation.
+- Branch matches original-plan tracking; base remains reachable. No remote branch contains the reviewed HEAD.
+
+## Prior findings
+
+F1 containment; F2 deduplication/association; F3 stable IDs; F4 bounded reads/discovery; F5 pending routing; F6 repartition generations; F7 active/closed reviewer association; F8 unreadable-history uncertainty; F9 ordinal markers; F10 Merge evidence; F11 manager approval exclusion; F12 distinct change IDs; F13 successor executor lineage; F14 successful reviewer approvals; F15 actual hotplug models; F16 retry deduplication; F17 retry roles: resolved. Inspected their current cumulative code and reran the complete focused progress test module.
+
+F18 is resolved by cp01 v18: canonical completion_turn_number links only to a unique invocation with exact source run, turn and worker/reviewer role. Missing/ambiguous targets retain the recorded completion turn as text; missing evidence remains unknown; explicit event-ID compatibility remains. Component and actual browser coverage verify this producer/consumer contract.
+
+A candidate concerning generic failed-review classification was excluded: the inspected production process-failure path writes harness-failed, not the proposed generic failed status. No demonstrated supported failure justified admitting it.
+
+## Verification
+
+Fresh local checks at the reviewed HEAD:
+
+- `uv run pytest -q tests/test_run_progress.py --basetemp=/root/code/evidence/aflow-dogfood-20260909/visual-progress-review-20260911/review-v19-core --tb=short`: 38 passed.
+- `uv run pytest -q tests/test_control_plane_repository.py::test_progress_projection_failure_does_not_hide_base_status tests/test_control_plane_repository.py::test_progress_cache_is_separated_by_project_and_refreshes_new_turn_evidence apps/aflow_app/server/tests/test_control_plane_api.py::test_progress_transport_models_keep_optional_status_and_full_detail_shapes tests/test_control_plane_services.py::test_context_detail_reuses_status_summary_without_full_context_escalation apps/aflow_app/server/tests/test_mcp.py::test_mcp_run_context_progress_matches_authenticated_rest --basetemp=/root/code/evidence/aflow-dogfood-20260909/visual-progress-review-20260911/review-v19-contracts --tb=short`: five passed.
+- `npm --prefix apps/aflow_app/web test -- --run src/components/CheckpointHistory.test.tsx src/components/RunProgress.test.tsx`: 25 passed.
+- `npm --prefix apps/aflow_app/web run build`: passed.
+- `uv run ruff check aflow/control_plane apps/aflow_app/server/src`: passed.
+- `git diff --check 0290a03 HEAD`: passed.
+- Exact browser node `apps/aflow_app/server/tests/test_run_progress_browser.py::test_checkpoint_history_review_evidence_and_generation_refresh`: one passed in Chromium, one in WebKit, via `uv run --project apps/aflow_app/server pytest -q ... --tb=short`. Invocation-owned AFLOW_BROWSER_ARTIFACT_DIR and --basetemp paths use review-v19-chromium / review-v19-chromium-tmp and review-v19-webkit / review-v19-webkit-tmp under the evidence root above. WebKit uses AFLOW_TEST_BROWSER=webkit. Fresh Chromium screenshot inspected.
+- Reused retained CP5 viewport/theme and v17 GlobalRunOverview/RunDashboard proof for unchanged implementations, together with previous focused regression evidence. CI owns full suites.
+- Prompt-supplied worktree-relative turn-041/result.json is absent; the decision relies on code/history, retained evidence and the independent checks above.
+
+## Approval finalization
+
+Squash all 23 unpublished handoff commits into one after the unchanged base, including this tracked review record and the compacted DEVLOG entry. Preserve implementation blobs, delete the superseded private v18 overlay, and leave the ignored original plan in place for engine finalization. Record the final approved SHA in original-plan tracking only, avoiding a self-referential commit.
+
+The test invocation's incidental server uv.lock refresh was restored to reviewed bytes. No implementation, controller, shared runtime installation, account or live-state edits were made by review.
+
+Publication, integration with current main, exact-SHA CI, live activation and physical-device acceptance remain downstream and unclaimed. Preserve loading, recovery/pending-review/startup guards and concurrent stop-after-turn controls during integration.
+
+No material findings

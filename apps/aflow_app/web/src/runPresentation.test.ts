@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RunStatus } from './types'
-import { executionDuration, runPlanDisplayName, statusLabel } from './runPresentation'
+import { executionDuration, runPlanDisplayName, runPlanDisplayNameForRun, runPlanPath, statusLabel } from './runPresentation'
 
 const run = { status: 'manifest_only', ownership: 'control_plane', evidence: { manifest_created_at: '2026-09-08T10:00:00Z' } } as RunStatus
 describe('honest run timing', () => {
@@ -39,5 +39,20 @@ describe('run plan presentation', () => {
   it('falls back to the exact run id only when the plan name is absent', () => {
     expect(runPlanDisplayName(null, 'run-without-plan')).toBe('run-without-plan')
     expect(runPlanDisplayName('/srv/plans/.md', 'run-with-empty-name')).toBe('run-with-empty-name')
+  })
+
+  it('prefers canonical original identity when legacy list fields are absent', () => {
+    const run = {
+      run_id: 'run-canonical',
+      status: 'running',
+      ownership: 'control_plane',
+      evidence: {},
+      progress: {
+        original_plan_display_name: 'canonical-plan.md',
+        original_plan_path: '/srv/original/canonical-plan.md',
+      },
+    } as RunStatus
+    expect(runPlanPath(run)).toBe('/srv/original/canonical-plan.md')
+    expect(runPlanDisplayNameForRun(run)).toBe('Canonical plan')
   })
 })

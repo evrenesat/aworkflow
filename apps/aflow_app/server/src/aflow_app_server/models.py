@@ -53,6 +53,158 @@ class CapabilityResponse(CanonicalTransportModel):
     service_features: tuple[str, ...]
 
 
+class RunProgressCountResponse(CanonicalTransportModel):
+    value: int | None = None
+    coverage: Literal["complete", "partial", "unavailable"] = "unavailable"
+
+
+class RunProgressExecutorResponse(CanonicalTransportModel):
+    role: str | None = None
+    team: str | None = None
+    selector: str | None = None
+    harness: str | None = None
+    model: str | None = None
+    model_display: str | None = None
+    effort: str | None = None
+    source_run_id: str | None = None
+    invocation_id: str | None = None
+    turn_number: int | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+
+
+class RunProgressCheckpointResponse(CanonicalTransportModel):
+    checkpoint_id: str | None = None
+    ordinal: int | None = None
+    title: str | None = None
+    status: Literal[
+        "pending",
+        "implementing",
+        "reviewing",
+        "repairing",
+        "approved",
+        "recorded_complete",
+        "blocked",
+        "unknown",
+    ] = "unknown"
+    awaiting_review: bool = False
+    worker_attempts: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    repair_passes: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    reviews: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    runtime_retries: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    applied_upgrades: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    recorded_at: str | None = None
+    duration_seconds: float | None = None
+    scope_id: str | None = None
+    generation_id: str | None = None
+    parent_checkpoint_id: str | None = None
+    source_run_id: str | None = None
+
+
+class RunProgressEventResponse(CanonicalTransportModel):
+    event_id: str
+    checkpoint_id: str | None = None
+    scope_id: str | None = None
+    source_run_id: str | None = None
+    turn_number: int | None = None
+    decision_number: int | None = None
+    kind: str = "unknown"
+    outcome: str | None = None
+    executor: RunProgressExecutorResponse | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+    reason: str | None = None
+    source_reference: Mapping[str, Any] | None = None
+
+
+class RunProgressChangeResponse(CanonicalTransportModel):
+    change_id: str
+    status: Literal["applied", "pending", "failed", "unknown"] = "unknown"
+    kind: str = "configuration_change"
+    roles: tuple[str, ...] = ()
+    old_team: str | None = None
+    new_team: str | None = None
+    old_selector: str | None = None
+    new_selector: str | None = None
+    old_model: str | None = None
+    new_model: str | None = None
+    old_effort: str | None = None
+    new_effort: str | None = None
+    turn_number: int | None = None
+    checkpoint_id: str | None = None
+    generation_id: str | None = None
+    reason: str | None = None
+    recorded_at: str | None = None
+    source_reference: Mapping[str, Any] | None = None
+
+
+class RunProgressDeliveryStageResponse(CanonicalTransportModel):
+    stage: str
+    status: Literal[
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+        "unknown",
+        "not_applicable",
+    ] = "unknown"
+    recorded_at: str | None = None
+    reason: str | None = None
+    source_reference: Mapping[str, Any] | None = None
+
+
+class RunProgressTruncationResponse(CanonicalTransportModel):
+    evidence_bytes: int = 0
+    records_read: int = 0
+    checkpoints_read: int = 0
+    events_read: int = 0
+    omitted_records: int = 0
+    omitted_checkpoints: int = 0
+    notices: tuple[str, ...] = ()
+
+
+class RunProgressSummaryResponse(CanonicalTransportModel):
+    schema_version: int
+    availability: Literal["complete", "partial", "unavailable", "not_applicable"]
+    observed_at: str | None = None
+    evidence_at: str | None = None
+    reason_codes: tuple[str, ...] = ()
+    original_plan_identity: str | None = None
+    original_plan_display_name: str | None = None
+    original_plan_path: str | None = None
+    total_checkpoints: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    approved_checkpoints: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    recorded_complete_checkpoints: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    checkpoint_states: Mapping[str, Literal[
+        "pending", "implementing", "reviewing", "repairing", "approved",
+        "recorded_complete", "blocked", "unknown",
+    ]] = Field(default_factory=dict)
+    current_checkpoint_id: str | None = None
+    current_checkpoint_ordinal: int | None = None
+    current_checkpoint_title: str | None = None
+    activity: str | None = None
+    phase: str | None = None
+    run_status: str | None = None
+    current_executor: RunProgressExecutorResponse | None = None
+    last_executor: RunProgressExecutorResponse | None = None
+    worker_attempts: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    repair_passes: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    reviews: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    runtime_retries: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+    applied_upgrades: RunProgressCountResponse = Field(default_factory=RunProgressCountResponse)
+
+
+class RunProgressDetailResponse(RunProgressSummaryResponse):
+    checkpoints: tuple[RunProgressCheckpointResponse, ...] = ()
+    events: tuple[RunProgressEventResponse, ...] = ()
+    applied_changes: tuple[RunProgressChangeResponse, ...] = ()
+    pending_changes: tuple[RunProgressChangeResponse, ...] = ()
+    delivery: tuple[RunProgressDeliveryStageResponse, ...] = ()
+    truncation: RunProgressTruncationResponse = Field(default_factory=RunProgressTruncationResponse)
+
+
 class RunStatusResponse(CanonicalTransportModel):
     activity: Literal["active", "inactive", "unknown"] = "unknown"
     status_reason_code: str = "activity_unknown"
@@ -79,6 +231,7 @@ class RunStatusResponse(CanonicalTransportModel):
     skipped_steps: tuple[str, ...] = ()
     restarted_from_run_id: str | None = None
     evidence: Mapping[str, Any]
+    progress: RunProgressSummaryResponse | None = None
 
 
 class StartRunResponse(CanonicalTransportModel):

@@ -77,6 +77,115 @@ def test_repository_lists_stable_plan_and_run_metadata(tmp_path: Path) -> None:
     assert legacy_metadata.read_text() == '{"status":"running","workflow_name":"old"}\n'
 
 
+def test_repository_status_and_list_expose_only_the_canonical_summary(
+    tmp_path: Path,
+) -> None:
+    plan = tmp_path / "plans" / "in-progress" / "canonical.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Canonical\n\n"
+        "### [x] Checkpoint 1: First\n- [x] done\n\n"
+        "### [ ] Checkpoint 2: Second\n- [ ] pending\n",
+        encoding="utf-8",
+    )
+    run_dir = _owned_run(tmp_path)
+    metadata_path = run_dir / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "repo_root": str(tmp_path),
+            "original_plan_path": str(plan),
+            "history_complete": True,
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    repository = RunRepository(tmp_path)
+    status = repository.get_run_status("owned-run")
+    listed = repository.list_runs().runs[0]
+
+    assert status.progress is not None
+    assert status.progress.total_checkpoints.value == 2
+    assert status.progress.approved_checkpoints.value == 0
+    assert status.progress.recorded_complete_checkpoints.value == 1
+    assert status.progress.original_plan_display_name == "canonical.md"
+    assert listed.progress == status.progress
+    assert "events" not in status.to_dict()["progress"]
+    assert "checkpoints" not in status.to_dict()["progress"]
+
+
+def test_progress_projection_failure_does_not_hide_base_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owned_run(tmp_path)
+    monkeypatch.setattr(
+        "aflow.control_plane.run_progress.project_run_progress_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("optional evidence failed")),
+    )
+
+    status = RunRepository(tmp_path).get_run_status("owned-run")
+
+    assert status.run_id == "owned-run"
+    assert status.status == "needs_attention"
+    assert status.progress is None
+
+
+def test_progress_cache_is_separated_by_project_and_refreshes_new_turn_evidence(
+    tmp_path: Path,
+) -> None:
+    roots = []
+    for name in ("first", "second"):
+        root = tmp_path / name
+        root.mkdir()
+        plan = root / "plans" / "in-progress" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text(
+            f"# {name}\n\n### [ ] Checkpoint 1: {name}\n- [ ] work\n",
+            encoding="utf-8",
+        )
+        run_dir = _owned_run(root, run_id="same-run")
+        metadata_path = run_dir / "run.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata.update(
+            {
+                "repo_root": str(root),
+                "original_plan_path": str(plan),
+                "history_complete": True,
+            }
+        )
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        roots.append((root, run_dir))
+
+    first_status = RunRepository(roots[0][0]).get_run_status("same-run")
+    second_status = RunRepository(roots[1][0]).get_run_status("same-run")
+
+    assert first_status.progress is not None
+    assert second_status.progress is not None
+    assert first_status.progress.original_plan_identity != second_status.progress.original_plan_identity
+    assert first_status.progress.current_checkpoint_title == "Checkpoint 1: first"
+    assert second_status.progress.current_checkpoint_title == "Checkpoint 1: second"
+
+    turn_dir = roots[0][1] / "turns" / "turn-001"
+    turn_dir.mkdir(parents=True)
+    (turn_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "turn_number": 1,
+                "role": "worker",
+                "status": "completed",
+                "finished_at": "2026-09-10T00:00:01Z",
+                "selector": "codex.test",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    refreshed = RunRepository(roots[0][0]).get_run_status("same-run")
+
+    assert refreshed.progress is not None
+    assert refreshed.progress.worker_attempts.value == 1
+
+
 def test_repository_tails_events_with_sequence_cursor_and_limit(tmp_path: Path) -> None:
     run_dir = _owned_run(tmp_path)
     for number in range(1, 5):
@@ -86,6 +195,25 @@ def test_repository_tails_events_with_sequence_cursor_and_limit(tmp_path: Path) 
 
     assert [event.sequence for event in events] == [3, 4]
     assert [event.data["number"] for event in events] == [3, 4]
+
+
+def test_repository_bounded_run_reads_are_contained_and_read_only(tmp_path: Path) -> None:
+    run_dir = _owned_run(tmp_path)
+    artifact = run_dir / "turns" / "turn-001" / "result.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"status":"completed"}\n', encoding="utf-8")
+    metadata_before = (run_dir / "run.json").read_bytes()
+    artifact_before = artifact.read_bytes()
+
+    repository = RunRepository(tmp_path)
+
+    assert repository.read_run_metadata("owned-run")["status"] == "running"
+    assert repository.read_run_artifact("owned-run", "turns/turn-001/result.json") == artifact_before
+    assert (run_dir / "run.json").read_bytes() == metadata_before
+    assert artifact.read_bytes() == artifact_before
+
+    with pytest.raises(RepositoryError, match="contained relative path"):
+        repository.read_run_artifact("owned-run", "../outside.json")
 
 
 def test_repository_reads_historical_direct_cli_runs_without_enabling_control_paths(

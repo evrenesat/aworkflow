@@ -577,8 +577,8 @@ def test_mcp_run_context_progress_matches_authenticated_rest(mcp_client) -> None
     client, root, _, _ = mcp_client
     fixture = _seed_issue35_progress_fixture(root)
     run_id = fixture["run_id"]
-    overlay = fixture["overlay"]
     assert isinstance(run_id, str)
+    overlay = fixture["overlay"]
     assert isinstance(overlay, Path)
     assert overlay.is_file()
     assert not (root / overlay.name).exists()
@@ -597,27 +597,14 @@ def test_mcp_run_context_progress_matches_authenticated_rest(mcp_client) -> None
     )
 
     assert mcp_context == rest_context
-    assert rest_context["data"]["progress"] == {
-        "availability": "available",
-        "checkpoint": {"index": 4, "name": "Checkpoint 4: Stage 4"},
-        "total": 14,
-        "complete": False,
-        "repairing": True,
-        "overlay_path": str(overlay),
-        "reason": None,
-        "last_finished_turn": {
-            "turn_number": 3,
-            "step": "review",
-            "status": "completed",
-            "summary": "exit 0: review approved",
-        },
-        "current_turn": {
-            "turn_number": 4,
-            "step": "implement",
-            "status": "starting",
-            "summary": None,
-        },
-    }
+    progress = rest_context["data"]["progress"]
+    assert progress["schema_version"] == 1
+    assert progress["availability"] == "partial"
+    assert progress["current_checkpoint_ordinal"] == 4
+    assert progress["current_checkpoint_title"] == "Checkpoint 4: Stage 4"
+    assert progress["total_checkpoints"] == {"value": 14, "coverage": "complete"}
+    assert len(progress["checkpoints"]) == 14
+    assert progress["truncation"]["events_read"] == 2
 
 
 def test_mcp_and_rest_context_ignore_agent_transcript_stop(mcp_client) -> None:

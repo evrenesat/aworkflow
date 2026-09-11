@@ -236,6 +236,12 @@ class ControlPlaneService:
     def capabilities(self, project_id: str):
         return self._project(project_id).daemon.application.capabilities.get()
 
+    @staticmethod
+    def _status(item, run_id: str) -> RunStatus:
+        """Return daemon status with progress using the final activity read."""
+        status = item.daemon.service.run_status(run_id)
+        return item.daemon.application.repository.with_progress(status)
+
     def list_plans(
         self, project_id: str, *, limit: int, cursor: str | None
     ) -> tuple[PlanRecord, ...]:
@@ -247,13 +253,22 @@ class ControlPlaneService:
         item = self._project(project_id)
         page = item.daemon.application.repository.list_history(limit=limit, cursor=cursor, history=history)
         return RunPage(
-            runs=tuple(replace(item.daemon.service.run_status(run.run_id), history_state=run.history_state, history_revision=run.history_revision) for run in page.runs),
+            runs=tuple(
+                replace(
+                    self._status(item, run.run_id),
+                    history_state=run.history_state,
+                    history_revision=run.history_revision,
+                )
+                for run in page.runs
+            ),
             next_cursor=page.next_cursor,
         )
 
     def run_status(self, project_id: str, run_id: str) -> RunStatus:
         item = self._project(project_id)
-        return RunHistory(item.daemon.application.repository).project(item.daemon.service.run_status(run_id), external=True)
+        return RunHistory(item.daemon.application.repository).project(
+            self._status(item, run_id), external=True
+        )
 
     def change_history(self, project_id, run_id, *, state, expected_revision, idempotency_key, acknowledge_active=False):
         item = self._project(project_id)
@@ -294,11 +309,12 @@ class ControlPlaneService:
         level: str,
         full_scope: bool,
     ) -> ContextBundle:
-        self.run_status(project_id, run_id)
+        status = self.run_status(project_id, run_id)
         return self._project(project_id).daemon.application.context.get(
             run_id,
             level=level,  # type: ignore[arg-type]
             full_scope=full_scope,
+            status=status,
         )
 
     def preflight(
@@ -413,7 +429,7 @@ class ControlPlaneService:
             caller_scope=self._caller_scope(project_id, caller_scope),
             idempotency_key=idempotency_key,
         )
-        return result, item.daemon.service.run_status(run_id)
+        return result, self._status(item, run_id)
 
     def owner_stop(
         self,
@@ -425,12 +441,14 @@ class ControlPlaneService:
         caller_scope: str = "rest",
     ) -> RunStatus:
         with self.project_lock(project_id):
-            return self._project(project_id).daemon.service.owner_stop(
+            item = self._project(project_id)
+            status = item.daemon.service.owner_stop(
                 run_id,
                 expected_revision=expected_revision,
                 caller_scope=self._caller_scope(project_id, caller_scope),
                 idempotency_key=idempotency_key,
             )
+            return item.daemon.application.repository.with_progress(status)
 
     def resume(
         self,

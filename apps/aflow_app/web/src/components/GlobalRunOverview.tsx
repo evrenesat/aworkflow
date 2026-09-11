@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { fetchGlobalRuns, matchesGlobalRun, selectGlobalRuns, useRecentRunsLimit } from '../globalRuns'
 import type { ProjectInfo, RunStatus } from '../types'
-import { executionDuration, runPlanDisplayName, runPlanPath, statusLabel } from '../runPresentation'
+import { executionDuration, runPlanDisplayNameForRun, runPlanPath, statusLabel } from '../runPresentation'
 import { formatMachineLabel } from '../label'
 import { projectContextLabel } from '../projectPresentation'
 import { useHeaderSlots } from './HeaderSlots'
+import { RunProgress } from './RunProgress'
 
 export function RecentRunsLimit() {
   const [limit, setLimit] = useRecentRunsLimit()
@@ -103,7 +104,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     const projectLabel = project ? projectContextLabel(project, projects) : projectId
     const status = statusLabel(run)
     const exactPath = runPlanPath(run)
-    const displayName = runPlanDisplayName(exactPath, run.run_id)
+    const displayName = runPlanDisplayNameForRun(run)
     return <li key={JSON.stringify([projectId, run.run_id])}>
       <button
         className="card global-run-row"
@@ -117,6 +118,7 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
           {run.history_state === 'archived' && <span className="status-pill">Archived</span>}
         </span>
         <span className="text-sm text-dim">{[run.workflow_name ? formatMachineLabel(run.workflow_name) : null, run.team ? formatMachineLabel(run.team) : null, run.current_step ? formatMachineLabel(run.current_step) : null, executionDuration(run, Date.now())].filter(Boolean).join(' · ') || 'No execution details reported'}</span>
+        <RunProgress run={run} />
         <span className="text-xs text-dim mono">Plan: {exactPath ?? 'Not reported'} · Run: {run.run_id}</span>
       </button>
     </li>

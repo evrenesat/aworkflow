@@ -610,6 +610,9 @@ def build_context_bundle(
     *,
     level: Literal["lite", "full"] = "lite",
     full_scope: bool = False,
+    progress_activity: str | None = None,
+    progress_phase: str | None = None,
+    progress_run_status: str | None = None,
 ) -> ContextBundle:
     """Adapt existing manager context, with Lite default and explicit Full scope."""
     if level not in {"lite", "full"}:
@@ -629,7 +632,7 @@ def build_context_bundle(
         "events": [event.to_dict() for event in read_events(root, limit=100)],
     }
     manager_context: Mapping[str, Any] | None = None
-    from .run_progress import project_run_progress
+    from .run_progress import project_run_progress_detail
     from .worker_diagnostics import worker_evidence
 
     worker = worker_evidence(root.parent.parent.parent, root.name, f"aflow-run-{root.name}.service")
@@ -646,9 +649,15 @@ def build_context_bundle(
         # A pre-turn run has no finalized artifact yet; metadata/events remain
         # the authoritative bounded context until the first boundary exists.
         pass
-    data["progress"] = project_run_progress(
+    # Use only the contained canonical reducer inputs here.  The manager
+    # context above is already owned by this request, but passing it back into
+    # progress would make list/status and context facts depend on context
+    # level and could trigger a second evidence authority.
+    data["progress"] = project_run_progress_detail(
         root,
-        run_metadata=metadata,
-        manager_context=manager_context,
+        metadata=metadata,
+        activity=progress_activity,
+        phase=progress_phase,
+        run_status=progress_run_status,
     )
     return ContextBundle(run_id=root.name, level=level, data=data)

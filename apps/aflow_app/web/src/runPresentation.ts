@@ -20,7 +20,15 @@ export function runPlanDisplayName(planPath: string | null | undefined, runId: s
 export function runPlanPath(run: RunStatus): string | null {
   if (typeof run.plan_path === 'string' && run.plan_path.trim()) return run.plan_path
   const evidencePath = run.evidence.plan_path
-  return typeof evidencePath === 'string' && evidencePath.trim() ? evidencePath : null
+  if (typeof evidencePath === 'string' && evidencePath.trim()) return evidencePath
+  const canonicalPath = run.progress?.original_plan_path
+  return typeof canonicalPath === 'string' && canonicalPath.trim() ? canonicalPath : null
+}
+
+/** Use the canonical original identity when the legacy list fields are absent. */
+export function runPlanDisplayNameForRun(run: RunStatus): string {
+  const canonicalName = run.progress?.original_plan_display_name?.trim()
+  return runPlanDisplayName(canonicalName || runPlanPath(run), run.run_id)
 }
 
 export function statusLabel(run: RunStatus): string {

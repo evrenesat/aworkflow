@@ -8,6 +8,7 @@ import type {
   GuidedProfileSummary,
   RecoveryRequest,
   RecoveryWorkerEvidence,
+  RunProgressDetail,
   RunProgressAvailability,
   RunProgressReason,
   RunProgressTurn,
@@ -26,9 +27,11 @@ import { MoreMenu, MenuItem } from './MoreMenu'
 import { NewRunPage, WorktreePreflightPanel, type WorktreePreflightLoadState } from './NewRunPage'
 import { Combobox } from './Combobox'
 import { useHeaderSlots } from './HeaderSlots'
-import { runPlanDisplayName, runPlanPath, statusLabel, executionDuration } from '../runPresentation'
+import { runPlanDisplayName, runPlanDisplayNameForRun, runPlanPath, statusLabel, executionDuration } from '../runPresentation'
 import { workspaceHref } from '../urlState'
 import { formatMachineChoice, formatMachineLabel } from '../label'
+import { RunProgress } from './RunProgress'
+import { CheckpointHistory } from './CheckpointHistory'
 
 const MAX_TIMELINE_EVENTS = 100
 /** Bounded wait for exact source inactivity before a successor start. */
@@ -272,6 +275,21 @@ function contextText(context: RunContext | null, key: string): string {
     if (typeof value === 'string' || typeof value === 'number') return String(value)
   }
   return 'Not reported'
+}
+
+function canonicalProgressFromContext(context: RunContext | null, runId: string | null): RunProgressDetail | null {
+  if (!context || !runId || context.run_id !== runId) return null
+  const progress = context.data.progress
+  if (typeof progress !== 'object' || progress === null || Array.isArray(progress)) return null
+  if (!['complete', 'partial', 'unavailable', 'not_applicable'].includes(progress.availability)) return null
+  // Older observer context uses the same `progress` key for a smaller
+  // checkpoint summary.  Only the canonical contract owns the selected-run
+  // detail view; keep the legacy projection on its compatibility path.
+  if (!Object.prototype.hasOwnProperty.call(progress, 'total_checkpoints')
+    || !Object.prototype.hasOwnProperty.call(progress, 'approved_checkpoints')
+    || !Object.prototype.hasOwnProperty.call(progress, 'recorded_complete_checkpoints')
+    || !Object.prototype.hasOwnProperty.call(progress, 'current_checkpoint_id')) return null
+  return progress as RunProgressDetail
 }
 
 function planPathFromContext(context: RunContext | null): string {
@@ -1581,7 +1599,22 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     try {
       const result = await api.getRunContext(projectId, runId, level, level === 'full', { signal: contextAbortRef.current.signal })
       if (request !== contextRequestRef.current || selectedRunRef.current !== runId) return
-      setContext(result)
+      setContext((previous) => {
+        if (previous?.run_id !== runId || level !== 'lite') return result
+        // A progress refresh is intentionally allowed to use Lite context,
+        // but it must not discard a richer Full diagnostics payload. Preserve
+        // the full response and replace only the additive canonical progress
+        // projection when the Lite response actually returned one.
+        if (previous.level === 'full') {
+          return Object.prototype.hasOwnProperty.call(result.data, 'progress')
+            ? { ...previous, data: { ...previous.data, progress: result.data.progress } }
+            : previous
+        }
+        if (Object.prototype.hasOwnProperty.call(result.data, 'progress')) return result
+        return previous.data.progress === undefined
+          ? result
+          : { ...result, data: { ...result.data, progress: previous.data.progress } }
+      })
       setContextUpdatedAt(new Date().toISOString())
       setContextBusy(false)
     } catch (contextLoadError) {
@@ -2343,7 +2376,12 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       : 'stream stopped — refresh for updates'
   const startTime = selectedRun?.started_at ?? null
   const elapsed = selectedRun ? executionDuration(selectedRun, elapsedNow) : null
-  const checkpoints = checkpointSummary(context)
+  const canonicalDetail = canonicalProgressFromContext(context, selectedRun?.run_id ?? null)
+  const canonicalProgress = selectedRun?.progress ?? canonicalDetail
+  // The canonical projection owns checkpoint facts when present. Legacy
+  // context remains the compatibility path for older records and its unique
+  // manager explanation continues to render below the canonical detail.
+  const checkpoints = canonicalProgress ? null : checkpointSummary(context)
   const outcome = managerOutcome(context, checkpoints)
   const selectedPlanPath = selectedRun
     ? selectedRun.plan_path ?? (textEvidence(selectedRun, 'plan_path') !== 'Not reported'
@@ -2756,7 +2794,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
             {!hosted && <label>Run history<select className="input" aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
             {listedRuns.length === 0 ? <p className="text-sm text-dim">No runs yet</p> : listedRuns.map((run) => {
               const exactPath = runPlanPath(run)
-              const displayName = runPlanDisplayName(exactPath, run.run_id)
+              const displayName = runPlanDisplayNameForRun(run)
               const status = statusLabel(run)
               return <button
                 data-sidebar-editor-item={run.run_id}
@@ -2771,6 +2809,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   {formatMachineLabel(run.workflow_name ?? '')}{run.current_step ? ` · ${formatMachineLabel(run.current_step)}` : ''}
                   {run.skipped_steps.length > 0 ? ` · ${run.skipped_steps.length} skipped` : ''}
                 </span>
+                <RunProgress run={run} />
                 <span className="text-xs text-dim mono">Plan: {exactPath ?? 'Not reported'} · Run: {run.run_id}</span>
               </button>
             })}
@@ -2799,21 +2838,25 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
                   <button className="btn btn-danger" disabled={busyAction === 'history' || (selectedRun.activity === 'active' && !acknowledgeActive)} onClick={() => void mutateHistory(historyConfirm)}>Confirm {historyConfirm}</button>
                   <button className="btn btn-secondary" onClick={() => setHistoryConfirm(null)}>Cancel</button>
                 </div>}
-                <dl className="run-scan-summary">
-                  <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
-                  <div><dt>Checkpoint / review scope</dt><dd>{checkpoints ? checkpointProgressText(checkpoints) : 'Not reported'}</dd></div>
-                  <div><dt>Worker / reviewer</dt><dd>{runActorSummary(lastExecuted)}</dd></div>
-                  <div><dt>Elapsed / completion</dt><dd>{selectedRunTiming}</dd></div>
-                </dl>
-                <dl className="run-progress-strip">
-                  {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
-                  {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
-                  <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
-                  {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
-                  {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
-                    : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
-                  {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
-                </dl>
+                {canonicalProgress
+                  ? <CheckpointHistory projectId={projectId} run={selectedRun} progress={canonicalProgress} detail={canonicalDetail} />
+                  : <>
+                    <dl className="run-scan-summary">
+                      <div><dt>Project</dt><dd className="mono">{projectId}</dd></div>
+                      <div><dt>Checkpoint / review scope</dt><dd>{checkpoints ? checkpointProgressText(checkpoints) : 'Not reported'}</dd></div>
+                      <div><dt>Worker / reviewer</dt><dd>{runActorSummary(lastExecuted)}</dd></div>
+                      <div><dt>Elapsed / completion</dt><dd>{selectedRunTiming}</dd></div>
+                    </dl>
+                    <dl className="run-progress-strip">
+                      {selectedRun.current_step && <div><dt>Current step / turns</dt><dd>{formatMachineLabel(selectedRun.current_step)} · {selectedRun.turns_completed ?? 0}</dd></div>}
+                      {selectedRun.workflow_name && <div><dt>Workflow</dt><dd>{formatMachineLabel(selectedRun.workflow_name)}</dd></div>}
+                      <div><dt>Team</dt><dd>{selectedRun.team ? formatMachineLabel(selectedRun.team) : 'Not recorded'}</dd></div><div><dt>Max turns</dt><dd>{selectedRun.max_turns ?? 'Not recorded'}</dd></div>
+                      {lastExecuted && <div><dt>Last executed</dt><dd>{lastExecuted.turnNumber !== null ? `turn ${lastExecuted.turnNumber}` : 'Not reported'}</dd></div>}
+                      {startTime ? <div><dt>Started</dt><dd>{timestamp(startTime)}{elapsed ? ` · ${selectedRunIsActive ? 'running for' : 'duration'} ${elapsed}` : ''}</dd></div>
+                        : selectedRun.evidence.manifest_created_at ? <div><dt>Submitted</dt><dd>{timestamp(selectedRun.evidence.manifest_created_at)}</dd></div> : null}
+                      {selectedRun.ended_at && <div><dt>Ended</dt><dd>{timestamp(selectedRun.ended_at)}</dd></div>}
+                    </dl>
+                  </>}
               </div>
               {selectedRun.ownership === 'legacy' && <div className="notice">Legacy execution record. Workflow controls are unavailable; history controls remain available.</div>}
               {pendingBoundaryStop && <div className="notice" role="status">Stop requested — finishing current turn. The current worker/reviewer call may finish before the run becomes Stopped; this does not approve the checkpoint.</div>}

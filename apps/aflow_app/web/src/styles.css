@@ -305,6 +305,24 @@ input::placeholder, textarea::placeholder {
   .input {
     min-height: 48px;
   }
+
+  .run-issue-summary .dashboard-actions {
+    width: 100%;
+    flex-shrink: 1;
+  }
+
+  .dashboard-actions > .btn,
+  .dashboard-actions > .confirmation {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .dashboard-actions > .btn {
+    height: auto;
+    min-height: var(--tap-target);
+    text-align: center;
+  }
 }
 
 .run-dashboard {
@@ -373,7 +391,13 @@ input::placeholder, textarea::placeholder {
 .run-issue-summary > div:first-child { min-width: 0; }
 .run-issue-summary p { margin-top: var(--spacing-xs); }
 .run-issue-failure { border-left-color: var(--color-error); }
-.run-issue-summary .dashboard-actions { justify-content: flex-start; flex-shrink: 0; }
+.run-issue-summary .dashboard-actions { justify-content: flex-start; flex-shrink: 0; min-width: 0; max-width: 100%; }
+
+.dashboard-actions > * {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
 
 .recovery-action,
 .recovery-provenance {
@@ -415,6 +439,234 @@ input::placeholder, textarea::placeholder {
 .run-progress-strip dd {
   margin: var(--spacing-xs) 0 0;
   font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  min-width: 0;
+}
+
+.checkpoint-history-heading {
+  align-items: flex-start;
+}
+
+.checkpoint-history-heading h4,
+.checkpoint-history-detail-heading h5,
+.checkpoint-history-navigation h5,
+.checkpoint-history-detail h5,
+.checkpoint-history-attempts h6,
+.checkpoint-history-disclosure h6 {
+  margin: 0;
+}
+
+.checkpoint-history-summary,
+.checkpoint-history-checkpoint-meta,
+.checkpoint-history-event-meta,
+.checkpoint-history-evidence-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: var(--spacing-sm) var(--spacing-md);
+  margin: 0;
+  padding: var(--spacing-sm);
+  background: var(--color-surface-hover);
+  border-radius: var(--radius-md);
+}
+
+.checkpoint-history-summary div,
+.checkpoint-history-checkpoint-meta div,
+.checkpoint-history-event-meta div,
+.checkpoint-history-evidence-meta div {
+  min-width: 0;
+}
+
+.checkpoint-history-summary dt,
+.checkpoint-history-checkpoint-meta dt,
+.checkpoint-history-event-meta dt,
+.checkpoint-history-evidence-meta dt {
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+}
+
+.checkpoint-history-summary dd,
+.checkpoint-history-checkpoint-meta dd,
+.checkpoint-history-event-meta dd,
+.checkpoint-history-evidence-meta dd {
+  margin: var(--spacing-xs) 0 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-layout {
+  min-width: 0;
+}
+
+/* The checkpoint history list is intentionally part of document flow. The
+   shared layout may make wide navigation sticky for long settings lists, but
+   this bounded evidence list must never become a competing scroll owner. */
+.checkpoint-history-layout .sidebar-editor-navigation {
+  position: static;
+  max-height: none;
+  overflow: visible;
+}
+
+.checkpoint-history-navigation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  min-width: 0;
+}
+
+.checkpoint-history-navigation > .section-heading {
+  align-items: flex-start;
+}
+
+.checkpoint-history-entry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--spacing-xs);
+  min-height: var(--tap-target);
+  padding: var(--spacing-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.checkpoint-history-entry.selected {
+  border-color: var(--color-primary);
+  background: var(--color-surface-hover);
+}
+
+.checkpoint-history-entry-title,
+.checkpoint-history-event-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+  width: 100%;
+  min-width: 0;
+}
+
+.checkpoint-history-entry-title strong,
+.checkpoint-history-event-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  min-width: 0;
+}
+
+.checkpoint-history-detail-heading {
+  min-width: 0;
+}
+
+.checkpoint-history-detail-heading > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-empty-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.checkpoint-history-attempts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  min-width: 0;
+}
+
+.checkpoint-history-timeline,
+.checkpoint-history-change-list,
+.checkpoint-history-delivery-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.checkpoint-history-timeline {
+  counter-reset: checkpoint-event;
+}
+
+.checkpoint-history-event,
+.checkpoint-history-change {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  min-width: 0;
+  padding: var(--spacing-sm);
+  border-left: 3px solid var(--color-border);
+  background: var(--color-surface-hover);
+}
+
+.checkpoint-history-event::before {
+  counter-increment: checkpoint-event;
+  content: counter(checkpoint-event);
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+}
+
+.checkpoint-history-event p,
+.checkpoint-history-change p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-history-event-meta {
+  padding: 0;
+  background: transparent;
+}
+
+.checkpoint-history-disclosures {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.checkpoint-history-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--spacing-sm);
+}
+
+.checkpoint-history-disclosure > summary {
+  min-height: var(--tap-target);
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.checkpoint-history-change-list {
+  margin-top: var(--spacing-sm);
+}
+
+.checkpoint-history-delivery-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-md);
+  justify-content: space-between;
+  min-width: 0;
+  padding: var(--spacing-xs) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.checkpoint-history-delivery-list li > * {
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
@@ -500,6 +752,82 @@ input::placeholder, textarea::placeholder {
   background: var(--color-surface-hover);
   border-color: var(--color-primary);
 }
+
+.compact-run-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  min-width: 0;
+  width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.compact-run-progress-line,
+.compact-run-progress-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs) var(--spacing-md);
+  min-width: 0;
+}
+
+.compact-run-progress-line strong {
+  font-weight: 600;
+}
+
+.compact-run-progress-line > span,
+.compact-run-progress-meta,
+.compact-run-progress-metrics {
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+}
+
+.compact-run-progress-meta > span:not(:last-child)::after {
+  content: ' ·';
+  margin-left: var(--spacing-md);
+}
+
+.compact-run-progress-strip {
+  display: flex;
+  gap: 2px;
+  width: 100%;
+  min-height: 0.45rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--color-surface-hover);
+}
+
+.compact-run-progress-segment {
+  flex: 1 1 0;
+  min-width: 2px;
+  min-height: 0.45rem;
+  background: var(--color-border);
+}
+
+.compact-run-progress-segment.approved { background: var(--color-success); }
+.compact-run-progress-segment.recorded { background: var(--color-warning); }
+.compact-run-progress-segment.current { background: var(--color-primary); }
+.compact-run-progress-segment.unknown { background: repeating-linear-gradient(135deg, var(--color-border), var(--color-border) 3px, var(--color-surface-hover) 3px, var(--color-surface-hover) 6px); }
+
+.compact-run-progress-bar {
+  display: block;
+  width: 100%;
+  min-height: 0.45rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--color-surface-hover);
+}
+
+.compact-run-progress-bar > span {
+  display: block;
+  min-height: 0.45rem;
+  background: var(--color-success);
+}
+
+.compact-run-progress-bar.partial > span { background: var(--color-warning); }
+.compact-run-progress-bar.unknown > span { background: repeating-linear-gradient(135deg, var(--color-border), var(--color-border) 3px, var(--color-surface-hover) 3px, var(--color-surface-hover) 6px); }
+.compact-run-progress.unavailable,
+.compact-run-progress.not_applicable { color: var(--color-text-dim); }
 
 .status-pill {
   display: inline-flex;

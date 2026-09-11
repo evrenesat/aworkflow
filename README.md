@@ -128,6 +128,26 @@ aflow run path/to/plan.md -- keep changes limited to the requested scope
 If no workflow is named, AFlow uses `aflow.default_workflow` from the
 configuration.
 
+## Run progress in the web view
+
+The authenticated web application opens All runs, where an owner can select a
+run and inspect its checkpoint history. The selected run view uses the same
+read-only progress projection as the list summary: checkpoint position,
+approval totals, attempt history, executor identity, applied or pending
+changes, and delivery evidence remain tied to the selected project and run.
+An active reviewer is distinct from a queued review, and each verified
+repartition generation remains listed beneath its stable original checkpoint.
+
+Counts are evidence-qualified. A partial count is a lower bound, and missing
+or conflicting evidence is shown as unavailable rather than treated as zero.
+Approval is separate from a checked plan item, and compact markers use only
+identity-specific checkpoint evidence rather than aggregate approval counts. A
+committed lifecycle does not by itself prove a successful merge, and a pending
+or unknown CI/live stage is never presented as success. Historical executor names and models are
+shown exactly as recorded. Refresh and compact Back retain the selected
+checkpoint when its identity remains available; the observer view does not
+launch workflows or mutate controller state.
+
 Status and progress are printed as readable, append-only blocks on stderr. A
 run emits one identity and plan header, preparation and turn updates, and a
 final summary. On a capable TTY, only each block's heading is bold; redirected

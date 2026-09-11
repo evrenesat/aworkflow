@@ -299,6 +299,47 @@ def test_control_and_context_services_apply_authorization_and_read_only_legacy_r
         ControlService(repository).apply("legacy-run", RunControlRequest(expected_revision=0, max_turns=3))
 
 
+def test_context_detail_reuses_status_summary_without_full_context_escalation(
+    tmp_path: Path,
+) -> None:
+    _owned_run(tmp_path)
+    plan = tmp_path / "plans" / "in-progress" / "context.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "# Context\n\n"
+        "### [x] Checkpoint 1: First\n- [x] done\n\n"
+        "### [ ] Checkpoint 2: Second\n- [ ] pending\n",
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / ".aflow" / "runs" / "owned-run"
+    metadata_path = run_dir / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "repo_root": str(tmp_path),
+            "original_plan_path": str(plan),
+            "history_complete": True,
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    repository = RunRepository(tmp_path)
+    status = repository.get_run_status("owned-run")
+    context = ContextService(repository).get("owned-run")
+    detail = context.to_dict()["data"]["progress"]
+
+    assert status.progress is not None
+    assert detail["schema_version"] == status.progress.schema_version
+    assert detail["total_checkpoints"] == status.progress.total_checkpoints.to_dict()
+    assert detail["approved_checkpoints"] == status.progress.approved_checkpoints.to_dict()
+    assert len(detail["checkpoints"]) == 2
+    assert "events" not in status.progress.to_dict()
+    with pytest.raises(PermissionError, match="explicit"):
+        ContextService(repository).get("owned-run", level="full")
+    full = ContextService(repository).get("owned-run", level="full", full_scope=True)
+    assert full.to_dict()["data"]["progress"]["total_checkpoints"] == detail["total_checkpoints"]
+
+
 def test_startup_questions_are_opaque_transient_service_records(monkeypatch: pytest.MonkeyPatch) -> None:
     question = StartupQuestion(
         kind=StartupQuestionKind.PICK_STEP,

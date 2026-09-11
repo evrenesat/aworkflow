@@ -76,6 +76,33 @@ boundary against the built web assets at desktop and 390px mobile widths.
 This observer path does not write run artifacts or alter manager routing,
 turn selection, or historical captured contexts.
 
+The web All-runs summary and selected-run checkpoint history consume this same
+projection; the detail view is not a second status authority and does not
+request one context document per row. Progress cache entries are bounded and
+keyed by the exact project/run evidence identity. Metadata and evidence
+fingerprint changes invalidate the entry, so a newly finalized turn or a
+terminal transition cannot remain hidden behind a permanent stale cache. The
+projection keeps partial lower bounds, unknown values, and unavailable delivery
+stages explicit, and it preserves the exact historical executor identity
+instead of replacing it with today's configuration. Compact checkpoint markers
+use a bounded ordinal-to-status map only when the returned checkpoint structure
+is complete (at most 30 checkpoints), so aggregate counts never imply which
+checkpoint was approved or recorded complete. A committed plan lifecycle alone
+does not prove a successful merge; Merge is successful only with its own receipt.
+Completed reviewer turns use proven active review scope, exact same-turn
+boundary lineage, or the immediately preceding completed worker boundary that
+retains the exact awaiting-review original scope—never the post-worker
+snapshot. Conflicting or incomplete retained evidence stays unassigned;
+verified repartition records remain applied generation entries under the stable
+original checkpoint.
+
+Unreadable turn results and malformed event records make dependent history
+counts partial without discarding readable events, plan structure, or
+authoritative status. A retained executor remains attached to its own event,
+but is not presented as the latest executor when a newer unreadable turn makes
+recency unprovable. Absent optional manager or delivery artifacts do not create
+that uncertainty.
+
 At a new manager boundary after a review rejection, the active repair overlay
 remains the task identity and is retained as active-plan evidence. The
 checkpoint list, completion state, and checkpoint evidence instead come from

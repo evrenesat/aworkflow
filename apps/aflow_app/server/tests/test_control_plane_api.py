@@ -19,7 +19,11 @@ from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind
 from aflow.control_plane import (
     CapabilitySet,
     ContextBundle,
+    RunProgressCheckpoint,
+    RunProgressChange,
     LaunchManifest,
+    RunProgressDetail,
+    RunProgressSummary,
     RunControlRequest,
     RunStatus,
     StartRunResult,
@@ -36,6 +40,8 @@ from aflow_app_server.models import (
     CapabilityResponse,
     ContextResponse,
     RunControlPayload,
+    RunProgressDetailResponse,
+    RunProgressSummaryResponse,
     RunStatusResponse,
     ResumeRunPayload,
     StartRunResponse,
@@ -893,6 +899,26 @@ def test_transport_models_match_canonical_control_plane_models() -> None:
     assert set(WorktreePreflightResponse.model_fields) == set(payloads["preflight"])
 
 
+def test_progress_transport_models_keep_optional_status_and_full_detail_shapes() -> None:
+    summary_status = RunStatus(run_id="legacy", status="needs_attention")
+    response = RunStatusResponse.from_canonical(summary_status)
+    assert response.progress is None
+
+    summary_response = RunProgressSummaryResponse.from_canonical(RunProgressSummary())
+    detail_response = RunProgressDetailResponse.from_canonical(
+        RunProgressDetail(
+            checkpoint_states={"2": "approved"},
+            checkpoints=(RunProgressCheckpoint("checkpoint-1", awaiting_review=True),),
+            applied_changes=(RunProgressChange("change-1", generation_id="generation-1"),),
+        )
+    )
+    assert summary_response.model_dump(mode="json")["availability"] == "unavailable"
+    assert summary_response.model_dump(mode="json")["checkpoint_states"] == {}
+    assert detail_response.model_dump(mode="json")["checkpoint_states"] == {"2": "approved"}
+    assert detail_response.model_dump(mode="json")["checkpoints"][0]["awaiting_review"] is True
+    assert detail_response.model_dump(mode="json")["applied_changes"][0]["generation_id"] == "generation-1"
+
+
 def test_openapi_documents_control_plane_operations_and_models() -> None:
     schema = app.openapi()
     paths = schema["paths"]
@@ -925,6 +951,38 @@ def test_openapi_documents_control_plane_operations_and_models() -> None:
     resume_schema = schema["components"]["schemas"]["ResumeRunPayload"]
     assert {"extra_instructions", "recovery"} == set(resume_schema["properties"])
     assert "durable-evidence" in resume_schema["properties"]["recovery"]["description"]
+
+
+def test_run_list_uses_summary_only_without_context_requests(control_client, monkeypatch):
+    from aflow_app_server import main
+
+    client, root, _, _ = control_client
+    fixture = _seed_issue35_progress_fixture(root)
+    run_id = fixture["run_id"]
+    assert isinstance(run_id, str)
+    detail = client.get(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/context"
+    )
+    assert detail.status_code == 200, detail.text
+    detail_progress = detail.json()["data"]["progress"]
+    assert len(detail_progress["checkpoints"]) == 14
+
+    project = main._control_plane_service._project(PROJECT_ID)
+    context = project.daemon.application.context
+
+    def unexpected_context_request(*_args, **_kwargs):
+        raise AssertionError("run list must not request per-row context")
+
+    monkeypatch.setattr(context, "get", unexpected_context_request)
+    listed = client.get(f"/api/control-plane/projects/{PROJECT_ID}/runs?history=all")
+
+    assert listed.status_code == 200, listed.text
+    payload = next(item for item in listed.json()["runs"] if item["run_id"] == run_id)
+    progress = payload["progress"]
+    assert "events" not in progress
+    assert "checkpoints" not in progress
+    assert progress["total_checkpoints"] == {"value": 14, "coverage": "complete"}
+    assert detail_progress["total_checkpoints"] == progress["total_checkpoints"]
 
 
 def test_deprecated_execution_routes_are_not_registered() -> None:

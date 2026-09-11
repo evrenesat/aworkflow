@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api'
 import * as api from '../api'
-import type { WorktreePreflight } from '../types'
+import type { RunContext, RunProgressDetail, RunProgressSummary, WorktreePreflight } from '../types'
 import { RunDashboard, type RunSelectionChange } from './RunDashboard'
 import { App } from '../App'
 
@@ -72,6 +72,90 @@ const ownedRun = {
   selected_start_step: null, skipped_steps: [] as string[], restarted_from_run_id: null as string | null,
   started_at: '2024-01-01T00:00:00Z',
   evidence: { manifest_created_at: '2024-01-01T00:00:00Z', plan_path: 'plans/in-progress/demo.md', worktree_path: '/workspace/alpha', branch: 'feature/run' },
+}
+
+function canonicalListProgress(): RunProgressSummary {
+  const known = (value: number) => ({ value, coverage: 'complete' as const })
+  return {
+    schema_version: 1, availability: 'complete', observed_at: '2026-09-11T12:00:00Z', evidence_at: '2026-09-11T11:59:00Z',
+    reason_codes: [], original_plan_identity: 'run-owned-plan', original_plan_display_name: 'run-owned.md', original_plan_path: '/workspace/alpha/plans/run-owned.md',
+    total_checkpoints: known(11), approved_checkpoints: known(4), recorded_complete_checkpoints: known(4),
+    current_checkpoint_id: 'cp-5', current_checkpoint_ordinal: 5, current_checkpoint_title: 'Checkpoint 5: Active',
+    activity: 'active', phase: 'implementing', run_status: 'running', current_executor: null, last_executor: null,
+    worker_attempts: known(2), repair_passes: known(0), reviews: known(1), runtime_retries: known(0), applied_upgrades: known(0),
+  }
+}
+
+function canonicalDetailProgress(overrides: Partial<RunProgressDetail> = {}): RunProgressDetail {
+  const known = (value: number) => ({ value, coverage: 'complete' as const })
+  const worker = {
+    role: 'worker', team: 'base', selector: 'codex.worker', harness: 'codex', model: 'gpt-5', model_display: 'GPT-5', effort: 'high',
+    source_run_id: 'run-owned', invocation_id: 'invoke-worker-5', turn_number: 5,
+    started_at: '2026-09-11T10:00:00Z', ended_at: null, duration_seconds: null,
+  }
+  const reviewer = {
+    role: 'reviewer', team: 'base', selector: 'codex.reviewer', harness: 'codex', model: 'gpt-5', model_display: 'GPT-5', effort: 'high',
+    source_run_id: 'run-owned', invocation_id: 'invoke-review-4', turn_number: 4,
+    started_at: '2026-09-11T09:50:00Z', ended_at: '2026-09-11T09:55:00Z', duration_seconds: 300,
+  }
+  return {
+    ...canonicalListProgress(),
+    current_executor: worker,
+    last_executor: reviewer,
+    checkpoints: [
+      {
+        checkpoint_id: 'cp-4', ordinal: 4, title: 'Checkpoint 4: Reviewed', status: 'approved',
+        worker_attempts: known(1), repair_passes: known(1), reviews: known(2), runtime_retries: known(0), applied_upgrades: known(0),
+        recorded_at: '2026-09-11T09:55:00Z', duration_seconds: 900, scope_id: 'scope-4', generation_id: 'generation-4', parent_checkpoint_id: null, source_run_id: 'run-owned',
+      },
+      {
+        checkpoint_id: 'cp-5', ordinal: 5, title: 'Checkpoint 5: Active', status: 'implementing',
+        worker_attempts: known(1), repair_passes: known(0), reviews: known(0), runtime_retries: known(0), applied_upgrades: known(0),
+        recorded_at: null, duration_seconds: null, scope_id: 'scope-5', generation_id: 'generation-5', parent_checkpoint_id: 'cp-4', source_run_id: 'run-owned',
+      },
+      {
+        checkpoint_id: 'cp-6', ordinal: 6, title: 'Checkpoint 6: Pending', status: 'pending',
+        worker_attempts: known(0), repair_passes: known(0), reviews: known(0), runtime_retries: known(0), applied_upgrades: known(0),
+        recorded_at: null, duration_seconds: null, scope_id: 'scope-6', generation_id: 'generation-6', parent_checkpoint_id: null, source_run_id: 'run-owned',
+      },
+    ],
+    events: [
+      {
+        event_id: 'attempt-4', checkpoint_id: 'cp-4', scope_id: 'scope-4', source_run_id: 'run-owned', turn_number: 2, decision_number: null,
+        kind: 'worker_attempt', outcome: 'completed', executor: reviewer, started_at: '2026-09-11T09:30:00Z', ended_at: '2026-09-11T09:40:00Z', duration_seconds: 600,
+        reason: 'implemented the checkpoint', source_reference: { run_id: 'run-owned', turn_number: 2 },
+      },
+      {
+        event_id: 'review-4', checkpoint_id: 'cp-4', scope_id: 'scope-4', source_run_id: 'run-owned', turn_number: 3, decision_number: 1,
+        kind: 'review_rejection', outcome: 'rejected', executor: reviewer, started_at: '2026-09-11T09:41:00Z', ended_at: '2026-09-11T09:42:00Z', duration_seconds: 60,
+        reason: 'review requested a repair', source_reference: { run_id: 'run-owned', decision_number: 1 },
+      },
+      {
+        event_id: 'repair-4', checkpoint_id: 'cp-4', scope_id: 'scope-4', source_run_id: 'run-owned', turn_number: 4, decision_number: null,
+        kind: 'repair_attempt', outcome: 'completed', executor: worker, started_at: '2026-09-11T09:43:00Z', ended_at: '2026-09-11T09:50:00Z', duration_seconds: 420,
+        reason: 'addressed review rejection', source_reference: { run_id: 'run-owned', turn_number: 4 },
+      },
+      {
+        event_id: 'attempt-5', checkpoint_id: 'cp-5', scope_id: 'scope-5', source_run_id: 'run-owned', turn_number: 5, decision_number: null,
+        kind: 'worker_attempt', outcome: 'running', executor: worker, started_at: '2026-09-11T10:00:00Z', ended_at: null, duration_seconds: null,
+        reason: null, source_reference: { run_id: 'run-owned', turn_number: 5 },
+      },
+    ],
+    applied_changes: [{
+      change_id: 'upgrade-4', status: 'applied', kind: 'worker_upgrade', roles: ['worker'], old_team: 'base', new_team: 'full', old_selector: 'codex.worker', new_selector: 'codex.repair',
+      old_model: 'gpt-5', new_model: 'gpt-5-repair', old_effort: 'medium', new_effort: 'high', turn_number: 4, checkpoint_id: 'cp-4', reason: 'repair team applied', recorded_at: '2026-09-11T09:43:00Z', source_reference: { run_id: 'run-owned' },
+    }],
+    pending_changes: [{
+      change_id: 'pending-5', status: 'pending', kind: 'team_change', roles: ['reviewer'], old_team: 'base', new_team: 'full', old_selector: null, new_selector: 'codex.reviewer', old_model: null, new_model: null, old_effort: null, new_effort: null,
+      turn_number: null, checkpoint_id: 'cp-5', reason: 'applies on next safe turn', recorded_at: null, source_reference: { run_id: 'run-owned' },
+    }],
+    delivery: [
+      { stage: 'final_review', status: 'succeeded', recorded_at: '2026-09-11T09:55:00Z', reason: null, source_reference: null },
+      { stage: 'ci', status: 'unknown', recorded_at: null, reason: 'No CI receipt', source_reference: null },
+    ],
+    truncation: { evidence_bytes: 100, records_read: 12, checkpoints_read: 3, events_read: 4, omitted_records: 0, omitted_checkpoints: 0, notices: [] },
+    ...overrides,
+  }
 }
 
 function observerProgress(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -2796,6 +2880,87 @@ describe('RunDashboard', () => {
     // The progress header carries the run's current step and turns.
     expect(screen.getByText('Implement · 2')).toBeDefined()
     expect(screen.queryByText(/stream connected|stream stopped/)).toBeNull()
+  })
+
+  it('renders canonical list progress without adding a context request for the row', async () => {
+    const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [listed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(listed)
+
+    renderDashboard()
+
+    expect((await screen.findAllByText('4 / 11 approved')).length).toBeGreaterThan(0)
+    expect(screen.getByText(/Implementing CP5 of 11/)).toBeDefined()
+    expect(screen.getByText('Plan: /workspace/alpha/plans/run-owned.md · Run: run-owned')).toBeDefined()
+    expect(api.getRunContext).toHaveBeenCalledTimes(1)
+    expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-owned', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) }))
+  })
+
+  it('inspects selected checkpoint history while preserving full diagnostics on refresh', async () => {
+    const listed = { ...ownedRun, evidence: {}, plan_path: null, progress: canonicalListProgress() }
+    const canonicalDetail = canonicalDetailProgress()
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [listed], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockResolvedValue(listed)
+    vi.mocked(api.getRunContext).mockImplementation(async (_projectId, runId, level) => ({
+      run_id: runId,
+      level,
+      schema_version: 1,
+      data: { progress: canonicalDetail, ...(level === 'full' ? { marker: 'full-marker' } : {}) },
+    }))
+
+    renderDashboard()
+
+    await screen.findByRole('button', { name: /Checkpoint 5: Active/ })
+    fireEvent.click(screen.getByRole('button', { name: /Checkpoint 4: Reviewed/ }))
+    expect(screen.getAllByRole('heading', { name: 'Checkpoint 4: Reviewed' }).length).toBeGreaterThan(0)
+    expect(screen.getByText('Review rejection')).toBeDefined()
+
+    openTechnicalDetails()
+    fireEvent.click(screen.getByText('Raw details'))
+    await screen.findByText(/full-marker/)
+    const fullCallsBeforeRefresh = vi.mocked(api.getRunContext).mock.calls.filter(call => call[2] === 'full').length
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(vi.mocked(api.getRunContext).mock.calls.filter(call => call[2] === 'full').length).toBeGreaterThan(fullCallsBeforeRefresh))
+    expect(screen.getByText(/full-marker/)).toBeDefined()
+    expect(screen.getAllByRole('heading', { name: 'Checkpoint 4: Reviewed' }).length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: 'Owner stop…' })).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Restart with changes' })).toBeDefined()
+  })
+
+  it('rejects a late checkpoint context response after selecting a different run', async () => {
+    const otherRun = { ...ownedRun, run_id: 'run-other', status: 'completed', started_at: '2024-01-02T00:00:00Z' }
+    const oldContext = deferred<RunContext>()
+    const newContext = deferred<RunContext>()
+    const oldProgress = canonicalDetailProgress({ events: [canonicalDetailProgress().events[3]] })
+    const newProgress = canonicalDetailProgress({ events: [{ ...canonicalDetailProgress().events[3], reason: 'new context evidence' }] })
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun, otherRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation(async (_projectId, runId) => runId === otherRun.run_id ? otherRun : ownedRun)
+    vi.mocked(api.getRunContext).mockImplementation(async (_projectId, runId, _level) => {
+      if (runId === otherRun.run_id) return newContext.promise
+      return oldContext.promise
+    })
+
+    renderDashboard({ requestedRunId: ownedRun.run_id })
+    await screen.findByRole('button', { name: /run-owned Running/ })
+    await waitFor(() => expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-owned', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) })))
+
+    fireEvent.click(screen.getByRole('button', { name: /run-other Completed/ }))
+    await screen.findByRole('button', { name: /run-other Completed/ })
+    await waitFor(() => expect(api.getRunContext).toHaveBeenCalledWith('control-project', 'run-other', 'lite', false, expect.objectContaining({ signal: expect.any(AbortSignal) })))
+
+    await act(async () => {
+      newContext.resolve({ run_id: 'run-other', level: 'lite', schema_version: 1, data: { progress: newProgress } })
+      await newContext.promise
+    })
+    await screen.findByText(/new context evidence/)
+
+    await act(async () => {
+      oldContext.resolve({ run_id: 'run-owned', level: 'lite', schema_version: 1, data: { progress: oldProgress } })
+      await oldContext.promise
+    })
+    expect(screen.getByText(/new context evidence/)).toBeDefined()
+    expect(screen.queryByText(/old context evidence/)).toBeNull()
   })
 
   it('copies the sanitized dashboard link and reports clipboard failure without hidden data', async () => {
