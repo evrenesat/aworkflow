@@ -23,32 +23,53 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const [history, setHistory] = useState<'visible' | 'archived' | 'all'>('visible')
   const [byProject, setByProject] = useState<Record<string, RunStatus[]>>({})
   const [errors, setErrors] = useState<string[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loadedIdentity, setLoadedIdentity] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
   const [nonce, setNonce] = useState(0)
   const [limit] = useRecentRunsLimit()
   const [search, setSearch] = useState('')
   const [attentionVisible, setAttentionVisible] = useState(10)
-  const ids = projects.map(p => p.id).sort().join('\n')
+  const projectIds = projects.map(p => p.id).sort()
+  const ids = projectIds.join('\n')
+  const resultsIdentity = JSON.stringify([history, projectIds])
+  const registryReady = !registryLoading && !registryError
+  const initialPending = !registryError && (!registryReady || loadedIdentity !== resultsIdentity)
   useEffect(() => {
     const controller = new AbortController()
     let busy = false
     const refresh = async () => {
-      if (busy || document.visibilityState === 'hidden') return
-      busy = true
-      const result = await fetchGlobalRuns(ids ? ids.split('\n') : [], controller.signal, history)
-      if (!controller.signal.aborted) {
-        setByProject(previous => ({ ...previous, ...result.byProject }))
-        setErrors(result.errors)
-        setLoading(false)
+      if (busy || document.visibilityState === 'hidden' || !registryReady) return
+      if (!ids) {
+        setErrors([])
+        setLoadedIdentity(resultsIdentity)
+        return
       }
-      busy = false
+      busy = true
+      setRefreshing(true)
+      try {
+        const result = await fetchGlobalRuns(ids ? ids.split('\n') : [], controller.signal, history)
+        if (!controller.signal.aborted) {
+          setByProject(previous => ({ ...previous, ...result.byProject }))
+          setErrors(result.errors)
+          setLoadedIdentity(resultsIdentity)
+        }
+      } finally {
+        busy = false
+        if (!controller.signal.aborted) setRefreshing(false)
+      }
     }
     void refresh()
     const timer = setInterval(() => void refresh(), 10000)
     document.addEventListener('visibilitychange', refresh)
     window.addEventListener('aflow-history-changed', refresh)
-    return () => { controller.abort(); clearInterval(timer); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('aflow-history-changed', refresh) }
-  }, [ids, nonce, history])
+    return () => {
+      controller.abort()
+      setRefreshing(false)
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', refresh)
+      window.removeEventListener('aflow-history-changed', refresh)
+    }
+  }, [history, ids, nonce, registryReady, resultsIdentity])
   const rows = projects.flatMap(project => (byProject[project.id] ?? []).map(run => ({ projectId: project.id, run })))
   const filteredRows = rows.filter(row => {
     const project = projects.find(candidate => candidate.id === row.projectId)
@@ -57,11 +78,22 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
   const selected = selectGlobalRuns(filteredRows, limit, history)
   const attentionRows = selected.attention.slice(0, attentionVisible)
   const remainingAttention = selected.attention.length - attentionRows.length
+  const resultsPending = !registryError && (initialPending || refreshing)
+  const hasUsableRows = rows.length > 0
+  const visibleErrors = loadedIdentity === resultsIdentity ? errors : []
+  const showGroups = (!registryError || hasUsableRows) && (!initialPending || hasUsableRows)
+  const groups = ([
+    { key: 'ongoing', label: `Ongoing (${selected.ongoing.length})`, rows: selected.ongoing },
+    { key: 'recent', label: `Recent (${selected.recent.length})`, rows: selected.recent },
+    { key: 'attention', label: `Needs attention (${selected.attention.length})`, rows: attentionRows },
+  ] as const)
+  const visibleGroups = visibleErrors.length > 0 ? groups.filter(group => group.rows.length > 0) : groups
   useEffect(() => setAttentionVisible(10), [history, ids, search])
 
   function changeHistory(next: 'visible' | 'archived' | 'all') {
     setByProject({})
-    setLoading(true)
+    setErrors([])
+    setLoadedIdentity(null)
     setAttentionVisible(10)
     setHistory(next)
   }
@@ -99,21 +131,19 @@ export function GlobalRunOverview({ projects, onOpen, registryLoading = false, r
     {!hosted && <div className="section-heading"><h2>All runs</h2><button className="btn btn-secondary" onClick={() => setNonce(n => n + 1)}>Refresh</button></div>}
     {!hosted && <label>Run history<select className="input" aria-label="Run history" value={history} onChange={event => changeHistory(event.target.value as typeof history)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>}
     <label className="run-search-field">Search loaded runs<input className="input" type="search" aria-label="Search loaded runs" placeholder="Plan, project, status, or run ID" value={search} onChange={event => setSearch(event.target.value)} /></label>
-    {errors.length > 0 && <p role="alert" className="notice">Partial or stale results: {errors.join(', ')}. Last available runs are retained.</p>}
-    {loading && <p>Loading runs…</p>}
-    {registryError && <p role="alert">Project list unavailable: {registryError}. Open Projects to retry.</p>}
-    {!registryLoading && !registryError && !projects.length && <p>No registered projects. Add a project in Projects to start.</p>}
-    {!loading && !rows.length && !errors.length && projects.length > 0 && <p>No runs yet.</p>}
-    {!loading && rows.length > 0 && filteredRows.length === 0 && <p className="text-sm text-dim">No loaded runs match “{search.trim()}”.</p>}
-    {([
-      { key: 'ongoing', label: `Ongoing (${selected.ongoing.length})`, rows: selected.ongoing },
-      { key: 'recent', label: `Recent (${selected.recent.length})`, rows: selected.recent },
-      { key: 'attention', label: `Needs attention (${selected.attention.length})`, rows: attentionRows },
-    ] as const).map(group => <section key={group.key}>
-      <h3>{group.label}</h3>
-      {group.rows.length === 0 && <p className="text-sm text-dim">{group.key === 'ongoing' ? 'No ongoing runs.' : group.key === 'attention' ? 'No runs need attention.' : 'No recent runs.'}</p>}
-      {group.rows.length > 0 && <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>}
-      {group.key === 'attention' && remainingAttention > 0 && <button type="button" className="btn btn-secondary" onClick={() => setAttentionVisible(count => count + 10)}>Show more ({remainingAttention} remaining)</button>}
-    </section>)}
+    <div className="global-run-results" aria-busy={resultsPending}>
+      {resultsPending && <p role="status" className="global-run-loading"><span className="spinner global-run-loading-spinner" aria-hidden="true" /><span>{initialPending ? 'Loading runs…' : 'Refreshing runs…'}</span></p>}
+      {visibleErrors.length > 0 && <p role="alert" className="notice">{rows.length > 0 ? 'Partial or stale results' : 'Run results unavailable'} for: {visibleErrors.join(', ')}. {rows.length > 0 ? 'Last available runs are retained.' : 'Use Refresh to try again.'}</p>}
+      {registryError && <p role="alert">Project list unavailable: {registryError}. Open Projects to retry.</p>}
+      {!resultsPending && !registryError && !projects.length && <p>No registered projects. Add a project in Projects to start.</p>}
+      {!resultsPending && !registryError && !rows.length && !visibleErrors.length && projects.length > 0 && <p>No runs yet.</p>}
+      {!initialPending && rows.length > 0 && filteredRows.length === 0 && <p className="text-sm text-dim">No loaded runs match “{search.trim()}”.</p>}
+      {showGroups && visibleGroups.map(group => <section key={group.key}>
+        <h3>{group.label}</h3>
+        {group.rows.length === 0 && <p className="text-sm text-dim">{group.key === 'ongoing' ? 'No ongoing runs.' : group.key === 'attention' ? 'No runs need attention.' : 'No recent runs.'}</p>}
+        {group.rows.length > 0 && <ul className="compact-list">{group.rows.map(renderRunRow)}</ul>}
+        {group.key === 'attention' && remainingAttention > 0 && <button type="button" className="btn btn-secondary" onClick={() => setAttentionVisible(count => count + 10)}>Show more ({remainingAttention} remaining)</button>}
+      </section>)}
+    </div>
   </div>
 }

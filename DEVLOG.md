@@ -1,5 +1,31 @@
 # DEVLOG
 
+## 2026-09-11 — Render truthful All runs loading (Issue 40, Checkpoint 1)
+
+- All runs now waits for the current registry/project/history identity before
+  making zero-count or empty-state claims. Initial pending results expose one
+  accessible animated status with `aria-busy`; registry and complete/partial
+  run failures exit loading with actionable errors, while successful rows stay
+  visible during ordinary refresh. Reduced motion leaves the status spinner
+  static and visible.
+- Added deferred component coverage for registry/run ordering, populated and
+  empty success, complete/partial failure, history selection, and refresh
+  retention. Added the focused real-browser node
+  `test_global_run_overview_loading_journey` with deterministic delayed,
+  empty, populated, and error responses plus desktop/phone screenshot output.
+- Verification passed: `npm --prefix apps/aflow_app/web test -- --run
+  src/components/GlobalRunOverview.test.tsx src/globalRuns.test.ts` (16
+  tests), `npm --prefix apps/aflow_app/web run build`, and the exact browser
+  node under Chromium and WebKit. The browser commands were:
+
+  ```text
+  AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py::test_global_run_overview_loading_journey --basetemp=/root/code/evidence/aflow-dogfood-20260909/issue40-review-20260911/chromium-final2
+  AFLOW_TEST_BROWSER=webkit uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py::test_global_run_overview_loading_journey --basetemp=/root/code/evidence/aflow-dogfood-20260909/issue40-review-20260911/webkit-final2
+  ```
+
+  Both passed, and artifacts are retained under the invocation roots
+  `/root/code/evidence/aflow-dogfood-20260909/issue40-review-20260911/`.
+
 ## 2026-09-11 — Isolate pending-review fixture Git state
 
 - The pending-review fixture now commits a narrow `.aflow/` ignore and binds

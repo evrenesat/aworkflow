@@ -254,6 +254,29 @@ input::placeholder, textarea::placeholder {
   to { transform: rotate(360deg); }
 }
 
+.global-run-results {
+  min-width: 0;
+}
+
+.global-run-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-height: 2rem;
+}
+
+.global-run-loading-spinner {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
+
 .error-message {
   padding: var(--spacing-md);
   background: color-mix(in srgb, var(--color-error) 10%, var(--color-surface));

@@ -47,10 +47,119 @@ function makeRun(run_id: string, overrides: Record<string, unknown> = {}): RunSt
   } as RunStatus
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(value => { resolve = value })
+  return { promise, resolve }
+}
+
+function page(runs: RunStatus[]) {
+  return { runs, next_cursor: null, schema_version: 1 }
+}
+
 describe('GlobalRunOverview project context', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [childRun], next_cursor: null, schema_version: 1 })
+  })
+
+  it('waits for the registry and current runs before making empty-state claims', async () => {
+    const runs = deferred<ReturnType<typeof page>>()
+    vi.mocked(api.listControlPlaneRuns).mockReturnValue(runs.promise)
+    const view = render(<GlobalRunOverview projects={[]} registryLoading onOpen={vi.fn()} />)
+
+    expect(screen.getByRole('status').textContent).toBe('Loading runs…')
+    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
+    expect(view.container.querySelector('.global-run-loading-spinner')).toBeTruthy()
+    expect(screen.queryByText(/No registered projects/)).toBeNull()
+    expect(screen.queryByRole('heading', { name: /Ongoing/ })).toBeNull()
+    expect(api.listControlPlaneRuns).not.toHaveBeenCalled()
+
+    view.rerender(<GlobalRunOverview projects={[primary]} registryLoading={false} onOpen={vi.fn()} />)
+    await waitFor(() => expect(api.listControlPlaneRuns).toHaveBeenCalledWith('primary', expect.anything(), expect.anything()))
+    expect(screen.getByRole('status').textContent).toBe('Loading runs…')
+    expect(screen.queryByText('No runs yet.')).toBeNull()
+    expect(screen.queryByText('No ongoing runs.')).toBeNull()
+
+    runs.resolve(page([makeRun('populated-run')]))
+    expect(await screen.findByRole('button', { name: /populated-run/ })).toBeTruthy()
+    expect(screen.queryByRole('status')).toBeNull()
+    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('false')
+  })
+
+  it('renders a successful empty result only after the run request completes', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue(page([]))
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+
+    expect(await screen.findByText('No runs yet.')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Ongoing (0)' })).toBeTruthy()
+    expect(screen.getByText('No ongoing runs.')).toBeTruthy()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('exits loading with a complete run failure instead of showing an empty state', async () => {
+    vi.mocked(api.listControlPlaneRuns).mockRejectedValue(new Error('runs unavailable'))
+    render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/Run results unavailable/)
+    expect(screen.queryByText('No runs yet.')).toBeNull()
+    expect(screen.queryByRole('heading', { name: /Ongoing/ })).toBeNull()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('retains successful rows while reporting a partial run failure', async () => {
+    const retained = makeRun('retained-run')
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async projectId => {
+      if (projectId === 'child') throw new Error('child unavailable')
+      return page([retained])
+    })
+    render(<GlobalRunOverview projects={[primary, child]} onOpen={vi.fn()} />)
+
+    expect(await screen.findByRole('button', { name: /retained-run/ })).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toMatch(/Partial or stale results/)
+    expect(screen.queryByText('No runs yet.')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Ongoing (0)' })).toBeNull()
+  })
+
+  it('clears the current result for history changes and keeps rows during refresh', async () => {
+    const visible = makeRun('visible-run', { plan_path: 'plans/visible.md' })
+    const archived = makeRun('archived-run', { history_state: 'archived', plan_path: 'plans/archived.md' })
+    const refreshed = deferred<ReturnType<typeof page>>()
+    let visibleCalls = 0
+    let archivedCalls = 0
+    vi.mocked(api.listControlPlaneRuns).mockImplementation(async (_projectId, options) => {
+      if (options?.history === 'archived') {
+        archivedCalls += 1
+        return archivedCalls === 1 ? page([archived]) : refreshed.promise
+      }
+      visibleCalls += 1
+      return visibleCalls === 1 ? page([visible]) : refreshed.promise
+    })
+    const view = render(<GlobalRunOverview projects={[primary]} onOpen={vi.fn()} />)
+    expect(await screen.findByRole('button', { name: /visible-run/ })).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Run history'), { target: { value: 'archived' } })
+    expect(await screen.findByRole('button', { name: /archived-run/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /visible-run/ })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Refreshing runs…'))
+    // The refresh is for the selected history, so the usable archived row stays visible.
+    expect(screen.getByRole('button', { name: /archived-run/ })).toBeTruthy()
+    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('true')
+
+    refreshed.resolve(page([makeRun('refreshed-run', { history_state: 'archived', plan_path: 'plans/refreshed.md' })]))
+    expect(await screen.findByRole('button', { name: /refreshed-run/ })).toBeTruthy()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('stops initial loading and exposes a registry failure', () => {
+    const view = render(<GlobalRunOverview projects={[]} registryError="registry unavailable" onOpen={vi.fn()} />)
+
+    expect(screen.getByRole('alert').textContent).toMatch(/Project list unavailable: registry unavailable/)
+    expect(screen.queryByRole('status')).toBeNull()
+    expect(view.container.querySelector('.global-run-results')?.getAttribute('aria-busy')).toBe('false')
+    expect(screen.queryByRole('heading', { name: /Ongoing/ })).toBeNull()
   })
 
   it('labels child history with the parent while opening the exact child ID', async () => {

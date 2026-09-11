@@ -554,6 +554,126 @@ def test_project_worktree_presentation(control_client, monkeypatch, width: int, 
             browser.close()
 
 
+def test_global_run_overview_loading_journey(control_client, monkeypatch, tmp_path):
+    """Prove the All runs view distinguishes pending, success, refresh and failure."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    held_registry = []
+    held_runs = []
+    run_mode = {"value": "server"}
+    hold_next_run = {"value": False}
+    registry_requests = {"count": 0}
+    run_requests = {"count": 0}
+
+    def hold_registry(route):
+        registry_requests["count"] += 1
+        if registry_requests["count"] == 1:
+            held_registry.append(route)
+        else:
+            route.continue_()
+
+    def control_runs(route):
+        run_requests["count"] += 1
+        if run_requests["count"] == 1 or hold_next_run["value"]:
+            hold_next_run["value"] = False
+            held_runs.append(route)
+            return
+        if run_mode["value"] == "empty":
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"runs": [], "next_cursor": None, "schema_version": 1}),
+            )
+        elif run_mode["value"] == "error":
+            route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps({"detail": {"code": "runs_unavailable"}}),
+            )
+        else:
+            route.continue_()
+
+    browser_name = os.environ.get("AFLOW_TEST_BROWSER", "chromium").strip().lower()
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.route("**/api/projects", hold_registry)
+            page.route(f"**/api/control-plane/projects/{PROJECT_ID}/runs**", control_runs)
+            _login(page, url)
+
+            status = page.get_by_role("status")
+            status.wait_for()
+            expect(status).to_contain_text("Loading runs…")
+            assert page.locator(".global-run-results").get_attribute("aria-busy") == "true"
+            assert page.locator(".global-run-results h3").count() == 0
+            assert page.get_by_text("No runs yet.", exact=True).count() == 0
+            assert page.locator(".global-run-loading-spinner").is_visible()
+            page.emulate_media(reduced_motion="no-preference")
+            animated = page.locator(".global-run-loading-spinner").evaluate(
+                "element => getComputedStyle(element).animationName"
+            )
+            assert animated == "spin", animated
+            page.emulate_media(reduced_motion="reduce")
+            reduced_motion = page.locator(".global-run-loading-spinner").evaluate(
+                "element => getComputedStyle(element).animationName"
+            )
+            assert reduced_motion == "none", reduced_motion
+            desktop_image = tmp_path / f"issue40-{browser_name}-desktop-loading.png"
+            page.screenshot(path=str(desktop_image), full_page=True)
+            print("ISSUE40_SCREENSHOT", desktop_image)
+
+            assert held_registry, "registry request was not held"
+            with page.expect_request(
+                re.compile(rf".*/api/control-plane/projects/{re.escape(PROJECT_ID)}/runs(?:\?.*)?$")
+            ):
+                held_registry.pop(0).continue_()
+            expect(status).to_contain_text("Loading runs…")
+            assert page.locator(".global-run-results h3").count() == 0
+            assert not page.get_by_text("No runs yet.", exact=True).is_visible()
+            assert held_runs, "initial runs request was not held"
+
+            page.emulate_media(reduced_motion="no-preference")
+            held_runs.pop(0).continue_()
+            populated_row = page.get_by_role("button", name=re.compile(r"Long plan 00.*responsive-run-00"))
+            populated_row.wait_for()
+            assert page.get_by_text("No runs yet.", exact=True).count() == 0
+            assert page.get_by_role("heading", name=re.compile(r"Recent \(\d+\)")).is_visible()
+
+            page.set_viewport_size({"width": 390, "height": 844})
+            hold_next_run["value"] = True
+            with page.expect_request(
+                re.compile(rf".*/api/control-plane/projects/{re.escape(PROJECT_ID)}/runs(?:\?.*)?$")
+            ):
+                page.get_by_role("button", name="Refresh", exact=True).click()
+            expect(page.get_by_role("status")).to_contain_text("Refreshing runs…")
+            expect(populated_row).to_be_visible()
+            phone_image = tmp_path / f"issue40-{browser_name}-phone-refresh.png"
+            page.screenshot(path=str(phone_image), full_page=True)
+            print("ISSUE40_SCREENSHOT", phone_image)
+            assert held_runs, "refresh runs request was not held"
+            held_runs.pop(0).continue_()
+            expect(page.get_by_role("status")).to_have_count(0)
+
+            run_mode["value"] = "empty"
+            page.goto(f"{url}/?view=all-runs")
+            expect(page.get_by_text("No runs yet.", exact=True)).to_be_visible()
+            expect(page.get_by_role("heading", name="Ongoing (0)", exact=True)).to_be_visible()
+            expect(page.get_by_role("status")).to_have_count(0)
+
+            run_mode["value"] = "error"
+            page.goto(f"{url}/?view=all-runs")
+            expect(page.get_by_role("alert")).to_contain_text("Run results unavailable")
+            assert page.get_by_text("No runs yet.", exact=True).count() == 0
+            assert page.locator(".global-run-results h3").count() == 0
+            expect(page.get_by_role("status")).to_have_count(0)
+        finally:
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_route_matrix(control_client, monkeypatch, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""
