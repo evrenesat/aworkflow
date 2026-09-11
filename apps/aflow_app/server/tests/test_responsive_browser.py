@@ -364,14 +364,15 @@ def _wait_for_loaded_plan_rows(page: Page) -> None:
 
 
 def _assert_run_detail(page: Page, expected_title: str, expected_run_id: str) -> None:
-    """Assert readable presentation separately from the exact run identity."""
+    """Wait for readable presentation and the exact requested run identity."""
     detail = page.locator(".run-detail:visible").first
     detail.wait_for()
-    assert detail.locator("h3").inner_text() == expected_title
-    assert detail.get_by_title("Copy run ID", exact=True).inner_text() == expected_run_id
-    assert page.evaluate(
-        "() => new URL(location.href).searchParams.get('run')"
-    ) == expected_run_id
+    expect(detail.locator("h3")).to_have_text(expected_title)
+    expect(detail.get_by_title("Copy run ID", exact=True)).to_have_text(expected_run_id)
+    page.wait_for_function(
+        "expectedRunId => new URL(location.href).searchParams.get('run') === expectedRunId",
+        arg=expected_run_id,
+    )
 
 
 def _visible_dashboard(page: Page):

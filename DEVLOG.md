@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-11 — Await exact selected run identity in browser helper
+
+- `_assert_run_detail` now retries the exact readable heading and Copy run ID
+  with Playwright expectations, then waits for the exact `run` URL query value;
+  a previously visible detail cannot satisfy a later navigation assertion.
+- Audited the responsive and run-navigation browser helpers for the same stale
+  detail assumption; no other identical case was found. Production behavior,
+  scenarios and existing identity/geometry assertions remain unchanged.
+- Verification: production web build; the exact `desktop` and `desktop-tall`
+  responsive cases passed in Chromium and WebKit (2 each); `git diff --check`
+  passed. Logs are retained under
+  `/root/code/evidence/aflow-dogfood-20260909/run-detail-readiness-review-20260911/`.
+
 ## 2026-09-11 — Bind pristine copied plans to managed worktree branches
 
 - Restored the narrow initial managed-worktree rebinding path for pristine
