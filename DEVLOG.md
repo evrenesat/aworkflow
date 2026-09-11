@@ -14,6 +14,17 @@
 - Verification: 538 core tests and 52 subtests, 59 server tests, lint, whitespace
   checks, and the independent prior-finding reproduction passed without providers.
 
+## 2026-09-11 — Align progress browser title assertions (Checkpoint 1)
+
+- Replaced the two stale filename-as-heading expectations with the approved
+  `Repair overlay` and `Missing evidence` titles, while asserting each exact
+  selected fixture run ID in the current detail and retaining technical path,
+  progress, turn, and unavailable-state evidence.
+- Audited all browser-test heading and Markdown-path assumptions; no other stale
+  presentation contract was confirmed. Web build, both progress browser cases
+  in Chromium and WebKit, and the full Chromium server suite passed. Logs and
+  screenshots are retained under `/root/code/evidence/aflow-dogfood-20260909/progress-title-review-20260911/`.
+
 ## 2026-09-11 — Align readable run-title browser contracts (Checkpoint 1)
 
 - Preserved the shipped readable run presentation while updating browser

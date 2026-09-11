@@ -53,6 +53,12 @@ def _assert_shell_contract(page, width: int, height: int) -> None:
     expect(menu).to_be_hidden()
 
 
+def _assert_selected_run_identity(page, run_id: str) -> None:
+    expect(
+        page.locator(".run-detail").get_by_role("button", name=run_id, exact=True)
+    ).to_be_visible()
+
+
 @pytest.mark.parametrize(
     ("width", "height"),
     ((1280, 720), (390, 844)),
@@ -80,7 +86,8 @@ def test_run_progress_transport_and_browser_parity(
             page = browser.new_page(viewport={"width": width, "height": height})
             _login(page, url)
             page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
-            page.get_by_role("heading", name="repair-overlay.md", exact=True).wait_for()
+            page.get_by_role("heading", name="Repair overlay", exact=True).wait_for()
+            _assert_selected_run_identity(page, run_id)
 
             expect(page.get_by_text("Checkpoint 4: Stage 4 (4 of 14)", exact=True)).to_be_visible()
             repairing = page.locator(".dashboard-section p").filter(has_text="Repairing").first
@@ -112,7 +119,8 @@ def test_run_progress_transport_and_browser_parity(
             page.goto(
                 f"{url}/?project={PROJECT_ID}&view=runs&run={missing_run_id}"
             )
-            page.get_by_role("heading", name="missing-evidence.md", exact=True).wait_for()
+            page.get_by_role("heading", name="Missing evidence", exact=True).wait_for()
+            _assert_selected_run_identity(page, missing_run_id)
             expect(
                 page.get_by_text(
                     "Progress unavailable — the original plan is unavailable.",
