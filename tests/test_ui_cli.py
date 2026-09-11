@@ -307,6 +307,13 @@ class TestBackgroundLifecycle:
             "control_run",
             "owner_stop",
             "resume_run",
+            "read_plan",
+            "create_plan",
+            "update_plan",
+            "promote_plan",
+            "list_plan_documents",
+            "get_global_config",
+            "patch_global_config",
         }
         assert len(mcp_call("resources/templates/list")["result"]["resourceTemplates"]) == 3
 

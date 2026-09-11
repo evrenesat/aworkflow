@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-09-11 — Align detached UI MCP discovery (Checkpoint 1)
+
+- HISTORY: CI evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-2053c498-failed.log` showed the real detached web server returning seven approved plan/config authoring tools beyond the stale 14-name UI discovery expectation.
+- Updated only the detached server's exact `tools/list` expectation to 21 names. The 14 core names, authenticated request, three resource templates, health, second-start, and owned-stop assertions remain unchanged; no production or core-registry contract changed.
+- Verification passed: `uv run pytest -q tests/test_ui_cli.py -k test_daemon_start_health_and_stop` (`1 passed, 14 deselected in 4.62s`) and `uv run pytest -q tests/test_ui_cli.py` (`15 passed in 5.05s`).
+
 ## 2026-09-11 — Align CLI startup diagnostic acceptance (Checkpoint 1)
 
 - HISTORY: CI evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-1ae095c-failed.log` showed the non-TTY startup-recovery test still expected the former `inconsistent checkpoint state` wording; production emitted the approved `Plan checkpoint state is inconsistent...` safe message.
