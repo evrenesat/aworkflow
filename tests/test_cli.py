@@ -4165,7 +4165,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert result == 1
             stderr_output = stderr_capture.getvalue().lower()
             assert 'interactive confirmation is required' in stderr_output
-            assert 'inconsistent checkpoint state' in stderr_output
+            assert 'plan checkpoint state is inconsistent' in stderr_output
 
     def test_cli_pre_handoff_auto_refreshes_pristine_stale_base_without_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

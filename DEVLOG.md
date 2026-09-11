@@ -1,5 +1,11 @@
 # DEVLOG
 
+## 2026-09-11 — Align CLI startup diagnostic acceptance (Checkpoint 1)
+
+- HISTORY: CI evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-1ae095c-failed.log` showed the non-TTY startup-recovery test still expected the former `inconsistent checkpoint state` wording; production emitted the approved `Plan checkpoint state is inconsistent...` safe message.
+- Updated only that stderr assertion to the approved `plan checkpoint state is inconsistent` phrase. The explicit interactive-confirmation, exit-1, no-input, and neighboring parser/recovery wording assertions remain unchanged.
+- Verification passed: `uv run pytest -q tests/test_cli.py -k test_cli_requires_tty_for_startup_recovery` (`1 passed, 156 deselected in 0.56s`); `uv run pytest -q tests/test_cli.py` (`157 passed, 129 subtests passed in 5.92s`).
+
 ## 2026-09-10 — Isolate real CLI test run artifacts (Checkpoint 1)
 
 - `test_cli_workflow_override` now inspects its durable `run.json` to verify
