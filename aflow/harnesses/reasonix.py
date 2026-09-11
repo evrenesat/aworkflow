@@ -160,7 +160,8 @@ def parse_acp_jsonrpc(
     finals: list[str] = []
     matched_result: Mapping[str, Any] | None = None
     matching_response_count = 0
-    for line_number, line in enumerate(stdout.splitlines(), 1):
+    # JSONL records are delimited by LF; Unicode line separators can be payload data.
+    for line_number, line in enumerate(stdout.split("\n"), 1):
         if not line.strip():
             continue
         try:

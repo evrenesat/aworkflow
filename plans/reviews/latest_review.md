@@ -1,90 +1,63 @@
-# Issue34 cumulative review — 2026-09-11
+# JSONL record boundaries cumulative review - 2026-09-11
 
-Branch: `aflow-issue-34-backup-provenance-20260909-20260911-075113`.
-Original plan: `plans/in-progress/issue-34-backup-provenance-20260909.md`.
-Active overlay reviewed: `issue-34-backup-provenance-20260909-cp01-v03.md`.
-Unchanged Pre-Handoff Base HEAD: `b46e441ca758383df60eefe571d097c5ce597ad9`.
-Reviewed HEAD: `4398aa75e4e8799248e77afb1487b6ec9ab9b251`.
-Coverage: **1 new / 6 total commits**: cp1 v01 `2fc052ef`, cp2 v01 `a4eb60f3`, cp3 v01 `ac11d471`, cp1 v02 `8587d517`, cp1 v03 `f4813743`, cp1 v04 `4398aa75`. Reviewed the entire original-base-through-HEAD implementation across all 21 changed files against the original requirements. Incremental inspection was supplementary.
+Original and active plan: `plans/in-progress/jsonl-record-boundaries-20260911.md`.
+Branch: `aflow-jsonl-record-boundaries-20260911-20260911-122140`.
+Unchanged Pre-Handoff Base HEAD: `fcfb7ec4450165682d1b031e3e20809821315442`.
+Reviewed HEAD: `4c8416822f571af011282b97354b031899332ee4`.
+Coverage: **1 new / 1 total commit**, `cp1 v01`, all checkpoint 1 requirements
+and the complete cumulative diff in session.py, reasonix.py, tests and DEVLOG.
 
 ## Previous findings
 
-- F1 resolved: fresh service identities isolate reused paths and baseline ownership while preserving body deduplication.
-- F2 resolved: exact unowned source/original history survives service identity adoption, rename, rollback and follow-up cleanup.
-- F3 resolved: allocated follow-up captures use the actual run directory identity; retained multi-turn/two-run tests assert references and deduplication.
-- F4 resolved: snapshot wording no longer contradicts the plan's known baseline; both browser journeys preserve the actual unsaved draft.
-- F5 resolved: selected-owner references and Ready-promotion metadata supply event/run/turn/timestamp without borrowing another owner's details; absent historical timestamps remain null.
-- F6 resolved: controller completion prepares the unique owner before the file move and binds exact unowned capture associations. The real-controller regression verifies snapshot and cleaned-up follow-up details in Done, pagination, identical destination reuse, conflicting destination rejection, unknown baseline and unchanged bodies.
+None for this handoff; no follow-up overlay exists. The previous latest report
+concerns other handoffs and was archived byte-for-byte.
 
-## Findings and verification
+## Findings and evidence
 
-No admitted material findings. Applied the material-code-review admission gate, exclusions and proportionate-fix discipline.
+No admitted material findings. Applied the material-code-review admission gate,
+exclusions and proportionate-fix discipline. All three equivalent framing sites
+split only on LF. JSON parsing, object validation, blank-record handling, order,
+physical record diagnostics, identity checks and assistant/tool selection retain
+their established behavior. CRLF whitespace is accepted by json.loads; Unicode
+string characters remain payload data. No production code was edited in review.
 
-- Independently ran `GIT_CONFIG_GLOBAL=/dev/null uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_plan_store.py -k 'backup or baseline or external or followup or shared_body or controller'`: **13 passed, 11 deselected**, one existing Starlette deprecation warning.
-- Reused retained verification for reviewed HEAD in `fix-cp01-v03.md`: 7 backup helper tests; 3 directly affected runtime nodes (with the corrected `WorkflowArtifactTests` class); 2 daemon preallocation cases; 2 MCP parity/journey cases; 24 plan-store cases; ruff and diff checks. The owner explicitly requests focused verification and reuse of valid evidence.
-- Reused unchanged frontend evidence in `fix-cp01-v02.md`: 12 component tests, production build and isolated Chromium/WebKit backup journeys. Inspected both latest 390×844 screenshots, showing compact headers, readable Baseline/Snapshot history, wrapping and the actual unsaved draft. Reviewed the browser assertions; no physical-device claim.
-- Source-searched all backup wrappers/call sites, daemon preparation and MCP promotion contracts. Reviewed metadata validation/atomic writes, retained body naming and deduplication, current-owner association, service rollback, controller completion, authorized bounded REST pages, exact revisions, frontend request guards/drafts and cumulative documentation. Semantic marker contracts are unchanged.
-- `git diff --check b46e441..HEAD` passed. Git confirms the branch, reachable unchanged base and 1 new / 6 total commits. Only the expected tracked reviewer record was dirty before finalization.
+Independently ran 22 focused cases in tests/test_harness_sessions.py: all passed
+in 0.25s. Exact pytest node suffixes (each prefixed by
+`tests/test_harness_sessions.py::`, invoked with `uv run pytest -q`):
 
-Evidence root: `/root/code/evidence/aflow-dogfood-20260909/issue34-review-20260911/`.
+- test_jsonl_parser_keeps_wire_events_separate
+- test_jsonl_parser_preserves_unicode_string_data_and_lf_framing
+- test_jsonl_parser_rejects_invalid_records_at_physical_lf_line
+- test_codex_structured_output_preserves_unicode_assistant_text_and_semantics
+- test_reasonix_acp_jsonl_preserves_unicode_string_data
+- test_codex_structured_output_extracts_one_session_and_final_response
+- test_codex_structured_output_excludes_tools_and_echoed_prompts
+- test_codex_structured_assistant_stop_remains_terminal_marker
+- test_codex_structured_output_requires_assistant_final_and_preserves_failure
+- test_structured_output_rejects_missing_ambiguous_or_malformed_identity
+- test_reasonix_acp_parses_open_prompt_streams_and_final_output
+- test_reasonix_acp_rejects_mismatched_error_or_malformed_wire
 
-## Approval and finalization
-
-Approved for one cumulative squash onto the unchanged base. Include this already-tracked review record and the compacted handoff DEVLOG in the single unpublished commit. Preserve all other reviewed implementation blobs. Rotate the prior report byte-for-byte without force-adding the ignored archive; remove the superseded v03 overlay and leave the original plan in place. Record the final approved SHA only in original-plan tracking, avoiding a self-referential commit amendment.
-
-Finalization checks require exactly one commit after the base, no tracked edits outside that commit, unchanged implementation blobs and no stale issue34 fix plans. Controller/coordinator merge, publication, exact-SHA CI and live activation remain separate pending delivery gates. No external comments or issue closure.
-
----
-
-Retained target-branch review:
-
-# Run detail navigation readiness — cumulative approval review
-
-Original and active plan: `plans/in-progress/run-detail-navigation-readiness-20260911.md`.
-Unchanged Pre-Handoff Base HEAD: `833f26cb2bf554341836ce48626755b0f1a0fc4e`.
-Reviewed HEAD: `ae9a3197c1758012f0b963f230af7dd8917ecfc9`.
-Coverage: 1 new / 1 total commit, `cp1 v01`, all of checkpoint 1 and the
-complete base-to-HEAD implementation in test_responsive_browser.py and DEVLOG.md.
-No previous findings or follow-up plans exist for this handoff. The previous
-latest report concerns managed-worktree branch binding and is archived
-byte-for-byte, not treated as an unresolved finding for this repair.
-
-## Findings
-
-No material findings. The helper awaits the requested exact title and Copy run
-ID with Playwright string expectations, then the exact URL run query value
-with strict equality. Default timeouts remain untouched. The run39-to-run00
-caller retains its exact fixture identities. The run-navigation suite imports
-this same helper; no duplicate helper repair is needed. Production UI, project,
-geometry, draft and payload assertions are unchanged. No code was edited in review.
-
-## Verification
-
-Reused retained worker evidence, as explicitly authorized, under
-`/root/code/evidence/aflow-dogfood-20260909/run-detail-readiness-review-20260911/`:
-
-- `web-build-final.log`: npm production build passed (TypeScript and Vite).
-- `chromium-desktop-cases-final.log`: requested desktop and desktop-tall
-  responsive route cases passed, 2 passed in 15.45s.
-- `webkit-desktop-cases-final.log`: same two cases passed, 2 passed in 18.56s.
-
-Earlier retained failures used an unsupported `exact` keyword to `to_have_text`;
-that keyword is absent from committed code and final logs pass.
-The prompt-referenced worktree-local worker result.json is absent; retained
-external logs provide the authorized verification evidence. No full suites
-were rerun. Independently checked the cumulative diff and working-tree
-`git diff --check`; both passed. Reviewed the helper, navigation callers,
-and shared import in test_run_navigation_browser.py.
+`uv run ruff check aflow`, `git diff --check` and the cumulative
+`git diff --check fcfb7ec4450165682d1b031e3e20809821315442 HEAD` passed.
+Reused the authorized retained read-only capture proof at
+`/root/code/evidence/aflow-dogfood-20260909/jsonl-boundary-review-20260911/capture-proof.md`:
+182 and 522 LF records parse, each capture contains one NEL, final-result
+contracts pass and source bytes remain unchanged. Synthetic tests additionally
+cover U+2028/U+2029, LF/CRLF, trailing empty records, actual malformed JSON,
+nonobjects, exact final text and exclusion of tool-only semantic controls.
+No whole suites or controller/recovery mutations; CI owns full suites.
 
 ## Disposition
 
 Approved for one unpublished final handoff commit after the unchanged base,
 including this tracked report and preserving all reviewed implementation blobs.
-No fix plan is needed; no stale fix plan exists for this handoff. DEVLOG already
-contains one relevant entry. Original plan stays in place for engine finalization;
-final approved SHA and finalization checks are recorded there after commit.
-Ignored plans, archive and external evidence are not force-added.
-Merge, origin/main publication, exact-SHA CI and live activation remain the
-managed controller/coordinator delivery gates, not outcomes of this local review.
+DEVLOG already has one handoff entry. No fix plan is needed or stale overlay
+present. Original plan remains for engine finalization; final approved SHA and
+post-commit checks are recorded there without a self-referential amendment.
+Private plans, archive and external proof are not force-added. Require exactly
+one final commit and no tracked edits outside it. Managed controller/coordinator
+merge, origin/main publication, exact-SHA CI and live activation remain separate
+pending delivery gates.
 
 No material findings

@@ -279,7 +279,8 @@ def extract_structured_final_assistant_text(stdout: str) -> str | None:
         candidates.append(json.loads(stdout))
     except json.JSONDecodeError:
         pass
-    for line in stdout.splitlines():
+    # JSONL records are delimited by LF; Unicode line separators can be payload data.
+    for line in stdout.split("\n"):
         try:
             candidates.append(json.loads(line))
         except json.JSONDecodeError:
@@ -310,7 +311,8 @@ def select_agent_semantic_output(
 
 def parse_jsonl_events(stdout: str) -> tuple[Mapping[str, Any], ...]:
     events: list[Mapping[str, Any]] = []
-    for line_number, line in enumerate(stdout.splitlines(), 1):
+    # JSONL records are delimited by LF; Unicode line separators can be payload data.
+    for line_number, line in enumerate(stdout.split("\n"), 1):
         if not line.strip():
             continue
         try:

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -15,9 +16,10 @@ from aflow.harnesses.session import (
     SessionCapabilities,
     SessionRequest,
     SessionResult,
+    select_agent_semantic_output,
     parse_jsonl_events,
 )
-from aflow.stop_marker import detect_stop_marker
+from aflow.stop_marker import STRUCTURED_TRANSPORT_OUTPUT_SOURCE, detect_stop_marker
 
 
 @dataclass
@@ -876,3 +878,141 @@ def test_fake_session_driver_exposes_provider_operation_crash_boundaries(crash_p
 def test_jsonl_parser_keeps_wire_events_separate() -> None:
     events = parse_jsonl_events('{"type":"progress","value":1}\n')
     assert events == ({"type": "progress", "value": 1},)
+
+
+@pytest.mark.parametrize("record_separator", ("\n", "\r\n"))
+def test_jsonl_parser_preserves_unicode_string_data_and_lf_framing(
+    record_separator: str,
+) -> None:
+    payload = "NEL=" + chr(0x85) + " U+2028=" + chr(0x2028) + " U+2029=" + chr(0x2029)
+    stdout = record_separator.join(
+        (
+            json.dumps({"type": "progress", "value": payload}, ensure_ascii=False),
+            json.dumps({"type": "progress", "value": "second"}, ensure_ascii=False),
+            "",
+            "",
+        )
+    )
+
+    events = parse_jsonl_events(stdout)
+
+    assert len(events) == 2
+    assert events[0] == {"type": "progress", "value": payload}
+    assert events[1] == {"type": "progress", "value": "second"}
+
+
+@pytest.mark.parametrize(
+    ("invalid_record", "expected_error"),
+    (
+        ('{"type":"progress"', "session event line 3 is not JSON"),
+        ("[]", "session event line 3 is not an object"),
+    ),
+)
+def test_jsonl_parser_rejects_invalid_records_at_physical_lf_line(
+    invalid_record: str,
+    expected_error: str,
+) -> None:
+    stdout = "\n".join(
+        (
+            json.dumps({"type": "progress", "value": "before" + chr(0x85)}, ensure_ascii=False),
+            "",
+            invalid_record,
+            "",
+        )
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        parse_jsonl_events(stdout)
+
+
+def test_codex_structured_output_preserves_unicode_assistant_text_and_semantics() -> None:
+    final_text = "approved " + chr(0x85) + chr(0x2028) + chr(0x2029)
+    tool_text = "AFLOW_STOP: HISTORY: old tool output " + chr(0x85)
+    echoed_text = "AFLOW_STOP: HISTORY: echoed prompt " + chr(0x2028)
+    stdout = "\n".join(
+        (
+            json.dumps({"type": "thread.started", "thread_id": "session-123"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "thread_id": "session-123",
+                    "item": {"type": "command_execution", "aggregated_output": tool_text},
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "type": "message.completed",
+                    "thread_id": "session-123",
+                    "role": "user",
+                    "text": echoed_text,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "type": "message.completed",
+                    "thread_id": "session-123",
+                    "role": "assistant",
+                    "text": final_text,
+                },
+                ensure_ascii=False,
+            ),
+            "",
+        )
+    )
+    driver = CodexAdapter().session_driver(
+        exec_help=CODEX_EXEC_HELP, resume_help=CODEX_RESUME_HELP
+    )
+
+    result = driver.parse_result(request(), stdout)
+
+    assert result.final_output == final_text
+    assert select_agent_semantic_output(
+        stdout, output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE
+    ) == final_text
+    tool_only = "\n".join(stdout.split("\n")[:2]) + "\n"
+    assert select_agent_semantic_output(
+        tool_only, output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE
+    ) == ""
+
+
+def test_reasonix_acp_jsonl_preserves_unicode_string_data() -> None:
+    final_text = "result " + chr(0x85) + chr(0x2028) + chr(0x2029)
+    stdout = "\r\n".join(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "rx-1",
+                        "update": {"content": {"text": final_text}},
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"sessionId": "rx-1", "finalOutput": final_text},
+                },
+                ensure_ascii=False,
+            ),
+            "",
+            "",
+        )
+    )
+
+    events, session_id, output, matched_result = reasonix_module.parse_acp_jsonrpc(
+        stdout,
+        expected_response_id=2,
+        expected_session_id="rx-1",
+        require_output=True,
+    )
+
+    assert len(events) == 2
+    assert session_id == "rx-1"
+    assert output == final_text
+    assert matched_result == {"sessionId": "rx-1", "finalOutput": final_text}

@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-11 — Preserve Unicode JSONL record boundaries (Checkpoint 1)
+
+- Changed shared session extraction, canonical session parsing, and Reasonix
+  ACP framing to split JSONL only on LF; CRLF remains accepted JSON whitespace,
+  while U+0085, U+2028, and U+2029 remain string data.
+- Added focused regressions for LF/CRLF records, trailing empty lines, strict
+  malformed/nonobject diagnostics, exact assistant text, and tool-only semantic
+  exclusion. Test source uses ASCII code-point construction.
+- Read-only proof parsed the two retained captures (182 and 522 records),
+  preserved both source files byte-for-byte, and passed the final-result
+  contract. Evidence is retained at
+  `/root/code/evidence/aflow-dogfood-20260909/jsonl-boundary-review-20260911/`.
+- Verification: 22 focused session tests, Ruff, and `git diff --check` passed.
+
 ## 2026-09-11 — Explain plan backup provenance (issue34)
 
 - Preserve existing backup bytes/names and byte-identical deduplication while
