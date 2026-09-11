@@ -1490,6 +1490,54 @@ def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client
     )
 
 
+def test_mcp_resume_persists_reviewer_start_step_and_replays_once(mcp_client) -> None:
+    client, root, units, monkeypatch = mcp_client
+    pending = _rest_start_pending(client, monkeypatch)
+    started = _rest_answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":[]}'
+    )
+    before = source_path.read_bytes()
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **_kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="review_implementation",
+            extra_instructions=(),
+            resume_context=object(),
+        ),
+    )
+    arguments = {
+        "project_id": PROJECT_ID,
+        "run_id": run_id,
+        "idempotency_key": "mcp-resume-review",
+    }
+    first = _mcp_tool(client, "resume_run", arguments)
+    replay = _mcp_tool(client, "resume_run", arguments)
+
+    assert first["run_id"] != run_id
+    assert replay["run_id"] == first["run_id"]
+    assert len(units.start_calls) == 2
+    successor_id = first["run_id"]
+    record = json.loads(
+        (root / ".aflow" / "start-requests" / f"{successor_id}.json").read_text()
+    )
+    assert record["prepared"]["start_step"] == "review_implementation"
+    manifest = json.loads(
+        (root / ".aflow" / "launches" / f"{successor_id}.json").read_text()
+    )
+    assert manifest["start_step"] == "review_implementation"
+    assert source_path.read_bytes() == before
+
+
 def test_mcp_reserved_plan_admission_failure_preserves_safe_identity(mcp_client) -> None:
     from aflow.api.startup import (
         PLAN_ADMISSION_ERROR_CODE,

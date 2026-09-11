@@ -36,13 +36,14 @@ from .config import (
 from .manager_context import scoped_reviewer_rejection_count
 from .live_config import load_live_config, load_live_config_for_run
 from .resume_relocation import ResumeRelocation, prepare_resume_relocation
-from .plan import PlanParseError, PlanSnapshot, load_plan
+from .plan import PlanParseError, PlanSnapshot, load_plan, parse_plan_text
 from .skill_installer import InstallerError, install_skills
 from .skill_installer import DEFAULT_BUNDLED_SKILL_NAMES
 from .run_state import (
     ActiveImplementationScope,
     FrozenRunIdentity,
     PendingFinalizedTurn,
+    PendingCumulativeReview,
     PendingRepartitionV1,
     RUN_STATE_SCHEMA_VERSION,
     ResumeContext,
@@ -56,6 +57,22 @@ from .run_state import (
 
 
 _MISSING_RESUME_FIELD = object()
+
+
+class ResumeScopeReconciliationError(ValueError):
+    """A durable progression claim was not safe to bind to a successor scope."""
+
+    error_kind = "resume_scope_reconciliation"
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        super().__init__(
+            f"error: run '{run_id}' cannot reconcile completed implementation "
+            f"scope: {reason}."
+        )
+
+
 _PENDING_REPARTITION_STAGES = frozenset({
     "decided",
     "proposed",
@@ -100,14 +117,17 @@ _PENDING_REPARTITION_ARTIFACT_FIELDS = (
 )
 from .workflow import (
     WorkflowError,
+    _latest_approved_checkpoint_index,
+    _rebase_scope_envelope_evidence,
     _scope_envelope_reference,
     _validate_scope_envelope_bytes,
+    evaluate_condition,
     load_scope_envelope_for_resume,
     load_scope_evidence_for_resume,
     move_completed_plan_to_done,
 )
-from .repartition import derive_generation_id
-from .runlog import load_run_json
+from .repartition import derive_generation_id, parse_envelope_bytes, slice_checkpoint_source
+from .runlog import RunPaths, load_run_json, resolve_envelope_texts
 from .analyzer import resolve_run_id
 from .recovery_runtime import (
     RecoveryRuntimeValidationError,
@@ -175,6 +195,7 @@ class ResumeBootstrap:
     max_turns_explicit: bool
     start_step_override: bool = False
     parsed_plan: object | None = None
+    relocation: ResumeRelocation | None = None
 
 
 INSTALL_SKILLS_HELP = """\
@@ -1493,6 +1514,8 @@ def _bootstrap_resume_invocation(
         allow_extra_instructions_override=extra_instructions_provided,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
+        run_dir=run_dir,
+        relocation=relocation,
     )
     if mismatch_reason is not None:
         raise ValueError(
@@ -1528,7 +1551,11 @@ def _bootstrap_resume_invocation(
         plan_path=plan_path,
         workflow_name=workflow_name,
         team=effective_saved_team,
-        start_step=effective_start_step,
+        start_step=(
+            resume_context.pending_cumulative_review.reviewer_step_name
+            if resume_context.pending_cumulative_review is not None
+            else effective_start_step
+        ),
         max_turns=effective_max_turns,
         extra_instructions=effective_extra,
         resume_context=resume_context,
@@ -1537,8 +1564,12 @@ def _bootstrap_resume_invocation(
         workflow_config=workflow_config,
         team_explicit=saved_team_explicit,
         max_turns_explicit=saved_max_turns_explicit,
-        start_step_override=start_step_override,
+        start_step_override=(
+            start_step_override
+            or resume_context.pending_cumulative_review is not None
+        ),
         parsed_plan=parsed_plan_for_startup,
+        relocation=relocation,
     )
 
 
@@ -1559,6 +1590,8 @@ def _resume_candidate_mismatch_reason(
     allow_max_turns_override: bool = False,
     team_explicit: bool | None = None,
     max_turns_explicit: bool | None = None,
+    run_dir: Path | None = None,
+    relocation: ResumeRelocation | None = None,
 ) -> str | None:
     """Check if the previous run is a valid resume candidate for the current invocation.
 
@@ -1604,11 +1637,35 @@ def _resume_candidate_mismatch_reason(
 
     last_snapshot = prev_run.get("last_snapshot")
     terminal_integration_only = _is_terminal_integration_resume(prev_run)
+    pending_cumulative_review = None
+    if (
+        isinstance(last_snapshot, Mapping)
+        and last_snapshot.get("is_complete") is True
+        and not terminal_integration_only
+        and not terminal_completion_only
+    ):
+        if run_dir is not None:
+            try:
+                pending_cumulative_review = _resume_pending_cumulative_review_resume(
+                    run_id=run_dir.name,
+                    run_dir=run_dir,
+                    prev_run=prev_run,
+                    plan_path=current_plan_path,
+                    current_repo_root=current_repo_root,
+                    workflow_steps=_resume_workflow_steps(
+                        current_workflow_config,
+                        current_workflow_name,
+                    ),
+                    relocation=relocation,
+                )
+            except ResumeScopeReconciliationError as exc:
+                return f"pending cumulative review evidence is invalid: {exc.reason}"
     if (
         isinstance(last_snapshot, dict)
         and last_snapshot.get("is_complete") is True
         and not terminal_integration_only
         and not terminal_completion_only
+        and pending_cumulative_review is None
         and not _completed_manager_budget_boundary_pending(prev_run, current_repo_root)
     ):
         return "its last saved plan snapshot was already complete"
@@ -2008,6 +2065,1433 @@ def _manager_resume_fields_for_scope(
     return fields
 
 
+def _resume_owned_plan_path(
+    plan_path: Path,
+    prev_run: Mapping[str, object],
+    *,
+    run_id: str,
+) -> Path:
+    """Resolve the plan copy owned by the saved execution lifecycle."""
+    lifecycle_setup = prev_run.get("lifecycle_setup", ())
+    if not isinstance(lifecycle_setup, list) or "worktree" not in lifecycle_setup:
+        return plan_path
+
+    repo_value = prev_run.get("repo_root")
+    worktree_value = prev_run.get("worktree_path")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (repo_value, worktree_value)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "worktree lifecycle metadata is incomplete while locating the owned plan",
+        )
+    try:
+        repo_root = Path(repo_value).resolve()
+        worktree_root = Path(worktree_value).resolve()
+        relative = plan_path.resolve().relative_to(repo_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "saved original plan is outside the recorded repository/worktree roots",
+        ) from exc
+    return worktree_root / relative
+
+
+def _resume_scope_envelope_texts(
+    run_dir: Path,
+    envelope_bytes: bytes,
+    *,
+    run_id: str,
+    plan_path: Path,
+) -> tuple[object, str]:
+    """Resolve the already-validated immutable envelope without source writes."""
+    try:
+        source_root = run_dir.resolve(strict=True)
+        paths = RunPaths(
+            repo_root=source_root.parent.parent.parent,
+            runs_root=source_root.parent,
+            run_dir=source_root,
+            turns_dir=source_root / "turns",
+            manager_dir=source_root / "manager",
+            run_json=source_root / "run.json",
+        )
+        envelope = _rebase_scope_envelope_evidence(
+            paths,
+            parse_envelope_bytes(envelope_bytes),
+        )
+        plan_text, _checkpoint_text = resolve_envelope_texts(paths, envelope)
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"immutable scope envelope evidence cannot be resolved for '{plan_path}': {exc}",
+        ) from exc
+    return envelope, plan_text
+
+
+def _resume_path_matches(value: object, expected: Path) -> bool:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        return False
+    try:
+        return Path(value).expanduser().resolve() == expected.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _resume_result_path(
+    value: object,
+    *,
+    relocation: ResumeRelocation | None,
+) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        path = Path(value).expanduser()
+        if relocation is not None:
+            path = relocation.map_path(path, required=False)
+        return path
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _resume_normalized_plan_bytes(
+    text: str,
+    *,
+    checkpoint_index: int,
+) -> bytes:
+    """Normalize only checklist markers in one completed checkpoint."""
+    source_slice = slice_checkpoint_source(text, checkpoint_index=checkpoint_index)
+    if source_slice is None:
+        raise ValueError(
+            f"checkpoint {checkpoint_index} is absent from the owned plan"
+        )
+    checkpoint = re.sub(
+        rb"\[([ xX])\]",
+        b"[ ]",
+        source_slice.full_text.encode("utf-8"),
+    )
+    plan_bytes = text.encode("utf-8")
+    return (
+        plan_bytes[: source_slice.checkpoint_byte_start]
+        + checkpoint
+        + plan_bytes[source_slice.checkpoint_byte_end :]
+    )
+
+
+def _resume_normalized_checkpoint_bytes(
+    text: str,
+    *,
+    checkpoint_index: int,
+) -> bytes:
+    """Return one checkpoint body with only its checklist markers normalized."""
+    source_slice = slice_checkpoint_source(text, checkpoint_index=checkpoint_index)
+    if source_slice is None:
+        raise ValueError(
+            f"checkpoint {checkpoint_index} is absent from the owned plan"
+        )
+    return re.sub(
+        rb"\[([ xX])\]",
+        b"[ ]",
+        source_slice.full_text.encode("utf-8"),
+    )
+
+
+def _resume_workflow_steps(
+    workflow_config: object,
+    workflow_name: str,
+) -> Mapping[str, object] | None:
+    """Resolve executable workflow steps from either config shape used by callers."""
+    direct_steps = getattr(workflow_config, "steps", None)
+    if isinstance(direct_steps, Mapping):
+        return direct_steps
+    workflows = getattr(workflow_config, "workflows", None)
+    workflow = workflows.get(workflow_name) if isinstance(workflows, Mapping) else None
+    steps = getattr(workflow, "steps", None)
+    return steps if isinstance(steps, Mapping) else None
+
+
+def _resume_read_json_object(path: Path, *, label: str, run_id: str) -> Mapping[str, object]:
+    """Read one controller-owned JSON object without following artifact links."""
+    if path.is_symlink() or not path.is_file():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"{label} is missing or is not an owned regular artifact",
+        )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"{label} is missing or unreadable: {exc}",
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"{label} must be a JSON object",
+        )
+    return value
+
+
+def _resume_workspace_state(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    run_id: str,
+) -> Mapping[str, object]:
+    """Load the latest immutable branch/HEAD boundary for a strict resume."""
+    inline = prev_run.get("workspace_state")
+    if inline is not None:
+        if not isinstance(inline, Mapping):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "source workspace_state is not a JSON object",
+            )
+        return inline
+
+    manager_dir = run_dir / "manager"
+    if manager_dir.is_symlink() or not manager_dir.is_dir():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source has no owned manager boundary for branch/HEAD evidence",
+        )
+    decision_number = prev_run.get("manager_decision_number")
+    if (
+        isinstance(decision_number, int)
+        and not isinstance(decision_number, bool)
+        and decision_number > 0
+    ):
+        boundary_path = manager_dir / f"decision-{decision_number:03d}" / "boundary.json"
+        boundary = _resume_read_json_object(
+            boundary_path,
+            label="latest manager boundary",
+            run_id=run_id,
+        )
+        boundary_value = boundary.get("boundary")
+        if not isinstance(boundary_value, Mapping):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "latest manager boundary has no structured boundary payload",
+            )
+        workspace = boundary_value.get("workspace_state")
+        if not isinstance(workspace, Mapping):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "latest manager boundary has no workspace_state evidence",
+            )
+        return workspace
+
+    try:
+        decisions = sorted(
+            (
+                path
+                for path in manager_dir.glob("decision-*/boundary.json")
+                if not path.is_symlink() and path.is_file()
+            ),
+            reverse=True,
+        )
+    except OSError as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source manager boundaries cannot be enumerated: {exc}",
+        ) from exc
+    if not decisions:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source has no owned manager boundary for branch/HEAD evidence",
+        )
+    boundary = _resume_read_json_object(
+        decisions[0],
+        label="latest manager boundary",
+        run_id=run_id,
+    )
+    boundary_value = boundary.get("boundary")
+    workspace = boundary_value.get("workspace_state") if isinstance(boundary_value, Mapping) else None
+    if not isinstance(workspace, Mapping):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "latest manager boundary has no workspace_state evidence",
+        )
+    return workspace
+
+
+def _resume_git_output(
+    root: Path,
+    args: tuple[str, ...],
+    *,
+    run_id: str,
+    label: str,
+) -> str:
+    try:
+        result = subprocess.run(
+            ("git", *args),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"{label} Git identity could not be verified: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown Git error"
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"{label} Git identity could not be verified: {detail}",
+        )
+    return result.stdout.strip()
+
+
+def _resume_validate_workspace_identity(
+    *,
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    current_repo_root: Path,
+    run_id: str,
+) -> None:
+    """Require the source's recorded clean branch and exact commit still exist."""
+    workspace = _resume_workspace_state(run_dir, prev_run, run_id=run_id)
+    expected_head = None
+    for key in ("head", "execution_head", "worktree_head", "current_head"):
+        value = workspace.get(key)
+        if value is None:
+            value = prev_run.get(key)
+        if value is not None:
+            expected_head = value
+            break
+    if not isinstance(expected_head, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected_head
+    ) is None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source workspace boundary has no full repository HEAD",
+        )
+
+    expected_branch = workspace.get("branch")
+    if expected_branch is None:
+        expected_branch = prev_run.get("feature_branch")
+    if not isinstance(expected_branch, str) or not expected_branch.strip():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source workspace boundary has no branch",
+        )
+    feature_branch = prev_run.get("feature_branch")
+    if isinstance(feature_branch, str) and feature_branch and expected_branch != feature_branch:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source workspace boundary branch differs from feature_branch",
+        )
+    dirty = workspace.get("dirty_worktree")
+    if not isinstance(dirty, str) or dirty.strip():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source workspace boundary records a dirty worktree",
+        )
+    merge_state = workspace.get("merge_state")
+    if merge_state is not None and merge_state != "managed":
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source workspace boundary is no longer managed",
+        )
+
+    lifecycle_setup = prev_run.get("lifecycle_setup", ())
+    execution_root = current_repo_root
+    if isinstance(lifecycle_setup, list) and "worktree" in lifecycle_setup:
+        worktree_value = prev_run.get("worktree_path")
+        if not isinstance(worktree_value, str) or not worktree_value.strip():
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "worktree lifecycle metadata has no execution worktree",
+            )
+        execution_root = Path(worktree_value)
+    if execution_root.is_symlink() or not execution_root.is_dir():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "recorded execution worktree is missing or is a symlink",
+        )
+    try:
+        resolved_execution_root = execution_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"recorded execution root cannot be resolved: {exc}",
+        ) from exc
+
+    actual_top_level = Path(
+        _resume_git_output(
+            resolved_execution_root,
+            ("rev-parse", "--show-toplevel"),
+            run_id=run_id,
+            label="source execution worktree",
+        )
+    ).resolve()
+    if actual_top_level != resolved_execution_root:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source execution worktree is not the recorded Git root",
+        )
+    actual_branch = _resume_git_output(
+        resolved_execution_root,
+        ("symbolic-ref", "--short", "HEAD"),
+        run_id=run_id,
+        label="source execution worktree",
+    )
+    if actual_branch != expected_branch:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source branch changed from '{expected_branch}' to '{actual_branch}'",
+        )
+    actual_head = _resume_git_output(
+        resolved_execution_root,
+        ("rev-parse", "HEAD"),
+        run_id=run_id,
+        label="source execution worktree",
+    )
+    if actual_head.lower() != expected_head.lower():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source HEAD changed from '{expected_head}' to '{actual_head}'",
+        )
+    status = _resume_git_output(
+        resolved_execution_root,
+        ("status", "--porcelain", "--untracked-files=all"),
+        run_id=run_id,
+        label="source execution worktree",
+    )
+    unexpected_status = tuple(
+        line
+        for line in status.splitlines()
+        if not (
+            line.startswith("?? ")
+            and line[3:].strip() == ".aflow-config-pair.lock"
+        )
+    )
+    if unexpected_status:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source execution worktree changed after the finalized worker",
+        )
+
+
+def _resume_validate_inactive_unit(
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    *,
+    run_id: str,
+) -> None:
+    """Bind active-session metadata to the source unit's nonce-bound exit receipt."""
+    try:
+        hotplug_resume_fields(prev_run)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source owner/session state is invalid: {exc}",
+        ) from exc
+    units_dir = run_dir / "units"
+    if units_dir.is_symlink() or not units_dir.is_dir():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source has no owned unit receipt directory",
+        )
+    start = _resume_read_json_object(
+        units_dir / "start.json",
+        label="source unit start receipt",
+        run_id=run_id,
+    )
+    exit_receipt = _resume_read_json_object(
+        units_dir / "exit.json",
+        label="source unit exit receipt",
+        run_id=run_id,
+    )
+    nonce = start.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source unit start receipt has no nonce",
+        )
+    if (
+        start.get("schema") != 1
+        or start.get("run_id") != run_id
+        or start.get("unit") != f"aflow-run-{run_id}.service"
+        or exit_receipt.get("schema") != 1
+        or exit_receipt.get("nonce") != nonce
+        or not isinstance(exit_receipt.get("returncode"), int)
+        or isinstance(exit_receipt.get("returncode"), bool)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source unit exit receipt does not prove owned inactivity",
+        )
+
+
+def _resume_scan_turn_results(
+    run_dir: Path,
+    *,
+    active_turn: int,
+    run_id: str,
+) -> Mapping[str, object]:
+    """Scan bounded finalized turn receipts and reject any prior reviewer."""
+    turns_dir = run_dir / "turns"
+    if turns_dir.is_symlink() or not turns_dir.is_dir():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source has no owned turns directory",
+        )
+    try:
+        children = list(turns_dir.iterdir())
+    except OSError as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source turns cannot be enumerated: {exc}",
+        ) from exc
+    for child in children:
+        match = re.fullmatch(r"turn-(\d+)", child.name)
+        if match is None:
+            continue
+        if child.is_symlink() or not child.is_dir():
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"source turn artifact '{child.name}' is not an owned directory",
+            )
+        if int(match.group(1)) > active_turn:
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "source contains a turn artifact after its finalized active turn",
+            )
+    if active_turn > 256:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source finalized turn history exceeds the bounded resume scan",
+        )
+    current: Mapping[str, object] | None = None
+    for turn_number in range(1, active_turn + 1):
+        turn_dir = turns_dir / f"turn-{turn_number:03d}"
+        if turn_dir.is_symlink() or not turn_dir.is_dir():
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"source turn-{turn_number:03d} is missing or is not owned",
+            )
+        result = _resume_read_json_object(
+            turn_dir / "result.json",
+            label=f"source turn-{turn_number:03d} result",
+            run_id=run_id,
+        )
+        role = result.get("step_role")
+        status = result.get("status")
+        if not isinstance(role, str) or not role.strip() or not isinstance(status, str):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"source turn-{turn_number:03d} result has incomplete finalized metadata",
+            )
+        if status in {"starting", "running"}:
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"source turn-{turn_number:03d} result is not finalized",
+            )
+        if role == "reviewer":
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "source contains a reviewer result before the pending full review",
+            )
+        if result.get("review_rejection") is not None:
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "source contains a recorded reviewer rejection",
+            )
+        if turn_number == active_turn:
+            current = result
+    if current is None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source has no finalized active worker result",
+        )
+    return current
+
+
+def _resume_pending_cumulative_review_resume(
+    *,
+    run_id: str,
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    plan_path: Path,
+    current_repo_root: Path,
+    workflow_steps: Mapping[str, object] | None,
+    relocation: ResumeRelocation | None,
+) -> PendingCumulativeReview | None:
+    """Classify one complete, failed run whose worker-to-review edge is pending."""
+    last_snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    raw_scope = prev_run.get("active_implementation_scope")
+    if last_snapshot is None or not last_snapshot.is_complete:
+        return None
+    if not isinstance(raw_scope, Mapping) or raw_scope.get("awaiting_review") is not True:
+        return None
+
+    if prev_run.get("status") != "failed":
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source is active or does not have a terminal controller failure",
+        )
+    for field_name in (
+        "end_reason",
+        "completion_phase",
+        "merge_status",
+        "merge_failure_reason",
+        "approved_commit",
+        "publication_receipt",
+        "completion_receipt",
+    ):
+        value = prev_run.get(field_name)
+        if value not in (None, ""):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"source already has terminal review/publication metadata in {field_name}",
+            )
+    if (
+        last_snapshot.current_checkpoint_index is not None
+        or last_snapshot.current_checkpoint_name is not None
+        or last_snapshot.unchecked_checkpoint_count != 0
+        or last_snapshot.current_checkpoint_unchecked_step_count != 0
+        or last_snapshot.total_checkpoint_count < 1
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source complete snapshot has inconsistent checkpoint counts",
+        )
+
+    try:
+        manager_resume_fields_strict(prev_run)
+        hotplug_fields = hotplug_resume_fields(prev_run)
+        manager_fields = _manager_resume_fields_for_scope(
+            prev_run,
+            reset_scope=False,
+            run_dir=run_dir,
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source manager authority is invalid: {exc}",
+        ) from exc
+    scope = manager_fields.get("active_implementation_scope")
+    if not isinstance(scope, ActiveImplementationScope) or not scope.awaiting_review:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source awaiting-review scope is incomplete or not current authority",
+        )
+    if (
+        not isinstance(scope.checkpoint_index, int)
+        or isinstance(scope.checkpoint_index, bool)
+        or scope.checkpoint_index < 1
+        or not isinstance(scope.checkpoint_name, str)
+        or not scope.checkpoint_name.strip()
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source awaiting-review scope has no concrete checkpoint identity",
+        )
+    if (
+        scope.current_partition_generation_id is not None
+        or scope.current_partition_candidate_sha256 is not None
+        or scope.current_partition_id is not None
+        or manager_fields.get("pending_repartition") is not None
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source checkpoint partition state is still pending",
+        )
+    if scope.carried_reviewer_rejection_count != 0 or manager_fields.get("reviewer_rejection_count") != 0:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source awaiting-review scope carries reviewer-rejection state",
+        )
+    if any(
+        getattr(item, "scope_id", None) == scope.scope_id
+        for item in manager_fields.get("review_rejection_history", ())
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source awaiting-review scope already has review history",
+        )
+    for label in ("pending_manager_notes", "pending_step_team_override"):
+        pending = manager_fields.get(label)
+        if pending is not None and not getattr(pending, "consumed", False):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"source {label} is not consumed",
+            )
+    boundary = manager_fields.get("pending_boundary_decision")
+    if boundary is not None and not (
+        getattr(boundary, "applied", False) and getattr(boundary, "consumed", False)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source manager boundary is not consumed",
+        )
+    if prev_run.get("current_hotplug_transaction") is not None or prev_run.get("pending_hotplug_transaction") is not None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source provider hotplug state is unresolved",
+        )
+    if hotplug_fields.get("current_hotplug_transaction") is not None or hotplug_fields.get("pending_hotplug_transaction") is not None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source provider hotplug state is unresolved",
+        )
+
+    active_turn = prev_run.get("active_turn")
+    turns_completed = prev_run.get("turns_completed")
+    if (
+        not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn < 1
+        or not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed != active_turn
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source turn ownership is not one finalized worker turn",
+        )
+    _resume_validate_inactive_unit(run_dir, prev_run, run_id=run_id)
+    _resume_validate_workspace_identity(
+        run_dir=run_dir,
+        prev_run=prev_run,
+        current_repo_root=current_repo_root,
+        run_id=run_id,
+    )
+    result = _resume_scan_turn_results(
+        run_dir,
+        active_turn=active_turn,
+        run_id=run_id,
+    )
+    if (
+        result.get("turn_number") != active_turn
+        or result.get("step_role") != "worker"
+        or result.get("status") != "completed"
+        or type(result.get("returncode")) is not int
+        or result.get("returncode") != 0
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source active worker receipt is not a successful finalized turn",
+        )
+    step_name = result.get("step_name")
+    selector = result.get("selector")
+    active_plan_value = result.get("active_plan_path")
+    original_plan_value = result.get("original_plan_path")
+    chosen_transition = result.get("chosen_transition")
+    chosen_condition = result.get("chosen_transition_condition")
+    new_plan_value = result.get("new_plan_path")
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (
+            step_name,
+            selector,
+            active_plan_value,
+            original_plan_value,
+            chosen_transition,
+            chosen_condition,
+            new_plan_value,
+        )
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt lacks stable step, plan, or transition identity",
+        )
+    if chosen_transition == "END":
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt ended the workflow before full review",
+        )
+    conditions = result.get("conditions")
+    if not isinstance(conditions, Mapping) or any(
+        type(conditions.get(name)) is not bool
+        for name in ("DONE", "NEW_PLAN_EXISTS", "MAX_TURNS_REACHED")
+    ) or conditions.get("DONE") is not True or conditions.get("NEW_PLAN_EXISTS") is not False or conditions.get("MAX_TURNS_REACHED") is not False:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt has invalid completion conditions",
+        )
+    snapshot_before = _resume_plan_snapshot(result.get("snapshot_before"))
+    snapshot_after = _resume_plan_snapshot(result.get("snapshot_after"))
+    if snapshot_before is None or snapshot_after is None or not snapshot_after.is_complete:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt lacks strict before/after snapshots",
+        )
+    if snapshot_after != last_snapshot:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt does not match the complete run snapshot",
+        )
+    if (
+        snapshot_before.is_complete
+        or not isinstance(snapshot_before.current_checkpoint_index, int)
+        or isinstance(snapshot_before.current_checkpoint_index, bool)
+        or snapshot_before.current_checkpoint_index < 1
+        or not isinstance(snapshot_before.current_checkpoint_name, str)
+        or not snapshot_before.current_checkpoint_name.strip()
+        or snapshot_before.current_checkpoint_unchecked_step_count < 1
+        or snapshot_before.unchecked_checkpoint_count < 1
+        or snapshot_before.total_checkpoint_count != last_snapshot.total_checkpoint_count
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker before-snapshot is not a concrete unfinished checkpoint",
+        )
+
+    if workflow_steps is None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current workflow has no executable step graph",
+        )
+    worker_step = workflow_steps.get(step_name)
+    if worker_step is None or getattr(worker_step, "role", None) != "worker":
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source worker step '{step_name}' is not configured as a worker",
+        )
+    transitions = getattr(worker_step, "go", ())
+    selected = [
+        transition
+        for transition in transitions
+        if getattr(transition, "to", None) == chosen_transition
+        and getattr(transition, "when", None) == chosen_condition
+    ]
+    if len(selected) != 1:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker transition is not uniquely present in the current workflow graph",
+        )
+    transition = selected[0]
+    try:
+        condition_matches = evaluate_condition(
+            chosen_condition,
+            done=conditions["DONE"],
+            new_plan_exists=conditions["NEW_PLAN_EXISTS"],
+            max_turns_reached=conditions["MAX_TURNS_REACHED"],
+        )
+    except (WorkflowError, TypeError, ValueError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source worker transition condition is invalid: {exc}",
+        ) from exc
+    if not condition_matches or not getattr(transition, "preserve_active_plan", False):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker transition does not preserve the configured full-review boundary",
+        )
+    reviewer_step_name = getattr(transition, "to", None)
+    reviewer_step = workflow_steps.get(reviewer_step_name)
+    if reviewer_step is None or getattr(reviewer_step, "role", None) != "reviewer":
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker transition does not target a configured reviewer",
+        )
+    if prev_run.get("current_step_name") not in {step_name, reviewer_step_name}:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source run metadata does not identify the worker-to-review boundary",
+        )
+
+    owned_plan_path = _resume_owned_plan_path(plan_path, prev_run, run_id=run_id)
+    if not owned_plan_path.is_file() or owned_plan_path.is_symlink():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"current owned plan is missing: {owned_plan_path}",
+        )
+    for label, value in (
+        ("source original plan", prev_run.get("original_plan_path")),
+        ("source active plan", prev_run.get("active_plan_path")),
+    ):
+        if value is not None and not (
+            _resume_path_matches(value, plan_path)
+            or _resume_path_matches(value, owned_plan_path)
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"{label} names a repair overlay instead of the original plan",
+            )
+    result_active_path = _resume_result_path(
+        active_plan_value,
+        relocation=relocation,
+    )
+    result_original_path = _resume_result_path(
+        original_plan_value,
+        relocation=relocation,
+    )
+    if result_active_path is None or result_original_path is None or not (
+        _resume_path_matches(result_active_path, plan_path)
+        or _resume_path_matches(result_active_path, owned_plan_path)
+    ) or not (
+        _resume_path_matches(result_original_path, plan_path)
+        or _resume_path_matches(result_original_path, owned_plan_path)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt names a repair overlay instead of the original plan",
+        )
+
+    try:
+        scope_envelope_bytes = load_scope_envelope_for_resume(run_dir, scope)
+        load_scope_evidence_for_resume(run_dir, scope, scope_envelope_bytes)
+        envelope, captured_text = _resume_scope_envelope_texts(
+            run_dir,
+            scope_envelope_bytes,
+            run_id=run_id,
+            plan_path=plan_path,
+        )
+        captured_plan = parse_plan_text(captured_text, source_path=plan_path)
+        current_plan = load_plan(owned_plan_path)
+        current_text = owned_plan_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, PlanParseError, ValueError, WorkflowError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"source or current plan evidence cannot be parsed strictly: {exc}",
+        ) from exc
+    if current_plan.snapshot != last_snapshot or not current_plan.snapshot.is_complete:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan does not match the complete worker snapshot",
+        )
+    if (
+        captured_plan.snapshot.is_complete
+        or captured_plan.snapshot.current_checkpoint_index != scope.checkpoint_index
+        or captured_plan.snapshot.current_checkpoint_name != scope.checkpoint_name
+        or captured_plan.snapshot.total_checkpoint_count != last_snapshot.total_checkpoint_count
+        or getattr(envelope, "checkpoint_index", None) != scope.checkpoint_index
+        or getattr(envelope, "checkpoint_name", None) != scope.checkpoint_name
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "captured scope evidence does not identify the stale active checkpoint",
+        )
+    try:
+        logical_plan_path = plan_path.resolve().relative_to(current_repo_root.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"original plan cannot be bound to the current repository: {exc}",
+        ) from exc
+    if (
+        not _resume_path_matches(scope.original_plan_path, plan_path)
+        and not _resume_path_matches(scope.original_plan_path, owned_plan_path)
+    ) or getattr(envelope, "original_plan_path", None) != logical_plan_path:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "scope envelope and active scope name different original-plan identities",
+        )
+    if len(captured_plan.sections) != len(current_plan.sections) or len(captured_plan.sections) != last_snapshot.total_checkpoint_count:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan changed its checkpoint structure",
+        )
+    expected_index = scope.checkpoint_index
+    for index, (captured_section, current_section) in enumerate(
+        zip(captured_plan.sections, current_plan.sections),
+        start=1,
+    ):
+        if (
+            captured_section.name != current_section.name
+            or captured_section.checked_step_count + captured_section.unchecked_step_count
+            != current_section.checked_step_count + current_section.unchecked_step_count
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan changed checkpoint names or step structure",
+            )
+        if index < expected_index and (
+            captured_section.heading_checked != current_section.heading_checked
+            or captured_section.checked_step_count != current_section.checked_step_count
+            or captured_section.unchecked_step_count != current_section.unchecked_step_count
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan changed completed checkpoint evidence before the stale scope",
+            )
+        if index > expected_index and (
+            current_section.checked_step_count < captured_section.checked_step_count
+            or current_section.unchecked_step_count > captured_section.unchecked_step_count
+            or captured_section.heading_checked and not current_section.heading_checked
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan regressed a later checkpoint",
+            )
+    if not 1 <= expected_index <= len(current_plan.sections):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "stale active checkpoint is not present in the current plan",
+        )
+    stale_section = current_plan.sections[expected_index - 1]
+    if stale_section.name != scope.checkpoint_name or not stale_section.heading_checked or stale_section.unchecked_step_count != 0:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan does not show the stale scope as completed",
+        )
+    try:
+        if _resume_normalized_checkpoint_bytes(
+            captured_text,
+            checkpoint_index=expected_index,
+        ) != _resume_normalized_checkpoint_bytes(
+            current_text,
+            checkpoint_index=expected_index,
+        ):
+            raise ValueError("completed scope bytes changed beyond checklist markers")
+    except ValueError as exc:
+        raise ResumeScopeReconciliationError(run_id, str(exc)) from exc
+    before_index = snapshot_before.current_checkpoint_index
+    if before_index not in {expected_index, expected_index + 1} or before_index > len(current_plan.sections):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker evidence skips the stale scope or identifies no next checkpoint",
+        )
+    before_section = current_plan.sections[before_index - 1]
+    if snapshot_before.current_checkpoint_name != before_section.name:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker before-snapshot checkpoint name differs from the current plan",
+        )
+    if before_index == expected_index and snapshot_before != captured_plan.snapshot:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker before-snapshot differs from captured active-scope evidence",
+        )
+    new_plan_path = _resume_result_path(new_plan_value, relocation=relocation)
+    expected_plan_parents = {
+        plan_path.parent.resolve(),
+        owned_plan_path.parent.resolve(),
+    }
+    expected_new_plan_pattern = re.compile(
+        re.escape(
+            f"{plan_path.stem}-cp{before_index:02d}-v"
+        )
+        + r"\d+"
+        + re.escape(plan_path.suffix or ".md")
+        + r"$"
+    )
+    if (
+        new_plan_path is None
+        or new_plan_path.parent.resolve() not in expected_plan_parents
+        or expected_new_plan_pattern.fullmatch(new_plan_path.name) is None
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source worker receipt names an unexpected follow-up plan",
+        )
+
+    attempts = manager_fields.get("implementation_attempts", {})
+    matching_attempts = [
+        attempt
+        for attempt in attempts.get(scope.scope_id, ())
+        if (
+            attempt.turn_number == active_turn
+            and attempt.step_name == step_name
+            and attempt.role == "worker"
+            and attempt.selector == selector
+            and attempt.outcome == "accepted"
+        )
+    ] if isinstance(attempts, Mapping) else []
+    if len(matching_attempts) != 1:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source manager authority has no matching successful worker attempt",
+        )
+    if _latest_approved_checkpoint_index(current_text) is not None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current plan already records an accepted checkpoint review",
+        )
+    return PendingCumulativeReview(
+        source_run_dir=run_dir,
+        worker_turn_number=active_turn,
+        worker_step_name=step_name,
+        reviewer_step_name=reviewer_step_name,
+        snapshot_before=snapshot_before,
+        worker_artifact_path=(
+            f"resumed-from/{run_id}/turns/turn-{active_turn:03d}/result.json"
+        ),
+    )
+
+
+def _resume_scope_routing_blocker(
+    manager_fields: dict[str, object],
+    *,
+    scope: ActiveImplementationScope,
+    prev_run: Mapping[str, object],
+    run_id: str,
+) -> None:
+    """Reject one-hop state that must be consumed before scope closure."""
+    if scope.awaiting_review:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "the active scope is awaiting checkpoint review",
+        )
+    if any(
+        value is not None
+        for value in (
+            scope.current_partition_generation_id,
+            scope.current_partition_candidate_sha256,
+            scope.current_partition_id,
+            manager_fields.get("pending_repartition"),
+        )
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "checkpoint partition state is still pending",
+        )
+    if scope.carried_reviewer_rejection_count != 0:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "the active scope carries reviewer-rejection history",
+        )
+    if manager_fields.get("reviewer_rejection_count") != 0:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "reviewer-rejection state must be resolved before scope closure",
+        )
+    if any(
+        getattr(record, "scope_id", None) == scope.scope_id
+        for record in manager_fields.get("review_rejection_history", ())
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "the active scope has a recorded reviewer rejection",
+        )
+
+    for label in ("pending_manager_notes", "pending_step_team_override"):
+        pending = manager_fields.get(label)
+        if pending is not None and not getattr(pending, "consumed", False):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                f"{label} must be consumed before scope closure",
+            )
+    boundary = manager_fields.get("pending_boundary_decision")
+    if boundary is not None and not (
+        getattr(boundary, "applied", False)
+        and getattr(boundary, "consumed", False)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "an unconsumed manager boundary decision must be replayed first",
+        )
+    if any(
+        prev_run.get(field) is not None
+        for field in ("current_hotplug_transaction", "pending_hotplug_transaction")
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "provider hotplug state is unresolved",
+        )
+
+
+def _reconcile_verified_resume_scope(
+    *,
+    run_id: str,
+    run_dir: Path,
+    prev_run: Mapping[str, object],
+    plan_path: Path,
+    relocation: ResumeRelocation | None,
+    scope: ActiveImplementationScope | None,
+    manager_fields: Mapping[str, object],
+    scope_envelope_bytes: bytes | None,
+    pending_finalized_turn: PendingFinalizedTurn | None,
+) -> bool:
+    """Recognize only a strict transport-failure checkpoint progression.
+
+    The function is deliberately read-only.  A true result means the caller
+    may construct a successor with the old scope closed; the normal workflow
+    then opens the next scope and captures its envelope through its canonical
+    helpers.
+    """
+    if scope is None or scope_envelope_bytes is None:
+        return False
+    source_snapshot = _resume_plan_snapshot(prev_run.get("last_snapshot"))
+    if source_snapshot is None or source_snapshot.is_complete:
+        return False
+    if (
+        scope.checkpoint_index is None
+        or source_snapshot.current_checkpoint_index is None
+        or source_snapshot.current_checkpoint_index <= scope.checkpoint_index
+    ):
+        return False
+    if source_snapshot.current_checkpoint_index != scope.checkpoint_index + 1:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source snapshot skips more than one checkpoint after the active scope",
+        )
+
+    _resume_scope_routing_blocker(
+        manager_fields,
+        scope=scope,
+        prev_run=prev_run,
+        run_id=run_id,
+    )
+    if pending_finalized_turn is not None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "a finalized turn boundary must be resolved before scope progression",
+        )
+    if prev_run.get("status") != "failed":
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "the source run is still active or has no terminal transport failure",
+        )
+
+    active_turn = prev_run.get("active_turn")
+    turns_completed = prev_run.get("turns_completed")
+    if (
+        not isinstance(active_turn, int)
+        or isinstance(active_turn, bool)
+        or active_turn < 1
+        or not isinstance(turns_completed, int)
+        or isinstance(turns_completed, bool)
+        or turns_completed != active_turn - 1
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source turn ownership is not a single terminal worker attempt",
+        )
+
+    result_path = run_dir / "turns" / f"turn-{active_turn:03d}" / "result.json"
+    if any(
+        path.is_symlink()
+        for path in (run_dir, result_path.parent.parent, result_path.parent, result_path)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt is not an owned regular artifact",
+        )
+    try:
+        result_value = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"terminal worker receipt is missing or unreadable: {exc}",
+        ) from exc
+    if not isinstance(result_value, Mapping):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt must be a JSON object",
+        )
+    result = result_value
+    if (
+        result.get("turn_number") != active_turn
+        or result.get("step_role") != "worker"
+        or result.get("status") != "harness-failed"
+        or not isinstance(result.get("returncode"), int)
+        or isinstance(result.get("returncode"), bool)
+        or result.get("returncode") == 0
+        or result.get("chosen_transition") is not None
+        or result.get("chosen_transition_condition") is not None
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt does not prove a transport-only failure",
+        )
+    conditions = result.get("conditions")
+    if not isinstance(conditions, Mapping) or any(
+        not isinstance(conditions.get(name), bool)
+        or conditions.get(name)
+        for name in ("DONE", "NEW_PLAN_EXISTS", "MAX_TURNS_REACHED")
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt has missing or non-terminal conditions",
+        )
+
+    snapshot_before = _resume_plan_snapshot(result.get("snapshot_before"))
+    snapshot_after = _resume_plan_snapshot(result.get("snapshot_after"))
+    if snapshot_before is None or snapshot_after is None:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt lacks strict before/after plan snapshots",
+        )
+    if snapshot_after != source_snapshot:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt does not match the source run snapshot",
+        )
+
+    owned_plan_path = _resume_owned_plan_path(plan_path, prev_run, run_id=run_id)
+    if not (
+        _resume_path_matches(prev_run.get("active_plan_path"), plan_path)
+        or _resume_path_matches(prev_run.get("active_plan_path"), owned_plan_path)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "source metadata names an active plan overlay instead of the original plan",
+        )
+    result_active_path = _resume_result_path(
+        result.get("active_plan_path"), relocation=relocation
+    )
+    if result_active_path is None or not (
+        _resume_path_matches(result_active_path, plan_path)
+        or _resume_path_matches(result_active_path, owned_plan_path)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt names a different active plan",
+        )
+    if not owned_plan_path.is_file() or owned_plan_path.is_symlink():
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"current owned plan is missing: {owned_plan_path}",
+        )
+
+    envelope, envelope_plan_text = _resume_scope_envelope_texts(
+        run_dir,
+        scope_envelope_bytes,
+        run_id=run_id,
+        plan_path=plan_path,
+    )
+    try:
+        captured_plan = parse_plan_text(envelope_plan_text, source_path=plan_path)
+        current_plan = load_plan(owned_plan_path)
+        current_plan_text = owned_plan_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, PlanParseError, ValueError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"captured or current plan cannot be parsed strictly: {exc}",
+        ) from exc
+    if snapshot_before != captured_plan.snapshot:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "terminal worker receipt before-snapshot differs from captured scope evidence",
+        )
+    if current_plan.snapshot != source_snapshot:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan does not match the terminal worker after-snapshot",
+        )
+
+    expected_index = scope.checkpoint_index
+    if not isinstance(expected_index, int):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "captured scope has no concrete checkpoint index",
+        )
+    try:
+        captured_normalized = _resume_normalized_plan_bytes(
+            envelope_plan_text,
+            checkpoint_index=expected_index,
+        )
+        current_normalized = _resume_normalized_plan_bytes(
+            current_plan_text,
+            checkpoint_index=expected_index,
+        )
+    except ValueError as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"plan checkpoint bytes cannot be normalized strictly: {exc}",
+        ) from exc
+    if current_normalized != captured_normalized:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan changed bytes beyond the completed checkpoint checklist",
+        )
+    if (
+        captured_plan.snapshot.current_checkpoint_index != expected_index
+        or captured_plan.snapshot.current_checkpoint_name != scope.checkpoint_name
+        or getattr(envelope, "checkpoint_index", None) != expected_index
+        or getattr(envelope, "checkpoint_name", None) != scope.checkpoint_name
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "captured scope evidence does not identify the active checkpoint",
+        )
+    try:
+        repo_root_value = prev_run["repo_root"]
+        if not isinstance(repo_root_value, str) or not repo_root_value.strip():
+            raise ValueError("repo_root is missing")
+        logical_plan_path = plan_path.resolve().relative_to(
+            Path(repo_root_value).resolve()
+        ).as_posix()
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            f"saved plan cannot be bound to the recorded repository: {exc}",
+        ) from exc
+    if (
+        not _resume_path_matches(scope.original_plan_path, plan_path)
+        or getattr(envelope, "original_plan_path", None) != logical_plan_path
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "scope envelope and active scope name different original-plan identities",
+        )
+
+    if len(captured_plan.sections) != len(current_plan.sections):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan changed its checkpoint structure",
+        )
+    if len(captured_plan.sections) != captured_plan.snapshot.total_checkpoint_count:
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "captured plan checkpoint count is inconsistent with its snapshot",
+        )
+    for index, (captured_section, current_section) in enumerate(
+        zip(captured_plan.sections, current_plan.sections),
+        start=1,
+    ):
+        if (
+            captured_section.name != current_section.name
+            or captured_section.checked_step_count
+            + captured_section.unchecked_step_count
+            != current_section.checked_step_count
+            + current_section.unchecked_step_count
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan changed checkpoint names or step structure",
+            )
+        if index != expected_index and (
+            captured_section.heading_checked != current_section.heading_checked
+            or captured_section.unchecked_step_count
+            != current_section.unchecked_step_count
+            or captured_section.checked_step_count
+            != current_section.checked_step_count
+        ):
+            raise ResumeScopeReconciliationError(
+                run_id,
+                "current owned plan changed checkpoint structure",
+            )
+    if not (
+        1 <= expected_index < len(current_plan.sections)
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "the next checkpoint is not present in the current owned plan",
+        )
+    old_section = current_plan.sections[expected_index - 1]
+    next_section = current_plan.sections[expected_index]
+    if (
+        not old_section.heading_checked
+        or old_section.unchecked_step_count != 0
+        or next_section.heading_checked
+        or next_section.name != source_snapshot.current_checkpoint_name
+        or next_section.unchecked_step_count
+        != source_snapshot.current_checkpoint_unchecked_step_count
+        or source_snapshot.current_checkpoint_index != expected_index + 1
+    ):
+        raise ResumeScopeReconciliationError(
+            run_id,
+            "current owned plan does not show exactly the next unchecked checkpoint",
+        )
+
+    # This mirrors the canonical workflow scope close: only one-hop scope and
+    # routing state are cleared. Attempts, budgets, histories, and pressure
+    # diagnostics remain available to the successor.
+    manager_fields["active_implementation_scope"] = None
+    manager_fields["pending_manager_notes"] = None
+    manager_fields["pending_step_team_override"] = None
+    manager_fields["pending_boundary_decision"] = None
+    manager_fields["reviewer_rejection_count"] = 0
+    return True
+
+
 def _reconstruct_resume_context(
     *,
     resolved_run_id: Path,
@@ -2202,9 +3686,56 @@ def _reconstruct_resume_context(
         manager_fields["pending_step_team_override"] = None
         manager_fields["pending_boundary_decision"] = None
 
+    pending_cumulative_review: PendingCumulativeReview | None = None
+    if not reset_scope and not terminal_completion_only and not terminal_integration_only:
+        repo_root_value = prev_run.get("repo_root")
+        if isinstance(repo_root_value, str) and repo_root_value.strip():
+            pending_cumulative_review = _resume_pending_cumulative_review_resume(
+                run_id=run_id,
+                run_dir=run_dir,
+                prev_run=prev_run,
+                plan_path=plan_path,
+                current_repo_root=Path(repo_root_value).resolve(),
+                workflow_steps=workflow_steps,
+                relocation=relocation,
+            )
+
+    reconciled_scope = False
+    if (
+        not reset_scope
+        and not terminal_completion_only
+        and not terminal_integration_only
+        and pending_cumulative_review is None
+    ):
+        reconciled_scope = _reconcile_verified_resume_scope(
+            run_id=run_id,
+            run_dir=run_dir,
+            prev_run=prev_run,
+            plan_path=plan_path,
+            relocation=relocation,
+            scope=(
+                active_scope
+                if isinstance(active_scope, ActiveImplementationScope)
+                else None
+            ),
+            manager_fields=manager_fields,
+            scope_envelope_bytes=scope_envelope_bytes,
+            pending_finalized_turn=pending_finalized_turn,
+        )
+        if reconciled_scope:
+            # The predecessor remains authoritative and immutable.  The
+            # successor will open and capture the exact next scope normally.
+            scope_envelope_source_path = None
+            scope_envelope_bytes = None
+            scope_evidence_artifact_bytes = {}
+
     recovered_active_plan = (
         str(plan_path)
-        if terminal_integration_only or terminal_completion_only
+        if (
+            reconciled_scope
+            or terminal_integration_only
+            or terminal_completion_only
+        )
         else active_plan_path
     )
     if (
@@ -2291,6 +3822,8 @@ def _reconstruct_resume_context(
         interrupted_step_name=(
             None
             if reset_scope
+            else pending_cumulative_review.reviewer_step_name
+            if pending_cumulative_review is not None
             else effective_start_step
             if start_step_override
             else (
@@ -2303,6 +3836,7 @@ def _reconstruct_resume_context(
             )
         ),
         pending_finalized_turn=pending_finalized_turn,
+        pending_cumulative_review=pending_cumulative_review,
         frozen_run_identity=frozen_run_identity,
         live_config_path=(
             frozen_run_identity.live_config_path
@@ -2355,6 +3889,7 @@ def _reconstruct_resume_context(
         scope_envelope_bytes=scope_envelope_bytes,
         scope_envelope_source_path=scope_envelope_source_path,
         scope_evidence_artifact_bytes=scope_evidence_artifact_bytes,
+        resume_scope_reconciled=reconciled_scope,
         repartition_artifact_bytes=repartition_artifact_bytes,
         resume_relocation=relocation.provenance() if relocation is not None else None,
         resumed_from_team=resumed_from_team,
@@ -2444,6 +3979,12 @@ def _detect_resume_candidate(
         allow_max_turns_override=allow_max_turns_override,
         team_explicit=team_explicit,
         max_turns_explicit=max_turns_explicit,
+        run_dir=run_dir,
+        relocation=(
+            resume_bootstrap.relocation
+            if resume_bootstrap is not None
+            else None
+        ),
     )
     if reason is not None:
         if require_resume:

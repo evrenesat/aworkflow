@@ -423,6 +423,13 @@ overlay remains routable.
 Resume also normalizes legacy durable state that captured a completed
 checkpoint or checklist-style repair overlay after its original checkpoint
 advanced, closing that stale scope before the next worker starts.
+For a modern cumulative run whose terminal worker receipt is a strict
+transport failure, resume performs the same normalization only after matching
+the immutable scope envelope, before/after snapshots, final owned plan copy,
+and one-checkpoint progression. Ambiguous ownership, pending review or
+partition state, and changed or missing artifacts fail before a harness; the
+successor opens the next scope through the normal capture helper and preserves
+the predecessor run as immutable lineage.
 
 Manager transport may select an adapter-native final-response argv without
 changing ordinary workflow invocations. Progress analysis keeps whole-run

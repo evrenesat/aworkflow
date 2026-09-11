@@ -3803,7 +3803,22 @@ def _render_checkpoint_review_context(
     scope = state.active_implementation_scope
     target: _CheckpointReviewPromptTarget | None = None
     attempts: list[ImplementationAttempt] = []
-    if scope is not None and scope.awaiting_review:
+    if (
+        resume is not None
+        and resume.pending_cumulative_review is not None
+        and state.turns_completed == 0
+    ):
+        pending = resume.pending_cumulative_review
+        target = _review_target_from_snapshot(
+            pending.snapshot_before,
+            original_plan_path=original_plan_path,
+            worker_artifact_path=pending.worker_artifact_path,
+            source=(
+                "verified completed cumulative worker result "
+                "(full original-plan review)"
+            ),
+        )
+    elif scope is not None and scope.awaiting_review:
         attempts = state.implementation_attempts.get(scope.scope_id, [])
         worker_attempts = [item for item in attempts if item.role == "worker"]
         if worker_attempts:
@@ -3887,6 +3902,15 @@ def _render_checkpoint_review_context(
         f"- Original plan: {original_plan_path}",
         f"- Review evidence: {target.source}",
     ])
+    if (
+        resume is not None
+        and resume.pending_cumulative_review is not None
+        and state.turns_completed == 0
+    ):
+        lines.append(
+            "- Review coverage: complete original plan and all accumulated "
+            "implementation commits; checked boxes are not approval."
+        )
     if active_plan_path != original_plan_path:
         lines.append(f"- Active plan/overlay: {active_plan_path}")
     if target.worker_artifact_path is not None:
@@ -7427,6 +7451,13 @@ def run_workflow(
         # lineage available for a later target restart; the first brief still
         # remains self-contained and never carries provider-private context.
         preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.resume_scope_reconciled:
+        # The successor opens the next scope, but the verified predecessor
+        # remains immutable lineage and must not be pruned by keep_runs.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
+    if resume is not None and resume.pending_cumulative_review is not None:
+        # The cumulative worker result is the reviewer's immutable evidence.
+        preserved_resume_run_ids.add(resume.resumed_from_run_id)
     if terminal_completion_resume and resume is not None:
         preserved_resume_run_ids.update(terminal_delivery_lineage)
     if (
@@ -7439,6 +7470,7 @@ def run_workflow(
         source_run_dir = _resume_source_run_dir(config.repo_root, resume)
         if source_run_dir is not None:
             preserved_resume_run_ids.add(source_run_dir.name)
+    resume_lineage_preserved_run_ids = frozenset(preserved_resume_run_ids)
     run_paths = create_run_paths(
         replace(
             config,
@@ -7983,7 +8015,11 @@ def run_workflow(
         resume is not None and resume.terminal_integration_only
     )
     if done and not terminal_integration_only and not terminal_completion_resume and not (
-        resume is not None and resume.pending_finalized_turn is not None
+        resume is not None
+        and (
+            resume.pending_finalized_turn is not None
+            or resume.pending_cumulative_review is not None
+        )
     ):
         prior_original_plan_path = original_plan_path
         try:
@@ -10412,7 +10448,11 @@ def run_workflow(
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
             )
-            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            prune_old_runs(
+                run_paths.runs_root,
+                config.keep_runs,
+                preserved_run_ids=resume_lineage_preserved_run_ids,
+            )
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
@@ -10449,7 +10489,11 @@ def run_workflow(
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
         )
-        prune_old_runs(run_paths.runs_root, config.keep_runs)
+        prune_old_runs(
+            run_paths.runs_root,
+            config.keep_runs,
+            preserved_run_ids=resume_lineage_preserved_run_ids,
+        )
         banner.stop(state)
         _emit_event(
             observer,
@@ -10664,7 +10708,11 @@ def run_workflow(
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
             )
-            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            prune_old_runs(
+                run_paths.runs_root,
+                config.keep_runs,
+                preserved_run_ids=resume_lineage_preserved_run_ids,
+            )
             banner.stop(state)
             _emit_event(observer, RunCompletedEvent.create(
                 run_dir=run_paths.run_dir,
@@ -11067,7 +11115,11 @@ def run_workflow(
             _refresh_live_supervision_consumers()
             _write_override_boundary(status="running")
             if preserve_resume_override_source:
-                prune_old_runs(run_paths.runs_root, config.keep_runs)
+                prune_old_runs(
+                    run_paths.runs_root,
+                    config.keep_runs,
+                    preserved_run_ids=resume_lineage_preserved_run_ids,
+                )
             return current_step_name, baseline_team_name
         consumed_digest = (
             prior.digest
@@ -11187,7 +11239,11 @@ def run_workflow(
             )
             _write_override_boundary(status="waiting_for_valid_override")
             if preserve_resume_override_source:
-                prune_old_runs(run_paths.runs_root, config.keep_runs)
+                prune_old_runs(
+                    run_paths.runs_root,
+                    config.keep_runs,
+                    preserved_run_ids=resume_lineage_preserved_run_ids,
+                )
             banner.stop(state)
             raise WorkflowError(
                 state.status_message,
@@ -11312,7 +11368,11 @@ def run_workflow(
         state.override_source_run_dir = None
         _write_override_boundary(status="running")
         if preserve_resume_override_source:
-            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            prune_old_runs(
+                run_paths.runs_root,
+                config.keep_runs,
+                preserved_run_ids=resume_lineage_preserved_run_ids,
+            )
         return current_step_name, baseline_team_name
 
     # A resumed transaction is reconciled before the first harness. Accepted
@@ -11572,7 +11632,11 @@ def run_workflow(
                 active_plan_path=active_plan_path,
                 new_plan_path=new_plan_path,
             )
-            prune_old_runs(run_paths.runs_root, config.keep_runs)
+            prune_old_runs(
+                run_paths.runs_root,
+                config.keep_runs,
+                preserved_run_ids=resume_lineage_preserved_run_ids,
+            )
             banner.stop(state)
             raise WorkflowError(summary, run_dir=run_paths.run_dir)
 
@@ -11604,7 +11668,11 @@ def run_workflow(
             active_plan_path=active_plan_path,
             new_plan_path=new_plan_path,
         )
-        prune_old_runs(run_paths.runs_root, config.keep_runs)
+        prune_old_runs(
+            run_paths.runs_root,
+            config.keep_runs,
+            preserved_run_ids=resume_lineage_preserved_run_ids,
+        )
         banner.stop(state)
 
         _emit_event(observer, RunCompletedEvent.create(
@@ -13029,7 +13097,13 @@ def run_workflow(
                 scope_before_finalize is not None
                 and scope_before_finalize.awaiting_review
                 and step.role != "worker"
-                and not done
+                and (
+                    not done
+                    or (
+                        resume is not None
+                        and resume.pending_cumulative_review is not None
+                    )
+                )
                 and new_plan_exists
                 and snapshot_before == post_snapshot
                 and controller_next_step is not None
@@ -13424,6 +13498,10 @@ def run_workflow(
         recovery_summary=state.current_harness_recovery,
         recovery_history=tuple(state.harness_recovery_history),
     ))
-    prune_old_runs(run_paths.runs_root, config.keep_runs)
+    prune_old_runs(
+        run_paths.runs_root,
+        config.keep_runs,
+        preserved_run_ids=resume_lineage_preserved_run_ids,
+    )
     banner.stop(state)
     raise WorkflowError(summary, run_dir=run_paths.run_dir)

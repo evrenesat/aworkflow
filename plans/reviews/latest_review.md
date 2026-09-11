@@ -1,3 +1,43 @@
+# Cumulative resume scope review — 2026-09-11
+
+Branch: `aflow-cumulative-resume-scope-reconciliation-recovery-20-20260911-123621`.
+Original plan: `plans/in-progress/cumulative-resume-scope-reconciliation-recovery-20260911.md`.
+Active repair overlay reviewed: `cumulative-resume-scope-reconciliation-recovery-20260911-cp01-v01.md`.
+Unchanged Pre-Handoff Base HEAD: `441796fbe90e8e197b00f00ad891373df1aac344`.
+Reviewed HEAD: `1222829fe0e315cb23ee0ae71fc101d5962a6cf5`.
+Full cumulative coverage: **1 new / 3 total commits**, adopted `cp1 v01` (998c04bb, matching c8df060d), `cp2 v01` (e38017e0), and `cp1 v02` (1222829f). Reviewed both original checkpoints, the repair, and all changed production code, tests, and documentation from the original base.
+
+## Previous findings
+
+F1 (P2, high confidence), introduced by e38017e0: resolved in 1222829f. Worker receipt paths no longer enter the premature metadata identity loop. Strict relocation-aware worker-path validation remains intact. The registered linked-worktree regression reaches exactly one reviewer with zero initial worker calls and unchanged predecessor hashes; an unmapped overlay path is rejected. No unresolved prior findings remain.
+
+## Current findings
+
+None admitted under the material-code-review gate. The cumulative implementation binds one-checkpoint progression to captured evidence, preserves source lineage and scoped routing constraints, and admits verified completed work directly to full review. Review rejection retains the repair overlay flow. Existing JSONL framing and recovery API production files are unchanged by the handoff.
+
+## Verification evidence
+
+Independently passed on reviewed HEAD:
+
+```sh
+uv run pytest -q tests/test_resume_pending_review.py tests/test_resume_relocation.py tests/test_resume_scope_reconciliation.py --basetemp=/tmp/aflow-review-v02-tests
+# 50 passed
+uv run ruff check aflow
+# All checks passed
+git diff --check 441796fb HEAD
+# passed
+```
+
+Reused valid retained evidence from the prior cumulative review: daemon reviewer-step persistence/idempotency (1 passing node), REST/MCP parity (2 passing nodes), and the exact stale-CP2/final-worker-starts-CP3 approval probe. The follow-up only changes premature receipt path validation; the new linked-worktree positive/negative tests verify that correction. Retained CP1 proof covers resume-manager-budget/relocation (34), affected runtime (8), and manager-context (3) cases. Evidence resides under the private cumulative-scope-review-20260911 directory. Actual3492a076 eligibility diagnosis remains historical read-only evidence. CI owns full suites.
+
+## Disposition
+
+Approved for one accumulated squash onto the unchanged base. Consolidate the two handoff devlog entries, include this already-tracked reviewer record, remove the resolved fix overlay, and preserve all reviewed code/test blobs. The original ignored plan stays in place for engine finalization and records the final approved SHA after commit creation. No empty follow-up plan, private evidence, or ignored archive is added. Publication, CI, and live activation remain controller/coordinator delivery stages.
+
+No material findings
+
+---
+
 # Recovery browser portability — cumulative approval review
 
 Original and active plan: `plans/in-progress/recovery-browser-portable-artifacts-20260911.md`.

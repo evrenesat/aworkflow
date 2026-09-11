@@ -82,6 +82,27 @@ Process-creation races after a successful preflight still use the existing
 126/127 launch-error normalization. The guardian remains the fallback for
 legacy runs and failures outside the safe local preflight boundary.
 
+## Resuming Completed Cumulative Work Awaiting Review
+
+A run can have a complete original plan while still requiring its configured
+full reviewer. This is a pending-review boundary, not terminal success. Normal
+resume admission accepts this case only when the controller is failed and
+inactive, no review/publication/completion receipt exists, and durable worker
+evidence proves the configured worker-to-review transition. Admission binds the
+worker receipt to the captured original checkpoint, the current complete plan,
+the exact clean branch and `HEAD`, and the owned unit's nonce-bound exit receipt.
+Missing, changed, active, or ambiguously owned evidence remains rejected.
+
+The successor starts directly at the configured reviewer and carries the
+predecessor's worker result as immutable review evidence; it never re-runs that
+worker first. A reviewer approval continues through the ordinary terminal
+review and delivery path. A reviewer rejection keeps the normal focused
+follow-up-plan/worker overlay flow and preserves the predecessor run. Resume
+through CLI, daemon, REST, or MCP uses the same admission and idempotency
+boundary. For an actual run, inspect the saved run metadata, finalized worker
+receipt, scope envelope/evidence, manager boundary, unit start/exit receipts,
+and current Git identity read-only before requesting recovery.
+
 ## Manager Contexts and Evidence Budget
 
 Manager contexts are versioned. Selectors below 4 rebuild historical schema

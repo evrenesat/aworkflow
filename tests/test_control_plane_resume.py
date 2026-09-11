@@ -97,6 +97,29 @@ def _workflow_config() -> WorkflowUserConfig:
     )
 
 
+def _pending_review_workflow_config() -> WorkflowUserConfig:
+    workflow = WorkflowConfig(
+        steps={
+            "implement": WorkflowStepConfig(
+                role="worker",
+                prompts=("p",),
+                go=(GoTransition(to="review", when="DONE", preserve_active_plan=True),),
+            ),
+            "review": WorkflowStepConfig(
+                role="reviewer",
+                prompts=("p",),
+                go=(GoTransition(to="END", when="DONE"),),
+            ),
+        },
+        first_step="implement",
+    )
+    return WorkflowUserConfig(
+        roles={"worker": "codex.worker", "reviewer": "codex.worker"},
+        workflows={"managed": workflow},
+        prompts={"p": "Work."},
+    )
+
+
 def _daemon_for_config(
     tmp_path: Path,
     monkeypatch,
@@ -139,6 +162,80 @@ def _daemon_for_config(
         max_turns=None,
         team=None,
     )
+
+
+def test_daemon_resume_persists_reviewer_start_step_and_replays_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    units = InMemoryUnitManager()
+    workflow_config = _pending_review_workflow_config()
+    daemon, request = _daemon_for_config(tmp_path, monkeypatch, units, workflow_config)
+    source_id = "pending-review-source"
+    create_launch_manifest(
+        request.repo_root,
+        LaunchManifest(
+            run_id=source_id,
+            project_root=str(request.repo_root),
+            plan_path=str(request.plan_path),
+            workflow_name="managed",
+            max_turns=2,
+            idempotency_key="source-key",
+            caller_scope="project:one",
+        ),
+    )
+    source_dir = request.repo_root / ".aflow" / "runs" / source_id
+    source_dir.mkdir()
+    source_dir.joinpath("run.json").write_text(
+        '{"status":"failed","workflow_name":"managed","team":null,'
+        '"selected_start_step":null}'
+    )
+    write_launch_phase(request.repo_root, source_id, "unit_started")
+    before = source_dir.joinpath("run.json").read_bytes()
+    sentinel = object()
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **_kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=request.plan_path,
+            max_turns=2,
+            team=None,
+            start_step="review",
+            extra_instructions=(),
+            workflow_config=workflow_config,
+            resume_context=sentinel,
+        ),
+    )
+
+    continuation = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-pending-review",
+    )
+    replay = daemon.service.resume(
+        source_id,
+        caller_scope="project:one",
+        idempotency_key="resume-pending-review",
+    )
+
+    assert continuation.created is True
+    assert replay.created is False
+    assert replay.run_id == continuation.run_id
+    assert len(units.start_calls) == 1
+    record = daemon.service._read_record(continuation.run_id)
+    assert record["prepared"]["start_step"] == "review"
+    manifest = daemon.application.repository.get_launch_manifest(continuation.run_id)
+    assert manifest is not None
+    assert manifest.start_step == "review"
+    prepared, resume_context = _worker_prepared(
+        record,
+        manifest,
+        request.repo_root,
+        request.config_path,
+        workflow_config,
+    )
+    assert prepared.start_step == "review"
+    assert resume_context is sentinel
+    assert source_dir.joinpath("run.json").read_bytes() == before
 
 
 @pytest.mark.parametrize("source_phase", ("unit_started", "launch_started"))

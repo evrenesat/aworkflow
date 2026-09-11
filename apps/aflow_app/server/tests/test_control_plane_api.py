@@ -1061,6 +1061,51 @@ def test_control_events_context_controls_owner_stop_and_resume(control_client) -
     assert stopped.json()["launch_phase"] == "owner_stopped"
 
 
+def test_rest_resume_persists_reviewer_start_step_and_replays_once(control_client) -> None:
+    client, root, units, monkeypatch = control_client
+    pending = _start_pending(client, monkeypatch)
+    started = _answer_pending(client, pending, monkeypatch)
+    run_id = started["result"]["run_id"]
+    units.stop(f"aflow-run-{run_id}.service")
+    source_path = root / ".aflow" / "runs" / run_id / "run.json"
+    source_path.write_text(
+        '{"status":"running","workflow_name":"managed","team":null,'
+        '"selected_start_step":"implement","max_turns":3,'
+        '"extra_instructions":[]}'
+    )
+    before = source_path.read_bytes()
+    monkeypatch.setattr(
+        "aflow.cli._bootstrap_resume_invocation",
+        lambda **_kwargs: SimpleNamespace(
+            workflow_name="managed",
+            plan_path=root / "plans" / "todo" / "test-plan.md",
+            max_turns=3,
+            team=None,
+            start_step="review_implementation",
+            extra_instructions=(),
+            resume_context=object(),
+        ),
+    )
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/resume"
+    first = client.post(endpoint, headers={"Idempotency-Key": "resume-review"})
+    replay = client.post(endpoint, headers={"Idempotency-Key": "resume-review"})
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 200
+    successor_id = first.json()["run_id"]
+    assert replay.json()["run_id"] == successor_id
+    assert len(units.start_calls) == 2
+    record = json.loads(
+        (root / ".aflow" / "start-requests" / f"{successor_id}.json").read_text()
+    )
+    assert record["prepared"]["start_step"] == "review_implementation"
+    manifest = json.loads(
+        (root / ".aflow" / "launches" / f"{successor_id}.json").read_text()
+    )
+    assert manifest["start_step"] == "review_implementation"
+    assert source_path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     (

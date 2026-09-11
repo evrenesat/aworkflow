@@ -748,6 +748,18 @@ class RecoverySessionContext:
 
 
 @dataclass(frozen=True)
+class PendingCumulativeReview:
+    """Verified completed worker evidence awaiting the configured full review."""
+
+    source_run_dir: Path
+    worker_turn_number: int
+    worker_step_name: str
+    reviewer_step_name: str
+    snapshot_before: PlanSnapshot
+    worker_artifact_path: str
+
+
+@dataclass(frozen=True)
 class ResumeContext:
     resumed_from_run_id: str
     feature_branch: str | None
@@ -773,6 +785,7 @@ class ResumeContext:
     scope_pressure_reason: str | None = None
     last_manager_report_path: str | None = None
     pending_finalized_turn: PendingFinalizedTurn | None = None
+    pending_cumulative_review: PendingCumulativeReview | None = None
     frozen_run_identity: FrozenRunIdentity | None = None
     live_config_path: str | None = None
     team_explicit: bool | None = None
@@ -810,6 +823,9 @@ class ResumeContext:
     # run's repository-relative path. Bind the exact bytes before a new run
     # may prune that source, then restore them beneath the continuation.
     scope_evidence_artifact_bytes: Mapping[str, bytes] = field(default_factory=dict)
+    # The predecessor contains verified progression evidence and must remain
+    # available as immutable lineage while the successor opens the next scope.
+    resume_scope_reconciled: bool = False
     # Pending repartition artifacts are copied before create_run_paths may
     # prune the source run (notably with keep_runs = 1).
     repartition_artifact_bytes: Mapping[str, bytes] = field(default_factory=dict)

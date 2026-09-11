@@ -44,6 +44,24 @@
   `/root/code/evidence/aflow-dogfood-20260909/jsonl-boundary-review-20260911/`.
 - Verification: 22 focused session tests, Ruff, and `git diff --check` passed.
 
+## 2026-09-11 — Reconcile cumulative resume scope and pending full review
+
+- Resume now recognizes only a strict terminal worker transport failure that
+  advances exactly one checkpoint: the immutable scope envelope, worker
+  receipt, before/after snapshots, and owned plan copy must all agree.
+- The successor closes only one-hop scope/routing state, preserves budgets and
+  history, opens the exact next worker scope through normal capture, and keeps
+  the predecessor run from `keep_runs` pruning. Pending review, partition,
+  active-owner, malformed, and changed-artifact cases fail closed.
+- Completed cumulative work can resume directly to its configured full reviewer
+  after strict worker, plan, clean branch/HEAD, and inactive-unit validation.
+  Rejection preserves the focused repair flow; relocation maps immutable worker
+  receipt paths before validating them. Source receipts remain unchanged.
+- Verification: 50 focused pending-review, relocation, and scope regressions,
+  Ruff, and whitespace checks passed. Retained manager/runtime/context and
+  daemon/REST/MCP idempotency proof remains applicable. Guard-report eligibility
+  was inspected read-only; actual recovery belongs to the coordinator.
+
 ## 2026-09-11 — Explain plan backup provenance (issue34)
 
 - Preserve existing backup bytes/names and byte-identical deduplication while
