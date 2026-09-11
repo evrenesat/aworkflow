@@ -379,3 +379,57 @@ the unchanged base and clean tracked state. Publication, exact-SHA CI and live
 activation remain controller/coordinator steps, not claimed by this approval.
 
 No material findings
+
+
+---
+
+# Run-summary phone wrapping — cumulative approval, 2026-09-11
+
+Original/active plan: `plans/in-progress/run-summary-phone-wrapping-20260911.md`.
+Branch: `aflow-run-summary-phone-wrapping-20260911-20260911-174613`.
+Unchanged Pre-Handoff Base HEAD: `72c84f9d900f6003347e21374158bd82426b55fc`.
+Reviewed HEAD: `57c2326e1113d2fae55e138b0f1034f0171d561a`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the complete original checkpoint
+and all three changed files. No previous findings or fix overlays for this handoff.
+
+No material findings under the admission gate, exclusions and proportionate-fix
+discipline. The only production change adds overflow-wrap:anywhere to direct
+run-detail dashboard-section paragraphs. The accepted Latest progress markup
+matches this boundary, including decision/current turn/finalized summary prose.
+There is no clipping, text mutation, font reduction or API/state change. Native
+inputs, explicit raw report scrolling, visual progress and follow-up/stop/recovery
+behavior retain their existing owners and markup.
+
+Verification reuses valid completed worker evidence from
+`/root/code/agent_flow/.aflow/runs/20260911t174612z-ce0f5a0a/turns/turn-001/transport.stdout`
+and its successful result.json; the supplied worktree-relative artifact is absent.
+The final source matches the tested diff. Inspected the complete browser journey,
+fixture isolation, retained six final geometry JSON files and command exit codes.
+
+- `npm --prefix apps/aflow_app/web run build`: exit 0.
+- `AFLOW_TEST_BROWSER=chromium AFLOW_BROWSER_ARTIFACT_DIR=/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/chromium-final-artifacts uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_run_progress_browser.py::test_run_summary_wraps_without_document_overflow --basetemp=/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/chromium-final-basetemp`: 3 passed, 7.75s, exit 0.
+- Same exact node with WebKit and corresponding `webkit-final-artifacts` / `webkit-final-basetemp`: 3 passed, 8.72s, exit 0.
+- Required params: phone-320 (320x568), phone-390 (390x844), desktop (1280x720).
+- Controlled document widths: Chromium 1521→320, 1521→390, 2005→1280;
+  WebKit 1730→320, 1730→390, 2244→1280. Body widths match viewport;
+  paragraph scroll/client widths match at 246, 316 and 934px respectively.
+- Exact synthetic token preservation and actionable run menu open/Escape close
+  are asserted. Private source text and host paths are absent from portable tests.
+- Independent `git diff --check 72c84f9d HEAD` and clean initial tracked state passed.
+  No full suites repeated; CI owns them.
+
+The preliminary active fixture exposed an unchanged WebKit 320px diagnostics
+hint at right=344.421875 while summary scroll/client widths already matched at
+246px. The final completed-run fixture isolates the requested finalized-summary
+case. That pre-existing hint is outside this fix; approval does not claim every
+active-run phone state is free of overflow or physical-device acceptance.
+
+Approve one unpublished final handoff commit, including this tracked reviewer
+record. Preserve all three reviewed implementation blobs and the single DEVLOG
+entry. No fix plan is needed or created. Leave the ignored original plan in place
+for engine finalization; record final approved SHA there after committing.
+Verify exactly one commit after the unchanged base and no dirty tracked edits.
+Publication, exact-SHA CI and live activation remain controller/coordinator
+steps and are not claimed by this local review.
+
+No material findings

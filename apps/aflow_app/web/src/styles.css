@@ -481,6 +481,10 @@ input::placeholder, textarea::placeholder {
   gap: var(--spacing-md);
 }
 
+.run-detail .dashboard-section > p {
+  overflow-wrap: anywhere;
+}
+
 .run-list-item {
   padding: var(--spacing-sm);
   border-radius: var(--radius-md);

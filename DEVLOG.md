@@ -1,5 +1,18 @@
 # DEVLOG
 
+## 2026-09-11 — Wrap finalized run-summary prose on narrow screens
+
+- Added the focused boundary `.run-detail .dashboard-section > p { overflow-wrap: anywhere; }`. This keeps the complete finalized summary visible without changing stored evidence, native input scrolling, or the explicitly scrollable raw report.
+- Added `test_run_summary_wraps_without_document_overflow`, which uses a disposable completed run and a synthetic unbroken commit token in the actual Run details shell. It checks the exact token, the existing run-actions menu, and document/body geometry at 320×568, 390×844, and 1280×720. Controlled no-wrap/fixed results were Chromium 1521→320, 1521→390, 2005→1280px and WebKit 1730→320, 1730→390, 2244→1280px; the summary paragraph scroll/client widths matched at 246, 316, and 934px after wrapping.
+- Verification passed with `npm --prefix apps/aflow_app/web run build`, then:
+
+  ```text
+  AFLOW_TEST_BROWSER=chromium AFLOW_BROWSER_ARTIFACT_DIR=/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/chromium-final-artifacts uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_run_progress_browser.py::test_run_summary_wraps_without_document_overflow --basetemp=/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/chromium-final-basetemp
+  AFLOW_TEST_BROWSER=webkit AFLOW_BROWSER_ARTIFACT_DIR=/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/webkit-final-artifacts uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_run_progress_browser.py::test_run_summary_wraps_without_document_overflow --basetemp=/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/webkit-final-basetemp
+  ```
+
+  Both browser invocations passed 3 cases. Evidence is retained under `/root/code/evidence/aflow-dogfood-20260909/run-summary-wrapping-review-20260911/`.
+
 ## 2026-09-11 — Gate immediate stop on selected-run control admission
 
 - The focused immediate-stop test now holds the admitted capabilities response,
