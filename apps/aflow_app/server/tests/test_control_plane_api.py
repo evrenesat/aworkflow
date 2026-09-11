@@ -436,6 +436,19 @@ def _commit_fixture_repository(root: Path) -> None:
     )
 
 
+def _register_peer_project(
+    registry: ProjectRegistry,
+    managed_root: Path,
+    project_id: str = "peer-project",
+) -> Path:
+    """Create one disposable Git root and add only its exact registry record."""
+    root = managed_root / project_id
+    root.mkdir()
+    subprocess.run(("git", "init", "-q", str(root)), check=True, capture_output=True)
+    registry.register(project_id, "Peer project", project_id)
+    return root
+
+
 def _issue35_original_plan(*, current: int = 4) -> str:
     sections: list[str] = []
     for index in range(1, 15):
@@ -1560,6 +1573,251 @@ def test_control_plane_rejects_unknown_projects_and_plan_traversal(control_clien
     )
     assert rejected.status_code == 422
     assert rejected.json() == {"detail": {"code": "operation_rejected"}}
+
+
+def test_two_registered_projects_keep_exact_plan_and_launch_boundaries(
+    control_client, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Identical documents remain isolated while release identity stays shared."""
+    from aflow_app_server import main
+
+    client, root, units, _ = control_client
+    registry = main._project_registry
+    original_service = main._control_plane_service
+    assert registry is not None
+    assert original_service is not None
+    peer_root = _register_peer_project(registry, root.parent)
+    peer_id = "peer-project"
+    plan_name = "same-boundary.md"
+    markers = {
+        PROJECT_ID: "PROJECT_A_ONLY",
+        peer_id: "PROJECT_B_ONLY",
+    }
+
+    # Both projects intentionally use the same plan basename.  The authoring
+    # API must keep content and revisions scoped to the exact registry ID.
+    created: dict[str, dict[str, object]] = {}
+    for project_id, marker in markers.items():
+        response = client.post(
+            f"/api/projects/{project_id}/plans",
+            json={
+                "name": plan_name,
+                "content": f"# {project_id}\n\n{marker}\n",
+            },
+        )
+        assert response.status_code == 201, response.text
+        created[project_id] = response.json()
+        assert created[project_id]["project_id"] == project_id
+
+    for project_id, marker in markers.items():
+        read = client.get(
+            f"/api/projects/{project_id}/plans/todo/{plan_name}"
+        )
+        assert read.status_code == 200, read.text
+        assert marker in read.json()["content"]
+        listed = client.get(f"/api/control-plane/projects/{project_id}/plans")
+        assert listed.status_code == 200
+        assert any(
+            item["path"] == f"plans/todo/{plan_name}"
+            for item in listed.json()["plans"]
+        )
+
+    updated_a = client.put(
+        f"/api/projects/{PROJECT_ID}/plans/todo/{plan_name}",
+        json={
+            "content": f"# {PROJECT_ID}\n\n{markers[PROJECT_ID]}\nA_UPDATED\n",
+            "expected_revision": created[PROJECT_ID]["revision"],
+        },
+    )
+    assert updated_a.status_code == 200, updated_a.text
+    assert "A_UPDATED" in updated_a.json()["content"]
+    peer_read = client.get(f"/api/projects/{peer_id}/plans/todo/{plan_name}")
+    assert peer_read.status_code == 200
+    assert peer_read.json()["content"] == (
+        f"# {peer_id}\n\n{markers[peer_id]}\n"
+    )
+
+    promoted: dict[str, dict[str, object]] = {}
+    for project_id, revision in (
+        (PROJECT_ID, updated_a.json()["revision"]),
+        (peer_id, created[peer_id]["revision"]),
+    ):
+        response = client.post(
+            f"/api/projects/{project_id}/plans/todo/{plan_name}/promote",
+            json={"expected_revision": revision},
+        )
+        assert response.status_code == 200, response.text
+        promoted[project_id] = response.json()
+        assert promoted[project_id]["path"] == f"plans/in-progress/{plan_name}"
+
+    # A project-scoped launch cannot name an absolute path from its peer, and
+    # invalid registry operations must not mutate the persistent allowlist.
+    foreign_plan = peer_root / "plans" / "in-progress" / plan_name
+    rejected_foreign = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        json={"plan_path": str(foreign_plan), "workflow_name": "managed"},
+    )
+    assert rejected_foreign.status_code == 422
+    assert rejected_foreign.json() == {"detail": {"code": "operation_rejected"}}
+    registry_bytes = registry.path.read_bytes()
+    rejected_root = client.post(
+        "/api/projects",
+        json={
+            "mode": "register",
+            "path": "../outside-project",
+            "display_name": "Outside",
+        },
+    )
+    assert rejected_root.status_code == 422
+    assert rejected_root.json() == {"detail": {"code": "operation_rejected"}}
+    assert registry.path.read_bytes() == registry_bytes
+    assert client.get("/api/projects/not-registered/plans").status_code == 404
+    assert client.get(
+        "/api/control-plane/projects/not-registered/runs"
+    ).status_code == 404
+
+    # Replace the fixture service only inside this test so the selected
+    # environment contains a synthetic secret.  The service still validates
+    # one shared executable, environment file, release identity, and global
+    # workflow pair for both dynamically composed project daemons.
+    secret = "issue6-synthetic-secret"
+    control_service = ControlPlaneService(
+        registry,
+        aflow_executable=root / "release" / "bin" / "aflow",
+        environment_file=root / "aflowd.env",
+        release_identity="issue6-release",
+        environment={"AFLOW_TEST_SECRET": secret},
+        daemon_factory=lambda config: AflowDaemon(config, units=units),
+        workflow_config_path=root.parent / "global" / "aflow.toml",
+    )
+    control_service.start()
+    monkeypatch.setattr(main, "_control_plane_service", control_service)
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+
+    captured_starts: dict[str, dict[str, object]] = {}
+    original_start = units.start
+
+    def capture_start(
+        name: str,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment_file: Path | None = None,
+        environment: dict[str, str] | None = None,
+    ):
+        captured_starts[name] = {
+            "cwd": cwd,
+            "environment_file": environment_file,
+            "environment": dict(environment or {}),
+        }
+        return original_start(
+            name,
+            argv,
+            cwd=cwd,
+            environment_file=environment_file,
+            environment=environment,
+        )
+
+    monkeypatch.setattr(units, "start", capture_start)
+    run_ids: dict[str, str] = {}
+    public_payloads: list[str] = []
+    for project_id, project_root in (
+        (PROJECT_ID, root),
+        (peer_id, peer_root),
+    ):
+        response = client.post(
+            f"/api/control-plane/projects/{project_id}/runs",
+            headers={"Idempotency-Key": f"issue6-{project_id}"},
+            json={
+                "plan_path": promoted[project_id]["path"],
+                "workflow_name": "managed",
+            },
+        )
+        assert response.status_code == 201, response.text
+        public_payloads.append(response.text)
+        run_id = response.json()["result"]["run_id"]
+        run_ids[project_id] = run_id
+
+        manifest_path = project_root / ".aflow" / "launches" / f"{run_id}.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["project_root"] == str(project_root.resolve())
+        assert manifest["plan_path"] == str(
+            (project_root / "plans" / "in-progress" / plan_name).resolve()
+        )
+        assert "executable" not in manifest
+        assert "environment" not in manifest
+        assert "environment_file" not in manifest
+
+        start_record = json.loads(
+            (
+                project_root
+                / ".aflow"
+                / "start-requests"
+                / f"{run_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert start_record["selected_executable"] == str(
+            (root / "release" / "bin" / "aflow").resolve()
+        )
+        assert start_record["selected_release_identity"] == "issue6-release"
+        assert start_record["selected_environment_file"]["path"] == str(
+            (root / "aflowd.env").resolve()
+        )
+        assert captured_starts[f"aflow-run-{run_id}.service"] == {
+            "cwd": project_root.resolve(),
+            "environment_file": (root / "aflowd.env").resolve(),
+            "environment": {"AFLOW_TEST_SECRET": secret},
+        }
+
+        events = client.get(
+            f"/api/control-plane/projects/{project_id}/runs/{run_id}/events?limit=100"
+        )
+        assert events.status_code == 200
+        public_payloads.append(events.text)
+        attempt = next(
+            event for event in events.json()["events"]
+            if event["event_type"] == "daemon_start_attempt"
+        )
+        assert attempt["data"]["cwd"] == str(project_root.resolve())
+        assert attempt["data"]["executable"] == str(
+            (root / "release" / "bin" / "aflow").resolve()
+        )
+        assert attempt["data"]["release_identity"] == "issue6-release"
+
+    assert len(captured_starts) == 2
+    assert {call[2] for call in units.start_calls} == {
+        root.resolve(),
+        peer_root.resolve(),
+    }
+    assert {
+        control_service._project(PROJECT_ID).config_path,
+        control_service._project(peer_id).config_path,
+    } == {(root.parent / "global" / "aflow.toml").resolve()}
+    reloaded_registry = ProjectRegistry(root.parent, registry.path)
+    assert {record.id for record in reloaded_registry.list_records()} == {
+        PROJECT_ID,
+        peer_id,
+    }
+
+    # StartRunPayload is closed: a client cannot select a different release,
+    # environment file, or arbitrary environment mapping for either project.
+    override = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "issue6-client-override"},
+        json={
+            "plan_path": promoted[PROJECT_ID]["path"],
+            "workflow_name": "managed",
+            "aflow_executable": "/tmp/attacker-aflow",
+            "environment_file": "/tmp/attacker.env",
+            "environment": {"AFLOW_TEST_SECRET": "client-secret"},
+        },
+    )
+    assert override.status_code == 422
+    assert len(captured_starts) == 2
+    public_payloads.append(override.text)
+    assert secret not in "\n".join(public_payloads)
+    assert "client-secret" not in "\n".join(public_payloads)
+    assert secret not in caplog.text
 
 
 def test_project_config_read_validate_save_and_stale_revision(control_client, tmp_path: Path) -> None:

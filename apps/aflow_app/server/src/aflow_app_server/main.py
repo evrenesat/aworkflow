@@ -17,6 +17,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -687,6 +688,17 @@ app.router.routes.append(_MCPMount("/mcp", app=mcp_http_app, name="mcp"))
 def _error_response(status_code: int, code: str, **extra: Any) -> JSONResponse:
     """Return a compact public error envelope with no exception text."""
     return JSONResponse(status_code=status_code, content={"detail": {"code": code, **extra}})
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    _: Request, __: RequestValidationError
+) -> JSONResponse:
+    """Reject malformed transport payloads without echoing submitted values."""
+    return _error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "operation_rejected",
+    )
 
 
 @app.exception_handler(DaemonStartupError)

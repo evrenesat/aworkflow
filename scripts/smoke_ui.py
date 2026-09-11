@@ -15,8 +15,8 @@ Modes
     HTTP check goes to the host's primary non-loopback address, so a
     Secure-cookie regression over plain HTTP fails loudly.  ``--login-only``
     performs the minimal HTTP login/cookie check; the default also registers
-    a project, runs a deterministic fake workflow to completion, restarts the
-    UI, and verifies the finished run is still visible.  ``--browser`` drives
+    two projects, runs deterministic fake workflows, restarts the UI, and
+    verifies both project-scoped histories remain visible.  ``--browser`` drives
     the flow through Playwright Chromium instead of raw HTTP.
 
 The script owns only its temporary homes, tools, processes, and files, never
@@ -26,19 +26,21 @@ touches live user configuration, and exits nonzero on any failure.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 import zipfile
+import uuid
 
 
 def log(message: str) -> None:
@@ -147,6 +149,7 @@ def http_request(
     cookie: str | None = None,
     payload: dict | None = None,
     origin: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     headers: dict[str, str] = {}
     if origin:
@@ -155,6 +158,8 @@ def http_request(
         headers["Authorization"] = f"Bearer {token}"
     if cookie:
         headers["Cookie"] = cookie
+    if extra_headers:
+        headers.update(extra_headers)
     data = json.dumps(payload).encode() if payload is not None else None
     if data is not None:
         headers["Content-Type"] = "application/json"
@@ -164,6 +169,134 @@ def http_request(
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
+
+
+@dataclass(frozen=True)
+class OwnedRun:
+    """A workflow run launched and therefore owned by this smoke invocation."""
+
+    project_id: str
+    run_id: str
+    unit_nonce: str | None = None
+
+
+class SmokeCleanupError(RuntimeError):
+    """One or more invocation-owned smoke resources could not be released."""
+
+
+class _SmokeUIUnavailable(RuntimeError):
+    """The temporary UI cannot service an owner-stop request."""
+
+
+_TERMINAL_RUN_STATUSES = frozenset(
+    {"completed", "done", "failed", "interrupted", "owner_stopped"}
+)
+_UI_UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
+_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+
+
+_INSTALLED_UNIT_CLEANUP = """\
+from pathlib import Path
+import sys
+
+from aflow.control_plane.persistent_units import PersistentUnitManager, _receipts_for
+
+
+project_root = Path(sys.argv[1]).resolve()
+run_id = sys.argv[2]
+expected_nonce = sys.argv[3]
+executable = Path(sys.argv[4])
+projects_root = Path(sys.argv[5]).resolve()
+unit_name = f"aflow-run-{run_id}.service"
+expected_directory = project_root / ".aflow" / "runs" / run_id / "units"
+receipts = _receipts_for(unit_name, project_root)
+if (
+    receipts is None
+    or receipts.directory != expected_directory
+    or receipts.nonce != expected_nonce
+):
+    raise SystemExit("owned persistent unit receipt does not match this smoke invocation")
+
+manager = PersistentUnitManager(
+    executable=executable,
+    projects_root=projects_root,
+)
+manager.register_project_root(project_root)
+state = manager.stop(unit_name)
+if state is None:
+    raise SystemExit("owned persistent unit disappeared during cleanup")
+if state.is_active:
+    raise SystemExit("owned persistent unit remained active after cleanup")
+"""
+
+
+MCP_PROTOCOL_VERSION = "2025-11-25"
+
+
+def mcp_request(
+    base_url: str,
+    token: str,
+    method: str,
+    params: dict | None = None,
+) -> dict:
+    """Call the stateless authenticated MCP transport over the UI port."""
+    status, _, body = http_request(
+        f"{base_url}/mcp",
+        method="POST",
+        token=token,
+        origin=base_url,
+        payload={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or {},
+        },
+        extra_headers={
+            "Accept": "application/json",
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        },
+    )
+    if status != 200:
+        fail(f"MCP {method} failed with status {status}: {body[:300]}")
+    try:
+        response = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"MCP {method} returned invalid JSON: {exc}")
+    if "error" in response:
+        fail(f"MCP {method} returned an error: {response['error']}")
+    return response["result"]
+
+
+def mcp_tool(
+    base_url: str,
+    token: str,
+    name: str,
+    arguments: dict | None = None,
+) -> object:
+    result = mcp_request(
+        base_url,
+        token,
+        "tools/call",
+        {"name": name, "arguments": arguments or {}},
+    )
+    if result.get("isError") is True:
+        content = result.get("content", [])
+        detail = (
+            content[0].get("text", "MCP tool error")
+            if content
+            else "MCP tool error"
+        )
+        fail(f"MCP tool {name} failed: {detail}")
+    structured = result.get("structuredContent")
+    if structured is not None:
+        return structured
+    content = result.get("content", [])
+    if not content or not isinstance(content[0].get("text"), str):
+        fail(f"MCP tool {name} returned no structured result")
+    try:
+        return json.loads(content[0]["text"])
+    except json.JSONDecodeError as exc:
+        fail(f"MCP tool {name} returned invalid JSON text: {exc}")
 
 
 class InstalledWheel:
@@ -178,6 +311,9 @@ class InstalledWheel:
         self.port = free_port()
         self.host = primary_non_loopback_address()
         self.process: subprocess.Popen | None = None
+        self._owned_runs: dict[tuple[str, str], OwnedRun] = {}
+        self._cleanup_session: str | None = None
+        self._cleanup_invocation_token = uuid.uuid4().hex
 
     _NODE_TOOLS = frozenset({"node", "npm", "npx", "nodejs", "corepack"})
 
@@ -290,14 +426,238 @@ class InstalledWheel:
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    def remember_session(self, session: str) -> None:
+        """Retain the latest session for cleanup after a UI restart."""
+        self._cleanup_session = session
+
+    def _project_root(self, project_id: str) -> Path:
+        if (
+            not isinstance(project_id, str)
+            or not project_id
+            or Path(project_id).name != project_id
+        ):
+            raise SmokeCleanupError(
+                f"cannot prove the smoke project identity for {project_id!r}"
+            )
+        projects_root = (self.home / "code").resolve()
+        project_root = (projects_root / project_id).resolve()
+        if project_root.parent != projects_root or not project_root.is_dir():
+            raise SmokeCleanupError(
+                f"cannot prove the smoke project root for {project_id!r}"
+            )
+        return project_root
+
+    def _unit_nonce(self, project_id: str, run_id: str) -> str | None:
+        if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+            return None
+        project_root = self._project_root(project_id)
+        receipt_dir = project_root / ".aflow" / "runs" / run_id / "units"
+        receipt_path = receipt_dir / "start.json"
+        if any(
+            path.is_symlink()
+            for path in (
+                project_root,
+                project_root / ".aflow",
+                project_root / ".aflow" / "runs",
+                project_root / ".aflow" / "runs" / run_id,
+                receipt_dir,
+                receipt_path,
+            )
+        ):
+            return None
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if (
+            type(payload.get("schema")) is not int
+            or payload.get("schema") != 1
+            or payload.get("run_id") != run_id
+            or payload.get("unit") != f"aflow-run-{run_id}.service"
+        ):
+            return None
+        nonce = payload.get("nonce")
+        return nonce if isinstance(nonce, str) and nonce else None
+
+    def remember_owned_run(self, project_id: str, run_id: str) -> None:
+        """Record a successful launch before any later smoke assertion runs."""
+        if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+            raise SmokeCleanupError(f"the server returned an unsafe run ID: {run_id!r}")
+        self._owned_runs[(project_id, run_id)] = OwnedRun(
+            project_id=project_id,
+            run_id=run_id,
+            unit_nonce=self._unit_nonce(project_id, run_id),
+        )
+
+    def _owner_stop_request(
+        self,
+        owned: OwnedRun,
+        session: str,
+        request,
+    ) -> None:
+        run_url = (
+            f"{self.base_url()}/api/control-plane/projects/"
+            f"{owned.project_id}/runs/{owned.run_id}"
+        )
+        try:
+            status, _, body = request(run_url, cookie=session)
+        except OSError as exc:
+            raise _SmokeUIUnavailable(str(exc)) from exc
+        if status in _UI_UNAVAILABLE_STATUSES:
+            raise _SmokeUIUnavailable(f"run status returned HTTP {status}")
+        if status != 200:
+            raise SmokeCleanupError(
+                f"could not inspect owned run {owned.project_id}/{owned.run_id}: "
+                f"HTTP {status} {body[:300]}"
+            )
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SmokeCleanupError(
+                f"owned run {owned.project_id}/{owned.run_id} returned invalid JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise SmokeCleanupError(
+                f"owned run {owned.project_id}/{owned.run_id} returned a non-object"
+            )
+        run_status = payload.get("status")
+        if run_status in _TERMINAL_RUN_STATUSES and payload.get("activity") != "active":
+            return
+        revision = payload.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise SmokeCleanupError(
+                f"owned run {owned.project_id}/{owned.run_id} has no valid revision"
+            )
+        cleanup_key = (
+            f"smoke-cleanup-{self._cleanup_invocation_token}-"
+            f"{owned.project_id}-{owned.run_id}-{uuid.uuid4().hex}"
+        )
+        try:
+            status, _, body = request(
+                f"{run_url}/owner-stop",
+                method="POST",
+                cookie=session,
+                payload={"expected_revision": revision},
+                origin=self.base_url(),
+                extra_headers={"Idempotency-Key": cleanup_key},
+            )
+        except OSError as exc:
+            raise _SmokeUIUnavailable(str(exc)) from exc
+        if status in _UI_UNAVAILABLE_STATUSES:
+            raise _SmokeUIUnavailable(f"owner-stop returned HTTP {status}")
+        if status != 200:
+            raise SmokeCleanupError(
+                f"could not stop owned run {owned.project_id}/{owned.run_id}: "
+                f"HTTP {status} {body[:300]}"
+            )
+        try:
+            stopped = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SmokeCleanupError(
+                f"owner-stop for {owned.project_id}/{owned.run_id} returned invalid JSON"
+            ) from exc
+        if not isinstance(stopped, dict) or stopped.get("status") != "owner_stopped":
+            raise SmokeCleanupError(
+                f"owner-stop for {owned.project_id}/{owned.run_id} did not record cleanup"
+            )
+
+    def _installed_python(self) -> Path:
+        """Find the interpreter belonging to this installed wheel tool."""
+        entrypoint = self.executable.resolve()
+        try:
+            first_line = entrypoint.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError) as exc:
+            raise SmokeCleanupError(
+                f"cannot inspect the installed aflow entry point: {entrypoint}"
+            ) from exc
+        if first_line.startswith("#!"):
+            interpreter = Path(first_line[2:].strip().split()[0])
+            if interpreter.is_file():
+                return interpreter
+        for candidate in (
+            entrypoint.parent / "python",
+            entrypoint.parent / "python3",
+        ):
+            if candidate.is_file():
+                return candidate
+        raise SmokeCleanupError(
+            f"cannot find the installed wheel interpreter for {entrypoint}"
+        )
+
+    def _fallback_stop_owned_run(self, owned: OwnedRun) -> None:
+        """Stop one exact unit through the installed runtime if UI is down."""
+        nonce = owned.unit_nonce or self._unit_nonce(owned.project_id, owned.run_id)
+        if nonce is None:
+            raise SmokeCleanupError(
+                f"cannot prove invocation ownership for {owned.project_id}/{owned.run_id}"
+            )
+        project_root = self._project_root(owned.project_id)
+        projects_root = (self.home / "code").resolve()
+        environment = self._env(node_free=False)
+        # Never let the source runner's import path cause fallback cleanup to
+        # load the checkout instead of the installed wheel under test.
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONHOME", None)
+        try:
+            completed = subprocess.run(
+                [
+                    str(self._installed_python()),
+                    "-c",
+                    _INSTALLED_UNIT_CLEANUP,
+                    str(project_root),
+                    owned.run_id,
+                    nonce,
+                    str(self.executable),
+                    str(projects_root),
+                ],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SmokeCleanupError(
+                f"installed-runtime cleanup failed for {owned.project_id}/{owned.run_id}: {exc}"
+            ) from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise SmokeCleanupError(
+                f"installed-runtime cleanup failed for {owned.project_id}/{owned.run_id}: {detail}"
+            )
+
+    def cleanup_owned_runs(self, *, request=http_request) -> None:
+        """Release every run launched by this invocation, including failures."""
+        failures: list[str] = []
+        for key, owned in tuple(self._owned_runs.items()):
+            try:
+                if self._cleanup_session is None:
+                    raise _SmokeUIUnavailable("no live UI session is available")
+                try:
+                    self._owner_stop_request(owned, self._cleanup_session, request)
+                except _SmokeUIUnavailable:
+                    self._fallback_stop_owned_run(owned)
+            except Exception as exc:
+                failures.append(f"{owned.project_id}/{owned.run_id}: {exc}")
+                log(f"cleanup warning for {owned.project_id}/{owned.run_id}: {exc}")
+            else:
+                del self._owned_runs[key]
+        if failures:
+            raise SmokeCleanupError("; ".join(failures))
+
 
 FAKE_HARNESS = """\
 #!/usr/bin/env python3
-import os, shutil, sys
+import os, shutil, sys, time
 from pathlib import Path
 
-plan = Path(os.environ["AFLOW_TEST_PLAN_PATH"])
+plan = Path.cwd() / os.environ["AFLOW_TEST_PLAN_RELATIVE"]
 scenario = os.environ.get("AFLOW_TEST_SCENARIO", "noop")
+if Path.cwd().name == os.environ.get("AFLOW_TEST_HOLD_PROJECT"):
+    scenario = "hold"
 count_file = Path(os.environ["AFLOW_TEST_COUNT_FILE"])
 count = int(count_file.read_text()) + 1 if count_file.exists() else 1
 count_file.write_text(str(count))
@@ -305,6 +665,8 @@ print(f"codex turn {count}")
 if scenario == "complete":
     shutil.copyfile(os.environ["AFLOW_TEST_COMPLETED_PLAN"], plan)
     sys.exit(0)
+if scenario == "hold":
+    time.sleep(300)
 sys.exit(0)
 """
 
@@ -322,9 +684,8 @@ def install_fake_harness(installed: InstalledWheel) -> None:
         env_path = installed._env()
         env_path["PATH"] = f"{bin_dir}:{env_path['PATH']}"
         env_path["AFLOW_TEST_SCENARIO"] = "complete"
-        env_path["AFLOW_TEST_PLAN_PATH"] = str(
-            installed.home / "code" / "smoke" / "plans" / "todo" / "smoke-plan.md"
-        )
+        env_path["AFLOW_TEST_HOLD_PROJECT"] = "smoke-b"
+        env_path["AFLOW_TEST_PLAN_RELATIVE"] = "plans/in-progress/smoke-plan.md"
         env_path["AFLOW_TEST_COUNT_FILE"] = str(installed.home / "turn-count")
         env_path["AFLOW_TEST_COMPLETED_PLAN"] = str(
             installed.home / "completed-plan.md"
@@ -333,6 +694,9 @@ def install_fake_harness(installed: InstalledWheel) -> None:
             "# Plan\n\n### [x] Checkpoint 1: First\n- [x] step one\n",
             encoding="utf-8",
         )
+        # The second project remains active so a UI stop/start can prove that
+        # persistent worker units are independent of the server process.
+        env_path["AFLOW_TEST_SCENARIO"] = "complete"
         completed = subprocess.run(
             [
                 str(installed.executable), "ui", "--daemon",
@@ -399,80 +763,280 @@ def http_login_and_settings(base_url: str, token: str) -> str:
     return session
 
 
-def full_run_flow(installed: InstalledWheel, session: str) -> None:
-    """Register a project, run the fake workflow, restart, re-verify."""
+def _commit_project(installed: InstalledWheel, project_id: str, message: str) -> None:
+    project_root = installed.home / "code" / project_id
+    environment = installed._env(node_free=False)
+    subprocess.run(
+        ["git", "-C", str(project_root), "add", "-A"],
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project_root),
+            "-c",
+            "user.name=smoke",
+            "-c",
+            "user.email=smoke@example.com",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+
+
+def _mcp_project_history(
+    base_url: str,
+    token: str,
+    project_id: str,
+    run_id: str,
+    plan_name: str,
+) -> None:
+    plans = mcp_tool(base_url, token, "list_plans", {"project_id": project_id})
+    if not isinstance(plans, dict) or not any(
+        plan.get("path") in {
+            f"plans/in-progress/{plan_name}",
+            f"plans/done/{plan_name}",
+        }
+        for plan in plans.get("plans", [])
+        if isinstance(plan, dict)
+    ):
+        fail(f"MCP plan history for {project_id} is not project-scoped")
+    runs = mcp_tool(base_url, token, "list_runs", {"project_id": project_id})
+    if not isinstance(runs, dict) or run_id not in {
+        run.get("run_id")
+        for run in runs.get("runs", [])
+        if isinstance(run, dict)
+    }:
+        fail(f"MCP run history for {project_id} lost {run_id}")
+    detail = mcp_tool(
+        base_url,
+        token,
+        "get_run",
+        {"project_id": project_id, "run_id": run_id},
+    )
+    if not isinstance(detail, dict) or detail.get("run_id") != run_id:
+        fail(f"MCP get_run returned the wrong project history for {project_id}")
+    if not str(detail.get("plan_path", "")).endswith(f"/{plan_name}"):
+        fail(f"MCP get_run returned the wrong plan for {project_id}")
+
+
+def full_run_flow(
+    installed: InstalledWheel, session: str
+) -> tuple[list[str], dict[str, str]]:
+    """Exercise two project roots, MCP, a restart, and independent workers."""
     base_url = installed.base_url()
-    status, _, body = http_request(
-        f"{base_url}/api/projects", method="POST", cookie=session,
-        payload={"mode": "create", "path": "smoke", "main_branch": "main"},
-        origin=base_url,
+    plan_name = "smoke-plan.md"
+    project_specs = (
+        ("smoke-a", "Smoke A", "SMOKE_A_ONLY"),
+        ("smoke-b", "Smoke B", "SMOKE_B_ONLY"),
     )
-    if status != 201:
-        fail(f"project creation failed with status {status}: {body[:300]}")
-    plan_content = "# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n"
-    status, _, body = http_request(
-        f"{base_url}/api/projects/smoke/plans", method="POST", cookie=session,
-        payload={"name": "smoke-plan.md", "content": plan_content},
-        origin=base_url,
+
+    for project_id, display_name, marker in project_specs:
+        status, _, body = http_request(
+            f"{base_url}/api/projects",
+            method="POST",
+            cookie=session,
+            payload={
+                "mode": "create",
+                "path": project_id,
+                "display_name": display_name,
+                "main_branch": "main",
+            },
+            origin=base_url,
+        )
+        if status != 201:
+            fail(f"{project_id} creation failed with status {status}: {body[:300]}")
+        created_project = json.loads(body)
+        if created_project.get("id") != project_id:
+            fail(f"project creation returned the wrong identity: {body[:300]}")
+
+        plan_content = (
+            f"# {display_name}\n\n"
+            "### [ ] Checkpoint 1: First\n"
+            f"- [ ] {marker}\n"
+        )
+        status, _, body = http_request(
+            f"{base_url}/api/projects/{project_id}/plans",
+            method="POST",
+            cookie=session,
+            payload={"name": plan_name, "content": plan_content},
+            origin=base_url,
+        )
+        if status != 201:
+            fail(f"{project_id} plan creation failed with status {status}: {body[:300]}")
+        created_plan = json.loads(body)
+        _commit_project(installed, project_id, f"{project_id} draft")
+
+        status, _, body = http_request(
+            f"{base_url}/api/projects/{project_id}/plans/todo/{plan_name}/promote",
+            method="POST",
+            cookie=session,
+            payload={"expected_revision": created_plan["revision"]},
+            origin=base_url,
+        )
+        if status != 200:
+            fail(f"{project_id} plan promotion failed with status {status}: {body[:300]}")
+        promoted = json.loads(body)
+        if promoted.get("path") != f"plans/in-progress/{plan_name}":
+            fail(f"{project_id} promotion returned the wrong path: {body[:300]}")
+        _commit_project(installed, project_id, f"{project_id} promote")
+
+    initialization = mcp_request(
+        base_url,
+        installed.token,
+        "initialize",
+        {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "aflow-issue-6-smoke", "version": "1"},
+        },
     )
-    if status != 201:
-        fail(f"plan creation failed with status {status}: {body[:300]}")
-    # Commit the plan so the worktree is clean and no startup question is
-    # raised for dirtiness.
-    subprocess.run(
-        ["git", "-C", str(installed.home / "code" / "smoke"),
-         "add", "-A"], check=True, capture_output=True,
-        env={**os.environ, "HOME": str(installed.home)},
-    )
-    subprocess.run(
-        ["git", "-C", str(installed.home / "code" / "smoke"),
-         "commit", "-q", "-m", "smoke plan"], check=True, capture_output=True,
-        env={**os.environ, "HOME": str(installed.home)},
-    )
-    status, _, body = http_request(
-        f"{base_url}/api/control-plane/projects/smoke/runs",
-        method="POST", cookie=session,
-        payload={"plan_path": "plans/todo/smoke-plan.md"},
-        origin=base_url,
-    )
-    payload = json.loads(body)
-    if "result" not in payload:
-        fail(f"run start returned a startup question or error: {body[:300]}")
-    if status not in (200, 201, 202):
-        fail(f"run start failed with status {status}: {body[:300]}")
-    run_id = payload["result"]["run_id"]
-    log(f"started smoke run {run_id}")
+    if initialization.get("protocolVersion") != MCP_PROTOCOL_VERSION:
+        fail("MCP negotiated an unexpected protocol version")
+    tools = mcp_request(base_url, installed.token, "tools/list")
+    tool_names = {tool.get("name") for tool in tools.get("tools", [])}
+    if not {"list_projects", "list_plans", "list_runs", "read_plan", "get_run"}.issubset(tool_names):
+        fail("the installed MCP registry is missing multi-project tools")
+    projects = mcp_tool(base_url, installed.token, "list_projects")
+    if not isinstance(projects, dict) or {
+        item.get("project_id") for item in projects.get("projects", [])
+        if isinstance(item, dict)
+    } != {
+        project_id for project_id, _, _ in project_specs
+    }:
+        fail(f"MCP project listing is not the exact registry: {projects}")
+    for project_id, _, _ in project_specs:
+        document = mcp_tool(
+            base_url,
+            installed.token,
+            "read_plan",
+            {
+                "project_id": project_id,
+                "plan_status": "in_progress",
+                "name": plan_name,
+            },
+        )
+        if not isinstance(document, dict) or document.get("project_id") != project_id:
+            fail(f"MCP read_plan returned the wrong project for {project_id}")
+
+    run_ids: dict[str, str] = {}
+    for project_id, _, _ in project_specs:
+        status, _, body = http_request(
+            f"{base_url}/api/control-plane/projects/{project_id}/runs",
+            method="POST",
+            cookie=session,
+            payload={"plan_path": f"plans/in-progress/{plan_name}"},
+            origin=base_url,
+            extra_headers={"Idempotency-Key": f"smoke-{project_id}"},
+        )
+        if status not in (200, 201, 202):
+            fail(f"{project_id} run start failed with status {status}: {body[:300]}")
+        payload = json.loads(body)
+        if "result" not in payload:
+            fail(f"{project_id} run start returned a startup question: {body[:300]}")
+        run_ids[project_id] = payload["result"]["run_id"]
+        installed.remember_owned_run(project_id, run_ids[project_id])
+        log(f"started {project_id} smoke run {run_ids[project_id]}")
+
+    def read_run(project_id: str, run_id: str, cookie: str) -> dict:
+        status, _, body = http_request(
+            f"{base_url}/api/control-plane/projects/{project_id}/runs/{run_id}",
+            cookie=cookie,
+        )
+        if status != 200:
+            fail(f"{project_id} run {run_id} read failed with status {status}")
+        try:
+            return json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            fail(f"{project_id} run {run_id} returned invalid JSON: {exc}")
 
     deadline = time.monotonic() + 120
-    final_status = ""
+    final_a: dict = {}
     while time.monotonic() < deadline:
-        status, _, body = http_request(
-            f"{base_url}/api/control-plane/projects/smoke/runs/{run_id}",
-            cookie=session,
-        )
-        if status == 200:
-            final_status = json.loads(body).get("status", "")
-            if final_status in {"completed", "done", "failed", "needs_attention"}:
-                break
+        final_a = read_run("smoke-a", run_ids["smoke-a"], session)
+        if final_a.get("status") in {"completed", "done", "failed", "needs_attention"}:
+            break
         time.sleep(1.0)
-    if final_status not in {"completed", "done"}:
-        fail(f"the smoke run ended as '{final_status}' instead of completing")
+    if final_a.get("status") not in {"completed", "done"}:
+        fail(f"smoke-a ended as '{final_a.get('status', '')}' instead of completing")
 
-    # Restart the UI; the finished run and its current-source provenance remain
-    # inspectable.
+    deadline = time.monotonic() + 30
+    active_b: dict = {}
+    while time.monotonic() < deadline:
+        active_b = read_run("smoke-b", run_ids["smoke-b"], session)
+        if active_b.get("status") == "running" and active_b.get("activity") == "active":
+            break
+        time.sleep(0.5)
+    if active_b.get("status") != "running" or active_b.get("activity") != "active":
+        fail(f"smoke-b did not prove an active independent worker: {active_b}")
+
+    for project_id, _, _ in project_specs:
+        _mcp_project_history(
+            base_url,
+            installed.token,
+            project_id,
+            run_ids[project_id],
+            plan_name,
+        )
+
+    # Stop only the UI server.  The held smoke-b worker must remain active and
+    # discoverable after the new UI process starts.
     installed.stop()
     installed.start()
     wait_for_health(base_url)
     session2 = http_login_and_settings(base_url, installed.token)
-    status, _, body = http_request(
-        f"{base_url}/api/control-plane/projects/smoke/runs/{run_id}",
-        cookie=session2,
-    )
+    installed.remember_session(session2)
+    status, _, body = http_request(f"{base_url}/api/projects", cookie=session2)
     if status != 200:
-        fail("the completed run disappeared after a UI restart")
-    if json.loads(body).get("status") not in {"completed", "done"}:
-        fail("the completed run lost its terminal status after restart")
-    run_json = installed.home / "code" / "smoke" / ".aflow" / "runs" / run_id / "run.json"
+        fail("the registered project list disappeared after a UI restart")
+    project_payloads = json.loads(body)
+    if {
+        (item.get("id"), item.get("display_name")) for item in project_payloads
+    } != {(project_id, display_name) for project_id, display_name, _ in project_specs}:
+        fail(f"the project registry changed after restart: {body[:500]}")
+
+    restarted_a = read_run("smoke-a", run_ids["smoke-a"], session2)
+    if restarted_a.get("status") not in {"completed", "done"}:
+        fail("the completed project-a run lost its terminal status after restart")
+    restarted_b = read_run("smoke-b", run_ids["smoke-b"], session2)
+    if restarted_b.get("status") != "running" or restarted_b.get("activity") != "active":
+        fail("the project-b worker was stopped or lost during UI restart")
+
+    for project_id, _, _ in project_specs:
+        status, _, body = http_request(
+            f"{base_url}/api/control-plane/projects/{project_id}/runs",
+            cookie=session2,
+        )
+        if status != 200:
+            fail(f"REST history for {project_id} disappeared after restart")
+        history = json.loads(body)
+        if run_ids[project_id] not in {run.get("run_id") for run in history.get("runs", [])}:
+            fail(f"REST history for {project_id} lost its run after restart")
+        _mcp_project_history(
+            base_url,
+            installed.token,
+            project_id,
+            run_ids[project_id],
+            plan_name,
+        )
+
+    run_json = (
+        installed.home
+        / "code"
+        / "smoke-a"
+        / ".aflow"
+        / "runs"
+        / run_ids["smoke-a"]
+        / "run.json"
+    )
     try:
         run_payload = json.loads(run_json.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -480,7 +1044,9 @@ def full_run_flow(installed: InstalledWheel, session: str) -> None:
     expected_live_config = (installed.home / ".config" / "aflow" / "aflow.toml").resolve()
     if run_payload.get("live_config_path") != str(expected_live_config):
         fail("the completed run did not retain the smoke configuration source")
-    log("full run flow survived a UI restart with current-source provenance intact")
+
+    log("two project histories, MCP parity, and an independent worker survived a UI restart")
+    return [display_name for _, display_name, _ in project_specs], run_ids
 
 
 PLAYWRIGHT_DRIVER = """
@@ -489,6 +1055,8 @@ from playwright.sync_api import sync_playwright
 
 base_url, token = sys.argv[1], sys.argv[2]
 login_only = sys.argv[3] == "login-only"
+project_names = json.loads(sys.argv[4])
+run_ids = json.loads(sys.argv[5])
 result = {"steps": []}
 with sync_playwright() as p:
     browser = p.chromium.launch()
@@ -511,6 +1079,15 @@ with sync_playwright() as p:
         page.reload(wait_until="domcontentloaded")
         page.wait_for_selector("text=aflow", timeout=20000)
         result["steps"].append("reload")
+        page.goto(base_url + "/?view=projects", wait_until="domcontentloaded")
+        page.get_by_role("heading", name="Projects", exact=True).wait_for(timeout=20000)
+        for project_name in project_names:
+            page.get_by_title(project_name, exact=True).wait_for(timeout=20000)
+        page.goto(base_url + "/?view=all-runs", wait_until="domcontentloaded")
+        page.get_by_role("heading", name="All runs", exact=True).wait_for(timeout=20000)
+        for run_id in run_ids:
+            page.get_by_text(f"Run: {run_id}", exact=False).first.wait_for(timeout=20000)
+        result["steps"].append("two-project-history")
         page.click("text=Logout")
         time.sleep(1)
         page.wait_for_selector('input[type="password"]', timeout=20000)
@@ -521,7 +1098,12 @@ print("PLAYWRIGHT_OK " + json.dumps(result))
 
 
 def browser_flow(
-    installed: InstalledWheel, *, login_only: bool, playwright_python: str | None
+    installed: InstalledWheel,
+    *,
+    login_only: bool,
+    playwright_python: str | None,
+    project_names: list[str] | None = None,
+    run_ids: list[str] | None = None,
 ) -> None:
     if playwright_python is None:
         fail("--browser requires --playwright-python pointing at an interpreter with playwright installed")
@@ -531,6 +1113,7 @@ def browser_flow(
         [
             playwright_python, str(driver), installed.base_url(),
             installed.token, "login-only" if login_only else "full",
+            json.dumps(project_names or []), json.dumps(run_ids or []),
         ],
         capture_output=True, text=True, timeout=180,
     )
@@ -538,6 +1121,21 @@ def browser_flow(
     if completed.returncode != 0 or "PLAYWRIGHT_OK" not in output:
         fail(f"browser flow failed:\n{output}\n{completed.stderr}")
     log("browser flow OK: " + output.split("PLAYWRIGHT_OK", 1)[1].strip())
+
+
+def finalize_invocation(installed: InstalledWheel) -> None:
+    """Clean owned workers before stopping the disposable UI process."""
+    failures: list[str] = []
+    try:
+        installed.cleanup_owned_runs()
+    except Exception as exc:
+        failures.append(f"worker cleanup: {exc}")
+    try:
+        installed.stop()
+    except Exception as exc:
+        failures.append(f"UI cleanup: {exc}")
+    if failures:
+        raise SmokeCleanupError("; ".join(failures))
 
 
 def main() -> int:
@@ -572,17 +1170,31 @@ def main() -> int:
         log(f"UI bound 0.0.0.0:{installed.port}; checking via non-loopback {base_url}")
         wait_for_health(base_url)
         session = http_login_and_settings(base_url, installed.token)
+        installed.remember_session(session)
+        project_names: list[str] = []
+        run_ids: dict[str, str] = {}
         if not args.login_only:
-            full_run_flow(installed, session)
+            project_names, run_ids = full_run_flow(installed, session)
         if args.browser:
-            browser_flow(installed, login_only=args.login_only,
-                         playwright_python=args.playwright_python)
-        installed.stop()
+            browser_flow(
+                installed,
+                login_only=args.login_only,
+                playwright_python=args.playwright_python,
+                project_names=project_names,
+                run_ids=list(run_ids.values()),
+            )
         log("SMOKE PASSED")
         passed = True
         return 0
     finally:
-        installed.stop()
+        try:
+            finalize_invocation(installed)
+        except Exception as exc:
+            if passed:
+                passed = False
+                log(f"failure evidence preserved at {home}")
+                raise
+            log(f"cleanup warning (original failure preserved): {exc}")
         if passed:
             shutil.rmtree(home, ignore_errors=True)
             shutil.rmtree(workdir, ignore_errors=True)

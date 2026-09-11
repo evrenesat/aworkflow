@@ -1,3 +1,38 @@
+# Issue 6 — Cumulative review approved
+
+Review base: `7dbb8eb07db5b7bf49ab8706974ee41e6d77226a` (unchanged Pre-Handoff Base HEAD).
+Reviewed implementation HEAD: `dc86dd7f451a980c62482bf5cb83a2fa3df8f1fa`.
+Coverage: 1 new / 2 total commits, `cp1 v01` and `cp1 v02`, including all seven changed files and the original checkpoint requirements. The active overlay was `issue-6-modern-multiproject-acceptance-20260909-cp01-v01.md`.
+
+## Previous finding disposition
+
+R1 (P2, high confidence), first reported against `b8a406ecd6df0b9ab6ca86ec02d9f29584856e05`, is resolved by `dc86dd7f451a980c62482bf5cb83a2fa3df8f1fa`. Successful launches immediately retain exact project/run identities. Guaranteed teardown cleans owned runs before UI shutdown; API owner-stop uses a fresh revision and invocation key. UI-unavailable cleanup uses the private installed interpreter and existing persistent-unit manager, validating exact receipt identity and nonce. Original failures and private HOME evidence survive teardown.
+
+## Cumulative assessment
+
+No material findings. Reviewed authoring and launch isolation, registry admission, shared current configuration and server-selected runtime identity, redacted malformed-request responses, REST/MCP histories, disposable installed-wheel restart/Chromium coverage, and successful/failed resource cleanup. Existing project-root resolution and per-project repositories remain authoritative. No production lifecycle, startup readiness, live loading, replacement/scope recovery, or stop-after-turn implementation changed. Documentation explicitly maps retired inventory/standalone/frozen-configuration requirements as superseded.
+
+## Verification evidence
+
+Retained evidence was inspected rather than repeating unchanged tests or installed journeys. Source: `/root/code/agent_flow/.aflow/runs/20260911t153328z-8a877c7e/turns/turn-001/transport.stdout` and `turn-003/transport.stdout`, with completed worker result records.
+
+- Original focused REST two-project launch/redaction, MCP two-project history, MCP schema/auth parity, REST unknown/traversal rejection, and five registry rejection cases passed. Build and Ruff passed.
+- `uv run pytest -q tests/test_smoke_ui.py --basetemp=/root/code/evidence/aflow-dogfood-20260909/issue6-review-20260911/cleanup-regression`: 3 passed against final worker changes. `uv run ruff check scripts/smoke_ui.py tests/test_smoke_ui.py`: passed.
+- Installed journey: `TMPDIR=/root/code/evidence/aflow-dogfood-20260909/issue6-review-20260911 uv run python scripts/smoke_ui.py --wheel dist/aworkflow-0.1.12-py3-none-any.whl --browser --playwright-python apps/aflow_app/server/.venv/bin/python`: exit 0; REST/MCP history, held worker survival across UI restart, Chromium login/reload/two-project-history/logout, and teardown passed.
+- Retained wheel SHA-256 prefix: `d0a305249e8f32bb`. Independently compared packaged server main and persistent-unit cleanup source bytes with reviewed checkout: identical.
+- Temporary evidence-root drivers `smoke-failure-driver.py` and `smoke-fallback-failure-driver.py` each exited 1 with the injected assertion preserved. Their JSON records identify exact private HOME and runs; worker process checks found no surviving owned processes. Independent review verified nonce-matched exit/stopped receipts for both runs in each probe.
+- Independent cumulative `git diff --check 7dbb8eb0 HEAD`: passed. Full suites remain CI-owned; no shared tool retarget or live UI restart was performed.
+
+## Approval and delivery boundary
+
+Approve the full cumulative handoff and squash both implementation commits plus this tracked reviewer record into one unpublished final commit after the unchanged base. Preserve implementation blobs and the single existing handoff DEVLOG entry. Remove the resolved private fix overlay; leave the original plan in place and record the final approved SHA there, outside the commit. Finalization verifies exactly one handoff commit and clean tracked state. No ignored plans or evidence are force-added.
+
+Publication, exact-SHA CI, and live activation remain the controller/coordinator's normal serialized delivery steps; this review does not claim them complete.
+
+---
+
+# Accepted main review history retained during integration
+
 # Stop after current turn — cumulative review v04
 
 Approved. No material findings under the material-code-review admission gate,

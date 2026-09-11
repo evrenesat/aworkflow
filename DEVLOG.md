@@ -19,6 +19,38 @@
   Install/refresh checks preserve edited skill trees. Focused tests and visual
   checks passed; full suites and activation remain delivery-gate responsibilities.
 
+## 2026-09-11 — Verify the modern multi-project UI boundary (Issue 6, Checkpoint 1)
+
+- Added focused REST and MCP coverage for two independently registered Git
+  roots using the same plan basename. Reads, edits, promotions, launches, and
+  histories stay bound to the requested project; unknown IDs, traversal,
+  foreign roots, and unsafe registration paths are rejected without registry
+  mutation.
+- Verified the existing shared global workflow pair and server-selected
+  executable, environment file, and release identity at each project's
+  immutable launch/start boundary. Client executable, environment-file, and
+  arbitrary-environment overrides are absent from the transport schema;
+  malformed transport errors now use the compact redacted envelope so
+  rejected payload values are not echoed.
+- Extended the existing disposable installed-wheel smoke to create and
+  promote the same plan in two projects, exercise REST and MCP, keep one fake
+  worker active across a UI restart, owner-stop it for cleanup, and verify both
+  histories with Chromium. No live UI, provider, editable install, or
+  production deployment was used.
+- The old root-owned `projects.toml`, standalone service, and mandatory frozen
+  per-run configuration requirements remain superseded; current execution
+  uses the shared live global pair and keeps any launch snapshot diagnostic.
+- Smoke teardown now retains each invocation-owned run as soon as it launches,
+  owner-stops active runs before stopping the disposable UI, and falls back to
+  the installed runtime's exact receipt/nonce-validated persistent-unit stop
+  when the temporary UI is unavailable. Failed journeys retain their HOME
+  evidence, including partial-launch cleanup.
+- Verification passed: the focused REST/MCP/registry nodes, Ruff,
+  `uv build`, `git diff --check`, and the installed-wheel smoke with
+  `--browser --playwright-python apps/aflow_app/server/.venv/bin/python`.
+  Pytest basetemps and smoke temporary HOME were supplied by the invocation's
+  private evidence root.
+
 ## 2026-09-11 — Separate pending user acceptance from checkpoint gates (Issue 39)
 
 - Bundled `aflow-plan` guidance now keeps executable checkpoint task lists to

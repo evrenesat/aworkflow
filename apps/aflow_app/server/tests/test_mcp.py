@@ -24,6 +24,7 @@ from test_control_plane_api import (
     _commit_fixture_repository,
     _prepared,
     _recovery_payload,
+    _register_peer_project,
     _unresolved_recovery_runtime,
     _seed_recovery_source,
     _seed_issue35_progress_fixture,
@@ -212,6 +213,11 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     assert "does" in tool_by_name["control_run"]["description"]
     assert "interrupt" in tool_by_name["control_run"]["description"]
     assert "Immediately" in tool_by_name["owner_stop"]["description"]
+    assert {
+        "aflow_executable",
+        "environment_file",
+        "environment",
+    }.isdisjoint(tool_by_name["start_run"]["inputSchema"]["properties"])
 
     resources = _mcp_request(client, "resources/templates/list")["result"]["resourceTemplates"]
     assert {resource["uriTemplate"] for resource in resources} == {
@@ -1052,6 +1058,127 @@ def test_mcp_authored_journey_reaches_existing_launch_service(mcp_client) -> Non
     )
     assert run["plan_path"] == str(root / promoted["path"])
     assert run["team"] == team
+
+
+def test_mcp_two_projects_keep_identical_plan_names_and_run_histories(
+    mcp_client,
+) -> None:
+    """MCP authoring and lifecycle calls retain the exact project scope."""
+    client, root, units, monkeypatch = mcp_client
+    from aflow_app_server import main
+
+    registry = main._project_registry
+    assert registry is not None
+    peer_root = _register_peer_project(registry, root.parent)
+    peer_id = "peer-project"
+    plan_name = "same-mcp-boundary.md"
+    markers = {
+        PROJECT_ID: "MCP_PROJECT_A_ONLY",
+        peer_id: "MCP_PROJECT_B_ONLY",
+    }
+
+    promoted: dict[str, dict[str, object]] = {}
+    for project_id, marker in markers.items():
+        created = _mcp_tool(
+            client,
+            "create_plan",
+            {
+                "project_id": project_id,
+                "name": plan_name,
+                "content": f"# {project_id}\n\n{marker}\n",
+            },
+        )
+        assert created["project_id"] == project_id
+        assert _mcp_tool(
+            client,
+            "read_plan",
+            {"project_id": project_id, "plan_status": "todo", "name": plan_name},
+        )["content"] == f"# {project_id}\n\n{marker}\n"
+        promoted[project_id] = _mcp_tool(
+            client,
+            "promote_plan",
+            {
+                "project_id": project_id,
+                "plan_status": "todo",
+                "name": plan_name,
+                "expected_revision": created["revision"],
+            },
+        )
+        assert promoted[project_id]["path"] == f"plans/in-progress/{plan_name}"
+
+    changed_a = _mcp_tool(
+        client,
+        "update_plan",
+        {
+            "project_id": PROJECT_ID,
+            "plan_status": "in_progress",
+            "name": plan_name,
+            "content": f"# {PROJECT_ID}\n\n{markers[PROJECT_ID]}\nA_UPDATED\n",
+            "expected_revision": promoted[PROJECT_ID]["revision"],
+        },
+    )
+    assert "A_UPDATED" in changed_a["content"]
+    assert _mcp_tool(
+        client,
+        "read_plan",
+        {"project_id": peer_id, "plan_status": "in_progress", "name": plan_name},
+    )["content"] == f"# {peer_id}\n\n{markers[peer_id]}\n"
+    assert _mcp_tool_error(
+        client,
+        "list_plans",
+        {"project_id": "not-registered"},
+    ) == "project_not_found"
+
+    assert _mcp_tool(client, "list_projects") == client.get(
+        "/api/control-plane/projects"
+    ).json()
+    for project_id in markers:
+        plans = _mcp_tool(client, "list_plans", {"project_id": project_id})
+        assert any(
+            plan["path"] == f"plans/in-progress/{plan_name}"
+            for plan in plans["plans"]
+        )
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", _prepared)
+    started_a = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": promoted[PROJECT_ID]["path"],
+            "workflow_name": "managed",
+            "idempotency_key": "mcp-project-a-boundary",
+        },
+    )
+    assert started_a["result"]["status"] == "running"
+
+    started_b = client.post(
+        f"/api/control-plane/projects/{peer_id}/runs",
+        headers={"Idempotency-Key": "rest-project-b-boundary"},
+        json={
+            "plan_path": promoted[peer_id]["path"],
+            "workflow_name": "managed",
+        },
+    )
+    assert started_b.status_code == 201, started_b.text
+    run_ids = {
+        PROJECT_ID: started_a["result"]["run_id"],
+        peer_id: started_b.json()["result"]["run_id"],
+    }
+    assert len(units.start_calls) == 2
+    assert {call[2] for call in units.start_calls} == {
+        root.resolve(),
+        peer_root.resolve(),
+    }
+    for project_id, run_id in run_ids.items():
+        history = _mcp_tool(client, "list_runs", {"project_id": project_id})
+        assert run_id in {run["run_id"] for run in history["runs"]}
+        detail = _mcp_tool(
+            client,
+            "get_run",
+            {"project_id": project_id, "run_id": run_id},
+        )
+        assert detail["plan_path"].endswith(f"/{plan_name}")
 
 
 def test_mcp_plan_authoring_matches_rest_and_preserves_stale_bytes(mcp_client) -> None:

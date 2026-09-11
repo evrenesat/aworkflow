@@ -213,8 +213,9 @@ aflow ui --host 127.0.0.1 --port 8765   # per-process overrides
 ```
 
 Workflows started from the UI keep running when the UI stops or restarts and
-reattach when it returns. Each run freezes a copy of the workflow
-configuration at launch, so later configuration edits affect only new runs.
+reattach when it returns. Each run may retain a launch-time configuration
+snapshot as diagnostic provenance; execution uses the current global pair at
+reservation, startup, resume, and safe turn boundaries.
 Normal installations ship the UI inside the `aworkflow` wheel and never need
 Node; editable development installs build the web assets automatically.
 The release Changelog is generated deterministically from the root `DEVLOG.md`
@@ -291,7 +292,8 @@ promote it, then use `list_plan_documents` and `list_plans` before calling
 `start_run`. If a browser or another MCP client changes a document first,
 reread it and retry with the returned revision; the server never silently
 retries stale writes. Global settings affect all registered projects at their
-next safe boundary or resume, while each run keeps its own launch snapshot.
+next safe boundary or resume. A run's launch snapshot is diagnostic
+provenance, not an execution configuration gate.
 Project registration and skill installation remain separate existing browser
 actions; they are not implied MCP authoring operations.
 
@@ -301,6 +303,31 @@ Tailscale Serve settings; MCP does not open another port. There is no
 standalone `aflow daemon` command, stdio transport, or `aflowd` executable.
 The retained systemd `aflowd.service` deployment runs `aflow-app-server` and
 keeps its existing service/state paths.
+
+## Modern multi-project boundary
+
+The current UI service implements multi-project operation through one
+versioned registry beneath the configured managed root. Registry records store
+normalized relative paths and are admitted only when the exact path is a
+non-symlink Git root. REST, MCP, plan authoring, and lifecycle calls resolve
+the requested project ID through that registry for every operation; identical
+plan names and run-history names therefore remain distinct by project root.
+
+All registered projects intentionally share one validated global
+`aflow.toml`/`workflows.toml` pair and one server-selected executable,
+environment file, and release identity. The immutable launch manifest records
+the exact project and plan identity. The daemon-owned start record and launch
+event record the selected runtime identity, while transport payloads do not
+accept executable, environment-file, or arbitrary-environment overrides.
+
+Checkpoint 1 verifies the two-project REST/MCP boundary, negative unknown,
+traversal, foreign-root, and unsafe-registration cases, release identity
+propagation, secret-free rejection responses, and the installed-wheel restart
+journey with Chromium. The old root-owned `projects.toml`, standalone service,
+and mandatory frozen per-run configuration requirements are superseded by this
+registry/service/live-global-settings design; they are not restored here.
+Production deployment, rollback, real provider execution, and migration of a
+retired service remain separately coordinated concerns.
 
 A minimal plan has checkpoint headings and task items:
 
