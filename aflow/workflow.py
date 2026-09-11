@@ -3965,7 +3965,10 @@ def _sync_startup_plan_metadata_for_execution(
     try:
         if exec_ctx is not None:
             metadata_before_branch_sync = parse_git_tracking_metadata(updated)
-            if metadata_before_branch_sync is not None:
+            if (
+                metadata_before_branch_sync is not None
+                and metadata_before_branch_sync.plan_branch == ""
+            ):
                 updated = rewrite_git_tracking_field(
                     updated,
                     "Plan Branch",
@@ -4862,6 +4865,68 @@ def _workflow_requires_git_tracking(
     return False
 
 
+def _resolve_startup_git_tracking_targets(
+    *,
+    repo_root: Path,
+    wf: WorkflowConfig,
+    repo_state: RepoState,
+    needs_bootstrap: bool,
+    planned_execution_branch: str | None,
+) -> tuple[str | None, str, bool]:
+    """Resolve the support identity available at the current startup boundary.
+
+    Lifecycle workflows receive the branch selected by lifecycle preflight.  A
+    workflow without lifecycle setup stays in the current checkout and uses
+    its actual symbolic branch.  Empty repositories may defer only the base
+    commit until lifecycle bootstrap has produced and verified one.
+    """
+    if wf.setup:
+        plan_branch = planned_execution_branch
+    else:
+        rc, plan_branch, err = _run_git(
+            ["symbolic-ref", "--short", "HEAD"],
+            cwd=repo_root,
+        )
+        if rc != 0 or not plan_branch:
+            detail = f": {err}" if err else ""
+            raise WorkflowError(
+                "cannot resolve the current symbolic branch for Git Tracking" + detail
+            )
+
+    if plan_branch is not None and (
+        not plan_branch
+        or "`" in plan_branch
+        or "\r" in plan_branch
+        or "\n" in plan_branch
+    ):
+        raise WorkflowError("cannot write a valid Git Tracking Plan Branch")
+
+    if repo_state == RepoState.READY:
+        try:
+            rc, resolved_head, err = _run_git(
+                ["rev-parse", "--verify", "HEAD"],
+                cwd=repo_root,
+            )
+        except OSError as exc:
+            raise WorkflowError(
+                f"cannot resolve repository HEAD for Git Tracking: {exc}"
+            ) from exc
+        if rc != 0 or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", resolved_head) is None:
+            detail = f": {err}" if err else ""
+            raise WorkflowError(
+                "cannot resolve a full repository HEAD for Git Tracking" + detail
+            )
+        return plan_branch, resolved_head.lower(), False
+
+    if needs_bootstrap and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN):
+        return plan_branch, "", True
+
+    raise WorkflowError(
+        "workflow requires Git Tracking, but no repository HEAD or eligible "
+        "lifecycle bootstrap is available"
+    )
+
+
 def _prepare_required_git_tracking_before_allocation(
     *,
     repo_root: Path,
@@ -4874,44 +4939,137 @@ def _prepare_required_git_tracking_before_allocation(
     is_resume: bool,
     startup_retry: RetryContext | None,
     terminal_completion_resume: bool = False,
+    planned_execution_branch: str | None = None,
+    expected_plan_bytes: bytes | None = None,
 ) -> tuple[ParsedPlan, bool]:
-    """Insert required Git Tracking metadata before durable run allocation."""
+    """Normalize required Git Tracking metadata before durable run allocation."""
     if terminal_completion_resume:
         return parsed_plan, False
     if not _workflow_requires_git_tracking(wf, workflow_config):
         return parsed_plan, False
 
     try:
-        original_bytes = original_plan_path.read_bytes()
-        plan_text = original_bytes.decode("utf-8")
+        source_bytes = original_plan_path.read_bytes()
+        if expected_plan_bytes is not None and source_bytes != expected_plan_bytes:
+            raise WorkflowError(
+                "startup plan changed during preparation; refusing Git Tracking normalization"
+            )
+        plan_text = source_bytes.decode("utf-8")
         metadata = parse_git_tracking_metadata(plan_text)
+    except WorkflowError:
+        raise
     except (OSError, UnicodeError, ValueError) as exc:
         raise WorkflowError(f"cannot inspect startup Git Tracking metadata: {exc}") from exc
 
     if metadata is not None:
-        bootstrap_fill_candidate = (
-            not is_resume
-            and startup_retry is None
-            and needs_bootstrap
-            and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN)
-            and metadata.plan_branch == ""
-            and metadata.pre_handoff_base_head == ""
+        missing_fields = tuple(
+            field_name
+            for field_name, value in (
+                ("Plan Branch", metadata.plan_branch),
+                ("Pre-Handoff Base HEAD", metadata.pre_handoff_base_head),
+            )
+            if value is None
         )
-        if not bootstrap_fill_candidate:
+        if missing_fields:
+            raise WorkflowError(
+                "Git Tracking metadata is malformed; missing required field(s): "
+                + ", ".join(missing_fields),
+                failure_kind="missing_git_tracking",
+            )
+
+        if metadata.plan_branch != "" and metadata.pre_handoff_base_head != "":
             return parsed_plan, False
+
         try:
             current_plan = parse_plan_text(plan_text, source_path=original_plan_path)
         except PlanParseError as exc:
             raise WorkflowError(
-                f"cannot parse current startup plan before deferred Git Tracking fill: {exc}"
+                f"cannot parse current startup plan before Git Tracking fill: {exc}"
             ) from exc
         if current_plan.snapshot != parsed_plan.snapshot:
             raise WorkflowError(
-                "startup plan changed after preparation; refusing deferred Git Tracking fill"
+                "startup plan changed after preparation; refusing Git Tracking normalization"
             )
         if not is_handoff_pristine_for_base_refresh(metadata, current_plan.sections):
-            return parsed_plan, False
-        return current_plan, True
+            raise WorkflowError(
+                "workflow requires complete Git Tracking identity for a started plan; "
+                "refusing to infer missing support metadata",
+                failure_kind="missing_git_tracking",
+            )
+
+        if is_resume or startup_retry is not None:
+            mode = "resume" if is_resume else "startup recovery"
+            raise WorkflowError(
+                "workflow requires complete Git Tracking identity; refusing to "
+                f"modify the plan during {mode}",
+                failure_kind="missing_git_tracking",
+            )
+
+        plan_branch_target, base_head_target, deferred_base_head = (
+            _resolve_startup_git_tracking_targets(
+                repo_root=repo_root,
+                wf=wf,
+                repo_state=repo_state,
+                needs_bootstrap=needs_bootstrap,
+                planned_execution_branch=planned_execution_branch,
+            )
+        )
+        updated_text = plan_text
+        if metadata.plan_branch == "" and plan_branch_target is not None:
+            updated_text = rewrite_git_tracking_field(
+                updated_text,
+                "Plan Branch",
+                plan_branch_target,
+            )
+        if metadata.pre_handoff_base_head == "" and base_head_target:
+            updated_text = rewrite_git_tracking_field(
+                updated_text,
+                "Pre-Handoff Base HEAD",
+                base_head_target,
+            )
+
+        if updated_text == plan_text:
+            return current_plan, deferred_base_head
+
+        try:
+            if original_plan_path.read_bytes() != source_bytes:
+                raise WorkflowError(
+                    "startup plan changed during preparation; refusing Git Tracking normalization"
+                )
+            _atomic_replace_bytes(original_plan_path, updated_text.encode("utf-8"))
+            reloaded_plan = load_plan(original_plan_path)
+            reloaded_text = original_plan_path.read_bytes().decode("utf-8")
+            reloaded_metadata = parse_git_tracking_metadata(reloaded_text)
+        except WorkflowError:
+            raise
+        except (OSError, UnicodeError, PlanParseError, ValueError) as exc:
+            raise WorkflowError(
+                f"cannot normalize startup Git Tracking metadata: {exc}"
+            ) from exc
+
+        if reloaded_metadata is None:
+            raise WorkflowError("normalized startup plan has no live Git Tracking section")
+        expected_branch = (
+            plan_branch_target if metadata.plan_branch == "" and plan_branch_target is not None
+            else metadata.plan_branch
+        )
+        expected_base = (
+            base_head_target
+            if metadata.pre_handoff_base_head == "" and base_head_target
+            else metadata.pre_handoff_base_head
+        )
+        if reloaded_metadata.plan_branch != expected_branch:
+            raise WorkflowError(
+                "normalized startup plan has an unexpected Plan Branch value"
+            )
+        if reloaded_metadata.pre_handoff_base_head != expected_base:
+            raise WorkflowError(
+                "normalized startup plan has an unexpected Pre-Handoff Base HEAD value"
+            )
+        if reloaded_plan.snapshot != parsed_plan.snapshot:
+            raise WorkflowError("Git Tracking normalization changed the checkpoint snapshot")
+
+        return reloaded_plan, deferred_base_head
 
     if is_resume or startup_retry is not None:
         mode = "resume" if is_resume else "startup recovery"
@@ -4933,41 +5091,38 @@ def _prepare_required_git_tracking_before_allocation(
             failure_kind="missing_git_tracking",
         )
 
-    deferred_base_head = False
-    if repo_state == RepoState.READY:
-        try:
-            rc, resolved_head, _ = _run_git(
-                ["rev-parse", "--verify", "HEAD"],
-                cwd=repo_root,
-            )
-        except OSError as exc:
-            raise WorkflowError(f"cannot resolve repository HEAD for Git Tracking: {exc}") from exc
-        if rc != 0 or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", resolved_head) is None:
-            raise WorkflowError("cannot resolve a full repository HEAD for Git Tracking insertion")
-        pre_handoff_base_head = resolved_head.lower()
-    elif needs_bootstrap and repo_state in (RepoState.NOT_A_REPO, RepoState.UNBORN):
-        pre_handoff_base_head = ""
-        deferred_base_head = True
-    else:
-        raise WorkflowError(
-            "workflow requires Git Tracking, but no repository HEAD or eligible lifecycle bootstrap is available"
+    plan_branch_target, pre_handoff_base_head, deferred_base_head = (
+        _resolve_startup_git_tracking_targets(
+            repo_root=repo_root,
+            wf=wf,
+            repo_state=repo_state,
+            needs_bootstrap=needs_bootstrap,
+            planned_execution_branch=planned_execution_branch,
         )
+    )
 
     try:
+        if original_plan_path.read_bytes() != source_bytes:
+            raise WorkflowError(
+                "startup plan changed during preparation; refusing Git Tracking insertion"
+            )
         updated_text = insert_git_tracking_section(
             plan_text,
             pre_handoff_base_head=pre_handoff_base_head,
+            plan_branch=plan_branch_target or "",
         )
         _atomic_replace_bytes(original_plan_path, updated_text.encode("utf-8"))
         reloaded_plan = load_plan(original_plan_path)
         reloaded_text = original_plan_path.read_bytes().decode("utf-8")
         reloaded_metadata = parse_git_tracking_metadata(reloaded_text)
+    except WorkflowError:
+        raise
     except (OSError, UnicodeError, PlanParseError, ValueError) as exc:
         raise WorkflowError(f"cannot normalize startup Git Tracking metadata: {exc}") from exc
 
     if reloaded_metadata is None:
         raise WorkflowError("normalized startup plan has no live Git Tracking section")
-    if reloaded_metadata.plan_branch != "":
+    if reloaded_metadata.plan_branch != (plan_branch_target or ""):
         raise WorkflowError("normalized startup plan has an unexpected Plan Branch value")
     if reloaded_metadata.pre_handoff_base_head != pre_handoff_base_head:
         raise WorkflowError("normalized startup plan has an unexpected Pre-Handoff Base HEAD value")
@@ -6877,6 +7032,14 @@ def run_workflow(
         and terminal_completion_plan_path is not None
         and terminal_completion_plan_path.is_file()
     )
+    expected_plan_bytes: bytes | None = None
+    if not terminal_completion_after_move and original_plan_path.is_file():
+        try:
+            expected_plan_bytes = original_plan_path.read_bytes()
+        except OSError as exc:
+            raise WorkflowError(
+                f"cannot read startup plan before lifecycle preflight: {exc}"
+            ) from exc
     repo_state = probe_repo_state(config.repo_root)
     needs_bootstrap = _lifecycle_is_bootstrap_eligible(wf, repo_state)
     lifecycle_plan = None
@@ -6917,10 +7080,19 @@ def run_workflow(
                 is_resume=resume is not None,
                 startup_retry=startup_retry,
                 terminal_completion_resume=terminal_completion_resume,
+                planned_execution_branch=(
+                    lifecycle_plan.feature_branch
+                    if lifecycle_plan is not None
+                    else None
+                ),
+                expected_plan_bytes=expected_plan_bytes,
             )
         )
     except WorkflowError as exc:
-        raise WorkflowError(f"startup plan preflight failed: {exc.summary}") from exc
+        raise WorkflowError(
+            f"startup plan preflight failed: {exc.summary}",
+            failure_kind=exc.failure_kind,
+        ) from exc
     except (OSError, UnicodeError, PlanParseError, ValueError) as exc:
         raise WorkflowError(f"startup plan preflight failed: {exc}") from exc
     if deferred_git_tracking_base_head and not needs_bootstrap:

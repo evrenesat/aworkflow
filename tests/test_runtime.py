@@ -6767,7 +6767,7 @@ class WorkflowPreflightTests(unittest.TestCase):
                 plan_text = plan_path.read_text(encoding='utf-8')
                 metadata = parse_git_tracking_metadata(plan_text)
                 assert metadata is not None
-                assert metadata.plan_branch == ''
+                assert metadata.plan_branch == 'main'
                 assert metadata.pre_handoff_base_head == current_head
                 assert observer.events == []
                 reservation_observations.append(plan_text)
@@ -6837,9 +6837,9 @@ class WorkflowPreflightTests(unittest.TestCase):
                 plan_text = plan_path.read_text(encoding='utf-8')
                 metadata = parse_git_tracking_metadata(plan_text)
                 assert metadata is not None
-                assert metadata.plan_branch == ''
-                assert metadata.pre_handoff_base_head == ''
-                assert plan_text == original
+                assert metadata.plan_branch == 'main'
+                assert metadata.pre_handoff_base_head == current_head
+                assert plan_text != original
                 reservation_observations.append(plan_text)
                 return real_reserve_run_id(root, requested_run_id)
 
@@ -6948,6 +6948,8 @@ class WorkflowPreflightTests(unittest.TestCase):
             assert result.final_snapshot.is_complete
 
     def test_existing_git_tracking_section_is_not_reinserted(self) -> None:
+        from aflow.plan import parse_git_tracking_metadata
+
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             _make_lifecycle_git_repo(repo_root, branch='main')
@@ -6983,8 +6985,128 @@ class WorkflowPreflightTests(unittest.TestCase):
                 runner=runner,
             )
             assert result.final_snapshot.is_complete
-            assert plan_path.read_text(encoding='utf-8').count('## Git Tracking') == 1
+            final_text = plan_path.read_text(encoding='utf-8')
+            metadata = parse_git_tracking_metadata(final_text)
+            assert metadata is not None
+            assert metadata.plan_branch == 'main'
+            assert metadata.pre_handoff_base_head == current_head
+            assert final_text.count('## Git Tracking') == 1
             assert (repo_root / 'plans' / 'backups' / 'plan.md').read_text(encoding='utf-8') == original
+
+    def test_review_workflow_fills_blank_base_without_overwriting_branch(self) -> None:
+        from aflow.plan import parse_git_tracking_metadata
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            rc, current_head, _ = _run_git_in_test(['rev-parse', '--verify', 'HEAD'], cwd=repo_root)
+            assert rc == 0
+            plan_path = repo_root / 'plan.md'
+            original = (
+                '# Plan\n\n## Git Tracking\n\n- Plan Branch: `main`\n'
+                '- Pre-Handoff Base HEAD: ``\n\n'
+                '### [ ] Checkpoint 1: First\n- [ ] step one\n'
+            )
+            _write_plan(plan_path, original)
+
+            def runner(argv, **kwargs):
+                text = plan_path.read_text(encoding='utf-8')
+                metadata = parse_git_tracking_metadata(text)
+                assert metadata is not None
+                assert metadata.plan_branch == 'main'
+                assert metadata.pre_handoff_base_head == current_head
+                _write_plan(
+                    plan_path,
+                    text.replace('### [ ] Checkpoint 1', '### [x] Checkpoint 1').replace(
+                        '- [ ] step one',
+                        '- [x] step one',
+                    ),
+                )
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                self._make_review_wf_config(),
+                'review_wf',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert plan_path.read_text(encoding='utf-8').count('## Git Tracking') == 1
+
+    def test_valid_git_tracking_identity_is_authoritative_on_in_place_start(self) -> None:
+        from aflow.plan import parse_git_tracking_metadata
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            rc, current_head, _ = _run_git_in_test(['rev-parse', '--verify', 'HEAD'], cwd=repo_root)
+            assert rc == 0
+            plan_path = repo_root / 'plan.md'
+            recorded_branch = 'review/source-branch'
+            original = _VALID_GIT_TRACKING_PLAN.replace(
+                '`main`', f'`{recorded_branch}`', 1
+            ).replace('`base`', f'`{current_head}`', 1)
+            _write_plan(plan_path, original)
+
+            def runner(argv, **kwargs):
+                text = plan_path.read_text(encoding='utf-8')
+                metadata = parse_git_tracking_metadata(text)
+                assert metadata is not None
+                assert metadata.plan_branch == recorded_branch
+                assert metadata.pre_handoff_base_head == current_head
+                _write_plan(
+                    plan_path,
+                    text.replace('### [ ] Checkpoint 1', '### [x] Checkpoint 1').replace(
+                        '- [ ] step one',
+                        '- [x] step one',
+                    ),
+                )
+                return subprocess.CompletedProcess(argv, 0, 'ok', '')
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                self._make_review_wf_config(),
+                'review_wf',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.final_snapshot.is_complete
+            assert f'- Plan Branch: `{recorded_branch}`' in plan_path.read_text(encoding='utf-8')
+
+    def test_git_tracking_normalization_rejects_concurrent_source_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            plan_path = repo_root / 'plan.md'
+            original = '# Plan\n\n### [ ] Checkpoint 1: First\n- [ ] step one\n'
+            _write_plan(plan_path, original)
+            concurrent = original + '\nConcurrent edit.\n'
+            runner_calls: list[int] = []
+
+            def edit_during_backup(*args, **kwargs):
+                plan_path.write_text(concurrent, encoding='utf-8')
+
+            with patch('aflow.workflow._backup_original_plan', side_effect=edit_during_backup):
+                with pytest.raises(WorkflowError, match='changed during preparation'):
+                    run_workflow(
+                        ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1),
+                        self._make_review_wf_config(),
+                        'review_wf',
+                        config_dir=repo_root,
+                        snapshot_config=False,
+                        runner=lambda *args, **kwargs: runner_calls.append(1),
+                    )
+
+            assert runner_calls == []
+            assert plan_path.read_text(encoding='utf-8') == concurrent
+            assert not (repo_root / '.aflow').exists()
 
     def test_non_review_workflow_does_not_insert_git_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7241,7 +7363,7 @@ class WorkflowPreflightTests(unittest.TestCase):
             assert worker_deferred
             assert worker_plan.snapshot == inserted_plan.snapshot
 
-    def test_preflight_passes_when_review_skill_and_git_tracking_present(self) -> None:
+    def test_preflight_rejects_malformed_git_tracking_before_harness(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / 'plan.md'
@@ -7254,9 +7376,10 @@ class WorkflowPreflightTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'ok', '')
 
             config = ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=1)
-            with pytest.raises(WorkflowError, match='reached max turns limit'):
+            with pytest.raises(WorkflowError, match='missing required field'):
                 run_workflow(config, wf_config, 'review_wf', config_dir=repo_root, snapshot_config=False, adapter=CodexAdapter(), runner=runner)
-            assert call_count[0] == 1
+            assert call_count[0] == 0
+            assert not (repo_root / '.aflow').exists()
 
     def test_preflight_skipped_for_non_review_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

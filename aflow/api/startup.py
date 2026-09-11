@@ -18,6 +18,7 @@ from aflow.plan import (
     GitTrackingMetadataError,
     MISSING_CHECKPOINT_SECTIONS,
     PlanParseError,
+    is_handoff_pristine_for_base_refresh,
     load_plan,
     load_plan_tolerant,
     parse_git_tracking_metadata,
@@ -26,6 +27,7 @@ from aflow.run_state import RetryContext
 from aflow.workflow import (
     _effective_retry_limit,
     _lifecycle_is_bootstrap_eligible,
+    _workflow_requires_git_tracking,
     generate_new_plan_path,
     preflight_pre_handoff_base_head_refresh,
     render_step_prompts,
@@ -533,6 +535,36 @@ def _preflight_startup_base_head_refresh(
         raise StartupError("Startup base/history validation could not be completed.") from exc
 
 
+def _preflight_required_git_tracking_identity(
+    request: StartupRequest,
+    parsed_plan: object,
+    *,
+    workflow_name: str,
+) -> None:
+    """Reject malformed or established plans with incomplete support identity."""
+    workflow = request.workflow_config.workflows[workflow_name]
+    if not _workflow_requires_git_tracking(workflow, request.workflow_config):
+        return
+    try:
+        metadata = parse_git_tracking_metadata(
+            request.plan_path.read_text(encoding="utf-8")
+        )
+    except GitTrackingMetadataError as exc:
+        raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND) from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise StartupError("Startup Git Tracking validation could not be completed.") from exc
+
+    if metadata is None:
+        return
+    if metadata.plan_branch is None or metadata.pre_handoff_base_head is None:
+        raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND)
+    if (
+        (metadata.plan_branch == "" or metadata.pre_handoff_base_head == "")
+        and not is_handoff_pristine_for_base_refresh(metadata, parsed_plan.sections)
+    ):
+        raise PlanAdmissionError(PLAN_ADMISSION_STARTED_HISTORY_KIND)
+
+
 def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
     """Prepare workflow startup, returning either a prepared run or a question.
 
@@ -632,6 +664,11 @@ def prepare_startup(request: StartupRequest) -> PreparedRun | StartupQuestion:
 
     effective_startup_base_head_refresh_sha = None
     if not request.resume_requested:
+        _preflight_required_git_tracking_identity(
+            request,
+            parsed_plan,
+            workflow_name=workflow_name,
+        )
         startup_base_head_refresh = _preflight_startup_base_head_refresh(
             request,
             parsed_plan,

@@ -27,19 +27,31 @@ At run start, `aflow` prints the new run ID immediately. Resumed runs also show 
 
 ## Fresh Review Plan Git Tracking
 
-Before allocating a run ID, launch manifest, run directory, or start event,
-AFlow backs up and validates the startup plan. A fresh review workflow whose
+At the normal startup-preparation boundary, AFlow backs up and validates the
+startup plan before a fresh run gets a launch manifest, run directory, or
+start event. A fresh review workflow whose
 plan is pristine and has no live `## Git Tracking` section receives exactly one
 minimal section immediately before its first live checkpoint. Normal
 repositories record the verified current `HEAD`. Eligible empty repositories
 temporarily receive an empty base, then record the exact verified bootstrap
 commit and actual lifecycle branch before the first ordinary worker turn.
 
+The same preparation fills blank required fields in an existing pristine
+section. In-place workflows record the current symbolic branch and full
+`HEAD`; lifecycle workflows use their already-selected execution branch and
+the current base (or defer only the base until bootstrap). Nonempty identity
+is preserved even when the checkout differs. A plan with progress and missing
+identity is rejected with a typed startup diagnostic rather than being
+reconstructed from the current checkout.
+
 Insertion is limited to fresh plans with no checked checkpoint or task and no
 orphan tracking fields. Started, resumed, recovery, ambiguous, malformed, and
-no-HEAD/non-bootstrap inputs fail before durable run allocation and leave the
-original plan unchanged. Existing sections retain automatic pristine base-HEAD
-refresh behavior and are never duplicated or rebuilt. There is no interactive
+no-HEAD/non-bootstrap inputs fail before a new harness or lifecycle mutation
+and leave the original plan unchanged. The daemon may retain a typed,
+idempotent startup-failure record when its reservation boundary has already
+been reached. Existing sections are never duplicated or rebuilt;
+only blank controller-owned fields are normalized. Existing pristine sections
+retain automatic base-HEAD refresh behavior, and there is no interactive
 base-refresh confirmation.
 
 ## Harness Environment Preflight

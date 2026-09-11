@@ -4311,7 +4311,7 @@ class WorkflowStartupFlowTests(unittest.TestCase):
                 (
                     '# Plan\n\n'
                     '## Git Tracking\n\n'
-                    '- Plan Branch: ``\n'
+                    '- Plan Branch: `main`\n'
                     f'- Pre-Handoff Base HEAD: `{current_head}`\n\n'
                     '### [x] Checkpoint 1: First\n'
                     '- [x] step one\n'
@@ -4348,13 +4348,70 @@ class WorkflowStartupFlowTests(unittest.TestCase):
             assert result == 0
             final_text = plan_path.read_text(encoding='utf-8')
             assert final_text.count('## Git Tracking') == 1
-            assert final_text.count('- Plan Branch: ``') == 1
+            assert final_text.count('- Plan Branch: `main`') == 1
             assert final_text.count(f'- Pre-Handoff Base HEAD: `{current_head}`') == 1
             run_dirs = list((repo_root / '.aflow' / 'runs').iterdir())
             assert len(run_dirs) == 1
             assert (run_dirs[0] / 'turns' / 'turn-001' / 'result.json').is_file()
             assert not (run_dirs[0] / 'turns' / 'turn-002').exists()
             assert 'startup aborted' not in stderr_capture.getvalue().lower()
+
+    def test_cli_rejects_started_blank_git_tracking_before_harness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            repo_root = tmp_path / 'repo'
+            repo_root.mkdir()
+            _make_lifecycle_git_repo(repo_root, branch='main')
+            home_dir = tmp_path / 'home'
+            home_dir.mkdir()
+            self._write_workflow_config(
+                home_dir,
+                workflow_name='single_step',
+                multi_step=False,
+                review_skill=True,
+            )
+            plan_path = repo_root / 'plan.md'
+            original = (
+                '# Plan\n\n'
+                '## Git Tracking\n\n'
+                '- Plan Branch: ``\n'
+                '- Pre-Handoff Base HEAD: ``\n\n'
+                '### [ ] Checkpoint 1: First\n'
+                '- [x] started\n'
+                '- [ ] step one\n'
+            )
+            _write_plan(plan_path, original)
+            count_file = repo_root / 'count.txt'
+            _write_workflow_harness_script(repo_root, 'codex')
+            env = _workflow_test_env(
+                repo_root,
+                scenario='noop',
+                plan_path=plan_path,
+                count_file=count_file,
+                home_dir=home_dir,
+            )
+            original_cwd = Path.cwd()
+            import io
+            import aflow.api.startup as startup_module
+            original_startup_probe = startup_module.probe_worktree
+            stderr_capture = io.StringIO()
+            try:
+                with patch.dict(os.environ, env, clear=True):
+                    startup_module.probe_worktree = lambda _: None
+                    os.chdir(repo_root)
+                    with patch('sys.stdin.isatty', return_value=False), \
+                         patch('sys.stdout.isatty', return_value=False), \
+                         patch('builtins.input', side_effect=AssertionError('unexpected input')), \
+                         patch('sys.stderr', stderr_capture):
+                        result = main(['run', str(plan_path)])
+            finally:
+                os.chdir(original_cwd)
+                startup_module.probe_worktree = original_startup_probe
+
+            assert result == 1
+            assert not count_file.exists()
+            assert plan_path.read_text(encoding='utf-8') == original
+            assert 'Git Tracking' in stderr_capture.getvalue()
 
     def test_cli_one_step_workflow_skips_picker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

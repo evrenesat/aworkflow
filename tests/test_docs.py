@@ -62,6 +62,7 @@ class SkillDocsTests(unittest.TestCase):
         assert (skill_root / 'references' / 'remote-observation.md').exists()
         assert (skill_root / 'scripts' / 'aflow_guard_snapshot.py').exists()
         assert (skill_root / 'scripts' / 'aflow_guard_issue.py').exists()
+        assert (skill_root / 'scripts' / 'aflow_guard_recovery.py').exists()
         assert not (skill_root / 'scripts' / 'aflow_guard_report.py').exists()
         assert not (skill_root / 'references' / 'reporting-and-email.md').exists()
 
@@ -75,6 +76,9 @@ class SkillDocsTests(unittest.TestCase):
         assert 'Never fix, retry, resume' in text
         assert 'terminal_transient_environment' not in text
         assert 'replacement-successor' not in text
+        assert 'One-shot neutral startup exception' in text
+        assert 'already_attempted' in text
+        assert 'Never add a CLI or tmux controller to a server-owned run' in text
         assert 'SRE mode' not in text
         assert ' ship mode' not in text.lower()
 

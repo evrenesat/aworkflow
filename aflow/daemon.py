@@ -907,6 +907,7 @@ class DaemonService:
             GitTrackingMetadataError,
             MISSING_CHECKPOINT_SECTIONS,
             PlanParseError,
+            is_handoff_pristine_for_base_refresh,
             load_plan,
             parse_git_tracking_metadata,
         )
@@ -921,32 +922,46 @@ class DaemonService:
         if not _workflow_requires_git_tracking(workflow, self._workflow_config):
             return
         try:
-            plan_text = request.plan_path.read_bytes().decode("utf-8")
+            source_bytes = request.plan_path.read_bytes()
+            plan_text = source_bytes.decode("utf-8")
             metadata = parse_git_tracking_metadata(plan_text)
             if metadata is not None:
                 if metadata.plan_branch is None or metadata.pre_handoff_base_head is None:
                     raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND)
                 try:
-                    load_plan(request.plan_path)
+                    parsed_plan = load_plan(request.plan_path)
                 except PlanParseError as exc:
                     if exc.error_kind == "inconsistent_checkpoint_state":
                         return
                     raise
-                return
+                if (
+                    metadata.plan_branch != ""
+                    and metadata.pre_handoff_base_head != ""
+                ):
+                    return
+                if not is_handoff_pristine_for_base_refresh(
+                    metadata,
+                    parsed_plan.sections,
+                ):
+                    return
             repo_state = probe_repo_state(self._config.repo_root)
             needs_bootstrap = _lifecycle_is_bootstrap_eligible(workflow, repo_state)
             _backup_original_plan(self._config.repo_root, request.plan_path)
-            parsed_plan = load_plan(request.plan_path)
             _prepare_required_git_tracking_before_allocation(
                 repo_root=self._config.repo_root,
                 original_plan_path=request.plan_path,
-                parsed_plan=parsed_plan,
+                parsed_plan=(
+                    parsed_plan
+                    if metadata is not None
+                    else load_plan(request.plan_path)
+                ),
                 wf=workflow,
                 workflow_config=self._workflow_config,
                 repo_state=repo_state,
                 needs_bootstrap=needs_bootstrap,
                 is_resume=request.resume_requested,
                 startup_retry=None,
+                expected_plan_bytes=source_bytes,
             )
         except PlanAdmissionError as exc:
             _logger.warning(

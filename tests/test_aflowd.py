@@ -3,15 +3,24 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
+import hashlib
+import importlib.util
 from pathlib import Path
 import json
 import subprocess
+import sys
 from threading import Event
 
 import pytest
 
 from aflow.api.models import PreparedRun, StartupQuestion, StartupQuestionKind, StartupRequest
-from aflow.config import GoTransition, WorkflowConfig, WorkflowStepConfig, WorkflowUserConfig
+from aflow.config import (
+    GoTransition,
+    TeamConfig,
+    WorkflowConfig,
+    WorkflowStepConfig,
+    WorkflowUserConfig,
+)
 from aflow.control_plane import (
     ControlConflictError,
     RepositoryNotFoundError,
@@ -29,6 +38,25 @@ from aflow.daemon import (
     DaemonIdempotencyConflict,
     _startup_request_digest,
 )
+
+
+GUARD_RECOVERY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "aflow"
+    / "bundled_skills"
+    / "aflow-guard-development-run"
+    / "scripts"
+    / "aflow_guard_recovery.py"
+)
+
+
+def _guard_recovery_module():
+    spec = importlib.util.spec_from_file_location("aflowd_guard_recovery", GUARD_RECOVERY_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _workflow_config() -> WorkflowUserConfig:
@@ -165,6 +193,92 @@ def _prepared(request: StartupRequest) -> PreparedRun:
         extra_instructions=(),
         start_step="implement",
     )
+
+
+def _neutral_recovery_receipt(
+    helper,
+    request: StartupRequest,
+    predecessor_run_id: str,
+    predecessor_idempotency_key: str,
+    base_head: str,
+) -> dict[str, object]:
+    plan_digest = hashlib.sha256(request.plan_path.read_bytes()).hexdigest()
+    choices_digest = hashlib.sha256(b"daemon replacement choices").hexdigest()
+    startup_request_id = f"startup-{predecessor_run_id}"
+    return {
+        "schema_version": helper.SCHEMA_VERSION,
+        "evidence": {
+            "source": "matched_launch_evidence",
+            "matched": True,
+            "authorization": {
+                "authorized": True,
+                "ownership_mode": "aflowd",
+                "launch_surface": "web_mcp",
+            },
+            "request": {
+                "startup_request_id": startup_request_id,
+                "idempotency_key": predecessor_idempotency_key,
+            },
+            "failure": {
+                "status": "failed",
+                "phase": "pre_controller",
+                "kind": "missing_or_blank_git_tracking",
+                "terminal": True,
+                "missing_fields": ["plan_branch", "pre_handoff_base_head"],
+            },
+            "identity": {
+                "predecessor_run_id": predecessor_run_id,
+                "matched_run_id": predecessor_run_id,
+                "startup_request_id": startup_request_id,
+            },
+            "work": {
+                "started_turns": 0,
+                "finalized_turns": 0,
+                "worker_changes": False,
+                "branch_created": False,
+                "worktree_created": False,
+                "plan_content_unchanged": True,
+                "plan_semantics_unchanged": True,
+                "launch_choices_unchanged": True,
+            },
+            "ownership": {
+                "controller": "none",
+                "child": "none",
+                "provider_session": "none",
+            },
+            "selected_launch": {
+                "repository": str(request.repo_root),
+                "plan": str(request.plan_path),
+                "workflow": "managed",
+                "team": "codex",
+                "start_step": "review",
+                "max_turns": request.max_turns or 2,
+                "extra_instructions": [],
+                "choices_digest": choices_digest,
+                "original_plan_content_sha256": plan_digest,
+                "branch": "main",
+                "base_head": base_head,
+            },
+            "derivation": {
+                "mechanically_derivable": True,
+                "method": "in_place_current_branch",
+                "branch": "main",
+                "base_head": base_head,
+            },
+            "match": {
+                "startup_request_id": startup_request_id,
+                "selected_plan": str(request.plan_path),
+                "selected_choices_digest": choices_digest,
+                "idempotency_key": predecessor_idempotency_key,
+                "predecessor_run_id": predecessor_run_id,
+            },
+            "content": {
+                "sha256": plan_digest,
+                "unchanged": True,
+                "semantic_unchanged": True,
+            },
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -374,6 +488,148 @@ def test_daemon_started_base_failure_preserves_reserved_typed_failure(
     assert status.reason == PLAN_ADMISSION_STARTED_HISTORY_SAFE_MESSAGE
     assert status.evidence["startup_failure"]["code"] == PLAN_ADMISSION_ERROR_CODE
     assert status.evidence["startup_failure"]["kind"] == PLAN_ADMISSION_STARTED_HISTORY_KIND
+
+
+def test_guard_replacement_uses_new_key_after_terminal_metadata_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from aflow.api.startup import PLAN_ADMISSION_TRACKING_KIND, PlanAdmissionError
+    from aflow.daemon import DaemonStartupError
+
+    units = InMemoryUnitManager()
+    daemon, request = _daemon(tmp_path, monkeypatch, units)
+    review_config = replace(
+        _review_workflow_config(),
+        teams={"codex": TeamConfig(roles={"worker": "codex.worker"})},
+    )
+    monkeypatch.setattr("aflow.daemon.load_workflow_config", lambda path: review_config)
+    request = replace(
+        request,
+        workflow_config=review_config,
+        start_step="review",
+        team="codex",
+    )
+
+    subprocess.run(
+        ("git", "init", "-b", "main"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.email", "test@test.com"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.name", "Test"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    (request.repo_root / "README.md").write_text("ready\n")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "commit", "-m", "init"),
+        cwd=request.repo_root,
+        check=True,
+        capture_output=True,
+    )
+    request.plan_path.write_text(
+        "# Plan\n\n"
+        "## 2. Git Tracking\n\n"
+        "- Plan Branch: ``\n"
+        "- Pre-Handoff Base HEAD: ``\n\n"
+        "### [ ] Checkpoint 1: First\n"
+        "- [x] started\n"
+        "- [ ] remaining\n"
+    )
+    predecessor_key = "daemon-predecessor"
+
+    def reject_metadata(_: StartupRequest) -> PreparedRun:
+        raise PlanAdmissionError(PLAN_ADMISSION_TRACKING_KIND)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", reject_metadata)
+    with pytest.raises(DaemonStartupError) as first:
+        daemon.service.start(
+            request,
+            caller_scope="project:guard",
+            idempotency_key=predecessor_key,
+        )
+    predecessor_run_id = first.value.run_id
+    assert predecessor_run_id is not None
+
+    base_head = subprocess.check_output(
+        ("git", "rev-parse", "HEAD"),
+        cwd=request.repo_root,
+        text=True,
+    ).strip()
+    helper = _guard_recovery_module()
+    receipt = _neutral_recovery_receipt(
+        helper,
+        request,
+        predecessor_run_id,
+        predecessor_key,
+        base_head,
+    )
+    state_dir = tmp_path / "guard-state"
+    state_dir.mkdir()
+    preparation_calls = 0
+
+    def prepare_success(value: StartupRequest) -> PreparedRun:
+        nonlocal preparation_calls
+        preparation_calls += 1
+        return _prepared_for_request(value)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", prepare_success)
+
+    def launch(selected: dict[str, object]) -> dict[str, object]:
+        replacement_key = selected["idempotency_key"]
+        assert isinstance(replacement_key, str)
+        assert replacement_key != predecessor_key
+        started = daemon.service.start(
+            request,
+            caller_scope="project:guard",
+            idempotency_key=replacement_key,
+        )
+        return {
+            "status": "acknowledged",
+            "successor": {
+                "run_id": started.run_id,
+                "idempotency_key": replacement_key,
+            },
+        }
+
+    recovered = helper.attempt_recovery(receipt, state_dir, launch)
+    repeated = helper.attempt_recovery(receipt, state_dir, launch)
+    with pytest.raises(DaemonStartupError) as replay:
+        daemon.service.start(
+            request,
+            caller_scope="project:guard",
+            idempotency_key=predecessor_key,
+        )
+    replayed = replay.value
+
+    replacement_key = recovered["record"]["request"]["replacement_idempotency_key"]
+    persisted = json.loads(
+        (state_dir / helper.ATTEMPT_FILE_NAME).read_text(encoding="utf-8")
+    )
+    assert recovered["status"] == "acknowledged"
+    assert repeated["status"] == "already_attempted"
+    assert replayed.run_id == predecessor_run_id
+    assert recovered["record"]["request"]["predecessor_idempotency_key"] == predecessor_key
+    assert replacement_key != predecessor_key
+    assert persisted["successor"]["idempotency_key"] == replacement_key
+    assert persisted["successor"]["run_id"] != predecessor_run_id
+    assert preparation_calls == 1
+    assert len(units.start_calls) == 1
 
 
 @pytest.mark.parametrize("failure", ["backup", "value"])

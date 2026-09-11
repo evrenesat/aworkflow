@@ -19,5 +19,8 @@ def test_guard_guidance_uses_ownership_matched_observation_contract() -> None:
     assert "Never use browser cookies or create a disposable transport" in skill
     assert "Use one authenticated `get_run` through the advertised MCP endpoint." in skill
     assert "`aflow-run-<run-id>.service` unit" in skill
+    assert "One-shot neutral startup exception" in skill
+    assert "normal selected launch path" in skill
+    assert "Never add a CLI or tmux controller to a server-owned run." in skill
     assert "Deployment is the sole post-launch mutation and is allowed only when the user" in skill
     assert "explicitly authorized it for this run and the terminal audit passed." in skill

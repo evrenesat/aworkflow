@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-09-11 — Complete startup metadata and bound neutral recovery (issue 9)
+
+- Normalize missing or blank Git Tracking support fields for pristine review
+  plans through canonical startup preparation, preserving explicit identity,
+  plan content, backups and typed rejection of incomplete started plans.
+- Add the guard's one durable attempt only for positively proven terminal,
+  owned, zero-work pre-controller metadata failure. Preserve observer boundaries
+  and use the selected normal launcher, including web/MCP for server-owned runs.
+- Keep predecessor request lineage and claim one distinct replacement key.
+  Record acknowledged, failed or uncertain external outcomes without relaunch;
+  reject conflicting successors and keys. Unknown evidence remains ineligible.
+- Focused metadata, CLI/REST/MCP, guard, daemon, installer/refresh and Ruff
+  checks passed. Cumulative review resolved F1/F2 and approved the handoff;
+  full suites and integrated deployment verification remain CI/coordinator-owned.
+
 ## 2026-09-11 — Trust current assistant output for control signals
 
 - Fixed the dogfood failure where a successful review stopped because stderr

@@ -333,10 +333,19 @@ def is_plan_pristine_for_git_tracking_bootstrap(
     return True
 
 
-def insert_git_tracking_section(text: str, *, pre_handoff_base_head: str) -> str:
+def insert_git_tracking_section(
+    text: str,
+    *,
+    pre_handoff_base_head: str,
+    plan_branch: str = "",
+) -> str:
     """Insert the minimal Git Tracking section before the first live checkpoint."""
-    if "`" in pre_handoff_base_head or "\r" in pre_handoff_base_head or "\n" in pre_handoff_base_head:
-        raise ValueError("Pre-Handoff Base HEAD must be a single value without backticks")
+    for field_name, value in (
+        ("Plan Branch", plan_branch),
+        ("Pre-Handoff Base HEAD", pre_handoff_base_head),
+    ):
+        if "`" in value or "\r" in value or "\n" in value:
+            raise ValueError(f"{field_name} must be a single value without backticks")
 
     heading_line_numbers = _live_git_tracking_heading_line_numbers(text)
     if heading_line_numbers:
@@ -377,7 +386,7 @@ def insert_git_tracking_section(text: str, *, pre_handoff_base_head: str) -> str
 
     section = (
         f"## Git Tracking{newline}{newline}"
-        f"- Plan Branch: ``{newline}"
+        f"- Plan Branch: `{plan_branch}`{newline}"
         f"- Pre-Handoff Base HEAD: `{pre_handoff_base_head}`{newline}{newline}"
     )
     return text[:insertion_offset] + section + text[insertion_offset:]

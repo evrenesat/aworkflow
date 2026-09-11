@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,6 +21,7 @@ from test_control_plane_api import (
     TOKEN,
     _add_live_control_targets,
     _answer_pending as _rest_answer_pending,
+    _commit_fixture_repository,
     _prepared,
     _seed_issue35_progress_fixture,
     _start_pending as _rest_start_pending,
@@ -965,6 +967,64 @@ def test_mcp_plan_authoring_uses_default_template_and_safe_errors(mcp_client) ->
     )
     assert invalid_status["result"]["isError"] is True
     assert "document-body-secret.md" not in invalid_status["result"]["content"][0]["text"]
+
+
+def test_mcp_start_normalizes_blank_git_tracking_before_launch(mcp_client) -> None:
+    from aflow.plan import parse_git_tracking_metadata
+
+    client, root, units, monkeypatch = mcp_client
+    subprocess.run(
+        ("git", "checkout", "-b", "main"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (root / "README.md").write_text("ready\n", encoding="utf-8")
+    plan_path = root / "plans" / "todo" / "test-plan.md"
+    plan_path.write_text(
+        "# Test\n\n"
+        "## Git Tracking\n\n"
+        "- Plan Branch: ``\n"
+        "- Pre-Handoff Base HEAD: ``\n\n"
+        "### [ ] Checkpoint 1: Test\n- [ ] step\n",
+        encoding="utf-8",
+    )
+    _commit_fixture_repository(root)
+    head_result = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected_head = head_result.stdout.strip()
+    monkeypatch.setattr("aflow.workflow._workflow_requires_git_tracking", lambda *_: True)
+    observed: dict[str, object] = {}
+
+    def prepare(request):
+        metadata = parse_git_tracking_metadata(
+            request.plan_path.read_text(encoding="utf-8")
+        )
+        assert metadata is not None
+        observed["branch"] = metadata.plan_branch
+        observed["base"] = metadata.pre_handoff_base_head
+        return _prepared(request)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", prepare)
+    started = _mcp_tool(
+        client,
+        "start_run",
+        {
+            "project_id": PROJECT_ID,
+            "plan_path": "plans/todo/test-plan.md",
+            "workflow_name": "managed",
+            "idempotency_key": "mcp-blank-git-tracking",
+        },
+    )
+
+    assert started["result"]["status"] == "running"
+    assert observed == {"branch": "main", "base": expected_head}
+    assert len(units.start_calls) == 1
 
 
 def test_mcp_startup_control_and_resume_are_idempotent_and_match_rest(mcp_client) -> None:

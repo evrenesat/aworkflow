@@ -555,3 +555,18 @@ def test_real_bundled_package_refresh_keeps_edits_and_idempotence(
     (repeat,) = store.refresh_skills([SKILL])
     assert repeat.status == "refreshed"
     assert repeat.changed is False
+
+
+def test_real_guard_refresh_contains_recovery_helper_without_stale_bundle_files(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+
+    (result,) = store.refresh_skills(["aflow-guard-development-run"])
+
+    assert result.status == "initialized"
+    guard = root / "aflow-guard-development-run"
+    assert (guard / "scripts" / "aflow_guard_recovery.py").is_file()
+    assert not (guard / "scripts" / "aflow_guard_report.py").exists()
+    assert not (guard / "references" / "reporting-and-email.md").exists()

@@ -1,21 +1,27 @@
 ---
 name: aflow-guard-development-run
-description: Monitor and audit an explicitly selected AFlow run without changing its implementation, recovery state, plan, configuration, or controller. Use when the user asks to guard, babysit, monitor, observe, production-check, or keep watch over an AFlow workflow or its explicitly authorized deployment. Launch new legacy CLI runs in tmux, check every 30 minutes, use remote or MCP features read-only when available, report confirmed AFlow defects as sanitized GitHub issues, audit terminal results, and then stop.
+description: Monitor and audit an explicitly selected AFlow run without changing its implementation, recovery state, plan, configuration, or controller, except for one evidence-backed neutral startup correction under an explicit start-and-monitor authorization. Use when the user asks to guard, babysit, monitor, observe, production-check, or keep watch over an AFlow workflow or its explicitly authorized deployment. Launch new legacy CLI runs in tmux, check every 30 minutes, use remote or MCP features read-only when available, report confirmed AFlow defects as sanitized GitHub issues, audit terminal results, and then stop.
 ---
 
 # Observe an AFlow Run
 
 Observe the exact run selected by the user. Protect the implementation outcome
-and Codex quota by remaining read-only after launch.
+and Codex quota by remaining read-only after launch. A start-and-monitor request
+has one narrower pre-launch exception described below; ordinary observation
+remains read-only.
 
 ## Hard boundaries
 
 - Monitor, investigate, report, audit, and pause. Never fix, retry, resume,
-  replace, replan, steer, hotplug, edit, test, commit, merge, or alter the run.
+  replace, replan, steer, hotplug, edit, test, commit, merge, or alter the run
+  during ordinary guard operation. The only exception is the bounded neutral
+  startup case below.
 - Never edit the guarded worktree, plan, `run.json`, configuration,
   overrides, controller, harness, deployment files, or AFlow source.
-- Never call MCP or REST write operations, including start, startup-answer,
-  control, stop, resume, or steering. Remote features are observation-only.
+- Never call MCP or REST write operations during ordinary observation, including
+  start, startup-answer, control, stop, resume, or steering. Remote features
+  are observation-only except for the explicitly authorized neutral startup
+  launch described below.
 - Keep exactly one 30-minute heartbeat attached to the initiating Codex task.
   Never create a secondary task or one cron task per tick.
 - Keep healthy ticks silent. Do not reread task history or unchanged artifacts.
@@ -30,6 +36,75 @@ and Codex quota by remaining read-only after launch.
   defects belong only in sanitized GitHub issues.
 - Deployment is the sole post-launch mutation and is allowed only when the user
   explicitly authorized it for this run and the terminal audit passed.
+
+## One-shot neutral startup exception
+
+Use this exception only when the same user request explicitly authorizes the
+guard to start and monitor the selected workflow. Monitoring an existing run,
+an unrequested retry, or a generic startup error does not authorize it.
+
+The exception is eligible only when a bounded receipt from matched launch
+evidence proves every item below. The receipt must be passed to
+`scripts/aflow_guard_recovery.py`; the helper does not inspect missing files and
+does not infer facts from their absence.
+
+- The predecessor is terminal and failed before controller creation because
+  required Git Tracking support metadata was missing or blank.
+- Started turns and finalized turns are both exactly zero. The matched evidence
+  proves no owned controller, child, provider session, branch, or worktree was
+  created by the attempt.
+- The selected plan content and launch choices are unchanged, and the original
+  plan content digest is recorded. Unknown, malformed, or semantically changed
+  evidence is ineligible.
+- The selected repository, plan, workflow, team, start step, turn budget, extra
+  instructions, and idempotency key are explicit. Branch and base are
+  mechanically derivable and matched to the selected launch.
+- The guard is authorized for the selected launch surface. A legacy run uses
+  its supported `aflow run` launcher; a `ui-server` or `aflowd` run uses the
+  advertised authenticated web/MCP start and startup-answer path.
+  Never add a CLI or tmux controller to a server-owned run.
+
+Claim the attempt in the guard's existing external state directory before any
+launch:
+
+```bash
+python3 <skill-dir>/scripts/aflow_guard_recovery.py \
+  --receipt <matched-launch-receipt.json> \
+  --state-dir <existing-guard-state-directory>
+```
+
+The claim is atomic and durable. Its record preserves the predecessor's
+`predecessor_idempotency_key` as lineage and assigns exactly one distinct
+`replacement_idempotency_key`; the emitted `launch_request.idempotency_key`
+is the replacement key. A second invocation returns `already_attempted` and
+launches nothing. After a successful claim, use the normal selected launch path
+with that replacement key so checkpoint 1's canonical metadata
+preparation owns the correction; do not rewrite the plan in the guard.
+
+Record the external outcome with the same replacement key, without launching
+again. For an acknowledged normal launch, write its successor identity to a
+bounded JSON file and run:
+
+```bash
+python3 <skill-dir>/scripts/aflow_guard_recovery.py \
+  --receipt <matched-launch-receipt.json> \
+  --state-dir <existing-guard-state-directory> \
+  --outcome acknowledged \
+  --replacement-idempotency-key <replacement-key> \
+  --successor-json <successor-identity.json>
+```
+
+Use the same command with `--outcome failed` or `--outcome uncertain` and no
+successor file when the normal launch reports that outcome. Repeated matching
+records are idempotent; a changed key or conflicting successor is blocked.
+Never replay an uncertain request: reconcile it only if the same durable
+replacement key later returns the same acknowledged launch. Provider recovery,
+configuration changes, implementation repair, branch repair, and scope resets
+are outside this exception.
+
+All other observer boundaries remain in force: one heartbeat, one bounded
+investigation, no duplicate controller, no guarded-worktree or plan edits, and
+no remote writes outside this single authorized startup path.
 
 ## Launch a new legacy run
 

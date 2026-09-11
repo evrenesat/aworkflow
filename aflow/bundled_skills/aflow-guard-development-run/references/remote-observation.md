@@ -42,13 +42,31 @@ tools:
 - `get_run_context` with Lite context only for a new anomaly
 - `preflight_run` with bounded dirty-worktree pages only when needed
 
-Never call these five writes:
+Never call these five writes during ordinary observation:
 
 - `start_run`
 - `answer_startup`
 - `control_run`
 - `owner_stop`
 - `resume_run`
+
+The only write exception is the explicitly authorized neutral startup case in
+the parent guard skill. Its matched receipt must be claimed before launch and
+must select this same advertised server surface. It may issue exactly one
+`start_run` request and, when that normal path returns a startup question,
+exactly one matching `answer_startup` request. The request must keep the
+original plan, workflow, team, start step, turn budget, extra instructions,
+branch/base derivation, and predecessor key as lineage. The `Idempotency-Key`
+header for the one replacement request is the durable
+`replacement_idempotency_key` emitted by the claim; do not reuse the
+predecessor key and do not generate another replacement key. Never use
+`control_run`, `owner_stop`, or `resume_run`; never create a CLI/tmux
+controller for a `ui-server` or `aflowd` run. An uncertain response is
+report-and-pause unless that same replacement key later exposes the already
+acknowledged launch.
+
+This exception does not change the tick contract: healthy ticks still call only
+`get_run`, and all other remote observation remains read-only.
 
 Page limits are 1 through 1000 with a default of 100. Keep reads below the
 default unless one exact anomaly requires otherwise.

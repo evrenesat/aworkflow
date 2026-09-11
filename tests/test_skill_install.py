@@ -797,6 +797,9 @@ def test_include_optional_links_supporting_resources_through_the_link(
     guard = destination / "aflow-guard-development-run"
     assert (guard / "agents" / "openai.yaml").is_file()
     assert (guard / "scripts" / "aflow_guard_issue.py").is_file()
+    assert (guard / "scripts" / "aflow_guard_recovery.py").is_file()
+    assert not (guard / "scripts" / "aflow_guard_report.py").exists()
+    assert not (guard / "references" / "reporting-and-email.md").exists()
 
 
 def test_default_install_excludes_optional_skills(disposable_home: Path, tmp_path: Path) -> None:

@@ -1,33 +1,70 @@
-# Progress readable titles — cumulative review, 2026-09-11
+# Issue 9 — cumulative approval review, 2026-09-11
 
-Original and active plan: `plans/in-progress/progress-readable-title-20260911.md`.
-Branch: `aflow-progress-readable-title-20260911-20260911-073808`.
-Unchanged review/squash base: `7ccbe57b000202bdc28f011633d691db9d8473d1`.
-Reviewed HEAD: `7d4b9dea3a820e433ad19eb3116b82a168393665`.
-Coverage: 1 new / 1 total commit, `cp1 v01`, covering the entire completed original plan. No previous findings or follow-up plans exist for this handoff; the rotated report concerns a separate semantic-stop handoff.
+Original plan: `plans/in-progress/issue-9-bounded-startup-recovery-20260909.md`.
+Active repair overlay: `issue-9-bounded-startup-recovery-20260909-cp01-v01.md`.
+Branch: `aflow-issue-9-bounded-startup-recovery-20260909-20260911-075547`.
+Unchanged Pre-Handoff Base HEAD: `b46e441ca758383df60eefe571d097c5ce597ad9`.
+Reviewed HEAD: `11b4465b745b808621bb18328bf33f54ab667a2c`.
+Coverage: **1 new / 3 total commits**, including `5112734e` (cp1 v01),
+`1cae4c4c` (cp2 v01), and `11b4465b` (cp2 v02). Both original checkpoints
+and the full base-to-HEAD implementation across all 21 changed files were reviewed.
+Incremental fix inspection did not replace cumulative review.
 
-## Findings and scope
+## Previous findings
 
-Zero findings pass the material-code-review admission gate. The complete cumulative diff changes only the progress browser test and one DEVLOG entry. Both explicit readable heading assertions match `runPlanDisplayName` and RunDashboard. Each selected detail separately asserts the exact fixture run ID through its visible copy button. Original checkpoint versus repair, technical repair path, current/finished turns, refresh transition, unavailable-state evidence, and desktop/mobile cases remain intact. Production UI and REST/MCP contracts are unchanged.
+- F1 resolved: the external CLI can record acknowledged, failed and uncertain
+  outcomes from a consumed claim. Callback and external recording share bounded
+  validation; matching uncertainty can be acknowledged, and conflicting keys or
+  successors are rejected. Actual subprocess regressions passed.
+- F2 resolved: claims retain the predecessor key as lineage and persist one
+  distinct replacement key before launch. The in-memory daemon regression proves
+  the predecessor replays its typed failure while the replacement reaches
+  preparation once and starts one unit. Repeated attempts do not relaunch.
 
-The source audit covered every `test_*browser.py` heading, run-detail and Markdown-path match, including heading calls outside `.run-detail h3`. Other filename matches are technical paths, plan selectors or editor labels; startup and responsive title expectations already use readable names. No additional stale heading assertion was confirmed.
+## Cumulative findings
 
-## Verification evidence
+No material findings. Reviewed canonical missing/blank/partial Git Tracking
+normalization, pristine/started admission, source-byte preservation, lifecycle
+branch/base selection and bootstrap, explicit identity preservation, typed
+CLI/server errors, REST/MCP admission tests, guard receipt eligibility and
+one-attempt persistence, external outcomes, observer boundaries, and bundled
+installer/refresh behavior. Existing startup backup wrappers and capture calls
+remain intact for issue34 integration. No production edits were needed.
 
-Inspected retained worker logs in `/root/code/evidence/aflow-dogfood-20260909/progress-title-review-20260911/`:
+## Verification
 
-- `web-build.log`: `npm --prefix apps/aflow_app/web run build` passed after locked dependency installation.
-- `progress-chromium.log`: `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_run_progress_browser.py` — 2 passed.
-- `progress-webkit.log`: the same command with `AFLOW_TEST_BROWSER=webkit` — 2 passed.
-- `full-server-chromium.log`: `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests` — 332 passed, 3 deprecation warnings.
-- Browser screenshots are retained in the external chromium, webkit and full-chromium directories.
+Independently ran:
 
-The worker receipt at `/root/code/agent_flow/.aflow/runs/20260911t073808z-419eef22/turns/turn-001/result.json` confirms return code zero, completed checkpoint, explicit Playwright cache, and transition to review. The execution-worktree-relative receipt is absent; the authoritative parent-run receipt was inspected. Review independently repeated the source audit and both working-tree and cumulative `git diff --check`; all passed. Existing successful suites were inspected rather than rerun for this narrow assertion-only change.
+```text
+uv run pytest -q tests/test_guard_recovery.py::test_cli_claim_records_acknowledged_successor tests/test_guard_recovery.py::test_cli_outcomes_never_enable_relaunch tests/test_guard_recovery.py::test_replacement_key_is_durable_and_distinct tests/test_aflowd.py::test_guard_replacement_uses_new_key_after_terminal_metadata_failure
+4 passed in 1.23s
+```
 
-## Approval and finalization
+Reused retained evidence for unchanged scope:
 
-Approved for one final handoff commit after the unchanged base, including this already-tracked reviewer record. The prior report was rotated byte-for-byte. No private plans or evidence are force-added, and there are no stale fix plans. Only one handoff DEVLOG entry exists, so no compaction is needed. Final approved SHA belongs in original-plan tracking, outside its own commit. Finalization verifies exactly one accumulated commit, identical reviewed implementation blobs, and clean tracked state; its receipt is retained in the external evidence directory.
+- Prior cumulative CP1 review: 52 metadata tests passed, 493 deselected,
+  27 subtests passed; worker evidence also records focused CLI, REST and MCP nodes.
+- CP2 v01: 56 snapshot/ownership/issue/docs tests and three installer/refresh
+  nodes passed, with Ruff and compilation checks.
+- CP2 v02: 31 recovery tests, one daemon replacement test, 24 ownership/docs
+  tests and three installer/refresh nodes passed; `uv run ruff check aflow` passed.
+- Current working and cumulative `git diff --check` passed.
 
-The original plan remains in place for the managed engine. Merge, origin/main publication, exact-SHA CI, live activation and worktree teardown remain subsequent engine/coordinator delivery stages and are not claimed by this review. Repository publication settings are origin/main.
+Evidence is retained outside the execution worktree at
+`/root/code/evidence/aflow-dogfood-20260909/issue9-review-20260911/`.
+Full suites belong to CI. No live services, providers, installed skills or
+real guarded runs were modified.
+
+## Disposition
+
+Approved for one unpublished accumulated handoff commit after the unchanged
+base. Finalization includes this tracked review report and one compact DEVLOG
+handoff entry, removes the superseded private fix overlay, preserves reviewed
+implementation blobs, and leaves original-plan tracking in place for engine
+finalization. The final approved SHA is recorded in original-plan tracking,
+not in a self-referential commit. Prior review was rotated byte-for-byte;
+ignored private plans/evidence are not force-added. Merge, origin/main
+publication, exact-SHA CI and live activation remain controller/coordinator
+owned and are not claimed by this local review.
 
 No material findings

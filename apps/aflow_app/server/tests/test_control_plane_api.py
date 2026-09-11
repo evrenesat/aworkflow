@@ -1783,6 +1783,60 @@ def test_plan_admission_rejection_is_safe_and_preallocation_stays_empty(
     assert not (root / ".aflow" / "last_run_id").exists()
 
 
+def test_rest_start_normalizes_blank_git_tracking_before_launch(control_client) -> None:
+    from aflow.plan import parse_git_tracking_metadata
+
+    client, root, units, monkeypatch = control_client
+    subprocess.run(
+        ("git", "checkout", "-b", "main"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    (root / "README.md").write_text("ready\n", encoding="utf-8")
+    plan_path = root / "plans" / "todo" / "test-plan.md"
+    plan_path.write_text(
+        "# Test\n\n"
+        "## Git Tracking\n\n"
+        "- Plan Branch: ``\n"
+        "- Pre-Handoff Base HEAD: ``\n\n"
+        "### [ ] Checkpoint 1: Test\n- [ ] step\n",
+        encoding="utf-8",
+    )
+    _commit_fixture_repository(root)
+    head_result = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected_head = head_result.stdout.strip()
+    monkeypatch.setattr("aflow.workflow._workflow_requires_git_tracking", lambda *_: True)
+    observed: dict[str, object] = {}
+
+    def prepare(request):
+        metadata = parse_git_tracking_metadata(
+            request.plan_path.read_text(encoding="utf-8")
+        )
+        assert metadata is not None
+        observed["branch"] = metadata.plan_branch
+        observed["base"] = metadata.pre_handoff_base_head
+        return _prepared(request)
+
+    monkeypatch.setattr("aflow.daemon.prepare_startup", prepare)
+    response = client.post(
+        f"/api/control-plane/projects/{PROJECT_ID}/runs",
+        headers={"Idempotency-Key": "rest-blank-git-tracking"},
+        json={"plan_path": "plans/todo/test-plan.md", "workflow_name": "managed"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["result"]["status"] == "running"
+    assert observed == {"branch": "main", "base": expected_head}
+    assert len(units.start_calls) == 1
+
+
 @pytest.mark.parametrize("failure", ["backup", "value"])
 def test_unclassified_preallocation_failure_is_generic_and_redacted(
     control_client,
