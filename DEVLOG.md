@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-09-11 — Gate immediate stop on selected-run control admission
+
+- The focused immediate-stop test now holds the admitted capabilities response,
+  proves that Stop now is unavailable before selected-run controls initialize,
+  releases the deferred response, and awaits the existing control-admission
+  boundary before opening confirmation.
+- The test still proves no owner-stop request before explicit confirmation,
+  exactly one request with the selected project/run/revision and idempotency
+  key, the immediate endpoint remains separate from boundary control, and the
+  terminal response is rendered. This is a test-ordering repair; no production
+  timing or timeout changed.
+- The active-plan command passed: `npm --prefix apps/aflow_app/web test --
+  --run src/components/RunDashboard.test.tsx -t 'keeps Stop now on the
+  immediate endpoint|requests a stop after'` (1 targeted test passed; the
+  remaining 101 cases were filtered). `git diff --check` and scoped status/
+  stat checks also passed. CI remains responsible for full suites; the
+  historical macOS scheduling cause remains unproven.
+
 ## 2026-09-11 — Stabilize stop and compact-header readiness checks
 
 - The compact-header test now holds `listProjects` with a deferred response,

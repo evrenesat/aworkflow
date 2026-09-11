@@ -1515,14 +1515,28 @@ describe('RunDashboard', () => {
 
   it('keeps Stop now on the immediate endpoint and confirms its terminal response', async () => {
     const stopped = { ...ownedRun, status: 'owner_stopped', launch_phase: 'owner_stopped' }
+    const capabilitiesReady = deferred<typeof capabilities>()
+    vi.mocked(api.getControlPlaneCapabilities).mockImplementationOnce(() => capabilitiesReady.promise)
     vi.mocked(api.ownerStopControlPlaneRun).mockResolvedValue(stopped)
     renderDashboard()
+
+    await waitFor(() => expect(api.getControlPlaneCapabilities).toHaveBeenCalledWith('control-project'))
+    expect(screen.queryByRole('button', { name: 'Stop now…', exact: true })).toBeNull()
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+    await act(async () => {
+      capabilitiesReady.resolve(capabilities)
+      await capabilitiesReady.promise
+    })
+    await waitForControlAdmission()
+
     fireEvent.click(await screen.findByRole('button', { name: 'Stop now…', exact: true }))
     await screen.findByText(/interrupts the active worker\/reviewer call/)
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Stop now', exact: true }))
     await waitFor(() => expect(api.ownerStopControlPlaneRun).toHaveBeenCalledWith(
       'control-project', 'run-owned', 1, expect.stringMatching(/^owner-stop-/),
     ))
+    expect(api.ownerStopControlPlaneRun).toHaveBeenCalledTimes(1)
     await screen.findByText(/Stop now recorded for run-owned/)
     expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()

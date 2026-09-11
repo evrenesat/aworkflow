@@ -1,5 +1,7 @@
 # Issue 6 — Cumulative review approved
 
+<!-- Earlier accepted review records retained below; latest review is appended. -->
+
 Review base: `7dbb8eb07db5b7bf49ab8706974ee41e6d77226a` (unchanged Pre-Handoff Base HEAD).
 Reviewed implementation HEAD: `dc86dd7f451a980c62482bf5cb83a2fa3df8f1fa`.
 Coverage: 1 new / 2 total commits, `cp1 v01` and `cp1 v02`, including all seven changed files and the original checkpoint requirements. The active overlay was `issue-6-modern-multiproject-acceptance-20260909-cp01-v01.md`.
@@ -228,5 +230,63 @@ for engine finalization and record final approved SHA there after committing.
 Verify one commit after base and clean tracked state. Publication, exact-SHA
 CI and live activation remain controller/coordinator delivery steps, not
 claimed by this local approval.
+
+No material findings
+
+
+---
+
+# CI immediate-stop admission — cumulative approval, 2026-09-11
+
+Original/active plan: `plans/in-progress/ci-immediate-stop-admission-20260911.md`.
+Branch: `aflow-ci-immediate-stop-admission-20260911-20260911-171136`.
+Unchanged base: `92c3f442cfd27f27f90f02acb2129eebf52500ec`.
+Reviewed HEAD: `933efe68f2ae31a7d6d298a1069d6f440ca68d34`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, the entire original checkpoint and
+both changed files. No prior findings or fix overlays belong to this handoff.
+
+No material findings under the admission gate, exclusions and proportionate-fix
+discipline. Deferred capabilities block loadDashboard admission; after release,
+the existing readiness helper observes Control team populated by selected-run
+initialization before the confirmation click. Required confirmation text/button,
+zero premature calls, one exact project/run/revision/idempotency request,
+terminal response and zero boundary calls remain asserted. Missing or wrong
+confirmation fails required lookups. Production source-change guards and
+concurrent stop/recovery interfaces are unchanged. No timeout inflation.
+Historical CI confirms missing confirmation; its precise scheduling cause
+remains unproven, as correctly recorded in DEVLOG.
+
+## State reconciliation
+
+The supplied relative artifact is absent; the completed result is under
+`/root/code/agent_flow/.aflow/runs/20260911t171135z-cbe60d6d/turns/turn-001/result.json`.
+Three unchecked steps belong to snapshot_before; snapshot_after has zero and
+DONE=true. Both current controller-root and worktree original plans have the
+checkpoint and all three steps checked. Code and verification support those
+marks. The manager-note discrepancy is absent from current plan copies.
+No controller recovery or durable-state mutation is required.
+
+## Verification
+
+```sh
+npm --prefix apps/aflow_app/web test -- --run src/components/RunDashboard.test.tsx -t 'keeps Stop now on the immediate endpoint|requests a boundary stop through revisioned control'
+git diff --check 92c3f442 HEAD
+```
+
+Independent result: 2 passed, 100 filtered; whitespace check passed. Evidence:
+`/root/code/evidence/aflow-dogfood-20260909/ci-immediate-stop-review-20260911/reviewer-component.log`.
+The worker's command passed one case; its second filter matches no current name,
+so review used the actual boundary-stop case. Reused accepted base App/build/
+Chromium/WebKit evidence recorded above; those sources are unchanged. No whole
+suite or build rerun. Private paths are absent from portable test code.
+
+## Finalization
+
+Approve one unpublished final handoff commit including this tracked review.
+Preserve both implementation blobs and the single DEVLOG entry. No fix plan is
+needed or created. Keep the ignored original plan for engine finalization and
+record the final approved SHA there after committing. Verify one commit after
+the unchanged base and clean tracked state. Publication, exact-SHA CI and live
+activation remain controller/coordinator steps, not claimed by this approval.
 
 No material findings
