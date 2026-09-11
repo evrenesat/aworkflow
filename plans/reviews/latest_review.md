@@ -1,35 +1,35 @@
-# Cumulative review — readable run browser contract
+# Semantic stop markers — final cumulative review, 2026-09-11
 
-Original and active plan: `plans/in-progress/readable-run-browser-contract-20260911.md`.
-Branch: `aflow-readable-run-browser-contract-20260911-20260911-031806`.
-Unchanged Pre-Handoff Base HEAD: `c786d8cbf27137b206549c021f5fcb825905c2d8`.
-Reviewed HEAD: `1399bf86b9e0c89e64c759b8a480b1d1b9a6efed`.
-Coverage: checkpoint 1, `cp1 v01`; 1 new commit, 1 total handoff commit.
+Original plan: `plans/in-progress/semantic-stop-markers-20260909.md`.
+Reviewed overlay: `plans/in-progress/semantic-stop-markers-20260909-cp01-v01.md`.
+Branch: `aflow-semantic-stop-markers-20260909-20260911-023056`.
+Unchanged review/squash base: `6d4eac1e7ca7cd65ebe9e8e84ea0c7677307f003`.
+Reviewed HEAD: `1b6ddf9777f8458fa6c1b40caee696c2a4286dbd`.
+Coverage: 1 new / 3 total commits; `cp1 v01` (`74d9d6a8`), `cp2 v01` (`9efb1f0d`), and follow-up `cp01 v01` (`1b6ddf97`). Both original checkpoints are complete. The review covered the full original base-to-HEAD implementation, not only the follow-up.
 
-## Findings and previous disposition
+## Previous finding disposition
 
-No material findings. This is the first review of this handoff; there are no prior findings or follow-up plans to resolve. The previous latest review belongs to earlier integrated work and is archived byte-for-byte.
+R1 (P2) resolved. Final assistant text remains intact, including JSON examples and Markdown fences. Explicit `semantic_output_source` metadata distinguishes actual structured transport from final text; successful session normalization persists `final_text`, and observers prefer the finalized result metadata. The original independent reproduction now preserves current stop and scope-pressure lines after JSON and rejects fenced historical controls. Runtime regression evidence also verifies normalized final text, retained raw transport, and matching analyzer/manager decisions.
 
-Reviewed the complete base-to-HEAD diff, all four changed files, surrounding fixture/navigation/startup code, shipped run presentation and metadata, and the original plan and UI guidelines. The tests independently assert literal readable titles, exact run IDs in detail metadata and URL, and exact All runs project/status/title/ID rows. Fixture39 remains covered through project history, and the visible global fixture00 is explicitly selected. The startup filename expectations were demonstrably stale and their correction is within the bounded audit scope.
+## Cumulative review
 
-The cumulative diff preserves viewport/theme coverage, geometry, scrolling, focus, hit tests, drafts, exact mutation payloads and revisions. It introduces no production changes, sleeps, timeout inflation, skips or relaxed geometry assertions. Source search for `run-detail h3|long-plan-39|Test project · Completed` found no remaining stale filename-as-run-heading assertions; remaining filename selectors refer to plan-editor rows or retained exact technical paths. Applied the material finding admission gate, exclusions and proportionate-fix discipline; no candidate requires a fix.
+Reviewed all 20 changed implementation, test, and documentation files and surrounding invocation, lifecycle/bootstrap/merge, session parsing, artifact persistence, analyzer, manager-context, and progress-summary paths. Reviewed real-stop priority, tool/prompt exclusion, command stderr compatibility, malformed/nonzero handling, raw artifact retention, historical recorded outcomes, workflow advance, and REST/MCP parity. No further candidate passed the material-code-review admission gate. Legacy records lacking an output contract retain the documented command-stream compatibility fallback; classification does not rewrite historical outcomes. No production code, active controllers, issue35 checkpoint authority, or concurrent UI presentation was changed by review.
 
 ## Verification
 
-External evidence root: `/root/code/evidence/aflow-dogfood-20260909/readable-run-browser-review-20260911/`.
+- `GIT_CONFIG_GLOBAL=/dev/null uv run pytest -q tests/test_runtime.py tests/test_manager_context.py tests/test_analyzer.py tests/test_harnesses.py tests/test_harness_sessions.py tests/test_scope_pressure.py tests/test_control_plane_repository.py`: 538 passed, 52 subtests passed.
+- `uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_mcp.py apps/aflow_app/server/tests/test_control_plane_api.py`: 59 passed, 3 existing deprecation warnings.
+- `uv run ruff check aflow`: passed.
+- Working-tree and cumulative `git diff --check`: passed.
+- Re-executed the prior source-selection proof: all three R1 cases now agree.
+- Worker turn-004 receipt records completed implementation, return code zero, and transition to review.
 
-- `npm --prefix apps/aflow_app/web run build`: passed (`reviewer-build.log`).
-- `AFLOW_TEST_BROWSER=chromium uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py apps/aflow_app/server/tests/test_run_navigation_browser.py apps/aflow_app/server/tests/test_plan_startup_browser.py --basetemp=/root/code/evidence/aflow-dogfood-20260909/readable-run-browser-review-20260911/reviewer-chromium`: 22 passed, 3 existing deprecation warnings (`reviewer-chromium.log`).
-- `AFLOW_TEST_BROWSER=webkit uv run --project apps/aflow_app/server pytest -q apps/aflow_app/server/tests/test_responsive_browser.py apps/aflow_app/server/tests/test_run_navigation_browser.py --basetemp=/root/code/evidence/aflow-dogfood-20260909/readable-run-browser-review-20260911/reviewer-webkit`: 21 passed, 3 existing deprecation warnings (`reviewer-webkit.log`).
-- `git diff --check c786d8cb..HEAD`: passed.
-- Inspected reviewer Chromium light and worker full2 WebKit dark 390×844 run-detail screenshots: readable Long plan 39 and exact responsive-run-39 are visible with header and Back controls. Physical mobile keyboard/browser-toolbar behavior was not exercised.
+Logs and proof are retained outside the execution worktree in `/root/code/evidence/aflow-dogfood-20260909/semantic-stop-review-20260911/`: `review2-core.log`, `review2-server.log`, `review2-ruff.log`, and `review2-source-selection-proof.json`. Tests use disposable fake runners and transport fixtures; no provider calls. The two-step workflow journey and authenticated REST/MCP parity are separate focused fixtures.
 
-The worker receipt is available at `/root/code/agent_flow/.aflow/runs/20260911t031806z-0ef5f8cf/turns/turn-001/result.json`; it is absent from this worktree. Final worker full2 logs report 21 passes per engine. Earlier failed diagnostic logs remain retained; they do not substitute for the fresh passing verification above.
+## Approval and handoff
 
-## Approval and lifecycle
+Approved for one accumulated handoff commit after the unchanged base. Finalization includes this tracked review record and the compacted DEVLOG entry, removes the resolved temporary overlay, and retains the original plan for engine finalization. The previous review is rotated byte-for-byte; ignored/untracked private plans and evidence are not force-added. Final approved SHA is recorded in original-plan tracking, avoiding a self-referential commit. Post-squash verification must show exactly one commit, identical implementation blobs, and clean tracked state; the verification receipt is retained in the external evidence directory.
 
-Approved for the single cumulative handoff squash after the unchanged base, including this intentional already-tracked reviewer record. Preserve all reviewed test and DEVLOG blobs. Only one DEVLOG entry belongs to this handoff, so no compaction is needed. No fix plan is required or created. Ignored private plan/evidence/archive files are not force-added. The original plan remains in place for engine finalization; final approved SHA, exact commit count, blob preservation and clean tracked-state verification are recorded there after the squash.
-
-The managed workflow owns merge/rm_worktree and publication to origin/main. Existing publication settings resolve to origin/main. Publication, exact-SHA CI and live activation are pending and are not claimed by this review. Shared tool installation, controllers and concurrent semantic-stop work were untouched.
+Engine/coordinator own subsequent merge, publication to origin/main, CI, live activation, and worktree teardown. Those delivery stages are not claimed by this review.
 
 No material findings

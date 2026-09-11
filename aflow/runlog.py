@@ -1100,6 +1100,8 @@ def _turn_result_payload(
     payload: dict[str, object] = {
         "turn_number": turn_number,
         "label": invocation.label,
+        "output_contract": invocation.output_contract,
+        "semantic_output_source": invocation.semantic_output_source,
         "status": status,
         "snapshot_before": snapshot_before.to_dict(),
         "snapshot_after": _snapshot_payload(snapshot_after),
@@ -1593,7 +1595,16 @@ def write_turn_artifacts_start(
     (turn_dir / "system-prompt.txt").write_text(invocation.system_prompt, encoding="utf-8")
     (turn_dir / "user-prompt.txt").write_text(invocation.user_prompt, encoding="utf-8")
     (turn_dir / "effective-prompt.txt").write_text(invocation.effective_prompt, encoding="utf-8")
-    _write_json(turn_dir / "argv.json", {"argv": list(invocation.argv), "label": invocation.label, "prompt_mode": invocation.prompt_mode})
+    _write_json(
+        turn_dir / "argv.json",
+        {
+            "argv": list(invocation.argv),
+            "label": invocation.label,
+            "prompt_mode": invocation.prompt_mode,
+            "output_contract": invocation.output_contract,
+            "semantic_output_source": invocation.semantic_output_source,
+        },
+    )
     _write_json(turn_dir / "env.json", {"env": dict(invocation.env)})
     result_payload = _turn_result_payload(
         turn_number=turn_number,

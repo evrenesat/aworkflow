@@ -618,8 +618,14 @@ def _turn_summary(turn_dir: Path, record: Mapping[str, Any]) -> str | None:
     if stdout:
         try:
             from aflow.manager_context import extract_semantic_result
+            from aflow.stop_marker import resolve_semantic_output_source
 
-            result = extract_semantic_result(stdout).result
+            result = extract_semantic_result(
+                stdout,
+                output_source=resolve_semantic_output_source(
+                    record.get("semantic_output_source"), artifact_dir=turn_dir
+                ),
+            ).result
         except (OSError, TypeError, ValueError):
             result = stdout
         result_text = _bounded_summary(result)

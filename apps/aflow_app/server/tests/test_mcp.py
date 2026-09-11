@@ -346,6 +346,84 @@ def test_mcp_run_context_progress_matches_authenticated_rest(mcp_client) -> None
     }
 
 
+def test_mcp_and_rest_context_ignore_agent_transcript_stop(mcp_client) -> None:
+    client, root, _, _ = mcp_client
+    plan = root / "plans" / "in-progress" / "semantic-stop-context.md"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text(
+        "# Semantic stop context\n\n"
+        "### [x] Checkpoint 1: Completed\n"
+        "- [x] completed step\n",
+        encoding="utf-8",
+    )
+    run_id = "semantic-stop-context"
+    run_dir = root / ".aflow" / "runs" / run_id
+    turn_dir = run_dir / "turns" / "turn-001"
+    turn_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "repo_root": str(root),
+                "plan_path": str(plan),
+                "original_plan_path": str(plan),
+                "active_plan_path": str(plan),
+                "workflow_name": "managed",
+                "current_step_name": "review",
+                "turns_completed": 1,
+                "end_reason": "done",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (turn_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "turn_number": 1,
+                "step_name": "review",
+                "step_role": "implementer",
+                "status": "completed",
+                "returncode": 0,
+                "output_contract": "agent",
+                "chosen_transition": "END",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (turn_dir / "stdout.txt").write_text(
+        "approved final response\n", encoding="utf-8"
+    )
+    stderr = (
+        "tool transcript: read an old review artifact\n"
+        "AFLOW_STOP: HISTORY: old persisted tool output\n"
+    )
+    stderr_path = turn_dir / "stderr.txt"
+    stderr_path.write_text(stderr, encoding="utf-8")
+    stderr_before = stderr_path.read_bytes()
+
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/context"
+    rest_context = client.get(
+        endpoint,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert rest_context.status_code == 200, rest_context.text
+    rest_payload = rest_context.json()
+    mcp_payload = _mcp_tool(
+        client,
+        "get_run_context",
+        {"project_id": PROJECT_ID, "run_id": run_id},
+    )
+
+    assert mcp_payload == rest_payload
+    manager_context = rest_payload["data"]["manager_context"]
+    assert manager_context["finished_turn"]["detected_stop"] == []
+    assert manager_context["finished_turn"]["status"] == "completed"
+    assert manager_context["finished_turn"]["raw_artifacts"][1]["byte_size"] == len(stderr_before)
+    assert stderr_path.read_bytes() == stderr_before
+
+
 def test_mcp_trailing_slash_mount_supports_discovery_resource_read_and_header_auth(
     mcp_client,
 ) -> None:

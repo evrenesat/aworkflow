@@ -16,6 +16,7 @@ from .preflight import (
     HarnessPreflightProbe,
     diagnostic_fields,
 )
+from ..stop_marker import STRUCTURED_TRANSPORT_OUTPUT_SOURCE
 
 
 REASONIX_SESSION_CONTROL_TIMEOUT_SECONDS = 60.0
@@ -446,6 +447,7 @@ class ReasonixAcpDriver:
             argv=(self.executable, "acp"),
             env={}, prompt_mode="owned-session", system_prompt=request.system_prompt,
             user_prompt=request.user_prompt, effective_prompt="",
+            semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
         )
 
     def execute_session(

@@ -91,6 +91,20 @@ referenced through its durable turn artifact. Historical rows are represented
 inline only by `history_summary`; the four compatibility collections remain
 empty while their complete details live in the manager-history artifact.
 
+Turn diagnostics keep semantic output separate from transport diagnostics. Each
+invocation records an output contract: agent turns derive current signals from
+the accepted final assistant response, including the existing structured-event
+extractor only when the captured source is explicitly recorded as
+`structured_transport`. Normal and normalized session turns record
+`semantic_output_source = final_text`, so JSON-looking prose is scanned intact;
+missing source metadata has the same compatible fallback. Command turns retain
+their stdout/stderr result semantics. Successful agent stderr can therefore
+contain tool history without becoming a current control message. Raw
+stdout/stderr artifacts remain unchanged and available for historical
+diagnosis; a recorded terminal outcome is not reclassified by a later observer
+pass. Raw session transport is retained separately in `transport.stdout` and is
+never guessed from or concatenated into final assistant text.
+
 - The exact UTF-8 inline user prompt targets 16 KiB (`MANAGER_INLINE_CONTEXT_TARGET_BYTES`)
   and is hard-limited to 40 KiB (`MANAGER_INLINE_CONTEXT_MAX_BYTES`) before any
   provider process starts. Optional latest-turn prose is removed if necessary;
@@ -648,7 +662,8 @@ automatic repartition.
 `AFLOW_SCOPE_PRESSURE: <reason>` is a nonterminal structural signal. With an
 enabled manager and a valid envelope it forces Full evaluation, but Full can
 still continue, upgrade, repartition, or stop. It is not a numeric size gate.
-A real `AFLOW_STOP` wins when both markers occur and remains terminal.
+A real `AFLOW_STOP` in the trusted semantic output wins when both markers occur
+and remains terminal.
 Manager-disabled workflows fail clearly on real scope pressure rather than
 silently ignoring it.
 

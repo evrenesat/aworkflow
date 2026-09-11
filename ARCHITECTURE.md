@@ -219,7 +219,14 @@ Turn-text diagnostics preserve the stream and structured outcome boundary:
 semantic stdout is scanned for text signals, successful zero-return stderr may
 be a harness transcript and remains untrusted context, and stderr becomes a
 failure diagnostic only for a nonzero return code or a failure-like turn
-status. Explicit `AFLOW_STOP` parsing remains independent on both streams.
+status. Each invocation records an output contract: agent turns use the
+accepted final assistant response (including the existing structured-event
+extractor only for an explicit `structured_transport` source); normalized
+session results record `final_text` so JSON-looking assistant prose remains
+intact, and absent source metadata falls back to that interpretation. Command
+turns retain stdout/stderr result semantics. Explicit `AFLOW_STOP` parsing uses
+that trusted semantic output; raw streams remain unchanged diagnostic evidence,
+with raw session transport retained separately in `transport.stdout`.
 Durable plan, branch, worktree, boundary, and turn-outcome fields override
 contradictory transcript text. Live schema-v3 contexts keep plan and
 checkpoint bodies out of both Lite and Full prompts; both levels use the
@@ -553,7 +560,12 @@ classifier while retaining its backup-plan and active-plan allowances.
    f. Before the harness runs, copy a non-original active plan into `plans/backups/` (content-aware, collision-safe naming shared with the startup original-plan backup; identical content deduplicates and changed content gains a `_vNN` version while existing backups and unrelated files are preserved). Original active plans skip this per-turn path because they already have the startup backup, and a missing active plan is skipped, while backup I/O failures fail the turn before the harness starts.
    g. Run the agent CLI as a subprocess, streaming stdout/stderr. Process-creation `OSError`s are converted into bounded nonzero results (127 for a missing executable, 126 for other launch failures) before this normal harness-result path continues, so the controller can finalize its existing artifacts and terminal metadata.
    h. For worktree flows, sync the original plan back from the worktree to the primary checkout immediately after the harness returns (before parsing post-turn state). This ensures the primary copy reflects any edits the harness made, even if the harness exited with non-zero status.
-   i. Before reloading the plan, scan stdout and stderr for a line starting with `AFLOW_STOP:`. If found, fail the run immediately with the extracted reason without entering the plan-reload or transition path.
+   i. Before reloading the plan, inspect the invocation's trusted semantic
+      output for a line starting with `AFLOW_STOP:`. Agent turns use the
+      accepted final assistant response and command turns use their result
+      streams. If found, fail the run immediately with the extracted reason
+      without entering the plan-reload or transition path; raw stdout/stderr
+      artifacts are preserved unchanged.
    j. Reload the plan again to get the post-turn snapshot. If the plan is left in an inconsistent checkpoint state (heading marked complete but unchecked steps remain) and the harness exited cleanly, a retry may be scheduled instead of failing immediately (see `retry_inconsistent_checkpoint_state`).
    k. Evaluate `go` transitions using condition symbols (`DONE`, `NEW_PLAN_EXISTS`, `MAX_TURNS_REACHED`).
    l. Finalize turn artifacts with the active plan that rendered the current

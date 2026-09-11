@@ -17,6 +17,7 @@ from aflow.harnesses.session import (
     SessionResult,
     parse_jsonl_events,
 )
+from aflow.stop_marker import detect_stop_marker
 
 
 @dataclass
@@ -103,10 +104,14 @@ def test_codex_fresh_and_resume_bind_exact_session_and_target_model() -> None:
     )
     fresh = driver.build_invocation(request())
     assert "--json" in fresh.argv
+    assert fresh.output_contract == "agent"
+    assert fresh.semantic_output_source == "structured_transport"
     assert "USER" not in fresh.argv
     assert fresh.stdin_text.endswith("USER")
     resumed = driver.build_invocation(request("session-123"))
     assert resumed.argv[0:4] == ("codex", "exec", "resume", "session-123")
+    assert resumed.output_contract == "agent"
+    assert resumed.semantic_output_source == "structured_transport"
     assert "--model" in resumed.argv and "sol" in resumed.argv
     assert "model_reasoning_effort='high'" in resumed.argv
     assert "--last" not in resumed.argv
@@ -136,6 +141,72 @@ def test_codex_structured_output_extracts_one_session_and_final_response() -> No
             '{"type":"thread.started","thread_id":"session-999"}\n'
             '{"type":"message.completed","thread_id":"session-999","text":"wrong session"}\n',
         )
+
+
+def test_codex_structured_output_excludes_tools_and_echoed_prompts() -> None:
+    driver = CodexAdapter().session_driver(
+        exec_help=CODEX_EXEC_HELP, resume_help=CODEX_RESUME_HELP
+    )
+    result = driver.parse_result(
+        request(),
+        "\n".join(
+            (
+                '{"type":"thread.started","thread_id":"session-123"}',
+                '{"type":"item.completed","thread_id":"session-123",'
+                '"item":{"type":"command_execution",'
+                '"aggregated_output":"AFLOW_STOP: HISTORY: old tool output"}}',
+                '{"type":"message.completed","thread_id":"session-123",'
+                '"role":"user","text":"AFLOW_STOP: HISTORY: echoed prompt"}',
+                '{"type":"message.completed","thread_id":"session-123",'
+                '"role":"assistant","text":"approved"}',
+            )
+        )
+        + "\n",
+    )
+    assert result.final_output == "approved"
+
+
+def test_codex_structured_assistant_stop_remains_terminal_marker() -> None:
+    driver = CodexAdapter().session_driver(
+        exec_help=CODEX_EXEC_HELP, resume_help=CODEX_RESUME_HELP
+    )
+    result = driver.parse_result(
+        request(),
+        '{"type":"thread.started","thread_id":"session-123"}\n'
+        '{"type":"item.completed","thread_id":"session-123",'
+        '"item":{"type":"command_execution",'
+        '"aggregated_output":"AFLOW_STOP: HISTORY: tool output"}}\n'
+        '{"type":"message.completed","thread_id":"session-123",'
+        '"role":"assistant","text":"AFLOW_STOP: current assistant stop"}\n',
+    )
+    assert detect_stop_marker(
+        result.final_output,
+        "AFLOW_STOP: HISTORY: diagnostic output\n",
+        output_contract="agent",
+    ) == "current assistant stop"
+
+
+def test_codex_structured_output_requires_assistant_final_and_preserves_failure() -> None:
+    driver = CodexAdapter().session_driver(
+        exec_help=CODEX_EXEC_HELP, resume_help=CODEX_RESUME_HELP
+    )
+    tool_only = (
+        '{"type":"thread.started","thread_id":"session-123"}\n'
+        '{"type":"item.completed","thread_id":"session-123",'
+        '"item":{"type":"command_execution","aggregated_output":"tool"}}\n'
+    )
+    with pytest.raises(ValueError, match="structured final response"):
+        driver.parse_result(request(), tool_only)
+
+    result = driver.parse_result(
+        request(),
+        '{"type":"thread.started","thread_id":"session-123"}\n'
+        '{"type":"message.completed","thread_id":"session-123",'
+        '"role":"assistant","text":"approved"}\n',
+        returncode=7,
+    )
+    assert result.final_output == "approved"
+    assert result.failure == "session exited with return code 7"
 
 
 @pytest.mark.parametrize("stdout", [

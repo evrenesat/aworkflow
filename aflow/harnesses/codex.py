@@ -9,6 +9,7 @@ from .session import (
     SessionResult,
     parse_structured_result,
 )
+from ..stop_marker import STRUCTURED_TRANSPORT_OUTPUT_SOURCE
 
 
 def probe_codex_capabilities(exec_help: str, resume_help: str) -> SessionCapabilities:
@@ -102,6 +103,7 @@ class CodexSessionDriver:
             user_prompt=request.user_prompt,
             effective_prompt=effective_prompt,
             stdin_text=effective_prompt,
+            semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
         )
 
     def parse_result(

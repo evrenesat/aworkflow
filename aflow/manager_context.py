@@ -21,10 +21,22 @@ from .analyzer import (
     extract_text_signals,
     snapshot_signature,
 )
+from .harnesses.session import (
+    extract_structured_final_assistant_text,
+    select_agent_semantic_output,
+)
 from .plan import PlanParseError, load_plan_tolerant, parse_plan_text
 from .repartition import parse_envelope_bytes
 from .scope_pressure import has_scope_pressure
-from .stop_marker import extract_stop_markers
+from .stop_marker import (
+    AGENT_OUTPUT_CONTRACT,
+    FINAL_TEXT_OUTPUT_SOURCE,
+    OutputContract,
+    SemanticOutputSource,
+    extract_trusted_stop_markers,
+    resolve_output_contract,
+    resolve_semantic_output_source,
+)
 
 
 MANAGER_CONTEXT_SCHEMA_VERSION = 1
@@ -231,58 +243,19 @@ def _bounded(text: str) -> str:
     return text[:DIAGNOSTIC_LIMIT] + "\n[diagnostic excerpt truncated]"
 
 
-def _text_content(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        parts = [_text_content(item) for item in value]
-        joined = "".join(part for part in parts if part)
-        return joined or None
-    if isinstance(value, dict):
-        for key in ("text", "content", "output_text"):
-            candidate = _text_content(value.get(key))
-            if candidate:
-                return candidate
-    return None
-
-
-def _structured_final_assistant_result(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        if value.get("role") == "assistant":
-            candidate = _text_content(value.get("content", value.get("text")))
-            if candidate:
-                return candidate
-        for key in ("result", "final", "final_output", "output", "message", "item"):
-            candidate = _structured_final_assistant_result(value.get(key))
-            if candidate:
-                return candidate
-        candidates = [_structured_final_assistant_result(item) for item in value.get("messages", [])] if isinstance(value.get("messages"), list) else []
-        return next((item for item in reversed(candidates) if item), None)
-    if isinstance(value, list):
-        candidates = [_structured_final_assistant_result(item) for item in value]
-        return next((item for item in reversed(candidates) if item), None)
-    return None
-
-
-def extract_semantic_result(stdout: str) -> SemanticTurnOutcome:
-    """Extract a complete final assistant response from common JSON/event streams."""
-    candidates: list[Any] = []
-    try:
-        candidates.append(json.loads(stdout))
-    except json.JSONDecodeError:
-        pass
-    for line in stdout.splitlines():
-        try:
-            candidates.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    for candidate in reversed(candidates):
-        result = _structured_final_assistant_result(candidate)
-        if result:
-            return SemanticTurnOutcome("structured_stream", result, False)
-    if candidates:
+def extract_semantic_result(
+    stdout: str,
+    *,
+    output_source: SemanticOutputSource = FINAL_TEXT_OUTPUT_SOURCE,
+) -> SemanticTurnOutcome:
+    """Extract assistant text only when the artifact declares transport."""
+    output_source = resolve_semantic_output_source(output_source)
+    if output_source == FINAL_TEXT_OUTPUT_SOURCE:
+        return SemanticTurnOutcome("plain_text", stdout, False)
+    structured = extract_structured_final_assistant_text(stdout)
+    if structured is not None:
+        if structured:
+            return SemanticTurnOutcome("structured_stream", structured, False)
         return SemanticTurnOutcome("unrecognized_structured_stream", stdout, True)
     return SemanticTurnOutcome("plain_text", stdout, False)
 
@@ -343,6 +316,73 @@ def _load_turns(run_dir: Path) -> list[dict[str, Any]]:
         result["_turn_dir"] = turn_dir
         turns.append(result)
     return turns
+
+
+def _turn_output_contract(turn: Mapping[str, Any]) -> OutputContract:
+    """Read the explicit semantic-stream contract, with a legacy fallback."""
+    turn_dir = turn.get("_turn_dir")
+    artifact_dir = Path(turn_dir) if isinstance(turn_dir, (str, Path)) else None
+    return resolve_output_contract(
+        turn.get("output_contract"), artifact_dir=artifact_dir
+    )
+
+
+def _turn_semantic_output_source(turn: Mapping[str, Any]) -> SemanticOutputSource:
+    """Resolve the format of the persisted stdout artifact."""
+    turn_dir = turn.get("_turn_dir")
+    artifact_dir = Path(turn_dir) if isinstance(turn_dir, (str, Path)) else None
+    return resolve_semantic_output_source(
+        turn.get("semantic_output_source"), artifact_dir=artifact_dir
+    )
+
+
+def _select_turn_semantic_output(
+    turn: Mapping[str, Any],
+    stdout: str,
+    *,
+    output_contract: OutputContract,
+) -> str:
+    if output_contract != AGENT_OUTPUT_CONTRACT:
+        return stdout
+    return select_agent_semantic_output(
+        stdout, output_source=_turn_semantic_output_source(turn)
+    )
+
+
+def _extract_turn_semantic_result(
+    turn: Mapping[str, Any],
+    stdout: str,
+    *,
+    output_contract: OutputContract,
+) -> SemanticTurnOutcome:
+    if output_contract != AGENT_OUTPUT_CONTRACT:
+        return extract_semantic_result(stdout)
+    return extract_semantic_result(
+        stdout, output_source=_turn_semantic_output_source(turn)
+    )
+
+
+def _turn_signal_evidence(
+    turn: Mapping[str, Any],
+    semantic_stdout: str,
+    stderr: str,
+    *,
+    output_contract: OutputContract,
+) -> list[Any]:
+    """Classify selected semantic text while retaining command stream parity."""
+    if output_contract == AGENT_OUTPUT_CONTRACT:
+        return classify_turn_text_signals(
+            semantic_stdout,
+            stderr,
+            turn.get("status"),
+            turn.get("returncode"),
+        )
+    return classify_turn_text_signals(
+        "\n".join((semantic_stdout, stderr)),
+        "",
+        turn.get("status"),
+        turn.get("returncode"),
+    )
 
 
 def _path_from_metadata(run_dir: Path, value: Any) -> Path | None:
@@ -1439,7 +1479,15 @@ def _duration_seconds(turn: dict[str, Any]) -> float | None:
 
 def _compact_turn(run_dir: Path, turn: dict[str, Any]) -> CompactRunRecord:
     turn_dir = Path(turn["_turn_dir"])
-    semantic = extract_semantic_result(_read_text(turn_dir / "stdout.txt") or str(turn.get("stdout", "")))
+    stdout = _read_text(turn_dir / "stdout.txt") or str(turn.get("stdout", ""))
+    stderr = _read_text(turn_dir / "stderr.txt") or str(turn.get("stderr", ""))
+    output_contract = _turn_output_contract(turn)
+    semantic_stdout = _select_turn_semantic_output(
+        turn, stdout, output_contract=output_contract
+    )
+    semantic = _extract_turn_semantic_result(
+        turn, stdout, output_contract=output_contract
+    )
     before = snapshot_signature(turn.get("snapshot_before"))
     after = snapshot_signature(turn.get("snapshot_after"))
     return CompactRunRecord(
@@ -1451,7 +1499,12 @@ def _compact_turn(run_dir: Path, turn: dict[str, Any]) -> CompactRunRecord:
         selector=turn.get("selector") if isinstance(turn.get("selector"), str) else None,
         semantic_summary=_bounded(semantic.result),
         plan_delta=before is not None and after is not None and before != after,
-        signals=tuple(sorted(set(extract_text_signals(semantic.result) + (["explicit_stop"] if extract_stop_markers(semantic.result) else [])))),
+        signals=tuple(sorted(set(
+            extract_text_signals(semantic_stdout)
+            + (["explicit_stop"] if extract_trusted_stop_markers(
+                semantic_stdout, stderr, output_contract=output_contract
+            ) else [])
+        ))),
         routing={"chosen_transition": turn.get("chosen_transition"), "recovery_action": turn.get("recovery_action")},
     )
 
@@ -1565,18 +1618,24 @@ def _full_v3_workflow_history_records(
         turn_dir = Path(turn["_turn_dir"])
         stdout = _read_text(turn_dir / "stdout.txt") or str(turn.get("stdout", ""))
         stderr = _read_text(turn_dir / "stderr.txt") or str(turn.get("stderr", ""))
-        semantic = extract_semantic_result(stdout)
+        output_contract = _turn_output_contract(turn)
+        semantic_stdout = _select_turn_semantic_output(
+            turn, stdout, output_contract=output_contract
+        )
+        semantic = _extract_turn_semantic_result(
+            turn, stdout, output_contract=output_contract
+        )
         is_reviewer = turn.get("step_role") == "reviewer"
         record["semantic_summary"] = _v3_reference_safe_semantic_result(
             semantic, reviewer=is_reviewer
         )
         record["semantic_extraction"] = semantic.extraction
         record["semantic_fallback"] = semantic.fallback
-        signal_evidence = classify_turn_text_signals(
-            stdout,
+        signal_evidence = _turn_signal_evidence(
+            turn,
+            semantic_stdout,
             stderr,
-            turn.get("status"),
-            turn.get("returncode"),
+            output_contract=output_contract,
         )
         record["diagnostics"] = {
             "signals": sorted({item.name for item in signal_evidence}),
@@ -1680,10 +1739,16 @@ def _full_v3_latest_turn(
     stderr: str,
 ) -> dict[str, Any]:
     """Return detailed current-turn semantics without transcript bodies."""
-    semantic = extract_semantic_result(stdout)
+    output_contract = _turn_output_contract(finished)
+    semantic_stdout = _select_turn_semantic_output(
+        finished, stdout, output_contract=output_contract
+    )
+    semantic = _extract_turn_semantic_result(
+        finished, stdout, output_contract=output_contract
+    )
     is_reviewer = finished.get("step_role") == "reviewer"
     signal_evidence = classify_turn_text_signals(
-        stdout,
+        semantic_stdout,
         stderr,
         finished.get("status"),
         finished.get("returncode"),
@@ -1955,7 +2020,13 @@ def build_manager_context(
     finished_dir = Path(finished["_turn_dir"])
     stdout = _read_text(finished_dir / "stdout.txt") or str(finished.get("stdout", ""))
     stderr = _read_text(finished_dir / "stderr.txt") or str(finished.get("stderr", ""))
-    semantic = extract_semantic_result(stdout)
+    output_contract = _turn_output_contract(finished)
+    semantic_stdout = _select_turn_semantic_output(
+        finished, stdout, output_contract=output_contract
+    )
+    semantic = _extract_turn_semantic_result(
+        finished, stdout, output_contract=output_contract
+    )
     legacy_boundary = (
         boundary_was_supplied
         and "context_schema_version" not in boundary
@@ -2122,10 +2193,20 @@ def build_manager_context(
         "snapshot_changed": snapshot_signature(finished.get("snapshot_before")) != snapshot_signature(finished.get("snapshot_after")),
         "proposed_transition": boundary.get("proposed_transition", finished.get("chosen_transition")),
         "recovery": finished.get("recovery_action"),
-        "conditions": finished.get("conditions"), "detected_stop": extract_stop_markers(stdout) + extract_stop_markers(stderr),
+        "conditions": finished.get("conditions"),
+        "detected_stop": extract_trusted_stop_markers(
+            semantic_stdout, stderr, output_contract=output_contract
+        ),
         "diagnostics": {
-            "signals": sorted(set(extract_text_signals("\n".join((stdout, stderr))))),
-            "stdout_excerpt": _bounded(stdout),
+            "signals": sorted({
+                item.name for item in _turn_signal_evidence(
+                    finished,
+                    semantic_stdout,
+                    stderr,
+                    output_contract=output_contract,
+                )
+            }),
+            "stdout_excerpt": _bounded(semantic_stdout),
             "stderr_excerpt": _bounded(stderr),
         },
         "raw_artifacts": raw_artifacts,
@@ -2191,7 +2272,7 @@ def build_manager_context(
         return json.loads(json.dumps(context.to_dict(), sort_keys=True))
     # --- Schema v2 additions ---
     signal_evidence = classify_turn_text_signals(
-        stdout,
+        semantic_stdout,
         stderr,
         finished.get("status"),
         finished.get("returncode"),
@@ -2225,7 +2306,9 @@ def build_manager_context(
                 diagnostics["stdout_excerpt"] = (
                     "Reviewer output withheld from Lite; see the review stdout artifact."
                 )
-    scope_pressure = has_scope_pressure(stdout, stderr)
+    scope_pressure = has_scope_pressure(
+        semantic_stdout, stderr, output_contract=output_contract
+    )
     # Expose scope pressure in controller_state so level selection can force Full.
     context.controller_state["scope_pressure_detected"] = scope_pressure
     # Also carry the exact scope-pressure reason from the boundary when present.

@@ -4452,6 +4452,103 @@ class RunlogSingleRunDirTests(unittest.TestCase):
 
 class WorkflowArtifactTests(unittest.TestCase):
 
+    def test_normalized_session_final_text_remains_observer_semantic_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            _write_plan(plan_path, _VALID_PLAN)
+            final_output = (
+                "Diagnostic details:\n"
+                "```json\n"
+                '{"ok":false}\n'
+                "```\n"
+                "AFLOW_STOP: needs owner input\n"
+            )
+            raw_transport = "\n".join(
+                (
+                    json.dumps(
+                        {"type": "thread.started", "thread_id": "session-123"}
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message.completed",
+                            "thread_id": "session-123",
+                            "role": "assistant",
+                            "text": final_output,
+                        }
+                    ),
+                )
+            ) + "\n"
+            workflow_config = WorkflowUserConfig(
+                roles={"worker": "codex.default"},
+                harnesses={
+                    "codex": WorkflowHarnessConfig(
+                        profiles={"default": HarnessProfileConfig(model="sol")}
+                    )
+                },
+                workflows={
+                    "simple": WorkflowConfig(
+                        steps={
+                            "implement_plan": WorkflowStepConfig(
+                                role="worker",
+                                prompts=("p",),
+                                go=(GoTransition(to="END"),),
+                            )
+                        },
+                        first_step="implement_plan",
+                    )
+                },
+                prompts={"p": "Work."},
+            )
+            session_driver = CodexAdapter().session_driver(
+                exec_help="codex exec --json resume",
+                resume_help="Usage: codex exec resume [SESSION_ID] --model",
+            )
+
+            def runner(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=raw_transport, stderr=""
+                )
+
+            with pytest.raises(WorkflowError) as ctx:
+                run_workflow(
+                    ControllerConfig(
+                        repo_root=repo_root, plan_path=plan_path, max_turns=2
+                    ),
+                    workflow_config,
+                    "simple",
+                    config_dir=repo_root,
+                    snapshot_config=False,
+                    adapter=CodexAdapter(),
+                    session_driver=session_driver,
+                    runner=runner,
+                )
+
+            assert ctx.value.run_dir is not None
+            turn_dir = ctx.value.run_dir / "turns" / "turn-001"
+            result_payload = json.loads(
+                (turn_dir / "result.json").read_text(encoding="utf-8")
+            )
+            assert result_payload["semantic_output_source"] == "final_text"
+            assert (turn_dir / "stdout.txt").read_text(encoding="utf-8") == final_output
+            assert (turn_dir / "transport.stdout").read_text(encoding="utf-8") == raw_transport
+
+            from aflow.analyzer import analyze_single_run
+
+            analysis = analyze_single_run(
+                run_dir=ctx.value.run_dir,
+                runs_root=repo_root / ".aflow" / "runs",
+                selection="explicit_run_id",
+                include_noise=True,
+            )
+            assert analysis["run"]["aflow_stop_messages"] == ["needs owner input"]
+            from aflow.manager_context import build_manager_context
+
+            context = build_manager_context(ctx.value.run_dir)
+            assert context["finished_turn"]["detected_stop"] == [
+                "needs owner input"
+            ]
+
     def test_owned_session_exception_terminalizes_turn_and_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -11795,7 +11892,7 @@ class StopMarkerTests(unittest.TestCase):
             assert 'terminal owner boundary' in str(ctx.value)
             assert 'validated immutable envelope' not in str(ctx.value)
 
-    def test_stop_marker_in_stderr_fails_workflow(self) -> None:
+    def test_command_stop_marker_in_stderr_fails_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             plan_path = repo_root / 'plan.md'
@@ -11809,13 +11906,149 @@ class StopMarkerTests(unittest.TestCase):
                     stderr='AFLOW_STOP: unrelated changes block this step\n',
                 )
 
+            class CommandResultAdapter(CodexAdapter):
+                def build_invocation(self, **kwargs):
+                    return replace(
+                        super().build_invocation(**kwargs),
+                        output_contract="command",
+                    )
+
             with pytest.raises(WorkflowError) as ctx:
                 run_workflow(
                     ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
-                    wf_config, 'simple', config_dir=repo_root, adapter=CodexAdapter(), runner=runner,
+                    wf_config, 'simple', config_dir=repo_root,
+                    adapter=CommandResultAdapter(), runner=runner,
                         snapshot_config=False,
                 )
             assert 'unrelated changes block this step' in str(ctx.value)
+
+    def test_agent_stderr_tool_history_does_not_stop_successful_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            wf_config = self._make_wf_config()
+            stderr = (
+                'tool history: read an old review artifact\n'
+                'AFLOW_STOP: HISTORY: old stop from file\n'
+            )
+
+            def runner(argv, **kwargs):
+                _write_plan(plan_path, _COMPLETE_PLAN)
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout='approved final response\n', stderr=stderr
+                )
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=5),
+                wf_config,
+                'simple',
+                config_dir=repo_root,
+                adapter=CodexAdapter(),
+                runner=runner,
+                snapshot_config=False,
+            )
+
+            assert result.turns_completed == 1
+            assert result.final_snapshot.is_complete
+            turn_dir = result.run_dir / 'turns' / 'turn-001'
+            assert (turn_dir / 'stderr.txt').read_text(encoding='utf-8') == stderr
+            result_json = json.loads(
+                (turn_dir / 'result.json').read_text(encoding='utf-8')
+            )
+            assert result_json['output_contract'] == 'agent'
+
+    def test_fake_codex_review_journey_keeps_next_step_and_analysis_truthful(self) -> None:
+        from aflow.analyzer import analyze_single_run
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / 'plan.md'
+            _write_plan(plan_path, _VALID_PLAN)
+            complete_stderr = (
+                'tool transcript: opened an old review artifact\n'
+                'AFLOW_STOP: HISTORY: old stop from file\n'
+            )
+            calls: list[str] = []
+
+            workflow = WorkflowConfig(
+                steps={
+                    'implement': WorkflowStepConfig(
+                        role='worker',
+                        prompts=('p',),
+                        go=(GoTransition(to='review', when='DONE'),),
+                    ),
+                    'review': WorkflowStepConfig(
+                        role='reviewer',
+                        prompts=('p',),
+                        go=(GoTransition(to='END', when='DONE'),),
+                    ),
+                },
+                first_step='implement',
+            )
+            config = WorkflowUserConfig(
+                roles={'worker': 'codex.worker', 'reviewer': 'codex.reviewer'},
+                harnesses={
+                    'codex': WorkflowHarnessConfig(profiles={
+                        'worker': HarnessProfileConfig(model='worker'),
+                        'reviewer': HarnessProfileConfig(model='reviewer'),
+                    })
+                },
+                workflows={'journey': workflow},
+                prompts={'p': 'Work from {ACTIVE_PLAN_PATH}.'},
+            )
+
+            def runner(argv, **kwargs):
+                model = argv[argv.index('--model') + 1]
+                calls.append(model)
+                if model == 'worker':
+                    _write_plan(plan_path, _COMPLETE_PLAN)
+                    return subprocess.CompletedProcess(
+                        argv, 0, 'approved implementation\n', complete_stderr
+                    )
+                return subprocess.CompletedProcess(
+                    argv, 0, 'approved review\n', 'review diagnostics\n'
+                )
+
+            result = run_workflow(
+                ControllerConfig(repo_root=repo_root, plan_path=plan_path, max_turns=3),
+                config,
+                'journey',
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert calls == ['worker', 'reviewer']
+            assert result.turns_completed == 2
+            assert result.final_snapshot.is_complete
+            assert result.end_reason == 'done'
+            first_turn = result.run_dir / 'turns' / 'turn-001'
+            assert (first_turn / 'stderr.txt').read_text(encoding='utf-8') == complete_stderr
+            first_result = json.loads(
+                (first_turn / 'result.json').read_text(encoding='utf-8')
+            )
+            second_result = json.loads(
+                (result.run_dir / 'turns' / 'turn-002' / 'result.json').read_text(
+                    encoding='utf-8'
+                )
+            )
+            assert first_result['chosen_transition'] == 'review'
+            assert first_result['output_contract'] == 'agent'
+            assert second_result['chosen_transition'] == 'END'
+
+            analysis = analyze_single_run(
+                run_dir=result.run_dir,
+                runs_root=repo_root / '.aflow' / 'runs',
+                selection='explicit_run_id',
+                include_noise=True,
+            )
+            assert analysis['run']['aflow_stop_messages'] == []
+            assert analysis['run']['outcome'] == {
+                'kind': 'completed',
+                'status': 'completed',
+            }
 
     def test_stop_marker_writes_run_json_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -13673,7 +13906,11 @@ class LifecycleBootstrapTests(unittest.TestCase):
                 if model.startswith("manager-"):
                     manager_calls += 1
                 return subprocess.CompletedProcess(
-                    argv, 0, "AFLOW_SCOPE_PRESSURE: no active scope", ""
+                    argv,
+                    0,
+                    "Diagnostic details:\n```json\n{\"ok\":false}\n```\n"
+                    "AFLOW_SCOPE_PRESSURE: no active scope",
+                    "",
                 )
 
             with pytest.raises(WorkflowError, match="no active implementation scope is open"):

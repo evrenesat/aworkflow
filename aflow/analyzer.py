@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .runlog import resolve_last_run_id
-from .stop_marker import extract_stop_markers
+from .harnesses.session import select_agent_semantic_output
+from .stop_marker import (
+    AGENT_OUTPUT_CONTRACT,
+    extract_stop_markers,
+    extract_trusted_stop_markers,
+    resolve_output_contract,
+    resolve_semantic_output_source,
+)
 
 
 TEXT_SIGNAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -316,10 +323,22 @@ def analyze_turn(turn: dict[str, Any]) -> dict[str, Any]:
     turn_dir = Path(turn["_turn_dir"])
     stdout_text = read_turn_stream(turn_dir, turn, filename="stdout.txt", inline_key="stdout")
     stderr_text = read_turn_stream(turn_dir, turn, filename="stderr.txt", inline_key="stderr")
-    combined_text = "\n".join(part for part in (stdout_text, stderr_text) if part)
+    output_contract = resolve_output_contract(
+        turn.get("output_contract"), artifact_dir=turn_dir
+    )
+    semantic_output_source = resolve_semantic_output_source(
+        turn.get("semantic_output_source"), artifact_dir=turn_dir
+    )
+    semantic_stdout = (
+        select_agent_semantic_output(
+            stdout_text, output_source=semantic_output_source
+        )
+        if output_contract == AGENT_OUTPUT_CONTRACT
+        else stdout_text
+    )
 
     signal_evidence = classify_turn_text_signals(
-        stdout_text,
+        semantic_stdout,
         stderr_text,
         turn.get("status"),
         turn.get("returncode"),
@@ -339,8 +358,19 @@ def analyze_turn(turn: dict[str, Any]) -> dict[str, Any]:
     if recovery is not None:
         signals.update(_recovery_signal_names(recovery))
 
-    aflow_stop_messages = extract_aflow_stop(stdout_text) + extract_aflow_stop(stderr_text)
-    highlights = summarize_text_lines(combined_text)
+    aflow_stop_messages = extract_trusted_stop_markers(
+        semantic_stdout, stderr_text, output_contract=output_contract
+    )
+    diagnostic_parts = [semantic_stdout]
+    if (
+        output_contract != AGENT_OUTPUT_CONTRACT
+        or turn.get("returncode") not in (None, 0)
+        or turn.get("status") in FAILURE_LIKE_TURN_STATUSES
+    ):
+        diagnostic_parts.append(stderr_text)
+    highlights = summarize_text_lines(
+        "\n".join(part for part in diagnostic_parts if part)
+    )
     if turn.get("error"):
         highlights = summarize_reason_text(str(turn.get("error"))) + highlights
     if recovery is not None and recovery.get("reason"):

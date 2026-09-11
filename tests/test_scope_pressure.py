@@ -60,6 +60,12 @@ def test_falls_back_to_stderr() -> None:
     assert result == "from stderr"
 
 
+def test_agent_contract_ignores_diagnostic_stderr() -> None:
+    stderr = f"tool transcript\n{SCOPE_PRESSURE_SENTINEL_PREFIX} HISTORY: old tool output"
+    assert detect_scope_pressure("approved", stderr, output_contract="agent") is None
+    assert has_scope_pressure("approved", stderr, output_contract="agent") is False
+
+
 def test_has_scope_pressure_true() -> None:
     assert has_scope_pressure(
         f"{SCOPE_PRESSURE_SENTINEL_PREFIX} real", ""

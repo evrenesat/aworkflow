@@ -24,7 +24,10 @@ from aflow.manager import (
     build_manager_prompts,
     build_manager_note_correction_prompts,
 )
-from aflow.stop_marker import detect_stop_marker
+from aflow.stop_marker import (
+    STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+    detect_stop_marker,
+)
 from aflow.repartition import (
     EvidenceArtifactReferenceV2,
     create_envelope,
@@ -125,10 +128,12 @@ def _write_turn(
     returncode: int | None = 0,
     before: dict[str, object] | None = None,
     after: dict[str, object] | None = None,
+    output_contract: str | None = None,
+    semantic_output_source: str | None = None,
 ) -> None:
     turn_dir = run_dir / "turns" / f"turn-{number:03d}"
     turn_dir.mkdir(parents=True)
-    _write_json(turn_dir / "result.json", {
+    result = {
         "turn_number": number,
         "step_name": step,
         "step_role": role,
@@ -138,7 +143,12 @@ def _write_turn(
         "snapshot_before": before or _snapshot(),
         "snapshot_after": after or _snapshot(),
         "chosen_transition": "next",
-    })
+    }
+    if output_contract is not None:
+        result["output_contract"] = output_contract
+    if semantic_output_source is not None:
+        result["semantic_output_source"] = semantic_output_source
+    _write_json(turn_dir / "result.json", result)
     (turn_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
     (turn_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
 
@@ -333,17 +343,127 @@ def test_context_exposes_compact_active_implementation_scope(tmp_path: Path) -> 
 def test_structured_semantics_and_bounded_large_trace_reference(tmp_path: Path) -> None:
     run_dir, _ = _run(tmp_path)
     stream = '\n'.join((json.dumps({"role": "assistant", "content": "first"}), json.dumps({"type": "result", "result": "complete final answer"})))
-    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=stream)
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout=stream,
+        output_contract="agent",
+        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+    )
     turn_dir = run_dir / "turns" / "turn-001"
     (turn_dir / "stderr.txt").write_text("x" * (DIAGNOSTIC_LIMIT + 100), encoding="utf-8")
 
     context = build_manager_context(run_dir)
 
-    assert extract_semantic_result(stream).result == "complete final answer"
+    assert extract_semantic_result(
+        stream, output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE
+    ).result == "complete final answer"
     assert context["finished_turn"]["semantic_result"]["extraction"] == "structured_stream"
     assert len(context["finished_turn"]["diagnostics"]["stderr_excerpt"]) < DIAGNOSTIC_LIMIT + 100
     assert context["finished_turn"]["raw_artifacts"][1]["byte_size"] == DIAGNOSTIC_LIMIT + 100
-    assert extract_semantic_result('{"type": "unknown"}').fallback is True
+    assert extract_semantic_result(
+        '{"type": "unknown"}',
+        output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+    ).fallback is True
+
+
+def test_structured_semantics_excludes_tool_and_echoed_prompt_events() -> None:
+    stream = "\n".join(
+        (
+            '{"type":"thread.started","thread_id":"session-123"}',
+            '{"type":"item.completed","thread_id":"session-123",'
+            '"item":{"type":"command_execution",'
+            '"aggregated_output":"AFLOW_STOP: HISTORY: old tool output"}}',
+            '{"type":"message.completed","thread_id":"session-123",'
+            '"role":"user","text":"AFLOW_STOP: HISTORY: echoed prompt"}',
+            '{"type":"message.completed","thread_id":"session-123",'
+            '"role":"assistant","text":"approved"}',
+        )
+    )
+    assert extract_semantic_result(
+        stream, output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE
+    ).result == "approved"
+
+
+def test_agent_output_contract_keeps_diagnostic_markers_out_of_context(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    stderr = "tool transcript\nAFLOW_STOP: HISTORY: old tool output\n"
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout="approved final output\n",
+        stderr=stderr,
+        output_contract="agent",
+    )
+
+    context = build_manager_context(run_dir, boundary={"context_schema_version": 3})
+
+    assert context["finished_turn"]["detected_stop"] == []
+    assert context["scope_pressure_detected"] is False
+    assert (run_dir / "turns" / "turn-001" / "stderr.txt").read_text(
+        encoding="utf-8"
+    ) == stderr
+
+
+def test_agent_context_detects_structured_assistant_stop_only(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    stdout = "\n".join(
+        (
+            '{"type":"thread.started","thread_id":"session-123"}',
+            '{"type":"item.completed","thread_id":"session-123",'
+            '"item":{"type":"command_execution",'
+            '"aggregated_output":"AFLOW_STOP: HISTORY: tool output"}}',
+            '{"type":"message.completed","thread_id":"session-123",'
+            '"role":"user","text":"AFLOW_STOP: HISTORY: echoed prompt"}',
+            '{"type":"message.completed","thread_id":"session-123",'
+            '"role":"assistant","text":"AFLOW_STOP: current assistant stop"}',
+        )
+    )
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout=stdout,
+        stderr="AFLOW_STOP: HISTORY: diagnostic output\n",
+        output_contract="agent",
+        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+    )
+
+    context = build_manager_context(run_dir, boundary={"context_schema_version": 3})
+
+    assert context["finished_turn"]["detected_stop"] == [
+        "current assistant stop"
+    ]
+
+
+def test_agent_context_keeps_scope_pressure_after_final_text_json(tmp_path: Path) -> None:
+    run_dir, _ = _run(tmp_path)
+    stdout = (
+        "Diagnostic details:\n"
+        "```json\n"
+        '{"ok":false}\n'
+        "```\n"
+        "AFLOW_SCOPE_PRESSURE: split this checkpoint\n"
+    )
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout=stdout,
+        output_contract="agent",
+    )
+
+    context = build_manager_context(run_dir, boundary={"context_schema_version": 3})
+
+    assert context["finished_turn"]["detected_stop"] == []
+    assert context["scope_pressure_detected"] is True
+    assert context["controller_state"]["scope_pressure_detected"] is True
 
 
 def test_progress_detects_alternating_reviewer_non_convergence(tmp_path: Path) -> None:
@@ -1533,7 +1653,19 @@ def test_v3_full_history_preserves_recognized_and_plain_results(
     tmp_path: Path, stdout: str, extraction: str, expected: str
 ) -> None:
     run_dir, plan = _run(tmp_path)
-    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=stdout)
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout=stdout,
+        semantic_output_source=(
+            STRUCTURED_TRANSPORT_OUTPUT_SOURCE
+            if extraction == "structured_stream"
+            else None
+        ),
+        output_contract=("agent" if extraction == "structured_stream" else None),
+    )
     boundary = dict(_enveloped_boundary(run_dir, plan))
     boundary["context_schema_version"] = 4
 
@@ -1568,7 +1700,15 @@ def test_v3_full_history_hides_unrecognized_structured_stream(
         "session_id": private_session_sentinel,
         "metadata": {"provider_private": True},
     })
-    _write_turn(run_dir, 1, step="implement", role="implementer", stdout=stdout)
+    _write_turn(
+        run_dir,
+        1,
+        step="implement",
+        role="implementer",
+        stdout=stdout,
+        output_contract="agent",
+        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+    )
     boundary = dict(_enveloped_boundary(run_dir, plan))
     boundary["context_schema_version"] = 4
 

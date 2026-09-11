@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .stop_marker import iter_non_fenced_lines
+from .stop_marker import (
+    COMMAND_OUTPUT_CONTRACT,
+    OutputContract,
+    iter_non_fenced_lines,
+    semantic_output_streams,
+)
 
 SCOPE_PRESSURE_SENTINEL_PREFIX = "AFLOW_SCOPE_PRESSURE:"
 SCOPE_PRESSURE_FALLBACK_REASON = "scope pressure without a reason"
@@ -38,24 +43,45 @@ def extract_scope_pressure_markers(text: str) -> list[str]:
     return messages
 
 
-def parse_scope_pressure(stdout: str, stderr: str) -> ScopePressureResult:
+def parse_scope_pressure(
+    stdout: str,
+    stderr: str,
+    *,
+    output_contract: OutputContract = COMMAND_OUTPUT_CONTRACT,
+) -> ScopePressureResult:
     """Return the canonical scope-pressure result with bounded reason.
 
     Preserves stdout-before-stderr ordering and ignores fenced examples
     and ``<reason>`` placeholders.
     """
-    for text in (stdout, stderr):
+    for text in semantic_output_streams(
+        stdout, stderr, output_contract=output_contract
+    ):
         messages = extract_scope_pressure_markers(text)
         if messages:
             return ScopePressureResult(detected=True, reason=messages[0])
     return ScopePressureResult(detected=False, reason=None)
 
 
-def detect_scope_pressure(stdout: str, stderr: str) -> str | None:
+def detect_scope_pressure(
+    stdout: str,
+    stderr: str,
+    *,
+    output_contract: OutputContract = COMMAND_OUTPUT_CONTRACT,
+) -> str | None:
     """Return the first scope-pressure reason, preserving stdout-before-stderr priority."""
-    return parse_scope_pressure(stdout, stderr).reason
+    return parse_scope_pressure(
+        stdout, stderr, output_contract=output_contract
+    ).reason
 
 
-def has_scope_pressure(stdout: str, stderr: str) -> bool:
+def has_scope_pressure(
+    stdout: str,
+    stderr: str,
+    *,
+    output_contract: OutputContract = COMMAND_OUTPUT_CONTRACT,
+) -> bool:
     """True when at least one real scope-pressure marker is present."""
-    return parse_scope_pressure(stdout, stderr).detected
+    return parse_scope_pressure(
+        stdout, stderr, output_contract=output_contract
+    ).detected

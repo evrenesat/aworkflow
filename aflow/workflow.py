@@ -123,7 +123,13 @@ from .hotplug import (
 )
 from .harnesses.session import SessionDriver, SessionRequest, SessionResult
 from .runlog import create_repartition_attempt_paths, create_run_paths, finalize_turn_artifacts, load_run_json, prune_old_runs, write_issue_summary, write_manager_artifacts, write_manager_note_correction_artifacts, write_repartition_artifact, RunMetadataWriter, RunPaths, write_turn_artifacts_start
-from .stop_marker import detect_stop_marker
+from .stop_marker import (
+    COMMAND_OUTPUT_CONTRACT,
+    FINAL_TEXT_OUTPUT_SOURCE,
+    OutputContract,
+    STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+    detect_stop_marker,
+)
 from .scope_pressure import parse_scope_pressure
 from .status import BannerRenderer, WorkflowGraphSource
 from aflow.api.events import (
@@ -5014,8 +5020,18 @@ def _build_retry_appendix(parse_error_str: str) -> str:
     return f"{_RETRY_APPENDIX_INTRO}{parse_error_str}"
 
 
-def _detect_stop_marker(stdout: str, stderr: str) -> str | None:
-    return detect_stop_marker(stdout, stderr)
+def _detect_stop_marker(
+    stdout: str,
+    stderr: str,
+    *,
+    output_contract: OutputContract = COMMAND_OUTPUT_CONTRACT,
+    semantic_stdout: str | None = None,
+) -> str | None:
+    return detect_stop_marker(
+        stdout if semantic_stdout is None else semantic_stdout,
+        stderr,
+        output_contract=output_contract,
+    )
 
 
 _BRANCH_STEM_MAX_LEN = 50
@@ -5895,7 +5911,7 @@ def _execute_init_repo_handoff(
     readme_body: str,
     banner: BannerRenderer,
     state: ControllerState,
-) -> subprocess.CompletedProcess[str]:
+) -> tuple[subprocess.CompletedProcess[str], OutputContract]:
     team_lead_role = workflow_config.aflow.team_lead
     if not team_lead_role:
         raise WorkflowError("lifecycle bootstrap requires [aflow].team_lead to be configured")
@@ -5925,8 +5941,10 @@ def _execute_init_repo_handoff(
         lifecycle_phase="bootstrap",
     )
     if runner is None:
-        return _run_process(invocation, primary_root, banner, state)
-    return _run_injected_runner(runner, invocation, primary_root)
+        completed = _run_process(invocation, primary_root, banner, state)
+    else:
+        completed = _run_injected_runner(runner, invocation, primary_root)
+    return completed, invocation.output_contract
 
 
 def _resolve_team_lead_profile(
@@ -6185,7 +6203,7 @@ def _verify_merge_success(
 
 def _try_fast_forward_merge(
     exec_ctx: ExecutionContext,
-) -> subprocess.CompletedProcess[str] | None:
+) -> tuple[subprocess.CompletedProcess[str], OutputContract] | None:
     primary_root = exec_ctx.primary_repo_root
 
     rc, head_ref, err = _run_git(["symbolic-ref", "--short", "HEAD"], cwd=primary_root)
@@ -6231,11 +6249,14 @@ def _try_fast_forward_merge(
             f"'{exec_ctx.main_branch}' failed: {merge_err or merge_out or 'unknown git error'}"
         )
 
-    return subprocess.CompletedProcess(
-        ["git", *merge_args],
-        merge_rc,
-        merge_out,
-        merge_err,
+    return (
+        subprocess.CompletedProcess(
+            ["git", *merge_args],
+            merge_rc,
+            merge_out,
+            merge_err,
+        ),
+        COMMAND_OUTPUT_CONTRACT,
     )
 
 
@@ -6518,7 +6539,7 @@ def _execute_merge_handoff(
     new_plan_path: Path,
     banner: BannerRenderer,
     state: ControllerState,
-) -> subprocess.CompletedProcess[str]:
+) -> tuple[subprocess.CompletedProcess[str], OutputContract]:
     primary_root = exec_ctx.primary_repo_root
     team_lead_role = workflow_config.aflow.team_lead
     if not team_lead_role:
@@ -6561,8 +6582,10 @@ def _execute_merge_handoff(
         lifecycle_phase="merge",
     )
     if runner is None:
-        return _run_process(invocation, primary_root, banner, state)
-    return _run_injected_runner(runner, invocation, primary_root)
+        completed = _run_process(invocation, primary_root, banner, state)
+    else:
+        completed = _run_injected_runner(runner, invocation, primary_root)
+    return completed, invocation.output_contract
 
 
 def _perform_merge_teardown(
@@ -6593,7 +6616,7 @@ def _perform_merge_teardown(
             exec_ctx,
             original_plan_path=original_plan_path,
         )
-        merge_completed = _execute_merge_handoff(
+        merge_completed, merge_output_contract = _execute_merge_handoff(
             exec_ctx,
             wf,
             workflow_config,
@@ -6619,6 +6642,7 @@ def _perform_merge_teardown(
     stop_reason = _detect_stop_marker(
         merge_completed.stdout,
         merge_completed.stderr,
+        output_contract=merge_output_contract,
     )
     if stop_reason is not None:
         _restore_primary_plan_after_merge(prepared_primary_plan)
@@ -7873,7 +7897,7 @@ def run_workflow(
                 readme_title, readme_body = derive_readme_content(
                     plan_text, original_plan_path.stem
                 )
-                bootstrap_result = _execute_init_repo_handoff(
+                bootstrap_result, bootstrap_output_contract = _execute_init_repo_handoff(
                     config.repo_root,
                     workflow_config,
                     team_name=active_team_name,
@@ -7887,7 +7911,9 @@ def run_workflow(
                     state=state,
                 )
                 stop_reason = _detect_stop_marker(
-                    bootstrap_result.stdout, bootstrap_result.stderr
+                    bootstrap_result.stdout,
+                    bootstrap_result.stderr,
+                    output_contract=bootstrap_output_contract,
                 )
                 if stop_reason is not None:
                     raise WorkflowError(
@@ -11530,6 +11556,11 @@ def run_workflow(
                         user_prompt=user_prompt,
                         effort=resolved.effort,
                     )
+                if turn_session_request is not None:
+                    invocation = replace(
+                        invocation,
+                        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+                    )
                 _preflight_or_fail(
                     invocation,
                     step_adapter,
@@ -11855,6 +11886,11 @@ def run_workflow(
                         user_prompt=user_prompt,
                         effort=resolved.effort,
                     )
+                if turn_session_request is not None:
+                    invocation = replace(
+                        invocation,
+                        semantic_output_source=STRUCTURED_TRANSPORT_OUTPUT_SOURCE,
+                    )
                 _preflight_or_fail(
                     invocation,
                     step_adapter,
@@ -11905,6 +11941,7 @@ def run_workflow(
             snapshot_before=snapshot_before,
         )
         completed: subprocess.CompletedProcess[str] | None = None
+        semantic_stdout: str | None = None
         post_snapshot: PlanSnapshot | None = None
         conditions: dict[str, bool] | None = None
         selected_transition: GoTransition | None = None
@@ -12028,6 +12065,7 @@ def run_workflow(
                         )
                 except (RuntimeError, ValueError) as exc:
                     _fail_hotplug_target(f"session result validation failed: {exc}")
+                    semantic_stdout = ""
                     completed = subprocess.CompletedProcess(
                         completed.args, 1, completed.stdout,
                         f"session result validation failed: {exc}",
@@ -12063,6 +12101,11 @@ def run_workflow(
                         completed.args, completed.returncode,
                         session_result.final_output, completed.stderr,
                     )
+                    invocation = replace(
+                        invocation,
+                        semantic_output_source=FINAL_TEXT_OUTPUT_SOURCE,
+                    )
+                    semantic_stdout = session_result.final_output
                     transaction = state.current_hotplug_transaction
                     if (
                         transaction is not None
@@ -12093,7 +12136,12 @@ def run_workflow(
                             new_plan_path=new_plan_path,
                         )
 
-            stop_reason = _detect_stop_marker(completed.stdout, completed.stderr)
+            stop_reason = _detect_stop_marker(
+                completed.stdout,
+                completed.stderr,
+                output_contract=invocation.output_contract,
+                semantic_stdout=semantic_stdout,
+            )
             if stop_reason is not None:
                 state.status_message = "failed"
                 _record_issue("aflow-stop", f"AFLOW_STOP: {stop_reason}", turn_dir=turn_dir)
@@ -12693,6 +12741,7 @@ def run_workflow(
             if (turn_dir / "stdout.txt").is_file() else "",
             (turn_dir / "stderr.txt").read_text(encoding="utf-8")
             if (turn_dir / "stderr.txt").is_file() else "",
+            output_contract=invocation.output_contract,
         )
         scope_pressure_reason = scope_pressure.reason if scope_pressure.detected else None
 

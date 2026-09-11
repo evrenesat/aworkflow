@@ -1,5 +1,19 @@
 # DEVLOG
 
+## 2026-09-11 — Trust current assistant output for control signals
+
+- Fixed the dogfood failure where a successful review stopped because stderr
+  contained an old stop line read from a tool artifact. Agent control signals
+  use accepted assistant output; command invocations retain both result streams.
+- Turn artifacts distinguish final text from structured transport. Normalized
+  final text preserves JSON examples and fences; raw session transport remains
+  separate. Analyzer, manager context, and progress summaries share this boundary.
+- Recorded terminal outcomes and raw evidence remain intact. Fake runner/session
+  tests cover workflow advance, current controls, historical examples, and
+  normalized artifacts; authenticated REST/MCP fixtures verify context parity.
+- Verification: 538 core tests and 52 subtests, 59 server tests, lint, whitespace
+  checks, and the independent prior-finding reproduction passed without providers.
+
 ## 2026-09-11 — Align readable run-title browser contracts (Checkpoint 1)
 
 - Preserved the shipped readable run presentation while updating browser
