@@ -628,6 +628,8 @@ def build_context_bundle(
         "run_metadata": bounded_redacted(metadata),
         "events": [event.to_dict() for event in read_events(root, limit=100)],
     }
+    manager_context: Mapping[str, Any] | None = None
+    from .run_progress import project_run_progress
     from .worker_diagnostics import worker_evidence
 
     worker = worker_evidence(root.parent.parent.parent, root.name, f"aflow-run-{root.name}.service")
@@ -636,11 +638,17 @@ def build_context_bundle(
     try:
         from aflow.manager_context import build_manager_context
 
-        data["manager_context"] = bounded_redacted(
-            build_manager_context(root, level=level, trigger="control_plane_context")
+        manager_context = build_manager_context(
+            root, level=level, trigger="control_plane_context"
         )
+        data["manager_context"] = bounded_redacted(manager_context)
     except (OSError, ValueError):
         # A pre-turn run has no finalized artifact yet; metadata/events remain
         # the authoritative bounded context until the first boundary exists.
         pass
+    data["progress"] = project_run_progress(
+        root,
+        run_metadata=metadata,
+        manager_context=manager_context,
+    )
     return ContextBundle(run_id=root.name, level=level, data=data)

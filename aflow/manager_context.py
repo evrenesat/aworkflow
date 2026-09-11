@@ -21,7 +21,7 @@ from .analyzer import (
     extract_text_signals,
     snapshot_signature,
 )
-from .plan import PlanParseError, load_plan_tolerant
+from .plan import PlanParseError, load_plan_tolerant, parse_plan_text
 from .repartition import parse_envelope_bytes
 from .scope_pressure import has_scope_pressure
 from .stop_marker import extract_stop_markers
@@ -30,6 +30,7 @@ from .stop_marker import extract_stop_markers
 MANAGER_CONTEXT_SCHEMA_VERSION = 1
 MANAGER_CONTEXT_SCHEMA_VERSION_V2 = 2
 MANAGER_CONTEXT_SCHEMA_VERSION_V3 = 3
+ORIGINAL_CHECKPOINT_AUTHORITY_VERSION = 1
 DIAGNOSTIC_LIMIT = 2_000
 MAX_MANAGER_NOTE_SCOPE_PATHS = 32
 MAX_MANAGER_NOTE_SCOPE_PATH_LENGTH = 240
@@ -103,6 +104,15 @@ class StructuredPlanState:
     current_checkpoint: dict[str, Any] | None
     is_complete: bool | None
     parse_error: str | None
+
+
+@dataclass(frozen=True)
+class _OriginalPlanAuthority:
+    """Controller-validated source for checkpoint state in a live context."""
+
+    path: Path | None = None
+    text: str | None = None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +447,137 @@ def _resolve_validated_envelope(
     return payload
 
 
+def _scope_has_checkpoint_identity(scope: Mapping[str, Any] | None) -> bool:
+    if not isinstance(scope, Mapping):
+        return False
+    scope_id = scope.get("scope_id")
+    checkpoint_index = scope.get("checkpoint_index")
+    checkpoint_name = scope.get("checkpoint_name")
+    return (
+        isinstance(scope_id, str)
+        and bool(scope_id.strip())
+        and isinstance(checkpoint_index, int)
+        and not isinstance(checkpoint_index, bool)
+        and checkpoint_index > 0
+        and isinstance(checkpoint_name, str)
+        and bool(checkpoint_name.strip())
+    )
+
+
+def _read_evidence_text(
+    run_dir: Path,
+    reference: Mapping[str, Any],
+) -> str | None:
+    """Read one validated content-addressed evidence reference as UTF-8."""
+    from .runlog import resolve_evidence_artifact
+
+    try:
+        raw = resolve_evidence_artifact(_v3_run_paths(run_dir), reference)
+        return raw.decode("utf-8", "strict")
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def _text_matches_evidence_reference(
+    text: str,
+    reference: Mapping[str, Any],
+) -> bool:
+    raw = text.encode("utf-8")
+    return (
+        reference.get("sha256") == hashlib.sha256(raw).hexdigest()
+        and reference.get("byte_size") == len(raw)
+    )
+
+
+def _envelope_plan_text(
+    run_dir: Path,
+    envelope: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve the exact original-plan bytes from a validated envelope."""
+    embedded = envelope.get("plan_text")
+    if isinstance(embedded, str):
+        return embedded, None
+    if "plan_text" in envelope and embedded is not None:
+        return None, "invalid_evidence"
+    reference = envelope.get("plan_ref")
+    if not isinstance(reference, Mapping):
+        return None, "invalid_evidence"
+    text = _read_evidence_text(run_dir, reference)
+    if text is None:
+        return None, "invalid_evidence"
+    return text, None
+
+
+def _resolve_original_plan_authority(
+    run_dir: Path,
+    *,
+    run_json: Mapping[str, Any],
+    finished_turn: Mapping[str, Any],
+    boundary: Mapping[str, Any],
+    scope: Mapping[str, Any] | None,
+    validated_envelope: Mapping[str, Any] | None,
+) -> _OriginalPlanAuthority | None:
+    """Resolve original checkpoint authority without promoting a repair overlay.
+
+    A complete envelope reference is authoritative when present.  A boundary
+    copy may replace a pruned v2 evidence artifact only when its bytes match
+    the envelope reference.  Without immutable envelope fields, the declared
+    original path or exact boundary copy is the only fallback.  Invalid scope
+    evidence deliberately returns an unavailable authority instead of
+    falling through to the active overlay.
+    """
+    if not _scope_has_checkpoint_identity(scope):
+        return None
+
+    original_value = (
+        boundary.get("original_plan_path")
+        or run_json.get("original_plan_path")
+        or finished_turn.get("original_plan_path")
+        or run_json.get("plan_path")
+    )
+    original_path = _path_from_metadata(run_dir, original_value)
+    envelope_values = tuple(
+        boundary.get(key)
+        for key in (
+            "envelope_artifact_path",
+            "envelope_artifact_sha256",
+            "envelope_canonical_sha256",
+        )
+    )
+    if any(value is not None for value in envelope_values):
+        if not all(isinstance(value, str) and value.strip() for value in envelope_values):
+            return _OriginalPlanAuthority(path=original_path, reason="invalid_evidence")
+        if validated_envelope is None:
+            return _OriginalPlanAuthority(path=original_path, reason="invalid_evidence")
+
+        envelope_text, envelope_reason = _envelope_plan_text(
+            run_dir, validated_envelope
+        )
+        if envelope_text is not None:
+            return _OriginalPlanAuthority(path=original_path, text=envelope_text)
+
+        # A resumed v2 run can retain the exact boundary copy after its source
+        # evidence was pruned.  It is usable only when it still agrees with
+        # the immutable envelope reference.
+        boundary_text = boundary.get("original_plan_content")
+        plan_reference = validated_envelope.get("plan_ref")
+        if (
+            isinstance(boundary_text, str)
+            and isinstance(plan_reference, Mapping)
+            and _text_matches_evidence_reference(boundary_text, plan_reference)
+        ):
+            return _OriginalPlanAuthority(path=original_path, text=boundary_text)
+        return _OriginalPlanAuthority(
+            path=original_path,
+            reason=envelope_reason or "invalid_evidence",
+        )
+
+    boundary_text = boundary.get("original_plan_content")
+    if isinstance(boundary_text, str):
+        return _OriginalPlanAuthority(path=original_path, text=boundary_text)
+    return _OriginalPlanAuthority(path=original_path)
+
+
 def _unavailable_envelope(reason: str) -> dict[str, Any]:
     """Return an explicit non-authoritative verdict for missing evidence."""
     return {"available": False, "validated": False, "reason": reason}
@@ -522,6 +663,7 @@ def _capture_v3_evidence(
     finished: Mapping[str, Any],
     plan_state_payload: Mapping[str, Any],
     validated_envelope: Mapping[str, Any] | None,
+    original_authority: _OriginalPlanAuthority | None,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
     """Capture/reuse content-addressed plan and checkpoint evidence.
 
@@ -571,16 +713,34 @@ def _capture_v3_evidence(
             if active_candidate is not None:
                 active_text = _read_text(active_candidate) or None
     original_text: str | None = None
+    authority_invalid = (
+        original_authority is not None
+        and original_authority.reason is not None
+    )
     envelope_plan_ref: Any = None
     envelope_text_authoritative = False
-    if validated_envelope is not None and validated_envelope.get("available"):
+    if (
+        not authority_invalid
+        and validated_envelope is not None
+        and validated_envelope.get("available")
+    ):
         envelope_plan_ref = validated_envelope.get("plan_ref")
         if not isinstance(envelope_plan_ref, Mapping):
             # Schema-v1 envelope payload embeds the immutable plan text.
             envelope_text_authoritative = True
             embedded = validated_envelope.get("plan_text")
             original_text = embedded if isinstance(embedded, str) else None
-    if not envelope_text_authoritative and original_text is None:
+    if not authority_invalid and original_authority is not None:
+        if original_authority.text is not None:
+            original_text = original_authority.text
+        elif capture and original_authority.path is not None:
+            original_text = _read_text(original_authority.path) or None
+    if (
+        not authority_invalid
+        and not envelope_text_authoritative
+        and original_text is None
+        and original_authority is None
+    ):
         # The boundary persists the exact original bytes captured at runtime
         # so historical rebuilds never depend on later file mutations. This
         # also covers v2 envelopes whose referenced evidence cannot be
@@ -655,7 +815,7 @@ def _capture_v3_evidence(
                     "source": "boundary_plan_file",
                 }
 
-    # --- Current checkpoint of the active plan ---
+    # --- Current checkpoint, always bound to the original scope authority ---
     checkpoint_entry: dict[str, Any] = _v3_unavailable(
         "the current checkpoint bytes are unavailable at this boundary"
     )
@@ -669,7 +829,107 @@ def _capture_v3_evidence(
         current = plan_state_payload.get("current_checkpoint")
         if isinstance(current, Mapping):
             checkpoint_index = current.get("index")
-    if active_text is not None and isinstance(checkpoint_index, int):
+
+    def envelope_checkpoint_info(envelope: Mapping[str, Any]) -> dict[str, Any]:
+        values = {
+            "checkpoint_index": envelope.get("checkpoint_index"),
+            "checkpoint_name": envelope.get("checkpoint_name"),
+            "line_start": envelope.get("checkpoint_line_start"),
+            "line_end": envelope.get("checkpoint_line_end"),
+            "byte_start": envelope.get("checkpoint_byte_start"),
+            "byte_end": envelope.get("checkpoint_byte_end"),
+        }
+        if (
+            isinstance(values["checkpoint_index"], int)
+            and isinstance(values["checkpoint_name"], str)
+            and all(
+                isinstance(values[key], int)
+                for key in ("line_start", "line_end", "byte_start", "byte_end")
+            )
+        ):
+            return values
+        return {}
+
+    def checkpoint_entry_for_text(
+        checkpoint_text: str,
+        info: dict[str, Any],
+        expected_reference: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        raw = checkpoint_text.encode("utf-8")
+        if expected_reference is not None and not _text_matches_evidence_reference(
+            checkpoint_text, expected_reference
+        ):
+            return None
+        if expected_reference is not None:
+            resolved = available_reference(expected_reference)
+            if resolved is not None:
+                return {"available": True, "reference": resolved, **info}
+        if capture:
+            # Live checkpoint capture failures propagate and abort context
+            # construction instead of binding evidence to the overlay.
+            captured = capture_checkpoint_evidence(paths, checkpoint_text)
+            captured_dict = _v3_ref_dict(captured)
+            if expected_reference is not None and (
+                captured_dict.get("sha256") != expected_reference.get("sha256")
+                or captured_dict.get("byte_size") != expected_reference.get("byte_size")
+            ):
+                return None
+            return {"available": True, "reference": captured_dict, **info}
+        from .runlog import evidence_reference
+
+        reference = evidence_reference(paths, "checkpoint", hashlib.sha256(raw).hexdigest(), len(raw))
+        resolved = available_reference(reference)
+        if resolved is None:
+            return None
+        return {"available": True, "reference": resolved, **info}
+
+    if original_authority is not None and not authority_invalid:
+        expected_checkpoint_reference: Mapping[str, Any] | None = None
+        if validated_envelope is not None and validated_envelope.get("available"):
+            envelope_info = envelope_checkpoint_info(validated_envelope)
+            if envelope_info:
+                checkpoint_info = envelope_info
+            checkpoint_reference = validated_envelope.get("checkpoint_ref")
+            if isinstance(checkpoint_reference, Mapping):
+                expected_checkpoint_reference = checkpoint_reference
+            else:
+                embedded_checkpoint = validated_envelope.get("checkpoint_text")
+                if isinstance(embedded_checkpoint, str) and checkpoint_info:
+                    checkpoint_entry = checkpoint_entry_for_text(
+                        embedded_checkpoint, checkpoint_info
+                    ) or checkpoint_entry
+
+        if original_text is not None and isinstance(checkpoint_index, int):
+            try:
+                source_slice = slice_checkpoint_source(
+                    original_text, checkpoint_index=checkpoint_index
+                )
+            except ValueError:
+                source_slice = None
+            if source_slice is not None:
+                source_info = {
+                    "checkpoint_index": source_slice.checkpoint_index,
+                    "checkpoint_name": source_slice.checkpoint_name,
+                    "line_start": source_slice.heading_line,
+                    "line_end": (
+                        original_text.encode("utf-8")[: source_slice.checkpoint_byte_end]
+                        .decode("utf-8", "strict")
+                        .count("\n")
+                        + 1
+                    ),
+                    "byte_start": source_slice.checkpoint_byte_start,
+                    "byte_end": source_slice.checkpoint_byte_end,
+                }
+                if not checkpoint_info or source_info == checkpoint_info:
+                    checkpoint_info = source_info
+                    checkpoint_entry = checkpoint_entry_for_text(
+                        source_slice.full_text,
+                        checkpoint_info,
+                        expected_checkpoint_reference,
+                    ) or checkpoint_entry
+    elif original_authority is None and active_text is not None and isinstance(checkpoint_index, int):
+        # Preserve the legacy unscoped behavior.  A scoped repair never takes
+        # this branch, so an unheaded overlay cannot masquerade as a checkpoint.
         try:
             source_slice = slice_checkpoint_source(
                 active_text, checkpoint_index=checkpoint_index
@@ -677,45 +937,23 @@ def _capture_v3_evidence(
         except ValueError:
             source_slice = None
         if source_slice is not None:
-            checkpoint_text = source_slice.full_text
             plan_bytes = active_text.encode("utf-8")
-            line_end = (
-                plan_bytes[: source_slice.checkpoint_byte_end]
-                .decode("utf-8", "strict")
-                .count("\n")
-                + 1
-            )
             checkpoint_info = {
                 "checkpoint_index": source_slice.checkpoint_index,
                 "checkpoint_name": source_slice.checkpoint_name,
                 "line_start": source_slice.heading_line,
-                "line_end": line_end,
+                "line_end": (
+                    plan_bytes[: source_slice.checkpoint_byte_end]
+                    .decode("utf-8", "strict")
+                    .count("\n")
+                    + 1
+                ),
                 "byte_start": source_slice.checkpoint_byte_start,
                 "byte_end": source_slice.checkpoint_byte_end,
             }
-            if capture:
-                # Live checkpoint capture failures propagate and abort
-                # context construction instead of marking evidence available
-                # with unbound or partial references.
-                checkpoint_ref = capture_checkpoint_evidence(paths, checkpoint_text)
-                checkpoint_entry = {
-                    "available": True,
-                    "reference": _v3_ref_dict(checkpoint_ref),
-                    **checkpoint_info,
-                }
-            else:
-                digest = hashlib.sha256(checkpoint_text.encode("utf-8")).hexdigest()
-                from .runlog import evidence_reference
-
-                checkpoint_ref = evidence_reference(
-                    paths, "checkpoint", digest, len(checkpoint_text.encode("utf-8"))
-                )
-                if available_reference(checkpoint_ref) is not None:
-                    checkpoint_entry = {
-                        "available": True,
-                        "reference": _v3_ref_dict(checkpoint_ref),
-                        **checkpoint_info,
-                    }
+            checkpoint_entry = checkpoint_entry_for_text(
+                source_slice.full_text, checkpoint_info
+            ) or checkpoint_entry
 
     # --- Reviewer stdout: durable turn-artifact reference, never a copy ---
     reviewer_entry: dict[str, Any] | None = None
@@ -1000,7 +1238,55 @@ def _bounded_scope_identity(identity: str | None) -> str | None:
     return "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _plan_state(run_dir: Path, run_json: dict[str, Any], finished_turn: dict[str, Any]) -> tuple[StructuredPlanState, Path | None]:
+def _plan_state_from_parsed(
+    parsed: Any,
+    *,
+    parse_error: str | None,
+    original_value: Any,
+    active_value: Any,
+    active_path: Path | None,
+) -> tuple[StructuredPlanState, Path | None]:
+    checkpoints = tuple({
+        "index": index,
+        "name": section.name,
+        "heading_checked": section.heading_checked,
+        "checked_step_count": section.checked_step_count,
+        "unchecked_step_count": section.unchecked_step_count,
+    } for index, section in enumerate(parsed.sections, start=1))
+    snapshot = parsed.snapshot
+    current = None
+    if snapshot.current_checkpoint_index is not None:
+        current = next(
+            (
+                item for item in checkpoints
+                if item["index"] == snapshot.current_checkpoint_index
+            ),
+            None,
+        )
+    return StructuredPlanState(
+        original_plan_path=(
+            str(original_value) if isinstance(original_value, str) else None
+        ),
+        active_plan_path=(
+            str(active_value) if isinstance(active_value, str) else None
+        ),
+        active_repair_plan=bool(
+            active_value and original_value and active_value != original_value
+        ),
+        checkpoints=checkpoints,
+        current_checkpoint=current,
+        is_complete=snapshot.is_complete,
+        parse_error=parse_error,
+    ), active_path
+
+
+def _plan_state(
+    run_dir: Path,
+    run_json: dict[str, Any],
+    finished_turn: dict[str, Any],
+    *,
+    original_authority: _OriginalPlanAuthority | None = None,
+) -> tuple[StructuredPlanState, Path | None]:
     # ``run_json`` carries boundary overrides applied immediately above. Prefer
     # it over the finalized turn, whose active path is necessarily pre-routing.
     active_value = (
@@ -1014,34 +1300,85 @@ def _plan_state(run_dir: Path, run_json: dict[str, Any], finished_turn: dict[str
         or run_json.get("plan_path")
     )
     active_path = _path_from_metadata(run_dir, active_value)
-    checkpoints: tuple[dict[str, Any], ...] = ()
-    current: dict[str, Any] | None = None
-    complete: bool | None = None
-    parse_error: str | None = None
-    if active_path is not None:
+    source_path = (
+        original_authority.path
+        if original_authority is not None
+        else active_path
+    )
+    if original_authority is not None and original_authority.reason is not None:
+        return StructuredPlanState(
+            original_plan_path=(
+                str(original_value) if isinstance(original_value, str) else None
+            ),
+            active_plan_path=(
+                str(active_value) if isinstance(active_value, str) else None
+            ),
+            active_repair_plan=bool(
+                active_value and original_value and active_value != original_value
+            ),
+            checkpoints=(),
+            current_checkpoint=None,
+            is_complete=None,
+            parse_error=original_authority.reason,
+        ), active_path
+
+    if original_authority is not None and original_authority.text is not None:
         try:
-            loaded = load_plan_tolerant(active_path)
-            checkpoints = tuple({
-                "index": index,
-                "name": section.name,
-                "heading_checked": section.heading_checked,
-                "checked_step_count": section.checked_step_count,
-                "unchecked_step_count": section.unchecked_step_count,
-            } for index, section in enumerate(loaded.parsed_plan.sections, start=1))
-            snapshot = loaded.parsed_plan.snapshot
-            complete = snapshot.is_complete
-            if snapshot.current_checkpoint_index is not None:
-                current = next((item for item in checkpoints if item["index"] == snapshot.current_checkpoint_index), None)
-            parse_error = str(loaded.parse_error) if loaded.parse_error else None
+            parsed = parse_plan_text(
+                original_authority.text,
+                source_path=source_path or Path("<captured original plan>"),
+            )
+            return _plan_state_from_parsed(
+                parsed,
+                parse_error=None,
+                original_value=original_value,
+                active_value=active_value,
+                active_path=active_path,
+            )
+        except (PlanParseError, ValueError) as exc:
+            return StructuredPlanState(
+                original_plan_path=(
+                    str(original_value) if isinstance(original_value, str) else None
+                ),
+                active_plan_path=(
+                    str(active_value) if isinstance(active_value, str) else None
+                ),
+                active_repair_plan=bool(
+                    active_value and original_value and active_value != original_value
+                ),
+                checkpoints=(),
+                current_checkpoint=None,
+                is_complete=None,
+                parse_error=str(exc),
+            ), active_path
+
+    if source_path is not None:
+        try:
+            loaded = load_plan_tolerant(source_path)
+            return _plan_state_from_parsed(
+                loaded.parsed_plan,
+                parse_error=str(loaded.parse_error) if loaded.parse_error else None,
+                original_value=original_value,
+                active_value=active_value,
+                active_path=active_path,
+            )
         except (OSError, PlanParseError, ValueError) as exc:
             parse_error = str(exc)
+    else:
+        parse_error = None
     return StructuredPlanState(
-        original_plan_path=str(original_value) if isinstance(original_value, str) else None,
-        active_plan_path=str(active_value) if isinstance(active_value, str) else None,
-        active_repair_plan=bool(active_value and original_value and active_value != original_value),
-        checkpoints=checkpoints,
-        current_checkpoint=current,
-        is_complete=complete,
+        original_plan_path=(
+            str(original_value) if isinstance(original_value, str) else None
+        ),
+        active_plan_path=(
+            str(active_value) if isinstance(active_value, str) else None
+        ),
+        active_repair_plan=bool(
+            active_value and original_value and active_value != original_value
+        ),
+        checkpoints=(),
+        current_checkpoint=None,
+        is_complete=None,
         parse_error=parse_error,
     ), active_path
 
@@ -1630,8 +1967,73 @@ def build_manager_context(
         run_json["original_plan_path"] = boundary["original_plan_path"]
     if boundary.get("active_plan_path") is not None:
         run_json["active_plan_path"] = boundary["active_plan_path"]
-    plan_state, active_plan_path = _plan_state(run_dir, run_json, finished)
+    boundary_schema_version = boundary.get("context_schema_version")
+    active_scope = boundary.get("active_implementation_scope")
+    active_scope_mapping = active_scope if isinstance(active_scope, Mapping) else None
+    complete_envelope_reference = (
+        isinstance(boundary.get("envelope_artifact_path"), str)
+        and bool(boundary.get("envelope_artifact_path"))
+        and isinstance(boundary.get("envelope_artifact_sha256"), str)
+        and bool(boundary.get("envelope_artifact_sha256"))
+        and isinstance(boundary.get("envelope_canonical_sha256"), str)
+        and bool(boundary.get("envelope_canonical_sha256"))
+    )
+    validated_envelope: dict[str, Any] | None = None
+    if (
+        not legacy_boundary
+        and isinstance(boundary_schema_version, int)
+        and boundary_schema_version >= 3
+        and complete_envelope_reference
+    ):
+        validated_envelope = _resolve_validated_envelope(
+            run_dir,
+            boundary["envelope_artifact_path"],
+            boundary["envelope_artifact_sha256"],
+            boundary["envelope_canonical_sha256"],
+            active_scope_mapping,
+        )
     captured_plan_state = boundary.get("captured_plan_state")
+    current_authority_boundary = (
+        isinstance(
+            boundary.get("original_checkpoint_authority_version"),
+            int,
+        )
+        and not isinstance(
+            boundary.get("original_checkpoint_authority_version"),
+            bool,
+        )
+        and boundary.get("original_checkpoint_authority_version")
+        == ORIGINAL_CHECKPOINT_AUTHORITY_VERSION
+    )
+    historical_captured_boundary = (
+        isinstance(captured_plan_state, dict)
+        and not current_authority_boundary
+    )
+    original_authority = _resolve_original_plan_authority(
+        run_dir,
+        run_json=run_json,
+        finished_turn=finished,
+        boundary=boundary,
+        scope=(
+            active_scope_mapping
+            if (
+                not legacy_boundary
+                and isinstance(boundary_schema_version, int)
+                and boundary_schema_version >= 3
+            )
+            else None
+        ),
+        validated_envelope=validated_envelope,
+    )
+    authority_for_boundary = (
+        None if historical_captured_boundary else original_authority
+    )
+    plan_state, active_plan_path = _plan_state(
+        run_dir,
+        run_json,
+        finished,
+        original_authority=authority_for_boundary,
+    )
     if isinstance(captured_plan_state, dict):
         # The controller captured this before invoking the manager.  Reuse it
         # during historical analysis so later plan edits cannot alter the
@@ -1780,7 +2182,6 @@ def build_manager_context(
     if not legacy_boundary:
         context.controller_state["progress_scope"] = progress_scope
     # Determine whether to produce schema v2 (boundary selector >= 3).
-    boundary_schema_version = boundary.get("context_schema_version")
     use_v2 = (
         isinstance(boundary_schema_version, int)
         and boundary_schema_version >= 3
@@ -1840,22 +2241,10 @@ def build_manager_context(
         else None
     )
 
-    # --- Envelope: resolve, read, hash-check, parse, and include validated payload ---
-    validated_envelope: dict[str, Any] | None = None
+    # --- Envelope: include the authority validated before plan parsing ---
     envelope_artifact_path = boundary.get("envelope_artifact_path")
     envelope_artifact_sha256 = boundary.get("envelope_artifact_sha256")
     envelope_canonical_sha256 = boundary.get("envelope_canonical_sha256")
-    complete_envelope_reference = (
-        isinstance(envelope_artifact_path, str) and envelope_artifact_path
-        and isinstance(envelope_artifact_sha256, str) and envelope_artifact_sha256
-        and isinstance(envelope_canonical_sha256, str) and envelope_canonical_sha256
-    )
-    if complete_envelope_reference:
-        validated_envelope = _resolve_validated_envelope(
-            run_dir, envelope_artifact_path,
-            envelope_artifact_sha256, envelope_canonical_sha256,
-            active_scope_mapping,
-        )
     if validated_envelope is not None:
         context.controller_state["repartition_evidence"] = {"status": "validated"}
         envelope = (
@@ -2013,22 +2402,29 @@ def build_manager_context(
     # --- Original plan content (Full only) ---
     original_plan_content: str | None = None
     if level == "full":
-        immutable_plan_text = (
-            validated_envelope.get("plan_text")
-            if validated_envelope is not None
-            else None
-        )
-        if isinstance(immutable_plan_text, str):
-            original_plan_content = immutable_plan_text
+        if authority_for_boundary is not None:
+            if authority_for_boundary.reason is None:
+                if isinstance(authority_for_boundary.text, str):
+                    original_plan_content = authority_for_boundary.text
+                elif authority_for_boundary.path is not None:
+                    original_plan_content = _read_text(authority_for_boundary.path) or None
         else:
-            original_value = (
-                boundary.get("original_plan_path")
-                or run_json.get("original_plan_path")
-                or run_json.get("plan_path")
+            immutable_plan_text = (
+                validated_envelope.get("plan_text")
+                if validated_envelope is not None
+                else None
             )
-            original_path = _path_from_metadata(run_dir, original_value)
-            if original_path is not None:
-                original_plan_content = _read_text(original_path) or None
+            if isinstance(immutable_plan_text, str):
+                original_plan_content = immutable_plan_text
+            else:
+                original_value = (
+                    boundary.get("original_plan_path")
+                    or run_json.get("original_plan_path")
+                    or run_json.get("plan_path")
+                )
+                original_path = _path_from_metadata(run_dir, original_value)
+                if original_path is not None:
+                    original_plan_content = _read_text(original_path) or None
 
     v2_context = ManagerContextV2(
         schema_version=MANAGER_CONTEXT_SCHEMA_VERSION_V2,
@@ -2092,6 +2488,7 @@ def build_manager_context(
         finished=finished,
         plan_state_payload=plan_state_payload,
         validated_envelope=validated_envelope,
+        original_authority=authority_for_boundary,
     )
     finished_turn = context.finished_turn
     semantic_payload = finished_turn.get("semantic_result")

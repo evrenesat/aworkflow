@@ -35,6 +35,20 @@ Starting requires current activity evidence. Missing or untrusted activity is
 Needs attention, separately listed outside Recent; confirmed execution failures
 are Failed and preparation failures are Could not start.
 
+Run details use the server's read-only progress projection. A verified
+checkpoint shows its name and total; a repair overlay is shown separately with
+its filename. If the original plan or scope evidence is missing or unreadable,
+the dashboard says Progress unavailable instead of displaying a zero total.
+Current turns and the last finalized turn are separate, so a starting turn is
+never presented as finished.
+
+REST context reads and MCP `get_run_context` use the same authenticated,
+read-only context bundle, including this progress projection. The server
+regression fixture and the built dashboard journey exercise that parity in
+Chromium and WebKit at desktop and 390px mobile widths. Browser keyboard
+events cover the responsive menu contract; physical mobile keyboard behavior
+still requires separate device verification.
+
 Run history uses `POST .../runs/{run_id}/archive`, `POST .../restore`, and
 `DELETE .../runs/{run_id}` beneath the existing project route. Send
 `Idempotency-Key` and a JSON `expected_revision` (the run's `history_revision`),

@@ -10,6 +10,7 @@ from aflow.analyzer import extract_aflow_stop
 from aflow.api import AnalyzeRequest, analyze_runs
 from aflow.manager_context import (
     DIAGNOSTIC_LIMIT,
+    ORIGINAL_CHECKPOINT_AUTHORITY_VERSION,
     build_manager_context,
     build_manager_note_scope,
     extract_semantic_result,
@@ -24,7 +25,13 @@ from aflow.manager import (
     build_manager_note_correction_prompts,
 )
 from aflow.stop_marker import detect_stop_marker
-from aflow.repartition import create_envelope, write_envelope_atomic
+from aflow.repartition import (
+    EvidenceArtifactReferenceV2,
+    create_envelope,
+    create_envelope_v2,
+    slice_checkpoint_source,
+    write_envelope_atomic,
+)
 
 
 INCIDENT_SIGNAL_TEXT = "\n".join(
@@ -174,6 +181,104 @@ def _enveloped_boundary(run_dir: Path, plan: Path) -> dict[str, object]:
         "envelope_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
         "envelope_canonical_sha256": envelope.canonical_envelope_sha256,
     }
+
+
+def _repair_context_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, dict[str, object], str, str]:
+    """Build a v2 scope boundary with an unheaded repair overlay."""
+    repo = tmp_path / "repo"
+    original = repo / "plans" / "in-progress" / "original.md"
+    overlay = repo / "plans" / "in-progress" / "original-cp03-v01.md"
+    original.parent.mkdir(parents=True)
+    original_text = (
+        "# Original plan\n\n"
+        "### [x] Checkpoint 1: First\n- [x] first\n\n"
+        "### [x] Checkpoint 2: Second\n- [x] second\n\n"
+        "### [ ] Checkpoint 3: Third\n- [ ] third\n"
+    )
+    overlay_text = "# Repair overlay\n\n- [ ] repair the third checkpoint\n"
+    original.write_text(original_text, encoding="utf-8")
+    overlay.write_text(overlay_text, encoding="utf-8")
+    run_dir = repo / ".aflow" / "runs" / "run-1"
+    _write_json(run_dir / "run.json", {
+        "plan_path": str(original),
+        "active_plan_path": str(overlay),
+        "original_plan_path": str(original),
+        "team": "base",
+        "turns_completed": 1,
+        "max_turns": 5,
+    })
+
+    checkpoint_slice = slice_checkpoint_source(original_text, checkpoint_index=3)
+    assert checkpoint_slice is not None
+    checkpoint_text = checkpoint_slice.full_text
+    plan_bytes = original_text.encode("utf-8")
+    checkpoint_bytes = checkpoint_text.encode("utf-8")
+    plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+    checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+    plan_ref = EvidenceArtifactReferenceV2(
+        kind="plan",
+        path=f".aflow/runs/run-1/evidence/plans/{plan_sha256}.md",
+        sha256=plan_sha256,
+        byte_size=len(plan_bytes),
+    )
+    checkpoint_ref = EvidenceArtifactReferenceV2(
+        kind="checkpoint",
+        path=(
+            f".aflow/runs/run-1/evidence/checkpoints/{checkpoint_sha256}.md"
+        ),
+        sha256=checkpoint_sha256,
+        byte_size=len(checkpoint_bytes),
+    )
+    (run_dir / "evidence" / "plans").mkdir(parents=True)
+    (run_dir / "evidence" / "checkpoints").mkdir(parents=True)
+    (repo / plan_ref.path).write_bytes(plan_bytes)
+    (repo / checkpoint_ref.path).write_bytes(checkpoint_bytes)
+    scope_id = "plans/in-progress/original.md::checkpoint-3::third"
+    envelope = create_envelope_v2(
+        scope_id=scope_id,
+        original_plan_path="plans/in-progress/original.md",
+        plan_text=original_text,
+        checkpoint_index=3,
+        plan_ref=plan_ref,
+        checkpoint_ref=checkpoint_ref,
+    )
+    artifact = write_envelope_atomic(
+        envelope,
+        run_dir / "scopes" / envelope.scope_digest,
+    )
+    artifact_bytes = artifact.read_bytes()
+    boundary = {
+        "context_schema_version": 4,
+        "original_plan_path": str(original),
+        "active_plan_path": str(overlay),
+        "active_plan_content": overlay_text,
+        "original_plan_content": original_text,
+        "active_implementation_scope": {
+            "scope_id": scope_id,
+            "original_plan_path": str(original),
+            "checkpoint_index": 3,
+            "checkpoint_name": "Checkpoint 3: Third",
+            "opened_turn_number": 1,
+            "awaiting_review": True,
+        },
+        "envelope_artifact_path": (
+            f"scopes/{envelope.scope_digest}/envelope.json"
+        ),
+        "envelope_artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "envelope_canonical_sha256": envelope.canonical_envelope_sha256,
+        "proposed_transition": "implement",
+    }
+    return (
+        run_dir,
+        repo,
+        original,
+        overlay,
+        boundary,
+        original_text,
+        overlay_text,
+    )
 
 
 def test_lite_and_full_context_keep_plan_boundary(tmp_path: Path) -> None:
@@ -2258,21 +2363,339 @@ def test_v3_live_capture_checkpoint_store_failure_propagates_not_crash(
         )
 
 
-def test_v3_live_capture_absent_checkpoint_slice_stays_unavailable(
+def test_v3_live_capture_repair_overlay_keeps_original_checkpoint_authority(
     tmp_path: Path,
 ) -> None:
-    """A missing checkpoint slice is legitimate absence, not a store failure."""
-    run_dir, plan = _run(tmp_path)
-    no_checkpoint_text = "# No checkpoints\n\n- [ ] ordinary task\n"
+    """A repair overlay cannot hide the original checkpoint authority."""
+    (
+        run_dir,
+        repo,
+        original,
+        overlay,
+        boundary,
+        original_text,
+        overlay_text,
+    ) = _repair_context_fixture(tmp_path)
+    boundary = dict(boundary)
+    boundary["original_checkpoint_authority_version"] = (
+        ORIGINAL_CHECKPOINT_AUTHORITY_VERSION
+    )
     _write_turn(run_dir, 1, step="implement", role="implementer", stdout="done")
-    boundary = dict(_enveloped_boundary(run_dir, plan))
-    boundary["context_schema_version"] = 4
-    boundary["active_plan_content"] = no_checkpoint_text
 
     context = build_manager_context(
         run_dir, level="full", boundary=boundary,
-        active_plan_content=no_checkpoint_text, capture_evidence=True,
+        active_plan_content=overlay_text, capture_evidence=True,
     )
+    plan_state = context["plan_state"]
+    assert plan_state["original_plan_path"] == str(original)
+    assert plan_state["active_plan_path"] == str(overlay)
+    assert plan_state["active_repair_plan"] is True
+    assert [item["name"] for item in plan_state["checkpoints"]] == [
+        "Checkpoint 1: First",
+        "Checkpoint 2: Second",
+        "Checkpoint 3: Third",
+    ]
+    assert plan_state["current_checkpoint"]["index"] == 3
+    assert plan_state["parse_error"] is None
+
+    active_ref = context["evidence"]["active_plan"]["reference"]
+    original_ref = context["evidence"]["original_plan"]["reference"]
     checkpoint = context["evidence"]["checkpoint"]
-    assert checkpoint["available"] is False
-    assert "unavailable" in checkpoint["reason"]
+    assert (repo / active_ref["path"]).read_text(encoding="utf-8") == overlay_text
+    assert (repo / original_ref["path"]).read_text(encoding="utf-8") == original_text
+    assert checkpoint["available"] is True
+    checkpoint_text = (repo / checkpoint["reference"]["path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "### [ ] Checkpoint 3: Third" in checkpoint_text
+    assert "Repair overlay" not in checkpoint_text
+
+    direct_boundary = dict(boundary)
+    direct_boundary.pop("original_checkpoint_authority_version")
+    direct = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=direct_boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=False,
+    )
+    assert direct["plan_state"]["current_checkpoint"]["index"] == 3
+    assert direct["evidence"]["checkpoint"]["available"] is True
+
+    legacy_boundary = dict(boundary)
+    legacy_boundary["context_schema_version"] = 3
+    context_v2 = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=legacy_boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=False,
+    )
+    assert context_v2["active_plan_content"] == overlay_text
+    assert context_v2["original_plan_content"] == original_text
+    assert context_v2["plan_state"]["current_checkpoint"]["index"] == 3
+
+
+def test_v3_live_repair_invalid_envelope_stays_unavailable(
+    tmp_path: Path,
+) -> None:
+    run_dir, _, _, overlay, boundary, _, overlay_text = _repair_context_fixture(tmp_path)
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="rejected")
+    boundary = dict(boundary)
+    boundary["envelope_artifact_sha256"] = "a" * 64
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=True,
+    )
+
+    plan_state = context["plan_state"]
+    assert plan_state["active_plan_path"] == str(overlay)
+    assert plan_state["active_repair_plan"] is True
+    assert plan_state["checkpoints"] == []
+    assert plan_state["is_complete"] is None
+    assert plan_state["parse_error"] == "invalid_evidence"
+    assert context["evidence"]["checkpoint"]["available"] is False
+    assert context["controller_state"]["repartition_evidence"]["status"] == (
+        "unavailable"
+    )
+
+    legacy_boundary = dict(boundary)
+    legacy_boundary["context_schema_version"] = 3
+    context_v2 = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=legacy_boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=False,
+    )
+    assert context_v2["original_plan_content"] is None
+    assert context_v2["plan_state"]["parse_error"] == "invalid_evidence"
+
+
+def test_v3_live_repair_malformed_original_is_not_replaced_by_overlay(
+    tmp_path: Path,
+) -> None:
+    run_dir, _, original, overlay, boundary, _, overlay_text = _repair_context_fixture(
+        tmp_path
+    )
+    malformed = "# Malformed original\n\n- [ ] ordinary task\n"
+    original.write_text(malformed, encoding="utf-8")
+    boundary = dict(boundary)
+    for key in (
+        "envelope_artifact_path",
+        "envelope_artifact_sha256",
+        "envelope_canonical_sha256",
+    ):
+        boundary.pop(key)
+    boundary["original_plan_content"] = malformed
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="rejected")
+
+    context = build_manager_context(
+        run_dir,
+        level="full",
+        boundary=boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=False,
+    )
+
+    plan_state = context["plan_state"]
+    assert plan_state["original_plan_path"] == str(original)
+    assert plan_state["active_plan_path"] == str(overlay)
+    assert plan_state["active_repair_plan"] is True
+    assert plan_state["checkpoints"] == []
+    assert plan_state["is_complete"] is None
+    assert plan_state["parse_error"] is not None
+    assert "checkpoint" in plan_state["parse_error"].lower()
+
+
+def test_v3_historical_repair_context_reconstructs_byte_identically(
+    tmp_path: Path,
+) -> None:
+    (
+        run_dir,
+        repo,
+        original,
+        overlay,
+        boundary,
+        original_text,
+        overlay_text,
+    ) = _repair_context_fixture(tmp_path)
+    boundary = dict(boundary)
+    boundary["original_checkpoint_authority_version"] = (
+        ORIGINAL_CHECKPOINT_AUTHORITY_VERSION
+    )
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="rejected")
+    stored = build_manager_context(
+        run_dir,
+        level="full",
+        trigger="post_turn",
+        decision_number=1,
+        run_metadata={
+            "plan_path": str(original),
+            "active_plan_path": str(overlay),
+            "original_plan_path": str(original),
+            "team": "base",
+            "turns_completed": 1,
+            "max_turns": 5,
+        },
+        boundary=boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=True,
+    )
+    boundary["captured_plan_state"] = stored["plan_state"]
+    decision_dir = run_dir / "manager" / "decision-001"
+    _write_json(decision_dir / "context.json", stored)
+    _write_json(decision_dir / "result.json", {
+        "decision_number": 1,
+        "finalized_turn_number": 1,
+        "level": "full",
+        "status": "accepted",
+        "action": "continue",
+    })
+    _write_json(decision_dir / "boundary.json", {
+        "decision_number": 1,
+        "trigger": "post_turn",
+        "run_metadata": {
+            "plan_path": str(original),
+            "active_plan_path": str(overlay),
+            "original_plan_path": str(original),
+            "team": "base",
+            "turns_completed": 1,
+            "max_turns": 5,
+        },
+        "boundary": boundary,
+        "active_plan_content": overlay_text,
+    })
+    tracked = [decision_dir / "context.json", decision_dir / "boundary.json"]
+    before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in tracked
+    }
+    original.write_text("# Changed original\n\n- [ ] no authority\n", encoding="utf-8")
+    overlay.write_text("# Changed overlay\n", encoding="utf-8")
+
+    rebuilt = analyze_runs(AnalyzeRequest(
+        repo_root=repo,
+        run_id=run_dir.name,
+        manager_context="full",
+        turn=1,
+    ))
+
+    assert rebuilt == stored
+    assert rebuilt["plan_state"]["current_checkpoint"]["index"] == 3
+    assert (
+        repo / rebuilt["evidence"]["active_plan"]["reference"]["path"]
+    ).read_text(encoding="utf-8") == overlay_text
+    assert (
+        repo / rebuilt["evidence"]["original_plan"]["reference"]["path"]
+    ).read_text(encoding="utf-8") == original_text
+    after = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in tracked
+    }
+    assert after == before
+
+
+def test_v3_historical_pre_handoff_repair_context_preserves_captured_payload(
+    tmp_path: Path,
+) -> None:
+    """Legacy schema-v3 captures retain unavailable evidence on rebuild."""
+    (
+        run_dir,
+        repo,
+        original,
+        overlay,
+        boundary,
+        _,
+        overlay_text,
+    ) = _repair_context_fixture(tmp_path)
+    _write_turn(run_dir, 1, step="review", role="reviewer", stdout="rejected")
+
+    legacy_boundary = dict(boundary)
+    legacy_boundary.pop("original_checkpoint_authority_version", None)
+    metadata = {
+        "plan_path": str(original),
+        "active_plan_path": str(overlay),
+        "original_plan_path": str(original),
+        "team": "base",
+        "turns_completed": 1,
+        "max_turns": 5,
+    }
+    stored = build_manager_context(
+        run_dir,
+        level="full",
+        trigger="post_turn",
+        decision_number=1,
+        run_metadata=metadata,
+        boundary=legacy_boundary,
+        active_plan_content=overlay_text,
+        capture_evidence=True,
+    )
+
+    # These are the durable fields emitted by the pre-handoff builder. Keep
+    # them explicit so this regression does not derive its expected legacy
+    # payload by rebuilding it with the current implementation.
+    legacy_plan_state = {
+        "original_plan_path": str(original),
+        "active_plan_path": str(overlay),
+        "active_repair_plan": True,
+        "checkpoints": [],
+        "current_checkpoint": None,
+        "is_complete": None,
+        "parse_error": f"{overlay}: no checkpoint sections were found",
+    }
+    stored["plan_state"] = legacy_plan_state
+    stored["manager_note_scope"]["active_plan_identity"] = str(overlay)
+    stored["evidence"]["checkpoint"] = {
+        "available": False,
+        "reason": "the current checkpoint bytes are unavailable at this boundary",
+    }
+    stored["plan_content_disclosure"]["checkpoint"] = "unavailable"
+    assert stored["history_summary"]["total_turns"] == 1
+
+    legacy_boundary["captured_plan_state"] = legacy_plan_state
+    decision_dir = run_dir / "manager" / "decision-001"
+    _write_json(decision_dir / "context.json", stored)
+    _write_json(decision_dir / "result.json", {
+        "decision_number": 1,
+        "finalized_turn_number": 1,
+        "level": "full",
+        "status": "accepted",
+        "action": "continue",
+    })
+    _write_json(decision_dir / "boundary.json", {
+        "decision_number": 1,
+        "trigger": "post_turn",
+        "run_metadata": metadata,
+        "boundary": legacy_boundary,
+        "active_plan_content": overlay_text,
+    })
+    tracked = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    }
+    original.write_text("# Changed original\n\n- [ ] no authority\n", encoding="utf-8")
+    overlay.write_text("# Changed overlay\n", encoding="utf-8")
+
+    rebuilt = analyze_runs(AnalyzeRequest(
+        repo_root=repo,
+        run_id=run_dir.name,
+        manager_context="full",
+        turn=1,
+    ))
+
+    assert rebuilt == stored
+    assert rebuilt["evidence"]["checkpoint"] == {
+        "available": False,
+        "reason": "the current checkpoint bytes are unavailable at this boundary",
+    }
+    assert rebuilt["plan_content_disclosure"]["checkpoint"] == "unavailable"
+    after = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == tracked

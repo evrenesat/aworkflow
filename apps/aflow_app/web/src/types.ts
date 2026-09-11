@@ -409,6 +409,34 @@ export interface RunEventTail {
   events: RunEvent[]
 }
 
+export type RunProgressAvailability = 'available' | 'partial' | 'unavailable'
+export type RunProgressReason = 'missing_plan' | 'unreadable_plan' | 'non_checkpoint_plan' | 'missing_scope' | 'invalid_evidence'
+
+export interface RunProgressCheckpoint {
+  index: number | null
+  name: string | null
+}
+
+export interface RunProgressTurn {
+  turn_number: number | null
+  step: string | null
+  status: string | null
+  summary: string | null
+}
+
+/** Read-only observer projection; nullable fields mean the server has no evidence. */
+export interface RunProgress {
+  availability: RunProgressAvailability
+  checkpoint: RunProgressCheckpoint | null
+  total: number | null
+  complete: boolean | null
+  repairing: boolean
+  overlay_path: string | null
+  reason: RunProgressReason | null
+  last_finished_turn: RunProgressTurn | null
+  current_turn: RunProgressTurn | null
+}
+
 export interface RunContext {
   run_id: string
   level: 'lite' | 'full'

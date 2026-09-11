@@ -296,6 +296,150 @@ def _commit_fixture_repository(root: Path) -> None:
     )
 
 
+def _issue35_original_plan(*, current: int = 4) -> str:
+    sections: list[str] = []
+    for index in range(1, 15):
+        mark = "x" if index < current else " "
+        sections.append(
+            f"### [{mark}] Checkpoint {index}: Stage {index}\n"
+            f"- [{mark}] complete stage {index}\n"
+        )
+    return "# Issue 35 progress fixture\n\n" + "\n".join(sections)
+
+
+def _seed_issue35_progress_fixture(root: Path) -> dict[str, object]:
+    """Create one registered-root run with a linked, unregistered repair worktree."""
+    original = root / "plans" / "in-progress" / "issue35-original.md"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text(_issue35_original_plan(), encoding="utf-8")
+    _commit_fixture_repository(root)
+
+    execution = root.parent / f"{root.name}-issue35-execution"
+    subprocess.run(
+        ("git", "-C", str(root), "worktree", "add", "-q", "--detach", str(execution)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    overlay = execution / "repair-overlay.md"
+    overlay.write_text(
+        "# Repair overlay\n\nThis fixture deliberately has no checkpoint headings.\n",
+        encoding="utf-8",
+    )
+
+    run_id = "issue35-progress-repair"
+    run_dir = root / ".aflow" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    scope = {
+        "scope_id": "original::checkpoint-4",
+        "original_plan_path": str(original),
+        "checkpoint_index": 4,
+        "checkpoint_name": "Checkpoint 4: Stage 4",
+        "opened_turn_number": 3,
+        "awaiting_review": True,
+    }
+    metadata = {
+        "status": "running",
+        "repo_root": str(root),
+        "execution_repo_root": str(execution),
+        "worktree_path": str(execution),
+        "original_plan_path": str(original),
+        "active_plan_path": str(overlay),
+        "plan_path": str(original),
+        "workflow_name": "managed",
+        "current_step_name": "implement",
+        "turns_completed": 3,
+        "max_turns": 14,
+        "run_started_at": "2026-09-10T00:00:00Z",
+        "active_implementation_scope": scope,
+    }
+    run_json = run_dir / "run.json"
+    run_json.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    finished_dir = run_dir / "turns" / "turn-003"
+    finished_dir.mkdir(parents=True)
+    (finished_dir / "result.json").write_text(
+        json.dumps({
+            "turn_number": 3,
+            "step_name": "review",
+            "status": "completed",
+            "returncode": 0,
+            "started_at": "2026-09-10T00:00:03Z",
+            "finished_at": "2026-09-10T00:00:05Z",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    (finished_dir / "stdout.txt").write_text("review approved\n", encoding="utf-8")
+
+    starting_dir = run_dir / "turns" / "turn-004"
+    starting_dir.mkdir(parents=True)
+    (starting_dir / "result.json").write_text(
+        json.dumps({
+            "turn_number": 4,
+            "step_name": "implement",
+            "status": "starting",
+            "started_at": "2026-09-10T00:00:06Z",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    (starting_dir / "stdout.txt").write_text("", encoding="utf-8")
+    append_run_event(run_dir, "scope_opened", {
+        "scope_id": scope["scope_id"],
+        "checkpoint_index": scope["checkpoint_index"],
+        "checkpoint_name": scope["checkpoint_name"],
+    })
+    append_run_event(run_dir, "turn_started", {
+        "turn_number": 4,
+        "step_name": "implement",
+    })
+
+    missing_run_id = "issue35-progress-missing"
+    missing_path = root / "plans" / "in-progress" / "missing-evidence.md"
+    missing_run_dir = root / ".aflow" / "runs" / missing_run_id
+    missing_run_dir.mkdir(parents=True, exist_ok=True)
+    (missing_run_dir / "run.json").write_text(
+        json.dumps({
+            "status": "completed",
+            "repo_root": str(root),
+            "original_plan_path": str(missing_path),
+            "active_plan_path": str(missing_path),
+            "plan_path": str(missing_path),
+            "workflow_name": "managed",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "run_json": run_json,
+        "original": original,
+        "execution": execution,
+        "overlay": overlay,
+        "missing_run_id": missing_run_id,
+    }
+
+
+def _close_issue35_repair_scope(fixture: dict[str, object]) -> None:
+    """Advance the disposable fixture after its repair scope is closed."""
+    original = fixture["original"]
+    run_json = fixture["run_json"]
+    assert isinstance(original, Path)
+    assert isinstance(run_json, Path)
+    original.write_text(_issue35_original_plan(current=5), encoding="utf-8")
+    metadata = json.loads(run_json.read_text(encoding="utf-8"))
+    assert isinstance(metadata, dict)
+    metadata.update({
+        "active_implementation_scope": None,
+        "active_plan_path": str(original),
+        "plan_path": str(original),
+    })
+    run_json.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
 def _preflight_request(
     *,
     limit: int = 200,

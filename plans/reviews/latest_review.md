@@ -1,21 +1,33 @@
-# Detached UI MCP discovery cumulative review
+# Cumulative approval — issue 35 repair progress
 
-Approved. No findings passed the material-code-review admission gate; aflow-review-squash governs finalization.
+Original plan: `plans/in-progress/issue-35-repair-progress-20260909.md`.
+Reviewed overlay: `plans/in-progress/issue-35-repair-progress-20260909-cp01-v01.md` (resolved and removed on approval).
+Branch: `aflow-issue-35-repair-progress-20260909-20260910-230639`.
+Unchanged Pre-Handoff Base HEAD: `a268c78b9e1dcdbebf3125c17669d42810f29414`.
+Reviewed head: `00abbb0d2d603b84ed31433f3390e513e2d13c88`.
+New commits since previous review: 1. Total handoff commits reviewed: 5.
+Coverage: CP1 v01 (`a01bd4d4`), CP2 v01 (`55c0d9bb`), CP3 v01 (`7f17ff93`), CP4 v01 (`1b9aa1d3`), and follow-up cp01 v01 (`00abbb0d`). All four original checkpoints are checked.
 
-Reviewed base `2053c498904b73aec6db83a5d85063f6d4ef09a5` through head `9148d6aae55cfff7ba3d76918074c73ce54f2bdd`: one new and one total commit, `cp1 v01`, covering the complete original plan. No prior findings or follow-up plans belong to this handoff.
+## Findings and disposition
 
-Original and active plan: `plans/in-progress/ui-mcp-discovery-contract-20260911.md`; all steps complete. Worker evidence read from mapped primary artifact `/root/code/agent_flow/.aflow/runs/20260911t010336z-87577391/turns/turn-001/result.json`. All writes remain in this execution worktree.
+No material findings. R1 is resolved: new live boundaries persist `original_checkpoint_authority_version: 1`; pre-change captured boundaries retain legacy evidence/disclosure construction while new captures and rebuilds retain original checkpoint authority. The pre-handoff-module reproducer now completes actual historical analysis with exact payload equality and byte-identical artifacts. The new regression explicitly supplies legacy plan state, unavailable checkpoint evidence and disclosure, exercises `analyze_runs`, and checks durable artifact hashes. Runtime coverage asserts the persisted discriminator. No prior finding remains unresolved.
 
-Reviewed the full cumulative diff, surrounding lifecycle test, both web authoring registrars, adapter composition, and core/web registry and authenticated discovery assertions. Content search for `tools/list|list_tools|create_control_plane_mcp` covered root and server tests. Only the detached-server expectation was stale. Exactly seven approved names were added to exact-set equality, preserving 14 core tools, bearer auth, health, three resource templates, duplicate start and owned shutdown. Production and core-registry expectations are unchanged. Implementation scope is only tests/test_ui_cli.py and one DEVLOG entry.
+After checking R1, reviewed the complete cumulative implementation from the unchanged base through the reviewed head, including observer scope/path/evidence precedence and finalization, UI projection and legacy fallback, late-response handling, REST/MCP/browser fixtures, live authority/evidence selection, negative scope/digest tests, history compatibility, and documentation. Manager routing and turn selection remain unchanged. No additional candidate met the material finding admission gate.
 
-Reviewer verification:
-- `uv run pytest -q tests/test_ui_cli.py -k test_daemon_start_health_and_stop`: 1 passed, 14 deselected in 2.81s.
-- `uv run pytest -q tests/test_ui_cli.py`: 15 passed in 5.26s.
-- Existing fixtures isolate HOME/configuration, ports and owned processes.
-- `git diff --check 2053c498904b73aec6db83a5d85063f6d4ef09a5..HEAD`: passed; initial worktree clean.
+## Verification
 
-Approve feature-only squash after unchanged base, preserving reviewed implementation and including review artifacts. One handoff DEVLOG entry needs no compaction. No fix plan created and no stale handoff fix plans exist. Final commit identity, count and preservation checks are recorded in the original ignored plan after squash. Engine owns lifecycle move and normal merge; coordinator owns publication, exact-SHA CI and live acceptance. No delivery gate is claimed here.
+- Fresh `uv run python .aflow/review-issue35/reproduce_history_drift.py`: historical reconstruction preserved exactly; artifacts byte-identical. Historical output was prefixed `HISTORY:`.
+- Fresh `uv run pytest -q tests/test_run_progress.py tests/test_manager_context.py tests/test_manager.py tests/test_runtime.py tests/test_live_config_runtime.py --tb=short`: 451 passed, 43 subtests passed, two known host-global-ignore lifecycle fixture failures. Output: `.aflow/review-issue35/repeat-python.log`.
+- Fresh process-isolated rerun with `GIT_CONFIG_GLOBAL=/dev/null` of `tests/test_runtime.py::WorkflowLifecycleRuntimeTests::test_rejected_final_lifecycle_push_resumes_without_replaying_worker` and `tests/test_runtime.py::WorkflowLifecycleRuntimeTests::test_two_tracked_plan_runs_publish_ignored_done_lifecycle_cleanly`: 2 passed. Output: `.aflow/review-issue35/repeat-isolated.log`. Shared Git configuration was not changed.
+- Fresh `uv run ruff check aflow` and `git diff --check`: passed.
+- Retained prior cumulative verification, as explicitly permitted by the unchanged overlay scope: observer/repository/service/context regressions; authenticated REST/MCP 45 passed; web 336 passed across 22 files; production build passed; real Chromium 2 passed and WebKit 2 passed after that build. No browser, transport or observer implementation changed in the follow-up.
+- Twelve retained screenshots: `.aflow/review-issue35/chromium/` and `.aflow/review-issue35/webkit/`. Re-inspected Chromium 390px repair and WebKit desktop next-checkpoint screenshots. Physical mobile keyboard remains unverified.
+- Supplied worker result `.aflow/runs/20260910t230638z-89fc9ad0/turns/turn-006/result.json` is absent from this execution root. Review relied on committed code, independent tests and retained verification evidence.
 
-HISTORY: Prior latest review concerns separate web MCP authoring work; archived byte-for-byte as `260911_0109.md`.
+## Approval and lifecycle
+
+Approved for the required one-commit cumulative squash from the unchanged base. The remote main SHA was verified against `git ls-remote`; its merge base with this handoff is the original base, so none of the five rewritten feature commits is accepted main history. Only expected reviewer-owned plan progress was dirty at entry.
+
+Approval finalization rotates the prior review byte-identically, compacts the three handoff DEVLOG entries, removes the resolved fix overlay without creating an empty replacement, and preserves implementation files. The original plan remains in `plans/in-progress/` for engine finalization and records the final squash SHA and one-commit verification. Publication, exact-SHA CI, live activation and ticket acceptance remain coordinator-owned; none is claimed by this review.
 
 No material findings

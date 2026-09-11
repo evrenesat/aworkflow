@@ -1,5 +1,21 @@
 # DEVLOG
 
+## 2026-09-11 — Truthful repair progress and historical authority compatibility
+
+- Added read-only original-checkpoint progress to REST/MCP context and the run
+  dashboard: repair overlays remain separate, missing evidence has no invented
+  total, and current turns stay distinct from the last finalized result.
+- New live manager contexts use validated original checkpoint authority while
+  retaining overlay task identity. A durable boundary version preserves exact
+  pre-change historical reconstruction; routing and turn selection are intact.
+- Verified observer, context and runtime regressions, authenticated REST/MCP
+  parity, 336 web tests, the production build, and desktop/390px Chromium and
+  WebKit progress journeys. Repeat review passed 451 Python tests and 43
+  subtests; two host-ignore fixture failures passed with process-local Git
+  configuration isolation. Historical analysis preserved payloads and bytes.
+- Physical mobile keyboard remains unverified. Publication, exact-SHA CI,
+  live activation and issue acceptance remain coordinator-owned.
+
 ## 2026-09-11 — Align detached UI MCP discovery (Checkpoint 1)
 
 - HISTORY: CI evidence in `/root/code/evidence/aflow-dogfood-20260909/ci-2053c498-failed.log` showed the real detached web server returning seven approved plan/config authoring tools beyond the stale 14-name UI discovery expectation.

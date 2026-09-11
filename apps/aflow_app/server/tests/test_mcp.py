@@ -21,6 +21,7 @@ from test_control_plane_api import (
     _add_live_control_targets,
     _answer_pending as _rest_answer_pending,
     _prepared,
+    _seed_issue35_progress_fixture,
     _start_pending as _rest_start_pending,
     control_client as _control_client_fixture,  # noqa: F401
 )
@@ -296,6 +297,53 @@ def test_mcp_stateless_http_auth_metadata_resources_and_rest_parity(mcp_client) 
     assert token_resource.status_code == 400
     assert token_resource.json() == {"detail": {"code": "token_payload_rejected"}}
     assert "super-secret-token" not in token_resource.text
+
+
+def test_mcp_run_context_progress_matches_authenticated_rest(mcp_client) -> None:
+    client, root, _, _ = mcp_client
+    fixture = _seed_issue35_progress_fixture(root)
+    run_id = fixture["run_id"]
+    overlay = fixture["overlay"]
+    assert isinstance(run_id, str)
+    assert isinstance(overlay, Path)
+    assert overlay.is_file()
+    assert not (root / overlay.name).exists()
+
+    endpoint = f"/api/control-plane/projects/{PROJECT_ID}/runs/{run_id}/context"
+    rest_response = client.get(
+        endpoint,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert rest_response.status_code == 200, rest_response.text
+    rest_context = rest_response.json()
+    mcp_context = _mcp_tool(
+        client,
+        "get_run_context",
+        {"project_id": PROJECT_ID, "run_id": run_id},
+    )
+
+    assert mcp_context == rest_context
+    assert rest_context["data"]["progress"] == {
+        "availability": "available",
+        "checkpoint": {"index": 4, "name": "Checkpoint 4: Stage 4"},
+        "total": 14,
+        "complete": False,
+        "repairing": True,
+        "overlay_path": str(overlay),
+        "reason": None,
+        "last_finished_turn": {
+            "turn_number": 3,
+            "step": "review",
+            "status": "completed",
+            "summary": "exit 0: review approved",
+        },
+        "current_turn": {
+            "turn_number": 4,
+            "step": "implement",
+            "status": "starting",
+            "summary": None,
+        },
+    }
 
 
 def test_mcp_trailing_slash_mount_supports_discovery_resource_read_and_header_auth(

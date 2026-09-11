@@ -60,6 +60,37 @@ The same module runs in Chromium by default and WebKit when
 the generated screenshot artifacts. These emulated checks do not stand in for
 physical mobile keyboard or browser-toolbar verification.
 
+## Observer progress boundary
+
+`control_plane/run_progress.py` adds a bounded, read-only projection to the
+existing context bundle. It resolves only controller-declared repository and
+execution-worktree roots, keeps an open repair scope separate from its
+original checkpoint plan, and reports unavailable evidence instead of
+inventing a denominator or completion state. Finalized and starting turn
+records remain separate in the projection.
+
+REST context reads and MCP `get_run_context` both pass through the same
+`ContextService`, so they expose identical progress fields. The dedicated
+server fixture and real Chromium/WebKit dashboard journey verify that
+boundary against the built web assets at desktop and 390px mobile widths.
+This observer path does not write run artifacts or alter manager routing,
+turn selection, or historical captured contexts.
+
+At a new manager boundary after a review rejection, the active repair overlay
+remains the task identity and is retained as active-plan evidence. The
+checkpoint list, completion state, and checkpoint evidence instead come from
+the validated open scope envelope or the exact declared original plan. Invalid
+or missing original authority stays unavailable; supplied captured plan state
+and prior manager decisions are not rewritten, and the existing repair route
+and turn selection remain unchanged.
+
+New manager boundaries persist an original-checkpoint-authority version marker
+so later reconstruction can distinguish the corrected capture contract from
+pre-change schema-v3 records. Historical boundaries that already contain a
+captured plan state and lack that marker retain their recorded evidence and
+disclosure, including legitimately unavailable checkpoint evidence; direct
+contexts and marked captures continue using the corrected original authority.
+
 Presentation must not take over domain state: `GlobalSettings` owns drafts and
 selected editor IDs across guided/raw mode changes, and retains the single
 Skills presentation instance behind native `hidden` semantics across Settings
@@ -195,6 +226,14 @@ checkpoint bodies out of both Lite and Full prompts; both levels use the
 controller-declared evidence references, with Full receiving richer bounded
 scope and rejection detail. Historical v1/v2 contexts retain their stored
 versioned body fields.
+
+The control-plane context bundle also carries a read-only `progress` projection
+for observers. It resolves an open implementation/review scope separately from
+the active plan overlay, obtains checkpoint totals only from declared and
+validated original-plan evidence, and exposes finalized and current turns as
+distinct records. Missing, malformed, or unavailable evidence remains
+explicitly unavailable; this projection does not alter manager turn loading or
+controller routing.
 
 ### Run-local evidence store and reference-only manager contexts
 
@@ -942,6 +981,7 @@ aflow/
     capabilities.py    # versioned capability descriptions
     models.py          # launch, run, event, and context models
     persistence.py     # atomic manifests, events, and revisions
+    run_progress.py    # read-only observer plan/turn projection
     reconciliation.py  # durable state and unit reconciliation
     repository.py      # allowlisted repository/plan operations
     services.py        # lifecycle service orchestration

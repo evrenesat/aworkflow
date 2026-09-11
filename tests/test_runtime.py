@@ -12511,6 +12511,140 @@ class LifecycleBootstrapTests(unittest.TestCase):
             assert 'end_reason' not in run_json
             assert len(list((ctx.value.run_dir / 'manager').iterdir())) == 1
 
+    def test_repair_overlay_manager_boundary_uses_original_checkpoint_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            plan_path = repo_root / "plan.md"
+            repair_path = repo_root / "plan-cp03-v01.md"
+            original_text = (
+                "# Plan\n\n"
+                "### [x] Checkpoint 1: First\n- [x] first\n\n"
+                "### [x] Checkpoint 2: Second\n- [x] second\n\n"
+                "### [ ] Checkpoint 3: Third\n- [ ] third\n"
+            )
+            complete_text = original_text.replace(
+                "### [ ] Checkpoint 3: Third", "### [x] Checkpoint 3: Third"
+            ).replace("- [ ] third", "- [x] third")
+            repair_text = "# Repair overlay\n\n- [ ] repair the third checkpoint\n"
+            _write_plan(plan_path, original_text)
+            workflow = WorkflowConfig(
+                manager_enabled=True,
+                steps={
+                    "implement": WorkflowStepConfig(
+                        role="worker",
+                        prompts=("p",),
+                        go=(
+                            GoTransition(to="END", when="DONE"),
+                            GoTransition(to="review"),
+                        ),
+                    ),
+                    "review": WorkflowStepConfig(
+                        role="reviewer",
+                        prompts=("p",),
+                        go=(GoTransition(to="implement"),),
+                    ),
+                },
+                first_step="implement",
+            )
+            wf_config = WorkflowUserConfig(
+                roles={
+                    "worker": "codex.worker",
+                    "reviewer": "codex.reviewer",
+                    "manager_lite": "codex.manager-lite",
+                    "manager_full": "codex.manager-full",
+                },
+                harnesses={"codex": WorkflowHarnessConfig(profiles={
+                    "worker": HarnessProfileConfig(model="worker"),
+                    "reviewer": HarnessProfileConfig(model="reviewer"),
+                    "manager-lite": HarnessProfileConfig(model="manager-lite"),
+                    "manager-full": HarnessProfileConfig(model="manager-full"),
+                })},
+                workflows={"managed": workflow},
+                prompts={"p": "Work from {ACTIVE_PLAN_PATH}."},
+                manager=ManagerConfig(
+                    lite_role="manager_lite",
+                    full_role="manager_full",
+                    full_after_stalled_turns=1,
+                ),
+            )
+            worker_calls = 0
+            manager_contexts: list[dict[str, object]] = []
+
+            def runner(argv, **kwargs):
+                nonlocal worker_calls
+                model = argv[argv.index("--model") + 1]
+                if model.startswith("manager-"):
+                    prompt = _runner_prompt(argv, kwargs)
+                    manager_contexts.append(json.loads(
+                        prompt.split("MANAGER_CONTEXT_JSON:\n", 1)[1]
+                    ))
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({
+                        "schema_version": 1,
+                        "action": "continue",
+                        "reason": "The existing repair transition remains valid.",
+                        "next_step_notes": [],
+                        "stop_report": None,
+                    }), "")
+                if model == "worker":
+                    worker_calls += 1
+                    if worker_calls == 2:
+                        _write_plan(plan_path, complete_text)
+                elif model == "reviewer":
+                    _write_plan(repair_path, repair_text)
+                return subprocess.CompletedProcess(argv, 0, "synthetic turn", "")
+
+            result = run_workflow(
+                ControllerConfig(
+                    repo_root=repo_root,
+                    plan_path=plan_path,
+                    max_turns=4,
+                ),
+                wf_config,
+                "managed",
+                config_dir=repo_root,
+                snapshot_config=False,
+                adapter=CodexAdapter(),
+                runner=runner,
+            )
+
+            assert result.turns_completed == 3
+            assert worker_calls == 2
+            assert len(manager_contexts) == 3
+            repair_context = manager_contexts[1]
+            repair_state = repair_context["plan_state"]
+            assert repair_state["original_plan_path"] == str(plan_path)
+            assert repair_state["active_plan_path"] == str(repair_path)
+            assert repair_state["active_repair_plan"] is True
+            assert [item["name"] for item in repair_state["checkpoints"]] == [
+                "Checkpoint 1: First",
+                "Checkpoint 2: Second",
+                "Checkpoint 3: Third",
+            ]
+            assert repair_state["current_checkpoint"]["index"] == 3
+            assert repair_state["parse_error"] is None
+            assert repair_context["controller_state"]["repartition_evidence"][
+                "status"
+            ] == "validated"
+            active_ref = repair_context["evidence"]["active_plan"]["reference"]
+            assert (repo_root / active_ref["path"]).read_text() == repair_text
+            checkpoint_ref = repair_context["evidence"]["checkpoint"]["reference"]
+            checkpoint_text = (repo_root / checkpoint_ref["path"]).read_text()
+            assert "### [ ] Checkpoint 3: Third" in checkpoint_text
+            assert "Repair overlay" not in checkpoint_text
+            decision = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "result.json")
+                .read_text(encoding="utf-8")
+            )
+            assert decision["status"] == "accepted"
+            assert decision["action"] == "continue"
+            boundary_payload = json.loads(
+                (result.run_dir / "manager" / "decision-002" / "boundary.json")
+                .read_text(encoding="utf-8")
+            )
+            assert boundary_payload["boundary"][
+                "original_checkpoint_authority_version"
+            ] == 1
+
     def test_manager_gates_end_and_persists_its_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)

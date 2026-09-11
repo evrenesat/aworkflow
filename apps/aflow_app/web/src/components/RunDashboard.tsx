@@ -6,6 +6,9 @@ import type {
   ControlPlaneReadiness,
   GuidedFormProjection,
   GuidedProfileSummary,
+  RunProgressAvailability,
+  RunProgressReason,
+  RunProgressTurn,
   RunContext,
   RunEvent,
   RunStatus,
@@ -240,7 +243,9 @@ function textEvidence(run: RunStatus, key: string): string {
 function contextRecord(context: RunContext | null, key: string): Record<string, unknown> | null {
   if (!context) return null
   const section = context.data[key]
-  return typeof section === 'object' && section !== null ? section as Record<string, unknown> : null
+  return typeof section === 'object' && section !== null && !Array.isArray(section)
+    ? section as Record<string, unknown>
+    : null
 }
 
 function contextText(context: RunContext | null, key: string): string {
@@ -279,27 +284,213 @@ function planPathFromContext(context: RunContext | null): string {
   return 'Not reported'
 }
 
+const ACTIVE_TURN_STATUSES = new Set(['starting', 'running', 'active', 'in_progress'])
+const PROGRESS_REASONS = new Set<RunProgressReason>([
+  'missing_plan',
+  'unreadable_plan',
+  'non_checkpoint_plan',
+  'missing_scope',
+  'invalid_evidence',
+])
+
 interface CheckpointSummary {
-  complete: boolean
+  availability: RunProgressAvailability
+  authoritative: boolean
+  complete: boolean | null
   name: string | null
   index: number | null
-  count: number
+  total: number | null
+  repairing: boolean
+  overlayFileName: string | null
+  reason: RunProgressReason | null
+  currentTurn: RunProgressTurn | null
+  lastFinishedTurn: RunProgressTurn | null
+}
+
+function positiveInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+function boundedNonEmptyText(value: unknown, limit: number): string | null {
+  if (typeof value !== 'string') return null
+  const text = value.trim()
+  if (!text) return null
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+}
+
+function progressReason(value: unknown): RunProgressReason | null {
+  return typeof value === 'string' && PROGRESS_REASONS.has(value as RunProgressReason)
+    ? value as RunProgressReason
+    : null
+}
+
+function progressCheckpoint(value: unknown): { index: number | null; name: string | null } | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const checkpoint = value as Record<string, unknown>
+  const index = positiveInteger(checkpoint.index)
+  const name = boundedNonEmptyText(checkpoint.name, 240)
+  return index !== null || name !== null ? { index, name } : null
+}
+
+function progressTurn(value: unknown): RunProgressTurn | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const turn = value as Record<string, unknown>
+  const turnNumber = positiveInteger(turn.turn_number)
+  const step = boundedNonEmptyText(turn.step ?? turn.step_name, 240)
+  const status = boundedNonEmptyText(turn.status, 120)
+  const summary = boundedNonEmptyText(turn.summary, 512)
+  return turnNumber !== null || step !== null || status !== null || summary !== null
+    ? { turn_number: turnNumber, step, status, summary }
+    : null
+}
+
+function isActiveTurn(turn: RunProgressTurn | null): boolean {
+  if (!turn?.status) return false
+  return ACTIVE_TURN_STATUSES.has(turn.status.toLowerCase())
+}
+
+function isFinishedTurn(turn: RunProgressTurn | null): turn is RunProgressTurn {
+  return turn !== null && turn.status !== null && !isActiveTurn(turn)
+}
+
+function overlayFileName(value: unknown): string | null {
+  const path = boundedNonEmptyText(value, 512)
+  if (!path) return null
+  const filename = path.split(/[\\/]/).pop()
+  return filename && filename !== '.' && filename !== '..' ? filename : null
+}
+
+function emptyProgressSummary(authoritative: boolean, reason: RunProgressReason | null = null): CheckpointSummary {
+  return {
+    availability: 'unavailable',
+    authoritative,
+    complete: null,
+    name: null,
+    index: null,
+    total: null,
+    repairing: false,
+    overlayFileName: null,
+    reason,
+    currentTurn: null,
+    lastFinishedTurn: null,
+  }
+}
+
+function checkpointSummaryFromProjection(progress: Record<string, unknown>): CheckpointSummary {
+  const availability = progress.availability
+  if (availability !== 'available' && availability !== 'partial' && availability !== 'unavailable') {
+    return emptyProgressSummary(true, 'invalid_evidence')
+  }
+  const checkpoint = progressCheckpoint(progress.checkpoint)
+  const total = positiveInteger(progress.total)
+  const complete = typeof progress.complete === 'boolean' ? progress.complete : null
+  const lastFinishedTurn = progressTurn(progress.last_finished_turn)
+  const currentTurn = progressTurn(progress.current_turn)
+  return {
+    availability,
+    authoritative: true,
+    complete: availability === 'available' ? complete : null,
+    name: checkpoint?.name ?? null,
+    index: checkpoint?.index ?? null,
+    total,
+    repairing: progress.repairing === true,
+    overlayFileName: overlayFileName(progress.overlay_path),
+    reason: progressReason(progress.reason),
+    currentTurn,
+    lastFinishedTurn: isFinishedTurn(lastFinishedTurn) ? lastFinishedTurn : null,
+  }
+}
+
+function legacyScopeSummary(managerContext: Record<string, unknown>): CheckpointSummary | null {
+  const controller = contextObject(managerContext.controller_state)
+  const candidates = [
+    managerContext.active_implementation_scope,
+    controller?.active_implementation_scope,
+  ]
+  for (const candidate of candidates) {
+    const scope = contextObject(candidate)
+    if (!scope) continue
+    const index = positiveInteger(scope.checkpoint_index)
+    const name = boundedNonEmptyText(scope.checkpoint_name, 240)
+    if (index === null || name === null) continue
+    return {
+      availability: 'partial',
+      authoritative: false,
+      complete: null,
+      name,
+      index,
+      total: null,
+      repairing: false,
+      overlayFileName: null,
+      reason: null,
+      currentTurn: null,
+      lastFinishedTurn: null,
+    }
+  }
+  return null
+}
+
+function contextObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function legacyPlanSummary(managerContext: Record<string, unknown>): CheckpointSummary | null {
+  const planState = contextObject(managerContext.plan_state)
+  if (!planState || !Array.isArray(planState.checkpoints) || planState.checkpoints.length === 0) return null
+  const checkpoints = planState.checkpoints
+  const valid = checkpoints.every((value, offset) => {
+    const checkpoint = contextObject(value)
+    return positiveInteger(checkpoint?.index) === offset + 1
+      && boundedNonEmptyText(checkpoint?.name, 240) !== null
+  })
+  if (!valid) return null
+  const currentCandidate = progressCheckpoint(planState.current_checkpoint)
+  const current = currentCandidate
+    && currentCandidate.index !== null
+    && currentCandidate.name !== null
+    && currentCandidate.index <= checkpoints.length
+    && boundedNonEmptyText(
+      contextObject(checkpoints[currentCandidate.index - 1])?.name,
+      240,
+    ) === currentCandidate.name
+    ? currentCandidate
+    : null
+  const complete = typeof planState.is_complete === 'boolean' ? planState.is_complete : null
+  return {
+    availability: 'available',
+    authoritative: false,
+    complete: complete === true ? true : complete === false ? false : null,
+    name: current?.name ?? null,
+    index: current?.index ?? null,
+    total: checkpoints.length,
+    repairing: false,
+    overlayFileName: null,
+    reason: null,
+    currentTurn: null,
+    lastFinishedTurn: null,
+  }
+}
+
+function legacyProgressSummary(context: RunContext): CheckpointSummary {
+  const managerContext = contextRecord(context, 'manager_context')
+  if (managerContext) {
+    const scope = legacyScopeSummary(managerContext)
+    if (scope) return scope
+    const plan = legacyPlanSummary(managerContext)
+    if (plan) return plan
+  }
+  return emptyProgressSummary(false)
 }
 
 function checkpointSummary(context: RunContext | null): CheckpointSummary | null {
-  const managerContext = contextRecord(context, 'manager_context')
-  const planState = managerContext
-    && typeof managerContext.plan_state === 'object' && managerContext.plan_state !== null
-    ? managerContext.plan_state as Record<string, unknown>
-    : null
-  if (!planState) return null
-  const checkpoints = Array.isArray(planState.checkpoints) ? planState.checkpoints : []
-  const current = typeof planState.current_checkpoint === 'object' && planState.current_checkpoint !== null
-    ? planState.current_checkpoint as Record<string, unknown>
-    : null
-  const name = current && typeof current.name === 'string' ? current.name : null
-  const index = current && typeof current.index === 'number' ? current.index : null
-  return { name, index, count: checkpoints.length, complete: planState.is_complete === true }
+  if (!context) return null
+  if (Object.prototype.hasOwnProperty.call(context.data, 'progress')) {
+    const progress = contextObject(context.data.progress)
+    return progress ? checkpointSummaryFromProjection(progress) : emptyProgressSummary(true, 'invalid_evidence')
+  }
+  return legacyProgressSummary(context)
 }
 
 interface LastExecutedEvidence {
@@ -358,7 +549,9 @@ function lastExecutedEvidence(
 
 interface ManagerOutcome {
   decision: string | null
+  currentTurn: string | null
   finishedTurn: string | null
+  finishedSummary: string | null
   resultText: string | null
 }
 
@@ -367,48 +560,111 @@ function boundedText(value: unknown, limit: number): string | null {
   return value.length <= limit ? value : `${value.slice(0, limit)}…`
 }
 
-function managerOutcome(context: RunContext | null): ManagerOutcome | null {
+function progressTurnText(turn: RunProgressTurn | null): string | null {
+  if (!turn) return null
+  const parts: string[] = []
+  if (turn.turn_number !== null) parts.push(`turn ${turn.turn_number}`)
+  if (turn.step) parts.push(formatMachineLabel(turn.step))
+  if (turn.status) parts.push(turn.status)
+  return parts.length > 0 ? parts.join(' · ') : null
+}
+
+function hasLegacyFinishEvidence(turn: Record<string, unknown>): boolean {
+  return typeof turn.finished_at === 'string'
+    || typeof turn.ended_at === 'string'
+    || typeof turn.returncode === 'number'
+    || contextObject(turn.semantic_result) !== null
+    || boundedNonEmptyText(turn.error, 240) !== null
+    || Array.isArray(turn.raw_artifacts)
+}
+
+function managerOutcome(context: RunContext | null, progress: CheckpointSummary | null): ManagerOutcome | null {
   const managerContext = contextRecord(context, 'manager_context')
-  if (!managerContext) return null
   let decision: string | null = null
-  const extract = Array.isArray(managerContext.run_extract) ? managerContext.run_extract : []
-  const decisions = Array.isArray(managerContext.manager_decisions) && managerContext.manager_decisions.length > 0
-    ? managerContext.manager_decisions
-    : extract.filter((entry) => typeof entry === 'object' && entry !== null && entry.kind === 'manager_decision')
-      .map((entry) => ({
-        decision_number: entry.number,
-        action: entry.routing?.action,
-        reason: entry.semantic_summary,
-      }))
-  if (Array.isArray(decisions) && decisions.length > 0) {
-    const last = decisions[decisions.length - 1]
-    if (typeof last === 'object' && last !== null) {
-      const entry = last as Record<string, unknown>
-      const action = typeof entry.action === 'string' ? entry.action : 'unknown action'
-      const number = typeof entry.decision_number === 'number' ? ` #${entry.decision_number}` : ''
-      const reason = boundedText(entry.reason, 200)
-      decision = `Decision${number}: ${action}${reason ? ` — ${reason}` : ''}`
+  if (managerContext) {
+    const extract = Array.isArray(managerContext.run_extract) ? managerContext.run_extract : []
+    const decisions = Array.isArray(managerContext.manager_decisions) && managerContext.manager_decisions.length > 0
+      ? managerContext.manager_decisions
+      : extract.filter((entry) => typeof entry === 'object' && entry !== null && entry.kind === 'manager_decision')
+        .map((entry) => ({
+          decision_number: entry.number,
+          action: entry.routing?.action,
+          reason: entry.semantic_summary,
+        }))
+    if (Array.isArray(decisions) && decisions.length > 0) {
+      const last = decisions[decisions.length - 1]
+      if (typeof last === 'object' && last !== null) {
+        const entry = last as Record<string, unknown>
+        const action = typeof entry.action === 'string' ? entry.action : 'unknown action'
+        const number = typeof entry.decision_number === 'number' ? ` #${entry.decision_number}` : ''
+        const reason = boundedText(entry.reason, 200)
+        decision = `Decision${number}: ${action}${reason ? ` — ${reason}` : ''}`
+      }
     }
   }
-  const finished = typeof managerContext.finished_turn === 'object' && managerContext.finished_turn !== null
-    ? managerContext.finished_turn as Record<string, unknown>
-    : null
+  let currentTurn: string | null = null
   let finishedTurn: string | null = null
+  let finishedSummary: string | null = null
   let resultText: string | null = null
-  if (finished) {
-    const parts: string[] = []
-    if (typeof finished.turn_number === 'number') parts.push(`turn ${finished.turn_number}`)
-    if (typeof finished.step_name === 'string') parts.push(formatMachineLabel(finished.step_name))
-    if (typeof finished.status === 'string') parts.push(finished.status)
-    if (typeof finished.returncode === 'number') parts.push(`exit ${finished.returncode}`)
-    finishedTurn = parts.length ? parts.join(' · ') : null
-    const semantic = typeof finished.semantic_result === 'object' && finished.semantic_result !== null
-      ? finished.semantic_result as Record<string, unknown>
+  if (progress?.authoritative) {
+    currentTurn = progress.currentTurn && !isFinishedTurn(progress.currentTurn)
+      ? progressTurnText(progress.currentTurn)
       : null
-    resultText = semantic ? boundedText(semantic.result, 240) : boundedText(finished.error, 240)
+    const lastFinished = progress.lastFinishedTurn
+    if (isFinishedTurn(lastFinished)) {
+      finishedTurn = progressTurnText(lastFinished)
+      finishedSummary = lastFinished.summary
+    }
+  } else if (managerContext) {
+    const current = progressTurn(managerContext.current_turn)
+    currentTurn = current && !isFinishedTurn(current) ? progressTurnText(current) : null
+    const finished = contextObject(managerContext.finished_turn)
+    const normalizedFinished = progressTurn(finished)
+    if (normalizedFinished !== null && isFinishedTurn(normalizedFinished) && finished && hasLegacyFinishEvidence(finished)) {
+      const parts: string[] = []
+      if (normalizedFinished.turn_number !== null) parts.push(`turn ${normalizedFinished.turn_number}`)
+      if (normalizedFinished.step) parts.push(formatMachineLabel(normalizedFinished.step))
+      if (normalizedFinished.status) parts.push(normalizedFinished.status)
+      if (typeof finished.returncode === 'number') parts.push(`exit ${finished.returncode}`)
+      finishedTurn = parts.length ? parts.join(' · ') : null
+      const semantic = contextObject(finished.semantic_result)
+      resultText = semantic ? boundedText(semantic.result, 240) : boundedText(finished.error, 240)
+    }
   }
-  if (!decision && !finishedTurn && !resultText) return null
-  return { decision, finishedTurn, resultText }
+  if (!decision && !currentTurn && !finishedTurn && !finishedSummary && !resultText) return null
+  return { decision, currentTurn, finishedTurn, finishedSummary, resultText }
+}
+
+function progressUnavailableReason(reason: RunProgressReason | null): string {
+  switch (reason) {
+    case 'missing_plan': return 'the original plan is unavailable'
+    case 'unreadable_plan': return 'the original plan could not be read'
+    case 'non_checkpoint_plan': return 'the source is not a checkpoint plan'
+    case 'missing_scope': return 'the active checkpoint scope is unavailable'
+    case 'invalid_evidence': return 'the recorded progress evidence is invalid'
+    default: return 'verified progress evidence was not returned'
+  }
+}
+
+function checkpointProgressText(progress: CheckpointSummary): string {
+  if (progress.availability === 'unavailable') {
+    return `Progress unavailable — ${progressUnavailableReason(progress.reason)}.`
+  }
+  if (progress.availability === 'available' && progress.complete === true) {
+    return progress.total !== null
+      ? `All ${progress.total} checkpoints complete`
+      : 'Completed (verified)'
+  }
+  const name = progress.name ?? (progress.index !== null ? `Checkpoint ${progress.index}` : null)
+  if (name) {
+    if (progress.total !== null && progress.index !== null && progress.index <= progress.total) {
+      return `${name} (${progress.index} of ${progress.total})`
+    }
+    return progress.index !== null ? `${name} (${progress.index})` : name
+  }
+  return progress.total !== null
+    ? `Progress available — current checkpoint not reported (${progress.total} checkpoints)`
+    : 'Progress available — current checkpoint not reported'
 }
 
 function latestControlOverride(events: RunEvent[]): Record<string, unknown> | null {
@@ -1729,7 +1985,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   const startTime = selectedRun?.started_at ?? null
   const elapsed = selectedRun ? executionDuration(selectedRun, elapsedNow) : null
   const checkpoints = checkpointSummary(context)
-  const outcome = managerOutcome(context)
+  const outcome = managerOutcome(context, checkpoints)
   const selectedPlanPath = selectedRun
     ? selectedRun.plan_path ?? (textEvidence(selectedRun, 'plan_path') !== 'Not reported'
       ? textEvidence(selectedRun, 'plan_path')
@@ -2097,11 +2353,14 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               {selectedRun.reason && <div className="notice">{selectedRun.reason}</div>}
 
 
-              {(checkpoints || outcome?.decision || outcome?.finishedTurn || outcome?.resultText) && <section className="dashboard-section">
+              {(checkpoints || outcome?.decision || outcome?.currentTurn || outcome?.finishedTurn || outcome?.finishedSummary || outcome?.resultText) && <section className="dashboard-section">
                 <h4>Latest progress</h4>
-                {checkpoints && <p>{checkpoints.complete ? `All ${checkpoints.count} checkpoints complete` : `${checkpoints.name ?? 'Checkpoint'} (${checkpoints.index ?? '?'} of ${checkpoints.count})`}</p>}
+                {checkpoints && <p>{checkpointProgressText(checkpoints)}</p>}
+                {checkpoints?.repairing && <p><strong>Repairing</strong>{checkpoints.overlayFileName ? <> · {checkpoints.overlayFileName}</> : null}</p>}
                 {outcome?.decision && <p>{outcome.decision}</p>}
+                {outcome?.currentTurn && <p>Current turn: {outcome.currentTurn}</p>}
                 {outcome?.finishedTurn && <p>Last finished turn: {outcome.finishedTurn}</p>}
+                {outcome?.finishedSummary && <p>Last finished summary: {outcome.finishedSummary}</p>}
                 {outcome?.resultText && <pre className="dashboard-payload">{outcome.resultText}</pre>}
               </section>}
 

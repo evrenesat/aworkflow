@@ -74,6 +74,30 @@ const ownedRun = {
   evidence: { manifest_created_at: '2024-01-01T00:00:00Z', plan_path: 'plans/in-progress/demo.md', worktree_path: '/workspace/alpha', branch: 'feature/run' },
 }
 
+function observerProgress(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    availability: 'available',
+    checkpoint: { index: 4, name: 'Checkpoint 4: Repair' },
+    total: 14,
+    complete: false,
+    repairing: false,
+    overlay_path: null,
+    reason: null,
+    last_finished_turn: null,
+    current_turn: null,
+    ...overrides,
+  }
+}
+
+function progressContext(progress: Record<string, unknown>, managerContext?: Record<string, unknown>) {
+  return {
+    run_id: 'run-owned',
+    level: 'lite' as const,
+    data: { progress, ...(managerContext ? { manager_context: managerContext } : {}) },
+    schema_version: 1,
+  }
+}
+
 const committedConfig = {
   project_id: 'control-project',
   revision: 'a'.repeat(64),
@@ -566,6 +590,112 @@ describe('RunDashboard', () => {
     // The progress header names the plan file from canonical run evidence;
     // the demo-2 context fallback above stays under Diagnostics.
     expect(screen.getByRole('heading', { name: 'demo.md' })).toBeDefined()
+  })
+
+  it('renders verified repair progress and separates current from last finished turns', async () => {
+    vi.mocked(api.getRunContext).mockResolvedValue(progressContext(observerProgress({
+      repairing: true,
+      overlay_path: '/workspace/alpha/execution/repair-overlay.md',
+      current_turn: { turn_number: 4, step: 'implement', status: 'starting', summary: null },
+      last_finished_turn: { turn_number: 3, step: 'review', status: 'completed', summary: 'exit 0: review approved' },
+    })))
+
+    renderDashboard()
+
+    expect(await screen.findByText('Checkpoint 4: Repair (4 of 14)')).toBeDefined()
+    expect(screen.getByText('Repairing')).toBeDefined()
+    expect(screen.getByText(/repair-overlay\.md/)).toBeDefined()
+    expect(screen.getByText('Current turn: turn 4 · Implement · starting')).toBeDefined()
+    expect(screen.getByText('Last finished turn: turn 3 · Review · completed')).toBeDefined()
+    expect(screen.getByText('Last finished summary: exit 0: review approved')).toBeDefined()
+    expect(screen.queryByText(/\? of 0/)).toBeNull()
+    expect(screen.queryByText(/All 0 checkpoints complete/)).toBeNull()
+  })
+
+  it('renders a known partial scope without inventing a denominator', async () => {
+    vi.mocked(api.getRunContext).mockResolvedValue(progressContext(observerProgress({
+      availability: 'partial',
+      total: null,
+      complete: null,
+      checkpoint: { index: 4, name: 'Checkpoint 4: Scope only' },
+      reason: 'missing_plan',
+    })))
+
+    renderDashboard()
+
+    expect(await screen.findByText('Checkpoint 4: Scope only (4)')).toBeDefined()
+    expect(screen.queryByText(/Checkpoint 4: Scope only \(4 of/)).toBeNull()
+    expect(screen.queryByText(/\? of 0/)).toBeNull()
+  })
+
+  it('renders unavailable evidence and refuses empty legacy completion', async () => {
+    vi.mocked(api.getRunContext).mockResolvedValue(progressContext(observerProgress({
+      availability: 'unavailable',
+      checkpoint: null,
+      total: 0,
+      complete: true,
+      reason: 'non_checkpoint_plan',
+    })))
+
+    renderDashboard()
+
+    expect(await screen.findByText('Progress unavailable — the source is not a checkpoint plan.')).toBeDefined()
+    expect(screen.queryByText(/All 0 checkpoints complete/)).toBeNull()
+    expect(screen.queryByText(/\? of 0/)).toBeNull()
+  })
+
+  it('keeps a legacy controller scope partial when its checkpoint list is empty', async () => {
+    vi.mocked(api.getRunContext).mockResolvedValue({
+      run_id: 'run-owned',
+      level: 'lite',
+      data: {
+        manager_context: {
+          plan_state: { checkpoints: [], is_complete: true, current_checkpoint: null },
+          controller_state: {
+            active_implementation_scope: {
+              scope_id: 'original::checkpoint-4',
+              checkpoint_index: 4,
+              checkpoint_name: 'Checkpoint 4: Legacy scope',
+            },
+          },
+        },
+      },
+      schema_version: 1,
+    })
+
+    renderDashboard()
+
+    expect(await screen.findByText('Checkpoint 4: Legacy scope (4)')).toBeDefined()
+    expect(screen.queryByText(/All 0 checkpoints complete/)).toBeNull()
+  })
+
+  it('advances from a repairing scope to the next checkpoint after refresh', async () => {
+    let emit: ((events: api.RunEvent[]) => void) | null = null
+    vi.mocked(api.subscribeToRunEvents).mockImplementation((subscription) => {
+      emit = subscription.onEvents
+      return () => {}
+    })
+    const repairing = progressContext(observerProgress({
+      repairing: true,
+      overlay_path: '/workspace/alpha/execution/repair-overlay.md',
+    }))
+    const next = progressContext(observerProgress({
+      checkpoint: { index: 5, name: 'Checkpoint 5: Next' },
+    }))
+    vi.mocked(api.getRunContext).mockResolvedValueOnce(repairing).mockResolvedValue(next)
+
+    renderDashboard()
+
+    expect(await screen.findByText('Checkpoint 4: Repair (4 of 14)')).toBeDefined()
+    expect(screen.getByText('Repairing')).toBeDefined()
+    if (!emit) throw new Error('event subscription was not registered')
+    await act(async () => {
+      emit!([{ sequence: 2, event_type: 'scope_closed', data: {}, schema_version: 1, timestamp: '2024-01-01T00:02:00Z' }])
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    })
+
+    expect(await screen.findByText('Checkpoint 5: Next (5 of 14)')).toBeDefined()
+    expect(screen.queryByText('Repairing')).toBeNull()
   })
 
   it('keeps startup questions distinct from a running workflow and sends an answer idempotently', async () => {
@@ -2301,7 +2431,19 @@ describe('RunDashboard', () => {
       if (runId === 'run-owned') {
         await new Promise((resolve) => { releaseOwned = resolve })
       }
-      return { run_id: runId, level, data: runId === 'run-owned' ? { stale: true } : { status: 'fresh' }, schema_version: 1, ...(level === 'full' ? { fullScope } : {}) }
+      const stale = runId === 'run-owned'
+      return {
+        run_id: runId,
+        level,
+        data: {
+          progress: observerProgress({
+            checkpoint: { index: stale ? 4 : 5, name: stale ? 'Checkpoint 4: Stale' : 'Checkpoint 5: Fresh' },
+          }),
+          ...(stale ? { stale: true } : { status: 'fresh' }),
+        },
+        schema_version: 1,
+        ...(level === 'full' ? { fullScope } : {}),
+      }
     })
     renderDashboard()
     await screen.findByRole('button', { name: 'run-owned' })
@@ -2310,10 +2452,13 @@ describe('RunDashboard', () => {
     await waitFor(() => expect(screen.getByText(/run run-owned/)).toBeDefined())
     fireEvent.click(screen.getByRole('button', { name: /other\.md/ }))
     await screen.findByText(/run run-other/)
+    await screen.findByText('Checkpoint 5: Fresh (5 of 14)')
+    expect(screen.queryByText('Checkpoint 4: Stale (4 of 14)')).toBeNull()
     await waitFor(() => expect(screen.getByText(/"status": "fresh"/)).toBeDefined())
     releaseOwned?.(null)
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(screen.queryByText(/"stale": true/)).toBeNull()
+    expect(screen.queryByText('Checkpoint 4: Stale (4 of 14)')).toBeNull()
     expect(screen.getByText(/"status": "fresh"/)).toBeDefined()
   })
   it('keeps an uncertain creation key across Cancel, run selection and New run', async () => {
@@ -2376,7 +2521,8 @@ describe('RunDashboard', () => {
     await screen.findByText('No agent started.')
     expect(screen.getAllByText('Could not start').length).toBe(2)
     expect(screen.getByText('Untracked file: fixture.txt')).toBeDefined()
-    expect(screen.queryByText('Latest progress')).toBeNull()
+    await waitFor(() => expect(api.getRunContext).toHaveBeenCalled())
+    expect(await screen.findByText(/Progress unavailable/)).toBeDefined()
     vi.useFakeTimers()
     try {
       vi.advanceTimersByTime(3600000)

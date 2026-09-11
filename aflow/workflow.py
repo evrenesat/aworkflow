@@ -50,6 +50,7 @@ from .manager import (
 )
 from .manager_context import (
     MANAGER_CONTEXT_SCHEMA_VERSION_V3,
+    ORIGINAL_CHECKPOINT_AUTHORITY_VERSION,
     build_manager_context,
     build_manager_note_scope,
     summarize_repair_plan,
@@ -457,6 +458,9 @@ class _ManagerCallExecutor:
             **boundary.__dict__,
             "active_plan_content": captured_active_plan,
             "original_plan_content": captured_original_plan,
+            "original_checkpoint_authority_version": (
+                ORIGINAL_CHECKPOINT_AUTHORITY_VERSION
+            ),
             "manager_note_scope": proposed_note_scope,
             "retry_manager_note_scope": retry_note_scope,
             "workspace_state": {
