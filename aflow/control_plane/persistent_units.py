@@ -191,6 +191,36 @@ class PersistentUnitManager:
         )
         self._stop_timeout_seconds = float(stop_timeout_seconds)
         self._receipt_roots: dict[str, Path] = {}
+        self._bound_project_root: Path | None = None
+
+    def bind_project_root(self, repo_root: Path) -> None:
+        """Bind receipt lookup to one validated daemon repository root."""
+        source = Path(repo_root)
+        try:
+            root = source.resolve(strict=True)
+        except OSError as exc:
+            raise PersistentUnitError(
+                "persistent unit project root must be an existing directory"
+            ) from exc
+        if not root.is_dir():
+            raise PersistentUnitError(
+                "persistent unit project root must be an existing directory"
+            )
+        if (
+            self._bound_project_root is not None
+            and self._bound_project_root != root
+        ):
+            raise PersistentUnitError(
+                "persistent unit manager is already bound to a different project root"
+            )
+        for mapped_root in self._receipt_roots.values():
+            try:
+                Path(mapped_root).relative_to(root)
+            except ValueError as exc:
+                raise PersistentUnitError(
+                    "persistent unit manager has a receipt mapping outside the project root"
+                ) from exc
+        self._bound_project_root = root
 
     # ------------------------------------------------------------------ start
 
@@ -211,6 +241,14 @@ class PersistentUnitManager:
         working_directory = Path(cwd).resolve()
         if not working_directory.is_dir():
             raise ValueError("workflow unit working directory must exist")
+        if (
+            self._bound_project_root is not None
+            and working_directory != self._bound_project_root
+        ):
+            raise PersistentUnitError(
+                "persistent unit manager is bound to a different project root; "
+                "refusing to start outside that root"
+            )
         if not os.access(self._executable, os.X_OK):
             raise PersistentUnitError(
                 f"the aflow executable is not runnable: {self._executable}"
@@ -340,12 +378,14 @@ class PersistentUnitManager:
     _receipt_roots: dict[str, Path]
 
     def _cwd_for(self, name: str) -> Path:
-        root = self._receipt_roots.get(name)
-        if root is not None:
-            return root
         match = _UNIT_NAME_RE.fullmatch(name)
         if match is None:
             raise ValueError("workflow unit name must use the aflow-run-<id>.service form")
+        if self._bound_project_root is not None:
+            return self._bound_project_root
+        root = self._receipt_roots.get(name)
+        if root is not None:
+            return root
         run_id = match.group("run_id")
         candidates = [Path.cwd()]
         if self._projects_root is not None:

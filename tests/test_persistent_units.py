@@ -152,6 +152,42 @@ def _unit_is_inactive(manager: PersistentUnitManager, name: str) -> bool:
     return state is not None and not state.is_active
 
 
+def _write_terminal_receipt(
+    root: Path,
+    unit: str,
+    *,
+    nonce: str,
+    returncode: int = 0,
+) -> Path:
+    run_id = unit[len("aflow-run-") : -len(".service")]
+    receipt_dir = root / ".aflow" / "runs" / run_id / "units"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    (receipt_dir / "start.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "run_id": run_id,
+                "unit": unit,
+                "nonce": nonce,
+                "started_at": "2026-09-12T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (receipt_dir / "exit.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "nonce": nonce,
+                "returncode": returncode,
+                "at": "2026-09-12T00:00:01Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return receipt_dir
+
+
 def test_start_writes_receipts_and_reports_active(tmp_path, fake_aflow, repo, monkeypatch):
     _spawn_env(repo, monkeypatch)
     _harness(repo)
@@ -279,7 +315,7 @@ def test_stop_signals_only_the_owned_process_group(tmp_path, fake_aflow, repo, m
     _harness(repo)
     manager = PersistentUnitManager(executable=fake_aflow)
     unit = "aflow-run-20260908t000000z-0000000f.service"
-    state = manager.start(unit, (str(repo / "bin" / "worker"),), cwd=repo)
+    _state = manager.start(unit, (str(repo / "bin" / "worker"),), cwd=repo)
     receipts = repo / ".aflow" / "runs" / "20260908t000000z-0000000f" / "units"
     child = json.loads((receipts / "child.json").read_text())
 
@@ -331,3 +367,165 @@ def test_unit_name_and_argv_validation(tmp_path, fake_aflow, repo):
             ("x",),
             cwd=tmp_path / "missing",
         )
+
+
+def test_bound_unit_lookup_does_not_scan_sibling_projects(
+    tmp_path: Path, fake_aflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = tmp_path / "primary"
+    sibling = tmp_path / "sibling"
+    primary.mkdir()
+    sibling.mkdir()
+    for index in range(40):
+        (sibling / f"unrelated-{index:02d}").mkdir()
+    manager = PersistentUnitManager(executable=fake_aflow, projects_root=tmp_path)
+    manager.bind_project_root(primary)
+    unit = "aflow-run-20260912t000000z-00000020.service"
+
+    def fail_enumeration(*_args, **_kwargs):
+        pytest.fail("bound receipt lookup enumerated a project root")
+
+    monkeypatch.setattr(Path, "iterdir", fail_enumeration)
+    for _ in range(4):
+        assert manager.get(unit) is None
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "not-a-unit.service",
+        "aflow-run-UPPER.service",
+        "aflow-run-a..service",
+    ],
+)
+def test_bound_unit_lookup_rejects_malformed_names(
+    bound: bool,
+    name: str,
+    tmp_path: Path,
+    fake_aflow: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    manager = PersistentUnitManager(executable=fake_aflow, projects_root=tmp_path)
+    if bound:
+        manager.bind_project_root(root)
+
+    def fail_access(*_args, **_kwargs):
+        pytest.fail("malformed unit name reached receipt or project discovery")
+
+    monkeypatch.setattr(Path, "iterdir", fail_access)
+    with pytest.raises(ValueError, match="aflow-run"):
+        manager.get(name)
+
+
+def test_bound_unit_lookup_observes_receipt_created_after_miss(
+    tmp_path: Path, fake_aflow: Path
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    unit = "aflow-run-20260912t000000z-00000021.service"
+    manager = PersistentUnitManager(executable=fake_aflow, projects_root=tmp_path)
+    manager.bind_project_root(root)
+
+    assert manager.get(unit) is None
+    _write_terminal_receipt(root, unit, nonce="late-receipt")
+
+    observed = manager.get(unit)
+    assert observed is not None
+    assert observed.name == unit
+    assert observed.active_state == "inactive"
+    assert observed.sub_state == "dead"
+    assert observed.result == "success"
+
+
+def test_bound_unit_lookup_does_not_cross_same_name_projects(
+    tmp_path: Path, fake_aflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = tmp_path / "primary"
+    sibling = tmp_path / "sibling"
+    primary.mkdir()
+    sibling.mkdir()
+    unit = "aflow-run-20260912t000000z-00000022.service"
+    _write_terminal_receipt(sibling, unit, nonce="sibling-nonce", returncode=17)
+    manager = PersistentUnitManager(executable=fake_aflow, projects_root=tmp_path)
+    manager.bind_project_root(primary)
+    signalled: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        manager,
+        "_signal_group",
+        lambda *args: signalled.append(args),
+    )
+
+    assert manager.get(unit) is None
+    assert manager.stop(unit) is None
+    assert signalled == []
+
+
+def test_bound_unit_manager_rejects_rebind_and_foreign_start_before_side_effects(
+    tmp_path: Path, fake_aflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = tmp_path / "primary"
+    foreign = tmp_path / "foreign"
+    primary.mkdir()
+    foreign.mkdir()
+    manager = PersistentUnitManager(executable=fake_aflow)
+    manager.bind_project_root(primary)
+    manager.bind_project_root(primary.resolve())
+    with pytest.raises(PersistentUnitError, match="different project root"):
+        manager.bind_project_root(foreign)
+    assert manager._bound_project_root == primary.resolve()
+    assert manager._receipt_roots == {}
+
+    mapped = PersistentUnitManager(executable=fake_aflow)
+    unit = "aflow-run-20260912t000000z-00000023.service"
+    mapped._receipt_roots[unit] = foreign.resolve()
+    with pytest.raises(PersistentUnitError, match="outside the project root"):
+        mapped.bind_project_root(primary)
+    assert mapped._bound_project_root is None
+    assert mapped._receipt_roots == {unit: foreign.resolve()}
+
+    receipt_dir = foreign / ".aflow" / "runs" / "20260912t000000z-00000023" / "units"
+
+    def fail_launch(*_args, **_kwargs):
+        pytest.fail("foreign start reached subprocess launch")
+
+    monkeypatch.setattr("aflow.control_plane.persistent_units.subprocess.Popen", fail_launch)
+    with pytest.raises(PersistentUnitError, match="outside that root"):
+        manager.start(unit, ("echo",), cwd=foreign)
+    assert manager._receipt_roots == {}
+    assert not receipt_dir.exists()
+
+
+def test_bound_unit_receipts_use_daemon_root_not_execution_worktree(
+    tmp_path: Path,
+    fake_aflow: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = tmp_path / "primary"
+    execution_worktree = tmp_path / "execution-worktree"
+    primary.mkdir()
+    execution_worktree.mkdir()
+    _spawn_env(primary, monkeypatch)
+    _harness(primary)
+    unit = "aflow-run-20260912t000000z-00000024.service"
+    execution_receipts = _write_terminal_receipt(
+        execution_worktree,
+        unit,
+        nonce="execution-nonce",
+        returncode=23,
+    )
+    manager = PersistentUnitManager(executable=fake_aflow, projects_root=tmp_path)
+    manager.bind_project_root(primary)
+
+    assert manager.get(unit) is None
+    execution_start = json.loads((execution_receipts / "start.json").read_text())
+    started = manager.start(unit, (str(primary / "bin" / "worker"),), cwd=primary)
+    primary_receipts = primary / ".aflow" / "runs" / "20260912t000000z-00000024" / "units"
+    primary_start = json.loads((primary_receipts / "start.json").read_text())
+    assert started.name == unit
+    assert primary_start["nonce"] != execution_start["nonce"]
+    assert manager._cwd_for(unit) == primary.resolve()
+    assert manager.get(unit) is not None
+    manager.stop(unit)

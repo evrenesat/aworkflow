@@ -2024,3 +2024,41 @@ controller/coordinator-owned and are not claimed complete by this review.
 No material findings
 
 ---
+
+## Project-scoped unit receipt lookup — cumulative review approved, 2026-09-12
+
+Review base: `4abcda76fe74c4b270e3cc7b8b3c0ba6be219da8` (unchanged).
+Reviewed HEAD: `44e513eb13f724098ecf681c554d371fb336c3d9`.
+Coverage: 1 new / 1 total commit, `cp1 v01`; all six changed files and
+all original checkpoint requirements. No previous findings or fix overlays
+apply to this handoff.
+
+No material findings passed the admission gate. Bound reads validate names
+before routing directly to the canonical daemon root, including misses;
+real receipt, nonce, process-birth and terminal validation remain unchanged.
+Foreign start/rebind rejects before ownership mutation or launch. Standalone
+positive-root discovery remains available. Server composition binds concrete
+persistent adapters after root validation, preserving generic factories.
+The no-enumeration test establishes bounded lookup independent of siblings;
+late receipts, same-name isolation, primary/execution-root separation and
+existing owned-process behavior have focused verification.
+
+Reused successful retained worker evidence against the reviewed source:
+`/root/code/agent_flow/.aflow/runs/20260912t221026z-1c77e989/turns/turn-001/transport.stdout`
+and completed `result.json`. Exact original-plan manager selection: 16 passed,
+4 deselected (final run 1.54s). Exact three server nodes: 3 passed (2.90s),
+with an existing Starlette deprecation warning. Scoped production Ruff passed;
+the broader four-changed-Python-file lint also passed. Reviewer independently
+checked the cumulative diff, surrounding receipt/stop/composition code, daemon
+launch cwd and `git diff --check 4abcda76 HEAD`. No full suites, live profiles,
+shared-tool changes, deployment waits or other worktree edits.
+
+Approve local implementation and consolidate with this tracked reviewer record
+into one unpublished commit after the unchanged base. Preserve all six reviewed
+file blobs and the single DEVLOG entry. No fix plan is needed or created.
+Leave the ignored original plan for engine finalization and record the final
+approved SHA there after committing. Verify one commit and clean tracked state.
+Publication, exact-SHA CI, activation and live performance measurement remain
+controller/coordinator-owned and pending; no overall loading target is certified.
+
+No material findings

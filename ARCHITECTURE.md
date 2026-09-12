@@ -1181,6 +1181,12 @@ React client expose four product areas: registered projects, the shared
 global workflow configuration pair plus server settings, filesystem plans,
 and durable workflow runs.
 
+Each registry project's `ControlPlaneService` composition binds its newly
+created persistent unit manager to the validated daemon repository root before
+the daemon starts. Bound observers inspect fresh receipts only under that
+exact root; standalone or unbound managers retain their existing positive-root
+reattachment discovery for compatibility.
+
 The web build derives compact release content from the repository root
 `DEVLOG.md` through `apps/aflow_app/web/scripts/generate-changelog.mjs`. The
 generator emits deterministic `src/generated/changelog.json` and root

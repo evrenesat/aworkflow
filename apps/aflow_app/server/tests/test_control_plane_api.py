@@ -34,6 +34,7 @@ from aflow.control_plane import (
     write_launch_phase,
 )
 from aflow.control_plane.persistence import append_run_event
+from aflow.control_plane.persistent_units import PersistentUnitManager
 from aflow.control_plane.units import InMemoryUnitManager, UnitState
 from aflow.daemon import AflowDaemon
 from aflow_app_server.config import ServerConfig
@@ -1705,6 +1706,59 @@ def test_control_plane_rejects_unknown_projects_and_plan_traversal(control_clien
     )
     assert rejected.status_code == 422
     assert rejected.json() == {"detail": {"code": "operation_rejected"}}
+
+
+def test_persistent_unit_factory_binds_each_validated_project_root(control_client) -> None:
+    from aflow_app_server import main
+
+    _, root, _, _ = control_client
+    registry = main._project_registry
+    assert registry is not None
+    peer_id = "peer-project"
+    peer_root = _register_peer_project(registry, root.parent, peer_id)
+    executable = root / "release" / "bin" / "aflow"
+    environment_file = root / "aflowd.env"
+    workflow_config_path = root.parent / "global" / "aflow.toml"
+    managers: list[PersistentUnitManager] = []
+
+    def persistent_factory() -> PersistentUnitManager:
+        manager = PersistentUnitManager(executable=executable)
+        managers.append(manager)
+        return manager
+
+    def daemon_factory(config, *, units):
+        return AflowDaemon(config, units=units)
+
+    service = ControlPlaneService(
+        registry,
+        aflow_executable=executable,
+        environment_file=environment_file,
+        release_identity="test-release",
+        daemon_factory=daemon_factory,
+        unit_manager_factory=persistent_factory,
+        workflow_config_path=workflow_config_path,
+    )
+    service._project(PROJECT_ID)
+    service._project(peer_id)
+
+    assert [manager._bound_project_root for manager in managers] == [
+        root.resolve(),
+        peer_root.resolve(),
+    ]
+    assert managers[0] is not managers[1]
+
+    default_units = InMemoryUnitManager()
+    default_service = ControlPlaneService(
+        registry,
+        aflow_executable=executable,
+        environment_file=environment_file,
+        release_identity="test-release",
+        daemon_factory=daemon_factory,
+        unit_manager_factory=lambda: default_units,
+        workflow_config_path=workflow_config_path,
+    )
+    default_service._project(PROJECT_ID)
+    assert not hasattr(default_units, "bind_project_root")
 
 
 def test_two_registered_projects_keep_exact_plan_and_launch_boundaries(

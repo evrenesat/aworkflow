@@ -33,6 +33,7 @@ from aflow.control_plane import (
 )
 from aflow.control_plane.run_history import RunHistory
 from aflow.daemon import AflowDaemon, DaemonConfig, DaemonError
+from aflow.control_plane.persistent_units import PersistentUnitManager
 
 from .project_registry import (
     ProjectRegistry,
@@ -132,7 +133,10 @@ class ControlPlaneService:
             persistent_units = unit_manager_factory
 
             def _factory_with_units(daemon_config: DaemonConfig) -> AflowDaemon:
-                return base_factory(daemon_config, units=persistent_units())
+                units = persistent_units()
+                if isinstance(units, PersistentUnitManager):
+                    units.bind_project_root(daemon_config.repo_root)
+                return base_factory(daemon_config, units=units)
 
             self._daemon_factory: DaemonFactory = _factory_with_units
         else:

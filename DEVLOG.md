@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-12 — Bind persistent receipt observation to daemon roots
+
+- Persistent unit managers composed for registered projects now resolve reads
+  directly under each daemon's validated repository root. Missing receipts are
+  still missing and newly written receipts are visible on the next read, while
+  unbound restart reattachment retains its existing discovery behavior.
+- Focused receipt ownership, collision, late-observation, foreign-start and
+  server-composition tests preserve nonce/process identity and terminal-state
+  validation without claiming the coordinator's later live performance target.
+
 ## 2026-09-12 — Preserve status projection and composite browser identity
 
 - Recovery test doubles now forward the explicit progress-projection keyword and
