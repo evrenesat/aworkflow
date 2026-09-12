@@ -1399,3 +1399,52 @@ Coordinator owns publication, exact-SHA CI, deployment/live check and final stop
 report for the existing settings delivery. This review makes no live claims.
 
 No material findings
+
+
+---
+
+# Held context gate ordering — cumulative review v01: approved
+
+Unchanged Pre-Handoff Base HEAD: `dc99aa4f93a741a63edabae32e80bb3090109976`.
+Reviewed implementation HEAD: `d3b109ecce4979a7819f16ab959d6647cead1e37`.
+Coverage: 1 new / 1 total commit, cp1 v01, the complete original plan and
+actual two-file diff. Original and active plan are
+held-context-gate-ordering-20260912.md. No prior findings or fix overlays apply;
+older entries in this record concern other handoffs.
+
+The callback records the exact route before page acknowledgement without an
+upstream fetch; the bounded acknowledgement wait precedes the trial helper.
+Continuation follows the original geometry, identity and nonempty-route checks,
+then the unchanged same-target offscreen and atomic hit assertions run against
+real fixture context. Cleanup continues held routes before unroute and catches
+teardown Playwright errors. The option exception requires both the exact
+combobox-listbox class token and listbox role, matching the bounded production
+Combobox and UI guideline. No obsolete combobox-options caller exists in web
+source. Product code, atomic helper and other scroller rules are unchanged.
+No material finding passes the material-code-review admission gate.
+
+Verification reused completed worker result and raw command receipts from
+`/root/code/agent_flow/.aflow/runs/20260912t052002z-6fcd9cfe/turns/turn-001/`;
+the prompt's worktree-relative receipt is absent. From apps/aflow_app/server:
+
+- `AFLOW_TEST_BROWSER=webkit uv run pytest -q tests/test_responsive_browser.py::test_responsive_action_hit_test_survives_late_context_growth --tb=short --basetemp "$test_temp_dir"`: final cleanup version, 1 passed in 4.38s.
+- Same exact growth case with `AFLOW_TEST_BROWSER=chromium`: final cleanup version, 1 passed in 3.76s.
+- `AFLOW_TEST_BROWSER=webkit uv run pytest -q 'tests/test_responsive_browser.py::test_responsive_team_family_journey[desktop]' --tb=short --basetemp "$test_temp_dir"`: 1 passed in 17.60s with the final scroller rule; the subsequent cleanup-only edit does not affect this journey.
+
+Each test invocation used fresh temporary state through --basetemp; no private
+host paths were added to portable tests. Initial missing-asset/login failures
+and the intermediate unroute-before-continue error were corrected before final
+passing receipts. Retained unaffected helper/negative and route evidence remains
+in the preceding approved handoff. Reviewer cumulative `git diff --check` passed.
+No full matrix, redundant browser runs or builds were repeated during review.
+
+Approval includes this tracked reviewer record in one unpublished final handoff
+commit above the unchanged base, preserving both reviewed implementation blobs.
+DEVLOG has one relevant entry; no compaction or fix plan is needed. Keep the
+ignored original plan in place for engine finalization and record the approved
+SHA there outside the commit. Verify one final commit and clean tracked state.
+Coordinator owns publication, exact-SHA CI, live activation and the owner-required
+stop after existing settings delivery. This bounded review stops here and makes
+no downstream delivery claims.
+
+No material findings

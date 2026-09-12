@@ -374,7 +374,10 @@ def _assert_no_unauthorized_scrollers(page: Page) -> None:
     unexpected = [item for item in scrollers if not (
         item["tag"] in {"TEXTAREA", "SELECT"}
         or "sidebar-editor-navigation" in item["className"]
-        or "combobox-options" in item["className"]
+        or (
+            item["role"] == "listbox"
+            and "combobox-listbox" in item["className"].split()
+        )
         or item["role"] == "menu"
     )]
     assert not unexpected, unexpected
@@ -614,7 +617,8 @@ def test_responsive_action_hit_test_survives_late_context_growth(
     held_context = []
 
     def hold_context(route):
-        held_context.append((route, route.fetch()))
+        held_context.append(route)
+        page.evaluate("() => { window.__aflowResponsiveContextCaptured = true }")
 
     def release_context_after_trial(target):
         before = target.bounding_box()
@@ -631,8 +635,8 @@ def test_responsive_action_hit_test_survives_late_context_growth(
 
         pending = held_context[:]
         held_context.clear()
-        for route, response in pending:
-            route.fulfill(response=response)
+        for route in pending:
+            route.continue_()
         page.unroute(context_pattern, hold_context)
         page.wait_for_function(
             "element => element.getBoundingClientRect().y > innerHeight",
@@ -658,6 +662,7 @@ def test_responsive_action_hit_test_survives_late_context_growth(
         try:
             _login(page, url)
             _ensure_project(page)
+            page.evaluate("() => { window.__aflowResponsiveContextCaptured = false }")
             page.route(context_pattern, hold_context)
             _open_destination(page, "Runs")
             page.get_by_role("button", name="New run", exact=True).wait_for()
@@ -667,18 +672,23 @@ def test_responsive_action_hit_test_survives_late_context_growth(
             )
             run_row.click()
             _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, RESPONSIVE_FIXTURE_RUN_ID)
+            page.wait_for_function(
+                "() => window.__aflowResponsiveContextCaptured === true"
+            )
             action = page.locator("button:visible").last
             _assert_action_hit_test(page, action, after_trial=release_context_after_trial)
         finally:
-            if held_context:
-                pending = held_context[:]
-                held_context.clear()
-                for route, response in pending:
-                    try:
-                        route.fulfill(response=response)
-                    except PlaywrightError:
-                        pass
+            pending = held_context[:]
+            held_context.clear()
+            for route in pending:
+                try:
+                    route.continue_()
+                except PlaywrightError:
+                    pass
+            try:
                 page.unroute(context_pattern, hold_context)
+            except PlaywrightError:
+                pass
             browser.close()
 
 

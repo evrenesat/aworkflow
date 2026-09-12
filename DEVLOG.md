@@ -1,5 +1,15 @@
 # DEVLOG
 
+## 2026-09-12 — Establish held-context capture before responsive trial
+
+- The responsive browser regression now records the intercepted context route and
+  acknowledges capture before the trial click, then releases the real response with
+  `route.continue_()` only after the pre-release geometry and hit checks. This fixes
+  the test-only `held_context.append((route, route.fetch()))` fetch-before-capture
+  ordering and avoids teardown-disposed fetch errors.
+- The scroller assertion now permits only the actual bounded `combobox-listbox`
+  `role=listbox` popover. No product code changed.
+
 ## 2026-09-12 — Make responsive hit snapshots atomic after context growth
 
 - The browser hit helper now resolves one exact visible `ElementHandle` before
