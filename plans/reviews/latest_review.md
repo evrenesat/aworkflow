@@ -2113,3 +2113,46 @@ coordinator-owned; this review does not claim deployed usability.
 No material findings
 
 ---
+
+## Compact selected-readiness CI repair — cumulative review approved, 2026-09-12
+
+Review base: `6bc13c3534b178cffbb5e00daa87061c32edde04` (unchanged).
+Reviewed HEAD: `78f1c431ee5b5a292d75c57b0db1e17024b98585`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all seven checkpoint steps
+and the complete four-file cumulative implementation. No previous findings
+or follow-up overlays apply to this handoff.
+
+No material findings passed the admission gate. Project-scoped shell retention
+preserves compact selection while exact direct detail is pending; direct identity,
+stale-response, missing/deleted and access gates remain intact. Both stop paths
+and the open immediate-stop confirmation use initial mutation admission.
+The complete delayed-worker journey retains provider release, durable revision,
+receipt, boundary finalization, reviewer/lineage and no-unit-stop assertions.
+Early selected reads and exact-project backend lookup are preserved.
+No timeout increases, forced clicks, blanket retries or portable host paths added.
+
+Reused inspected final worker command/output receipts in
+`/root/code/agent_flow/.aflow/runs/20260912t223745z-287927ed/turns/turn-001/transport.stdout`
+and its successful result.json (zero unchecked steps/checkpoints):
+
+- Final focused component command: 129 passed, 10.85s.
+- Final production build: passed, Vite 2.08s.
+- Final Chromium selection: 5 passed, 27.43s (both held-config viewports,
+  original phone/tablet routes and complete delayed-worker journey).
+- Final WebKit selection: 3 passed, 20.96s (held-config phone,
+  original phone-tall route and complete delayed-worker journey).
+- Earlier browser failures preceded fixture corrections. A concurrent
+  build/component attempt failed one existing resume test; the final standalone
+  component command passed. No full local suites repeated for this review.
+- Browser temporary roots were supplied through pytest --basetemp.
+  Reviewer cumulative git diff --check passed.
+
+Approve and consolidate the implementation plus this tracked reviewer record
+into one unpublished handoff commit after the unchanged base. Preserve all four
+reviewed blobs and the single handoff DEVLOG entry. No fix plan is needed.
+Leave the ignored original plan in place for engine finalization, recording the
+final SHA there after committing. Verify exactly one commit and clean tracked
+state. Publication, exact-SHA CI, normal activation and live timing remain
+coordinator-owned and pending; local approval does not certify deployed usability.
+
+No material findings

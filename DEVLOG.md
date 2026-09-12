@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-09-12 — Retain compact run navigation during readiness
+
+- An authorized Runs shell now remains mounted through same-project selection
+  while initial configuration is pending. Compact selection keeps its detail
+  intent, shows the exact pending run identity, and reveals content only after
+  that run's direct snapshot is accepted; Back still restores its row.
+- Initial admission consistently disables both boundary and immediate stop,
+  including an already-open confirmation, while readable running and pending
+  stop evidence remains visible. Focused component and browser regressions
+  cover held configuration without changing delayed-worker stop semantics.
+
 ## 2026-09-12 — Bind persistent receipt observation to daemon roots
 
 - Persistent unit managers composed for registered projects now resolve reads

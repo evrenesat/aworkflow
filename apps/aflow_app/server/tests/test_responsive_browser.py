@@ -1659,6 +1659,77 @@ def test_responsive_focus_resize_and_screenshots(control_client, monkeypatch, tm
             browser.close()
 
 
+@pytest.mark.parametrize(
+    ("width", "height"),
+    (
+        pytest.param(320, 568, id="phone-portrait"),
+        pytest.param(768, 1024, id="tablet"),
+    ),
+)
+def test_compact_selection_survives_pending_configuration(
+    control_client,
+    monkeypatch,
+    width: int,
+    height: int,
+):
+    """Keep one compact navigation owner while selected detail settles."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        try:
+            page = browser.new_page(viewport={"width": width, "height": height})
+            _login(page, url)
+            _ensure_project(page)
+
+            held_form = []
+            hold_enabled = {"value": True}
+
+            def hold_initial_form(route):
+                if hold_enabled["value"] and route.request.method == "POST" and not held_form:
+                    held_form.append(route)
+                else:
+                    route.continue_()
+
+            def release_form():
+                while held_form:
+                    held_form.pop(0).continue_()
+
+            page.route("**/api/config/form", hold_initial_form)
+            try:
+                first_run = RESPONSIVE_FIXTURE_RUN_ID
+                second_run = "responsive-run-38"
+                with page.expect_request("**/api/config/form", timeout=10_000):
+                    page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={first_run}")
+                _assert_run_detail(page, RESPONSIVE_FIXTURE_TITLE, first_run)
+                assert len(held_form) == 1, "initial configuration projection was not held"
+
+                page.get_by_role("button", name="← Back to Run history", exact=True).click()
+                row = page.locator(
+                    f".run-list-item[data-sidebar-editor-item='{second_run}']"
+                )
+                row.wait_for()
+                row.click()
+                _assert_run_detail(page, "Long plan 38", second_run)
+
+                page.get_by_role("button", name="← Back to Run history", exact=True).click()
+                expect(row).to_be_focused()
+
+                hold_enabled["value"] = False
+                with page.expect_response("**/api/config/form", timeout=10_000):
+                    release_form()
+                expect(row).to_be_focused()
+            finally:
+                hold_enabled["value"] = False
+                release_form()
+                page.unroute("**/api/config/form", hold_initial_form)
+        finally:
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_team_family_journey(
     control_client,
@@ -2601,11 +2672,25 @@ go = [{ to = "END" }]
                         with fresh_page.expect_request(capabilities_api, timeout=10_000):
                             fresh_page.goto(fresh_run_url)
                             fresh_dashboard = _visible_dashboard(fresh_page)
-                        expect(fresh_page.get_by_text("Loading runs…", exact=True)).to_be_visible()
-                        expect(fresh_dashboard.get_by_role(
+                        _assert_run_detail(
+                            fresh_page,
+                            "Graceful stop plan",
+                            run_id,
+                        )
+                        expect(fresh_page.get_by_text(
+                            "Stop requested — finishing current turn", exact=False
+                        )).to_be_visible()
+                        assert fresh_page.get_by_text("Running", exact=True).count() > 0
+                        immediate_stop = fresh_dashboard.get_by_role(
                             "button", name="Stop now…", exact=True
-                        )).to_have_count(0)
+                        )
+                        if immediate_stop.count():
+                            expect(immediate_stop).to_be_disabled()
                         assert len(held_capabilities) == 1, "admitted capabilities response was not held"
+                        held_state = client.get(run_path)
+                        assert held_state.status_code == 200, held_state.text
+                        assert held_state.json()["revision"] == persisted_payload["revision"]
+                        assert units.stop_calls == []
 
                         gate["enabled"] = False
                         release_held_capabilities()

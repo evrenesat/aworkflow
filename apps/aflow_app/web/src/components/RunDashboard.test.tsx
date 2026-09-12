@@ -355,6 +355,18 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function installCompactMedia() {
+  const media = {
+    matches: true,
+    media: '(max-width: 959px), (max-height: 599px)',
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+  } as unknown as MediaQueryList
+  Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => media })
+}
+
 type ResumeComparisonSetup = 'accepted-baseline' | 'pending'
 
 function installResumeComparisonSetup(setup: ResumeComparisonSetup) {
@@ -379,10 +391,12 @@ function installResumeComparisonSetup(setup: ResumeComparisonSetup) {
 describe('RunDashboard', () => {
   let locationBeforeTest = ''
   let clipboardDescriptorBeforeTest: PropertyDescriptor | undefined
+  let matchMediaBeforeTest: typeof window.matchMedia | undefined
 
   beforeEach(() => {
     locationBeforeTest = window.location.href
     clipboardDescriptorBeforeTest = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    matchMediaBeforeTest = window.matchMedia
     window.history.replaceState(null, '', window.location.pathname)
     vi.resetAllMocks()
     vi.mocked(api.getRestartOptions).mockResolvedValue(null as never)
@@ -409,6 +423,8 @@ describe('RunDashboard', () => {
     window.history.replaceState(null, '', locationBeforeTest)
     if (clipboardDescriptorBeforeTest) Object.defineProperty(navigator, 'clipboard', clipboardDescriptorBeforeTest)
     else Reflect.deleteProperty(navigator, 'clipboard')
+    if (matchMediaBeforeTest) Object.defineProperty(window, 'matchMedia', { configurable: true, value: matchMediaBeforeTest })
+    else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia
   })
 
   it('suspends hidden streams and refreshes on visibility restoration', async () => {
@@ -2869,6 +2885,84 @@ describe('RunDashboard', () => {
     })
     await screen.findByRole('button', { name: 'Refresh', exact: true })
     expect(within(detail).getByText('Completed')).toBeDefined()
+  })
+
+  it('keeps compact selection open for the exact run while initial configuration is pending', async () => {
+    installCompactMedia()
+    const configuration = deferred<typeof committedConfig>()
+    const selectedDetail = deferred<typeof ownedRun>()
+    const otherRun = {
+      ...ownedRun,
+      run_id: 'run-other',
+      status: 'completed',
+      revision: 2,
+      evidence: { ...ownedRun.evidence, plan_path: 'plans/in-progress/other.md' },
+    }
+    vi.mocked(api.getGlobalConfig).mockImplementationOnce(() => configuration.promise)
+    vi.mocked(api.listControlPlaneRuns).mockResolvedValue({ runs: [ownedRun, otherRun], next_cursor: null, schema_version: 1 })
+    vi.mocked(api.getControlPlaneRun).mockImplementation((_projectId, runId) => (
+      runId === otherRun.run_id ? selectedDetail.promise : Promise.resolve(ownedRun)
+    ))
+    const { container } = renderDashboard()
+
+    const row = await screen.findByRole('button', { name: /run-other Completed/ })
+    await waitFor(() => expect(container.querySelector('.run-detail')?.textContent).toContain('run-owned'))
+    fireEvent.click(row)
+
+    const detail = await screen.findByLabelText('Run details')
+    expect(within(detail).getByText('Loading run details')).toBeDefined()
+    expect(within(detail).getByText('run-other')).toBeDefined()
+    expect(within(detail).queryByRole('button', { name: 'run-owned', exact: true })).toBeNull()
+    expect(screen.getByRole('button', { name: '← Back to Run history' })).toBeDefined()
+
+    await act(async () => {
+      selectedDetail.resolve(otherRun)
+      await selectedDetail.promise
+    })
+    expect(within(detail).getByRole('button', { name: 'run-other', exact: true })).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: '← Back to Run history' }))
+    await waitFor(() => expect(document.activeElement).toBe(row))
+
+    await act(async () => {
+      configuration.resolve(committedConfig)
+      await configuration.promise
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh', exact: true })).toHaveProperty('disabled', false))
+    expect(document.activeElement).toBe(row)
+  })
+
+  it('blocks boundary stop and an open immediate-stop confirmation during renewed initial admission', async () => {
+    const heldConfiguration = deferred<typeof committedConfig>()
+    const view = renderDashboardNode(dashboardNode({ requestedRunId: ownedRun.run_id }))
+
+    const stopNow = await screen.findByRole('button', { name: 'Stop now…', exact: true })
+    fireEvent.click(stopNow)
+    expect(screen.getByRole('button', { name: 'Stop now', exact: true })).toBeDefined()
+
+    vi.mocked(api.getGlobalConfig).mockImplementationOnce(() => heldConfiguration.promise)
+    view.rerender(dashboardNode({ requestedRunId: ownedRun.run_id, visible: false }))
+    view.rerender(dashboardNode({ requestedRunId: ownedRun.run_id, visible: true }))
+
+    const boundary = await screen.findByRole('button', { name: 'Stop after current turn', exact: true })
+    const confirmedStop = screen.getByRole('button', { name: 'Stop now', exact: true })
+    await waitFor(() => {
+      expect(boundary).toHaveProperty('disabled', true)
+      expect(confirmedStop).toHaveProperty('disabled', true)
+    })
+    fireEvent.click(boundary)
+    fireEvent.click(confirmedStop)
+    expect(api.controlControlPlaneRun).not.toHaveBeenCalled()
+    expect(api.ownerStopControlPlaneRun).not.toHaveBeenCalled()
+
+    await act(async () => {
+      heldConfiguration.resolve(committedConfig)
+      await heldConfiguration.promise
+    })
+    await waitFor(() => {
+      expect(boundary).toHaveProperty('disabled', false)
+      expect(confirmedStop).toHaveProperty('disabled', false)
+    })
   })
 
   it('keeps an accepted selected snapshot readable when history fails', async () => {

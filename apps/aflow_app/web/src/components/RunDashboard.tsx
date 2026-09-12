@@ -957,6 +957,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     ? projectAvailability.available
     : null
   const [acceptedSelectedDetail, setAcceptedSelectedDetail] = useState<{ projectId: string; runId: string } | null>(null)
+  const [exposedShellProjectId, setExposedShellProjectId] = useState<string | null>(null)
   const [capabilities, setCapabilities] = useState<ControlPlaneCapabilities | null>(null)
   const [readiness, setReadiness] = useState<ControlPlaneReadiness | null>(null)
   const [plans, setPlans] = useState<ControlPlanePlan[]>([])
@@ -1086,6 +1087,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
     && acceptedSelectedDetail?.projectId === projectId
     && acceptedSelectedDetail.runId === selectedRunId,
   )
+
+  useEffect(() => {
+    if (projectAvailable === true && selectedDetailAccepted) setExposedShellProjectId(projectId)
+  }, [projectAvailable, projectId, selectedDetailAccepted])
 
   useEffect(() => {
     followupRequestRef.current += 1
@@ -1243,7 +1248,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
         setReadiness(readinessState)
         const availableHere = available.some((project) => project.project_id === projectId)
         setProjectAvailability({ projectId, available: availableHere })
-        if (!availableHere) setAcceptedSelectedDetail(null)
+        if (!availableHere) {
+          setAcceptedSelectedDetail(null)
+          setExposedShellProjectId(null)
+        }
         if (availableHere) await loadDashboard(projectId, () => active)
       } catch (loadError) {
         if (active) setProjectReadError(errorMessage(loadError, 'Failed to load control-plane projects'))
@@ -1414,6 +1422,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       setCapabilities(nextCapabilities)
       setPlans(nextPlans)
       setNextRunCursor(page.next_cursor)
+      setExposedShellProjectId(nextProjectId)
       const orderedRuns = newestRunsFirst(page.runs.filter(run => !deletedRef.current.has(run.run_id)))
       setRuns((current) => {
         // Refreshed pages never silently displace a run that was fetched
@@ -1937,7 +1946,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
 
   async function handleOwnerStop() {
-    if (!projectId || !selectedRun) return
+    if (!projectId || !selectedRun || !canMutate || !selectedRunHasLiveControls || !hasSafeControl('owner_stop')) return
     clearActionFeedback()
     const runId = selectedRun.run_id
     const intent = {
@@ -1973,7 +1982,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
 
   async function handleBoundaryStop() {
-    if (!projectId || !selectedRun || !selectedRunHasLiveControls) return
+    if (!projectId || !selectedRun || !canMutate || !selectedRunHasLiveControls || !hasSafeControl('owner_stop')) return
     clearActionFeedback()
     const runId = selectedRun.run_id
     const request: Parameters<typeof api.controlControlPlaneRun>[2] = {
@@ -2906,7 +2915,8 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
   }
 
   const renderAcceptedDetail = projectAvailable === true && selectedDetailAccepted && !newRunPage
-  const dashboardRenderable = !loading || renderAcceptedDetail
+  const retainedProjectShell = exposedShellProjectId === projectId && projectAvailable !== false && !newRunPage
+  const dashboardRenderable = !loading || renderAcceptedDetail || retainedProjectShell
   const hosted = useHeaderSlots(`run-dashboard:${projectId}`, {
     context: <h2 className="header-context-title">{newRunPage ? 'New run' : 'Runs'}</h2>,
     local: newRunPage ? <button className="btn btn-secondary btn-sm" onClick={cancelNewRun}>← Run history</button> : <label className="header-filter-select"><span>Run history</span><select aria-label="Run history" value={historyFilter} onChange={event => setHistoryFilter(event.target.value as typeof historyFilter)}><option value="visible">Visible</option><option value="archived">Archived</option><option value="all">All history</option></select></label>,
@@ -3032,7 +3042,10 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           </section>}>
 
           <section className="card run-detail" aria-label="Run details">
-            {selectedRunId && deletedIds.has(selectedRunId) ? <div><h3>Deleted record</h3><p>Workflow files and recovery data are retained.</p></div> : !selectedRun ? <p className="text-sm text-dim">Select a recorded run to inspect its server status and events.</p> : <>
+            {selectedRunId && deletedIds.has(selectedRunId) ? <div><h3>Deleted record</h3><p>Workflow files and recovery data are retained.</p></div>
+              : loading && selectedRunId && !selectedDetailAccepted
+                ? <div role="status"><h3>Loading run details</h3><p className="text-sm text-dim">Waiting for the exact run <span className="mono">{selectedRunId}</span>.</p></div>
+                : !selectedRun ? <p className="text-sm text-dim">Select a recorded run to inspect its server status and events.</p> : <>
               <div className="run-progress-header">
                 <div className="section-heading">
                   <div>
@@ -3244,9 +3257,9 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
 
               <section className="dashboard-section dashboard-actions">
                 {hasSafeControl('owner_stop') && selectedRunHasLiveControls && <>
-                  {!pendingBoundaryStop && <button className="btn btn-primary" disabled={busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Stop after current turn</button>}
+                  {!pendingBoundaryStop && <button className="btn btn-primary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => void handleBoundaryStop()}>Stop after current turn</button>}
                   <p className="text-sm text-dim">The current worker or reviewer call can finish at the next safe boundary. Stopping does not approve the checkpoint.</p>
-                  {!confirmOwnerStop ? <button className="btn btn-secondary" disabled={busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button> : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
+                  {!confirmOwnerStop ? <button className="btn btn-secondary" disabled={!canMutate || busyAction !== null || restartInProgress} onClick={() => setConfirmOwnerStop(true)}>Stop now…</button> : <div className="confirmation"><span>Stop {selectedRun.run_id} immediately? This interrupts the active worker/reviewer call; it does not approve the checkpoint.</span><button className="btn btn-danger" disabled={!canMutate || busyAction === 'owner-stop' || restartInProgress} onClick={() => void handleOwnerStop()}>Stop now</button><button className="btn btn-secondary" onClick={() => setConfirmOwnerStop(false)}>Cancel</button></div>}
                 </>}
                 {!selectedRunIssue && canResume && <>
                   {!confirmResume ? <button className="btn btn-primary" disabled={restartInProgress} onClick={() => setConfirmResume(true)}>Resume as new run…</button> : <div className="confirmation"><span>Confirm explicit resume. Source {selectedRun.run_id} remains visible; the server creates a distinct continuation run with the same workflow and current configuration source.</span><button className="btn btn-primary" disabled={busyAction === 'resume'} onClick={() => void handleResume()}>Confirm resume</button><button className="btn btn-secondary" onClick={() => setConfirmResume(false)}>Cancel</button></div>}
