@@ -2860,16 +2860,24 @@ describe('RunDashboard', () => {
   it('renders an accepted selected snapshot before held history and configuration resolve', async () => {
     const history = deferred<{ runs: Array<typeof ownedRun>; next_cursor: null; schema_version: number }>()
     const configuration = deferred<typeof committedConfig>()
-    const directRun = { ...ownedRun, status: 'completed', revision: 2 }
+    const directRun = { ...ownedRun, revision: 2 }
     vi.mocked(api.listControlPlaneRuns).mockImplementationOnce(() => history.promise)
     vi.mocked(api.getGlobalConfig).mockImplementationOnce(() => configuration.promise)
     vi.mocked(api.getControlPlaneRun).mockResolvedValue(directRun)
-    renderDashboard({ requestedRunId: directRun.run_id })
+    const { container } = renderDashboard({ requestedRunId: directRun.run_id })
 
     const detail = await screen.findByLabelText('Run details')
-    expect(within(detail).getByText('Completed')).toBeDefined()
-    expect(screen.getByText(/Run history is still loading\. 0 loaded so far; the history is incomplete\./)).toBeDefined()
+    expect(within(detail).getByRole('button', { name: directRun.run_id, exact: true })).toBeDefined()
+    expect(within(detail).getAllByText('Running').length).toBeGreaterThan(0)
+    const pendingHistory = screen.getByText(/Run history is still loading\. 0 loaded so far; the history is incomplete\./)
+    const layout = container.querySelector('[data-sidebar-editor-list="Run history"]')
+    expect(layout).not.toBeNull()
+    expect(layout?.compareDocumentPosition(pendingHistory) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    expect(screen.getAllByText(/Run history is still loading/)).toHaveLength(1)
     expect(screen.queryByText('No runs yet')).toBeNull()
+    expect(within(detail).getByText('Initial run controls are pending admission. Actions stay disabled until loading finishes.')).toBeDefined()
+    expect(within(detail).queryByText(/legacy read-only record/)).toBeNull()
+    expect((within(detail).getByLabelText('Control max turns') as HTMLInputElement).disabled).toBe(true)
     expect(screen.queryByRole('button', { name: 'Stop after current turn', exact: true })).toBeNull()
 
     await act(async () => {
@@ -2877,14 +2885,18 @@ describe('RunDashboard', () => {
       await history.promise
     })
     await waitFor(() => expect(api.getGlobalConfig).toHaveBeenCalled())
-    expect(within(detail).getByText('Completed')).toBeDefined()
+    expect(screen.queryByText(/Run history is still loading/)).toBeNull()
+    expect(within(detail).getByRole('button', { name: directRun.run_id, exact: true })).toBeDefined()
+    expect(within(detail).getByText('Initial run controls are pending admission. Actions stay disabled until loading finishes.')).toBeDefined()
 
     await act(async () => {
       configuration.resolve(committedConfig)
       await configuration.promise
     })
     await screen.findByRole('button', { name: 'Refresh', exact: true })
-    expect(within(detail).getByText('Completed')).toBeDefined()
+    await waitFor(() => expect((within(detail).getByLabelText('Control max turns') as HTMLInputElement).disabled).toBe(false))
+    expect(within(detail).queryByText(/pending admission/)).toBeNull()
+    expect(within(detail).getByRole('button', { name: directRun.run_id, exact: true })).toBeDefined()
   })
 
   it('keeps compact selection open for the exact run while initial configuration is pending', async () => {

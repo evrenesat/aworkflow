@@ -2197,3 +2197,48 @@ state. Exact-SHA CI, normal deployment and live performance verification remain
 coordinator-owned and pending; local approval does not certify those gates.
 
 No material findings
+
+
+---
+
+# Stable live controls during history completion — cumulative review approved
+
+Review base: `f57cfabb5a64e9ebea4fc0ee8a73180d32d95919` (unchanged Pre-Handoff Base HEAD).
+Reviewed HEAD: `a0ed144e911e434a4d3faedbc6d866c7ba04f361`.
+Coverage: 1 new / 1 total commit, `cp1 v01`, all four changed files and the
+complete original single-checkpoint plan. Original and active plan coincide.
+No previous findings apply to this handoff; unrelated historical records above
+are preserved. No material findings under the material-code-review gate.
+
+The single pending/error history status follows SidebarEditorLayout, preserving
+loaded counts, retry text and compact list/detail visibility. Owned live controls
+accurately disclose initial loading; ownership and admission gates are unchanged.
+The real-pointer probe holds only history, confirms exact direct status/events,
+retains the original pointer coordinates through release, checks geometry and
+hit identity, and opens native details with one mouse down/up. Existing early
+readiness, draft retention, navigation and restart journeys remain intact.
+
+Verification evidence was inspected and reused under the owner policy:
+`/root/code/agent_flow/.aflow/runs/20260912t231647z-f1af49c8/turns/turn-001/transport.stdout`
+and its completed result record. The artifact lives under the parent controller
+root, rather than this execution worktree's .aflow directory.
+
+- Focused RunDashboard component file: 121 passed; production web build passed.
+- Final Chromium subset: 5 passed (desktop/phone pointer, desktop restart,
+  desktop/phone early detail), basetemp `/tmp/aflow-live-controls-cp1-chromium-final-231648`.
+- Final WebKit phone subset: 2 passed (pointer and original restart journey),
+  basetemp `/tmp/aflow-live-controls-cp1-webkit-final-231648`.
+- Retained external `live-controls-held-history-20260912.json` confirms the
+  pre-fix 53px displacement and wrong BUTTON target, with disclosure closed.
+- Independent cumulative `git diff --check f57cfabb5a64e9ebea4fc0ee8a73180d32d95919 HEAD`
+  passed. No full suite repeated; no host-specific paths added to test code.
+
+Approve and include this tracked reviewer record in the single final unpublished
+handoff commit. Preserve all reviewed implementation blobs and the existing
+single DEVLOG entry. No fix overlay exists or is needed. Leave the private
+original plan in place for engine finalization and record final approved SHA
+there, outside the commit. Verify exactly one handoff commit and clean tracked
+state. Publication, exact-SHA CI, activation and live timing remain separate
+controller/coordinator delivery gates and are not claimed by this review.
+
+No material findings

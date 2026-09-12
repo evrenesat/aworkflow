@@ -1329,6 +1329,126 @@ def test_selected_run_detail_does_not_wait_for_history(
             browser.close()
 
 
+@pytest.mark.parametrize(
+    ("width", "height"),
+    (
+        pytest.param(1280, 720, id="desktop"),
+        pytest.param(390, 844, id="phone"),
+    ),
+)
+def test_history_completion_preserves_live_controls_pointer_target(
+    control_client, monkeypatch, width: int, height: int
+):
+    """Keep one real Adjust run gesture valid when held history completes."""
+    _, root, _, _ = control_client
+    _seed_responsive_fixture(root)
+    run_id, _ = _create_live_control_fixture(control_client, root, monkeypatch)
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    monkeypatch.setenv("AFLOW_APP_WEB_DIST", str(dist))
+    held_history = []
+    base_path = f"/api/control-plane/projects/{PROJECT_ID}/runs"
+    run_path = f"{base_path}/{run_id}"
+
+    def hold_initial_history(route) -> None:
+        if (
+            route.request.method == "GET"
+            and urlsplit(route.request.url).path == base_path
+        ):
+            held_history.append(route)
+            return
+        route.continue_()
+
+    with live_server() as url, sync_playwright() as playwright:
+        browser = _browser(playwright)
+        page = browser.new_page(viewport={"width": width, "height": height})
+        history_pattern = f"**/api/control-plane/projects/{PROJECT_ID}/runs**"
+        page.route(history_pattern, hold_initial_history)
+        try:
+            _login(page, url)
+            with page.expect_response(
+                lambda response: urlsplit(response.url).path == run_path
+            ) as direct_status, page.expect_response(
+                lambda response: urlsplit(response.url).path == f"{run_path}/events"
+            ) as direct_events:
+                page.goto(f"{url}/?project={PROJECT_ID}&view=runs&run={run_id}")
+            assert direct_status.value.status == 200
+            assert direct_events.value.status == 200
+            dashboard = _visible_dashboard(page)
+            identity = dashboard.get_by_title("Copy full run ID", exact=True)
+            expect(identity).to_have_attribute("aria-label", run_id)
+            pending = dashboard.get_by_role("status").filter(
+                has_text="Run history is still loading"
+            )
+            expect(pending).to_contain_text("0 loaded so far; the history is incomplete.")
+            details = dashboard.locator("details.dashboard-section").filter(
+                has_text="Adjust run"
+            ).first
+            summary = details.locator("summary")
+            summary.wait_for(state="visible")
+            summary.evaluate(
+                "element => element.scrollIntoView({behavior: 'instant', block: 'center', inline: 'nearest'})"
+            )
+            before = summary.bounding_box()
+            assert before and before["width"] > 0 and before["height"] > 0, before
+            before_flow = page.evaluate(
+                "() => ({scrollY, height: document.scrollingElement?.scrollHeight ?? 0})"
+            )
+            assert held_history, "initial run history response was not held"
+            pointer = {
+                "x": before["x"] + before["width"] / 2,
+                "y": before["y"] + before["height"] / 2,
+            }
+            page.mouse.move(pointer["x"], pointer["y"])
+
+            for held_route in held_history[:]:
+                held_route.fallback()
+            held_history.clear()
+            page.unroute(history_pattern, hold_initial_history)
+            pending.wait_for(state="hidden")
+
+            after = summary.bounding_box()
+            assert after, "Adjust run summary detached after history completion"
+            after_flow = page.evaluate(
+                "() => ({scrollY, height: document.scrollingElement?.scrollHeight ?? 0})"
+            )
+            assert after["y"] == pytest.approx(before["y"], abs=1), {
+                "before": before,
+                "after": after,
+                "before_flow": before_flow,
+                "after_flow": after_flow,
+            }
+            hit = summary.evaluate(
+                """(element, point) => {
+                    const target = document.elementFromPoint(point.x, point.y)
+                    return {
+                        tag: target?.tagName ?? null,
+                        is_summary: target === element || Boolean(target && element.contains(target)),
+                    }
+                }""",
+                pointer,
+            )
+            assert hit["is_summary"], {"pointer": pointer, "hit": hit, "after": after}
+
+            page.mouse.down()
+            page.mouse.up()
+            expect(details).to_have_attribute("open", "")
+            expect(dashboard.get_by_label("Control max turns", exact=True)).to_be_visible()
+            _assert_no_horizontal_overflow(page)
+            _assert_no_unauthorized_scrollers(page)
+            _assert_document_moves(page)
+        finally:
+            for held_route in held_history:
+                try:
+                    held_route.fallback()
+                except PlaywrightError:
+                    pass
+            try:
+                page.unroute(history_pattern, hold_initial_history)
+            except PlaywrightError:
+                pass
+            browser.close()
+
+
 @pytest.mark.parametrize(("width", "height"), VIEWPORTS)
 def test_responsive_route_matrix(control_client, monkeypatch, width: int, height: int):
     """Exercise every shell destination at each required CSS viewport."""

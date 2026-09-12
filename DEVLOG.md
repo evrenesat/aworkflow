@@ -2686,3 +2686,20 @@ HISTORY: Published clipboard history `c14f1f2`/`cd78d53` remains separate and mu
 - Focused App and ProjectPicker verification confirms that the single ready
   click performs exactly one additional registry read and the normal discovery
   refresh, without changing production loading guards.
+
+## 2026-09-12 — Stable live controls during history completion
+
+- A controlled held-history trace measured the Adjust run summary moving from
+  y=593.078125 to y=540.078125 when the transient 53px incomplete-history notice
+  disappeared above the selected controls. The pointer left at the original
+  center then hit a different disabled button and the native disclosure stayed
+  closed.
+- The single truthful pending/error history status now follows the run
+  list/detail layout in document flow, so completing history removes content
+  below selected controls. Owned live runs awaiting initial admission report
+  pending controls instead of falsely claiming legacy ownership.
+- Verification passed: focused RunDashboard (121 tests), production web build,
+  Chromium held-history/early-detail/live-control journeys (5 tests), and WebKit
+  phone held-history/live-control journeys (2 tests). These cover early exact
+  detail, pointer identity, one native click, compact navigation, draft retention
+  and existing restart semantics.

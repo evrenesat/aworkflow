@@ -2957,11 +2957,6 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
       {feedback && <div className="success-message">{feedback}</div>}
       {handoffError && <div className="error-message" role="alert">{handoffError}</div>}
       {restartNotice && <div className="notice" role="status">{restartNotice}</div>}
-      {projectAvailable && !newRunPage && historyIncomplete && <div className="notice text-sm" role="status">
-        {historyPending
-          ? `Run history is still loading. ${historyLoadedCount} loaded so far; the history is incomplete.`
-          : `Run history could not be loaded. ${historyLoadedCount} previously loaded; the history is incomplete. Use Refresh to retry.`}
-      </div>}
       {successorOutcomeUnknown && pendingSuccessorStart && (
         <div className="notice" role="alert">
           The successor request for {pendingSuccessorStart.sourceRunId} in {pendingSuccessorStart.projectId} is frozen while its outcome is unknown. Do not start a changed replacement.
@@ -3226,7 +3221,7 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
               </details>}
 
               {selectedRunHasLiveControls && <details className="dashboard-section"><summary>Adjust run</summary>
-                {!canMutate && <div className="notice">Actions are disabled because the server classifies this as a legacy read-only record.</div>}
+                {!canMutate && loading && <div className="notice">Initial run controls are pending admission. Actions stay disabled until loading finishes.</div>}
                 <div className="notice">
                   Changes are saved now and apply at the next safe turn or when the run resumes. Refresh after saving Settings to use newly saved teams and profiles; restarting is not required.
                 </div>
@@ -3345,6 +3340,11 @@ export function RunDashboard({ visible = true, page, onNewRun, onCancelNewRun, o
           </section>
         </SidebarEditorLayout>
       )}
+      {projectAvailable && !newRunPage && historyIncomplete && <div className="notice text-sm" role="status">
+        {historyPending
+          ? `Run history is still loading. ${historyLoadedCount} loaded so far; the history is incomplete.`
+          : `Run history could not be loaded. ${historyLoadedCount} previously loaded; the history is incomplete. Use Refresh to retry.`}
+      </div>}
 
       {projectAvailable && newRunPage && <NewRunPage
         startPlanPath={startPlanPath}
